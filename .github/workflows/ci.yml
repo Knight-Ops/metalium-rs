@@ -56,6 +56,13 @@ jobs:
       - name: Generated config table is current
         run: cargo xtask gen-cfg --check
 
+      # The instruction table is generated from Bits32.lua and cross-checked against
+      # the syntax blocks on the pages that embed each diagram. This proves the
+      # committed table still matches the pinned specification, and that the two
+      # descriptions of the instruction set still agree with each other.
+      - name: Generated instruction table is current
+        run: cargo xtask gen-isa --check
+
       - name: Format
         run: cargo fmt --all --check
 

@@ -30,4 +30,12 @@ hooks = [
     # catches a hand-edit to the generated file, which would otherwise survive
     # until CI.
     { id = "cargo-xtask-gen-cfg", name = "generated config table is current", entry = "cargo xtask gen-cfg --check", language = "system", files = "^(crates/tt-isa/src/cfg/|xtask/src/|PINS\\.toml)", pass_filenames = false },
+
+    # The instruction table, likewise -- and this one also re-runs the check that
+    # the specification's two descriptions of the instruction set agree, so an
+    # exception table edited without looking at what it explains fails here.
+    #
+    # Needs `cargo xtask fetch-spec` to have been run once; the pinned tree lives
+    # in vendor/ and is verified by content digest on every use.
+    { id = "cargo-xtask-gen-isa", name = "generated instruction table is current", entry = "cargo xtask gen-isa --check", language = "system", files = "^(crates/tt-isa/src/isa/|xtask/src/|PINS\\.toml)", pass_filenames = false },
 ]
