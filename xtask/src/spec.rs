@@ -25,6 +25,43 @@ pub fn vendored_root() -> PathBuf {
     workspace_root().join("vendor").join("tt-isa-documentation")
 }
 
+/// Override for working against a checkout of the specification itself.
+///
+/// Set it to a `tt-isa-documentation` working tree to generate against local
+/// edits. It is *not* an escape hatch: the tree still has to match the pinned
+/// content digest, so "works on my machine" and "works in CI" cannot diverge.
+pub const ROOT_ENV: &str = "TT_ISA_DOCS";
+
+/// The verified specification tree the generators should read.
+///
+/// Whichever tree is used -- the vendored copy or a local checkout named by
+/// [`ROOT_ENV`] -- it is checked against the pinned digest here, so there is one
+/// answer to "which specification did this table come from".
+pub fn root() -> Result<PathBuf, String> {
+    let (root, source) = match std::env::var_os(ROOT_ENV) {
+        Some(p) => (PathBuf::from(p), ROOT_ENV),
+        None => (vendored_root(), "vendor/tt-isa-documentation"),
+    };
+    if !root.is_dir() {
+        return Err(format!(
+            "{} does not exist. Run `cargo xtask fetch-spec`.",
+            root.display()
+        ));
+    }
+    let got = digest(&root)?;
+    if got != crate::pin::SPEC_CONTENT_SHA256 {
+        return Err(format!(
+            "{} ({source}) hashes {got}, not the pinned {}.\n\
+             It is not the specification revision this table was generated from. \
+             Run `cargo xtask fetch-spec --force`, or update PINS.toml and xtask's \
+             pin module if the bump is intentional.",
+            root.display(),
+            crate::pin::SPEC_CONTENT_SHA256
+        ));
+    }
+    Ok(root)
+}
+
 /// Directories whose `.md` files the generator reads, relative to the tree root.
 ///
 /// Every instruction page lives in a `TensixCoprocessor` directory — Wormhole's has

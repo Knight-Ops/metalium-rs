@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 mod fetch;
 mod gen_cfg;
+mod gen_isa;
 mod pin;
 mod ship;
 mod spec;
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
         Some("check-no-sim-in-ship") => ship::check_no_sim_in_ship(),
         Some("gen-cfg") => gen_cfg::gen_cfg(args.any(|a| a == "--check")),
         Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
+        Some("check-isa-sources") => gen_isa::check_sources(),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -44,4 +46,6 @@ tasks:
   gen-cfg [--check]       regenerate tt-isa's backend-configuration field table
                           from the pinned cfg_defines.h; --check fails if the
                           committed file is out of date rather than rewriting it
+  check-isa-sources       parse the pinned Bits32.lua and report what it holds,
+                          without generating anything
   check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs";
