@@ -4,9 +4,21 @@
 # deliberate act that invalidates the verification gates until they are re-run.
 
 [tt-isa-documentation]
-# The ISA specification. Local checkout is at ../tt-isa-documentation.
+# The ISA specification. Fetched by `cargo xtask fetch-spec`; a local checkout at
+# ../tt-isa-documentation is equivalent and gets the same check.
 repo = "https://github.com/tenstorrent/tt-isa-documentation"
 rev  = "f848eb668c2aeae742a88a49a86157e24a0a20c6"
+# SHA-256 over the *contents* of the files the instruction generator reads --
+# Diagrams/Src/Bits32.lua plus every page under the two TensixCoprocessor trees
+# and the two NoC/Atomics.md -- as (path, length, bytes) in sorted path order.
+#
+# Not the tarball's hash: GitHub regenerates source archives on demand and does
+# not promise their bytes are stable, so a tarball hash can fail for reasons that
+# have nothing to do with the specification. Hashing content is stable by
+# construction, applies equally to a git checkout, and pins exactly the bytes the
+# generator reads. Confirmed here by extracting the tarball and diffing it
+# against an independent git checkout at this rev.
+content_sha256 = "d08a44478ad67fa2c5516366536644741963203925f69b91976fe67eded9ae76"
 
 [ttsim]
 # The golden-reference simulator. Fetched by `cargo xtask fetch-ttsim`.

@@ -11,6 +11,7 @@ mod fetch;
 mod gen_cfg;
 mod pin;
 mod ship;
+mod spec;
 mod util;
 
 fn main() -> ExitCode {
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
         Some("fetch-ttsim") => fetch::fetch_ttsim(args.any(|a| a == "--force")),
         Some("check-no-sim-in-ship") => ship::check_no_sim_in_ship(),
         Some("gen-cfg") => gen_cfg::gen_cfg(args.any(|a| a == "--check")),
+        Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -37,6 +39,8 @@ usage: cargo xtask <task>
 
 tasks:
   fetch-ttsim [--force]   download the pinned libttsim_bh.so into vendor/
+  fetch-spec [--force]    download the pinned ISA specification tree into vendor/
+                          and verify it against the pinned content digest
   gen-cfg [--check]       regenerate tt-isa's backend-configuration field table
                           from the pinned cfg_defines.h; --check fails if the
                           committed file is out of date rather than rewriting it
