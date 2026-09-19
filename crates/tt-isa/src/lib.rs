@@ -11,6 +11,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod cfg;
 pub mod mailbox;
 pub mod noc;
 pub mod sfpu;

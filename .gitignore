@@ -6,3 +6,7 @@
 # *pinned* in PINS.toml, which is what actually matters -- it is the oracle every
 # gate is measured against.
 /vendor/*.so
+
+# Fetched by `cargo xtask gen-cfg`, pinned by SHA-256 in PINS.toml. The *generated*
+# Rust table is committed; the header it came from is not.
+/vendor/cfg_defines.h

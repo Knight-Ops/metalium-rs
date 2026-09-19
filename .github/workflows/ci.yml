@@ -38,6 +38,12 @@ jobs:
       - name: Fetch simulator
         run: cargo xtask fetch-ttsim
 
+      # The backend-configuration table is generated, never transcribed. This
+      # proves the committed table still matches the pinned header, so a pin bump
+      # cannot silently diverge from the code that depends on it.
+      - name: Generated config table is current
+        run: cargo xtask gen-cfg --check
+
       - name: Format
         run: cargo fmt --all --check
 

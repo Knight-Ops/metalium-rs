@@ -16,8 +16,11 @@ asset  = "libttsim_bh.so"
 sha256 = "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5"
 
 [tt-metal]
-# Source of cfg_defines.h. Not yet consumed; the baseline hand-writes the few
-# config fields it needs. Recorded now so tt-isa-gen starts from the same commit
-# the spec cites (BackendConfiguration.md:17).
-repo = "https://github.com/tenstorrent/tt-metal"
-rev  = "81989dcdb8f9b340c932ae7a71a346f4f08703eb"
+# Source of cfg_defines.h -- the 820 backend-configuration fields. Fetched and
+# parsed by `cargo xtask gen-cfg` into crates/tt-isa/src/cfg/generated.rs, which
+# IS committed; the header itself is not. This is the commit the specification
+# cites (BackendConfiguration.md:17).
+repo   = "https://github.com/tenstorrent/tt-metal"
+rev    = "81989dcdb8f9b340c932ae7a71a346f4f08703eb"
+path   = "tt_metal/hw/inc/blackhole/cfg_defines.h"
+sha256 = "bc2636abc3ea04e6ca322923e6f2713b242857d021d8ef39b9180a14bcb1a5b8"

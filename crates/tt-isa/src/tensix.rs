@@ -233,6 +233,12 @@ const _: () = assert!(COPROCESSOR_DONE_CHECK > PC_BUF_BASE);
 const _: () = assert!(COPROCESSOR_DONE_CHECK < PC_BUF_HAZARD_END);
 const _: () = assert!(MOP_EXPANDER_DONE_CHECK < PC_BUF_HAZARD_END);
 
+/// Tensix backend configuration — `Config`, `ConfigDualWrite` and `ThreadConfig`,
+/// mapped one after the other (`BabyRISCV/README.md:135`).
+///
+/// See [`crate::cfg`] for the field table and the address arithmetic.
+pub const TENSIX_CFG_BASE: u64 = 0xFFEF_0000;
+
 /// Tensix `Dst`, mapped into T0/T1/T2's address space (`Dst.md:105`).
 /// Unmapped for B and NC, and **not reachable over the NoC** — which is why reading
 /// a compute result requires a core to copy it into L1 first.
