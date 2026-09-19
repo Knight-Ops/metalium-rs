@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+targets = ["riscv32im-unknown-none-elf"]
+components = ["rustfmt", "clippy", "llvm-tools"]

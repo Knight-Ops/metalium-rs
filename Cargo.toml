@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tt-isa",
+    "crates/tt-ttsim-sys",
+    "crates/tt-ttsim",
+    "crates/tt-device",
+    "crates/tt-tests",
+    "xtask",
+]
+# tt-firmware builds for riscv32im and is driven by xtask, not the host workspace.
+exclude = ["crates/tt-firmware"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tt-isa = { path = "crates/tt-isa" }
+tt-ttsim-sys = { path = "crates/tt-ttsim-sys" }
+tt-ttsim = { path = "crates/tt-ttsim" }
+tt-device = { path = "crates/tt-device" }
+libloading = "0.8"

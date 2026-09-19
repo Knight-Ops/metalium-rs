@@ -1,0 +1,23 @@
+# Pinned upstream revisions.
+#
+# These are specification inputs, not dependencies. Bumping any of them is a
+# deliberate act that invalidates the verification gates until they are re-run.
+
+[tt-isa-documentation]
+# The ISA specification. Local checkout is at ../tt-isa-documentation.
+repo = "https://github.com/tenstorrent/tt-isa-documentation"
+rev  = "f848eb668c2aeae742a88a49a86157e24a0a20c6"
+
+[ttsim]
+# The golden-reference simulator. Fetched by `cargo xtask fetch-ttsim`.
+repo   = "https://github.com/tenstorrent/ttsim"
+tag    = "v1.10.9"
+asset  = "libttsim_bh.so"
+sha256 = "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5"
+
+[tt-metal]
+# Source of cfg_defines.h. Not yet consumed; the baseline hand-writes the few
+# config fields it needs. Recorded now so tt-isa-gen starts from the same commit
+# the spec cites (BackendConfiguration.md:17).
+repo = "https://github.com/tenstorrent/tt-metal"
+rev  = "81989dcdb8f9b340c932ae7a71a346f4f08703eb"

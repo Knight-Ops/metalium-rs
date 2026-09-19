@@ -1,0 +1,13 @@
+[build]
+target = "riscv32im-unknown-none-elf"
+
+[target.riscv32im-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Lcrates/tt-firmware",
+    # riscv32im has no C extension, so nothing should emit compressed
+    # instructions. Stated anyway, because the compressed encoding space is
+    # reused by `.ttinsn`: a compressed instruction here is not a smaller
+    # instruction, it is a Tensix push.
+    "-C", "target-feature=-c",
+]

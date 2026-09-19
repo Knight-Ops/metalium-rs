@@ -1,0 +1,24 @@
+# Deliberately outside the host workspace: this crate only ever builds for
+# riscv32im-unknown-none-elf, and mixing it into the host workspace would make
+# `cargo build` at the root try to build it for the host.
+[workspace]
+
+[package]
+name = "tt-firmware"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Bare-metal Rust for the Blackhole baby RISC-V cores."
+
+[dependencies]
+tt-isa = { path = "../tt-isa" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# There is no unwinder, and `ebreak` cannot back a panic path, so firmware
+# publishes a status word and spins instead. See src/lib.rs.
+panic = "abort"
+debug = true

@@ -1,0 +1,10 @@
+[package]
+name = "tt-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host-side Blackhole device access: transport abstraction, TLB windows, L1 addressing."
+
+[dependencies]
+tt-isa.workspace = true

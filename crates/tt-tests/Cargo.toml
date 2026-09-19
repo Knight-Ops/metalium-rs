@@ -1,0 +1,27 @@
+[package]
+name = "tt-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# No library of its own. This crate exists to hold gates that span several crates
+# -- notably any gate needing both tt-device and tt-ttsim, which tt-device itself
+# must never depend on.
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Gates tests that cannot pass against the simulator, either because ttsim does
+# not model the hardware they exercise or because it explicitly declines to.
+# They are compiled unconditionally so they cannot rot, and run only with
+# `cargo test -p tt-tests --features silicon` against real hardware.
+silicon = []
+
+[dependencies]
+
+[dev-dependencies]
+tt-isa.workspace = true
+tt-device.workspace = true
+tt-ttsim.workspace = true

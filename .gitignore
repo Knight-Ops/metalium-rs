@@ -1,0 +1,8 @@
+/target
+/crates/tt-firmware/target
+
+# The pinned simulator build, fetched by `cargo xtask fetch-ttsim`.
+# Not committed: a 244 KiB binary blob with its own release cadence. It is
+# *pinned* in PINS.toml, which is what actually matters -- it is the oracle every
+# gate is measured against.
+/vendor/*.so

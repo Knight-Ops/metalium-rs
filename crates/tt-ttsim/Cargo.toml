@@ -1,0 +1,16 @@
+[package]
+name = "tt-ttsim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safe wrapper over libttsim.so, implementing tt-device's Transport. Development/test only."
+
+[dependencies]
+tt-ttsim-sys.workspace = true
+tt-device.workspace = true
+tt-isa.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tt-ttsim-sys.workspace = true
