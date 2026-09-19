@@ -280,3 +280,290 @@ fn undrawn_bits_are_reported_rather_than_assumed_zero() {
     let dst16 = diagrams.last().unwrap();
     assert_eq!(dst16.undrawn(), 0, "this layout does cover its whole word");
 }
+
+// ---------------------------------------------------------------------------
+// The cross-check: the diagram against the macro template on its page.
+// ---------------------------------------------------------------------------
+
+use super::syntax::{self, Term};
+
+/// A page in the shape of the real ones.
+///
+/// Modelled on `SETDMAREG_Special.md`, because its three-term argument is the case
+/// the slot-base check exists for: the macro's shifts of 7, 3 and 0 and the
+/// diagram's bits 15, 11 and 8 all have to imply the same slot base of 8.
+const PAGE: &str = r#"# `SETDMAREG` (Special)
+
+**Backend execution unit:** Scalar Unit (ThCon)
+
+## Syntax
+
+```c
+TT_SETDMAREG(/* u2 */ ResultSize,
+           ((/* u4 */ WhichPackers) << 7) +
+           ((/* u4 */ InputSource ) << 3) +
+             /* u3 */ InputHalfReg,
+             1,
+             /* u7 */ ResultHalfReg)
+```
+
+## Encoding
+
+![](../../../Diagrams/Out/Bits32_SETDMAREG_Special.svg)
+
+## Functional model
+
+Prose that mentions `TT_SETDMAREG(x, y)` and must not be mistaken for the syntax.
+"#;
+
+const PAGE_DIAGRAM: &str = r#"local diagrams = {
+  SETDMAREG_Special = function()
+    return Bits32{
+      {0, 7, "ResultHalfReg"},
+      {7, 1, "1"},
+      {8, 3, "InputHalfReg", y = 1},
+      {11, 4, "InputSource", y = 2},
+      {15, 4, "WhichPackers", y = 1},
+      {22, 2, "ResultSize", y = 1},
+      {24, 8, "0x45"},
+    }
+  end,
+}
+"#;
+
+fn cross(diagram_src: &str, page_src: &str) -> Result<super::check::CrossCheck, String> {
+    let diagrams = lua::parse(diagram_src)?;
+    // Not `check::structure`: that holds over the whole instruction set (there is
+    // exactly one computed opcode, and it is RMWCIB's), which a two-diagram fixture
+    // cannot satisfy. The cross-check does not depend on it.
+    let diagrams = check::dedupe(diagrams)?;
+    let page =
+        syntax::parse_page("Fixture.md", page_src)?.expect("the fixture documents an encoding");
+    check::cross_check(&diagrams, std::slice::from_ref(&page))
+}
+
+#[track_caller]
+fn cross_rejects(diagram_src: &str, page_src: &str, expected: &str) {
+    match cross(diagram_src, page_src) {
+        Ok(_) => panic!("expected rejection mentioning {expected:?}, but it agreed"),
+        Err(msg) => assert!(
+            msg.contains(expected),
+            "expected a message mentioning {expected:?}, got: {msg}"
+        ),
+    }
+}
+
+#[test]
+fn the_macro_parses_into_slots_and_shifts() {
+    let page = syntax::parse_page("Fixture.md", PAGE).unwrap().unwrap();
+    assert_eq!(page.keys, ["SETDMAREG_Special"]);
+    assert_eq!(
+        page.calls.len(),
+        1,
+        "prose mentioning TT_SETDMAREG is not a syntax block"
+    );
+
+    let call = &page.calls[0];
+    assert_eq!(call.name, "SETDMAREG");
+    assert_eq!(call.slots.len(), 4, "four arguments, high bits first");
+
+    // The packed argument: three terms, shifted within one slot.
+    assert_eq!(
+        call.slots[1],
+        vec![
+            Term::Named {
+                name: "WhichPackers".into(),
+                width: 4,
+                signed: false,
+                shift: 7
+            },
+            Term::Named {
+                name: "InputSource".into(),
+                width: 4,
+                signed: false,
+                shift: 3
+            },
+            Term::Named {
+                name: "InputHalfReg".into(),
+                width: 3,
+                signed: false,
+                shift: 0
+            },
+        ]
+    );
+    // A literal argument names bits the diagram draws as a fixed value.
+    assert_eq!(call.slots[2], vec![Term::Literal { value: 1, shift: 0 }]);
+}
+
+#[test]
+fn the_two_sources_agree_about_the_fixture() {
+    let report = cross(PAGE_DIAGRAM, PAGE).expect("the fixture should agree");
+    assert_eq!(report.pairs, 1);
+    assert!(report.unembedded.is_empty());
+    assert!(report.unchecked.is_empty());
+}
+
+#[test]
+fn a_moved_field_is_caught_by_the_slot_base_even_though_its_width_is_right() {
+    // This is the check the whole cross-check exists for. `InputSource` keeps its
+    // name and its width; only its position moves, by one bit. Nothing in the
+    // diagram alone notices, and nothing in the macro alone notices. Together they
+    // do, because the slot no longer has a single base.
+    cross_rejects(
+        &PAGE_DIAGRAM.replace(r#"{11, 4, "InputSource""#, r#"{10, 4, "InputSource""#),
+        PAGE,
+        "imply different slot bases",
+    );
+    // The same mutation applied to the other source, for symmetry.
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace("InputSource ) << 3", "InputSource ) << 2"),
+        "imply different slot bases",
+    );
+}
+
+#[test]
+fn a_width_disagreement_is_caught_from_either_side() {
+    cross_rejects(
+        &PAGE_DIAGRAM.replace(r#"{22, 2, "ResultSize""#, r#"{22, 1, "ResultSize""#),
+        PAGE,
+        "bits in the diagram and",
+    );
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace("/* u2 */ ResultSize", "/* u3 */ ResultSize"),
+        "bits in the diagram and",
+    );
+}
+
+#[test]
+fn a_renamed_field_is_caught() {
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace("/* u7 */ ResultHalfReg", "/* u7 */ ResultReg"),
+        "the macro calls it",
+    );
+}
+
+#[test]
+fn a_disagreement_about_signedness_is_caught() {
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace("/* u7 */ ResultHalfReg", "/* i7 */ ResultHalfReg"),
+        "whether `ResultHalfReg` is signed",
+    );
+}
+
+#[test]
+fn a_field_the_macro_does_not_take_is_caught_unless_it_is_a_known_pinning() {
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace("/* u2 */ ResultSize,\n", "0,\n"),
+        "the macro takes",
+    );
+}
+
+#[test]
+fn a_diagram_no_page_embeds_is_reported() {
+    let extra = PAGE_DIAGRAM.replace(
+        "\n}\n",
+        "\n  SFPNOP = function()\n    return Bits32{\n      {24, 8, \"0x8F\"},\n    }\n  end,\n}\n",
+    );
+    assert_ne!(extra, PAGE_DIAGRAM, "the mutation must actually apply");
+    let report = cross(&extra, PAGE).expect("the pairs that exist still agree");
+    assert_eq!(report.unembedded, ["SFPNOP"]);
+}
+
+#[test]
+fn a_page_embedding_an_unknown_diagram_is_refused() {
+    cross_rejects(
+        PAGE_DIAGRAM,
+        &PAGE.replace(
+            "Bits32_SETDMAREG_Special.svg",
+            "Bits32_SETDMAREG_Imaginary.svg",
+        ),
+        "which Bits32.lua does not define",
+    );
+}
+
+#[test]
+fn prose_outside_the_syntax_block_is_not_mistaken_for_one() {
+    // `SETC16.md` really does discuss `TT_SETC16(CFG_STATE_ID_StateID_ADDR32, x)` in
+    // its notes. A whole-file search would take that for an encoding.
+    let page = syntax::parse_page("Fixture.md", PAGE).unwrap().unwrap();
+    assert_eq!(page.calls.len(), 1);
+}
+
+#[test]
+fn an_operandless_instruction_has_a_macro_with_no_arguments() {
+    // `TTI_SFPNOP` takes no arguments at all. It still counts as documented, which
+    // is what keeps the "has an opcode iff it has a macro" invariant true.
+    let src = PAGE
+        .replace("Bits32_SETDMAREG_Special.svg", "Bits32_SFPNOP.svg")
+        .replace(
+            "TT_SETDMAREG(/* u2 */ ResultSize,\n           ((/* u4 */ WhichPackers) << 7) +\n           ((/* u4 */ InputSource ) << 3) +\n             /* u3 */ InputHalfReg,\n             1,\n             /* u7 */ ResultHalfReg)",
+            "TTI_SFPNOP",
+        );
+    let page = syntax::parse_page("Fixture.md", &src).unwrap().unwrap();
+    assert_eq!(page.calls.len(), 1);
+    assert_eq!(page.calls[0].name, "SFPNOP");
+    assert!(page.calls[0].slots.is_empty());
+}
+
+/// `ZEROACC`, whose macro really does omit the `Revert` field the diagram draws.
+const ZEROACC_DIAGRAM: &str = r#"local diagrams = {
+  ZEROACC = function()
+    return Bits32{
+      {0, 10, "Imm10"},
+      {12, 2, "AddrMod"},
+      {14, 1, "Revert", y = 1},
+      {15, 2, "Mode"},
+      {19, 1, "UseDst32b", y = 1},
+      {24, 8, "0x48"},
+    }
+  end,
+}
+"#;
+
+const ZEROACC_PAGE: &str = r#"# `ZEROACC`
+
+## Syntax
+
+```c
+TT_ZEROACC(/* bool */ UseDst32b, /* u2 */ Mode, /* u2 */ AddrMod, /* u10 */ Imm10)
+```
+
+## Encoding
+
+![](../../../Diagrams/Out/Bits32_ZEROACC.svg)
+"#;
+
+#[test]
+fn a_pinned_field_lets_the_macro_take_fewer_operands_than_the_diagram_draws() {
+    // The exception is what makes this agree; without it the arity check fires,
+    // which `a_field_the_macro_does_not_take_is_caught_unless_it_is_a_known_pinning`
+    // covers from the other side.
+    let report = cross(ZEROACC_DIAGRAM, ZEROACC_PAGE)
+        .expect("ZEROACC's macro omits `Revert`, and the exception table says so");
+    assert_eq!(report.pairs, 1);
+
+    // ...and the exception is recorded as used, which is what stops it going stale.
+    assert!(
+        !check::stale_exceptions(&report)
+            .iter()
+            .any(|s| s.contains("ZEROACC.Revert")),
+        "the ZEROACC exception should count as used once it applies"
+    );
+}
+
+#[test]
+fn an_exception_that_never_applies_is_reported_as_stale() {
+    // Over a single page almost every exception is unused, which is exactly why
+    // this is a whole-corpus rule rather than part of the per-page comparison.
+    let report = cross(ZEROACC_DIAGRAM, ZEROACC_PAGE).unwrap();
+    let stale = check::stale_exceptions(&report);
+    assert!(
+        stale.iter().any(|s| s.contains("ATSWAP.SingleDataReg")),
+        "an exception no page needed should be named: {stale:?}"
+    );
+}
