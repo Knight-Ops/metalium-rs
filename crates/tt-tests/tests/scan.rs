@@ -54,7 +54,10 @@ fn find_addressable_l1() {
         }
     }
 
-    println!("\n      {}", (0..17).map(|x| format!("{x:>7}")).collect::<String>());
+    println!(
+        "\n      {}",
+        (0..17).map(|x| format!("{x:>7}")).collect::<String>()
+    );
     for y in 0..12u8 {
         let mut row = String::new();
         for x in 0..17u8 {

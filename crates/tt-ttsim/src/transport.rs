@@ -87,7 +87,12 @@ impl<'a> LibTtsim<'a> {
     /// Reject anything libttsim would refuse, before it gets the chance to `_Exit`.
     fn validate(bar: Bar, offset: u64, len: u64, dir: Dir) -> Result<()> {
         let oob = || TransportError::OutOfBounds { bar, offset, len };
-        let bad = |reason| TransportError::Misaligned { bar, offset, len, reason };
+        let bad = |reason| TransportError::Misaligned {
+            bar,
+            offset,
+            len,
+            reason,
+        };
 
         if len == 0 {
             return Err(bad("zero-length accesses are not meaningful"));

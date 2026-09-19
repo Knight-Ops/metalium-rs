@@ -64,7 +64,11 @@ pub enum OpenError {
     NotBlackhole { vendor: u16, device: u16 },
     /// A BAR base in configuration space did not match the address the library
     /// actually decodes. See [`expected_bar_base`].
-    BarMismatch { bar: tt_device::Bar, expected: u64, found: u64 },
+    BarMismatch {
+        bar: tt_device::Bar,
+        expected: u64,
+        found: u64,
+    },
 }
 
 impl std::fmt::Display for OpenError {
@@ -86,7 +90,11 @@ impl std::fmt::Display for OpenError {
                 "simulator reported {vendor:#06x}:{device:#06x}, not Blackhole. \
                  Is this libttsim_wh.so rather than libttsim_bh.so?"
             ),
-            OpenError::BarMismatch { bar, expected, found } => write!(
+            OpenError::BarMismatch {
+                bar,
+                expected,
+                found,
+            } => write!(
                 f,
                 "{bar:?} base is {found:#x} in config space but this build expects \
                  {expected:#x}; libttsim's hardcoded BAR map has changed"
@@ -162,7 +170,10 @@ impl Simulator {
         // SAFETY: callbacks are installed and this is the first and only init.
         unsafe { (lib.init)() };
 
-        let sim = Simulator { lib, _not_send: std::marker::PhantomData };
+        let sim = Simulator {
+            lib,
+            _not_send: std::marker::PhantomData,
+        };
         sim.verify()?;
         Ok(sim)
     }
@@ -173,7 +184,8 @@ impl Simulator {
         use tt_device::{Bar, ConfigOffset, DEVICE_ID_BLACKHOLE, VENDOR_ID_TENSTORRENT};
 
         // SAFETY: offset 0 is always decoded; the simulator is initialized.
-        let id = unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, ConfigOffset::VendorDevice as u32) };
+        let id =
+            unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, ConfigOffset::VendorDevice as u32) };
         let vendor = (id & 0xFFFF) as u16;
         let device = (id >> 16) as u16;
         if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
@@ -193,7 +205,11 @@ impl Simulator {
             let found = ((hi as u64) << 32) | ((lo & !0xF) as u64);
             let expected = expected_bar_base(bar);
             if found != expected {
-                return Err(OpenError::BarMismatch { bar, expected, found });
+                return Err(OpenError::BarMismatch {
+                    bar,
+                    expected,
+                    found,
+                });
             }
         }
         Ok(())

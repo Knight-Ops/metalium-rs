@@ -31,7 +31,8 @@ fn simulator_reports_blackhole() {
             id, 0xB140_1E52,
             "expected Blackhole vendor:device in config offset 0, got {id:#010x}"
         );
-        t.verify_is_blackhole().expect("verify_is_blackhole should agree");
+        t.verify_is_blackhole()
+            .expect("verify_is_blackhole should agree");
     });
 }
 
@@ -70,7 +71,10 @@ fn there_is_no_capability_list() {
     // terminate the process.
     in_simulator(|sim| {
         let mut t = sim.transport();
-        assert_eq!(t.config_read32(ConfigOffset::CapabilitiesPointer).unwrap(), 0);
+        assert_eq!(
+            t.config_read32(ConfigOffset::CapabilitiesPointer).unwrap(),
+            0
+        );
     });
 }
 
@@ -110,18 +114,34 @@ fn invalid_accesses_are_rejected_before_reaching_the_library() {
         let mut buf = [0u8; 4];
 
         let cases: &[(&str, tt_device::Result<()>)] = &[
-            ("read past the end of BAR0", t.bar_read(Bar::Bar0, Bar::Bar0.size(), &mut buf)),
-            ("read an undecoded BAR0 hole", t.bar_read(Bar::Bar0, 0x1A00_0000, &mut buf)),
-            ("read a write-only TLB config register", t.bar_read(Bar::Bar0, 0x1FC0_0000, &mut buf)),
-            ("write a read-only PCIe NIU register", t.bar_write(Bar::Bar0, 0x1FD0_4000, &buf)),
-            ("unaligned dword in BAR2", t.bar_read(Bar::Bar2, 0x1002, &mut buf)),
+            (
+                "read past the end of BAR0",
+                t.bar_read(Bar::Bar0, Bar::Bar0.size(), &mut buf),
+            ),
+            (
+                "read an undecoded BAR0 hole",
+                t.bar_read(Bar::Bar0, 0x1A00_0000, &mut buf),
+            ),
+            (
+                "read a write-only TLB config register",
+                t.bar_read(Bar::Bar0, 0x1FC0_0000, &mut buf),
+            ),
+            (
+                "write a read-only PCIe NIU register",
+                t.bar_write(Bar::Bar0, 0x1FD0_4000, &buf),
+            ),
+            (
+                "unaligned dword in BAR2",
+                t.bar_read(Bar::Bar2, 0x1002, &mut buf),
+            ),
         ];
         for (what, outcome) in cases {
             assert!(outcome.is_err(), "{what} should have been rejected");
         }
 
         // Still alive, and the device still answers.
-        t.verify_is_blackhole().expect("simulator should be unharmed");
+        t.verify_is_blackhole()
+            .expect("simulator should be unharmed");
     });
 }
 

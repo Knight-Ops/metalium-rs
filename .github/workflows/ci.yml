@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Simulator suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # riscv32im-unknown-none-elf is a built-in target, so the firmware needs no
+      # custom target JSON. llvm-tools supplies the objcopy and objdump that
+      # crates/tt-tests/build.rs uses to produce and check the firmware image.
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add riscv32im-unknown-none-elf
+          rustup component add clippy rustfmt llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The simulator is pinned by tag and SHA-256 in PINS.toml and verified on
+      # download, so caching it is safe: a cache hit that does not match the pin
+      # is rejected by the same check.
+      - name: Cache the pinned simulator
+        uses: actions/cache@v4
+        with:
+          path: vendor/libttsim_bh.so
+          key: libttsim-${{ hashFiles('PINS.toml') }}
+
+      - name: Fetch simulator
+        run: cargo xtask fetch-ttsim
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # Runs the whole stack: the firmware is built for riscv32im and checked for
+      # instructions Blackhole cannot execute, then every gate runs in-process
+      # against libttsim. Deterministic -- time only advances inside
+      # libttsim_clock -- so a failure here is real, never a flake.
+      - name: Test
+        run: cargo test --workspace
+
+      # The silicon-gated tests cannot run here, but they must keep compiling or
+      # they rot between now and the first hardware run.
+      - name: Type-check the silicon-only suite
+        run: cargo test --workspace --features tt-tests/silicon --no-run
+
+      # tt-ttsim binds a third-party .so. Binding it for development does not
+      # compromise the native-Rust goal; shipping it would.
+      - name: Simulator binding stays out of shippable crates
+        run: cargo xtask check-no-sim-in-ship

@@ -82,14 +82,23 @@ fn fetch_ttsim(force: bool) -> Result<(), String> {
     println!("fetching {url}");
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
 
     // Download beside the destination, then rename: a failed or interrupted fetch
     // must not leave a truncated .so that later hashes as "wrong version".
     let tmp = dest.with_extension("so.partial");
     let status = Command::new("curl")
-        .args(["--fail", "--location", "--silent", "--show-error", "--max-time", "300", "-o"])
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "300",
+            "-o",
+        ])
         .arg(&tmp)
         .arg(&url)
         .status()
@@ -144,7 +153,15 @@ fn check_no_sim_in_ship() -> Result<(), String> {
 
     for crate_name in SHIPPABLE {
         let out = Command::new("cargo")
-            .args(["tree", "--package", crate_name, "--edges", "normal", "--prefix", "none"])
+            .args([
+                "tree",
+                "--package",
+                crate_name,
+                "--edges",
+                "normal",
+                "--prefix",
+                "none",
+            ])
             .current_dir(&root)
             .output()
             .map_err(|e| format!("could not run cargo tree: {e}"))?;

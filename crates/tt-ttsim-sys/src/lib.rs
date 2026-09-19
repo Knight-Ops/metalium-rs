@@ -91,7 +91,10 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Open(e) => write!(f, "could not dlopen libttsim: {e}"),
             LoadError::MissingSymbol { name, source } => {
-                write!(f, "libttsim is missing required entry point `{name}`: {source}")
+                write!(
+                    f,
+                    "libttsim is missing required entry point `{name}`: {source}"
+                )
             }
         }
     }
@@ -124,7 +127,10 @@ impl Lib {
         macro_rules! sym {
             ($name:literal) => {{
                 let s: Symbol<'_, _> = unsafe { library.get(concat!($name, "\0").as_bytes()) }
-                    .map_err(|source| LoadError::MissingSymbol { name: $name, source })?;
+                    .map_err(|source| LoadError::MissingSymbol {
+                        name: $name,
+                        source,
+                    })?;
                 *s
             }};
         }

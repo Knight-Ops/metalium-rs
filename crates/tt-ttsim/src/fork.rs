@@ -140,8 +140,8 @@ mod tests {
     fn hard_exit_in_child_is_reported() {
         // Stands in for libttsim's `_Exit` on a contract violation: no unwinding,
         // no destructors. The parent must survive and report it.
-        let err = fork_scope(|| unsafe { libc::_exit(1) })
-            .expect_err("a hard exit should be reported");
+        let err =
+            fork_scope(|| unsafe { libc::_exit(1) }).expect_err("a hard exit should be reported");
         assert!(matches!(err, ForkError::Exited(1)), "{err:?}");
         assert!(err.to_string().contains("libttsim"));
     }
@@ -152,7 +152,10 @@ mod tests {
             libc::raise(libc::SIGKILL);
         })
         .expect_err("a killed child should be reported");
-        assert!(matches!(err, ForkError::Signalled(libc::SIGKILL)), "{err:?}");
+        assert!(
+            matches!(err, ForkError::Signalled(libc::SIGKILL)),
+            "{err:?}"
+        );
     }
 
     #[test]

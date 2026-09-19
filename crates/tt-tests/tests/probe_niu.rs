@@ -32,7 +32,9 @@ fn probe_top(x: u8, y: u8, dir: &std::path::Path) -> Option<u64> {
                 && dev.read32(&w, coord, addr).is_ok_and(|v| v == 0xA5A5_A5A5);
             fs::write(&verdict, if ok { "1" } else { "0" }).unwrap();
         });
-        fs::read_to_string(&verdict).map(|s| s == "1").unwrap_or(false)
+        fs::read_to_string(&verdict)
+            .map(|s| s == "1")
+            .unwrap_or(false)
     };
 
     if !trial(0x1000) {
@@ -82,7 +84,10 @@ fn measure_tile_memory_sizes() {
     ];
     for (label, x, y) in samples {
         match probe_top(x, y, &dir) {
-            Some(top) => println!("{label:22} ({x:2},{y:2}) -> first bad address {top:#x} ({} KiB)", top / 1024),
+            Some(top) => println!(
+                "{label:22} ({x:2},{y:2}) -> first bad address {top:#x} ({} KiB)",
+                top / 1024
+            ),
             None => println!("{label:22} ({x:2},{y:2}) -> nothing addressable"),
         }
     }

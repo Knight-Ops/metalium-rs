@@ -61,7 +61,11 @@ impl<N: NocId> NocCoord<N> {
     /// rather than an out-of-range tile.
     pub const fn new(x: u8, y: u8) -> Option<Self> {
         if x < 64 && y < 64 {
-            Some(NocCoord { x, y, _noc: PhantomData })
+            Some(NocCoord {
+                x,
+                y,
+                _noc: PhantomData,
+            })
         } else {
             None
         }

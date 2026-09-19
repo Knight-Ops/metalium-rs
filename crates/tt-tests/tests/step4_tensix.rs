@@ -59,15 +59,20 @@ fn multiply_on_device(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, a: f32, b: f32) -
     dev.release_tensix_backend(&w, tile).unwrap();
 
     // Operands and a sentinel result, staged while the core is still held.
-    dev.write32(&w, tile, mailbox::OPERAND_A, a.to_bits()).unwrap();
-    dev.write32(&w, tile, mailbox::OPERAND_B, b.to_bits()).unwrap();
+    dev.write32(&w, tile, mailbox::OPERAND_A, a.to_bits())
+        .unwrap();
+    dev.write32(&w, tile, mailbox::OPERAND_B, b.to_bits())
+        .unwrap();
     dev.write32(&w, tile, mailbox::RESULT, SENTINEL).unwrap();
     dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
 
     dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
         .unwrap();
 
-    match dev.wait_for_status(&w, tile, BUDGET, |s| s == status::DONE).unwrap() {
+    match dev
+        .wait_for_status(&w, tile, BUDGET, |s| s == status::DONE)
+        .unwrap()
+    {
         Ok(_) => {}
         Err(WaitError::Panicked { code }) => panic!("firmware panicked, code {code}"),
         Err(e) => panic!("{e}"),
@@ -86,7 +91,8 @@ fn sfpu_multiplies_three_by_two() {
     in_device(|dev| {
         let result = multiply_on_device(dev, tensix_tile(3, 4), 3.0, 2.0);
         assert_eq!(
-            result, EXPECTED,
+            result,
+            EXPECTED,
             "expected 6.0 ({EXPECTED:#010x}), got {result:#010x} ({})",
             f32::from_bits(result)
         );
@@ -121,7 +127,11 @@ fn it_works_on_more_than_one_tile() {
     in_device(|dev| {
         for (x, y) in [(1u8, 2u8), (16, 11), (7, 5)] {
             let tile = tensix_tile(x, y);
-            assert_eq!(multiply_on_device(dev, tile, 3.0, 2.0), EXPECTED, "tile ({x},{y})");
+            assert_eq!(
+                multiply_on_device(dev, tile, 3.0, 2.0),
+                EXPECTED,
+                "tile ({x},{y})"
+            );
         }
     });
 }
@@ -157,7 +167,10 @@ fn it_computes_rather_than_returning_a_constant() {
             );
             seen.insert(got);
         }
-        assert!(seen.len() > 4, "the device returned suspiciously few distinct values");
+        assert!(
+            seen.len() > 4,
+            "the device returned suspiciously few distinct values"
+        );
     });
 }
 
@@ -177,14 +190,18 @@ fn a_held_backend_does_not_produce_the_answer() {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let tile = tensix_tile(2, 3);
 
-        dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits()).unwrap();
-        dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits()).unwrap();
+        dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits())
+            .unwrap();
+        dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits())
+            .unwrap();
         dev.write32(&w, tile, mailbox::RESULT, SENTINEL).unwrap();
 
         // Deliberately skip release_tensix_backend.
         dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
             .unwrap();
-        let outcome = dev.wait_for_status(&w, tile, BUDGET, |s| s == status::DONE).unwrap();
+        let outcome = dev
+            .wait_for_status(&w, tile, BUDGET, |s| s == status::DONE)
+            .unwrap();
 
         match outcome {
             Ok(_) => {
@@ -209,11 +226,15 @@ fn the_firmware_reaches_done_not_just_running() {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let tile = tensix_tile(4, 7);
         dev.release_tensix_backend(&w, tile).unwrap();
-        dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits()).unwrap();
-        dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits()).unwrap();
+        dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits())
+            .unwrap();
+        dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits())
+            .unwrap();
         dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
             .unwrap();
-        dev.wait_for_status(&w, tile, BUDGET, |s| s == status::DONE).unwrap().unwrap();
+        dev.wait_for_status(&w, tile, BUDGET, |s| s == status::DONE)
+            .unwrap()
+            .unwrap();
         assert_eq!(dev.read_status(&w, tile).unwrap(), status::DONE);
         assert_eq!(dev.read32(&w, tile, mailbox::RESULT).unwrap(), EXPECTED);
     });

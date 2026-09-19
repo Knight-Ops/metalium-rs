@@ -252,9 +252,8 @@ mod tests {
         }
         // SoftReset.md:110 names RISCV_SOFT_RESET_0_BRISC / _TRISCS / _NCRISC.
         assert_eq!(Core::B.soft_reset_mask(), 1 << 11);
-        let triscs = Core::T0.soft_reset_mask()
-            | Core::T1.soft_reset_mask()
-            | Core::T2.soft_reset_mask();
+        let triscs =
+            Core::T0.soft_reset_mask() | Core::T1.soft_reset_mask() | Core::T2.soft_reset_mask();
         assert_eq!(triscs, 0b111 << 12);
         assert_eq!(Core::NC.soft_reset_mask(), 1 << 18);
     }
@@ -275,7 +274,11 @@ mod tests {
         assert_eq!(Core::B.reset_pc_override(), None);
         assert_eq!(Core::B.default_reset_pc(), 0);
         for core in [Core::T0, Core::T1, Core::T2, Core::NC] {
-            assert!(core.reset_pc_register().is_some(), "{} should be overridable", core.name());
+            assert!(
+                core.reset_pc_register().is_some(),
+                "{} should be overridable",
+                core.name()
+            );
         }
     }
 
@@ -323,7 +326,11 @@ mod tests {
     fn manual_ttsync_registers_are_adjacent() {
         // Their placement relative to the hazard range is asserted at compile
         // time; this pins the layout `ManualTTSync.md` describes.
-        assert_eq!(COPROCESSOR_DONE_CHECK - PC_BUF_BASE, 4, "after one padding word");
+        assert_eq!(
+            COPROCESSOR_DONE_CHECK - PC_BUF_BASE,
+            4,
+            "after one padding word"
+        );
         assert_eq!(MOP_EXPANDER_DONE_CHECK - COPROCESSOR_DONE_CHECK, 4);
     }
 

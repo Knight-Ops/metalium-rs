@@ -41,11 +41,20 @@ fn heartbeat_climbs() {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let tile = tensix_tile(3, 4);
 
-        dev.load_and_start(&w, tile, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS)
-            .unwrap();
+        dev.load_and_start(
+            &w,
+            tile,
+            Core::T0,
+            firmware::HEARTBEAT,
+            firmware::LOAD_ADDRESS,
+        )
+        .unwrap();
 
         // First, the firmware must reach its prologue.
-        match dev.wait_for_status(&w, tile, STARTUP_BUDGET, |s| s == status::RUNNING).unwrap() {
+        match dev
+            .wait_for_status(&w, tile, STARTUP_BUDGET, |s| s == status::RUNNING)
+            .unwrap()
+        {
             Ok(_) => {}
             Err(WaitError::Panicked { code }) => panic!("firmware panicked, code {code}"),
             Err(e) => panic!("{e}"),
@@ -77,15 +86,21 @@ fn a_core_held_in_reset_does_nothing() {
         let tile = tensix_tile(5, 6);
 
         dev.set_core_reset(&w, tile, Core::T0, true).unwrap();
-        dev.write(&w, tile, firmware::LOAD_ADDRESS, firmware::HEARTBEAT).unwrap();
-        dev.set_reset_pc(&w, tile, Core::T0, firmware::LOAD_ADDRESS as u32).unwrap();
+        dev.write(&w, tile, firmware::LOAD_ADDRESS, firmware::HEARTBEAT)
+            .unwrap();
+        dev.set_reset_pc(&w, tile, Core::T0, firmware::LOAD_ADDRESS as u32)
+            .unwrap();
 
         // Clear the mailbox, then let a lot of time pass with the core still held.
         dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
         dev.write32(&w, tile, mailbox::HEARTBEAT, 0).unwrap();
         dev.tick(100_000);
 
-        assert_eq!(dev.read_status(&w, tile).unwrap(), 0, "a core in reset must not run");
+        assert_eq!(
+            dev.read_status(&w, tile).unwrap(),
+            0,
+            "a core in reset must not run"
+        );
         assert_eq!(dev.read32(&w, tile, mailbox::HEARTBEAT).unwrap(), 0);
 
         // And releasing it starts the same image.
@@ -141,8 +156,14 @@ fn pc_snapshot_lands_in_the_loaded_image() {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let tile = tensix_tile(7, 3);
 
-        dev.load_and_start(&w, tile, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS)
-            .unwrap();
+        dev.load_and_start(
+            &w,
+            tile,
+            Core::T0,
+            firmware::HEARTBEAT,
+            firmware::LOAD_ADDRESS,
+        )
+        .unwrap();
         dev.wait_for_status(&w, tile, STARTUP_BUDGET, |s| s == status::RUNNING)
             .unwrap()
             .unwrap();
@@ -169,14 +190,20 @@ fn two_tiles_run_independently() {
         let a = tensix_tile(2, 2);
         let b = tensix_tile(16, 11);
 
-        dev.load_and_start(&w, a, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS).unwrap();
-        dev.wait_for_status(&w, a, STARTUP_BUDGET, |s| s == status::RUNNING).unwrap().unwrap();
+        dev.load_and_start(&w, a, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS)
+            .unwrap();
+        dev.wait_for_status(&w, a, STARTUP_BUDGET, |s| s == status::RUNNING)
+            .unwrap()
+            .unwrap();
 
         // b has had no image loaded and is still in reset.
         assert_ne!(dev.read_status(&w, b).unwrap(), status::RUNNING);
 
-        dev.load_and_start(&w, b, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS).unwrap();
-        dev.wait_for_status(&w, b, STARTUP_BUDGET, |s| s == status::RUNNING).unwrap().unwrap();
+        dev.load_and_start(&w, b, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS)
+            .unwrap();
+        dev.wait_for_status(&w, b, STARTUP_BUDGET, |s| s == status::RUNNING)
+            .unwrap()
+            .unwrap();
 
         dev.tick(8192);
         assert!(dev.read32(&w, a, mailbox::HEARTBEAT).unwrap() > 0);

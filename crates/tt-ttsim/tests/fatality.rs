@@ -56,9 +56,7 @@ fn reading_an_undecoded_bar0_offset_is_fatal() {
         let mut buf = [0u8; 4];
         // 0x1A00_0000 is the reserved span between the TLB windows and the config
         // array -- a plausible-looking offset that is not decoded.
-        unsafe {
-            (lib.pci_mem_rd_bytes)(0x1_0000_0000 + 0x1A00_0000, buf.as_mut_ptr().cast(), 4)
-        };
+        unsafe { (lib.pci_mem_rd_bytes)(0x1_0000_0000 + 0x1A00_0000, buf.as_mut_ptr().cast(), 4) };
         std::hint::black_box(buf);
     });
 }
@@ -67,9 +65,7 @@ fn reading_an_undecoded_bar0_offset_is_fatal() {
 fn reading_a_write_only_tlb_config_register_is_fatal() {
     is_fatal("TLB config read-back", |lib| {
         let mut buf = [0u8; 4];
-        unsafe {
-            (lib.pci_mem_rd_bytes)(0x1_0000_0000 + 0x1FC0_0000, buf.as_mut_ptr().cast(), 4)
-        };
+        unsafe { (lib.pci_mem_rd_bytes)(0x1_0000_0000 + 0x1FC0_0000, buf.as_mut_ptr().cast(), 4) };
         std::hint::black_box(buf);
     });
 }

@@ -81,7 +81,12 @@ pub enum TransportError {
     /// The access would fall outside the BAR.
     OutOfBounds { bar: Bar, offset: u64, len: u64 },
     /// The access violates an alignment or size rule for this region.
-    Misaligned { bar: Bar, offset: u64, len: u64, reason: &'static str },
+    Misaligned {
+        bar: Bar,
+        offset: u64,
+        len: u64,
+        reason: &'static str,
+    },
     /// The device reported something other than a Blackhole.
     NotBlackhole { vendor: u16, device: u16 },
     /// An implementation-specific failure (an ioctl, a missing device node).
@@ -96,7 +101,12 @@ impl fmt::Display for TransportError {
                 "access of {len} bytes at {bar:?}+{offset:#x} falls outside the BAR ({:#x} bytes)",
                 bar.size()
             ),
-            TransportError::Misaligned { bar, offset, len, reason } => write!(
+            TransportError::Misaligned {
+                bar,
+                offset,
+                len,
+                reason,
+            } => write!(
                 f,
                 "access of {len} bytes at {bar:?}+{offset:#x} is not permitted: {reason}"
             ),

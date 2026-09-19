@@ -76,9 +76,16 @@ impl<T: Transport> Device<T> {
         // Window 201 belongs to the kernel driver and must never be handed out --
         // honoured on the simulator too, where there is no driver to collide with,
         // so that allocation behaviour is identical on silicon.
-        let free: Vec<u16> = (0..NUM_WINDOWS).filter(|&i| i != KERNEL_RESERVED_WINDOW).collect();
+        let free: Vec<u16> = (0..NUM_WINDOWS)
+            .filter(|&i| i != KERNEL_RESERVED_WINDOW)
+            .collect();
 
-        Ok(Device { transport, chip: ChipId(0), free, shadow: BTreeMap::new() })
+        Ok(Device {
+            transport,
+            chip: ChipId(0),
+            free,
+            shadow: BTreeMap::new(),
+        })
     }
 
     pub fn chip(&self) -> ChipId {
@@ -96,7 +103,10 @@ impl<T: Transport> Device<T> {
 
     /// Reserve a window of the requested geometry.
     pub fn alloc_window(&mut self, kind: WindowKind) -> Result<Window> {
-        let position = self.free.iter().position(|&i| tlb::window_kind(i) == Some(kind));
+        let position = self
+            .free
+            .iter()
+            .position(|&i| tlb::window_kind(i) == Some(kind));
         match position {
             Some(p) => {
                 let index = self.free.remove(p);
@@ -131,13 +141,18 @@ impl<T: Transport> Device<T> {
         base_address: u64,
     ) -> Result<()> {
         let config = TlbConfig::unicast(base_address, coord);
-        let words = config.encode(window.kind).map_err(|_| TransportError::Misaligned {
-            bar: window.kind.bar(),
-            offset: base_address,
-            len: window.kind.size(),
-            reason: "device address is not window-aligned",
-        })?;
-        let shadow = Shadow { words, readable: config.is_readable() };
+        let words = config
+            .encode(window.kind)
+            .map_err(|_| TransportError::Misaligned {
+                bar: window.kind.bar(),
+                offset: base_address,
+                len: window.kind.size(),
+                reason: "device address is not window-aligned",
+            })?;
+        let shadow = Shadow {
+            words,
+            readable: config.is_readable(),
+        };
 
         if self.shadow.get(&window.index) == Some(&shadow) {
             return Ok(());
@@ -158,9 +173,13 @@ impl<T: Transport> Device<T> {
         address: u64,
         data: &[u8],
     ) -> Result<()> {
-        self.transfer(window, coord, address, data.len(), |dev, bar, off, range| {
-            dev.transport.bar_write(bar, off, &data[range])
-        })
+        self.transfer(
+            window,
+            coord,
+            address,
+            data.len(),
+            |dev, bar, off, range| dev.transport.bar_write(bar, off, &data[range]),
+        )
     }
 
     /// Read from `address` in the tile at `coord` into `out`, through `window`.
@@ -230,11 +249,13 @@ impl<T: Transport> Device<T> {
                 offset_in_window,
                 len: here as usize,
             });
-            address = address.checked_add(here).ok_or(TransportError::OutOfBounds {
-                bar: window.kind.bar(),
-                offset: address,
-                len: remaining,
-            })?;
+            address = address
+                .checked_add(here)
+                .ok_or(TransportError::OutOfBounds {
+                    bar: window.kind.bar(),
+                    offset: address,
+                    len: remaining,
+                })?;
             remaining -= here;
         }
         Ok(chunks)
@@ -299,7 +320,9 @@ impl<T: Transport> Device<T> {
         let mut found = Vec::new();
         for y in ys.clone() {
             for x in xs.clone() {
-                let Some(coord) = NocCoord::<N>::new(x, y) else { continue };
+                let Some(coord) = NocCoord::<N>::new(x, y) else {
+                    continue;
+                };
                 if let Some(tile) = self.probe_tile(window, coord)? {
                     found.push(tile);
                 }
@@ -366,7 +389,10 @@ mod tests {
     impl Transport for FakeTransport {
         fn bar_read(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> Result<()> {
             self.reads.push((bar, offset, dst.len()));
-            assert!(!Self::is_config(bar, offset), "TLB config registers are write-only");
+            assert!(
+                !Self::is_config(bar, offset),
+                "TLB config registers are write-only"
+            );
             let (tile, addr) = self.translate(offset).expect("window is configured");
             for (i, b) in dst.iter_mut().enumerate() {
                 *b = self.mem.get(&(tile, addr + i as u64)).copied().unwrap_or(0);
@@ -453,12 +479,19 @@ mod tests {
         let index = w.index();
         d.free_window(w);
         let w2 = d.alloc_window(WindowKind::TwoMib).unwrap();
-        assert_eq!(w2.index(), index, "lowest free window should come back first");
+        assert_eq!(
+            w2.index(),
+            index,
+            "lowest free window should come back first"
+        );
 
         // The new holder must not inherit the old shadow, or it would skip the
         // reconfiguration it needs.
         d.write(&w2, c(1, 2), 0, &[0xAA; 4]).unwrap();
-        assert!(config_write_count(&d) > before, "reconfiguration must be repeated");
+        assert!(
+            config_write_count(&d) > before,
+            "reconfiguration must be repeated"
+        );
     }
 
     #[test]
@@ -470,7 +503,11 @@ mod tests {
         // Start four bytes before a window boundary, run eight bytes past it.
         d.write(&w, c(1, 2), size - 4, &[0x5A; 8]).unwrap();
         let writes = data_writes(&d);
-        assert_eq!(writes.len(), 2, "should have split into two accesses: {writes:?}");
+        assert_eq!(
+            writes.len(),
+            2,
+            "should have split into two accesses: {writes:?}"
+        );
         assert_eq!(writes[0].2, 4, "first piece runs to the window boundary");
         assert_eq!(writes[1].2, 4, "second piece starts the next window");
         // The second piece lands at the start of the window aperture, because the
@@ -528,7 +565,10 @@ mod tests {
         d.write(&a, c(2, 3), 0x4000, &payload).unwrap();
         let mut back = vec![0u8; payload.len()];
         d.read(&b, c(2, 3), 0x4000, &mut back).unwrap();
-        assert_eq!(back, payload, "a second window must see the first window's writes");
+        assert_eq!(
+            back, payload,
+            "a second window must see the first window's writes"
+        );
     }
 
     #[test]

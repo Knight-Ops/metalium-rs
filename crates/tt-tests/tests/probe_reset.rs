@@ -15,11 +15,21 @@ fn dump_soft_reset() {
         let v = dev.read_soft_reset(&w, tile).unwrap();
         println!("SOFT_RESET_0 = {v:#034b} ({v:#010x})");
         for core in Core::ALL {
-            println!("  {:>2}: bit {:2} = {}", core.name(), core.soft_reset_bit(),
-                     (v >> core.soft_reset_bit()) & 1);
+            println!(
+                "  {:>2}: bit {:2} = {}",
+                core.name(),
+                core.soft_reset_bit(),
+                (v >> core.soft_reset_bit()) & 1
+            );
         }
-        println!("  BACKEND_RESET_MASK = {:#010x}", tensix::BACKEND_RESET_MASK);
-        println!("  backend bits set    = {:#010x}", v & tensix::BACKEND_RESET_MASK);
+        println!(
+            "  BACKEND_RESET_MASK = {:#010x}",
+            tensix::BACKEND_RESET_MASK
+        );
+        println!(
+            "  backend bits set    = {:#010x}",
+            v & tensix::BACKEND_RESET_MASK
+        );
     })
     .unwrap();
 }

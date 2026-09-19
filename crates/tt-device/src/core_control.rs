@@ -16,7 +16,10 @@ use crate::{Device, Result, Transport, TransportError};
 #[derive(Debug)]
 pub enum WaitError {
     /// The budget expired.
-    TimedOut { waited_cycles: u64, last_status: u32 },
+    TimedOut {
+        waited_cycles: u64,
+        last_status: u32,
+    },
     /// The firmware published [`status::PANICKED`].
     Panicked { code: u32 },
 }
@@ -24,15 +27,23 @@ pub enum WaitError {
 impl std::fmt::Display for WaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WaitError::TimedOut { waited_cycles, last_status } => {
+            WaitError::TimedOut {
+                waited_cycles,
+                last_status,
+            } => {
                 let hint = match *last_status {
-                    0 => " (the mailbox is still zero: the core may never have started, or is \
-                          running code that does not reach its prologue)",
+                    0 => {
+                        " (the mailbox is still zero: the core may never have started, or is \
+                          running code that does not reach its prologue)"
+                    }
                     s if s == status::RUNNING => " (the core started but has not finished)",
                     _ => "",
                 };
-                write!(f, "core did not respond within {waited_cycles} cycles; \
-                           last status {last_status:#010x}{hint}")
+                write!(
+                    f,
+                    "core did not respond within {waited_cycles} cycles; \
+                           last status {last_status:#010x}{hint}"
+                )
             }
             WaitError::Panicked { code } => {
                 write!(f, "firmware panicked with code {code}")
@@ -52,11 +63,7 @@ pub const CYCLES_PER_POLL: u32 = 512;
 
 impl<T: Transport> Device<T> {
     /// Read the tile-wide soft-reset register.
-    pub fn read_soft_reset<N: NocId>(
-        &mut self,
-        window: &Window,
-        tile: NocCoord<N>,
-    ) -> Result<u32> {
+    pub fn read_soft_reset<N: NocId>(&mut self, window: &Window, tile: NocCoord<N>) -> Result<u32> {
         self.read32(window, tile, tensix::SOFT_RESET_0)
     }
 
@@ -228,7 +235,10 @@ impl<T: Transport> Device<T> {
                 return Ok(Err(WaitError::Panicked { code }));
             }
             if waited >= budget_cycles {
-                return Ok(Err(WaitError::TimedOut { waited_cycles: waited, last_status: value }));
+                return Ok(Err(WaitError::TimedOut {
+                    waited_cycles: waited,
+                    last_status: value,
+                }));
             }
             self.tick(CYCLES_PER_POLL);
             waited += CYCLES_PER_POLL as u64;

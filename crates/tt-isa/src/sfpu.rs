@@ -87,7 +87,11 @@ impl Instruction {
 /// Place `value` into `count` bits starting at `first_bit`.
 const fn field(first_bit: u32, count: u32, value: u32) -> u32 {
     debug_assert!(first_bit + count <= 32);
-    let mask = if count == 32 { u32::MAX } else { (1u32 << count) - 1 };
+    let mask = if count == 32 {
+        u32::MAX
+    } else {
+        (1u32 << count) - 1
+    };
     debug_assert!(value <= mask);
     (value & mask) << first_bit
 }
@@ -152,7 +156,11 @@ pub enum EncodeError {
     /// A register index outside 0..=15.
     BadRegister { index: u32 },
     /// A field value too large for its bit width.
-    FieldTooLarge { name: &'static str, value: u32, bits: u32 },
+    FieldTooLarge {
+        name: &'static str,
+        value: u32,
+        bits: u32,
+    },
     /// `SFPMUL` used with `VC != 9`.
     MulWithoutZero { vc: u32 },
 }
@@ -194,10 +202,18 @@ pub const fn loadi(vd: u32, mode: u32, imm16: u32) -> Result<Instruction, Encode
         return Err(EncodeError::UnwritableDestination { vd });
     }
     if imm16 > 0xFFFF {
-        return Err(EncodeError::FieldTooLarge { name: "Imm16", value: imm16, bits: 16 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "Imm16",
+            value: imm16,
+            bits: 16,
+        });
     }
     if mode > 0xF {
-        return Err(EncodeError::FieldTooLarge { name: "Mod0", value: mode, bits: 4 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "Mod0",
+            value: mode,
+            bits: 4,
+        });
     }
     Ok(Instruction {
         word: field(0, 16, imm16) | field(16, 4, mode) | field(20, 4, vd) | field(24, 8, 0x71),
@@ -227,7 +243,13 @@ pub const fn mul(va: u32, vb: u32, vd: u32) -> Result<Instruction, EncodeError> 
 }
 
 /// `SFPMAD`: lanewise FP32 `LReg[vd] = ±(LReg[va] * LReg[vb]) ± LReg[vc]`.
-pub const fn mad(va: u32, vb: u32, vc: u32, vd: u32, mod1: u32) -> Result<Instruction, EncodeError> {
+pub const fn mad(
+    va: u32,
+    vb: u32,
+    vc: u32,
+    vd: u32,
+    mod1: u32,
+) -> Result<Instruction, EncodeError> {
     if let Err(e) = check_reg(va) {
         return Err(e);
     }
@@ -241,7 +263,11 @@ pub const fn mad(va: u32, vb: u32, vc: u32, vd: u32, mod1: u32) -> Result<Instru
         return Err(EncodeError::UnwritableDestination { vd });
     }
     if mod1 > 0xF {
-        return Err(EncodeError::FieldTooLarge { name: "Mod1", value: mod1, bits: 4 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "Mod1",
+            value: mod1,
+            bits: 4,
+        });
     }
     // Opcode 0x84 is SFPMAD; 0x86 is SFPMUL, which `SFPMUL.md` calls the preferred
     // spelling when VC is the constant-zero register. They are documented as the
@@ -250,7 +276,11 @@ pub const fn mad(va: u32, vb: u32, vc: u32, vd: u32, mod1: u32) -> Result<Instru
     // while its 0x84 handler accepts `Mod1 <= 3`. Since the recommended
     // negative-zero form needs NEGATE_VC, a modified multiply has to be spelled
     // SFPMAD to run on the simulator at all.
-    let opcode = if vc == LREG_ZERO && mod1 == 0 { 0x86 } else { 0x84 };
+    let opcode = if vc == LREG_ZERO && mod1 == 0 {
+        0x86
+    } else {
+        0x84
+    };
     Ok(Instruction {
         word: field(0, 4, mod1)
             | field(4, 4, vd)
@@ -264,7 +294,10 @@ pub const fn mad(va: u32, vb: u32, vc: u32, vd: u32, mod1: u32) -> Result<Instru
 
 /// `SFPNOP`: occupy a Vector Unit sub-unit for one cycle.
 pub const fn nop() -> Instruction {
-    Instruction { word: field(24, 8, 0x8F), kind: Kind::Nop }
+    Instruction {
+        word: field(24, 8, 0x8F),
+        kind: Kind::Nop,
+    }
 }
 
 /// `SFPSTORE`: move 32 datums from `LReg[vd]` into four consecutive rows of `Dst`.
@@ -281,14 +314,26 @@ pub const fn store(
         return Err(e);
     }
     if imm10 > 0x3FF {
-        return Err(EncodeError::FieldTooLarge { name: "Imm10", value: imm10, bits: 10 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "Imm10",
+            value: imm10,
+            bits: 10,
+        });
     }
     // Three bits on Blackhole, two on Wormhole.
     if addr_mod > 0x7 {
-        return Err(EncodeError::FieldTooLarge { name: "AddrMod", value: addr_mod, bits: 3 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "AddrMod",
+            value: addr_mod,
+            bits: 3,
+        });
     }
     if format > 0xF {
-        return Err(EncodeError::FieldTooLarge { name: "Mod0", value: format, bits: 4 });
+        return Err(EncodeError::FieldTooLarge {
+            name: "Mod0",
+            value: format,
+            bits: 4,
+        });
     }
     Ok(Instruction {
         word: field(0, 10, imm10)
@@ -352,10 +397,17 @@ mod tests {
     #[test]
     fn opcodes_match_bits32_lua() {
         assert_eq!(loadi(0, loadi_mode::UPPER, 0).unwrap().word() >> 24, 0x71);
-        assert_eq!(mad(0, 1, LREG_ZERO, 2, 0).unwrap().word() >> 24, 0x86, "SFPMUL");
+        assert_eq!(
+            mad(0, 1, LREG_ZERO, 2, 0).unwrap().word() >> 24,
+            0x86,
+            "SFPMUL"
+        );
         assert_eq!(mad(0, 1, 2, 3, 0).unwrap().word() >> 24, 0x84, "SFPMAD");
         assert_eq!(nop().word() >> 24, 0x8F);
-        assert_eq!(store(0, store_format::FP32, 0, 0).unwrap().word() >> 24, 0x72);
+        assert_eq!(
+            store(0, store_format::FP32, 0, 0).unwrap().word() >> 24,
+            0x72
+        );
     }
 
     #[test]
@@ -382,7 +434,11 @@ mod tests {
     fn store_uses_the_blackhole_addrmod_position() {
         let i = store(2, store_format::FP32, 0b101, 0x3FF).unwrap().word();
         assert_eq!(i & 0x3FF, 0x3FF, "Imm10 at 0");
-        assert_eq!((i >> 13) & 0x7, 0b101, "AddrMod occupies bits 13..=15 on Blackhole");
+        assert_eq!(
+            (i >> 13) & 0x7,
+            0b101,
+            "AddrMod occupies bits 13..=15 on Blackhole"
+        );
         assert_eq!((i >> 16) & 0xF, store_format::FP32, "Mod0 at 16");
         assert_eq!((i >> 20) & 0xF, 2, "VD at 20");
 
@@ -395,7 +451,11 @@ mod tests {
     #[test]
     fn mul_pins_vc_to_the_zero_register_and_negates_it() {
         let m = mul(0, 1, 2).unwrap();
-        assert_eq!((m.word() >> 8) & 0xF, LREG_ZERO, "VC is the constant-zero register");
+        assert_eq!(
+            (m.word() >> 8) & 0xF,
+            LREG_ZERO,
+            "VC is the constant-zero register"
+        );
         assert_eq!(
             m.word() & 0xF,
             mad_mod1::NEGATE_VC,
@@ -420,7 +480,11 @@ mod tests {
                 "Mod1 = {mod1} must use the SFPMAD spelling"
             );
         }
-        assert_eq!(mad(0, 1, 3, 2, 0).unwrap().word() >> 24, 0x84, "other VC is SFPMAD");
+        assert_eq!(
+            mad(0, 1, 3, 2, 0).unwrap().word() >> 24,
+            0x84,
+            "other VC is SFPMAD"
+        );
     }
 
     #[test]
@@ -454,7 +518,10 @@ mod tests {
         ));
         assert!(matches!(
             store(0, store_format::FP32, 8, 0),
-            Err(EncodeError::FieldTooLarge { name: "AddrMod", .. })
+            Err(EncodeError::FieldTooLarge {
+                name: "AddrMod",
+                ..
+            })
         ));
     }
 
@@ -478,7 +545,11 @@ mod tests {
         let i = loadi(0, loadi_mode::UPPER, 0x4040).unwrap();
         let t = i.ttinsn_word().unwrap();
         assert_eq!(t, i.word().rotate_left(2));
-        assert_ne!(t & 3, 3, "would collide with the uncompressed encoding space");
+        assert_ne!(
+            t & 3,
+            3,
+            "would collide with the uncompressed encoding space"
+        );
         assert_eq!(t.rotate_right(2), i.word(), "the core rotates it back");
     }
 
@@ -494,7 +565,11 @@ mod tests {
             store(15, 15, 7, 0x3FF).unwrap(),
         ];
         for i in all {
-            assert!(i.ttinsn_word().is_some(), "{:#010x} has no .ttinsn form", i.word());
+            assert!(
+                i.ttinsn_word().is_some(),
+                "{:#010x} has no .ttinsn form",
+                i.word()
+            );
         }
     }
 

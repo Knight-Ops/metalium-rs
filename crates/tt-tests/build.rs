@@ -41,7 +41,9 @@ fn main() {
             cmd.env_remove(key);
         }
     }
-    let status = cmd.status().expect("could not run cargo for the firmware build");
+    let status = cmd
+        .status()
+        .expect("could not run cargo for the firmware build");
     assert!(status.success(), "firmware build failed");
 
     let objcopy = tool("llvm-objcopy");
@@ -49,7 +51,11 @@ fn main() {
 
     for name in BINARIES {
         let elf = target_dir.join(TARGET).join("release").join(name);
-        assert!(elf.exists(), "firmware binary {name} was not produced at {}", elf.display());
+        assert!(
+            elf.exists(),
+            "firmware binary {name} was not produced at {}",
+            elf.display()
+        );
 
         let bin = out_dir.join(format!("{name}.bin"));
         let status = Command::new(&objcopy)
@@ -62,14 +68,20 @@ fn main() {
 
         check_instruction_set(&objdump, &elf, name);
 
-        println!("cargo:rustc-env=FIRMWARE_{}={}", name.to_uppercase(), bin.display());
+        println!(
+            "cargo:rustc-env=FIRMWARE_{}={}",
+            name.to_uppercase(),
+            bin.display()
+        );
     }
 }
 
 /// Emit `rerun-if-changed` for every source file under `dir`, skipping build
 /// output.
 fn track_sources(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -93,7 +105,11 @@ fn tool(name: &str) -> PathBuf {
         .expect("could not ask rustc for its sysroot");
     let sysroot = String::from_utf8(sysroot.stdout).unwrap();
     let host = std::env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".into());
-    let path = Path::new(sysroot.trim()).join("lib/rustlib").join(host).join("bin").join(name);
+    let path = Path::new(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(name);
     assert!(
         path.exists(),
         "{name} not found at {}. Install it with `rustup component add llvm-tools`.",
@@ -121,11 +137,15 @@ fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
     for line in text.lines() {
         // Instruction lines are "<hex address>:<whitespace><mnemonic><whitespace><operands>".
         // Label lines ("00006000 <_start>:") end in ':' and have no mnemonic after it.
-        let Some((addr, rest)) = line.split_once(':') else { continue };
+        let Some((addr, rest)) = line.split_once(':') else {
+            continue;
+        };
         if addr.trim().is_empty() || !addr.trim().chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
-        let Some(mnemonic) = rest.split_whitespace().next() else { continue };
+        let Some(mnemonic) = rest.split_whitespace().next() else {
+            continue;
+        };
         checked += 1;
         let operands = rest.trim().strip_prefix(mnemonic).unwrap_or("").trim();
         if let Some(why) = forbidden_reason(mnemonic).or_else(|| fence_reason(mnemonic, operands)) {

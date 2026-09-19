@@ -56,7 +56,10 @@ fn pattern_round_trips_through_two_windows() {
 
         let mut back = vec![0u8; data.len()];
         dev.read(&read_window, tile, 0x2_0000, &mut back).unwrap();
-        assert_eq!(back, data, "a second window must observe the first window's writes");
+        assert_eq!(
+            back, data,
+            "a second window must observe the first window's writes"
+        );
     });
 }
 
@@ -122,7 +125,8 @@ fn every_tensix_tile_is_addressable() {
         assert_eq!(tiles.len(), grid::TENSIX_TILE_COUNT);
 
         for (i, tile) in tiles.iter().enumerate() {
-            dev.write32(&w, *tile, 0x3000, 0x1000_0000 + i as u32).unwrap();
+            dev.write32(&w, *tile, 0x3000, 0x1000_0000 + i as u32)
+                .unwrap();
         }
         for (i, tile) in tiles.iter().enumerate() {
             let got = dev.read32(&w, *tile, 0x3000).unwrap();
@@ -178,6 +182,8 @@ fn window_exhaustion_is_an_error_not_a_panic() {
         }
         // 202 windows exist, one of which is reserved for the kernel driver.
         assert_eq!(held.len(), 201);
-        assert!(held.iter().all(|w| w.index() != tt_device::tlb::KERNEL_RESERVED_WINDOW));
+        assert!(held
+            .iter()
+            .all(|w| w.index() != tt_device::tlb::KERNEL_RESERVED_WINDOW));
     });
 }
