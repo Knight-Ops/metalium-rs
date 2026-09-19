@@ -46,7 +46,7 @@ Set up early; retrofitting is expensive.
       silicon-discovery work the docs may have obviated.
 - [x] **One newtype per coordinate space** — `NocCoord<Noc0>`, `NocCoord<Noc1>`,
       `Translated`, plus `ChipId` from day one.
-- [x] **Divergence log** — `docs/ttsim-divergence.md`, seeded with 18 entries.
+- [x] **Divergence log** — `docs/ttsim-divergence.md`, 21 entries and counting.
 - [x] **Silicon-only suite exists** — `--features silicon`, compiled always so it
       cannot rot.
 - [x] **Version control**, so the pinning discipline above is enforceable.
