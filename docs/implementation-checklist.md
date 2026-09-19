@@ -25,7 +25,7 @@ gate you have not seen reject something is not yet evidence.
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
 | 1 — Host addresses the chip | `[~]` | TLB/L1 done against the simulator; `tt-kmd` not started |
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
-| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip and `tt-isa-gen` done; corpus and tracing open |
+| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
 | 4 — Layout | `[ ]` | |
 | 5 — Elementwise binary | `[ ]` | |
 | 6 — Matmul | `[ ]` | The schedule risk |
@@ -40,7 +40,10 @@ gate you have not seen reject something is not yet evidence.
 Set up early; retrofitting is expensive.
 
 - [x] **Pin upstream revisions** — `PINS.toml` records the spec commit, the ttsim
-      release, and the tt-metal commit for `cfg_defines.h`.
+      release, and the tt-metal commit for `cfg_defines.h`. All three are now
+      hash-verified: the specification by a digest over the *contents* of the files
+      the generators read, since GitHub does not promise source tarballs are
+      byte-stable.
 - [ ] **Re-sync the spec quarterly.** Recent upstream commits fill in exactly the
       Blackhole `UNPACR`/`PACR` gaps Phase 6 depends on. Check before doing
       silicon-discovery work the docs may have obviated.
@@ -55,6 +58,10 @@ Set up early; retrofitting is expensive.
 - [x] **CI: `cargo xtask check-no-sim-in-ship`** wired in.
 - [x] **CI: `cargo xtask gen-cfg --check`**, so the committed configuration table
       cannot drift from the pinned header.
+- [x] **CI: `cargo xtask gen-isa --check`**, likewise for the instruction table —
+      and it re-runs the cross-check between the specification's two descriptions
+      of the instruction set, so an exception edited without looking at what it
+      explains fails there.
 - [x] **Pre-commit hooks** (`prek.toml`) running fmt, clippy for both workspaces,
       and the generated-table check — the same things CI runs, so a push does not
       fail on something a commit could have caught.
@@ -73,6 +80,10 @@ no answer.
 - [x] RISCV B has no reset-PC override — `set_reset_pc` refuses it.
 - [x] `LReg[8..]` unwritable by `SFPLOADI`/`SFPMAD` — refused rather than silently dropped.
 - [x] `SFPMUL` requires `VC == 9` — `VC` is implicit, not a parameter.
+- [x] **Wormhole's `SFPSTORE` cannot be reached by the Blackhole name.** The two
+      encodings differ in where `AddrMod` sits (13..15 against 14..15) and are now
+      separate table entries; the superseded one lives under
+      `isa::generated::defs::wormhole`, so using it has to be deliberate.
 - [ ] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
       Currently only documented. Make the buffer address a type parameterised by
       core role so the bad combination does not compile. *(Phase 3 leftover.)*
@@ -205,17 +216,32 @@ no answer.
 - [x] **Set `Dst` access format deliberately** rather than inheriting the reset
       default, which is the first real use of the generated table — and a test
       proves changing it changes the readback, so the path is not inert.
-- [ ] **Broad instruction corpus, asserted bit-exact.** Currently five
-      instructions. `Bits32.lua` is machine-readable and yields field layouts for
-      the whole ISA, so a generator is likely less work than hand-writing more.
+- [x] **Broad instruction corpus, encoded bit-exact.** `cargo xtask gen-isa`
+      parses `Diagrams/Src/Bits32.lua` into 148 instruction encodings and 19 datum
+      layouts, each cross-checked against the hand-written `TT_*(…)` syntax block
+      on the page that embeds its diagram. The two sources agree on names, widths,
+      signedness **and slot bit positions** across 167 pairs, with ten documented
+      exceptions. Provenance is derived from which tree embeds the diagram: 39
+      Blackhole, 24 shared, 11 superseded, 74 Wormhole-only and marked
+      `UNVERIFIED`.
+- [~] **Broad instruction corpus, *executed* against ttsim.** Split from the
+      above deliberately: encoding is host-side and covers everything, executing
+      needs surrounding state most instructions do not have yet. The generic
+      `corpus` firmware runs a host-staged program and dumps `Dst`, so adding a
+      case is host-side data. Eight gates so far, covering `SFPLOADI` modes,
+      `SFPMAD`, `SFPMOV`, `SFPABS`, `SFPSTORE` lane placement, and the numerics
+      entries C, D and E of the divergence log. `UNPACR`/`MVMUL`/`PACR` execution
+      waits for Phases 5–6; their encoders exist now.
 - [ ] **Stand up tracing.** `DebugTimestamper` gives a tile-wide 64-bit counter at
       `0xFFB1_21F0` plus a hardware event-trace primitive: one store to
       `RISCV_DEBUG_REG_TIMESTAMP` appends `{29-bit token, 64-bit counter}` to an L1
       ring buffer. Strictly better than per-core `mcycle` for correlating events
       across the five babies, and it pays for itself from Phase 5 onward. Use the
       documented retry loop for concurrent readers.
-- [ ] **Seed the silicon-only suite with `SFPLOADMACRO`.** The suite exists but
-      holds the `pc`-snapshot and held-backend tests, not this.
+- [~] **`SFPLOADMACRO`.** The simulator's refusal is now *watched* rather than
+      quoted: `step5_corpus.rs` pushes one, asserts the child dies, and runs a
+      control program of the same shape that survives. A silicon-side test of what
+      it actually does is still open.
 - [ ] **Probe whether ttsim models the documented hardware bugs** (open question 7)
       or the intended behaviour. Either answer is workable but changes what the
       simulator gate proves.
@@ -425,8 +451,12 @@ Documented, not speculative. These bite in Phases 2–4.
 
 ### Tier 2 — once the Tensix units are driven
 
-- [ ] `SFPMAD` — automatic stalling misses a handful of cases; see
-      `Instruction::stalls_automatically_after_mad` for where to record them.
+- [x] `SFPMAD` — automatic stalling misses seven documented cases, and
+      `Instruction::stalls_automatically_after_mad` now decides all of them rather
+      than returning `true` for everything. Four depend on the consuming
+      instruction's `Mod1`, which it can read because an `Instruction` carries its
+      definition. Untested against silicon, and ttsim models no timing, so the
+      answers are from the documentation.
 - [ ] `SFPLUTFP32` writes to `LReg[LReg[7] & 15]` instead of `LReg[VD]`.
 - [ ] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack.
 - [ ] `SFPSTOCHRND` — stochastic rounding is biased toward increasing magnitude,

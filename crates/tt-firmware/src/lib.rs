@@ -198,6 +198,21 @@ pub mod tensix {
         }
     }
 
+    /// Push a raw instruction word.
+    ///
+    /// The corpus firmware needs this: its program arrives as words in L1, encoded
+    /// by the host, so there is no [`Instruction`] to push. Everything the word
+    /// means was decided on the host side, where the generated table is.
+    ///
+    /// # Safety
+    ///
+    /// As [`push`], and additionally the word must be a valid encoding — nothing
+    /// here checks it.
+    #[inline]
+    pub unsafe fn push_word(word: u32) {
+        unsafe { core::ptr::write_volatile(tensix::INSTRN_BUF_BASE as *mut u32, word) }
+    }
+
     /// Block until the Tensix coprocessor has retired every instruction this
     /// thread pushed.
     ///
