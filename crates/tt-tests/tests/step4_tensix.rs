@@ -49,8 +49,21 @@ const EXPECTED: u32 = 0x40C0_0000;
 /// hardware one. See `docs/ttsim-divergence.md`.
 const CORE: Core = Core::T1;
 
+/// The Tensix thread [`CORE`] drives. `mhartid` reads zero on every core, so the
+/// firmware cannot work this out for itself.
+const CORE_THREAD: u32 = 1;
+
+/// `RISC_DEST_ACCESS_CTRL_SEC*.fmt` values. ttsim implements 0, 2 and 3.
+const DST_FMT_FP32: u32 = 0;
+const DST_FMT_BF16: u32 = 3;
+
 /// Multiply `a` by `b` on `tile`'s Vector Unit and return the FP32 bit pattern.
 fn multiply_on_device(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, a: f32, b: f32) -> u32 {
+    multiply_with_fmt(dev, tile, a, b, DST_FMT_FP32)
+}
+
+/// As [`multiply_on_device`], but with a chosen `Dst` access format.
+fn multiply_with_fmt(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, a: f32, b: f32, fmt: u32) -> u32 {
     let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
 
     // The backend has to come out of reset before the coprocessor will execute
@@ -65,6 +78,9 @@ fn multiply_on_device(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, a: f32, b: f32) -
         .unwrap();
     dev.write32(&w, tile, mailbox::RESULT, SENTINEL).unwrap();
     dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
+    dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
+        .unwrap();
+    dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, fmt).unwrap();
 
     dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
         .unwrap();
@@ -170,6 +186,33 @@ fn it_computes_rather_than_returning_a_constant() {
         assert!(
             seen.len() > 4,
             "the device returned suspiciously few distinct values"
+        );
+    });
+}
+
+/// The configuration write is real, not decoration.
+///
+/// The firmware sets `RISC_DEST_ACCESS_CTRL_SEC1_fmt` from the generated field
+/// table before reading `Dst`. If that write did nothing, changing the requested
+/// format would change nothing either — so asking for BF16 and getting the same
+/// FP32 answer back would mean the whole `tt-isa` configuration path is inert.
+///
+/// The BF16 value is deliberately not asserted. `SFPSTORE` wrote a 32-bit datum
+/// and this reads it back through a 16-bit shape, and the overlay between
+/// `Dst32b` and `Dst16b` is not documented well enough to predict. That it
+/// *differs* is the whole claim.
+#[test]
+fn the_dst_format_configuration_write_takes_effect() {
+    in_device(|dev| {
+        let tile = tensix_tile(4, 4);
+        let as_fp32 = multiply_with_fmt(dev, tile, 3.0, 2.0, DST_FMT_FP32);
+        assert_eq!(as_fp32, EXPECTED);
+
+        let as_bf16 = multiply_with_fmt(dev, tile, 3.0, 2.0, DST_FMT_BF16);
+        assert_ne!(
+            as_bf16, as_fp32,
+            "changing RISC_DEST_ACCESS_CTRL_SEC1_fmt changed nothing, so the \
+             configuration write never reached the hardware"
         );
     });
 }

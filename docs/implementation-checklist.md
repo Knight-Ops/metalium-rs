@@ -25,7 +25,7 @@ gate you have not seen reject something is not yet evidence.
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
 | 1 — Host addresses the chip | `[~]` | TLB/L1 done against the simulator; `tt-kmd` not started |
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
-| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip works; `tt-isa-gen`, corpus and tracing open |
+| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip and `tt-isa-gen` done; corpus and tracing open |
 | 4 — Layout | `[ ]` | |
 | 5 — Elementwise binary | `[ ]` | |
 | 6 — Matmul | `[ ]` | The schedule risk |
@@ -49,11 +49,15 @@ Set up early; retrofitting is expensive.
 - [x] **Divergence log** — `docs/ttsim-divergence.md`, seeded with 18 entries.
 - [x] **Silicon-only suite exists** — `--features silicon`, compiled always so it
       cannot rot.
-- [ ] **Put the repo under version control.** Nothing here is in git yet, which
-      makes the pinning discipline above unenforceable in practice.
-- [ ] **CI: simulator suite on every commit.** Deterministic, so no flakes.
-- [ ] **CI: wire in `cargo xtask check-no-sim-in-ship`.** The check exists and
-      passes; nothing runs it automatically.
+- [x] **Version control**, so the pinning discipline above is enforceable.
+- [x] **CI: simulator suite on every commit.** Deterministic, so no flakes.
+      Also fmt, clippy under `-D warnings`, and a type-check of the silicon suite.
+- [x] **CI: `cargo xtask check-no-sim-in-ship`** wired in.
+- [x] **CI: `cargo xtask gen-cfg --check`**, so the committed configuration table
+      cannot drift from the pinned header.
+- [x] **Pre-commit hooks** (`prek.toml`) running fmt, clippy for both workspaces,
+      and the generated-table check — the same things CI runs, so a push does not
+      fail on something a commit could have caught.
 - [ ] **CI: silicon suite nightly, and as a merge gate to main.**
 - [ ] **`burn-ndarray` as the second differential oracle.** ttsim is the ISA-level
       oracle; this is the tensor-level one. Needed from Phase 5.
@@ -189,10 +193,13 @@ no answer.
 - [x] `Dst` read path, including the swizzle transform.
 - [x] **Gate (sim):** the SFPU returns `0x40C0_0000`; seven host-supplied operand
       pairs match the host's own FP32 multiply bit-for-bit.
-- [ ] **`tt-isa-gen`** — parse tt-metal's `cfg_defines.h` into Rust consts.
-      **Generate, never transcribe:** there are thousands of fields. The baseline
-      hand-writes the few it needs; those must not outlive it. The file is *not*
-      vendored in the docs repo — fetch it at the commit `PINS.toml` records.
+- [x] **`tt-isa-gen`** — `cargo xtask gen-cfg` parses `cfg_defines.h` into 820
+      typed constants across seven sections. `Config` and `ThreadConfig` are
+      distinct types, so the write-instruction convention cannot be got wrong.
+      The generated table is committed and checked against the pinned header.
+- [x] **Set `Dst` access format deliberately** rather than inheriting the reset
+      default, which is the first real use of the generated table — and a test
+      proves changing it changes the readback, so the path is not inert.
 - [ ] **Broad instruction corpus, asserted bit-exact.** Currently five
       instructions. `Bits32.lua` is machine-readable and yields field layouts for
       the whole ISA, so a generator is likely less work than hand-writing more.

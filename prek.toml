@@ -1,0 +1,33 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "check-added-large-files" },
+]
+
+# Rust checks, matching what CI runs so a push never fails on something a commit
+# could have caught. All three use `pass_filenames = false`: cargo works on
+# crates, not on the file list a hook is handed, and passing paths it does not
+# understand would make it ignore them or fail.
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "cargo-fmt", name = "cargo fmt", entry = "cargo fmt --all --check", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "cargo-clippy", name = "cargo clippy", entry = "cargo clippy --workspace --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+
+    # The firmware is a separate workspace targeting riscv32im, so the host
+    # workspace's clippy never sees it. `--bins --lib` rather than
+    # `--all-targets`: there are no test targets, and asking for them fails
+    # looking for a `test` crate that does not exist for a no_std target.
+    { id = "cargo-clippy-firmware", name = "cargo clippy (firmware)", entry = "cargo clippy --manifest-path crates/tt-firmware/Cargo.toml --target riscv32im-unknown-none-elf --bins --lib -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+
+    # The backend-configuration table is generated from a pinned header. This
+    # catches a hand-edit to the generated file, which would otherwise survive
+    # until CI.
+    { id = "cargo-xtask-gen-cfg", name = "generated config table is current", entry = "cargo xtask gen-cfg --check", language = "system", files = "^(crates/tt-isa/src/cfg/|xtask/src/|PINS\\.toml)", pass_filenames = false },
+]

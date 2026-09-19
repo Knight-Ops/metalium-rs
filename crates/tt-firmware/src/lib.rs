@@ -257,3 +257,90 @@ pub mod tensix {
         unsafe { core::ptr::read_volatile(address as *const u32) }
     }
 }
+
+/// Reading and writing Tensix backend configuration from a baby RISC-V core.
+pub mod cfg {
+    use tt_isa::cfg::{ConfigBank, ConfigField, ThreadConfigField};
+
+    /// Read the word containing `field`.
+    ///
+    /// # Safety
+    ///
+    /// The Tensix backend must be out of soft reset.
+    #[inline]
+    pub unsafe fn read_config_word(field: ConfigField, bank: ConfigBank) -> u32 {
+        unsafe { core::ptr::read_volatile(field.riscv_address(bank) as *const u32) }
+    }
+
+    /// Set `field` to `value`, leaving the rest of its word alone.
+    ///
+    /// # Why this is a read-modify-write, and what that costs
+    ///
+    /// RISC-V can write `Config` **only with `sw`** — a whole 32-bit store — so a
+    /// bitfield narrower than a word has to be merged in by hand. There is no
+    /// atomic form, and the Configuration Unit enforces ordering across all three
+    /// Tensix threads regardless of which issued a request, so heavy use from one
+    /// thread starves the others. Neither matters for one-time setup before a
+    /// kernel runs; both would matter in a loop.
+    ///
+    /// `WRCFG` and `RMWCIB` are the Tensix-side alternatives, and `RMWCIB` does
+    /// the merge in hardware. They belong in a kernel's instruction stream rather
+    /// than in a core's prologue, which is why this exists.
+    ///
+    /// # Safety
+    ///
+    /// The Tensix backend must be out of soft reset, and no Tensix instruction
+    /// that reads this field may be in flight.
+    #[inline]
+    pub unsafe fn write_config_field(field: ConfigField, bank: ConfigBank, value: u32) {
+        let address = field.riscv_address(bank) as *mut u32;
+        // SAFETY: the caller guarantees the backend is out of reset; the address
+        // comes from the generated field table.
+        unsafe {
+            let word = core::ptr::read_volatile(address);
+            core::ptr::write_volatile(address, field.insert(word, value));
+        }
+    }
+
+    /// Read a `ThreadConfig` field for `thread`.
+    ///
+    /// There is no writing counterpart: RISC-V cannot write `ThreadConfig` at all.
+    /// `SETC16` is the only way, and it is a Tensix instruction.
+    ///
+    /// # Safety
+    ///
+    /// `thread` must be 0, 1 or 2, and the backend must be out of soft reset.
+    #[inline]
+    pub unsafe fn read_thread_config(field: ThreadConfigField, thread: u32) -> u16 {
+        // The entry is 32 bits wide with the value in the low half; read the word
+        // and narrow, rather than issuing a 16-bit load against an MMIO region.
+        let word =
+            unsafe { core::ptr::read_volatile(field.riscv_read_address(thread) as *const u32) };
+        field.extract(word as u16)
+    }
+
+    /// Which `Config` bank the given Tensix thread is currently using.
+    ///
+    /// Selected by `ThreadConfig[thread].CFG_STATE_ID_StateID`. Reading it rather
+    /// than assuming bank 0 costs one load and means configuration written here
+    /// lands where the coprocessor will actually look for it.
+    ///
+    /// **Not usable against ttsim.** It maps the whole configuration aperture to a
+    /// flat `Config` array with the bank hardcoded to zero, and models no
+    /// `ThreadConfig` region, so this read is fatal there. Code that must run on
+    /// the simulator has to assume bank 0 and say why.
+    ///
+    /// # Safety
+    ///
+    /// As [`read_thread_config`].
+    #[inline]
+    pub unsafe fn active_bank(thread: u32) -> ConfigBank {
+        use tt_isa::cfg::generated::thread::CFG_STATE_ID_StateID;
+        // SAFETY: delegated to the caller.
+        if unsafe { read_thread_config(CFG_STATE_ID_StateID, thread) } == 0 {
+            ConfigBank::Bank0
+        } else {
+            ConfigBank::Bank1
+        }
+    }
+}

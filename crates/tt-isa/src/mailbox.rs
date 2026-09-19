@@ -25,6 +25,14 @@ pub const RESULT_HI: u64 = MAILBOX_BASE + 0x10;
 pub const OPERAND_A: u64 = MAILBOX_BASE + 0x14;
 /// Second operand.
 pub const OPERAND_B: u64 = MAILBOX_BASE + 0x18;
+/// Which Tensix thread the running core drives: 0 for T0, 1 for T1, 2 for T2.
+///
+/// Written by the host because the core cannot work it out: `mhartid` reads zero
+/// on every core and `misa` lies, so identity comes from outside or from the
+/// build, never from a CSR.
+pub const THREAD_INDEX: u64 = MAILBOX_BASE + 0x1C;
+/// Requested `RISC_DEST_ACCESS_CTRL_SEC*.fmt`, so a test can vary it.
+pub const DST_ACCESS_FMT: u64 = MAILBOX_BASE + 0x20;
 
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x40;
