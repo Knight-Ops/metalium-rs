@@ -105,6 +105,71 @@ impl Core {
         }
     }
 
+    /// Base of this core's local data RAM in the NoC-visible *slow access path*
+    /// (`BabyRISCV/README.md:109-116`).
+    ///
+    /// Each local data RAM appears twice. At `MEM_LOCAL_BASE` it is reachable
+    /// only by its own core, with two-cycle loads and no contention. Here it is
+    /// reachable from any core **and over the NoC**, at eight cycles or worse —
+    /// new in Blackhole, and explicitly intended so that "the host [can] more
+    /// easily initialize the local data RAM, and [debuggers can] more easily
+    /// inspect it" (`README.md:157`).
+    ///
+    /// For RISC-V memory ordering the two mappings are *separate memory
+    /// regions* (`README.md:154`), so a core must reach its own RAM through
+    /// `MEM_LOCAL_BASE` and use this address only for another core's.
+    pub const fn local_data_ram_noc_address(self) -> u64 {
+        // A uniform 0x2000 stride from LOCAL_DATA_RAM_NOC_BASE, in hardware core
+        // order -- the same order as `pc_snapshot`, and deliberately derived from
+        // the same index so the two cannot drift apart.
+        LOCAL_DATA_RAM_NOC_BASE + (self.hardware_index() as u64) * LOCAL_DATA_RAM_NOC_STRIDE
+    }
+
+    /// Address space the slow access path reserves for this core: always 8 KiB.
+    ///
+    /// Kept distinct from [`local_data_ram_size`](Self::local_data_ram_size)
+    /// because for T0/T1/T2 they differ: the memory map gives each T-core *two*
+    /// 4 KiB rows with the same label while the RAM is only 4 KiB, and the
+    /// specification does not say what the upper half is. Anything staging into
+    /// this aperture must bound itself by the size, not by the window.
+    pub const fn local_data_ram_noc_window(self) -> u64 {
+        LOCAL_DATA_RAM_NOC_STRIDE
+    }
+
+    /// Position of this core in the hardware ordering B, NC, T0, T1, T2.
+    ///
+    /// Private because it is not meaningful on its own — it exists so that the
+    /// `pc` snapshot block and the local-RAM aperture, which share this order,
+    /// are generated from one place. Note that neither the soft-reset bits nor
+    /// the `DISABLE_RESET` bits follow it.
+    const fn hardware_index(self) -> u32 {
+        match self {
+            Core::B => 0,
+            Core::NC => 1,
+            Core::T0 => 2,
+            Core::T1 => 3,
+            Core::T2 => 4,
+        }
+    }
+
+    /// Bits of [`DISABLE_RESET`] for this core: the local-data-RAM bit, then the
+    /// debug `DR` register bit (`SoftReset.md:42-54`).
+    ///
+    /// With the local-data-RAM bit set, leaving soft reset does not start the
+    /// zeroing described at [`LOCAL_RAM_ZEROING_CYCLES`] at all — the window is
+    /// abolished rather than shortened. **A fourth core ordering**: T0 = 0,
+    /// T1 = 2, T2 = 4, B = 6, NC = 8, matching neither the soft-reset bits, nor
+    /// the `pc` snapshot order, nor the I-cache invalidate mask.
+    pub const fn disable_reset_bits(self) -> (u32, u32) {
+        match self {
+            Core::T0 => (0, 1),
+            Core::T1 => (2, 3),
+            Core::T2 => (4, 5),
+            Core::B => (6, 7),
+            Core::NC => (8, 9),
+        }
+    }
+
     /// Can this core push Tensix instructions? (`PushTensixInstruction.md:3`)
     pub const fn can_push_tensix(self) -> bool {
         !matches!(self, Core::NC)
@@ -156,6 +221,14 @@ pub const TRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_2234;
 pub const NCRISC_RESET_PC: u64 = 0xFFB1_2238;
 /// Bit 0 enables the override.
 pub const NCRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_223C;
+
+/// First byte of the NoC-visible local-data-RAM aperture
+/// (`BabyRISCV/README.md:109`).
+pub const LOCAL_DATA_RAM_NOC_BASE: u64 = 0xFFB1_4000;
+/// One past its last byte (`README.md:116`).
+pub const LOCAL_DATA_RAM_NOC_END: u64 = 0xFFB1_E000;
+/// Address space each core is given inside it.
+pub const LOCAL_DATA_RAM_NOC_STRIDE: u64 = 0x2000;
 
 /// How long the local data RAM spends zeroing itself after reset is released
 /// (`BabyRISCV/README.md:152`).
@@ -247,6 +320,107 @@ pub const DST_BASE: u64 = 0xFFBD_8000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ram_apertures_tile_the_documented_range() {
+        for (i, core) in Core::ALL.iter().enumerate() {
+            let base = core.local_data_ram_noc_address();
+            let end = base + core.local_data_ram_noc_window();
+            assert!(
+                base >= LOCAL_DATA_RAM_NOC_BASE && end <= LOCAL_DATA_RAM_NOC_END,
+                "{} sits outside the documented aperture",
+                core.name()
+            );
+            for other in &Core::ALL[..i] {
+                let o_base = other.local_data_ram_noc_address();
+                let o_end = o_base + other.local_data_ram_noc_window();
+                assert!(
+                    end <= o_base || base >= o_end,
+                    "{} overlaps {}",
+                    core.name(),
+                    other.name()
+                );
+            }
+        }
+        // Five cores at 0x2000 apiece exactly fill 0xFFB1_4000..0xFFB1_E000.
+        assert_eq!(
+            LOCAL_DATA_RAM_NOC_END - LOCAL_DATA_RAM_NOC_BASE,
+            Core::ALL.len() as u64 * LOCAL_DATA_RAM_NOC_STRIDE
+        );
+        // The memory map's first row, spelled out rather than derived.
+        assert_eq!(Core::B.local_data_ram_noc_address(), 0xFFB1_4000);
+        assert_eq!(Core::NC.local_data_ram_noc_address(), 0xFFB1_6000);
+        assert_eq!(Core::T0.local_data_ram_noc_address(), 0xFFB1_8000);
+        assert_eq!(Core::T1.local_data_ram_noc_address(), 0xFFB1_A000);
+        assert_eq!(Core::T2.local_data_ram_noc_address(), 0xFFB1_C000);
+    }
+
+    #[test]
+    fn local_ram_never_fills_more_than_its_aperture() {
+        for core in Core::ALL {
+            let size = core.local_data_ram_size() as u64;
+            assert!(size <= core.local_data_ram_noc_window());
+            // B and NC fill theirs; the T-cores are given twice the window they
+            // back, and what occupies the upper half is undocumented. Anything
+            // staging here must bound itself by the size.
+            let exact = matches!(core, Core::B | Core::NC);
+            assert_eq!(size == core.local_data_ram_noc_window(), exact);
+        }
+    }
+
+    #[test]
+    fn disable_reset_bits_are_ten_distinct_bits_below_ten() {
+        let mut mask = 0u32;
+        for core in Core::ALL {
+            let (ram, dr) = core.disable_reset_bits();
+            assert_eq!(
+                dr,
+                ram + 1,
+                "{}'s DR bit must follow its RAM bit",
+                core.name()
+            );
+            for bit in [ram, dr] {
+                // SoftReset.md:54: bits >= 10 have no effect.
+                assert!(bit < 10, "{} names bit {bit}", core.name());
+                assert_eq!(mask & (1 << bit), 0, "{} reuses bit {bit}", core.name());
+                mask |= 1 << bit;
+            }
+        }
+        assert_eq!(mask, 0x3FF, "the ten documented bits must all be claimed");
+    }
+
+    #[test]
+    fn the_per_core_orderings_really_are_different() {
+        // Blackhole numbers the five cores four different ways. Each of these
+        // tables is transcribed from a different page, and the failure mode of
+        // copying one into another is a hung core rather than a compile error --
+        // so the difference is asserted rather than left as a comment.
+        let mut soft_reset = [0u32; 5];
+        let mut disable_reset = [0u32; 5];
+        let mut hardware = [0u32; 5];
+        for (i, core) in Core::ALL.iter().enumerate() {
+            soft_reset[i] = core.soft_reset_bit();
+            disable_reset[i] = core.disable_reset_bits().0;
+            hardware[i] = core.hardware_index();
+        }
+
+        assert_eq!(soft_reset, [11, 12, 13, 14, 18]);
+        assert_eq!(disable_reset, [6, 0, 2, 4, 8]);
+        assert_eq!(hardware, [0, 2, 3, 4, 1]);
+        assert_ne!(soft_reset, disable_reset);
+        assert_ne!(disable_reset, hardware);
+
+        // The `pc` snapshot block and the local-RAM aperture share the hardware
+        // ordering, which is why both are generated from `hardware_index`.
+        for core in Core::ALL {
+            let i = core.hardware_index() as u64;
+            assert_eq!(core.pc_snapshot(), 0xFFB1_3138 + i * 4);
+            assert_eq!(
+                core.local_data_ram_noc_address(),
+                LOCAL_DATA_RAM_NOC_BASE + i * LOCAL_DATA_RAM_NOC_STRIDE
+            );
+        }
+    }
 
     #[test]
     fn reset_bits_are_distinct_and_match_the_named_masks() {

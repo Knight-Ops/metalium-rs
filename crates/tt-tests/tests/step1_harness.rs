@@ -7,6 +7,7 @@
 //! take the whole test binary with it.
 
 use tt_device::{Bar, ConfigOffset, Transport};
+use tt_isa::noc::ChipId;
 use tt_ttsim::{fork_scope, Simulator};
 
 /// Run a simulator test body in its own process, failing the test if it does not
@@ -60,6 +61,23 @@ fn bar_bases_match_the_addresses_libttsim_decodes() {
                 "{bar:?} base in config space disagrees with libttsim's decode map"
             );
         }
+    });
+}
+
+#[test]
+fn the_single_chip_build_exposes_exactly_one_chip() {
+    // `Simulator::open` walks all 32 device slots a bdf can name, so this is what
+    // licenses that walk for every other test in the workspace: on this build the
+    // 31 absent slots read all-ones rather than terminating the process, and the
+    // probe does not invent a chip that is not there.
+    in_simulator(|sim| {
+        assert_eq!(
+            sim.chip_count(),
+            1,
+            "libttsim_bh.so is the single-chip build; the dual-chip gate lives in \
+             step2_multichip.rs"
+        );
+        assert_eq!(sim.transport().chip(), ChipId(0));
     });
 }
 

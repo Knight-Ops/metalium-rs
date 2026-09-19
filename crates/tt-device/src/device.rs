@@ -80,9 +80,14 @@ impl<T: Transport> Device<T> {
             .filter(|&i| i != KERNEL_RESERVED_WINDOW)
             .collect();
 
+        // Taken from the transport rather than assumed: a transport is one chip,
+        // and it is the only thing that knows which. Asserting it here instead
+        // would let a `Device` claim to be a chip it does not address.
+        let chip = transport.chip();
+
         Ok(Device {
             transport,
-            chip: ChipId(0),
+            chip,
             free,
             shadow: BTreeMap::new(),
         })

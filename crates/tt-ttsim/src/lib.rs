@@ -35,6 +35,7 @@ pub use transport::LibTtsim;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tt_isa::noc::ChipId;
 use tt_ttsim_sys::{Lib, LoadError};
 
 /// Set once `Simulator::open` has succeeded. Never cleared: `libttsim_init` has no
@@ -52,6 +53,12 @@ static mut LIB: Option<&'static Lib> = None;
 /// The environment variable that overrides which `libttsim*.so` is loaded.
 pub const LIB_PATH_ENV: &str = "TT_TTSIM_LIB";
 
+/// The same, for the dual-chip build that [`x2_lib_path`] finds.
+///
+/// Not decoration: pointing this at the single-chip build is how the multi-chip
+/// gate is checked for vacuity without editing any code.
+pub const LIB_PATH_ENV_X2: &str = "TT_TTSIM_LIB_X2";
+
 #[derive(Debug)]
 pub enum OpenError {
     /// [`Simulator::open`] was already called in this process.
@@ -63,12 +70,20 @@ pub enum OpenError {
     /// The simulator came up, but did not report a Blackhole.
     NotBlackhole { vendor: u16, device: u16 },
     /// A BAR base in configuration space did not match the address the library
-    /// actually decodes. See [`expected_bar_base`].
+    /// actually decodes. See [`chip_bar_base`].
     BarMismatch {
+        chip: ChipId,
         bar: tt_device::Bar,
         expected: u64,
         found: u64,
     },
+    /// Not even chip 0 answered configuration space.
+    NoChips,
+    /// A chip was present above an absent slot. Every build libttsim ships
+    /// numbers its chips contiguously from zero, and [`ChipId`] is used both as
+    /// the bdf device field and as the stride multiplier, so an ordinal that is
+    /// not an index would put every access in the wrong 64 GiB window.
+    SparseTopology { gap: ChipId, present_above: ChipId },
 }
 
 impl std::fmt::Display for OpenError {
@@ -90,14 +105,28 @@ impl std::fmt::Display for OpenError {
                 "simulator reported {vendor:#06x}:{device:#06x}, not Blackhole. \
                  Is this libttsim_wh.so rather than libttsim_bh.so?"
             ),
+            OpenError::NoChips => write!(
+                f,
+                "no chip answered configuration space at bdf 0; the library loaded \
+                 but presents no PCIe endpoint"
+            ),
+            OpenError::SparseTopology { gap, present_above } => write!(
+                f,
+                "chip {} is absent but chip {} is present. This build numbers its \
+                 chips contiguously from zero, so a gap means the bdf-to-chip \
+                 mapping in this crate no longer matches the library's.",
+                gap.0, present_above.0
+            ),
             OpenError::BarMismatch {
+                chip,
                 bar,
                 expected,
                 found,
             } => write!(
                 f,
-                "{bar:?} base is {found:#x} in config space but this build expects \
-                 {expected:#x}; libttsim's hardcoded BAR map has changed"
+                "chip {}'s {bar:?} base is {found:#x} in config space but this build \
+                 expects {expected:#x}; libttsim's hardcoded BAR map has changed",
+                chip.0
             ),
         }
     }
@@ -118,6 +147,8 @@ impl From<LoadError> for OpenError {
 /// thread that created it.
 pub struct Simulator {
     lib: &'static Lib,
+    /// Chips this build presents, counted by `probe_chips` at open.
+    chips: u16,
     /// Makes `Simulator` `!Send + !Sync` without an unstable negative impl.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -170,54 +201,115 @@ impl Simulator {
         // SAFETY: callbacks are installed and this is the first and only init.
         unsafe { (lib.init)() };
 
-        let sim = Simulator {
+        let mut sim = Simulator {
             lib,
+            chips: 0,
             _not_send: std::marker::PhantomData,
         };
-        sim.verify()?;
+        sim.chips = sim.probe_chips()?;
         Ok(sim)
     }
 
-    /// Check that the simulator is the Blackhole build, and that its BAR map is the
-    /// one this crate's validation layer was written against.
-    fn verify(&self) -> Result<(), OpenError> {
+    /// Count the chips this build presents, and check each one's BAR map.
+    ///
+    /// The walk covers every device slot a bdf can name rather than stopping at
+    /// the first gap: presence is a prefix in every build libttsim ships, so a
+    /// gap would mean this crate's bdf-to-chip mapping no longer matches the
+    /// library's — and since [`ChipId`] doubles as the stride multiplier, that
+    /// would silently address the wrong 64 GiB window rather than fail. Reading
+    /// an absent slot is safe and returns all-ones; only *writing* one is fatal.
+    ///
+    /// The BAR check is the same guard the single-chip build always had, applied
+    /// per chip. The validation layer in [`transport`] decides whether an access
+    /// is legal by comparing against libttsim's *hardcoded* decode map, not
+    /// against whatever config space reports. Confirm the two still agree: if a
+    /// future libttsim moves a BAR, every subsequent access would be validated
+    /// against the wrong map and then terminate the process. Better to refuse to
+    /// start.
+    fn probe_chips(&self) -> Result<u16, OpenError> {
         use tt_device::{Bar, ConfigOffset, DEVICE_ID_BLACKHOLE, VENDOR_ID_TENSTORRENT};
 
-        // SAFETY: offset 0 is always decoded; the simulator is initialized.
-        let id =
-            unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, ConfigOffset::VendorDevice as u32) };
-        let vendor = (id & 0xFFFF) as u16;
-        let device = (id >> 16) as u16;
-        if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
-            return Err(OpenError::NotBlackhole { vendor, device });
-        }
-
-        // The validation layer in `transport` decides whether an access is legal by
-        // comparing against libttsim's *hardcoded* decode map, not against whatever
-        // config space reports. Confirm the two still agree: if a future libttsim
-        // moves a BAR, every subsequent access would be validated against the wrong
-        // map and then terminate the process. Better to refuse to start.
-        for bar in [Bar::Bar0, Bar::Bar2, Bar::Bar4] {
-            let lo_off = bar.config_offset() as u32;
-            // SAFETY: BAR offsets are decoded; the simulator is initialized.
-            let lo = unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, lo_off) };
-            let hi = unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, lo_off + 4) };
-            let found = ((hi as u64) << 32) | ((lo & !0xF) as u64);
-            let expected = expected_bar_base(bar);
-            if found != expected {
-                return Err(OpenError::BarMismatch {
-                    bar,
-                    expected,
-                    found,
+        let mut present = 0u16;
+        for index in 0..MAX_MMIO_CHIPS {
+            let chip = ChipId(index);
+            // SAFETY: offset 0 is always decoded, the bdf is well-formed, and an
+            // absent slot reads all-ones rather than faulting.
+            let id = unsafe {
+                (self.lib.pci_config_rd32)(chip_bdf(chip), ConfigOffset::VendorDevice as u32)
+            };
+            if id == u32::MAX {
+                continue;
+            }
+            if index != present {
+                return Err(OpenError::SparseTopology {
+                    gap: ChipId(present),
+                    present_above: chip,
                 });
             }
+
+            let vendor = (id & 0xFFFF) as u16;
+            let device = (id >> 16) as u16;
+            if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
+                return Err(OpenError::NotBlackhole { vendor, device });
+            }
+
+            for bar in [Bar::Bar0, Bar::Bar2, Bar::Bar4] {
+                // SAFETY: BAR offsets are decoded; the simulator is initialized.
+                let lo = unsafe {
+                    (self.lib.pci_config_rd32)(chip_bdf(chip), bar.config_offset() as u32)
+                };
+                let hi = unsafe {
+                    (self.lib.pci_config_rd32)(chip_bdf(chip), bar.config_offset_hi() as u32)
+                };
+                let found = ((hi as u64) << 32) | ((lo & !0xF) as u64);
+                let expected = chip_bar_base(chip, bar);
+                if found != expected {
+                    return Err(OpenError::BarMismatch {
+                        chip,
+                        bar,
+                        expected,
+                        found,
+                    });
+                }
+            }
+            present += 1;
         }
-        Ok(())
+
+        if present == 0 {
+            return Err(OpenError::NoChips);
+        }
+        Ok(present)
     }
 
-    /// Borrow this simulator as a [`Transport`](tt_device::Transport).
+    /// How many chips this build presents.
+    pub fn chip_count(&self) -> u16 {
+        self.chips
+    }
+
+    /// The chips this build presents, lowest first.
+    pub fn chips(&self) -> impl Iterator<Item = ChipId> {
+        (0..self.chips).map(ChipId)
+    }
+
+    /// Borrow this simulator as a [`Transport`](tt_device::Transport) for chip 0.
     pub fn transport(&mut self) -> LibTtsim<'_> {
-        LibTtsim::new(self.lib)
+        LibTtsim::new(self.lib, ChipId(0))
+    }
+
+    /// One transport per chip, lowest chip first.
+    ///
+    /// Plural because the `&mut self` is reborrowed once, for all of them: two
+    /// separate calls could not both be live, and holding two `Device`s at once
+    /// is the entire point. They coexist safely because each addresses a
+    /// disjoint 64 GiB window of physical address space.
+    ///
+    /// Note that [`clock`](Self::clock) advances *every* chip — libttsim runs
+    /// them on a single global timebase — so ticking one `Device` per chip in a
+    /// loop advances time once per chip, not once.
+    pub fn transports(&mut self) -> Vec<LibTtsim<'_>> {
+        (0..self.chips)
+            .map(|i| LibTtsim::new(self.lib, ChipId(i)))
+            .collect()
     }
 
     /// Advance simulated time.
@@ -230,13 +322,40 @@ impl Simulator {
     }
 }
 
-/// The bus/device/function of the first (and, in the `bh` build, only) chip.
+/// Bus/device/function of `chip`: bus 0, device `chip`, function 0.
 ///
-/// `function = bdf & 7`, `device = (bdf >> 3) & 0x1F`, `bus = (bdf >> 8) & 0xFF`.
-/// Reading an absent BDF returns all-ones; *writing* one is fatal.
-pub const BDF_CHIP0: u32 = 0;
+/// libttsim's `pci_device_from_bdf` reports a slot as absent unless the function
+/// is 0, the bus is 0, and the device index is below the build's chip count, so
+/// the chip number *is* the bdf device field. Reading an absent bdf returns
+/// all-ones; **writing one is fatal**, which is why nothing in this workspace
+/// calls `pci_config_wr32`.
+pub const fn chip_bdf(chip: ChipId) -> u32 {
+    debug_assert!(chip.0 < MAX_MMIO_CHIPS);
+    (chip.0 as u32) << 3
+}
 
-/// The address at which `libttsim` decodes each BAR.
+/// Device slots a bdf can name: the bdf device field is five bits wide.
+pub const MAX_MMIO_CHIPS: u16 = 32;
+
+/// Distance between one chip's BAR windows and the next chip's.
+///
+/// libttsim places device *i*'s BARs at device 0's bases plus `i` times this
+/// (`PER_DEVICE_PADDR_STRIDE`), so a host physical address uniquely identifies
+/// both the chip and the offset within it, and the memory-access entry points
+/// pick the chip out of the address rather than from any current-chip state.
+///
+/// The stride is exactly where chip 0's BAR4 ends — see the assertion in
+/// [`transport`] — so the bound that keeps an access inside its own BAR is also
+/// the bound that keeps it out of the next chip's window.
+pub const PER_CHIP_PADDR_STRIDE: u64 = 0x10_0000_0000;
+
+/// The address at which `libttsim` decodes `chip`'s `bar`.
+pub const fn chip_bar_base(chip: ChipId, bar: tt_device::Bar) -> u64 {
+    expected_bar_base(bar) + (chip.0 as u64) * PER_CHIP_PADDR_STRIDE
+}
+
+/// The address at which `libttsim` decodes each BAR, for chip 0 — equivalently,
+/// for the whole of the single-chip build, where the stride term is zero.
 ///
 /// These are compile-time constants inside the library, not values derived from
 /// configuration space. `libttsim_init` pre-programs config space to match, and
@@ -252,9 +371,22 @@ pub const fn expected_bar_base(bar: tt_device::Bar) -> u64 {
     }
 }
 
-/// Where `cargo xtask fetch-ttsim` puts the library.
+/// Where `cargo xtask fetch-ttsim` puts the single-chip library.
 pub fn default_lib_path() -> PathBuf {
     workspace_root().join("vendor").join("libttsim_bh.so")
+}
+
+/// The dual-chip (P300) build, overridable with [`LIB_PATH_ENV_X2`].
+///
+/// A separate accessor rather than a `Simulator::open` argument because the
+/// choice is per test binary — the simulator is a process-wide singleton — and
+/// because the override is how the multi-chip gate is run against the
+/// single-chip build to confirm it is not vacuous.
+pub fn x2_lib_path() -> PathBuf {
+    match std::env::var_os(LIB_PATH_ENV_X2) {
+        Some(p) => PathBuf::from(p),
+        None => workspace_root().join("vendor").join("libttsim_bh_x2.so"),
+    }
 }
 
 fn workspace_root() -> PathBuf {

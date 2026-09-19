@@ -26,7 +26,7 @@ host ──libttsim──> chip
 ## Getting started
 
 ```bash
-cargo xtask fetch-ttsim   # downloads the pinned libttsim_bh.so into vendor/
+cargo xtask fetch-ttsim   # downloads the pinned libttsim builds into vendor/
 cargo xtask fetch-spec    # downloads the pinned ISA specification into vendor/
 cargo test                # builds the riscv32im firmware and runs every gate
 ```

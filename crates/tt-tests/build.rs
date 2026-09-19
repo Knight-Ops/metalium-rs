@@ -209,6 +209,14 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
              instruction outside the target's extension set",
         );
     }
+    if mnemonic == "fence.i" {
+        return Some(
+            "Zifencei is not implemented. `fence.i` executes as a `nop`, which \
+             `InstructionCache.md:23` classes as NonContractualBehavior, and ttsim refuses it \
+             outright: \"fence.i does not flush the instruction cache on babyrisc and should \
+             not be used\". Write the 5-bit mask to `RISCV_IC_INVALIDATE_InvalidateAll` instead",
+        );
+    }
     if mnemonic.starts_with("c.") {
         return Some(
             "the C extension is not implemented, and its encoding space is reused by `.ttinsn`",

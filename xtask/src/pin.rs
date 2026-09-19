@@ -4,8 +4,28 @@
 //! Bumping either without the other is caught by the hash checks in [`crate::fetch`].
 
 pub const TTSIM_TAG: &str = "v1.10.9";
-pub const TTSIM_ASSET: &str = "libttsim_bh.so";
-pub const TTSIM_SHA256: &str = "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5";
+
+/// One release asset of the pinned ttsim tag.
+pub struct TtsimAsset {
+    pub name: &'static str,
+    pub sha256: &'static str,
+}
+
+/// The simulator builds this repository fetches, all from [`TTSIM_TAG`].
+///
+/// One tag covers every build, so the single-chip and dual-chip simulators
+/// cannot drift apart. `bh_x4` and `bh_x32` exist in the same release and are
+/// deliberately not pinned until something needs them.
+pub const TTSIM_ASSETS: &[TtsimAsset] = &[
+    TtsimAsset {
+        name: "libttsim_bh.so",
+        sha256: "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5",
+    },
+    TtsimAsset {
+        name: "libttsim_bh_x2.so",
+        sha256: "e1ffbaf39c7d071a2f64d7072a586da5f9a7bef55907459edbdb185189d23108",
+    },
+];
 
 /// The tt-metal commit `BackendConfiguration.md:17` cites for `cfg_defines.h`.
 pub const TT_METAL_REV: &str = "81989dcdb8f9b340c932ae7a71a346f4f08703eb";

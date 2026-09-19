@@ -41,7 +41,7 @@ const USAGE: &str = "\
 usage: cargo xtask <task>
 
 tasks:
-  fetch-ttsim [--force]   download the pinned libttsim_bh.so into vendor/
+  fetch-ttsim [--force]   download the pinned libttsim builds into vendor/
   fetch-spec [--force]    download the pinned ISA specification tree into vendor/
                           and verify it against the pinned content digest
   gen-cfg [--check]       regenerate tt-isa's backend-configuration field table

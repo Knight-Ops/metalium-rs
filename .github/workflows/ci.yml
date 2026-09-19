@@ -32,7 +32,9 @@ jobs:
       - name: Cache the pinned simulator
         uses: actions/cache@v4
         with:
-          path: vendor/libttsim_bh.so
+          path: |
+            vendor/libttsim_bh.so
+            vendor/libttsim_bh_x2.so
           key: libttsim-${{ hashFiles('PINS.toml') }}
 
       # The specification tree is the third pinned input. It is verified by a

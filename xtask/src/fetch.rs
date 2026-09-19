@@ -12,16 +12,25 @@ use crate::pin;
 use crate::spec;
 use crate::util::{download, sha256, workspace_root};
 
+/// Fetch every pinned simulator build.
 ///
-/// The `.so` is not committed — it is a 244 KiB binary blob with its own release
-/// cadence — but it is *pinned*, because it is the oracle every gate is measured
-/// against. An unnoticed change to it silently changes what the test suite proves.
+/// The `.so` files are not committed — each is a few hundred KiB of binary blob
+/// with its own release cadence — but they are *pinned*, because they are the
+/// oracle every gate is measured against. An unnoticed change to one silently
+/// changes what the test suite proves.
 pub fn fetch_ttsim(force: bool) -> Result<(), String> {
-    let dest = workspace_root().join("vendor").join(pin::TTSIM_ASSET);
+    for asset in pin::TTSIM_ASSETS {
+        fetch_ttsim_asset(asset, force)?;
+    }
+    Ok(())
+}
+
+fn fetch_ttsim_asset(asset: &pin::TtsimAsset, force: bool) -> Result<(), String> {
+    let dest = workspace_root().join("vendor").join(asset.name);
 
     if dest.exists() && !force {
         match sha256(&dest) {
-            Ok(h) if h == pin::TTSIM_SHA256 => {
+            Ok(h) if h == asset.sha256 => {
                 println!("{} is already present and matches the pin", dest.display());
                 return Ok(());
             }
@@ -32,7 +41,7 @@ pub fn fetch_ttsim(force: bool) -> Result<(), String> {
                      is intentional — note that doing so invalidates every gate until \
                      they are re-run.",
                     dest.display(),
-                    pin::TTSIM_SHA256
+                    asset.sha256
                 ))
             }
             Err(e) => return Err(e),
@@ -42,7 +51,7 @@ pub fn fetch_ttsim(force: bool) -> Result<(), String> {
     let url = format!(
         "https://github.com/tenstorrent/ttsim/releases/download/{}/{}",
         pin::TTSIM_TAG,
-        pin::TTSIM_ASSET
+        asset.name
     );
     println!("fetching {url}");
 
@@ -74,14 +83,13 @@ pub fn fetch_ttsim(force: bool) -> Result<(), String> {
     }
 
     let got = sha256(&tmp)?;
-    if got != pin::TTSIM_SHA256 {
+    if got != asset.sha256 {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "hash mismatch for {}:\n  expected {}\n  got      {got}\n\
              The pinned release asset should be immutable, so this means either the \
              download was corrupted or the tag was moved.",
-            pin::TTSIM_ASSET,
-            pin::TTSIM_SHA256
+            asset.name, asset.sha256
         ));
     }
 

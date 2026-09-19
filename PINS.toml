@@ -22,10 +22,22 @@ content_sha256 = "d08a44478ad67fa2c5516366536644741963203925f69b91976fe67eded9ae
 
 [ttsim]
 # The golden-reference simulator. Fetched by `cargo xtask fetch-ttsim`.
-repo   = "https://github.com/tenstorrent/ttsim"
-tag    = "v1.10.9"
-asset  = "libttsim_bh.so"
+#
+# One tag covers every build, so the single-chip and dual-chip simulators cannot
+# drift apart. `bh_x4` and `bh_x32` are published in the same release and are
+# deliberately not pinned until something needs them.
+repo = "https://github.com/tenstorrent/ttsim"
+tag  = "v1.10.9"
+
+[[ttsim.assets]]
+name   = "libttsim_bh.so"
 sha256 = "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5"
+
+[[ttsim.assets]]
+# The dual-chip (P300) build. Only the multi-chip gate loads it; every other gate
+# runs against the single-chip build above.
+name   = "libttsim_bh_x2.so"
+sha256 = "e1ffbaf39c7d071a2f64d7072a586da5f9a7bef55907459edbdb185189d23108"
 
 [tt-metal]
 # Source of cfg_defines.h -- the 820 backend-configuration fields. Fetched and

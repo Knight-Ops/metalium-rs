@@ -23,7 +23,7 @@ gate you have not seen reject something is not yet evidence.
 | Phase | State | Note |
 |--:|---|---|
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
-| 1 — Host addresses the chip | `[~]` | TLB/L1 done against the simulator; `tt-kmd` not started |
+| 1 — Host addresses the chip | `[~]` | TLB/L1 and the dual-chip gate done against the simulator; `tt-kmd` not started |
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
 | 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
 | 4 — Layout | `[ ]` | |
@@ -48,8 +48,10 @@ Set up early; retrofitting is expensive.
       Blackhole `UNPACR`/`PACR` gaps Phase 6 depends on. Check before doing
       silicon-discovery work the docs may have obviated.
 - [x] **One newtype per coordinate space** — `NocCoord<Noc0>`, `NocCoord<Noc1>`,
-      `Translated`, plus `ChipId` from day one.
-- [x] **Divergence log** — `docs/ttsim-divergence.md`, 21 entries and counting.
+      `Translated`, plus `ChipId` from day one. `ChipId` is now load-bearing rather
+      than merely present: it is the bdf device field *and* the stride multiplier
+      for a chip's BAR windows, so the day-one decision cost nothing to collect on.
+- [x] **Divergence log** — `docs/ttsim-divergence.md`, 26 entries and counting.
 - [x] **Silicon-only suite exists** — `--features silicon`, compiled always so it
       cannot rot.
 - [x] **Version control**, so the pinning discipline above is enforceable.
@@ -116,7 +118,9 @@ no answer.
 - [x] `fork_scope` isolation, so a `_Exit` becomes a failing assertion.
 - [x] `fatality.rs` pins five accesses as genuinely fatal, so the validation layer
       cannot quietly become unnecessary.
-- [x] `xtask fetch-ttsim` with a pinned tag and SHA-256.
+- [x] `xtask fetch-ttsim` with a pinned tag and SHA-256, now over two assets —
+      `libttsim_bh.so` and `libttsim_bh_x2.so` — from the one tag, so the
+      single-chip and dual-chip simulators cannot drift apart.
 - [x] **Gate (sim):** init succeeds, config offset 0 reads `0xB140_1E52`, the clock
       advances, a bad access is rejected before reaching the library.
 - [-] **Gate (silicon):** none — this phase is simulator infrastructure by definition.
@@ -142,8 +146,15 @@ no answer.
 - [x] **Gate (sim):** pattern round-trips through two *different* windows, on two
       tiles, across a window boundary; all 140 Tensix tiles addressable without
       aliasing.
-- [ ] **Gate (sim) under `bh_x2`** — chip indexing is typed but never exercised.
-      Needs `libttsim_bh_x2.so` and a second `ChipId`.
+- [x] **Gate (sim) under `bh_x2`** — two chips, two `Device`s, one process.
+      `crates/tt-tests/tests/step2_multichip.rs`: the same tile coordinate at the
+      same address on both chips holds different data, window index 0 on each does
+      not collide, and the step 2 round-trip and 140-tile sweep both repeat on
+      chip 1. `ChipId` is no longer assumed — `Device::open` takes it from
+      `Transport::chip()`, so a device cannot claim a chip it does not address.
+      Watched failing three ways: against the single-chip build via
+      `TT_TTSIM_LIB_X2`, with the chip dropped from `chip_bar_base`, and with
+      `Device::open` ignoring the transport.
 - [ ] **`tt-kmd` crate** — generate the ioctl structs with **bindgen** from
       tt-kmd's `ioctl.h`; it is real C with structs, which is what bindgen is good
       at, and `ethdump.c` only inlines a partial copy. (Not bindgen for
@@ -173,7 +184,11 @@ no answer.
 - [x] `spin()` avoids `core::hint::spin_loop()`, which emits `pause`
       (Zihintpause) — an extension Blackhole does not list.
 - [x] Instruction-set gate: no `c.*`, `lr.*`/`sc.*`, `fdiv`, `fsqrt`, `div`, `rem`,
-      no undecodable instructions, no unrecognised `fence` ordering.
+      `fence.i`, no undecodable instructions, no unrecognised `fence` ordering.
+      `fence.i` was a live hole until now: it is a distinct mnemonic, so the
+      `fence` operand screen never saw it and `forbidden_reason` had no arm for
+      it. The spec calls executing it `NonContractualBehavior` and ttsim refuses
+      it outright. Watched rejecting a deliberately planted `asm!("fence.i")`.
 - [x] **Gate (sim):** heartbeat climbs monotonically; a core held in reset does
       nothing; releasing one core does not disturb the others.
 - [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
@@ -187,9 +202,26 @@ no answer.
       `RISCV_IC_INVALIDATE_InvalidateAll` (bit 0=B, 1=T0, 2=T1, 3=T2, 4=NC). That
       register is **not NoC-accessible and not accessible to RISCV NC**, so NC
       depends on another core. Invalidation does not flush the pipeline.
-- [ ] **Local-RAM zeroing window.** Also avoided by construction — nothing is
-      staged into local RAM over the NoC. Needed if that changes: either set the
-      `RISCV_DEBUG_REG_DISABLE_RESET` bit first or wait out 2048 cycles.
+- [~] **Local-RAM zeroing window.** Still avoided by construction — nothing is
+      staged into local RAM over the NoC — but the addresses are no longer absent
+      from the code. `Core::local_data_ram_noc_address`, `local_data_ram_noc_window`
+      and `disable_reset_bits` are in `tt_isa::tensix`, unit-tested against all
+      four of Blackhole's mutually inconsistent per-core orderings, and the
+      T-core aperture being twice its backing RAM is encoded rather than noted.
+      **What the simulator proves:** that it models none of it — neither the
+      aperture nor `DISABLE_RESET`, in either direction — watched with a control
+      so the refusal is evidence (divergence rows 25 and 26). **What it cannot:**
+      anything behavioural, including whether setting the bit abolishes the
+      window as `SoftReset.md:116` says. The staging API and its silicon gates
+      are the remaining work.
+  - [ ] `Device::load_and_start_staged` with `SuppressZeroing` / `WaitOutZeroing`,
+        so a caller cannot get the ordering wrong, plus the `#[cfg(feature =
+        "silicon")]` pair: staged data survives release with the bit set, and is
+        deterministically wiped without it.
+  - [ ] **Open:** what occupies the upper 4 KiB of a T-core's 8 KiB slow-path
+        window? The memory map lists two identically-labelled rows per T-core and
+        the RAM is only 4 KiB. Refused by `local_data_ram_noc_window` for now;
+        resolvable only on silicon.
 - [ ] **Multi-core loader mutual exclusion.** `&mut self` is sufficient within one
       process; the soft-reset register has no atomic bit operations, so anything
       else touching the same tile needs coordination at a higher level.
@@ -230,8 +262,12 @@ no answer.
       `corpus` firmware runs a host-staged program and dumps `Dst`, so adding a
       case is host-side data. Eight gates so far, covering `SFPLOADI` modes,
       `SFPMAD`, `SFPMOV`, `SFPABS`, `SFPSTORE` lane placement, and the numerics
-      entries C, D and E of the divergence log. `UNPACR`/`MVMUL`/`PACR` execution
-      waits for Phases 5–6; their encoders exist now.
+      entries C and D of the divergence log. `UNPACR`/`MVMUL`/`PACR` execution
+      waits on *our* readiness, not the simulator's: `libttsim_bh.so` carries
+      `tensix_pacr`, `tensix_unpacr` and `tensix_mvmul` execute handlers, a block of
+      packer-specific refusal strings, and `fp32 to bf16/bfp8` conversion
+      diagnostics. Their encoders exist now; what is missing is the surrounding
+      state and the config staging to set it up.
 - [ ] **Stand up tracing.** `DebugTimestamper` gives a tile-wide 64-bit counter at
       `0xFFB1_21F0` plus a hardware event-trace primitive: one store to
       `RISCV_DEBUG_REG_TIMESTAMP` appends `{29-bit token, 64-bit counter}` to an L1
@@ -347,7 +383,10 @@ inter-chip transport before single-chip compute is correct is the most common wa
 projects of this shape stall.
 
 - [ ] **Run a 2-week timeboxed spike against `bh_x2` first, then re-estimate.**
-      Far cheaper than originally scoped — no second card, no link training.
+      Far cheaper than originally scoped — no second card, no link training, and
+      cheaper again now that the spike no longer starts from enumeration: opening
+      `bh_x2` and getting one `Device` per chip is done and gated (Phase 1). What
+      remains is inter-chip *transport*.
 - [ ] Resolve: **Ethernet-tile reset sequencing is undocumented for Blackhole.**
       There is no `BlackholeA0/EthernetTile/SoftReset.md`.
 - [ ] Resolve: **RISCV E0 is cooperatively shared with Tenstorrent firmware** — it

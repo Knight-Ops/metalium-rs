@@ -15,7 +15,9 @@
 use tt_device::{Bar, ConfigOffset, Result, Transport, TransportError};
 use tt_ttsim_sys::Lib;
 
-use crate::{expected_bar_base, BDF_CHIP0};
+use tt_isa::noc::ChipId;
+
+use crate::{chip_bar_base, chip_bdf};
 
 /// Size of a BAR0 TLB window.
 pub const TLB_2MIB_SIZE: u64 = 2 * 1024 * 1024;
@@ -72,16 +74,27 @@ enum Dir {
 /// most one live transport.
 pub struct LibTtsim<'a> {
     lib: &'a Lib,
+    /// Which chip this transport addresses. Constant for its whole life, and the
+    /// only thing that distinguishes one transport from another.
+    chip: ChipId,
 }
 
 impl<'a> LibTtsim<'a> {
-    pub(crate) fn new(lib: &'a Lib) -> Self {
-        LibTtsim { lib }
+    /// Deliberately `pub(crate)`: the only public constructors go through
+    /// `Simulator`, which has confirmed the chip is present. A transport naming
+    /// a chip that is not there would put every access in an unpopulated window,
+    /// which is fatal rather than an error.
+    pub(crate) fn new(lib: &'a Lib, chip: ChipId) -> Self {
+        LibTtsim { lib, chip }
     }
 
     /// Absolute simulator-internal physical address for a BAR offset.
-    fn paddr(bar: Bar, offset: u64) -> u64 {
-        expected_bar_base(bar) + offset
+    ///
+    /// The only chip-aware code in this workspace. libttsim picks the chip out of
+    /// the address and subtracts the stride before its intra-chip decode, so
+    /// everything below this line — `validate` included — is chip-independent.
+    fn paddr(&self, bar: Bar, offset: u64) -> u64 {
+        chip_bar_base(self.chip, bar) + offset
     }
 
     /// Reject anything libttsim would refuse, before it gets the chance to `_Exit`.
@@ -211,7 +224,7 @@ impl Transport for LibTtsim<'_> {
         // `dst` is a valid writable slice of exactly `len` bytes.
         unsafe {
             (self.lib.pci_mem_rd_bytes)(
-                Self::paddr(bar, offset),
+                self.paddr(bar, offset),
                 dst.as_mut_ptr().cast(),
                 dst.len() as u32,
             )
@@ -228,7 +241,7 @@ impl Transport for LibTtsim<'_> {
         // SAFETY: as above; `src` is a valid readable slice of exactly `len` bytes.
         unsafe {
             (self.lib.pci_mem_wr_bytes)(
-                Self::paddr(bar, offset),
+                self.paddr(bar, offset),
                 src.as_ptr().cast(),
                 src.len() as u32,
             )
@@ -240,14 +253,31 @@ impl Transport for LibTtsim<'_> {
         // `ConfigOffset` is a closed enum of exactly the offsets libttsim decodes,
         // so there is nothing further to validate.
         // SAFETY: the simulator is initialized and the offset is decodable.
-        Ok(unsafe { (self.lib.pci_config_rd32)(BDF_CHIP0, offset as u32) })
+        Ok(unsafe { (self.lib.pci_config_rd32)(chip_bdf(self.chip), offset as u32) })
     }
 
+    /// Advance the whole simulator.
+    ///
+    /// On a multi-chip build `libttsim_clock` steps every chip on a single
+    /// global timebase, so this is not per-chip: ticking one transport per chip
+    /// in a loop advances time once per chip. Time belongs to the
+    /// [`Simulator`](crate::Simulator), not to a transport.
     fn tick(&mut self, n: u32) {
         // SAFETY: initialized, and `!Send` keeps this on one thread.
         unsafe { (self.lib.clock)(n) }
     }
+
+    fn chip(&self) -> ChipId {
+        self.chip
+    }
 }
+
+/// Chip 0's BAR4 ends exactly where the next chip's windows begin, so
+/// `validate`'s `end > bar.size()` rejection is also what keeps one chip's
+/// accesses out of the next chip's 64 GiB window. That is why `validate` needs
+/// to know nothing about chips.
+const _: () =
+    assert!(crate::expected_bar_base(Bar::Bar4) + Bar::Bar4.size() == crate::PER_CHIP_PADDR_STRIDE);
 
 #[cfg(test)]
 mod tests {

@@ -40,22 +40,42 @@ pub struct Field {
     first_bit: u8,
     width: u8,
     signed: bool,
+    part: Option<&'static str>,
 }
 
 impl Field {
     /// Called by generated code only.
     #[doc(hidden)]
-    pub const fn new(name: &'static str, first_bit: u8, width: u8, signed: bool) -> Self {
+    pub const fn new(
+        name: &'static str,
+        first_bit: u8,
+        width: u8,
+        signed: bool,
+        part: Option<&'static str>,
+    ) -> Self {
         Field {
             name,
             first_bit,
             width,
             signed,
+            part,
         }
     }
 
     pub const fn name(self) -> &'static str {
         self.name
+    }
+
+    /// Which run of a field drawn as several disjoint ranges this is.
+    ///
+    /// The specification qualifies such fields parenthetically -- `Mantissa (low)`,
+    /// `Magnitude (middle)` -- and that qualifier is the *only* record of how the
+    /// runs reassemble. Bit order is not significance order: `Dst32_INT32` draws
+    /// `Magnitude (high)` at bit 16 and `(middle)` at bit 24, because Integer "32"
+    /// shares FP32's physical arrangement so that one `Dst.md` swizzle serves both.
+    /// Sorting the runs by [`Self::first_bit`] therefore reassembles them wrongly.
+    pub const fn part(self) -> Option<&'static str> {
+        self.part
     }
 
     pub const fn first_bit(self) -> u8 {
@@ -274,6 +294,7 @@ pub struct DatumLayout {
     key: &'static str,
     nbits: u8,
     fields: &'static [Field],
+    fixed: &'static [(Field, u32)],
     page: &'static str,
 }
 
@@ -284,14 +305,26 @@ impl DatumLayout {
         key: &'static str,
         nbits: u8,
         fields: &'static [Field],
+        fixed: &'static [(Field, u32)],
         page: &'static str,
     ) -> Self {
         DatumLayout {
             key,
             nbits,
             fields,
+            fixed,
             page,
         }
+    }
+
+    /// Bits the datum carries that are not operands -- in practice, the
+    /// must-be-zero padding `Src` formats leave between mantissa and exponent.
+    ///
+    /// Carried for the same reason [`InstructionDef::fixed`] is: code that *builds*
+    /// a datum has to know which bits to leave alone, and a field the table does not
+    /// mention is a bit the caller would have to invent a value for.
+    pub const fn fixed(self) -> &'static [(Field, u32)] {
+        self.fixed
     }
 
     pub const fn key(self) -> &'static str {
@@ -311,8 +344,29 @@ impl DatumLayout {
         self.page
     }
 
+    /// Look a field up by name, refusing an ambiguous one.
+    ///
+    /// Three layouts draw one logical field as several disjoint runs, and the
+    /// specification distinguishes the runs only by a parenthesised qualifier:
+    /// `Dst32_FP32`'s mantissa is 7 bits at 24 plus 16 at 0, with the exponent
+    /// between them. Returning the first match would hand back 7 of 23 mantissa
+    /// bits and say nothing about it, so an ambiguous name returns `None` and the
+    /// caller must use [`Self::part`].
     pub fn field(self, name: &str) -> Option<Field> {
-        self.fields.iter().copied().find(|f| f.name == name)
+        let mut it = self.fields.iter().copied().filter(|f| f.name == name);
+        match (it.next(), it.next()) {
+            (Some(f), None) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// One run of a field drawn as several. `part` is the parenthesised qualifier:
+    /// `"low"`, `"high"`, `"middle"`.
+    pub fn part(self, name: &str, part: &str) -> Option<Field> {
+        self.fields
+            .iter()
+            .copied()
+            .find(|f| f.name == name && matches!(f.part, Some(p) if p == part))
     }
 }
 
@@ -693,5 +747,177 @@ mod tests {
         assert_eq!(datum::DST16_BF16.field("Exponent").unwrap().width(), 8);
         assert_eq!(datum::DST16_BF16.field("Mantissa").unwrap().width(), 7);
         assert_eq!(datum::DST16_BF16.field("Sign").unwrap().first_bit(), 15);
+    }
+
+    /// Every bit of every `Src`/`Dst` datum is described by something.
+    ///
+    /// These layouts exist so that Phase 4 can convert against the documented bit
+    /// positions rather than against IEEE 754 assumptions. That only works if the
+    /// table accounts for the whole datum: a bit no field claims is a bit the
+    /// conversion code has to invent a value for, and the table does not say which.
+    ///
+    /// Scoped to `Src`/`Dst`. The `NOC_AT_LEN_BE_*` layouts share the table but are
+    /// a different kind of object -- byte-enable command encodings whose unlisted
+    /// bits are genuinely unused, and whose fixed runs are *discriminants* rather
+    /// than padding (`NOC_AT_LEN_BE_Increment` carries the value 1 at bits 12..16).
+    /// They are checked for consistency below instead.
+    ///
+    /// Note this is the first test to look at a `DatumLayout` at all --
+    /// `fields_stay_inside_their_word_and_do_not_overlap` iterates `ALL`, which is
+    /// instructions only.
+    #[test]
+    fn every_bit_of_every_datum_is_described() {
+        for layout in ALL_LAYOUTS.iter().filter(|l| is_src_or_dst(l)) {
+            let mut claimed = 0u32;
+            for f in layout.fields() {
+                assert_eq!(
+                    claimed & f.mask(),
+                    0,
+                    "{}: {} overlaps another field",
+                    layout.key(),
+                    f.name()
+                );
+                claimed |= f.mask();
+            }
+            for (f, value) in layout.fixed() {
+                assert_eq!(
+                    claimed & f.mask(),
+                    0,
+                    "{}: a fixed run overlaps a named field",
+                    layout.key()
+                );
+                assert_eq!(
+                    *value,
+                    0,
+                    "{}: a Src/Dst datum's fixed run is must-be-zero padding, not a \
+                     discriminant",
+                    layout.key()
+                );
+                claimed |= f.mask();
+            }
+            let all = if layout.nbits() >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << layout.nbits()) - 1
+            };
+            assert_eq!(
+                claimed,
+                all,
+                "{}: bits {:#010x} are described by nothing",
+                layout.key(),
+                all & !claimed
+            );
+        }
+    }
+
+    /// No two fields of a datum are indistinguishable by lookup.
+    ///
+    /// `DatumLayout::field` returns `None` for an ambiguous name rather than the
+    /// first match, so a name that is ambiguous *and* unqualified would be
+    /// unreachable through either accessor.
+    #[test]
+    fn datum_fields_are_distinguishable_by_name_and_part() {
+        for layout in ALL_LAYOUTS {
+            let mut seen = BTreeMap::new();
+            for f in layout.fields() {
+                let prev = seen.insert((f.name(), f.part()), f.first_bit());
+                assert!(
+                    prev.is_none(),
+                    "{}: two fields are both `{}` with part {:?}, at bits {} and {}",
+                    layout.key(),
+                    f.name(),
+                    f.part(),
+                    prev.unwrap_or(0),
+                    f.first_bit()
+                );
+            }
+        }
+    }
+
+    /// The three layouts that draw one logical field as several runs.
+    ///
+    /// Pinned literally, because the ordering is the trap: `Dst32_INT32` puts
+    /// `Magnitude (high)` at bit 16 and `(middle)` at bit 24. Integer "32" shares
+    /// FP32's physical arrangement so that `Dst.md`'s `Load32` can apply one
+    /// swizzle before the `fmt` switch, which means bit order is *not* significance
+    /// order and code that sorts the runs by `first_bit` reassembles them wrongly.
+    #[test]
+    fn split_fields_keep_the_order_the_specification_gives_them() {
+        fn parts(layout: &DatumLayout, name: &str) -> Vec<(&'static str, u8, u8)> {
+            layout
+                .fields()
+                .iter()
+                .filter(|f| f.name() == name)
+                .map(|f| (f.part().unwrap_or(""), f.first_bit(), f.width()))
+                .collect()
+        }
+
+        assert_eq!(
+            parts(&datum::DST32_FP32, "Mantissa"),
+            [("high", 24, 7), ("low", 0, 16)]
+        );
+        // Table order is descending bit position, so `middle` is listed before
+        // `high`. That is the whole point: the listing order is bit order, which is
+        // not significance order, so only the qualifier says how to reassemble.
+        assert_eq!(
+            parts(&datum::DST32_INT32, "Magnitude"),
+            [("middle", 24, 7), ("high", 16, 8), ("low", 0, 16)]
+        );
+        assert_eq!(
+            parts(&datum::SRC_INT16, "Magnitude"),
+            [("high", 11, 7), ("low", 0, 8)]
+        );
+
+        // An ambiguous name refuses rather than returning 7 of 23 mantissa bits.
+        assert_eq!(datum::DST32_FP32.field("Mantissa"), None);
+        assert_eq!(
+            datum::DST32_FP32.part("Mantissa", "low").unwrap().width(),
+            16
+        );
+        assert_eq!(
+            datum::DST32_FP32.part("Mantissa", "high").unwrap().width(),
+            7
+        );
+        assert_eq!(
+            datum::DST32_FP32.part("Mantissa", "low").unwrap().width()
+                + datum::DST32_FP32.part("Mantissa", "high").unwrap().width(),
+            23,
+            "FP32 has 23 mantissa bits however they are drawn"
+        );
+        // An unambiguous name still resolves.
+        assert_eq!(datum::DST16_BF16.field("Mantissa").unwrap().width(), 7);
+    }
+
+    /// A datum layout describing a value held in `Src` or `Dst`, as opposed to one
+    /// of the `NOC_AT_LEN_BE_*` command encodings that share the table.
+    fn is_src_or_dst(layout: &DatumLayout) -> bool {
+        layout.key().starts_with("Src_") || layout.key().starts_with("Dst")
+    }
+
+    /// The `NOC_AT_LEN_BE_*` layouts are internally consistent, even though they do
+    /// not account for every bit.
+    #[test]
+    fn the_noc_atomic_layouts_do_not_overlap_themselves() {
+        let mut checked = 0;
+        for layout in ALL_LAYOUTS.iter().filter(|l| !is_src_or_dst(l)) {
+            let mut claimed = 0u32;
+            for f in layout
+                .fields()
+                .iter()
+                .chain(layout.fixed().iter().map(|(f, _)| f))
+            {
+                assert_eq!(
+                    claimed & f.mask(),
+                    0,
+                    "{}: {} overlaps",
+                    layout.key(),
+                    f.name()
+                );
+                claimed |= f.mask();
+            }
+            checked += 1;
+        }
+        // A filter that matched nothing would pass vacuously.
+        assert_eq!(checked, 8, "the NOC_AT_LEN_BE_* layouts");
     }
 }

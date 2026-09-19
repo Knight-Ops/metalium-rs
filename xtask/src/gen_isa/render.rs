@@ -276,10 +276,24 @@ fn operands(d: &Diagram) -> Vec<(&str, &super::model::DrawnField)> {
     v
 }
 
+/// `Field::new(name, first_bit, width, signed, part)`.
+///
+/// `signed` stays its own parameter rather than being derived from `part` at
+/// runtime: `Field::signed` is `const fn` on the encode path, and a string compare
+/// there would be a needless risk.
+///
+/// Every other parenthesised qualifier becomes `part`. Dropping it is what made
+/// `Dst32_FP32` carry two fields both called `Mantissa`, with nothing to say which
+/// run was which -- and the runs do not reassemble in bit order, so the qualifier
+/// is the only record of how they fit together.
 fn field_expr(name: &str, f: &super::model::DrawnField) -> String {
-    let signed = matches!(&f.label, Label::Named { note: Some(n), .. } if n == "signed");
+    let (signed, part) = match &f.label {
+        Label::Named { note: Some(n), .. } if n == "signed" => (true, "None".to_string()),
+        Label::Named { note: Some(n), .. } => (false, format!("Some({n:?})")),
+        _ => (false, "None".to_string()),
+    };
     format!(
-        "Field::new(\"{name}\", {}, {}, {signed})",
+        "Field::new(\"{name}\", {}, {}, {signed}, {part})",
         f.first_bit, f.width
     )
 }
@@ -297,7 +311,7 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
             // The opcode is carried separately.
             Label::Fixed { .. } if f.first_bit == 24 && f.width == 8 => None,
             Label::Fixed { value } => Some(format!(
-                "(Field::new(\"\", {}, {}, false), {value})",
+                "(Field::new(\"\", {}, {}, false, None), {value})",
                 f.first_bit, f.width
             )),
             _ => None,
@@ -352,14 +366,30 @@ fn unspecified(d: &Diagram) -> u32 {
 fn emit_layout(out: &mut String, input: &Input<'_>, d: &Diagram) {
     let (_, page) = &input.provenance[&d.key];
     let fields: Vec<String> = operands(d).iter().map(|(n, f)| field_expr(n, f)).collect();
+    // The must-be-zero padding `Src` formats carry between mantissa and exponent.
+    // Without it the table describes 16 of a 19-bit datum, and code building a
+    // datum has no way to learn which bits to leave alone. Datums have no opcode,
+    // so unlike `emit_def` there is nothing to exclude here.
+    let fixed: Vec<String> = d
+        .fields
+        .iter()
+        .filter_map(|f| match &f.label {
+            Label::Fixed { value } => Some(format!(
+                "(Field::new(\"\", {}, {}, false, None), {value})",
+                f.first_bit, f.width
+            )),
+            _ => None,
+        })
+        .collect();
     writeln!(out, "    /// `{}`, from `{page}`.", d.key).unwrap();
     writeln!(
         out,
-        "    pub static {}: DatumLayout = DatumLayout::new(\"{}\", {}, &[{}], \"{page}\");\n",
+        "    pub static {}: DatumLayout = DatumLayout::new(\"{}\", {}, &[{}], &[{}], \"{page}\");\n",
         d.key.to_uppercase(),
         d.key,
         d.nbits,
-        fields.join(", ")
+        fields.join(", "),
+        fixed.join(", "),
     )
     .unwrap();
 }

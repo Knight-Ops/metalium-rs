@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use tt_isa::noc::ChipId;
+
 /// A PCIe base address register.
 ///
 /// Blackhole exposes three (`PCIExpressTile/README.md:36`). BAR2 is the DBI /
@@ -36,6 +38,20 @@ impl Bar {
             Bar::Bar0 => ConfigOffset::Bar0Lo,
             Bar::Bar2 => ConfigOffset::Bar2Lo,
             Bar::Bar4 => ConfigOffset::Bar4Lo,
+        }
+    }
+
+    /// Byte offset of this BAR's high dword.
+    ///
+    /// Exists so that reading a 64-bit base never needs `config_offset() + 4`
+    /// arithmetic on the discriminant: [`ConfigOffset`] is a closed enum
+    /// precisely so an out-of-range config read cannot be written, and adding to
+    /// it as an integer steps straight back out of that guarantee.
+    pub const fn config_offset_hi(self) -> ConfigOffset {
+        match self {
+            Bar::Bar0 => ConfigOffset::Bar0Hi,
+            Bar::Bar2 => ConfigOffset::Bar2Hi,
+            Bar::Bar4 => ConfigOffset::Bar4Hi,
         }
     }
 }
@@ -193,14 +209,19 @@ pub trait Transport {
 
     /// Read a 64-bit BAR base from configuration space, masking the low flag bits.
     fn bar_base(&mut self, bar: Bar) -> Result<u64> {
-        let lo_offset = bar.config_offset();
-        let hi_offset = match bar {
-            Bar::Bar0 => ConfigOffset::Bar0Hi,
-            Bar::Bar2 => ConfigOffset::Bar2Hi,
-            Bar::Bar4 => ConfigOffset::Bar4Hi,
-        };
-        let lo = self.config_read32(lo_offset)?;
-        let hi = self.config_read32(hi_offset)?;
+        let lo = self.config_read32(bar.config_offset())?;
+        let hi = self.config_read32(bar.config_offset_hi())?;
         Ok(((hi as u64) << 32) | ((lo & !0xF) as u64))
+    }
+
+    /// Which chip this transport reaches.
+    ///
+    /// One transport is one chip. On silicon that is the device behind a single
+    /// `/dev/tenstorrent/N` — no file descriptor reaches another chip's BARs — so
+    /// a chip parameter on the access methods would be unimplementable there.
+    /// Chip selection is therefore base-address selection, private to the
+    /// implementation, and this only reports the answer.
+    fn chip(&self) -> ChipId {
+        ChipId(0)
     }
 }
