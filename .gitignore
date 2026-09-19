@@ -10,3 +10,10 @@
 # Fetched by `cargo xtask gen-cfg`, pinned by SHA-256 in PINS.toml. The *generated*
 # Rust table is committed; the header it came from is not.
 /vendor/cfg_defines.h
+
+# Fetched by `cargo xtask fetch-spec`, pinned by content digest in PINS.toml. The
+# specification is a pinned *input*, not a dependency: it is third-party CC BY-ND
+# content with its own cadence, so it is verified on arrival rather than vendored.
+/vendor/tt-isa-documentation/
+/vendor/tt-isa-documentation.staging/
+/vendor/tt-isa-documentation.tar.gz

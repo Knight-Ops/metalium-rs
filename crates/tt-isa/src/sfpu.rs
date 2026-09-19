@@ -1,100 +1,23 @@
-//! Vector Unit (SFPU) instruction encoding.
+//! Vector Unit (SFPU) instruction encoding, with the hazards the hardware imposes.
 //!
-//! Field layouts are transcribed from `Diagrams/Src/Bits32.lua`, the source the
-//! encoding diagrams in the specification are generated from. Where Blackhole
-//! differs from Wormhole, `Bits32.lua` carries both — `SFPSTORE` has `AddrMod` at
-//! bits 14..15 while `SFPSTORE_BH` has it at 13..15 — and this module encodes the
-//! Blackhole form.
+//! The encodings themselves are generated — see [`crate::isa`], which turns
+//! `Diagrams/Src/Bits32.lua` into a table and a `const fn` per instruction. What is
+//! here is the layer above: the rules the specification states about *using* these
+//! instructions, which the bits alone do not express.
+//!
+//! The split is deliberate. `SFPLOADI` can encode any four-bit `VD`, so the
+//! generated encoder accepts one; but `LReg[8]` upwards are constants and a write
+//! to one is silently discarded, so [`loadi`] refuses it. `SFPMAD` can encode any
+//! `VC`, but the specification says not to use `SFPMUL` unless `VC == 9`, so [`mul`]
+//! does not offer the parameter. Every refusal here can cite a page; nothing here
+//! is a guess about the encoding, and nothing in the generated layer is a guess
+//! about the hardware.
 
+use crate::isa::generated::encode;
+use crate::isa::{self};
 use crate::tensix;
 
-/// A 32-bit Tensix instruction word.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Instruction {
-    word: u32,
-    kind: Kind,
-}
-
-/// Enough of an instruction's identity to reason about scheduling hazards.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Kind {
-    Loadi,
-    /// `SFPMAD`, or `SFPMUL` which is the same instruction with `VC == 9`.
-    Mad,
-    Nop,
-    Store,
-    Load,
-}
-
-impl Instruction {
-    /// The raw instruction word, as pushed by a `sw` to [`tensix::INSTRN_BUF_BASE`].
-    pub const fn word(self) -> u32 {
-        self.word
-    }
-
-    pub const fn kind(self) -> Kind {
-        self.kind
-    }
-
-    /// The same instruction encoded as the operand of a `.ttinsn` pseudo-instruction.
-    ///
-    /// `.ttinsn IMM32` is simply `IMM32` rotated left by two bits
-    /// (`PushTensixInstruction.md:21`); the core rotates it back and stores the
-    /// result to `INSTRN_BUF_BASE`, which is exactly what a `sw` there does. The
-    /// point of the encoding is that adjacent `.ttinsn`s sit in the instruction
-    /// stream, where the T0/T1/T2 instruction caches can fuse up to four of them
-    /// into a single push.
-    ///
-    /// Returns `None` if the instruction cannot be expressed this way. The form is
-    /// only valid for `IMM32 < 0xC000_0000`, because after rotation the low two
-    /// bits must not be `0b11` — that is the space uncompressed RISC-V
-    /// instructions occupy, and `.ttinsn` lives in the compressed-instruction
-    /// encoding space these cores do not implement.
-    pub const fn ttinsn_word(self) -> Option<u32> {
-        if self.word < 0xC000_0000 {
-            Some(self.word.rotate_left(2))
-        } else {
-            None
-        }
-    }
-
-    /// Does an `SFPNOP` have to be inserted between an `SFPMAD` and this
-    /// instruction?
-    ///
-    /// On Blackhole the two-cycle `SFPMAD` latency is handled by hardware: it
-    /// stalls a thread that presents an instruction reading what the `SFPMAD`
-    /// wrote (`SFPMAD.md`, "Instruction scheduling"). That is a change from
-    /// Wormhole, and it means the blanket "always follow a multiply with a NOP"
-    /// rule is wrong here — it would just cost a cycle.
-    ///
-    /// What survives is a *specific* list of instructions the stalling logic fails
-    /// to detect, due to documented hardware bugs. None of the instructions this
-    /// module can currently encode are on it, so this returns `false` throughout;
-    /// it exists so that adding `SFPIADD`, `SFPSHFT`, `SFPCONFIG`, `SFPSWAP`,
-    /// `SFPSHFT2`, or `SFPAND`/`SFPOR` with `USE_VB` has an obvious place to
-    /// record the hazard rather than an obvious place to forget it.
-    ///
-    /// Separately, automatic stalling does not apply at all inside an
-    /// `SFPLOADMACRO` sequence — which ttsim does not implement, so that case
-    /// cannot arise here yet.
-    pub const fn stalls_automatically_after_mad(self) -> bool {
-        match self.kind {
-            Kind::Loadi | Kind::Mad | Kind::Nop | Kind::Store | Kind::Load => true,
-        }
-    }
-}
-
-/// Place `value` into `count` bits starting at `first_bit`.
-const fn field(first_bit: u32, count: u32, value: u32) -> u32 {
-    debug_assert!(first_bit + count <= 32);
-    let mask = if count == 32 {
-        u32::MAX
-    } else {
-        (1u32 << count) - 1
-    };
-    debug_assert!(value <= mask);
-    (value & mask) << first_bit
-}
+pub use crate::isa::Instruction;
 
 /// `SFPLOADI` data-type modes (`SFPLOADI.md`).
 pub mod loadi_mode {
@@ -137,6 +60,22 @@ pub mod mad_mod1 {
     pub const INDIRECT_VD: u32 = 8;
 }
 
+/// Modifier bits named by `SFPMAD.md`'s list of cases automatic stalling misses.
+///
+/// Kept here rather than generated: they live in prose tables on each
+/// instruction's page, not in the encoding diagrams, and the generated layer
+/// deliberately describes bits rather than meanings.
+mod stall_modes {
+    /// `SFPAND_MOD1_USE_VB` / `SFPOR_MOD1_USE_VB`, new in Blackhole.
+    pub const USE_VB: u32 = 1;
+    /// `SFPSWAP_MOD1_SWAP` — the one `SFPSWAP` mode stalling handles correctly.
+    pub const SWAP_UNCONDITIONAL: u32 = 0;
+    /// `SFPSHFT2` modes the stalling logic does not see reads in
+    /// (`SUBVEC_SHFLROR1_AND_COPY4`, `SUBVEC_SHFLROR1`, `SUBVEC_SHFLSHR1`), and the
+    /// two where it watches the wrong register (`SHFT_LREG`, `SHFT_IMM`).
+    pub const SHFT2_MISSED: [u32; 5] = [2, 3, 4, 5, 6];
+}
+
 /// The `LReg` holding a constant `+0`, which is what makes `SFPMUL` a pure
 /// multiply (`SFPMUL.md`).
 pub const LREG_ZERO: u32 = 9;
@@ -163,6 +102,25 @@ pub enum EncodeError {
     },
     /// `SFPMUL` used with `VC != 9`.
     MulWithoutZero { vc: u32 },
+}
+
+impl EncodeError {
+    /// Translate the generated layer's refusal, which knows the field but not what
+    /// the field is for.
+    const fn from_isa(e: isa::EncodeError) -> Self {
+        match e {
+            isa::EncodeError::FieldTooLarge {
+                field,
+                value,
+                width,
+                ..
+            } => EncodeError::FieldTooLarge {
+                name: field,
+                value,
+                bits: width as u32,
+            },
+        }
+    }
 }
 
 impl core::fmt::Display for EncodeError {
@@ -196,29 +154,63 @@ const fn check_reg(index: u32) -> Result<(), EncodeError> {
     }
 }
 
+impl Instruction {
+    /// Does an `SFPNOP` have to be inserted between an `SFPMAD` and this
+    /// instruction?
+    ///
+    /// On Blackhole the two-cycle `SFPMAD` latency is handled by hardware: it
+    /// stalls a thread that presents an instruction reading what the `SFPMAD`
+    /// wrote (`SFPMAD.md`, "Instruction scheduling"). That is a change from
+    /// Wormhole, and it means the blanket "always follow a multiply with a NOP"
+    /// rule is wrong here — it would just cost a cycle.
+    ///
+    /// What survives is a specific list of cases the stalling logic fails to
+    /// detect, which `SFPMAD.md` enumerates as hardware bugs. Three are
+    /// unconditional; four depend on the consuming instruction's `Mod1`, and since
+    /// an [`Instruction`] carries its definition, that can be read rather than
+    /// assumed.
+    ///
+    /// Separately, automatic stalling does not apply at all inside an
+    /// `SFPLOADMACRO` sequence — which ttsim does not implement, so that case
+    /// cannot arise against the simulator.
+    pub fn stalls_automatically_after_mad(self) -> bool {
+        let mod1 = self.operand("Mod1").unwrap_or(0);
+        let missed = match self.def().mnemonic() {
+            // The stalling logic ignores `USE_VB`, so it believes these always read
+            // `VD` and never `VB`.
+            "SFPAND" | "SFPOR" => mod1 & stall_modes::USE_VB != 0,
+            // It does not realise these read from `VD` at all, nor that `SFPCONFIG`
+            // can read `LReg[0]`.
+            "SFPIADD" | "SFPSHFT" | "SFPCONFIG" => true,
+            // Every mode but the unconditional swap compares `VC` and `VD` on its
+            // first cycle, and the stalling logic sees no reads there.
+            "SFPSWAP" => mod1 != stall_modes::SWAP_UNCONDITIONAL,
+            // Three modes it sees no reads in at all, and two where it watches `VD`
+            // while the instruction reads `VB`.
+            "SFPSHFT2" => {
+                let mut i = 0;
+                let mut found = false;
+                while i < stall_modes::SHFT2_MISSED.len() {
+                    found |= stall_modes::SHFT2_MISSED[i] == mod1;
+                    i += 1;
+                }
+                found
+            }
+            _ => false,
+        };
+        !missed
+    }
+}
+
 /// `SFPLOADI`: write a 16-bit immediate into all lanes of `LReg[vd]`.
 pub const fn loadi(vd: u32, mode: u32, imm16: u32) -> Result<Instruction, EncodeError> {
     if vd > MAX_WRITABLE_LREG {
         return Err(EncodeError::UnwritableDestination { vd });
     }
-    if imm16 > 0xFFFF {
-        return Err(EncodeError::FieldTooLarge {
-            name: "Imm16",
-            value: imm16,
-            bits: 16,
-        });
+    match encode::sfploadi(vd, mode, imm16) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(EncodeError::from_isa(e)),
     }
-    if mode > 0xF {
-        return Err(EncodeError::FieldTooLarge {
-            name: "Mod0",
-            value: mode,
-            bits: 4,
-        });
-    }
-    Ok(Instruction {
-        word: field(0, 16, imm16) | field(16, 4, mode) | field(20, 4, vd) | field(24, 8, 0x71),
-        kind: Kind::Loadi,
-    })
 }
 
 /// `SFPMUL`: lanewise FP32 `LReg[vd] = LReg[va] * LReg[vb]`.
@@ -262,41 +254,42 @@ pub const fn mad(
     if vd > MAX_WRITABLE_LREG {
         return Err(EncodeError::UnwritableDestination { vd });
     }
-    if mod1 > 0xF {
-        return Err(EncodeError::FieldTooLarge {
-            name: "Mod1",
-            value: mod1,
-            bits: 4,
-        });
-    }
-    // Opcode 0x84 is SFPMAD; 0x86 is SFPMUL, which `SFPMUL.md` calls the preferred
-    // spelling when VC is the constant-zero register. They are documented as the
-    // same instruction to the hardware, so the choice is presentational — with one
-    // practical constraint: ttsim implements opcode 0x86 only for `Mod1 <= 1`,
-    // while its 0x84 handler accepts `Mod1 <= 3`. Since the recommended
-    // negative-zero form needs NEGATE_VC, a modified multiply has to be spelled
-    // SFPMAD to run on the simulator at all.
-    let opcode = if vc == LREG_ZERO && mod1 == 0 {
-        0x86
+    // `SFPMUL.md` calls opcode 0x86 the preferred spelling when VC is the
+    // constant-zero register, and the two are documented as the same instruction
+    // to the hardware -- so the choice is presentational, with one practical
+    // constraint: ttsim implements 0x86 only for `Mod1 <= 1`, while its 0x84
+    // handler accepts `Mod1 <= 3`. Since the recommended negative-zero form needs
+    // NEGATE_VC, a modified multiply has to be spelled SFPMAD to run on the
+    // simulator at all. See docs/ttsim-divergence.md entry 17.
+    let encoded = if vc == LREG_ZERO && mod1 == 0 {
+        encode::Sfpmul::ZERO
+            .va(va)
+            .vb(vb)
+            .vc(vc)
+            .vd(vd)
+            .mod1(mod1)
+            .encode()
     } else {
-        0x84
+        encode::Sfpmad::ZERO
+            .va(va)
+            .vb(vb)
+            .vc(vc)
+            .vd(vd)
+            .mod1(mod1)
+            .encode()
     };
-    Ok(Instruction {
-        word: field(0, 4, mod1)
-            | field(4, 4, vd)
-            | field(8, 4, vc)
-            | field(12, 4, vb)
-            | field(16, 4, va)
-            | field(24, 8, opcode),
-        kind: Kind::Mad,
-    })
+    match encoded {
+        Ok(i) => Ok(i),
+        Err(e) => Err(EncodeError::from_isa(e)),
+    }
 }
 
 /// `SFPNOP`: occupy a Vector Unit sub-unit for one cycle.
 pub const fn nop() -> Instruction {
-    Instruction {
-        word: field(24, 8, 0x8F),
-        kind: Kind::Nop,
+    match encode::sfpnop() {
+        Ok(i) => i,
+        // No operands, so nothing can fail to fit.
+        Err(_) => unreachable!(),
     }
 }
 
@@ -304,6 +297,11 @@ pub const fn nop() -> Instruction {
 ///
 /// With `imm10 = 0` and the address-modification registers at their reset values,
 /// lane *n* lands at `Dst[n / 8][(n & 7) * 2]` — rows 0..=3, even columns.
+///
+/// This is the Blackhole encoding, with `AddrMod` three bits wide at bit 13 rather
+/// than Wormhole's two at bit 14. That is no longer a fact to remember: the two are
+/// separate entries in the generated table, and the Wormhole one is only reachable
+/// as `isa::generated::defs::wormhole::SFPSTORE`.
 pub const fn store(
     vd: u32,
     format: u32,
@@ -313,36 +311,10 @@ pub const fn store(
     if let Err(e) = check_reg(vd) {
         return Err(e);
     }
-    if imm10 > 0x3FF {
-        return Err(EncodeError::FieldTooLarge {
-            name: "Imm10",
-            value: imm10,
-            bits: 10,
-        });
+    match encode::sfpstore(vd, format, addr_mod, imm10) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(EncodeError::from_isa(e)),
     }
-    // Three bits on Blackhole, two on Wormhole.
-    if addr_mod > 0x7 {
-        return Err(EncodeError::FieldTooLarge {
-            name: "AddrMod",
-            value: addr_mod,
-            bits: 3,
-        });
-    }
-    if format > 0xF {
-        return Err(EncodeError::FieldTooLarge {
-            name: "Mod0",
-            value: format,
-            bits: 4,
-        });
-    }
-    Ok(Instruction {
-        word: field(0, 10, imm10)
-            | field(13, 3, addr_mod)
-            | field(16, 4, format)
-            | field(20, 4, vd)
-            | field(24, 8, 0x72),
-        kind: Kind::Store,
-    })
 }
 
 /// Load a full FP32 constant into `LReg[vd]`.
@@ -570,6 +542,54 @@ mod tests {
                 "{:#010x} has no .ttinsn form",
                 i.word()
             );
+        }
+    }
+
+    /// This predicate used to return `true` for every instruction the module could
+    /// encode, which made it a comment with a function signature. It can answer the
+    /// real question now, because an [`Instruction`] carries its definition and its
+    /// operands — so the four mode-dependent cases in `SFPMAD.md`'s list can be
+    /// decided rather than assumed.
+    #[test]
+    fn the_cases_automatic_stalling_misses_are_the_documented_ones() {
+        use crate::isa::generated::encode;
+
+        // Nothing this module's own wrappers emit is on the list, which is why the
+        // step 4 firmware pushes SFPMUL straight into SFPSTORE with no SFPNOP.
+        assert!(store(2, store_format::FP32, 0, 0)
+            .unwrap()
+            .stalls_automatically_after_mad());
+        assert!(nop().stalls_automatically_after_mad());
+        assert!(loadi(0, loadi_mode::UPPER, 0)
+            .unwrap()
+            .stalls_automatically_after_mad());
+
+        // Unconditional: the logic does not see that these read VD.
+        assert!(!encode::sfpiadd(0, 0, 1, 0)
+            .unwrap()
+            .stalls_automatically_after_mad());
+        assert!(!encode::sfpshft(0, 0, 1, 0)
+            .unwrap()
+            .stalls_automatically_after_mad());
+
+        // Conditional on Mod1: SFPAND is only a hazard with USE_VB.
+        let and = |mod1| {
+            encode::sfpand(0, 1, 2, mod1)
+                .unwrap()
+                .stalls_automatically_after_mad()
+        };
+        assert!(and(0), "without USE_VB the logic tracks it correctly");
+        assert!(!and(stall_modes::USE_VB));
+
+        // SFPSWAP is safe in exactly one mode, the unconditional swap.
+        let swap = |mod1| {
+            encode::sfpswap(0, 1, mod1)
+                .unwrap()
+                .stalls_automatically_after_mad()
+        };
+        assert!(swap(stall_modes::SWAP_UNCONDITIONAL));
+        for mod1 in 1..=8 {
+            assert!(!swap(mod1), "SFPSWAP mode {mod1} is on the list");
         }
     }
 

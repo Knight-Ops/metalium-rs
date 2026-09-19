@@ -35,14 +35,33 @@ jobs:
           path: vendor/libttsim_bh.so
           key: libttsim-${{ hashFiles('PINS.toml') }}
 
+      # The specification tree is the third pinned input. It is verified by a
+      # digest over the contents of the files the generators read, not by the
+      # tarball's hash -- GitHub does not promise source archives are byte-stable.
+      - name: Cache the pinned specification tree
+        uses: actions/cache@v4
+        with:
+          path: vendor/tt-isa-documentation
+          key: tt-isa-docs-${{ hashFiles('PINS.toml') }}
+
       - name: Fetch simulator
         run: cargo xtask fetch-ttsim
+
+      - name: Fetch specification
+        run: cargo xtask fetch-spec
 
       # The backend-configuration table is generated, never transcribed. This
       # proves the committed table still matches the pinned header, so a pin bump
       # cannot silently diverge from the code that depends on it.
       - name: Generated config table is current
         run: cargo xtask gen-cfg --check
+
+      # The instruction table is generated from Bits32.lua and cross-checked against
+      # the syntax blocks on the pages that embed each diagram. This proves the
+      # committed table still matches the pinned specification, and that the two
+      # descriptions of the instruction set still agree with each other.
+      - name: Generated instruction table is current
+        run: cargo xtask gen-isa --check
 
       - name: Format
         run: cargo fmt --all --check

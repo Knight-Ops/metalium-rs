@@ -34,13 +34,51 @@ pub const THREAD_INDEX: u64 = MAILBOX_BASE + 0x1C;
 /// Requested `RISC_DEST_ACCESS_CTRL_SEC*.fmt`, so a test can vary it.
 pub const DST_ACCESS_FMT: u64 = MAILBOX_BASE + 0x20;
 
+/// How many instruction words the host has staged at [`PROGRAM`].
+pub const PROGRAM_LEN: u64 = MAILBOX_BASE + 0x24;
+/// How many `Dst` rows the firmware should copy to [`DUMP`] afterwards.
+pub const DUMP_ROW_COUNT: u64 = MAILBOX_BASE + 0x28;
+/// First `Dst` row to copy.
+pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
+
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x40;
+
+/// A Tensix instruction stream, staged by the host.
+///
+/// The descriptor lives in the mailbox; the program itself does not, because it is
+/// unbounded in a way the mailbox is not. Putting it here is what makes the corpus
+/// firmware generic: the host encodes a program with `tt_isa::isa`, writes the
+/// words, and the same image runs it. Adding an instruction to the corpus is then a
+/// host-side test case rather than a firmware change.
+pub const PROGRAM: u64 = MAILBOX_BASE + 0x1000;
+/// Most instructions a program may hold.
+pub const PROGRAM_MAX: u32 = 256;
+
+/// Where the firmware copies `Dst` rows for the host to read.
+///
+/// `Dst` is not reachable over the NoC, so this is the only way a host sees a
+/// compute result. Sixteen 32-bit datums per row.
+pub const DUMP: u64 = MAILBOX_BASE + 0x2000;
+/// Most `Dst` rows a run may copy out.
+pub const DUMP_MAX_ROWS: u32 = 16;
+/// Datums in one `Dst` row.
+pub const DUMP_ROW_WORDS: u32 = 16;
+
+/// Byte offset of `Dst` row `row`, datum `column`, within [`DUMP`].
+pub const fn dump_offset(row: u32, column: u32) -> u64 {
+    DUMP + ((row * DUMP_ROW_WORDS + column) as u64) * 4
+}
 
 // Compile-time rather than a test: if the mailbox ever moved past the end of L1,
 // every access to it would be out of bounds, and that should stop the build rather
 // than fail a test run.
 const _: () = assert!(MAILBOX_BASE + MAILBOX_SIZE <= crate::tensix::L1_SIZE);
+const _: () = assert!(PROGRAM + (PROGRAM_MAX as u64) * 4 <= DUMP);
+const _: () =
+    assert!(dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) + 4 <= crate::tensix::L1_SIZE);
+// The descriptor words have to stay inside the mailbox the firmware owns.
+const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 
 /// Values written to [`STATUS`].
 ///

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cfg;
+pub mod isa;
 pub mod mailbox;
 pub mod noc;
 pub mod sfpu;

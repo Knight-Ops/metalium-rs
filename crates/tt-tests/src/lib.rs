@@ -15,9 +15,16 @@ pub mod firmware {
     /// FP32 bit pattern.
     pub const SFPU_MUL: &[u8] = include_bytes!(env!("FIRMWARE_SFPU_MUL"));
 
+    /// A generic Tensix program runner: pushes the instruction stream the host
+    /// staged in L1 and copies the requested `Dst` rows back out.
+    ///
+    /// Adding a case to the instruction corpus is a host-side change, not a
+    /// firmware one.
+    pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
+
     /// Where a firmware image must be loaded in L1.
     ///
-    /// Fixed by `crates/tt-firmware/link-t0.x`, which places `.text` at RISCV T0's
+    /// Fixed by `crates/tt-firmware/link.x`, which places `.text` at RISCV T0's
     /// default reset PC so the image runs whether or not the loader programs the
     /// reset-PC override.
     pub const LOAD_ADDRESS: u64 = 0x6000;
