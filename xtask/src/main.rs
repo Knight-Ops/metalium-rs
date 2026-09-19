@@ -341,6 +341,30 @@ struct Field {
 /// is regular: every field has exactly those three defines plus an `_RMW`
 /// convenience macro, which is skipped because it carries no information the
 /// other three do not.
+///
+/// # Why this is hand-rolled rather than bindgen
+///
+/// bindgen runs on this header and produces 2467 flat `u32` constants, but two
+/// things make it the wrong tool:
+///
+/// * **It silently drops the `TileDescriptor` masks.** They are
+///   `0xffffffffffffffffffffffffffffffff`, which clang rejects as "integer
+///   literal is too large to be represented in any integer type". bindgen emits
+///   the field's `ADDR32` and `SHAMT` and omits the `MASK`, with no diagnostic —
+///   a field that looks complete and is not. The loop below errors on exactly
+///   that shape instead, which is how the `_CFGREG_BASE` defines were found.
+/// * **It discards the section comments**, and section membership is the whole
+///   point: it decides `Config` versus `ThreadConfig`, and therefore which write
+///   instruction is legal, whether RISC-V may write the field at all, and whether
+///   values are 16 or 32 bits wide. Without it there is no typing to do.
+///
+/// The resilience a real C parser would buy is bought here instead by failing
+/// loudly: a missing triple, a field before any section header, a section with no
+/// base, an unexpected wide mask, or zero fields parsed are all hard errors, and
+/// `gen-cfg --check` runs in CI and pre-commit so a pin bump cannot drift quietly.
+///
+/// bindgen *is* the right tool for `tt-kmd`'s `ioctl.h`, which is real C with
+/// structs rather than a wall of macros.
 /// A field under construction: its section, then `ADDR32`, `SHAMT` and `MASK` as
 /// each is encountered. The header emits them on consecutive lines, but nothing
 /// in the format guarantees that, so they are collected independently.

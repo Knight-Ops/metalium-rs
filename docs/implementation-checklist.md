@@ -133,7 +133,12 @@ no answer.
       aliasing.
 - [ ] **Gate (sim) under `bh_x2`** — chip indexing is typed but never exercised.
       Needs `libttsim_bh_x2.so` and a second `ChipId`.
-- [ ] **`tt-kmd` crate** — open `/dev/tenstorrent/N`, mmap BAR0/2/4, wrap
+- [ ] **`tt-kmd` crate** — generate the ioctl structs with **bindgen** from
+      tt-kmd's `ioctl.h`; it is real C with structs, which is what bindgen is good
+      at, and `ethdump.c` only inlines a partial copy. (Not bindgen for
+      `cfg_defines.h` — see the note on `parse_cfg_defines`; it silently drops the
+      two oversized masks and discards the section comments that decide
+      `Config` vs `ThreadConfig`.) Then open `/dev/tenstorrent/N`, mmap BAR0/2/4, wrap
       `ALLOCATE_TLB` (`0xFA0B`) / `CONFIGURE_TLB` / `FREE_TLB`,
       `GET_DEVICE_INFO` (`0xFA00`), `QUERY_MAPPINGS` (`0xFA02`),
       `SET_NOC_CLEANUP` (`0xFA0E`).
