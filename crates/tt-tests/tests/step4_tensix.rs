@@ -238,6 +238,10 @@ fn a_held_backend_does_not_produce_the_answer() {
         dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits())
             .unwrap();
         dev.write32(&w, tile, mailbox::RESULT, SENTINEL).unwrap();
+        dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
+            .unwrap();
+        dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, DST_FMT_FP32)
+            .unwrap();
 
         // Deliberately skip release_tensix_backend.
         dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
@@ -272,6 +276,10 @@ fn the_firmware_reaches_done_not_just_running() {
         dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits())
             .unwrap();
         dev.write32(&w, tile, mailbox::OPERAND_B, 2.0f32.to_bits())
+            .unwrap();
+        dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
+            .unwrap();
+        dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, DST_FMT_FP32)
             .unwrap();
         dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
             .unwrap();

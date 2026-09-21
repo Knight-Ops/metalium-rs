@@ -251,6 +251,170 @@ pub const INSTRN1_BUF_BASE: u64 = 0xFFE5_0000;
 /// B → Tensix thread 2. Same hazard as [`INSTRN1_BUF_BASE`].
 pub const INSTRN2_BUF_BASE: u64 = 0xFFE6_0000;
 
+/// Which Tensix thread an instruction is being pushed to.
+///
+/// A marker type rather than a number because the legal `(core, thread)` pairs are
+/// a sparse table, not a range — see [`PushesTo`].
+pub trait TensixThread {
+    /// 0, 1 or 2. Needed where a thread index is data rather than a choice, such as
+    /// the mailbox word the host and the image cross-check against each other.
+    const INDEX: u32;
+
+    /// `RISC_DEST_ACCESS_CTRL_SEC[INDEX].fmt` — the shape of this thread's RISC-V
+    /// view of `Dst` (`Dst.md`, "RISCV access to Dst").
+    ///
+    /// Carried here because the field is per-thread and picking it by matching on a
+    /// runtime index is how the wrong one gets chosen. `SEC` numbering follows the
+    /// thread, which is why the association is exact rather than conventional.
+    const DST_ACCESS_FMT: crate::cfg::ConfigField;
+}
+
+/// Tensix thread 0.
+pub struct Thread0;
+/// Tensix thread 1.
+pub struct Thread1;
+/// Tensix thread 2.
+pub struct Thread2;
+
+impl TensixThread for Thread0 {
+    const INDEX: u32 = 0;
+    const DST_ACCESS_FMT: crate::cfg::ConfigField =
+        crate::cfg::generated::alu::RISC_DEST_ACCESS_CTRL_SEC0_fmt;
+}
+impl TensixThread for Thread1 {
+    const INDEX: u32 = 1;
+    const DST_ACCESS_FMT: crate::cfg::ConfigField =
+        crate::cfg::generated::alu::RISC_DEST_ACCESS_CTRL_SEC1_fmt;
+}
+impl TensixThread for Thread2 {
+    const INDEX: u32 = 2;
+    const DST_ACCESS_FMT: crate::cfg::ConfigField =
+        crate::cfg::generated::alu::RISC_DEST_ACCESS_CTRL_SEC2_fmt;
+}
+
+/// A baby RISC-V core, as a type.
+///
+/// Core identity cannot be discovered at run time -- `mhartid` reads zero on every
+/// core and `misa` lies (see [`Core`]) -- so which core an image runs on is a
+/// build-time fact. That is exactly what makes it expressible in the type system,
+/// and [`PushesTo`] is why it is worth expressing: the `(core, buffer)` table has
+/// two entries that hang the core unrecoverably.
+///
+/// RISCV NC deliberately does not implement this trait: it cannot push at all
+/// (`PushTensixInstruction.md:3`).
+///
+/// ```
+/// # use tt_isa::tensix::{PushCore, RiscvT1};
+/// fn needs_push_core<C: PushCore>() -> &'static str { C::CORE.name() }
+/// assert_eq!(needs_push_core::<RiscvT1>(), "T1");
+/// ```
+///
+/// ```compile_fail
+/// # use tt_isa::tensix::{PushCore, RiscvNc};
+/// fn needs_push_core<C: PushCore>() {}
+/// needs_push_core::<RiscvNc>();
+/// ```
+pub trait PushCore {
+    /// The runtime spelling of the same fact, so the two cannot drift.
+    const CORE: Core;
+}
+
+/// RISCV B. The only core that can reach all three Tensix threads.
+pub struct RiscvB;
+/// RISCV T0.
+pub struct RiscvT0;
+/// RISCV T1.
+pub struct RiscvT1;
+/// RISCV T2.
+pub struct RiscvT2;
+/// RISCV NC. Implements neither [`PushCore`] nor [`PushesTo`], by construction.
+pub struct RiscvNc;
+
+impl PushCore for RiscvB {
+    const CORE: Core = Core::B;
+}
+impl PushCore for RiscvT0 {
+    const CORE: Core = Core::T0;
+}
+impl PushCore for RiscvT1 {
+    const CORE: Core = Core::T1;
+}
+impl PushCore for RiscvT2 {
+    const CORE: Core = Core::T2;
+}
+
+/// Which buffer address reaches thread `Th` from this core.
+///
+/// **This trait exists to make a hang unrepresentable.** The table in
+/// `PushTensixInstruction.md:5-9` is:
+///
+/// | Store address | B | T0 | T1 | T2 |
+/// |---|---|---|---|---|
+/// | [`INSTRN_BUF_BASE`] | thread 0 | thread 0 | thread 1 | thread 2 |
+/// | [`INSTRN1_BUF_BASE`] | thread 1 | *hangs* | *hangs* | *hangs* |
+/// | [`INSTRN2_BUF_BASE`] | thread 2 | *hangs* | *hangs* | *hangs* |
+///
+/// "Hangs" is not a fault that can be caught: it is an unrecoverable lockup of the
+/// RISC-V, so a stray store is unrecoverable rather than merely wrong. The impls
+/// below are exactly the non-hanging cells, so the bad combinations do not compile
+/// instead of being documented and hoped about.
+///
+/// Note that T0/T1/T2 each reach only their *own* thread, and all three do it
+/// through [`INSTRN_BUF_BASE`] -- the buffer address does not identify the thread,
+/// the pair does.
+///
+/// A legal pair resolves:
+///
+/// ```
+/// # use tt_isa::tensix::{PushesTo, RiscvB, Thread2, INSTRN2_BUF_BASE};
+/// assert_eq!(<RiscvB as PushesTo<Thread2>>::INSTRN_BUF, INSTRN2_BUF_BASE);
+/// ```
+///
+/// T0 reaching thread 1 would store to `INSTRN1_BUF_BASE` and hang the core. It
+/// does not compile:
+///
+/// ```compile_fail
+/// # use tt_isa::tensix::{PushesTo, RiscvT0, Thread1};
+/// let _ = <RiscvT0 as PushesTo<Thread1>>::INSTRN_BUF;
+/// ```
+///
+/// Nor does T2 reaching thread 0:
+///
+/// ```compile_fail
+/// # use tt_isa::tensix::{PushesTo, RiscvT2, Thread0};
+/// let _ = <RiscvT2 as PushesTo<Thread0>>::INSTRN_BUF;
+/// ```
+///
+/// Nor NC reaching anything at all:
+///
+/// ```compile_fail
+/// # use tt_isa::tensix::{PushesTo, RiscvNc, Thread0};
+/// let _ = <RiscvNc as PushesTo<Thread0>>::INSTRN_BUF;
+/// ```
+pub trait PushesTo<Th: TensixThread>: PushCore {
+    /// Address to `sw` the instruction word to.
+    const INSTRN_BUF: u64;
+}
+
+impl PushesTo<Thread0> for RiscvB {
+    const INSTRN_BUF: u64 = INSTRN_BUF_BASE;
+}
+impl PushesTo<Thread1> for RiscvB {
+    const INSTRN_BUF: u64 = INSTRN1_BUF_BASE;
+}
+impl PushesTo<Thread2> for RiscvB {
+    const INSTRN_BUF: u64 = INSTRN2_BUF_BASE;
+}
+impl PushesTo<Thread0> for RiscvT0 {
+    const INSTRN_BUF: u64 = INSTRN_BUF_BASE;
+}
+impl PushesTo<Thread1> for RiscvT1 {
+    const INSTRN_BUF: u64 = INSTRN_BUF_BASE;
+}
+impl PushesTo<Thread2> for RiscvT2 {
+    const INSTRN_BUF: u64 = INSTRN_BUF_BASE;
+}
+
 /// Base of the PCBuf / Manual TTSync / Tensix semaphore region
 /// (`BabyRISCV/README.md:126-128`).
 pub const PC_BUF_BASE: u64 = 0xFFE8_0000;
@@ -518,5 +682,84 @@ mod tests {
     fn only_nc_cannot_push_tensix_instructions() {
         assert!(!Core::NC.can_push_tensix());
         assert!(Core::ALL.iter().filter(|c| c.can_push_tensix()).count() == 4);
+    }
+
+    /// Every type that can push names a core that [`Core::can_push_tensix`] agrees
+    /// can push.
+    ///
+    /// This is what keeps the runtime enum and the type-level table from drifting.
+    /// `RiscvNc` cannot appear here: it implements neither trait. That absence is
+    /// gated by the `compile_fail` example on [`PushCore`], which rustdoc runs --
+    /// this module is `cfg(test)`, so an example placed here would never run at all.
+    #[test]
+    fn every_pushing_core_type_agrees_with_the_enum() {
+        fn check<C: PushCore>() {
+            assert!(
+                C::CORE.can_push_tensix(),
+                "{} implements PushCore but the enum says it cannot push",
+                C::CORE.name()
+            );
+        }
+        check::<RiscvB>();
+        check::<RiscvT0>();
+        check::<RiscvT1>();
+        check::<RiscvT2>();
+    }
+
+    /// The buffer address for each legal `(core, thread)` pair, against the table in
+    /// `PushTensixInstruction.md:5-9`.
+    ///
+    /// The illegal pairs are asserted by absence -- `PushesTo` has six impls and the
+    /// table has six non-hanging cells -- and by the `compile_fail` examples on
+    /// [`PushesTo`] itself, which are the gate actually watched failing: it is the
+    /// hang that matters, and a hang cannot be caught at run time.
+    #[test]
+    fn the_legal_push_pairs_use_the_documented_buffers() {
+        // RISCV B reaches all three threads, one buffer each.
+        assert_eq!(
+            <RiscvB as PushesTo<Thread0>>::INSTRN_BUF,
+            INSTRN_BUF_BASE,
+            "B -> Tensix thread 0"
+        );
+        assert_eq!(<RiscvB as PushesTo<Thread1>>::INSTRN_BUF, INSTRN1_BUF_BASE);
+        assert_eq!(<RiscvB as PushesTo<Thread2>>::INSTRN_BUF, INSTRN2_BUF_BASE);
+
+        // T0/T1/T2 reach only their own thread, and all three do it through the
+        // *same* address. The buffer does not identify the thread; the pair does.
+        assert_eq!(<RiscvT0 as PushesTo<Thread0>>::INSTRN_BUF, INSTRN_BUF_BASE);
+        assert_eq!(<RiscvT1 as PushesTo<Thread1>>::INSTRN_BUF, INSTRN_BUF_BASE);
+        assert_eq!(<RiscvT2 as PushesTo<Thread2>>::INSTRN_BUF, INSTRN_BUF_BASE);
+    }
+
+    /// The per-thread `Dst` access format fields are the ones the specification
+    /// names, and they are distinct.
+    ///
+    /// Distinctness is the point: the previous spelling picked between them by
+    /// matching on a runtime thread index, where a missing arm is a silent
+    /// misconfiguration of a *different* thread rather than an error.
+    #[test]
+    fn each_thread_carries_its_own_dst_access_format_field() {
+        use crate::cfg::generated::alu;
+
+        assert_eq!(Thread0::DST_ACCESS_FMT, alu::RISC_DEST_ACCESS_CTRL_SEC0_fmt);
+        assert_eq!(Thread1::DST_ACCESS_FMT, alu::RISC_DEST_ACCESS_CTRL_SEC1_fmt);
+        assert_eq!(Thread2::DST_ACCESS_FMT, alu::RISC_DEST_ACCESS_CTRL_SEC2_fmt);
+
+        let shamts = [
+            Thread0::DST_ACCESS_FMT.shamt(),
+            Thread1::DST_ACCESS_FMT.shamt(),
+            Thread2::DST_ACCESS_FMT.shamt(),
+        ];
+        assert_eq!(
+            shamts.len(),
+            3,
+            "three threads, three fields -- see the distinctness check below"
+        );
+        assert!(
+            shamts[0] != shamts[1] && shamts[1] != shamts[2] && shamts[0] != shamts[2],
+            "the three fields must be distinct: {shamts:?}"
+        );
+
+        assert_eq!([Thread0::INDEX, Thread1::INDEX, Thread2::INDEX], [0, 1, 2]);
     }
 }

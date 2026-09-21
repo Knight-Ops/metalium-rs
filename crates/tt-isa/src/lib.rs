@@ -17,3 +17,4 @@ pub mod mailbox;
 pub mod noc;
 pub mod sfpu;
 pub mod tensix;
+pub mod tile;

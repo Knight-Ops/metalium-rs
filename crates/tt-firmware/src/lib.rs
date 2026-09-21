@@ -162,7 +162,7 @@ fn panic(info: &PanicInfo) -> ! {
 /// Pushing Tensix instructions from a baby RISC-V core.
 pub mod tensix {
     use tt_isa::sfpu::Instruction;
-    use tt_isa::tensix;
+    use tt_isa::tensix::{self, PushesTo, TensixThread};
 
     /// Push one Tensix instruction into this core's Tensix thread.
     ///
@@ -182,17 +182,33 @@ pub mod tensix {
     /// encoding is implemented and tested in `tt_isa::sfpu`; using it belongs with
     /// the rest of the performance work, when there is a measurement to justify it.
     ///
+    /// # Which core, and which thread
+    ///
+    /// `C` is the core this image runs on and `Th` is the Tensix thread to reach.
+    /// Both are type parameters rather than arguments because the buffer address
+    /// depends on the *pair*, and two of the nine combinations hang the RISC-V
+    /// unrecoverably (`PushTensixInstruction.md:5-9`). `tt_isa::tensix::PushesTo`
+    /// is implemented for exactly the six that do not, so a hanging push is a
+    /// compile error rather than a lockup. `C` cannot be inferred -- core identity
+    /// is not discoverable at run time -- so every call site names it, which is the
+    /// point.
+    ///
     /// # Safety
     ///
-    /// Only RISCV B, T0, T1 and T2 may push; NC cannot. The caller is responsible
-    /// for the Tensix-side state the instruction assumes — in particular that the
-    /// backend is out of soft reset, since instructions issued while it is held
-    /// "might or might not be silently discarded".
+    /// The caller is responsible for the Tensix-side state the instruction assumes
+    /// — in particular that the backend is out of soft reset, since instructions
+    /// issued while it is held "might or might not be silently discarded" — and for
+    /// `C` actually being the core executing this code. Nothing can check the
+    /// latter: `mhartid` reads zero everywhere.
     #[inline]
-    pub unsafe fn push(instruction: Instruction) {
+    pub unsafe fn push<C, Th>(instruction: Instruction)
+    where
+        Th: TensixThread,
+        C: PushesTo<Th>,
+    {
         unsafe {
             core::ptr::write_volatile(
-                tensix::INSTRN_BUF_BASE as *mut u32,
+                <C as PushesTo<Th>>::INSTRN_BUF as *mut u32,
                 instruction.word(),
             )
         }
@@ -209,8 +225,12 @@ pub mod tensix {
     /// As [`push`], and additionally the word must be a valid encoding — nothing
     /// here checks it.
     #[inline]
-    pub unsafe fn push_word(word: u32) {
-        unsafe { core::ptr::write_volatile(tensix::INSTRN_BUF_BASE as *mut u32, word) }
+    pub unsafe fn push_word<C, Th>(word: u32)
+    where
+        Th: TensixThread,
+        C: PushesTo<Th>,
+    {
+        unsafe { core::ptr::write_volatile(<C as PushesTo<Th>>::INSTRN_BUF as *mut u32, word) }
     }
 
     /// Block until the Tensix coprocessor has retired every instruction this

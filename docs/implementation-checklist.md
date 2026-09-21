@@ -26,7 +26,7 @@ gate you have not seen reject something is not yet evidence.
 | 1 — Host addresses the chip | `[~]` | TLB/L1 and the dual-chip gate done against the simulator; `tt-kmd` not started |
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
 | 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
-| 4 — Layout | `[ ]` | |
+| 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
 | 5 — Elementwise binary | `[ ]` | |
 | 6 — Matmul | `[ ]` | The schedule risk |
 | 7 — Burn backend, training | `[ ]` | The milestone |
@@ -86,9 +86,18 @@ no answer.
       encodings differ in where `AddrMod` sits (13..15 against 14..15) and are now
       separate table entries; the superseded one lives under
       `isa::generated::defs::wormhole`, so using it has to be deliberate.
-- [ ] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
-      Currently only documented. Make the buffer address a type parameterised by
-      core role so the bad combination does not compile. *(Phase 3 leftover.)*
+- [x] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
+      `tt_isa::tensix::PushesTo<Th>` is implemented for exactly the six non-hanging
+      cells of `PushTensixInstruction.md:5-9`, so `push::<RiscvT0, Thread1>` does not
+      compile. Marker types rather than a runtime check because a hang cannot be
+      caught: it is an unrecoverable lockup, not a fault. Watched failing — adding
+      the `RiscvT0 -> Thread1` impl turns exactly that `compile_fail` doctest red and
+      no other. `Core::can_push_tensix` was dead before this and is now tied to the
+      type-level table by a test, and RISCV NC implements neither trait.
+      The cross-check it forced on the firmware found a live bug: `step4_tensix.rs`
+      never wrote `mailbox::THREAD_INDEX`, so the firmware read 0 and configured
+      **SEC0** — thread 0's `Dst` mapping — while running on T1. It passed only
+      because `fmt = 0` is also the reset default.
 - [ ] `Dst` exclusivity across the three Tensix threads. *(Phase 5–6.)*
 - [ ] `SrcA`/`SrcB` bank ownership handshake. *(Phase 6.)*
 - [ ] `NOC_CMD_WR_INLINE` must never target an L1 address. *(Needed once a core
@@ -293,15 +302,78 @@ testable, and it forces the hardest architectural decision — how tiled layout 
 block-float formats meet Burn's strided tensor model — while that is still cheap to
 change.
 
-- [ ] Row-major strided ↔ 32×32 tiled.
-- [ ] Padding for non-multiple-of-32 shapes.
-- [ ] FP32/BF16/FP16 conversion using the documented `Dst`/`Src` bit layouts, not
-      IEEE assumptions.
-- [ ] **Gate (sim):** property-tested round-trip, all dtypes, awkward shapes
-      (`[13, 47]`, `[1, 1, 1024]`). Cheap in the simulator, expensive on hardware.
-- [ ] **Gate (silicon):** representative sample plus every shape that exercises an
-      alignment boundary. `BlackholeA0/NoC/Alignment.md` does not exist and
-      violations are `UndefinedBehavior`, so this gate is where those get validated.
+**A tile is not a 32×32 square.** `UNPACR_Regular.md:182` treats a tile's datums as
+a flat `W`/`Z`/`Y`/`X` array with `X` fastest, dimensioned by a `TileDescriptor` in
+backend configuration. The familiar four-16×16-face tile is a *choice of
+descriptor*, so `tt_isa::tile` models the descriptor and `Layout::tt_metal_32x32` is
+one preset over it. Hardcoding 32×32 would have baked in an assumption the
+specification does not make.
+
+- [x] Row-major strided ↔ tiled. `crates/tt-layout`: `TensorView` carries shape and
+      **element strides**, so Burn's model is the input type rather than something
+      adapted to later. A transposed view is gated.
+- [x] Padding for shapes that are not a multiple of the tile extent. `PadValue::Zero`
+      is named rather than assumed — zero is right for accumulation and wrong for a
+      min-reduction, and only the caller knows which. `detilize` drops it.
+- [x] FP32/BF16/FP16 conversion against the documented bit patterns. **Not** the
+      `Dst`/`Src` layouts — see the correction below. BF16 has both documented
+      rounding modes because the packer offers both. FP16 conversion *refuses*
+      rather than approximates: the coprocessor has no NaN encoding and reads
+      `Exp == 31` as a finite value, so `fp32_to_fp16` returns
+      `Err(NoNanEncoding)` rather than silently substituting a number.
+- [x] **Gate (sim), host-side:** `crates/tt-layout/tests/roundtrip.rs`, proptest with
+      a deterministic RNG (CI is flake-free on purpose, and proptest seeds from the
+      OS by default), plus the named awkward shapes `[13, 47]` and `[1, 1, 1024]`.
+- [x] **Gate (sim), against the specification:** `crates/tt-layout/tests/placement.rs`
+      re-derives `FirstDatum` and the datum address from `UNPACR_Regular.md:55-212`
+      *without* calling `TileImage`, and checks every coordinate of seven
+      descriptors. **This gate exists because the round-trip gate is vacuous alone:**
+      watched passing unchanged with the face convention transposed, which
+      `placement.rs` catches. A round trip only proves tilize and detilize agree.
+- [x] **Gate (sim), through the transport:** `crates/tt-tests/tests/step7_layout.rs`
+      stages a tiled image in a Tensix tile's L1 through one window and reads it back
+      through another, including a grid filling the top of L1. Watched failing: a
+      negative control corrupts one datum in L1 and asserts the recovered tensor
+      differs, in exactly one element.
+- [x] **Numerics pinned to the document, not to an epsilon.** `bfp8_to_bf16` is
+      checked **exhaustively** over all 65 536 inputs against the C in
+      `FloatBitPatterns.md:117-134`. The documented traps are named tests: FP16
+      `Exp == 31` is finite, and BFP8 `Sign = 1, Mag = 0` is −2¹²⁸ rather than −0, so
+      `-0.0` does not survive a BFP8 round trip.
+- [~] **BFP-ready without BFP.** Datum widths are in **bits** so BFP4/BFP2 need no
+      signature change, and `TileImage` sizes and places the shared-exponent section
+      for BFP8 — tested — though no BFP encoder exists. The packer's encode direction
+      is Wormhole-only and cannot be checked against anything until Phase 6.
+- [ ] **Gate (silicon):** written and `#[cfg(feature = "silicon")]`, two tests.
+      **The alignment scope is narrower than this plan assumed.**
+      `WormholeB0/NoC/Alignment.md:19,23` says data travelling *from the host via
+      PCIe to an L1 address* has **no alignment restrictions at all**, so the host
+      staging path cannot violate anything. The C16 congruence applies when an L1
+      address is the *source* — the unpacker and packer driving the NoC — which is
+      Phase 6. The silicon test therefore asserts the documented "Any" across eleven
+      deliberately misaligned tile bases; a failure is a finding against a
+      Wormhole-sourced page Blackhole does not carry.
+
+### Two corrections to `RUST_IMPL_PLAN.md`
+
+1. **The conversion reference.** The plan says Phase 4 converts "using the documented
+   `Dst`/`Src` bit layouts". Those describe the **register files** — 19-bit `Src`
+   datums, swizzled 16/32-bit `Dst` ones — and are already generated into
+   `tt_isa::isa::generated::datum`. Host↔**L1** conversion is governed by
+   `FloatBitPatterns.md` and `Packers/FormatConversion.md:85-104`. Both matter, for
+   different directions: the `Dst` layouts are what the corpus firmware's readback
+   path uses. Implementing against the register layout here would have been wrong.
+2. **The alignment gate**, as above: the host→L1 path is documented as unrestricted.
+
+### Open, and deliberately so
+
+- [ ] **Which `Z` plane is which face of a tile is a convention, not a
+      specification.** The address generator fixes the *order* datums are visited;
+      nothing says which 2-D patch a `Z` plane corresponds to.
+      `Layout::tt_metal_32x32` picks row-major faces of row-major datums, and
+      `placement.rs` **pins** that choice with a test whose failure means the
+      convention changed — it does not claim the choice is correct. Settle it in
+      Phase 6 against what the unpacker's ADC walk wants; it is a one-line change.
 
 ---
 
@@ -529,6 +601,13 @@ Documented, not speculative. These bite in Phases 2–4.
       most likely to be modelled loosely. Resolve at the Phase 2 silicon gate.
 - [ ] **7.** Does ttsim model the documented hardware bugs, or the intended
       behaviour? Probe with targeted tests in Phase 3.
+- [ ] **9.** *(New.)* **The 4-bit `InDataFormat`/`OutDataFormat` codes are
+      undocumented** — absent from the specification tree *and* from
+      `cfg_defines.h`, which is why `tt_isa::tile::L1Format` carries no numeric
+      encoding. `libttsim_bh.so` prints them (`in_data_format=%d incompatible with
+      out_data_format=%d`) and validates pairs, so the mapping is *measurable*
+      against the simulator. Not needed for a host-side tile image; needed the moment
+      a `TileDescriptor` is staged into configuration. Resolve in Phase 6.
 - [ ] **8.** *(New.)* The Tensix grid topology in `tt_isa::noc::grid` was **measured
       against ttsim**, not quoted — `NOC_ENDPOINT_ID` is unimplemented there, so the
       documented discovery probe is unavailable. Three independent figures agree,

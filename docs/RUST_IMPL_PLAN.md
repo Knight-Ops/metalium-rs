@@ -659,17 +659,27 @@ counter concurrently.
 
 ### Phase 4 — Layout before compute (~4 weeks)
 
-**Deliverable:** `tt-layout`. Row-major strided ↔ 32×32 tiled. Padding for non-multiple-of-32
-shapes. FP32/BF16/FP16 conversion using the documented `Dst`/`Src` bit layouts, not IEEE
-assumptions.
+**Deliverable:** `tt-layout`. Row-major strided ↔ tiled. Padding for shapes that are not a
+multiple of the tile extent. FP32/BF16/FP16 conversion against the documented bit patterns,
+not IEEE assumptions.
+
+**Corrected during implementation.** Two things this paragraph originally said are wrong, and
+the checklist records why. (1) The conversion reference is `FloatBitPatterns.md` and
+`Packers/FormatConversion.md`, **not** the `Dst`/`Src` bit layouts — those describe the
+register files and govern the `Dst` readback path instead. (2) A tile is not a 32×32 square:
+`UNPACR_Regular.md:182` dimensions it from a `TileDescriptor`, and 32×32-of-four-16×16-faces
+is one choice among many.
 
 **Gate (simulator):** round-trip arbitrary tensors host→device→host unchanged, for every dtype
 in scope, including awkward shapes (`[13, 47]`, `[1, 1, 1024]`). Property-test with a
 shape/dtype generator — this is cheap in the simulator and expensive on hardware.
 
-**Gate (silicon):** the same suite, reduced to a representative sample plus every shape that
-exercises an alignment boundary. NoC alignment rules are `UndefinedBehavior` when violated and
-`Alignment.md` is absent from the Blackhole tree, so this gate is where those get validated.
+**Gate (silicon):** the same suite, reduced to a representative sample. **Narrower than
+originally scoped:** `WormholeB0/NoC/Alignment.md:19,23` says the host-via-PCIe to L1 path has
+no alignment restrictions at all, so the staging path cannot violate them. The C16 congruence
+applies when an L1 address is the *source*, which is the unpacker and packer in Phase 6. The
+silicon test asserts the documented "Any" across deliberately misaligned tile bases, since
+`Alignment.md` is absent from the Blackhole tree and a failure would be a real finding.
 
 **Sequencing rationale:** this is the layer every op sits on, it is independently testable, and
 it forces the hardest architectural decision — how tiled layout and block-float formats meet

@@ -17,10 +17,17 @@
 use tt_firmware::cfg::write_config_field;
 use tt_firmware::tensix::{push_word, read_dst32, wait_for_coprocessor};
 use tt_firmware::{fail, finish, l1_read32, l1_write32, publish, spin};
-use tt_isa::cfg::generated::alu;
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::{self, panic_code};
 use tt_isa::sfpu::dst32_address;
+use tt_isa::tensix::{RiscvT1, TensixThread, Thread1};
+
+/// Which core this image is loaded onto, and which Tensix thread it drives.
+///
+/// See the identical pair in `sfpu_mul.rs` for why this is a type and not a
+/// mailbox word. T1 because ttsim models the RISC-V view of `Dst` only for it.
+type Riscv = RiscvT1;
+type Thread = Thread1;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
@@ -34,7 +41,14 @@ pub extern "Rust" fn firmware_main() -> ! {
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
-    if thread > 2 || program_len > mailbox::PROGRAM_MAX || dump_rows > mailbox::DUMP_MAX_ROWS {
+    // `thread` is a cross-check rather than a choice: which core this is, is fixed
+    // at build time by `Riscv`/`Thread` above. A mismatch means the host started
+    // this image somewhere it did not intend, which would otherwise show up as a
+    // wrong result from a correctly-executed program.
+    if thread != Thread::INDEX
+        || program_len > mailbox::PROGRAM_MAX
+        || dump_rows > mailbox::DUMP_MAX_ROWS
+    {
         fail(panic_code::EXPLICIT);
     }
 
@@ -48,11 +62,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         // aperture to a flat `Config` array with the bank hardcoded to zero and no
         // `ThreadConfig` region, so reading the state ID there is fatal. Nothing
         // here changes it and its reset value is 0.
-        let field = match thread {
-            0 => alu::RISC_DEST_ACCESS_CTRL_SEC0_fmt,
-            1 => alu::RISC_DEST_ACCESS_CTRL_SEC1_fmt,
-            _ => alu::RISC_DEST_ACCESS_CTRL_SEC2_fmt,
-        };
+        let field = Thread::DST_ACCESS_FMT;
         if !field.fits(fmt) {
             fail(panic_code::EXPLICIT);
         }
@@ -66,9 +76,9 @@ pub extern "Rust" fn firmware_main() -> ! {
     let mut i = 0;
     while i < program_len {
         // SAFETY: the word is inside the staged program, whose length was checked
-        // above; this is RISCV T0/T1/T2, which may push; the backend is out of
-        // reset.
-        unsafe { push_word(l1_read32(mailbox::PROGRAM + (i as u64) * 4)) }
+        // above; `Riscv` may push to `Thread`, which the type system checked; the
+        // backend is out of reset.
+        unsafe { push_word::<Riscv, Thread>(l1_read32(mailbox::PROGRAM + (i as u64) * 4)) }
         i += 1;
     }
 

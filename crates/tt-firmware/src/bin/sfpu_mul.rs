@@ -13,10 +13,23 @@
 use tt_firmware::cfg::write_config_field;
 use tt_firmware::tensix::{push, read_dst32, wait_for_coprocessor};
 use tt_firmware::{fail, finish, l1_read32, publish, spin};
-use tt_isa::cfg::generated::alu;
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::{self, panic_code};
 use tt_isa::sfpu::{self, dst32_address, store_format};
+use tt_isa::tensix::{RiscvT1, TensixThread, Thread1};
+
+/// Which core this image is loaded onto, and which Tensix thread it therefore
+/// drives.
+///
+/// These are the *only* place that fact is written down on the device side. Core
+/// identity cannot be probed -- `mhartid` reads zero on every core -- so it is a
+/// build-time fact, and making it a type means the push path cannot reach a buffer
+/// that would hang this core (`tt_isa::tensix::PushesTo`).
+///
+/// T1 because it is the only core whose RISC-V view of `Dst` ttsim models
+/// (`ttsim-divergence.md`, row 12). The host must agree: see `step4_tensix.rs`.
+type Riscv = RiscvT1;
+type Thread = Thread1;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
@@ -34,7 +47,12 @@ pub extern "Rust" fn firmware_main() -> ! {
     let (a, b) = unsafe { (l1_read32(mailbox::OPERAND_A), l1_read32(mailbox::OPERAND_B)) };
     let thread = unsafe { l1_read32(mailbox::THREAD_INDEX) };
     let fmt = unsafe { l1_read32(mailbox::DST_ACCESS_FMT) };
-    if thread > 2 {
+    // The core this image runs on is a build-time fact (see `Riscv`/`Thread`
+    // above), so the mailbox word is a cross-check, not the source of truth: if the
+    // host started this image on a different core than it thinks, the Dst mapping
+    // written below would be another thread's and the failure would surface as a
+    // wrong result rather than as an error.
+    if thread != Thread::INDEX {
         fail(panic_code::EXPLICIT);
     }
 
@@ -43,9 +61,10 @@ pub extern "Rust" fn firmware_main() -> ! {
     // a 32-bit `lw` below is valid for; the reset default happens to be 0 too, but
     // depending on that is a bug waiting for the first kernel that changes it.
     //
-    // SEC1 because this firmware runs on the core driving Tensix thread 1 -- the
-    // only one whose Dst mapping ttsim models. The field is indexed per section,
-    // so the thread the core drives selects which one to write.
+    // The field is indexed per section, and `Thread::DST_ACCESS_FMT` carries the
+    // association, so the thread this image drives picks it rather than a `match`
+    // whose default arm would silently configure a different thread. Thread 1 is
+    // the only one whose Dst mapping ttsim models.
     //
     // SAFETY: the host released the Tensix backend before releasing this core, and
     // nothing has been pushed yet, so no Tensix instruction is in flight.
@@ -58,11 +77,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         // reset value is 0, so bank 0 is correct either way -- but on silicon,
         // where a kernel may have switched banks, `active_bank` is the right call.
         let bank = ConfigBank::Bank0;
-        let field = match thread {
-            0 => alu::RISC_DEST_ACCESS_CTRL_SEC0_fmt,
-            1 => alu::RISC_DEST_ACCESS_CTRL_SEC1_fmt,
-            _ => alu::RISC_DEST_ACCESS_CTRL_SEC2_fmt,
-        };
+        let field = Thread::DST_ACCESS_FMT;
         if !field.fits(fmt) {
             fail(panic_code::EXPLICIT);
         }
@@ -82,19 +97,20 @@ pub extern "Rust" fn firmware_main() -> ! {
         fail(panic_code::EXPLICIT)
     };
 
-    // SAFETY: this is RISCV T0, which may push; the host released the Tensix
+    // SAFETY: `Riscv` may push to `Thread` -- the type system checked it; the host
+    // released the Tensix
     // backend from soft reset before releasing this core.
     unsafe {
-        push(load_a[0]);
-        push(load_a[1]);
-        push(load_b[0]);
-        push(load_b[1]);
-        push(multiply);
+        push::<Riscv, Thread>(load_a[0]);
+        push::<Riscv, Thread>(load_a[1]);
+        push::<Riscv, Thread>(load_b[0]);
+        push::<Riscv, Thread>(load_b[1]);
+        push::<Riscv, Thread>(multiply);
         // No SFPNOP between the multiply and the store: on Blackhole the two-cycle
         // SFPMAD latency is covered by automatic stalling, and SFPSTORE is not one
         // of the documented cases that stalling fails to detect. See
         // `Instruction::stalls_automatically_after_mad`.
-        push(store);
+        push::<Riscv, Thread>(store);
     }
 
     // The pushes above have only reached a FIFO. Wait for them to retire before
