@@ -11,10 +11,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod cfg;
 pub mod isa;
 pub mod mailbox;
 pub mod noc;
+pub mod numerics;
 pub mod sfpu;
 pub mod tensix;
 pub mod tile;

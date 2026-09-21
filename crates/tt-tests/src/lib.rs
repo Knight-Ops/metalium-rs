@@ -5,6 +5,9 @@
 //! the simulator binding, so cross-cutting gates cannot live there — and so that
 //! `build.rs` can build the device firmware and hand the images to the tests.
 
+pub mod datapath;
+pub mod harness;
+
 /// Firmware images, built from `crates/tt-firmware` by this crate's `build.rs`
 /// and checked for instructions Blackhole cannot execute.
 pub mod firmware {

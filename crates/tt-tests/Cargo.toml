@@ -19,10 +19,16 @@ path = "src/lib.rs"
 # `cargo test -p tt-tests --features silicon` against real hardware.
 silicon = []
 
+# Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
+# is classified DEV_ONLY in `xtask/src/ship.rs`, so the simulator binding still
+# cannot reach a shippable artefact -- `check-no-sim-in-ship` walks the shippable
+# crates, and this is not one of them.
 [dependencies]
-
-[dev-dependencies]
 tt-isa.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
 tt-ttsim.workspace = true
+
+[dev-dependencies]
+burn-flex = { version = "0.21", default-features = false, features = ["std"] }
+burn-tensor = { version = "0.21", default-features = false, features = ["std"] }

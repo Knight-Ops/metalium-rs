@@ -88,6 +88,65 @@ impl L1Format {
     /// four (`Packers/FormatConversion.md:103`), so a byte-valued accessor could not
     /// describe them. The unpacker's own model has the same shape, carrying
     /// `DatumSizeBytes` as a fraction (`UNPACR_Regular.md:92-98`).
+    /// The 4-bit `InDataFormat` / `OutDataFormat` code, where it has been measured.
+    ///
+    /// **`MEASURED`, not documented** — a different status from the `UNVERIFIED`
+    /// marker the rest of this crate uses for Wormhole-sourced facts. Those are
+    /// hypotheses taken from a document; these are measurements taken from the
+    /// simulator, because there is no document: the encoding appears in neither the
+    /// specification tree nor `cfg_defines.h`.
+    ///
+    /// # How these three were established
+    ///
+    /// `crates/tt-tests/tests/probe_unpack.rs::survey_the_data_format_codes` stages
+    /// known FP32 datums in L1 and unpacks them to `Dst` once for each of the 256
+    /// `(InDataFormat, OutDataFormat)` pairs, each in its own `fork_scope`. ttsim
+    /// validates pairs and names its refusals, which separates three cases: a pair
+    /// it rejects as `incompatible`/`mismatches`, one it has not modelled
+    /// (`unpack_to_dst=1 in_data_format=N`), and one that runs. Exactly three run:
+    /// `(0, 0)`, `(0, 4)` and `(8, 8)`, and all three return the staged FP32 bits
+    /// unchanged.
+    ///
+    /// That identifies them, given two independent constraints from the
+    /// documentation:
+    ///
+    /// * `Packers/InputAddressGenerator.md` switches on `In_data_format & 3`, with
+    ///   `0` meaning four bytes per datum. Codes 0, 4 and 8 are all four-byte, and
+    ///   `UNPACR_Regular.md:95` says the four-byte formats are exactly FP32, TF32
+    ///   and INT32.
+    /// * `(0, 8)` is refused as `incompatible` while `(0, 4)` runs, so 0 and 4 are
+    ///   the same *kind* and 8 is not — float against integer. `UNPACR_Regular.md`
+    ///   also notes that "when unpacking to `Dst`, TF32 means FP32", which is why
+    ///   `(0, 4)` returns FP32 bits unchanged rather than truncating a mantissa.
+    ///
+    /// # What is deliberately still `None`
+    ///
+    /// Every 16-bit and block-float code. ttsim declines `UnpackToDst` for them
+    /// outright (`UnimplementedFunctionality: tensix_unpacr: unpack_to_dst=1
+    /// in_data_format=1`), so this path cannot measure them and guessing from
+    /// tt-metal's `DataFormat` enum would be transcription. They are reachable
+    /// through the packer instead, which is where they should be pinned.
+    ///
+    /// Re-derive all of it at the first silicon gate; a mismatch is a finding.
+    pub const fn code(self) -> Option<u32> {
+        match self {
+            L1Format::Fp32 => Some(0),
+            L1Format::Tf32 => Some(4),
+            L1Format::Int32 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// The format a code names, for the codes [`Self::code`] has measured.
+    pub const fn from_code(code: u32) -> Option<L1Format> {
+        match code {
+            0 => Some(L1Format::Fp32),
+            4 => Some(L1Format::Tf32),
+            8 => Some(L1Format::Int32),
+            _ => None,
+        }
+    }
+
     pub const fn datum_bits(self) -> u32 {
         match self {
             L1Format::Bfp2 | L1Format::Bfp2a => 2,
@@ -1202,6 +1261,69 @@ mod tests {
                 Ok(bits),
                 "{bits:#06x} did not survive the round trip"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod format_code_tests {
+    use super::*;
+
+    /// Pins the measured mapping, so a re-run of the probe that disagrees shows up
+    /// here rather than as wrong data three phases later.
+    #[test]
+    fn the_measured_format_codes_are_what_the_probe_found() {
+        assert_eq!(L1Format::Fp32.code(), Some(0));
+        assert_eq!(L1Format::Tf32.code(), Some(4));
+        assert_eq!(L1Format::Int32.code(), Some(8));
+    }
+
+    /// Every code this crate claims must round-trip, and every format it does not
+    /// claim must stay unclaimed -- otherwise a half-finished addition reads as a
+    /// measurement.
+    #[test]
+    fn codes_round_trip_and_nothing_else_is_claimed() {
+        let claimed = [L1Format::Fp32, L1Format::Tf32, L1Format::Int32];
+        for f in claimed {
+            let code = f.code().expect("claimed formats have a code");
+            assert_eq!(L1Format::from_code(code), Some(f));
+        }
+        for f in [
+            L1Format::Bf16,
+            L1Format::Fp16,
+            L1Format::Fp8,
+            L1Format::Bfp8,
+            L1Format::Bfp8a,
+            L1Format::Bfp4,
+            L1Format::Bfp4a,
+            L1Format::Bfp2,
+            L1Format::Bfp2a,
+            L1Format::Int16,
+            L1Format::Int8,
+            L1Format::Uint8,
+        ] {
+            assert_eq!(
+                f.code(),
+                None,
+                "{f:?} has no measured code; ttsim declines UnpackToDst for the \
+                 16-bit and block-float formats, so this path cannot establish one"
+            );
+        }
+    }
+
+    /// The independent cross-check: `Packers/InputAddressGenerator.md` switches on
+    /// `In_data_format & 3`, where zero means four bytes per datum. Every code this
+    /// crate claims must agree with the datum width the format already reports.
+    #[test]
+    fn every_measured_code_agrees_with_the_documented_size_rule() {
+        for f in [L1Format::Fp32, L1Format::Tf32, L1Format::Int32] {
+            let code = f.code().unwrap();
+            assert_eq!(
+                code & 3,
+                0,
+                "{f:?} has code {code}, whose low two bits say it is not four bytes"
+            );
+            assert_eq!(f.datum_bits(), 32, "{f:?} should be a 32-bit datum");
         }
     }
 }

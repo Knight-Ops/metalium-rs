@@ -36,8 +36,15 @@ pub mod loadi_mode {
     pub const LOWER: u32 = 10;
 }
 
-/// `SFPSTORE` / `SFPLOAD` data-type modes (`SFPSTORE.md`).
-pub mod store_format {
+/// `SFPLOAD` / `SFPSTORE` `Mod0` data-type modes.
+///
+/// One table, because both instructions use it and Blackhole documents the two
+/// `#define` blocks identically (`SFPLOAD.md:144-159`, `SFPSTORE.md:138-153`).
+/// Which conversion each mode performs differs by direction — `SFPLOAD`'s
+/// `MOD0_FMT_BF16` widens `Dst`'s BF16 to FP32, `SFPSTORE`'s narrows FP32 to BF16 —
+/// but the *numbering* is shared, so duplicating it would be two places to get
+/// wrong.
+pub mod mod0_fmt {
     /// Resolved at execution time against `ALU_FORMAT_SPEC_REG*` backend
     /// configuration. Avoid unless that configuration has been set up.
     pub const SRCB: u32 = 0;
@@ -45,8 +52,25 @@ pub mod store_format {
     pub const BF16: u32 = 2;
     pub const FP32: u32 = 3;
     pub const INT32: u32 = 4;
+    pub const INT8: u32 = 5;
+    pub const UINT16: u32 = 6;
+    pub const HI16: u32 = 7;
+    pub const INT16: u32 = 8;
+    pub const LO16: u32 = 9;
+    /// Blackhole overhauled this mode's addressing; it is not a plain `INT32`.
+    pub const INT32_ALL: u32 = 10;
     pub const ZERO: u32 = 11;
+    /// Deprecated on Blackhole: no longer performs a data type conversion.
+    pub const INT32_SM: u32 = 12;
+    /// Deprecated on Blackhole: no longer performs a data type conversion.
+    pub const INT8_COMP: u32 = 13;
+    pub const LO16_ONLY: u32 = 14;
+    pub const HI16_ONLY: u32 = 15;
 }
+
+/// The spelling [`store`] was written against, kept so existing call sites read
+/// the same. [`mod0_fmt`] is the full table and applies to [`load`] too.
+pub use mod0_fmt as store_format;
 
 /// `SFPMAD` / `SFPMUL` modifier bits (`SFPMAD.md`).
 pub mod mad_mod1 {
@@ -79,6 +103,10 @@ mod stall_modes {
 /// The `LReg` holding a constant `+0`, which is what makes `SFPMUL` a pure
 /// multiply (`SFPMUL.md`).
 pub const LREG_ZERO: u32 = 9;
+
+/// The `LReg` holding a constant `1.0` in every lane (`LReg.md:13`), which is what
+/// makes `SFPADD` a pure add: `VD = ±(1.0 * VB) ± VC`.
+pub const LREG_ONE: u32 = 10;
 
 /// Highest `LReg` index `SFPLOADI` and `SFPMAD` can write.
 ///
@@ -315,6 +343,77 @@ pub const fn store(
         Ok(i) => Ok(i),
         Err(e) => Err(EncodeError::from_isa(e)),
     }
+}
+
+/// `SFPLOAD`: move 32 datums from `Dst` into `LReg[vd]`.
+///
+/// The mirror of [`store`], and the instruction that lets the SFPU read what the
+/// unpacker wrote. `format` is a [`mod0_fmt`] mode.
+///
+/// # Addressing
+///
+/// `SFPLOAD.md`: "the top 8 bits of `Addr` end up selecting an aligned group of
+/// four rows of `Dst`, the next bit selects between even and odd columns, and the
+/// low bit goes unused". So one `SFPLOAD` reaches **half** of a four-row block —
+/// lane *n* reads `Dst[(Addr & ~3) + n/8][(n & 7) * 2 + ((Addr & 2) != 0)]` — and
+/// covering all sixteen columns takes two, one with bit 1 clear and one with it
+/// set. [`DST_ODD_COLUMNS`] is that bit.
+///
+/// # Refusals
+///
+/// `vd` must be below 8. The functional model guards the whole lane loop with
+/// `if (VD < 8)`, so a load into a constant register is silently dropped rather
+/// than faulting — the same shape as the `SFPLOADI` case [`loadi`] refuses.
+///
+/// Reading a `Dst` row whose `DstRowValid` is false is `UndefinedBehavior`
+/// (`ZEROACC.md`), and nothing here can check that: `Dst` has no power-on reset
+/// value, so a program that loads before anything has written must scrub first
+/// (`Dst.md:15` wants an `SFPSTORE` sweep, not merely a `ZEROACC`).
+pub const fn load(
+    vd: u32,
+    format: u32,
+    addr_mod: u32,
+    imm10: u32,
+) -> Result<Instruction, EncodeError> {
+    if let Err(e) = check_reg(vd) {
+        return Err(e);
+    }
+    if vd > MAX_WRITABLE_LREG {
+        return Err(EncodeError::UnwritableDestination { vd });
+    }
+    match encode::sfpload(vd, format, addr_mod, imm10) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(EncodeError::from_isa(e)),
+    }
+}
+
+/// The bit of an `SFPLOAD` / `SFPSTORE` address that selects odd `Dst` columns.
+///
+/// `SFPLOAD.md` / `SFPSTORE.md`: bit 1 of the resolved address adds one to the
+/// column, so the even and odd halves of a four-row block are two instructions with
+/// the same row group.
+pub const DST_ODD_COLUMNS: u32 = 2;
+
+/// `SFPADD`: lanewise FP32 `LReg[vd] = LReg[vb] + LReg[vc]`.
+///
+/// `SFPADD.md` calls itself "identical to `SFPMAD`, but the preferred opcode when
+/// `VA == 10`", because [`LREG_ONE`] makes the product a no-op. `VA` is therefore
+/// not a parameter here, for the same reason [`mul`] does not offer `VC`: the
+/// specification says not to use the instruction any other way.
+///
+/// Emitted as the `SFPMAD` spelling rather than the `SFPADD` one. `SFPADD.md`
+/// defines its functional model, conformance and scheduling entirely by reference
+/// to `SFPMAD` and says nothing the opcode changes, so the two are the same
+/// instruction; and there is precedent for preferring the general spelling —
+/// `docs/ttsim-divergence.md` row 17 records the simulator accepting `Mod1` values
+/// on `SFPMAD` that it rejects on the narrower `SFPMUL` opcode.
+pub const fn add(vb: u32, vc: u32, vd: u32) -> Result<Instruction, EncodeError> {
+    mad(LREG_ONE, vb, vc, vd, 0)
+}
+
+/// `SFPADD` with the addend negated: `LReg[vd] = LReg[vb] - LReg[vc]`.
+pub const fn sub(vb: u32, vc: u32, vd: u32) -> Result<Instruction, EncodeError> {
+    mad(LREG_ONE, vb, vc, vd, mad_mod1::NEGATE_VC)
 }
 
 /// Load a full FP32 constant into `LReg[vd]`.

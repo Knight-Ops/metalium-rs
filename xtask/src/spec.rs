@@ -72,7 +72,21 @@ const MARKDOWN_ROOTS: &[&str] = &[
     "WormholeB0/TensixTile/TensixCoprocessor",
 ];
 
-const MARKDOWN_FILES: &[&str] = &["BlackholeA0/NoC/Atomics.md", "WormholeB0/NoC/Atomics.md"];
+/// Individual files outside [`MARKDOWN_ROOTS`] that the workspace reads.
+///
+/// The two `Atomics.md` pages carry the `NOC_AT_LEN_BE_*` encodings.
+///
+/// `Miscellaneous/FMA/fma.c` is not markdown and is not read by a generator: it is
+/// the numerics *oracle*. `tt_isa::numerics::fma_bh` is a hand port of its
+/// `fma_model_bh`, and `crates/tt-tests/build.rs` compiles the file itself so the
+/// port can be differential-tested against it. An oracle that can change underneath
+/// the tests without the pin noticing is not an oracle, so it is hashed with
+/// everything else.
+const EXTRA_FILES: &[&str] = &[
+    "BlackholeA0/NoC/Atomics.md",
+    "WormholeB0/NoC/Atomics.md",
+    "Miscellaneous/FMA/fma.c",
+];
 
 /// The machine-readable bit-layout source every encoding diagram is rendered from.
 pub const BITS32: &str = "Diagrams/Src/Bits32.lua";
@@ -84,7 +98,7 @@ pub const BITS32: &str = "Diagrams/Src/Bits32.lua";
 /// hashing nothing would make the pin vacuous.
 pub fn consumed_files(root: &Path) -> Result<Vec<String>, String> {
     let mut out = vec![BITS32.to_string()];
-    for f in MARKDOWN_FILES {
+    for f in EXTRA_FILES {
         out.push((*f).to_string());
     }
     for dir in MARKDOWN_ROOTS {

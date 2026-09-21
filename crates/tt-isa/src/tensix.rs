@@ -199,6 +199,38 @@ pub const LOCAL_DATA_RAM_BASE: u64 = 0xFFB0_0000;
 /// (`BabyRISCV/README.md:106`), which is what lets the host start a core at all.
 pub const DEBUG_REGS_BASE: u64 = 0xFFB1_2000;
 
+/// `RISCV_DEBUG_REG_CFGREG_RD_CNTL` — the address to read from backend
+/// configuration.
+///
+/// `BackendConfiguration.md:66`: `Config` and `ThreadConfig` are **not** mapped
+/// into the NoC's address space, but writing `x` here makes hardware perform
+/// `CFGREG_RDDATA = ((uint32_t*)TENSIX_CFG_BASE)[x & 0x7ff]` a few cycles later.
+/// Since this block *is* NoC-visible, that is the host's only way to read backend
+/// configuration back — a read-only path, and the only cross-check on a
+/// configuration write that does not go through the firmware that performed it.
+///
+/// **`UNVERIFIED`.** The Blackhole `TileControlDebugStatus.md` names the register
+/// but gives no address table; `0xFFB1_2058` is from
+/// `WormholeB0/EthernetTile/TileControlDebugStatus.md:25`, where an Ethernet tile
+/// repurposes the same block offset for general use. **Confirmed against ttsim** by
+/// `crates/tt-tests/tests/probe_cfgreg.rs`, which reads back a word it has just
+/// written; re-derive on silicon.
+pub const CFGREG_RD_CNTL: u64 = 0xFFB1_2058;
+
+/// `RISCV_DEBUG_REG_CFGREG_RDDATA` — the word [`CFGREG_RD_CNTL`] asked for.
+///
+/// **`MEASURED`, not documented.** No page in either tree gives this address, so it
+/// was found by sweeping the debug block against ttsim
+/// (`probe_cfgreg::search_for_the_cfgreg_debug_registers`) and is pinned by
+/// `probe_cfgreg::the_host_can_read_backend_configuration_back`.
+///
+/// It is **eight words** after `CFGREG_RD_CNTL`, not one: `0xFFB1_205C` is the
+/// debug daisychain's `DBG_RD_DATA`, which answers a read with
+/// `debug_bus_rd_data: DBG_BUS_CTRL must be enabled` rather than with configuration.
+/// Guessing the adjacent word would have looked like a working address returning a
+/// wrong answer. Re-derive on silicon.
+pub const CFGREG_RDDATA: u64 = 0xFFB1_2078;
+
 /// `RISCV_DEBUG_REG_SOFT_RESET_0` (`SoftReset.md:6-8`).
 ///
 /// There are no atomic bit operations on this register: every change is a

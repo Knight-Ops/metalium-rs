@@ -27,7 +27,7 @@ gate you have not seen reject something is not yet evidence.
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
 | 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
 | 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
-| 5 — Elementwise binary | `[ ]` | |
+| 5 — Elementwise binary | `[~]` | Simulator gate done, FP32 only; BF16 blocked on ttsim, silicon gate open |
 | 6 — Matmul | `[ ]` | The schedule risk |
 | 7 — Burn backend, training | `[ ]` | The milestone |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
@@ -68,8 +68,14 @@ Set up early; retrofitting is expensive.
       and the generated-table check — the same things CI runs, so a push does not
       fail on something a commit could have caught.
 - [ ] **CI: silicon suite nightly, and as a merge gate to main.**
-- [ ] **`burn-ndarray` as the second differential oracle.** ttsim is the ISA-level
-      oracle; this is the tensor-level one. Needed from Phase 5.
+- [x] **`burn-flex` as the second differential oracle.** ttsim is the ISA-level
+      oracle; this is the tensor-level one. Needed from Phase 5. **Not
+      `burn-ndarray`**, which crates.io now marks `[Deprecated] … use burn-flex,
+      burn-cuda, burn-rocm`; `burn-flex 0.21.0` is the supported CPU backend and is
+      what `PINS.toml` should pin. Taken as a `tt-tests` dev-dependency at 0.21.
+      Note for Phase 7: in 0.21 the associated `Device` lives on `BackendTypes`, not
+      on `Backend`, so the supertrait list in `RUST_IMPL_PLAN.md` is already stale —
+      the item that says to re-verify it against the pinned version is load-bearing.
 
 ### Hazards to encode in the API, not in comments
 
@@ -98,6 +104,25 @@ no answer.
       never wrote `mailbox::THREAD_INDEX`, so the firmware read 0 and configured
       **SEC0** — thread 0's `Dst` mapping — while running on T1. It passed only
       because `fmt = 0` is also the reset default.
+- [x] **`STALLWAIT` block and condition masks are named, and paired.**
+      `tt_isa::backend::{block, cond}` carry the Blackhole numbering — which the
+      page says differs from Wormhole's and tells software to abstract — and
+      `wait_for_unpacker0`/`wait_for_packer`/`wait_for_sfpu`/`wait_for_matrix` emit
+      the block bit each condition needs. A condition set without its block bit
+      waits without stopping anything, which reads as a race rather than a missing
+      bit. `ZEROACC` runs on the **Matrix Unit**, so its wait is C4+B6 even though
+      everything around it in a `Dst` scrub is SFPU work.
+- [x] **A `WRCFG` to `STATE_RESET_EN` is refused.** `BackendConfiguration.md:40`:
+      writing *anything* to that word, by any instruction but `RMWCIB`, instantly
+      zeroes every `Config` word below `GLOBAL_CFGREG_BASE_ADDR32`. It is a
+      whole-configuration reset wearing the shape of an ordinary field write.
+      `backend::write_word` rejects it and a test watches the rejection.
+- [x] **A misaligned 128-bit `WRCFG` is refused rather than rounded.** The
+      instruction masks both indices with `& ~3` instead of faulting, so an
+      unaligned request silently writes four words elsewhere.
+- [ ] **`UnpackToDst` clobbers `SrcA[Bank]`** — `UNPACR_Regular.md:441`, rows not
+      characterised. Not load-bearing yet (nothing reads `SrcA`), but it makes the
+      two unpack modes mutually exclusive and Phase 6 must encode that.
 - [ ] `Dst` exclusivity across the three Tensix threads. *(Phase 5–6.)*
 - [ ] `SrcA`/`SrcB` bank ownership handshake. *(Phase 6.)*
 - [ ] `NOC_CMD_WR_INLINE` must never target an L1 address. *(Needed once a core
@@ -107,8 +132,10 @@ no answer.
 ### Tolerance policy
 
 - [x] Never a guessed epsilon — assert bit patterns against the documented model.
-- [ ] Derive expected values from `Miscellaneous/FMA/fma.c` (`fma_model_bh`) once
-      arithmetic beyond a single multiply is in scope.
+- [x] Derive expected values from `Miscellaneous/FMA/fma.c` (`fma_model_bh`).
+      `tt_isa::numerics::fma_bh` is a port, checked against the C itself — which
+      `crates/tt-tests/build.rs` compiles — over 200 000 cases. `fma.c` is now inside
+      the digest `PINS.toml` pins, so the oracle cannot change underneath the tests.
 
 ---
 
@@ -275,8 +302,17 @@ no answer.
       waits on *our* readiness, not the simulator's: `libttsim_bh.so` carries
       `tensix_pacr`, `tensix_unpacr` and `tensix_mvmul` execute handlers, a block of
       packer-specific refusal strings, and `fp32 to bf16/bfp8` conversion
-      diagnostics. Their encoders exist now; what is missing is the surrounding
-      state and the config staging to set it up.
+      diagnostics. **`UNPACR` and `PACR` now execute.** `probe_unpack.rs` stages a
+      tile in L1, configures unpacker 0 for `UnpackToDst`, and checks every datum
+      against the functional model; `probe_pack.rs` packs `Dst` back out and
+      completes the **L1 -> `Dst` -> L1 round trip**. Both carry controls watched
+      failing: a corrupted staged datum moves exactly one element at each stage, and
+      `ReadIntfSel` is checked to pack exactly the rows it names and leave a
+      sentinel beyond them untouched -- `PACR.md`'s central claim, and the one its
+      "basic" self-labelling makes worth testing hardest. `ReadIntfSel == 0` is
+      confirmed identical to `0b1111`, which the page's branch-free
+      `(1 << RowsRemaining) - 1` advice depends on. `MVMUL` stays open: it needs
+      `SrcA`/`SrcB` and is genuinely Phase 6.
 - [ ] **Stand up tracing.** `DebugTimestamper` gives a tile-wide 64-bit counter at
       `0xFFB1_21F0` plus a hardware event-trace primitive: one store to
       `RISCV_DEBUG_REG_TIMESTAMP` appends `{29-bit token, 64-bit counter}` to an L1
@@ -382,14 +418,34 @@ specification does not make.
 Eltwise before matmul deliberately: it exercises unpack → SFPU → pack with no
 `SrcA`/`SrcB` bank handshake, no fidelity phases, no RWC choreography.
 
-- [ ] Unpack → SFPU → pack for a binary op.
-- [ ] **Gate (sim):** differential vs `burn-ndarray`, with tolerances derived from
-      the documented FMA divergence rather than guessed.
-  - [ ] Include denormals — the SFPU flushes them.
-  - [ ] Include NaN — Blackhole canonicalises differently from IEEE *and* from
-        Wormhole. ttsim replaces every NaN with `0x7FC0_0000`.
-  - [ ] Assert exact equality against `fma_model_bh` wherever the operation is a
-        pure FMA.
+- [x] Unpack → SFPU → pack for a binary op. `crates/tt-tests/tests/step8_eltwise.rs`:
+      one `UNPACR` fills `Dst` rows 0..8, the kernel reads operand A from row group 0
+      and operand B from row group 4, and one `PACR` writes the result back to L1.
+      Multiply, add and subtract. The kernel is two passes because `SFPLOAD` and
+      `SFPSTORE` each reach 32 of a four-row group's 64 datums — the even columns or
+      the odd ones — and a separate gate pins that the two passes cover every datum
+      exactly once, so a half-written tile cannot pass unnoticed.
+- [x] **Gate (sim):** differential, with **two oracles making two different claims**.
+      `tt_isa::numerics::fma_bh` says what a pair of datums produces, bit for bit;
+      `burn-flex` says which pairs there should be. The operands for the Burn gate
+      are small integers so the two cannot disagree — where they *would* (denormals,
+      NaN, the overflow rule) Burn is the wrong oracle and the named cases are the
+      right one. No epsilon anywhere.
+  - [x] Include denormals — asserted to flush, and the model predicts the flush, so
+        the gate checks the pair rather than the device alone.
+  - [x] Include NaN — canonicalisation to `0x7FC0_0000` asserted, along with a check
+        that a NaN result actually occurred.
+  - [x] Assert exact equality against `fma_model_bh`. `tt_isa::numerics::fma_bh` is
+        a port of it; `crates/tt-tests/tests/fma_oracle.rs` compiles the real
+        `Miscellaneous/FMA/fma.c` and checks the port against it over 200 000
+        deterministic cases and all 2 744 edge-case triples. `PINS.toml` now hashes
+        that file, so the oracle cannot drift — watched failing before re-pinning.
+  - [-] **BF16 is not reachable on the simulator.** ttsim declines `UnpackToDst` for
+        every 16-bit and block-float input format (divergence row 31), so the BF16
+        kernel is silicon-only until the packer offers another route into `Dst`.
+      **Controls watched failing:** expecting the host's `f32` multiply instead of
+      the model; an empty kernel; swapped operand row groups; a reversed Burn
+      operand.
 - [ ] **Gate (silicon):** same suite. A mismatch here is a high-value bug report —
       it means the golden reference and the hardware disagree.
 
@@ -601,13 +657,21 @@ Documented, not speculative. These bite in Phases 2–4.
       most likely to be modelled loosely. Resolve at the Phase 2 silicon gate.
 - [ ] **7.** Does ttsim model the documented hardware bugs, or the intended
       behaviour? Probe with targeted tests in Phase 3.
-- [ ] **9.** *(New.)* **The 4-bit `InDataFormat`/`OutDataFormat` codes are
-      undocumented** — absent from the specification tree *and* from
-      `cfg_defines.h`, which is why `tt_isa::tile::L1Format` carries no numeric
-      encoding. `libttsim_bh.so` prints them (`in_data_format=%d incompatible with
-      out_data_format=%d`) and validates pairs, so the mapping is *measurable*
-      against the simulator. Not needed for a host-side tile image; needed the moment
-      a `TileDescriptor` is staged into configuration. Resolve in Phase 6.
+- [x] **9.** *(Resolved for the formats this phase needs.)* **The 4-bit
+      `InDataFormat`/`OutDataFormat` codes are undocumented** — absent from the
+      specification tree *and* from `cfg_defines.h`. Now **measured** rather than
+      transcribed: `probe_unpack::survey_the_data_format_codes` unpacks known FP32
+      datums once per `(in, out)` pair, and exactly three of 256 run, all returning
+      the staged bits unchanged. Combined with two independent documented
+      constraints — `Packers/InputAddressGenerator.md`'s `In_data_format & 3` size
+      switch and `UNPACR_Regular.md:95`'s list of the four-byte formats — that gives
+      `0 = FP32`, `4 = TF32`, `8 = INT32`. Recorded on `tt_isa::tile::L1Format::code`
+      as `MEASURED`, a deliberately different marker from `UNVERIFIED`: the latter
+      is a hypothesis from a document, this is a measurement where no document
+      exists. **Still open:** every 16-bit and block-float code, because ttsim
+      declines `UnpackToDst` for them entirely (divergence row 31); they must be
+      pinned through the packer instead. Divergence row G; re-derive on silicon.
+
 - [ ] **8.** *(New.)* The Tensix grid topology in `tt_isa::noc::grid` was **measured
       against ttsim**, not quoted — `NOC_ENDPOINT_ID` is unimplemented there, so the
       documented discovery probe is unavailable. Three independent figures agree,

@@ -8,9 +8,19 @@
 # ../tt-isa-documentation is equivalent and gets the same check.
 repo = "https://github.com/tenstorrent/tt-isa-documentation"
 rev  = "f848eb668c2aeae742a88a49a86157e24a0a20c6"
-# SHA-256 over the *contents* of the files the instruction generator reads --
-# Diagrams/Src/Bits32.lua plus every page under the two TensixCoprocessor trees
-# and the two NoC/Atomics.md -- as (path, length, bytes) in sorted path order.
+# SHA-256 over the *contents* of the files this workspace reads from the
+# specification -- Diagrams/Src/Bits32.lua, every page under the two
+# TensixCoprocessor trees, the two NoC/Atomics.md, and Miscellaneous/FMA/fma.c --
+# as (path, length, bytes) in sorted path order.
+#
+# fma.c joined the set when `tt_isa::numerics::fma_bh` was written: it is a hand
+# port of that file's `fma_model_bh`, `crates/tt-tests/build.rs` compiles the file
+# itself to differential-test the port, and every Phase 5 numerics gate asserts
+# device results against it. An oracle that can change without the pin noticing is
+# not an oracle. Adding it changed the digest from
+# d08a44478ad67fa2c5516366536644741963203925f69b91976fe67eded9ae76 -- recorded here
+# so the bump is legible as a deliberate widening of the set rather than a
+# specification revision. The tree itself is unchanged, still rev f848eb66.
 #
 # Not the tarball's hash: GitHub regenerates source archives on demand and does
 # not promise their bytes are stable, so a tarball hash can fail for reasons that
@@ -18,7 +28,7 @@ rev  = "f848eb668c2aeae742a88a49a86157e24a0a20c6"
 # construction, applies equally to a git checkout, and pins exactly the bytes the
 # generator reads. Confirmed here by extracting the tarball and diffing it
 # against an independent git checkout at this rev.
-content_sha256 = "d08a44478ad67fa2c5516366536644741963203925f69b91976fe67eded9ae76"
+content_sha256 = "218cc3281f0216070c2586db23cc747b3ba3ae0b23de81114cbd15820abbfc30"
 
 [ttsim]
 # The golden-reference simulator. Fetched by `cargo xtask fetch-ttsim`.
@@ -48,3 +58,20 @@ repo   = "https://github.com/tenstorrent/tt-metal"
 rev    = "81989dcdb8f9b340c932ae7a71a346f4f08703eb"
 path   = "tt_metal/hw/inc/blackhole/cfg_defines.h"
 sha256 = "bc2636abc3ea04e6ca322923e6f2713b242857d021d8ef39b9180a14bcb1a5b8"
+
+[burn]
+# The tensor-level differential oracle. ttsim is the ISA-level one; this is what
+# says which elements pair with which, which a bit-exact scalar model cannot.
+#
+# `burn-flex`, not `burn-ndarray`: crates.io marks the latter "[Deprecated] ... use
+# burn-flex, burn-cuda, burn-rocm". Pinned as a dev-dependency of tt-tests only, so
+# it cannot reach a shipped artefact -- `cargo xtask check-no-sim-in-ship` classifies
+# tt-tests as dev-only and enforces that.
+#
+# Burn moves quickly and 0.21 is a restructuring: the associated `Device` now lives
+# on `BackendTypes` rather than on `Backend`. The supertrait list in
+# docs/RUST_IMPL_PLAN.md predates that, which is why Phase 7 re-verifies it against
+# whatever version is pinned then rather than against the plan.
+repo    = "https://github.com/tracel-ai/burn"
+version = "0.21"
+crates  = ["burn-flex", "burn-tensor"]

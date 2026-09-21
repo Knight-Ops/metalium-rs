@@ -37,4 +37,4 @@ pub const SPEC_REV: &str = "f848eb668c2aeae742a88a49a86157e24a0a20c6";
 /// SHA-256 over the specification files the generator reads — not over the
 /// tarball, which GitHub does not promise is byte-stable. See `crate::spec`.
 pub const SPEC_CONTENT_SHA256: &str =
-    "d08a44478ad67fa2c5516366536644741963203925f69b91976fe67eded9ae76";
+    "218cc3281f0216070c2586db23cc747b3ba3ae0b23de81114cbd15820abbfc30";
