@@ -13,10 +13,20 @@ publish = false
 path = "src/lib.rs"
 
 [features]
-# Gates tests that cannot pass against the simulator, either because ttsim does
-# not model the hardware they exercise or because it explicitly declines to.
-# They are compiled unconditionally so they cannot rot, and run only with
-# `cargo test -p tt-tests --features silicon` against real hardware.
+# Selects the *device the whole suite runs against*, not merely which tests
+# compile. With it off, `harness::Dev` is `Device<LibTtsim>` and every gate runs
+# in-process against the simulator. With it on, `harness::Dev` is `Device<Kmd>`
+# and the same gates run against `/dev/tenstorrent/N`.
+#
+# It started as the narrower thing -- a flag for tests ttsim cannot host -- and
+# that reading is still true, because those tests are `#[cfg(feature =
+# "silicon")]` and only compile here. But the transport switch is the point: a
+# gate that proves something on the simulator should prove it on hardware without
+# being rewritten, and the two-gate rule is unaffordable if it means two suites.
+#
+# Tests that assert something *about the simulator* -- that it refuses an access,
+# that its decode map has a particular shape -- are `#[cfg(not(feature =
+# "silicon"))]` for the same reason.
 silicon = []
 
 # Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
@@ -28,6 +38,7 @@ tt-isa.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
 tt-ttsim.workspace = true
+tt-kmd.workspace = true
 
 [dev-dependencies]
 burn-flex = { version = "0.21", default-features = false, features = ["std"] }

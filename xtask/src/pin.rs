@@ -38,3 +38,21 @@ pub const SPEC_REV: &str = "f848eb668c2aeae742a88a49a86157e24a0a20c6";
 /// tarball, which GitHub does not promise is byte-stable. See `crate::spec`.
 pub const SPEC_CONTENT_SHA256: &str =
     "218cc3281f0216070c2586db23cc747b3ba3ae0b23de81114cbd15820abbfc30";
+
+/// The tt-kmd release whose `ioctl.h` defines the userspace ABI `tt-kmd` binds.
+///
+/// Chosen to match the driver actually loaded rather than to be current: at this
+/// tag the header is byte-identical to `/usr/src/tenstorrent-2.11.0/ioctl.h`, the
+/// DKMS source for the running module. A pin that named a newer tag would compile
+/// and would be wrong.
+pub const TTKMD_TAG: &str = "ttkmd-2.11.0";
+pub const TTKMD_IOCTL_SHA256: &str =
+    "831031cdb556f3f13597af838535d4ce594b47b63d685e87312db76087fbd4dc";
+
+// `TENSTORRENT_DRIVER_VERSION` deliberately does not appear here. The hash above
+// pins what we compiled against; what we are *talking to* is pinned by
+// `tt_kmd::PINNED_API_VERSION`, which `Kmd::open` checks against the driver's own
+// `GET_DRIVER_INFO` answer, because a matching header is no evidence about the
+// module that is loaded. A second copy of the number in this file would be a
+// second source of truth for one fact, and the copy nothing asserts is the one
+// that silently goes stale.

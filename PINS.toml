@@ -75,3 +75,29 @@ sha256 = "bc2636abc3ea04e6ca322923e6f2713b242857d021d8ef39b9180a14bcb1a5b8"
 repo    = "https://github.com/tracel-ai/burn"
 version = "0.21"
 crates  = ["burn-flex", "burn-tensor"]
+
+[tt-kmd]
+# The kernel driver's userspace ABI. Fetched by `cargo xtask fetch-kmd`.
+#
+# This pin is unlike the other three. They pin *specifications* -- documents that
+# describe hardware we then implement against. This one pins an *interface to a
+# program running on this machine*, and the pin is only meaningful if it names the
+# same version as the driver actually loaded. It does: the header at tag
+# ttkmd-2.11.0 is byte-identical to /usr/src/tenstorrent-2.11.0/ioctl.h, the DKMS
+# source for the `tenstorrent` module this host has bound to both cards.
+#
+# Byte-identity is checked rather than assumed, because UMD vendors its own
+# divergent snapshots (tt-metal/tt_metal/third_party/umd/device/pcie/ioctl.h is a
+# different file) and binding one of those would produce a layout that compiles,
+# runs, and is wrong.
+#
+# The hash is not the real guard, though. A header can match while the loaded
+# module does not, so `Kmd::open` additionally asks the driver its own opinion via
+# GET_DRIVER_INFO and refuses an IOCTL API version other than the one bound here.
+# The hash pins what we compiled against; the ioctl pins what we are talking to.
+repo    = "https://github.com/tenstorrent/tt-kmd"
+tag     = "ttkmd-2.11.0"
+path    = "ioctl.h"
+sha256  = "831031cdb556f3f13597af838535d4ce594b47b63d685e87312db76087fbd4dc"
+# TENSTORRENT_DRIVER_VERSION in the header above; asserted at runtime.
+api_version = 2

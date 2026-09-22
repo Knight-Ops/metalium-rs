@@ -17,3 +17,8 @@
 /vendor/tt-isa-documentation/
 /vendor/tt-isa-documentation.staging/
 /vendor/tt-isa-documentation.tar.gz
+
+# Fetched by `cargo xtask fetch-kmd`, pinned by SHA-256 in PINS.toml. Third-party
+# GPL-2.0-only-WITH-Linux-syscall-note header; verified on arrival rather than
+# vendored, like every other pinned input.
+/vendor/ioctl.h

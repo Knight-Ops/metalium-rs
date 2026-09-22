@@ -46,8 +46,20 @@ fn in_two_chips(f: impl FnOnce(&mut Dev<'_>, &mut Dev<'_>)) {
     }
 }
 
+/// Geometry-only, which is safe *here* and nowhere else.
+///
+/// This file opens `libttsim_bh_x2.so` directly rather than going through the
+/// backend, so it can only ever run against the simulator, and ttsim models
+/// unharvested chips. Every other gate takes a [`grid::Tensix`] and asks the chip,
+/// because on silicon a coordinate that passes this predicate can still be a
+/// fused-off tile — and addressing one hangs the NoC rather than returning an
+/// error. If this file is ever pointed at real cards, this helper has to change
+/// with it.
 fn tensix(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix(x, y), "({x},{y}) is not a Tensix tile");
+    assert!(
+        grid::is_tensix_geometry(x, y),
+        "({x},{y}) is not a Tensix tile"
+    );
     NocCoord::new(x, y).unwrap()
 }
 
@@ -192,12 +204,20 @@ fn the_same_window_index_on_both_chips_does_not_collide() {
 
 #[test]
 fn every_tensix_tile_is_addressable_on_chip_1() {
-    // The 140-tile sweep from step 2, on the second chip. The only thing here
+    // The full-grid sweep from step 2, on the second chip. The only thing here
     // that would catch a chip 1 harvested differently from chip 0.
+    //
+    // `Tensix::FULL` is correct *here specifically*, and stated rather than
+    // assumed: this gate drives the dual-chip simulator directly rather than going
+    // through the backend, and ttsim models unharvested chips. On silicon the same
+    // sweep must take each chip's grid from its own ARC, because two cards in one
+    // host are two ASICs with independent fuses -- which is exactly the divergence
+    // this gate claims to be looking for.
     in_two_chips(|_a, b| {
+        let grid = grid::Tensix::FULL;
         let window: Window = b.alloc_window(WindowKind::TwoMib).unwrap();
-        let tiles: Vec<_> = grid::tensix_tiles::<Noc0>().collect();
-        assert_eq!(tiles.len(), grid::TENSIX_TILE_COUNT);
+        let tiles: Vec<_> = grid.tiles::<Noc0>().collect();
+        assert_eq!(tiles.len(), grid.tile_count());
 
         for (i, tile) in tiles.iter().enumerate() {
             b.write32(&window, *tile, 0x3000, 0x7000_0000 | i as u32)

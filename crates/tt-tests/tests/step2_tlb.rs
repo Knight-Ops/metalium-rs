@@ -5,27 +5,29 @@
 //! window for both halves would pass even if the window configuration were ignored
 //! entirely, since the data would simply be going wherever the window already
 //! pointed and coming back from the same place.
+//!
+//! Every coordinate here is checked against the *chip's* grid rather than the
+//! part's geometry. An earlier version of this file used a hardcoded `(16, 11)`
+//! and a hardcoded population of 140, both true of an unharvested Blackhole and
+//! of ttsim. On a p150a with two columns fused off they name tiles that do not
+//! exist, and a NoC access to one of those does not fail — it hangs the NoC, the
+//! chip is reset to recover, and the PCIe link drops. That is why `tensix` takes a
+//! [`Tensix`] and why nothing in this file mentions a tile count.
 
-use tt_device::{tlb::WindowKind, Device, Window};
-use tt_isa::noc::{grid, Noc0, NocCoord};
-use tt_ttsim::{fork_scope, Simulator};
+use tt_device::{tlb::WindowKind, Window};
+use tt_isa::noc::grid::Tensix;
+use tt_isa::noc::{Noc0, NocCoord};
+use tt_tests::harness::{in_device, tensix_grid};
 
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-#[track_caller]
-fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-}
-
-fn tensix(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix(x, y), "({x},{y}) is not a Tensix tile");
+/// A Tensix coordinate this chip actually has.
+fn tensix(grid: &Tensix, x: u8, y: u8) -> NocCoord<Noc0> {
+    assert!(
+        grid.contains(x, y),
+        "({x},{y}) is not a Tensix tile on this chip: {} columns present, X must be \
+         one of {:?}",
+        grid.enabled_column_count(),
+        grid.columns().collect::<Vec<_>>()
+    );
     NocCoord::new(x, y).unwrap()
 }
 
@@ -46,11 +48,12 @@ fn pattern(len: usize, seed: u32) -> Vec<u8> {
 #[test]
 fn pattern_round_trips_through_two_windows() {
     in_device(|dev| {
+        let grid = tensix_grid(dev);
         let write_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let read_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
         assert_ne!(write_window.index(), read_window.index());
 
-        let tile = tensix(3, 4);
+        let tile = tensix(&grid, 3, 4);
         let data = pattern(4096, 0xC0FFEE);
         dev.write(&write_window, tile, 0x2_0000, &data).unwrap();
 
@@ -69,9 +72,17 @@ fn two_tiles_do_not_alias() {
     // these apart. If they were dropped, both writes would land in one tile and the
     // second read would return the first tile's data.
     in_device(|dev| {
+        let grid = tensix_grid(dev);
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let a = tensix(1, 2);
-        let b = tensix(16, 11);
+
+        // The extremes of the surviving grid, for the widest separation available:
+        // a dropped coordinate field is most visible between distant tiles. Taken
+        // from the chip rather than written down, because the largest X that is
+        // still a Tensix tile is exactly what harvesting changes.
+        let columns: Vec<u8> = grid.columns().collect();
+        let a = tensix(&grid, columns[0], 2);
+        let b = tensix(&grid, *columns.last().unwrap(), 11);
+        assert_ne!(a, b);
 
         let da = pattern(256, 0xAAAA);
         let db = pattern(256, 0x5555);
@@ -96,12 +107,13 @@ fn transfer_split_across_a_window_boundary_is_contiguous_on_the_device() {
     // both at the start of the aperture -- the failure mode if the window were not
     // retargeted between chunks.
     in_device(|dev| {
+        let grid = tensix_grid(dev);
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix(5, 6);
+        let tile = tensix(&grid, 5, 6);
 
         // L1 is 1536 KiB; write the last 8 bytes of it and read them back in two
         // halves through differently-aligned accesses.
-        let top = grid::TENSIX_L1_SIZE - 8;
+        let top = tt_isa::noc::grid::TENSIX_L1_SIZE - 8;
         let data = pattern(8, 0x1234);
         dev.write(&w, tile, top, &data).unwrap();
 
@@ -116,13 +128,31 @@ fn transfer_split_across_a_window_boundary_is_contiguous_on_the_device() {
 
 #[test]
 fn every_tensix_tile_is_addressable() {
-    // 140 tiles, each given a distinct value at the same address. Then all 140 are
-    // read back. Any coordinate that aliased onto another would show up as a
-    // mismatch, and a coordinate outside the grid would be fatal.
+    // Each of this chip's tiles gets a distinct value at the same address, then all
+    // of them are read back. Any coordinate that aliased onto another would show up
+    // as a mismatch.
+    //
+    // The population comes from the chip, not from a constant. The constant used to
+    // be 140 -- the count for an unharvested part -- and iterating it on a harvested
+    // chip walks straight into the fused-off columns.
     in_device(|dev| {
+        let grid = tensix_grid(dev);
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tiles: Vec<_> = grid::tensix_tiles::<Noc0>().collect();
-        assert_eq!(tiles.len(), grid::TENSIX_TILE_COUNT);
+        let tiles: Vec<_> = grid.tiles::<Noc0>().collect();
+        assert_eq!(tiles.len(), grid.tile_count());
+        assert!(
+            !tiles.is_empty(),
+            "a chip with no Tensix tiles is not usable"
+        );
+
+        // None of them may be in a fused-off column. Belt and braces over
+        // `Tensix::tiles`, because this is the assertion whose failure mode is a
+        // dead host rather than a red test.
+        let harvested: Vec<u8> = grid.harvested_columns().collect();
+        assert!(
+            tiles.iter().all(|t| !harvested.contains(&t.x())),
+            "the tile list includes a fused-off column: harvested X = {harvested:?}"
+        );
 
         for (i, tile) in tiles.iter().enumerate() {
             dev.write32(&w, *tile, 0x3000, 0x1000_0000 + i as u32)
@@ -144,9 +174,10 @@ fn l1_ends_where_the_specification_says() {
     // 1536 KiB per Tensix tile (`BabyRISCV/README.md:102`). The last dword is
     // writable; anything past it is not this tile's memory.
     in_device(|dev| {
+        let grid = tensix_grid(dev);
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix(3, 2);
-        let last = grid::TENSIX_L1_SIZE - 4;
+        let tile = tensix(&grid, 3, 2);
+        let last = tt_isa::noc::grid::TENSIX_L1_SIZE - 4;
         dev.write32(&w, tile, last, 0xFEED_FACE).unwrap();
         assert_eq!(dev.read32(&w, tile, last).unwrap(), 0xFEED_FACE);
     });
@@ -155,8 +186,9 @@ fn l1_ends_where_the_specification_says() {
 #[test]
 fn a_freed_window_can_be_reallocated_and_retargeted() {
     in_device(|dev| {
-        let a = tensix(2, 3);
-        let b = tensix(4, 5);
+        let grid = tensix_grid(dev);
+        let a = tensix(&grid, 2, 3);
+        let b = tensix(&grid, 4, 5);
 
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         dev.write32(&w, a, 0x1000, 0x1111_1111).unwrap();
@@ -180,10 +212,22 @@ fn window_exhaustion_is_an_error_not_a_panic() {
         while let Ok(w) = dev.alloc_window(WindowKind::TwoMib) {
             held.push(w);
         }
-        // 202 windows exist, one of which is reserved for the kernel driver.
+        // 202 windows exist, one of which is reserved for the kernel driver
+        // (`blackhole.c:22,42`: `TLB_2M_WINDOW_COUNT 202`, `KERNEL_TLB_INDEX` is
+        // the last of them).
         assert_eq!(held.len(), 201);
         assert!(held
             .iter()
             .all(|w| w.index() != tt_device::tlb::KERNEL_RESERVED_WINDOW));
+
+        // Hand them back. `Window` has no `Drop` that reaches the free list, so
+        // dropping them here would leave the device with none -- which the
+        // simulator does not notice, because its `in_device` hands out a fresh
+        // chip per call and never scrubs, while silicon's scrubs the gate tile
+        // after the body and needs a window to do it. That divergence is exactly
+        // what this gate found on its first real run.
+        for w in held {
+            dev.free_window(w);
+        }
     });
 }

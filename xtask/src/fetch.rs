@@ -202,3 +202,53 @@ pub fn fetch_spec(force: bool) -> Result<(), String> {
     println!("wrote {} ({})", dest.display(), pin::SPEC_REV);
     Ok(())
 }
+
+/// Fetch the pinned tt-kmd `ioctl.h` into `vendor/`.
+///
+/// Unlike the specification tree, this header is not something we implement
+/// *against* — it is the ABI of a program running on this machine, and the only
+/// reason the pin is trustworthy is that the tagged bytes match the DKMS source
+/// of the loaded module. Verified on arrival for the usual reason: UMD vendors
+/// its own divergent snapshots of this filename, and binding one of those would
+/// produce a layout that compiles, runs, and is silently wrong.
+pub fn fetch_kmd(force: bool) -> Result<(), String> {
+    let dest = workspace_root().join("vendor").join("ioctl.h");
+
+    if dest.exists() && !force {
+        match sha256(&dest) {
+            Ok(h) if h == pin::TTKMD_IOCTL_SHA256 => {
+                println!("{} is already present and matches the pin", dest.display());
+                return Ok(());
+            }
+            Ok(h) => {
+                return Err(format!(
+                    "{} exists but hashes {h}, not the pinned {}.\n\
+                     Re-run with --force to replace it, or update PINS.toml if the bump \
+                     is intentional — note that bumping this pin without also checking \
+                     `modinfo tenstorrent` means binding an ABI the loaded driver may \
+                     not speak.",
+                    dest.display(),
+                    pin::TTKMD_IOCTL_SHA256
+                ))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let url = format!(
+        "https://raw.githubusercontent.com/tenstorrent/tt-kmd/{}/ioctl.h",
+        pin::TTKMD_TAG
+    );
+    download(&url, &dest)?;
+
+    let got = sha256(&dest)?;
+    if got != pin::TTKMD_IOCTL_SHA256 {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "{url} hashes {got}, not the pinned {}",
+            pin::TTKMD_IOCTL_SHA256
+        ));
+    }
+    println!("wrote {} ({})", dest.display(), pin::TTKMD_TAG);
+    Ok(())
+}

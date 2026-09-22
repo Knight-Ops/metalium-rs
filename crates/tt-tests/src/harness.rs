@@ -12,18 +12,23 @@
 //! a refusal into a failing assertion, and [`survives`] turns it into a *value* —
 //! which is what makes the probes in this crate discovery tools rather than just
 //! tests.
+//!
+//! The fork survives the move to silicon, where there is no `_Exit` to catch, for
+//! two other reasons: a gate that wedges a baby RISC-V cannot take the runner
+//! with it, and it is the child's file descriptor closing that fires the driver's
+//! registered cleanup write. See [`crate::backend`].
 
 use tt_device::core_control::WaitError;
 use tt_device::tlb::WindowKind;
-use tt_device::{Device, Window};
+use tt_device::Window;
 use tt_isa::isa::Instruction;
 use tt_isa::mailbox::{self, status};
 use tt_isa::noc::{grid, Noc0, NocCoord};
 use tt_isa::tensix::Core;
-use tt_ttsim::{fork_scope, Simulator};
 
-/// A device backed by the simulator, for the lifetime of one `fork_scope`.
-pub type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
+/// Re-exported so a gate can say `harness::Dev` without caring which target it
+/// is built for. [`crate::backend`] is where the choice is made.
+pub use crate::backend::{in_device, survives, tensix_grid, Dev};
 
 /// T1, not T0: ttsim implements the RISC-V view of `Dst` only for `pipe == 1`
 /// (`docs/ttsim-divergence.md` row 12). A simulator constraint, not a hardware one.
@@ -41,11 +46,12 @@ pub const SENTINEL: u32 = 0xDEAD_BEEF;
 
 /// The Tensix tile the gates use.
 pub fn tensix_tile() -> NocCoord<Noc0> {
+    let (x, y) = crate::backend::GATE_TILE;
     assert!(
-        grid::is_tensix(3, 4),
+        grid::is_tensix_geometry(x, y),
         "the gates' tile must be a Tensix tile"
     );
-    NocCoord::new(3, 4).unwrap()
+    NocCoord::new(x, y).unwrap()
 }
 
 /// What to stage before a run and what to read after it.
@@ -194,35 +200,4 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
         l1.push(buf);
     }
     Outcome { dst, l1 }
-}
-
-/// Run `f` against a fresh simulator, inside a fork.
-///
-/// A fresh simulator per call is not just isolation from `_Exit`: `Dst` has no
-/// power-on reset value and nothing scrubs it (`Dst.md:15`), so two runs sharing a
-/// simulator leave the second reading the first's leftovers.
-#[track_caller]
-pub fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-}
-
-/// Did `f` run to completion, or did ttsim refuse something in it?
-///
-/// The discovery primitive: a refusal becomes `false` rather than a dead runner, so
-/// a probe can assert that the simulator declines a configuration *and* that a
-/// control of the same shape survives.
-pub fn survives(f: impl FnOnce(&mut Dev<'_>)) -> bool {
-    fork_scope(|| {
-        let mut sim = Simulator::open().unwrap();
-        let mut dev = Device::open(sim.transport()).unwrap();
-        f(&mut dev);
-    })
-    .is_ok()
 }

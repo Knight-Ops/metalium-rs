@@ -575,9 +575,30 @@ window, read it back through a *different* window, bytes match. Repeat against a
 validate coordinate handling, and against `bh_x2` to validate chip indexing.
 
 **Gate (silicon):** the same test against a real p150, and across two cards if available.
+**Closed** — 7/7 on both p150a cards. See `implementation-checklist.md`, and the operating
+notes below it, which every later silicon gate depends on.
 
 **Hazards:** multiple coordinate systems exist and are mutually incompatible. Establish the
 newtype discipline here (see Cross-cutting), not later.
+
+**What Phase 1 actually cost, and why it is worth reading before Phase 2's silicon gate.**
+The estimate above was for the addressing work, which was accurate. What it missed is that
+the first contact with real hardware is also the first test of every assumption the
+simulator was silently satisfying. One of them — that a Blackhole has 140 Tensix tiles —
+was measured on ttsim, recorded as a fact with a comment saying "re-derive it at the first
+silicon gate", and then not re-derived. Both cards here have 120: two columns are fused off
+for yield, and translation puts them at maximal X, exactly where the gate was writing.
+
+A NoC access to a fused-off tile is not an error. Nothing answers, the read never
+completes, the NoC hangs, and the chip is reset to recover it — which drops the PCIe link
+and, with the card passed through to a VM, kills the host. Budget for the fact that
+hardware bring-up failures on a passed-through accelerator are *host* failures, and that
+the evidence dies with the machine unless you arrange otherwise beforehand.
+
+The durable lesson is narrower than "test on hardware": a measured constant needs the
+mechanism that would notice it changing, not a comment asking a future reader to check.
+`grid::Tensix` now carries the chip's own answer and there is no 140 left in the tree to
+iterate.
 
 ### Phase 2 — Rust executing on a baby RISC-V (~2–3 weeks)
 

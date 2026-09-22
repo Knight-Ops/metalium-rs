@@ -11,6 +11,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod arc;
 pub mod backend;
 pub mod cfg;
 pub mod isa;

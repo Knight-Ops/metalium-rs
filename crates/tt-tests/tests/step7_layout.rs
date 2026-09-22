@@ -32,7 +32,10 @@ fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
 }
 
 fn tensix(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix(x, y), "({x},{y}) is not a Tensix tile");
+    assert!(
+        grid::is_tensix_geometry(x, y),
+        "({x},{y}) is not a Tensix tile"
+    );
     NocCoord::new(x, y).unwrap()
 }
 

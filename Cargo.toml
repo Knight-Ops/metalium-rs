@@ -5,6 +5,7 @@ members = [
     "crates/tt-ttsim-sys",
     "crates/tt-ttsim",
     "crates/tt-device",
+    "crates/tt-kmd",
     "crates/tt-layout",
     "crates/tt-tests",
     "xtask",
@@ -23,5 +24,7 @@ tt-isa = { path = "crates/tt-isa" }
 tt-ttsim-sys = { path = "crates/tt-ttsim-sys" }
 tt-ttsim = { path = "crates/tt-ttsim" }
 tt-device = { path = "crates/tt-device" }
+tt-kmd = { path = "crates/tt-kmd" }
 tt-layout = { path = "crates/tt-layout" }
 libloading = "0.8"
+libc = "0.2"

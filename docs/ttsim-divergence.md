@@ -4,9 +4,13 @@ Every place the simulator and the specification disagree, or where the simulator
 declines to model something. Each entry is a finding: either ttsim, the documentation,
 or our understanding is wrong, and all three are worth knowing about.
 
-The log exists from the first commit deliberately. There is no silicon on this machine,
-so the "silicon" column is empty everywhere — but the file and the habit need to predate
-the pressure to skip them.
+The log existed from the first commit deliberately, before there was anything to
+compare against — the file and the habit needed to predate the pressure to skip them.
+That has now paid off. Two p150a cards are attached to this machine as of Phase 1's
+silicon gate, and the log's most consequential entry is row 35, which is a divergence
+ttsim gives **no error for at all**: it models a chip with more Tensix tiles than any
+real one has. Nothing in the first table below could have caught it, because ttsim
+does not refuse anything — it just answers a fuller chip's questions.
 
 ## Not modelled by ttsim
 
@@ -47,6 +51,8 @@ the process. Each one that we hit is either routed around or deferred to a silic
 | # | What | Note |
 |--:|---|---|
 | 8 | DRAM tiles fault on Tensix NIU addresses | A DRAM tile's NIU is not at `0xFFB2_0000`, so a blind grid walk reading that address dies at the first DRAM column. This is most likely faithful, not a simulator artefact — it is why `ethdump.c` scans only the row it already knows is Ethernet. Our scans fork per coordinate. |
+| 35 | **ttsim models an unharvested chip.** Its Tensix population is 14 columns x 10 rows = 140; both p150a cards here have 12 columns = **120**, with columns at translated X 15 and 16 fused off | The worst failure mode in this log, and the only one with a blast radius outside the process. ttsim answers for all 140, so `grid` was *measured* as 140 (`probe_niu.rs`) and the Phase 1 gate hardcoded both that count and a `tensix(16, 11)`. On silicon those name tiles that do not exist, and a NoC access to a fused-off tile is not an error — nothing answers, the host's MMIO read through the TLB window never completes, and the NoC is left hung. Recovery is a chip reset, from either the ARC's 10-second watchdog (`blackhole.c:704`) or the driver's explicit ASIC + M3 reset (`blackhole.c:608-613`, `reset_arg = 3`); either drops the PCIe link, and with the card passed through to a VM that takes the **host** down. It did, twice. Harvesting is per-ASIC and cannot be probed for — probing is the hang — so it must be read from ARC telemetry before any Tensix access. See `tt_isa::arc`, `tt_device::telemetry`, and `grid::Tensix`. |
+| 36 | `HARVESTING_STATE` (ARC telemetry tag 4) reads `0x00000000` on both cards | Published in the tag directory and empty. The tag whose name answers the question is the one that lies about it: trusted as a source or even as a cross-check, it reports an unharvested chip and sends you straight back into row 35. `ENABLED_TENSIX_COL` (tag 34) is the real source, and reads `0xfff` on both cards. Firmware bundle 19.14.0.0. |
 | 9 | BAR bases are compile-time constants | `libttsim_init` pre-programs config space to match them, and config-space BAR *writes are accepted but change nothing*. Relocating a BAR the way a BIOS would makes config space lie while decoding continues against the constants. `Simulator::probe_chips` refuses to start if the two disagree — now per chip, against the stride formula in row 22 rather than against three constants. Watched firing: dropping the chip from `chip_bar_base` makes the dual-chip gate refuse to open rather than silently address chip 0 twice. |
 | 10 | Every contract violation calls `_Exit` | No return code, no unwinding, no destructors, no panic hook. This is why `tt_ttsim::transport` validates before calling and why tests run inside `fork_scope`. `crates/tt-ttsim/tests/fatality.rs` pins five cases as genuinely fatal, so the validation layer cannot quietly become unnecessary. |
 | 18 | Tensix backend soft reset is not modelled | `SOFT_RESET_0` comes up at `0x0004_7800` — only the RISC-V bits — and ttsim's handler acts on those alone. The Vector Unit is therefore always released, and `release_tensix_backend` is a no-op there. It is kept because it is required on silicon, where holding bit 10 means SFPU instructions "might or might not be silently discarded". The negative control that checks this is `#[cfg(feature = "silicon")]`. |

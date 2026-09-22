@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         Some("check-no-sim-in-ship") => ship::check_no_sim_in_ship(),
         Some("gen-cfg") => gen_cfg::gen_cfg(args.any(|a| a == "--check")),
         Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
+        Some("fetch-kmd") => fetch::fetch_kmd(args.any(|a| a == "--force")),
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
@@ -44,6 +45,8 @@ tasks:
   fetch-ttsim [--force]   download the pinned libttsim builds into vendor/
   fetch-spec [--force]    download the pinned ISA specification tree into vendor/
                           and verify it against the pinned content digest
+  fetch-kmd [--force]     download the pinned tt-kmd ioctl.h into vendor/; this is
+                          the driver ABI tt-kmd binds, not a specification
   gen-cfg [--check]       regenerate tt-isa's backend-configuration field table
                           from the pinned cfg_defines.h; --check fails if the
                           committed file is out of date rather than rewriting it

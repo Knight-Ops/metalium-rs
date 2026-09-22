@@ -1,0 +1,14 @@
+[package]
+name = "tt-kmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Shippable. This is the production path to the chip: the simulator binding is
+# the dev-only one, and `cargo xtask check-no-sim-in-ship` enforces that this
+# crate's dependency graph never reaches it.
+[dependencies]
+tt-isa.workspace = true
+tt-device.workspace = true
+libc.workspace = true

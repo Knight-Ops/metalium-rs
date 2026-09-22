@@ -251,8 +251,18 @@ pub mod niu {
 /// the documented Tensix tile count. Three independent figures agreeing is what
 /// makes this a fact rather than a guess.
 ///
-/// It is nonetheless a *measured* fact about one simulator build, not a quoted one.
-/// Re-derive it at the first silicon gate, and treat a mismatch as a finding.
+/// It is nonetheless a *measured* fact about one simulator build, not a quoted one,
+/// and the first silicon gate found the mismatch the warning that used to sit here
+/// predicted: ttsim models an *unharvested* chip, so 140 is the population of a
+/// full Blackhole and not of any particular one. Tenstorrent fuses off Tensix
+/// columns for yield, so a p150a commonly presents 120. Which columns are gone
+/// varies per ASIC and cannot be measured by probing, because probing a fused-off
+/// tile is the hang described in [`crate::arc`].
+///
+/// The geometry below is therefore split in two. [`is_tensix_geometry`] answers
+/// "could this coordinate ever hold a Tensix tile", which is a property of the
+/// part. [`Tensix`] answers "does *this* chip have a Tensix tile there", which is
+/// a property of one ASIC and has to come from its ARC.
 pub mod grid {
     use super::{NocCoord, NocId};
 
@@ -271,8 +281,34 @@ pub mod grid {
     /// Rows holding Tensix tiles, inclusive.
     pub const TENSIX_ROWS: core::ops::RangeInclusive<u8> = 2..=11;
 
-    /// Is this coordinate a Tensix tile?
-    pub const fn is_tensix(x: u8, y: u8) -> bool {
+    /// Every column that can hold Tensix tiles, in ascending X.
+    ///
+    /// Ascending X is not an arbitrary ordering: `NoC/Coordinates.md:54` says that
+    /// when columns are fused off, "`X` is remapped to put the fused columns at
+    /// maximal `X`". In translated space the surviving columns are therefore a
+    /// prefix of this array and the harvested ones are a suffix, whichever
+    /// physical columns were actually lost. That is what lets [`Tensix`] be built
+    /// from a *count* and spares us having to guess the bit order of a mask.
+    pub const TENSIX_COLUMNS: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
+
+    /// Rows of Tensix tiles. Harvesting on Blackhole is by column, not row
+    /// (`NoC/Coordinates.md:54`), unlike Wormhole where it is by row.
+    pub const TENSIX_ROW_COUNT: usize = 10;
+
+    /// Tensix tiles on a Blackhole with nothing fused off.
+    ///
+    /// The population of the *part*, not of any given chip. A real chip has
+    /// [`Tensix::tile_count`] of them.
+    pub const FULL_TENSIX_TILE_COUNT: usize = TENSIX_COLUMNS.len() * TENSIX_ROW_COUNT;
+
+    /// Could a Tensix tile ever live at this coordinate?
+    ///
+    /// Geometry alone. A true answer does not mean the tile is present on the chip
+    /// in front of you — for that, ask [`Tensix::contains`]. The distinction is
+    /// deliberately awkward to ignore: the name of the thing that *looks* like the
+    /// obvious predicate is the one that cannot get you a hung NoC, and the one
+    /// that can requires a value you could only have obtained from the ARC.
+    pub const fn is_tensix_geometry(x: u8, y: u8) -> bool {
         y >= *TENSIX_ROWS.start()
             && y <= *TENSIX_ROWS.end()
             && x != NON_MEMORY_COLUMN
@@ -281,17 +317,104 @@ pub mod grid {
             && x < super::GRID_WIDTH
     }
 
-    /// Every Tensix coordinate, in row-major order.
-    pub fn tensix_tiles<N: NocId>() -> impl Iterator<Item = NocCoord<N>> {
-        TENSIX_ROWS.flat_map(|y| {
-            (0..super::GRID_WIDTH)
-                .filter(move |&x| is_tensix(x, y))
-                .filter_map(move |x| NocCoord::<N>::new(x, y))
-        })
+    /// Which Tensix tiles one particular chip actually has.
+    ///
+    /// Obtained from the chip's ARC telemetry, never assumed. Construct it with
+    /// [`Tensix::from_enabled_column_mask`] on silicon; [`Tensix::FULL`] is correct
+    /// for the simulator, which models an unharvested chip.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Tensix {
+        /// How many of [`TENSIX_COLUMNS`] survive, counting from the front.
+        enabled_columns: u8,
     }
 
-    /// Documented number of Tensix tiles on a Blackhole.
-    pub const TENSIX_TILE_COUNT: usize = 140;
+    impl Tensix {
+        /// Every column present: a full Blackhole, and what ttsim models.
+        pub const FULL: Tensix = Tensix {
+            enabled_columns: TENSIX_COLUMNS.len() as u8,
+        };
+
+        /// The first `n` of [`TENSIX_COLUMNS`], or `None` if `n` exceeds the part.
+        pub const fn from_enabled_column_count(n: u8) -> Option<Tensix> {
+            if n as usize > TENSIX_COLUMNS.len() {
+                None
+            } else {
+                Some(Tensix { enabled_columns: n })
+            }
+        }
+        /// Interpret an `ENABLED_TENSIX_COL` telemetry word
+        /// ([`crate::arc::tag::ENABLED_TENSIX_COL`]).
+        ///
+        /// Only the population count is used, for the reason given on
+        /// [`TENSIX_COLUMNS`]: in translated space the survivors are a prefix, so
+        /// the count determines the set and the bit order does not matter. That
+        /// matters because the bit order is *not* published — UMD documents its own
+        /// `HarvestingMasks` as logical indices
+        /// (`umd/device/soc_descriptor.hpp:151-158`) but says nothing about the raw
+        /// firmware word, and a wrong guess about it would put a write on a
+        /// fused-off tile, which is precisely the failure this type exists to make
+        /// impossible.
+        ///
+        /// `None` if the set bits are not contiguous from bit 0. That shape would
+        /// contradict `NoC/Coordinates.md:54`, and the honest response to a chip
+        /// that contradicts the specification is to stop and report the word, not
+        /// to pick an interpretation and drive the NoC with it.
+        pub const fn from_enabled_column_mask(mask: u32) -> Option<Tensix> {
+            let n = mask.count_ones();
+            if n as usize > TENSIX_COLUMNS.len() {
+                return None;
+            }
+            // Contiguous from bit 0 iff the mask is 2^n - 1. Shifting by 32 is UB
+            // in Rust, so the full-width case is spelled out.
+            let expected = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            if mask != expected {
+                return None;
+            }
+            Some(Tensix {
+                enabled_columns: n as u8,
+            })
+        }
+
+        /// How many Tensix columns this chip has.
+        pub const fn enabled_column_count(&self) -> usize {
+            self.enabled_columns as usize
+        }
+
+        /// How many Tensix tiles this chip has: 120 on a p150a with two columns
+        /// fused off, 140 on a full part.
+        pub const fn tile_count(&self) -> usize {
+            self.enabled_columns as usize * TENSIX_ROW_COUNT
+        }
+
+        /// The X of each surviving column, ascending.
+        pub fn columns(&self) -> impl Iterator<Item = u8> + '_ {
+            TENSIX_COLUMNS[..self.enabled_columns as usize]
+                .iter()
+                .copied()
+        }
+
+        /// The X of each fused-off column, ascending.
+        ///
+        /// Worth having explicitly: a gate that wants to prove the harvesting mask
+        /// is *right* needs to name the tiles it must not touch, and a test that
+        /// asserts something about them beats a comment saying to avoid them.
+        pub fn harvested_columns(&self) -> impl Iterator<Item = u8> + '_ {
+            TENSIX_COLUMNS[self.enabled_columns as usize..]
+                .iter()
+                .copied()
+        }
+
+        /// Does *this* chip have a Tensix tile at this coordinate?
+        pub fn contains(&self, x: u8, y: u8) -> bool {
+            is_tensix_geometry(x, y) && self.columns().any(|c| c == x)
+        }
+
+        /// Every Tensix tile this chip has, in row-major order.
+        pub fn tiles<N: NocId>(&self) -> impl Iterator<Item = NocCoord<N>> + '_ {
+            TENSIX_ROWS
+                .flat_map(move |y| self.columns().filter_map(move |x| NocCoord::<N>::new(x, y)))
+        }
+    }
 
     #[cfg(test)]
     mod tests {
@@ -299,19 +422,70 @@ pub mod grid {
         use crate::noc::Noc0;
 
         #[test]
-        fn tensix_population_matches_the_documented_count() {
-            assert_eq!(tensix_tiles::<Noc0>().count(), TENSIX_TILE_COUNT);
+        fn a_full_part_matches_the_documented_count() {
+            assert_eq!(FULL_TENSIX_TILE_COUNT, 140);
+            assert_eq!(Tensix::FULL.tile_count(), 140);
+            assert_eq!(Tensix::FULL.tiles::<Noc0>().count(), 140);
+            assert_eq!(Tensix::FULL.harvested_columns().count(), 0);
         }
 
         #[test]
         fn the_excluded_columns_and_rows_are_excluded() {
-            assert!(!is_tensix(NON_MEMORY_COLUMN, 5));
-            assert!(!is_tensix(DRAM_COLUMNS[0], 5));
-            assert!(!is_tensix(DRAM_COLUMNS[1], 5));
-            assert!(!is_tensix(3, ETHERNET_ROW));
-            assert!(!is_tensix(3, 0));
-            assert!(is_tensix(3, 2));
-            assert!(is_tensix(16, 11));
+            assert!(!is_tensix_geometry(NON_MEMORY_COLUMN, 5));
+            assert!(!is_tensix_geometry(DRAM_COLUMNS[0], 5));
+            assert!(!is_tensix_geometry(DRAM_COLUMNS[1], 5));
+            assert!(!is_tensix_geometry(3, ETHERNET_ROW));
+            assert!(!is_tensix_geometry(3, 0));
+            assert!(is_tensix_geometry(3, 2));
+            assert!(is_tensix_geometry(16, 11));
+        }
+
+        #[test]
+        fn the_geometry_columns_are_exactly_the_tensix_columns() {
+            // TENSIX_COLUMNS must not drift from the predicate it summarises.
+            let derived = (0..super::super::GRID_WIDTH).filter(|&x| is_tensix_geometry(x, 2));
+            assert!(derived.eq(TENSIX_COLUMNS.iter().copied()));
+        }
+
+        #[test]
+        fn a_harvested_p150a_has_120_tiles_and_loses_the_top_columns() {
+            // Two columns fused off: NoC/Coordinates.md:54 puts them at maximal X,
+            // so 15 and 16 are the ones that must never be addressed.
+            let t = Tensix::from_enabled_column_count(12).unwrap();
+            assert_eq!(t.tile_count(), 120);
+            assert_eq!(t.tiles::<Noc0>().count(), 120);
+            assert!(t.harvested_columns().eq([15u8, 16].iter().copied()));
+            assert!(t.contains(14, 11));
+            assert!(!t.contains(15, 11));
+            assert!(!t.contains(16, 11));
+            // Still Tensix geometry -- which is exactly why the two predicates
+            // have to be different functions.
+            assert!(is_tensix_geometry(16, 11));
+        }
+
+        #[test]
+        fn a_mask_is_read_by_population_count() {
+            assert_eq!(
+                Tensix::from_enabled_column_mask(0b1111_1111_1111).unwrap(),
+                Tensix::from_enabled_column_count(12).unwrap()
+            );
+            assert_eq!(
+                Tensix::from_enabled_column_mask(0x3FFF).unwrap(),
+                Tensix::FULL
+            );
+        }
+
+        #[test]
+        fn a_mask_that_contradicts_the_specification_is_refused() {
+            // Holes in the middle would mean harvested columns are not at maximal
+            // X. Refuse rather than guess: the alternative is writing to a
+            // fused-off tile.
+            assert!(Tensix::from_enabled_column_mask(0b1111_1111_1101).is_none());
+            assert!(Tensix::from_enabled_column_mask(0b11_0000_0000_0000).is_none());
+            // More columns than the part has.
+            assert!(Tensix::from_enabled_column_mask(u32::MAX).is_none());
+            // No columns at all: the shape an absent telemetry tag takes.
+            assert_eq!(Tensix::from_enabled_column_mask(0).unwrap().tile_count(), 0);
         }
     }
 }

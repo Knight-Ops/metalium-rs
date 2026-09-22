@@ -45,7 +45,7 @@ const BUDGET: u64 = 400_000;
 const SCRATCH_GPR: u32 = 8;
 
 fn tile() -> NocCoord<Noc0> {
-    assert!(grid::is_tensix(3, 4));
+    assert!(grid::is_tensix_geometry(3, 4));
     NocCoord::new(3, 4).unwrap()
 }
 

@@ -8,6 +8,7 @@
 
 pub mod core_control;
 pub mod device;
+pub mod telemetry;
 pub mod tlb;
 pub mod transport;
 

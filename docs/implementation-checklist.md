@@ -7,9 +7,15 @@ is done, what is next, and what must not be forgotten*.
 `[ ]` not started · `[-]` deliberately not applicable here, with the reason given.
 
 **The two-gate rule.** No item is complete until it passes on the simulator *and* on
-silicon. There is no silicon on this machine, so every silicon gate below is open.
-That is a known, tracked gap — not an oversight — and the divergence log
-(`ttsim-divergence.md`) exists to make the eventual comparison cheap.
+silicon. **Silicon now exists here:** two Tenstorrent p150a cards (Blackhole), PCIe-passed
+through to this VM, driver `tenstorrent` 2.11.0, firmware bundle 19.14.0.0. Phase 1's
+silicon gate is closed; every later phase's is still open.
+
+The first silicon run vindicated the rule in the least comfortable way available. Phase 1
+had passed on the simulator for weeks while containing an assumption — 140 Tensix tiles —
+that is true of ttsim and of no real Blackhole. On hardware it hung the NoC and took the
+**host** down with it, twice. The divergence log's row 35 is that finding. A simulator
+gate is evidence about the simulator.
 
 **Before ticking a box, watch the gate fail.** Two gates in this repo were initially
 vacuous: the disassembly check matched no lines at all, and a discarded
@@ -23,7 +29,7 @@ gate you have not seen reject something is not yet evidence.
 | Phase | State | Note |
 |--:|---|---|
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
-| 1 — Host addresses the chip | `[~]` | TLB/L1 and the dual-chip gate done against the simulator; `tt-kmd` not started |
+| 1 — Host addresses the chip | `[x]` | **Gated on simulator and on silicon** (both p150a cards, 7/7). `tt-kmd` done; harvesting read from ARC telemetry |
 | 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
 | 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
 | 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
@@ -93,6 +99,14 @@ no answer.
       separate table entries; the superseded one lives under
       `isa::generated::defs::wormhole`, so using it has to be deliberate.
 - [x] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
+- [x] **A fused-off Tensix tile cannot be named by accident.** The predicate that looks
+      obvious is the safe one: `grid::is_tensix_geometry(x, y)` answers "could a Tensix
+      tile ever be here" and cannot hang anything, while `grid::Tensix::contains(x, y)`
+      answers "does *this chip* have one" and requires a value obtainable only from the
+      chip's ARC. A count is not a constant: `Tensix::tile_count()` replaced
+      `TENSIX_TILE_COUNT`, so there is no 140 left to iterate. This is the hazard that
+      cost two host crashes; it is encoded in two type signatures rather than in a
+      comment saying "mind the harvesting".
       `tt_isa::tensix::PushesTo<Th>` is implemented for exactly the six non-hanging
       cells of `PushTensixInstruction.md:5-9`, so `push::<RiscvT0, Thread1>` does not
       compile. Marker types rather than a runtime check because a hang cannot be
@@ -180,31 +194,133 @@ no answer.
 - [x] Transfers split at window boundaries; a straddling access is fatal.
 - [x] `ordering = Strict AXI`, matching `ethdump.c:239`.
 - [x] **Gate (sim):** pattern round-trips through two *different* windows, on two
-      tiles, across a window boundary; all 140 Tensix tiles addressable without
-      aliasing.
+      tiles, across a window boundary; every Tensix tile addressable without aliasing.
+      Reads 140 tiles on ttsim and 120 on these cards — the count comes from
+      `Tensix::tile_count()`, not from a constant, which is the fix for row 35.
 - [x] **Gate (sim) under `bh_x2`** — two chips, two `Device`s, one process.
       `crates/tt-tests/tests/step2_multichip.rs`: the same tile coordinate at the
       same address on both chips holds different data, window index 0 on each does
-      not collide, and the step 2 round-trip and 140-tile sweep both repeat on
-      chip 1. `ChipId` is no longer assumed — `Device::open` takes it from
+      not collide, and the step 2 round-trip and full-grid sweep both repeat on
+      chip 1. That sweep uses `Tensix::FULL` explicitly and says why: it drives the
+      dual-chip simulator directly rather than going through the backend, so on silicon
+      it would need each chip's own ARC read — two cards are two ASICs with independent
+      fuses, which is the divergence this gate claims to look for. `ChipId` is no longer assumed — `Device::open` takes it from
       `Transport::chip()`, so a device cannot claim a chip it does not address.
       Watched failing three ways: against the single-chip build via
       `TT_TTSIM_LIB_X2`, with the chip dropped from `chip_bar_base`, and with
       `Device::open` ignoring the transport.
-- [ ] **`tt-kmd` crate** — generate the ioctl structs with **bindgen** from
-      tt-kmd's `ioctl.h`; it is real C with structs, which is what bindgen is good
-      at, and `ethdump.c` only inlines a partial copy. (Not bindgen for
-      `cfg_defines.h` — see the note on `parse_cfg_defines`; it silently drops the
-      two oversized masks and discards the section comments that decide
-      `Config` vs `ThreadConfig`.) Then open `/dev/tenstorrent/N`, mmap BAR0/2/4, wrap
-      `ALLOCATE_TLB` (`0xFA0B`) / `CONFIGURE_TLB` / `FREE_TLB`,
-      `GET_DEVICE_INFO` (`0xFA00`), `QUERY_MAPPINGS` (`0xFA02`),
-      `SET_NOC_CLEANUP` (`0xFA0E`).
-  - [ ] `QUERY_MAPPINGS` takes `&mappings[0].mapping_size`, not the struct base.
-  - [ ] `SET_NOC_CLEANUP` re-asserts reset if the process dies — any real runtime
+- [x] **`tt-kmd` crate** — hand-written against a *pinned* `ioctl.h` rather than
+      bindgen'd. The pin is unlike the other three in `PINS.toml`: they pin
+      specifications, this pins an interface to a program running on this machine, and
+      it is only meaningful if it names the version actually loaded. It does — the
+      header at `ttkmd-2.11.0` is byte-identical to `/usr/src/tenstorrent-2.11.0/ioctl.h`
+      — and the hash is not the real guard anyway: `Kmd::open` asks the driver via
+      `GET_DRIVER_INFO` and refuses a mismatch, because a matching header is no evidence
+      about the loaded module. `crates/tt-kmd/tests/abi_layout.rs` checks every struct
+      offset against the C header, watched failing.
+  - [x] Opened **without** `O_APPEND`, deliberately. tt-kmd reads the open flags as a
+        power policy (`ioctl.h:363-380`): without it the driver requests high power
+        immediately; with it the state starts at zero and every feature — including
+        `TT_POWER_FLAG_TENSIX_ENABLE`, whose zero clock-gates the Tensix array — must be
+        asked for explicitly. Opening with `O_APPEND` and forgetting produces a chip on
+        which nothing runs and nothing says why.
+  - [x] `SET_NOC_CLEANUP` registered, but **only after** the grid is known — see the
+        ordering note in Silicon operating notes below.
+  - [-] `GET_HARVESTING` (`0xFA01`) is a **dead stub** in 2.11.0: `chardev.c:786-787` is a
+        bare `break`, there is no handler, and no struct for it in `ioctl.h`. Harvesting
+        comes from ARC telemetry instead.
+- [x] **Gate (silicon):** the Phase 1 round-trip on real p150a cards — 7/7 on **both**,
+      single-threaded, including the full 120-tile sweep and window exhaustion. Not
+      passed on the first attempt: see Silicon operating notes.
+  - [x] `QUERY_MAPPINGS` takes `&mappings[0].mapping_size`, not the struct base.
+  - [x] `SET_NOC_CLEANUP` re-asserts reset if the process dies — any real runtime
         needs it. Returns `EINVAL` on older `tt-kmd`; ethdump ignores the result.
-- [ ] **Gate (silicon):** the same round-trip on a real p150, and across two cards
-      if available.
+
+**Why not bindgen, in the end.** The plan called for it, and the reasoning was sound:
+`ioctl.h` is real C with structs, which is what bindgen is good at, and `ethdump.c` only
+inlines a partial copy. What decided against it is that the ABI needs *two* guards, and
+bindgen provides neither. The header must be the one the loaded module was built from —
+pinned by hash in `PINS.toml`, checked byte-for-byte against the DKMS source — and the
+running module must agree, which only `GET_DRIVER_INFO` can establish at runtime. A
+generated binding would have compiled cleanly against a divergent vendored copy (UMD ships
+one) and produced a layout that runs and is wrong. `abi_layout.rs` checks the hand-written
+structs against the C header instead, which gives the same protection bindgen would while
+leaving the pin and the runtime check as the actual guards. (Separately, and still true:
+not bindgen for `cfg_defines.h` — see the note on `parse_cfg_defines`; it silently drops
+the two oversized masks and discards the section comments that decide `Config` vs
+`ThreadConfig`.)
+
+---
+
+## Silicon operating notes
+
+Learned the hard way during Phase 1's silicon bring-up. Three host crashes bought these;
+they apply to every later phase's silicon gate, so they live here rather than in Phase 1.
+
+**Ask the chip what it is, before addressing any Tensix tile.** Harvesting is per-ASIC,
+it is invisible on the simulator (divergence row 35), and it cannot be discovered by
+probing, because probing a fused-off tile *is* the hang. `Device::tensix_grid` reads
+`ENABLED_TENSIX_COL` (ARC telemetry tag 34) and returns a `grid::Tensix`. Not tag 4,
+`HARVESTING_STATE`, which is published and empty (row 36).
+
+**The ARC is the one tile you can address before you know anything.** It sits at raw
+`(8, 0)`, and `NoC/Coordinates.md:28-29` gives `Y = 0` and `Y = 1` as the rows where X
+translation is not applied — so that coordinate denotes the same tile whether or not
+translation is on. Every other coordinate's meaning depends on the translation state you
+are trying to read. That invariance is the whole bootstrap; `tt_isa::arc` has a test
+pinning `ARC_Y == 0` so it cannot be refactored away.
+
+**The harvesting mask is read by population count, not bit position.**
+`NoC/Coordinates.md:54` says fused columns are remapped to *maximal X*, so in translated
+space the survivors are a prefix of `grid::TENSIX_COLUMNS` and the count determines the
+set. This matters because the raw firmware bit layout is **not** published — UMD documents
+its own `HarvestingMasks` as logical indices and says nothing about the word. Measured:
+`0xfff` on both cards, contiguous, 12 of 14 columns, harvested at X 15 and 16.
+`Tensix::from_enabled_column_mask` refuses a non-contiguous mask rather than guessing,
+because the cost of a wrong guess is a dead host, not a failed test.
+
+**Order of operations in `open()` is load-bearing.** Read the grid, *then* assert the gate
+tile survives on this ASIC, *then* register `SET_NOC_CLEANUP`, *then* scrub. The cleanup
+write is a NoC write to a Tensix tile; registered against a fused-off one it would fire on
+every close from then on, including the close that follows the hang.
+
+**Run silicon gates with `--test-threads=1`.** All tests share one physical card. Window
+allocation is global card state, so `window_exhaustion_is_an_error_not_a_panic`'s
+`assert_eq!(held.len(), 201)` is only true if nothing else holds a window. The simulator
+hides this by handing out a fresh chip per call.
+
+**`Window` has no `Drop` that reaches the free list.** A gate that allocates must
+`free_window`; dropping leaks it. This surfaced only on silicon, because silicon's
+`in_device` scrubs the gate tile *after* the body and needs a window to do it, while the
+simulator's never scrubs at all. The one gate whose job is to exhaust windows was the one
+that starved the cleanup path. Worth fixing properly at some point — a `Drop` impl would
+need `&mut Device`, so it is a real design change, not an oversight.
+
+**When a run can take the node down, buy forensics first.** A hard kill loses the
+journal's last minutes *and* unflushed file data — a linked test binary came back as 9.2 MB
+of zeros, and `journalctl`'s last entry predated the real death by over two minutes, which
+makes it useless as a time of death. What worked: a phase log `sync`'d after every write,
+carrying `/proc/sys/kernel/random/boot_id` on each line so a reboot is evidence rather than
+inference; and running the suite **one test at a time**, which is what identified the
+failing access instead of losing the output with the session.
+
+**`auto_reset_timeout=0` is the debugging posture.** It disables the ARC watchdog
+(`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a chip reset that
+drops the PCIe link and kills the host" into "card is wedged, recoverable". It removes the
+safety net that recovers a hung chip, so it is for bring-up, not for keeping.
+
+**Do not run `probe_niu.rs` as a grid oracle.** It opens `Simulator` directly, so it is
+structurally simulator-only and *cannot* reach a card — which is fortunate, because
+finding "the highest addressable byte at each coordinate" is precisely the sweep that
+hangs on a fused-off tile. Its 140 is where the bad constant came from.
+
+**Host infrastructure, for whoever inherits this VM.** The cards are passed through with
+`viommu=virtio`. Switching to the Intel vIOMMU broke the passed-through NVMe — admin queue
+DMA never completed (`nvme nvme0: I/O tag 28 QID 0 timeout` → `Identify Controller failed
+(-4)`), with `AMD-Vi ... IO_PAGE_FAULT` on the host, across four boots; reverting fixed it
+immediately. A DRAM-less controller doing Host Memory Buffer DMA through an emulated
+vIOMMU under VFIO is fragile. Unrelated to the cards, but it cost an hour of
+misattribution.
 
 ---
 
@@ -581,6 +697,16 @@ semantics) · [ ] `REPLAY` · [ ] `MOP`/`MOP_CFG`
 
 **Units** — [ ] the entire Scalar Unit (ThCon) · [ ] Mover (`XMOV`) ·
 [ ] Miscellaneous Unit
+
+**Closed by Phase 1's silicon gate** — [x] NoC coordinate translation is **on**
+(`NOC_TRANSLATION` = 1, both cards), so host-facing TLB coordinates are translated space,
+which the 120-tile sweep confirms end to end · [x] the translated Tensix map of
+`NoC/Coordinates.md:28-46` matches hardware for X and Y, including the gap at X 8 (CPUs)
+and X 9 (DRAM) · [x] harvested columns really are remapped to maximal X as
+`NoC/Coordinates.md:54` claims — the derivation depends on it and `0xfff` confirms it ·
+[x] 202 2 MiB windows with the last reserved for the driver (`blackhole.c:22,42`), 201
+allocatable · [x] a Tensix tile's L1 ends at 1536 KiB (`BabyRISCV/README.md:102`): the
+last dword is writable and reads back.
 
 ---
 

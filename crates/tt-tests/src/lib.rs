@@ -5,6 +5,7 @@
 //! the simulator binding, so cross-cutting gates cannot live there — and so that
 //! `build.rs` can build the device firmware and hand the images to the tests.
 
+pub mod backend;
 pub mod datapath;
 pub mod harness;
 

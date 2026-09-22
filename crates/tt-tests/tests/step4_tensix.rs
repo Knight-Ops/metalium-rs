@@ -31,7 +31,7 @@ fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
 }
 
 fn tensix_tile(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix(x, y));
+    assert!(grid::is_tensix_geometry(x, y));
     NocCoord::new(x, y).unwrap()
 }
 
