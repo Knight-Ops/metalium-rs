@@ -99,6 +99,22 @@ no answer.
       separate table entries; the superseded one lives under
       `isa::generated::defs::wormhole`, so using it has to be deliberate.
 - [x] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
+- [ ] **A dropped `Window` silently leaks its TLB window.** `Window` has no `Drop`
+      that returns the index to `Device`'s free list, so a gate that allocates and
+      does not `free_window` shrinks the pool for the rest of the process. Nothing
+      in the type system says so; it is currently a comment on `scrub`, which is
+      exactly the failure this section is about. It cost the Phase 1 silicon gate a
+      run (see Silicon operating notes) and the diagnostic was a bare
+      `OutOfBounds { offset: 0, len: 0 }` from an unrelated function.
+      **Why it is still open:** the obvious fix does not typecheck. `Drop` cannot
+      take `&mut Device`, so returning the index needs either a borrow of the
+      device in `Window` (which makes holding several windows at once — what the
+      exhaustion gate and every multi-window transfer do — a borrow conflict), or
+      shared interior mutability for the free list, or a `Device::scope`-style
+      closure owning the allocation. Pick one deliberately in Phase 2, when the
+      firmware path starts holding windows across calls and the cost of getting it
+      wrong goes up. Until then the exhaustion gate frees explicitly and `scrub`
+      names the cause.
 - [x] **A fused-off Tensix tile cannot be named by accident.** The predicate that looks
       obvious is the safe one: `grid::is_tensix_geometry(x, y)` answers "could a Tensix
       tile ever be here" and cannot hang anything, while `grid::Tensix::contains(x, y)`
@@ -293,8 +309,10 @@ hides this by handing out a fresh chip per call.
 `free_window`; dropping leaks it. This surfaced only on silicon, because silicon's
 `in_device` scrubs the gate tile *after* the body and needs a window to do it, while the
 simulator's never scrubs at all. The one gate whose job is to exhaust windows was the one
-that starved the cleanup path. Worth fixing properly at some point — a `Drop` impl would
-need `&mut Device`, so it is a real design change, not an oversight.
+that starved the cleanup path. Tracked as an open item under Hazards to encode in the API,
+with the three candidate designs and why the obvious one does not typecheck — not left as
+"worth fixing at some point", which is the phrasing that produced the 140 in the first
+place.
 
 **When a run can take the node down, buy forensics first.** A hard kill loses the
 journal's last minutes *and* unflushed file data — a linked test binary came back as 9.2 MB
