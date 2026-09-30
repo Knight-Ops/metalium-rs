@@ -75,6 +75,19 @@ pub const TRACE: u64 = MAILBOX_BASE + 0x30;
 /// other threads push before theirs, in program order.
 pub const PUSH_WINDOW: u64 = MAILBOX_BASE + 0x34;
 
+/// Non-zero: the runner is **resident**. It runs the staged program, writes
+/// this value to [`ACK`], and then, instead of stopping, waits for the host to
+/// write a different non-zero value here, re-reads its descriptor, and runs
+/// again. Zero at start: one run, then `DONE` and a spin, as before.
+///
+/// Phase 9: loading three images and releasing three cores per run cost more
+/// than most runs. A resident runner is loaded once per session.
+pub const GENERATION: u64 = MAILBOX_BASE + 0x38;
+/// The last [`GENERATION`] the resident runner finished. The host waits on this
+/// rather than on [`STATUS`], which a resident runner leaves at `DONE` between
+/// runs.
+pub const ACK: u64 = MAILBOX_BASE + 0x3C;
+
 /// The [`PUSH_WINDOW`] the host uses on the simulator: well under the 28
 /// instructions the first frontend FIFO holds (`PushTensixInstruction.md:15`).
 pub const SIM_PUSH_WINDOW: u32 = 16;
@@ -161,6 +174,7 @@ const _: () =
 const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PUSH_WINDOW + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(ACK + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
 
@@ -231,6 +245,12 @@ pub mod role {
         }
         pub const fn push_window(self) -> u64 {
             self.base + (super::PUSH_WINDOW - super::MAILBOX_BASE)
+        }
+        pub const fn generation(self) -> u64 {
+            self.base + (super::GENERATION - super::MAILBOX_BASE)
+        }
+        pub const fn ack(self) -> u64 {
+            self.base + (super::ACK - super::MAILBOX_BASE)
         }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {

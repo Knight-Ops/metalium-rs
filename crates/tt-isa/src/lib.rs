@@ -14,6 +14,8 @@
 pub mod arc;
 pub mod backend;
 pub mod cfg;
+pub mod dm;
+pub mod dram;
 pub mod eth;
 pub mod isa;
 pub mod mailbox;

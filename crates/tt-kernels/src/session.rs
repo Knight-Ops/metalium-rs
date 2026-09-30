@@ -27,7 +27,7 @@ use tt_isa::tensix::{self, Core};
 
 use crate::datapath;
 use crate::matmul::{self, Fidelity, SrcRoute};
-use crate::runtime::{self, Kernel, RoleImages, RunError, Schedule};
+use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
 
 /// Every baby RISC-V held in reset: what the cleanup write leaves behind, and
 /// the resting state between runs.
@@ -140,9 +140,13 @@ pub fn reset_thread_state<T: Transport>(
         return Ok(());
     }
     let program = datapath::thread_state_reset();
+    // Thread 0 first releases anything a failed kernel left blocked on a
+    // semaphore, which the backend pulse does not (row 65); otherwise thread 1
+    // or 2's reset would queue behind it forever.
+    let first = [datapath::release_semaphores(), program.clone()].concat();
     let kernel = Kernel {
         dump_rows: 0,
-        ..Kernel::new([&program, &program, &program], Schedule::InOrder)
+        ..Kernel::new([&first, &program, &program], Schedule::InOrder)
     };
     runtime::run(dev, tile, images, &kernel, RESET_BUDGET).map(|_| ())
 }
@@ -176,6 +180,10 @@ pub struct Session<T: Transport> {
     tile: NocCoord<Noc0>,
     grid: Tensix,
     images: RoleImages<'static>,
+    /// The role images, resident since the last [`Session::prepare`]
+    /// (`runtime::Resident`): one reset and one load per session rather than per
+    /// run. `None` only between a failed run and the next `prepare`.
+    resident: Option<Resident<Noc0>>,
 }
 
 impl<T: Transport> Session<T> {
@@ -216,18 +224,51 @@ impl<T: Transport> Session<T> {
             tile,
             grid,
             images,
+            resident: None,
         };
         session.prepare().map_err(SessionError::Reset)?;
         Ok(session)
     }
 
-    /// Put the tile back to a known state before a run: step 4 again.
+    /// Put the tile back to a known state: step 4 again, then the role images
+    /// loaded and left resident.
     pub fn prepare(&mut self) -> Result<(), RunError> {
+        if let Some(r) = self.resident.take() {
+            r.stop(&mut self.dev, &self.images)?;
+        }
         reset_tile(&mut self.dev, self.tile)?;
-        reset_thread_state(&mut self.dev, self.tile, &self.images)
+        reset_thread_state(&mut self.dev, self.tile, &self.images)?;
+        self.resident = Some(Resident::start(
+            &mut self.dev,
+            self.tile,
+            &self.images,
+            RESET_BUDGET,
+        )?);
+        Ok(())
     }
 
-    /// `A[m,k] @ B[k,n]`, row-major, on this session's tile ([`matmul_on`]).
+    /// Run `kernel` on the resident roles. A failure resets the tile and
+    /// restarts them before it is returned, so the session stays usable.
+    pub fn run(&mut self, kernel: &Kernel<'_>, budget: u64) -> Result<runtime::Outcome, RunError> {
+        if self.resident.is_none() {
+            self.prepare()?;
+        }
+        let r = self.resident.as_mut().expect("prepared above");
+        let out = r.run(&mut self.dev, &self.images, kernel, budget);
+        if out.is_err() {
+            self.resident = None;
+            // The kernel's error is the one to report; a recovery that fails
+            // too leaves `resident` empty, and the next run tries again.
+            if let Err(e) = self.prepare() {
+                eprintln!("session: recovery after a failed kernel failed as well: {e}");
+            }
+        }
+        out
+    }
+
+    /// `A[m,k] @ B[k,n]`, row-major, on this session's tile, chunked as
+    /// [`matmul_on`] chunks it but on the resident roles: no reset or image load
+    /// between chunks. Bit-identical to `matmul_on` (`step17_resident`).
     pub fn matmul(
         &mut self,
         a: &[f32],
@@ -237,17 +278,9 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<Vec<f32>, RunError> {
-        matmul_on(
-            &mut self.dev,
-            self.tile,
-            &self.images,
-            a,
-            b,
-            mkn,
-            route,
-            fidelity,
-            budget,
-        )
+        matmul::matmul_chunked(a, b, mkn, route, fidelity, |a, b, mkn| {
+            matmul::matmul_with(a, b, mkn, route, fidelity, |k| self.run(k, budget))
+        })
     }
 
     pub fn device(&mut self) -> &mut Device<T> {
@@ -266,7 +299,11 @@ impl<T: Transport> Session<T> {
         &self.images
     }
 
-    pub fn into_device(self) -> Device<T> {
+    /// The device, with the role cores held again.
+    pub fn into_device(mut self) -> Device<T> {
+        if let Some(r) = self.resident.take() {
+            let _ = r.stop(&mut self.dev, &self.images);
+        }
         self.dev
     }
 }

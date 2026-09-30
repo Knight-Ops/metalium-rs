@@ -151,6 +151,16 @@ pub mod tag {
     pub const ENABLED_ETH: u16 = 35;
     /// Nonzero when the NoC translates coordinates.
     pub const NOC_TRANSLATION: u16 = 40;
+    /// Per-channel GDDR training and BIST state. See [`crate::dram::Training`]
+    /// for the layout; `MEASURED` `0x5555_5555` on both cards.
+    pub const GDDR_STATUS: u16 = 22;
+    /// GDDR data rate in MT/s (`WormholeB0/ARCTile/Telemetry.md:54`).
+    /// `MEASURED` `0x3e80` = 16000 on both cards.
+    pub const GDDR_SPEED: u16 = 23;
+    /// Bitmask of *enabled* DRAM channels, bit `c` for channel `c` (UMD
+    /// `blackhole_tt_device.cpp:155-157` reads its complement as the harvesting
+    /// mask). `MEASURED` `0xff` on both cards, as a p150 should be.
+    pub const ENABLED_GDDR: u16 = 36;
     /// Packed harvesting state. **Published and empty — do not use.**
     ///
     /// Measured `0x00000000` on both p150a cards here (firmware bundle 19.14.0.0),

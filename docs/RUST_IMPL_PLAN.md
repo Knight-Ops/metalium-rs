@@ -1008,6 +1008,17 @@ taken.
 double buffering, multi-tile distribution with NoC multicast. Measure against the theoretical
 peak figures in the spec, not against a competitor.
 
+**Direction, decided 2026-09-30: device residency first.** The release baseline is 224 ms per
+MNIST step on the device against 0.5 ms for Flex on the host, and almost all of it is the host
+path: every matmul re-sends its operands over PCIe and repeats per-session work (a reset, seven
+firmware loads, program rebuilds). The answer is not a faster PCIe path but not using PCIe at all:
+a p150a carries 32 GiB of GDDR6, so the dataset and weights are loaded once at startup and stay
+there, and the metric is PCIe bytes per training step. The device-side items above follow once
+per-op cost is the device's. Progress and measurements are in the checklist's Phase 9 section;
+two findings shape it: the GDDR is reachable and gated on both cards (divergence measurement L),
+and under this VM the host's MMIO is uncached whatever the guest maps (measurement M), so bulk
+upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off the step.
+
 **ttsim does not model cycle-accurate timing.** It remains useful here for *correctness* of the
 more aggressive pipelined kernels — which is where correctness is hardest — but every
 performance number must come from hardware. Keep using the simulator as the correctness gate

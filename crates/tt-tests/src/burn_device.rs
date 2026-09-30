@@ -136,8 +136,10 @@ fn attach_engine(
     use burn_tt::{Engine, EngineError};
     use tt_device::Device;
 
+    // The same `Session` the silicon engine uses (`burn_tt::kmd_engine`), so
+    // the reduced run's golden exercises the resident path on both targets.
     struct Sim<'a> {
-        dev: Device<tt_ttsim::LibTtsim<'a>>,
+        session: tt_kernels::session::Session<tt_ttsim::LibTtsim<'a>>,
         config: Config,
     }
     impl Engine for Sim<'_> {
@@ -147,10 +149,7 @@ fn attach_engine(
             b: &[f32],
             mkn: [usize; 3],
         ) -> Result<Vec<f32>, EngineError> {
-            Ok(tt_kernels::session::matmul_on(
-                &mut self.dev,
-                crate::harness::tensix_tile(),
-                &tt_firmware_images::ROLES,
+            Ok(self.session.matmul(
                 a,
                 b,
                 mkn,
@@ -165,7 +164,15 @@ fn attach_engine(
         let mut sim = tt_ttsim::Simulator::open()
             .map_err(|e| EngineError(format!("could not open the simulator: {e}")))?;
         let dev = Device::open(sim.transport()).map_err(|e| EngineError(e.to_string()))?;
-        serve.serve(&mut Sim { dev, config });
+        let t = crate::harness::tensix_tile();
+        let session = tt_kernels::session::Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            tt_kernels::session::TileChoice::Exactly(t.x(), t.y()),
+            |_, _| Ok(()),
+        )
+        .map_err(|e| EngineError(e.to_string()))?;
+        serve.serve(&mut Sim { session, config });
         Ok(())
     })
 }

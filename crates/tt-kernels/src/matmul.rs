@@ -606,12 +606,29 @@ pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
     images: &crate::runtime::RoleImages<'_>,
     a: &[f32],
     b: &[f32],
-    [m, k, n]: [usize; 3],
+    mkn: [usize; 3],
     route: SrcRoute,
     fidelity: Fidelity,
     budget: u64,
 ) -> Result<Vec<f32>, crate::runtime::RunError> {
-    use crate::runtime::{self, Kernel, Schedule};
+    matmul_with(a, b, mkn, route, fidelity, |kernel| {
+        crate::runtime::run(dev, tile, images, kernel, budget)
+    })
+}
+
+/// [`matmul`], with the kernel handed to `run` -- [`crate::runtime::run`], or a
+/// [`crate::runtime::Resident`]'s `run` -- instead of a fixed runner.
+pub fn matmul_with(
+    a: &[f32],
+    b: &[f32],
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    run: impl FnOnce(
+        &crate::runtime::Kernel<'_>,
+    ) -> Result<crate::runtime::Outcome, crate::runtime::RunError>,
+) -> Result<Vec<f32>, crate::runtime::RunError> {
+    use crate::runtime::{Kernel, Schedule};
     let (in_fmt, out_fmt) = route.formats();
     let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
     let [unpack, math, pack] = matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity);
@@ -628,7 +645,7 @@ pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
             Schedule::Concurrent(&TILE_SEMAPHORES),
         )
     };
-    let out = runtime::run(dev, tile, images, &kernel, budget)?;
+    let out = run(&kernel)?;
     Ok(detilize_packed(&out.l1[0], m, n))
 }
 

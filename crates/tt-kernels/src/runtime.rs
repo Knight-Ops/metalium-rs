@@ -24,10 +24,12 @@
 //!   another name, which hid a missing hand-off on silicon that ttsim showed at
 //!   once (divergence row 53).
 
+use std::time::{Duration, Instant};
 use tt_device::core_control::WaitError;
 use tt_device::tlb::WindowKind;
 use tt_device::trace::TraceEvent;
-use tt_device::{Device, Transport, TransportError};
+
+use tt_device::{Device, Traffic, Transport, TransportError};
 use tt_isa::backend::{self, Before};
 use tt_isa::isa::Instruction;
 use tt_isa::mailbox::role::Mailbox;
@@ -108,6 +110,73 @@ pub struct Outcome {
     pub l1: Vec<Vec<u8>>,
     /// The timestamper events of a traced run, in order.
     pub trace: Vec<TraceEvent>,
+    /// Where the run's host time and transport traffic went.
+    pub profile: Profile,
+}
+
+/// The phases of one [`run`], each with its wall-clock time and what it moved
+/// across the transport. Always collected: it costs one `Instant` per phase.
+///
+/// Host time only. On ttsim it measures the simulator, not a chip, and is no
+/// performance number (divergence row 11); on silicon `Wait` is the one phase
+/// the device, rather than PCIe, can dominate.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub phases: Vec<(Phase, Duration, Traffic)>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Phase {
+    /// Backend release and the kernel's L1 staging (operands).
+    Stage,
+    /// The semaphore-initialising setup program, loaded, run and waited for.
+    Setup,
+    /// Mailbox words and role programs written to their slots.
+    Programs,
+    /// Firmware images loaded and the role cores released.
+    Launch,
+    /// Polling the role mailboxes for `DONE`.
+    Wait,
+    /// `Dst` dump, trace and L1 read-back.
+    ReadBack,
+}
+
+impl Profile {
+    /// Total time and traffic of every phase named `phase`.
+    pub fn of(&self, phase: Phase) -> (Duration, Traffic) {
+        self.phases
+            .iter()
+            .filter(|p| p.0 == phase)
+            .fold((Duration::ZERO, Traffic::default()), |(d, t), p| {
+                (d + p.1, t + p.2)
+            })
+    }
+}
+
+/// Records consecutive phases against one device.
+struct Stopwatch {
+    at: Instant,
+    traffic: Traffic,
+    profile: Profile,
+}
+
+impl Stopwatch {
+    fn start<T: Transport>(dev: &Device<T>) -> Self {
+        Stopwatch {
+            at: Instant::now(),
+            traffic: dev.traffic(),
+            profile: Profile::default(),
+        }
+    }
+
+    /// Close the phase that has been running since the last lap.
+    fn lap<T: Transport>(&mut self, dev: &Device<T>, phase: Phase) {
+        let (now, traffic) = (Instant::now(), dev.traffic());
+        self.profile
+            .phases
+            .push((phase, now - self.at, traffic - self.traffic));
+        (self.at, self.traffic) = (now, traffic);
+    }
 }
 
 impl Outcome {
@@ -205,19 +274,10 @@ fn program_bytes(program: &[Instruction]) -> Vec<u8> {
         .collect()
 }
 
-/// Run `kernel` on the Tensix tile at `tile`, waiting up to `budget` simulated
-/// cycles for each role (`Device::wait_for_mailbox`; on silicon a floor of one
-/// second applies).
-///
-/// The tile's backend is released first; the three role cores are held in
-/// reset again afterwards, success or not.
-pub fn run<T: Transport, N: NocId>(
-    dev: &mut Device<T>,
-    tile: NocCoord<N>,
-    images: &RoleImages<'_>,
-    kernel: &Kernel<'_>,
-    budget: u64,
-) -> Result<Outcome, RunError> {
+/// The setup program (for a concurrent schedule) and thread 0's program, with
+/// the `Dst` clear in front of whichever runs first.
+#[allow(clippy::type_complexity)]
+fn assemble(kernel: &Kernel<'_>) -> Result<(Option<Vec<Instruction>>, Vec<Instruction>), RunError> {
     if kernel.dump_rows > mailbox::DUMP_MAX_ROWS {
         return Err(RunError::TooManyDumpRows {
             rows: kernel.dump_rows,
@@ -243,6 +303,23 @@ pub fn run<T: Transport, N: NocId>(
             (Some(setup), kernel.roles[0].to_vec())
         }
     };
+    Ok((setup, unpack))
+}
+
+/// Run `kernel` on the Tensix tile at `tile`, waiting up to `budget` simulated
+/// cycles for each role (`Device::wait_for_mailbox`; on silicon a floor of one
+/// second applies).
+///
+/// The tile's backend is released first; the three role cores are held in
+/// reset again afterwards, success or not.
+pub fn run<T: Transport, N: NocId>(
+    dev: &mut Device<T>,
+    tile: NocCoord<N>,
+    images: &RoleImages<'_>,
+    kernel: &Kernel<'_>,
+    budget: u64,
+) -> Result<Outcome, RunError> {
+    let (setup, unpack) = assemble(kernel)?;
     let programs: [&[Instruction]; 3] = [&unpack, kernel.roles[1], kernel.roles[2]];
     for (thread, p) in programs.iter().enumerate() {
         if p.len() > mailbox::PROGRAM_MAX as usize {
@@ -253,11 +330,13 @@ pub fn run<T: Transport, N: NocId>(
         }
     }
 
+    let mut clock = Stopwatch::start(dev);
     let w = dev.alloc_window(WindowKind::TwoMib)?;
     dev.release_tensix_backend(&w, tile)?;
     for (addr, data) in kernel.stage {
         dev.write(&w, tile, *addr, data)?;
     }
+    clock.lap(dev, Phase::Stage);
 
     let push_window = if dev.transport().is_simulated() {
         mailbox::SIM_PUSH_WINDOW
@@ -310,6 +389,7 @@ pub fn run<T: Transport, N: NocId>(
             hold_all(dev)?;
             return Err(RunError::Setup(e));
         }
+        clock.lap(dev, Phase::Setup);
     }
     for (thread, program) in programs.iter().enumerate() {
         let dump = if thread == 1 { kernel.dump_rows } else { 0 };
@@ -318,11 +398,13 @@ pub fn run<T: Transport, N: NocId>(
     if kernel.trace {
         dev.configure_trace(&w, tile, mailbox::TRACE_BUFFER, mailbox::TRACE_BUFFER_BYTES)?;
     }
+    clock.lap(dev, Phase::Programs);
 
     let mut stuck = Vec::new();
     if setup.is_some() {
         // Every role released before any is waited for, by one write.
         dev.load_and_start_together(&w, tile, images)?;
+        clock.lap(dev, Phase::Launch);
         for (thread, (core, _, _)) in images.iter().enumerate() {
             if let Err(e) = wait(dev, thread)? {
                 stuck.push((thread, *core, e));
@@ -331,11 +413,17 @@ pub fn run<T: Transport, N: NocId>(
     } else {
         for (thread, &(core, image, at)) in images.iter().enumerate() {
             dev.load_and_start(&w, tile, core, image, at)?;
-            if let Err(e) = wait(dev, thread)? {
+            clock.lap(dev, Phase::Launch);
+            let waited = wait(dev, thread)?;
+            clock.lap(dev, Phase::Wait);
+            if let Err(e) = waited {
                 stuck.push((thread, core, e));
                 break;
             }
         }
+    }
+    if setup.is_some() {
+        clock.lap(dev, Phase::Wait);
     }
     // Leave the cores the way they were found: held. They spin after `DONE`,
     // and whatever runs next may depend on a core being in reset.
@@ -362,5 +450,277 @@ pub fn run<T: Transport, N: NocId>(
         dev.read(&w, tile, *addr, &mut buf)?;
         l1.push(buf);
     }
-    Ok(Outcome { dst, l1, trace })
+    clock.lap(dev, Phase::ReadBack);
+    Ok(Outcome {
+        dst,
+        l1,
+        trace,
+        profile: clock.profile,
+    })
+}
+
+/// The three role images, loaded once and left running between kernels.
+///
+/// [`run`] loads three images and releases three cores for every kernel; on
+/// silicon that is most of a short kernel's cost, and a matmul is many short
+/// kernels. A `Resident` does it once: [`Resident::start`] loads the images with
+/// a non-zero `mailbox::GENERATION`, which makes each runner wait for the next
+/// generation instead of stopping, and [`Resident::run`] then costs only the
+/// descriptor words, the programs and the operands.
+///
+/// Leaves state between kernels exactly as consecutive kernels in one program
+/// would: every kernel this crate builds sets the configuration it depends on
+/// (`matmul`'s preludes, the datapath's `*_config` programs), so nothing it
+/// reads is inherited. A kernel that fails leaves the cores in an unknown
+/// state; `run` refuses to go on after one, and the caller resets the tile and
+/// starts again.
+pub struct Resident<N: NocId> {
+    tile: NocCoord<N>,
+    window: tt_device::Window,
+    generation: u32,
+    poisoned: bool,
+}
+
+impl<N: NocId> Resident<N> {
+    /// Release the tile's backend, load the three role images and start them,
+    /// and wait for each to acknowledge an empty first generation.
+    pub fn start<T: Transport>(
+        dev: &mut Device<T>,
+        tile: NocCoord<N>,
+        images: &RoleImages<'_>,
+        budget: u64,
+    ) -> Result<Self, RunError> {
+        let window = dev.alloc_window(WindowKind::TwoMib)?;
+        dev.release_tensix_backend(&window, tile)?;
+        let r = Resident {
+            tile,
+            window,
+            generation: 1,
+            poisoned: false,
+        };
+        for thread in 0..3 {
+            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
+            dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
+        }
+        dev.load_and_start_together(&r.window, tile, images)?;
+        let stuck = r.wait(dev, &[0, 1, 2], images, budget)?;
+        if !stuck.is_empty() {
+            r.hold(dev, images)?;
+            return Err(RunError::Roles(stuck));
+        }
+        Ok(r)
+    }
+
+    pub fn tile(&self) -> NocCoord<N> {
+        self.tile
+    }
+
+    /// Run `kernel` on the resident roles. The same contract as [`run`], less
+    /// the image loads and core releases.
+    pub fn run<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+        kernel: &Kernel<'_>,
+        budget: u64,
+    ) -> Result<Outcome, RunError> {
+        if self.poisoned {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "a resident kernel failed; reset the tile and start again",
+            }));
+        }
+        let (setup, unpack) = assemble(kernel)?;
+        let programs: [&[Instruction]; 3] = [&unpack, kernel.roles[1], kernel.roles[2]];
+        let mut clock = Stopwatch::start(dev);
+        let tile = self.tile;
+        for (addr, data) in kernel.stage {
+            dev.l1_write(&self.window, tile, *addr, data)?;
+        }
+        clock.lap(dev, Phase::Stage);
+
+        if let Some(setup) = &setup {
+            self.generation += 1;
+            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true)?;
+            let stuck = self.wait(dev, &[0], images, budget)?;
+            if let Some((_, _, e)) = stuck.into_iter().next() {
+                self.poisoned = true;
+                return Err(RunError::Setup(e));
+            }
+            clock.lap(dev, Phase::Setup);
+        }
+        if kernel.trace {
+            dev.configure_trace(
+                &self.window,
+                tile,
+                mailbox::TRACE_BUFFER,
+                mailbox::TRACE_BUFFER_BYTES,
+            )?;
+        }
+        self.generation += 1;
+        // Every role's program and descriptor is in place before any role's
+        // generation moves, so the three start as close together as the host's
+        // three final writes allow.
+        for (thread, program) in programs.iter().enumerate() {
+            let dump = if thread == 1 { kernel.dump_rows } else { 0 };
+            self.stage(
+                dev,
+                thread,
+                program,
+                dump,
+                kernel.trace,
+                kernel.dst_fmt,
+                false,
+            )?;
+        }
+        clock.lap(dev, Phase::Programs);
+        let go = |dev: &mut Device<T>, thread: usize| {
+            let mb = Mailbox::of(thread as u32);
+            dev.write32(&self.window, tile, mb.generation(), self.generation)
+        };
+        let stuck = if setup.is_some() {
+            for thread in 0..3 {
+                go(dev, thread)?;
+            }
+            clock.lap(dev, Phase::Launch);
+            self.wait(dev, &[0, 1, 2], images, budget)?
+        } else {
+            // In order: each role runs to completion before the next moves,
+            // exactly as `run` sequences them.
+            let mut stuck = Vec::new();
+            for thread in 0..3 {
+                go(dev, thread)?;
+                stuck = self.wait(dev, &[thread], images, budget)?;
+                if !stuck.is_empty() {
+                    break;
+                }
+            }
+            stuck
+        };
+        clock.lap(dev, Phase::Wait);
+        if !stuck.is_empty() {
+            self.poisoned = true;
+            return Err(RunError::Roles(stuck));
+        }
+
+        let math = Mailbox::of(1);
+        let mut dst = Vec::with_capacity((kernel.dump_rows * mailbox::DUMP_ROW_WORDS) as usize);
+        for row in 0..kernel.dump_rows {
+            for col in 0..mailbox::DUMP_ROW_WORDS {
+                dst.push(dev.read32(&self.window, tile, math.dump_offset(row, col))?);
+            }
+        }
+        let trace = if kernel.trace {
+            dev.read_trace(&self.window, tile, mailbox::TRACE_BUFFER)?
+        } else {
+            Vec::new()
+        };
+        let mut l1 = Vec::with_capacity(kernel.read_back.len());
+        for (addr, len) in kernel.read_back {
+            let mut buf = vec![0u8; *len];
+            dev.l1_read(&self.window, tile, *addr, &mut buf)?;
+            l1.push(buf);
+        }
+        clock.lap(dev, Phase::ReadBack);
+        Ok(Outcome {
+            dst,
+            l1,
+            trace,
+            profile: clock.profile,
+        })
+    }
+
+    /// Hold the three role cores in reset again.
+    pub fn stop<T: Transport>(
+        self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+    ) -> Result<(), RunError> {
+        self.hold(dev, images)
+    }
+
+    fn hold<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+    ) -> Result<(), RunError> {
+        for (core, _, _) in images.iter() {
+            dev.set_core_reset(&self.window, self.tile, *core, true)?;
+        }
+        Ok(())
+    }
+
+    /// Write role `thread`'s descriptor and program; with `go`, also move its
+    /// generation so it runs.
+    #[allow(clippy::too_many_arguments)]
+    fn stage<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        thread: usize,
+        program: &[Instruction],
+        dump: u32,
+        traced: bool,
+        dst_fmt: u32,
+        go: bool,
+    ) -> Result<(), RunError> {
+        let (w, tile) = (&self.window, self.tile);
+        let mb = Mailbox::of(thread as u32);
+        if program.len() > mailbox::PROGRAM_MAX as usize {
+            return Err(RunError::ProgramTooLong {
+                thread,
+                len: program.len(),
+            });
+        }
+        let push_window = if dev.transport().is_simulated() {
+            mailbox::SIM_PUSH_WINDOW
+        } else {
+            0
+        };
+        dev.write32(w, tile, mb.thread_index(), thread as u32)?;
+        dev.write32(w, tile, mb.dst_access_fmt(), dst_fmt)?;
+        dev.write32(w, tile, mb.program_len(), program.len() as u32)?;
+        dev.write32(w, tile, mb.dump_row_first(), 0)?;
+        dev.write32(w, tile, mb.dump_row_count(), dump)?;
+        dev.write32(w, tile, mb.trace(), u32::from(traced))?;
+        dev.write32(w, tile, mb.push_window(), push_window)?;
+        if !program.is_empty() {
+            dev.l1_write(w, tile, mb.program(), &program_bytes(program))?;
+        }
+        for row in 0..dump {
+            for col in 0..mailbox::DUMP_ROW_WORDS {
+                dev.write32(w, tile, mb.dump_offset(row, col), DUMP_SENTINEL)?;
+            }
+        }
+        if go {
+            dev.write32(w, tile, mb.generation(), self.generation)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for each of `threads` to acknowledge the current generation.
+    fn wait<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        threads: &[usize],
+        images: &RoleImages<'_>,
+        budget: u64,
+    ) -> Result<Vec<(usize, Core, WaitError)>, RunError> {
+        let mut stuck = Vec::new();
+        for &thread in threads {
+            let mb = Mailbox::of(thread as u32);
+            let generation = self.generation;
+            let r = dev.wait_for_mailbox(
+                &self.window,
+                self.tile,
+                mb.ack(),
+                mb.panic_code(),
+                budget,
+                |v| v == generation,
+            )?;
+            if let Err(e) = r {
+                stuck.push((thread, images[thread].0, e));
+            }
+        }
+        Ok(stuck)
+    }
 }

@@ -111,6 +111,12 @@ int main(void) {
     printf("IOCTL CONFIGURE_TLB %lu\n",   (unsigned long)TENSTORRENT_IOCTL_CONFIGURE_TLB);
     printf("IOCTL SET_NOC_CLEANUP %lu\n", (unsigned long)TENSTORRENT_IOCTL_SET_NOC_CLEANUP);
     printf("IOCTL DRIVER_VERSION %lu\n",  (unsigned long)TENSTORRENT_DRIVER_VERSION);
+    printf("MAPPING RESOURCE0_UC %d\n", TENSTORRENT_MAPPING_RESOURCE0_UC);
+    printf("MAPPING RESOURCE0_WC %d\n", TENSTORRENT_MAPPING_RESOURCE0_WC);
+    printf("MAPPING RESOURCE1_UC %d\n", TENSTORRENT_MAPPING_RESOURCE1_UC);
+    printf("MAPPING RESOURCE1_WC %d\n", TENSTORRENT_MAPPING_RESOURCE1_WC);
+    printf("MAPPING RESOURCE2_UC %d\n", TENSTORRENT_MAPPING_RESOURCE2_UC);
+    printf("MAPPING RESOURCE2_WC %d\n", TENSTORRENT_MAPPING_RESOURCE2_WC);
     return 0;
 }
 "#;
@@ -306,6 +312,13 @@ fn the_rust_abi_matches_the_c_header() {
     check("IOCTL CONFIGURE_TLB", abi::CONFIGURE_TLB as usize);
     check("IOCTL SET_NOC_CLEANUP", abi::SET_NOC_CLEANUP as usize);
     check("IOCTL DRIVER_VERSION", tt_kmd::PINNED_API_VERSION as usize);
+    use abi::mapping_id as m;
+    check("MAPPING RESOURCE0_UC", m::RESOURCE0_UC as usize);
+    check("MAPPING RESOURCE0_WC", m::RESOURCE0_WC as usize);
+    check("MAPPING RESOURCE1_UC", m::RESOURCE1_UC as usize);
+    check("MAPPING RESOURCE1_WC", m::RESOURCE1_WC as usize);
+    check("MAPPING RESOURCE2_UC", m::RESOURCE2_UC as usize);
+    check("MAPPING RESOURCE2_WC", m::RESOURCE2_WC as usize);
 
     // The self-check the disassembly gate in `crates/tt-tests/build.rs` learned to
     // carry: a comparison loop that matches nothing passes vacuously.
