@@ -83,6 +83,11 @@ pub struct Kernel<'a> {
     /// timestamper. Silicon only: ttsim does not model the event stream
     /// (divergence row 54).
     pub trace: bool,
+    /// A completed run leaves every semaphore of its [`Schedule::Concurrent`]
+    /// set as the set initialises it: every post is matched by a take. A
+    /// [`Resident`] then skips the setup run of the next kernel with the same
+    /// set (`matmul::TILE_SEMAPHORES` says why a matmul qualifies).
+    pub restores_semaphores: bool,
 }
 
 impl<'a> Kernel<'a> {
@@ -97,6 +102,7 @@ impl<'a> Kernel<'a> {
             clear_dst: true,
             dst_fmt: DST_FMT_FP32,
             trace: false,
+            restores_semaphores: false,
         }
     }
 }
@@ -483,7 +489,13 @@ pub struct Resident<N: NocId> {
     /// holding the program is not written again. Consecutive chunks of one
     /// matmul usually share their programs, which were most of what a
     /// DRAM-resident matmul still sent over PCIe.
-    slots: std::cell::RefCell<[Vec<Instruction>; 3]>,
+    /// Held as encoded words: comparing `Instruction`s compares their
+    /// definitions too, which cost more than the PCIe writes it saved
+    /// (`MEASURED`: 14 us per descriptor write, on silicon).
+    slots: std::cell::RefCell<[Vec<u32>; 3]>,
+    /// The semaphore set the tile is known to hold, as initialised: set by a
+    /// setup run, kept by kernels that restore it, dropped by anything else.
+    semaphores: Option<Vec<SemaphoreInit>>,
 }
 
 impl<N: NocId> Resident<N> {
@@ -503,6 +515,7 @@ impl<N: NocId> Resident<N> {
             generation: 1,
             poisoned: false,
             slots: Default::default(),
+            semaphores: None,
         };
         for thread in 0..3 {
             r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
@@ -545,7 +558,16 @@ impl<N: NocId> Resident<N> {
         }
         clock.lap(dev, Phase::Stage);
 
-        if let Some(setup) = &setup {
+        let init = match kernel.schedule {
+            Schedule::Concurrent(init) => Some(init.to_vec()),
+            Schedule::InOrder => None,
+        };
+        // The setup only initialises semaphores (nothing to clear), and they
+        // already hold that: nothing to do.
+        let clears = kernel.clear_dst && kernel.dump_rows > 0;
+        let skip_setup = !clears && init.is_some() && self.semaphores == init;
+        self.semaphores = None;
+        if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
             self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true)?;
             let stuck = self.wait(dev, &[0], images, budget)?;
@@ -607,6 +629,9 @@ impl<N: NocId> Resident<N> {
         if !stuck.is_empty() {
             self.poisoned = true;
             return Err(RunError::Roles(stuck));
+        }
+        if kernel.restores_semaphores {
+            self.semaphores = init;
         }
 
         let math = Mailbox::of(1);
@@ -690,11 +715,12 @@ impl<N: NocId> Resident<N> {
         dev.write32(w, tile, mb.trace(), u32::from(traced))?;
         dev.write32(w, tile, mb.push_window(), push_window)?;
         let mut slots = self.slots.borrow_mut();
-        if !program.is_empty() && slots[thread] != program {
+        let words = program.iter().map(|i| i.word());
+        if !program.is_empty() && !slots[thread].iter().copied().eq(words.clone()) {
             // Forget the slot first: if the write fails, it holds neither.
             slots[thread].clear();
             dev.l1_write(w, tile, mb.program(), &program_bytes(program))?;
-            slots[thread] = program.to_vec();
+            slots[thread] = words.collect();
         }
         drop(slots);
         for row in 0..dump {

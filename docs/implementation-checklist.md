@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 16.8 ms/step (Flex: 0.5) with weights and activations resident in GDDR |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 9.9 ms/step on one card (Flex: 0.5), weights and activations resident in GDDR |
 
 ---
 
@@ -1202,6 +1202,24 @@ tensors in `burn-tt`, 9.5 gates.
 - [x] **Result: full MNIST 38.5 -> 16.8 ms/step** on both cards, accuracy
       unchanged, the reduced golden bit for bit on ttsim and both cards. Tensor
       traffic per step 675 KB up / 475 KB down -> 216 KB up / 35 KB down.
+- [x] **Profiled and cut, 16.8 -> 9.9 ms/step** (single card, both cards
+      alike, golden unchanged): element-wise in unrolled `flw`/`f*`/`fsw` loops
+      (7.4 -> 2.6 ms/step); the resident setup run skipped when a kernel
+      declares it restores its semaphores (`Kernel::restores_semaphores`, which
+      the matmul does by construction); face-wise transposes; and resident
+      program slots compared by encoded word -- comparing `Instruction`s
+      compared their definitions and cost 14 us per descriptor write on silicon,
+      more than the rewrite it saved (matmul 4.6 -> 2.7 ms/step). Per step now:
+      element-wise 2.6, matmul 2.7, upload 2.3, download 2.1, host 0.2 ms.
+- [x] **One switch for the topology**: `burn_tt::Topology` /
+      `attach_topology`, or `TT_TOPOLOGY=0` / `0,1` for the silicon harness, so a
+      benchmark runs on one card or both unchanged. Two cards are Phase 8's
+      mesh: host-staged, per-chunk resets, chips in turn -- 233 ms/step.
+- [ ] **The two-card full run's accuracy is 0.9195, one card's 0.9196.** The
+      reduced sharded run matches the golden bit for bit, so something past 32
+      steps diverges on the mesh. Phase 8 code; not yet investigated.
+- [ ] **The mesh is not device-resident**: GDDR tensors, per-chip resident
+      roles, and chips concurrent rather than in turn.
 - [ ] **Left per step:** the batch `x` (200 KB up: preload the dataset, a batch
       is a row-slice view), `g1` for the bias gradient's row sum (32 KB down),
       logits and `g2` (2.5 KB each, the loss stays on the host).

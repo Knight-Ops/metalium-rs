@@ -225,3 +225,81 @@ fn mnist_step_breakdown() {
         panic!("{e}");
     }
 }
+
+/// The DRAM-resident matmuls of one MNIST step, split into the mover's gather,
+/// the Tensix run and the mover's scatter.
+#[test]
+#[ignore = "benchmark"]
+fn dram_matmul_breakdown() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::session::{Session, TileChoice};
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let (x, y) = tt_tests::backend::GATE_TILE;
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Exactly(x, y))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        let cases = [
+            ("x@W1", [64, 784], false, [784, 128], false),
+            ("h@W2", [64, 128], false, [128, 10], false),
+            ("g2@W2t", [64, 10], false, [128, 10], true),
+            ("ht@g2", [64, 128], true, [64, 10], false),
+            ("xt@g1", [64, 784], true, [64, 128], false),
+        ];
+        for (label, [ar, ac], ta, [br, bc], tb) in cases {
+            let a = s.upload(&vec![0.5; ar * ac], ar, ac).unwrap();
+            let b = s.upload(&vec![0.25; br * bc], br, bc).unwrap();
+            let c = s
+                .matmul_dram(
+                    &a,
+                    ta,
+                    &b,
+                    tb,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    400_000,
+                )
+                .unwrap();
+            s.free(c).unwrap();
+            let _ = tt_kernels::tensor::stats::take();
+            let _ = s.take_profile();
+            let t0 = Instant::now();
+            let c = s
+                .matmul_dram(
+                    &a,
+                    ta,
+                    &b,
+                    tb,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    400_000,
+                )
+                .unwrap();
+            let wall = t0.elapsed();
+            let mut line = format!("MEASURE dram {label:<7} {wall:>9.2?} |");
+            for (k, n, d) in tt_kernels::tensor::stats::take() {
+                line += &format!(" {k} {n}x {d:.2?};");
+            }
+            let p = s.take_profile();
+            for ph in [
+                tt_kernels::runtime::Phase::Setup,
+                tt_kernels::runtime::Phase::Programs,
+                tt_kernels::runtime::Phase::Launch,
+                tt_kernels::runtime::Phase::Wait,
+                tt_kernels::runtime::Phase::ReadBack,
+            ] {
+                let (d, t) = p.of(ph);
+                line += &format!(" {ph:?} {d:.2?}/{}w{}r;", t.write_calls, t.read_calls);
+            }
+            println!("{line}");
+            for t in [a, b, c] {
+                s.free(t).unwrap();
+            }
+        }
+    }) {
+        panic!("{e}");
+    }
+}

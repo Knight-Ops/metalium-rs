@@ -57,16 +57,26 @@ fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 }
 
 /// Transpose the tile in the scratch slot into the slot at `dst`: header
-/// copied, datum `(r, c)` from `(c, r)`, both in face order.
+/// copied, datum `(r, c)` from `(c, r)`, both in face order -- face `(fr, fc)`
+/// of the result is face `(fc, fr)` of the source, transposed.
 fn transpose_from_scratch(dst: u64) {
     for w in 0..(dm::TILE_DATA / 4) {
         wr(dst + w * 4, rd(dm::SCRATCH + w * 4));
     }
-    let (src, out) = (dm::SCRATCH + dm::TILE_DATA, dst + dm::TILE_DATA);
-    for r in 0..32 {
-        for c in 0..32 {
-            let v = rd(src + dm::face_index(c, r) as u64 * 4);
-            wr(out + dm::face_index(r, c) as u64 * 4, v);
+    let src = (dm::SCRATCH + dm::TILE_DATA) as *const u32;
+    let out = (dst + dm::TILE_DATA) as *mut u32;
+    for fr in 0..2usize {
+        for fc in 0..2usize {
+            let (from, to) = ((fc * 2 + fr) * 256, (fr * 2 + fc) * 256);
+            for i in 0..16usize {
+                for j in 0..16usize {
+                    // SAFETY: both slots are inside L1 (`Entry::decode`), and
+                    // indices stay inside their 1024 datums. Plain accesses: the
+                    // NoC's writes to the scratch were fenced before this, and
+                    // the caller fences these stores before anything reads them.
+                    unsafe { *out.add(to + i * 16 + j) = *src.add(from + j * 16 + i) };
+                }
+            }
         }
     }
 }
@@ -74,15 +84,31 @@ fn transpose_from_scratch(dst: u64) {
 /// One compute entry over the 1024 datums of three tile slots (`dm::kind`).
 fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
     let (dst, a, b) = (dst + dm::TILE_DATA, a + dm::TILE_DATA, b + dm::TILE_DATA);
+    // Same-shape kinds pair datum i with datum i whatever the face order, so
+    // they walk the tile straight through (`tt_firmware::float`'s loops).
+    let (pd, pa, pb) = (dst as *mut u32, a as *const u32, b as *const u32);
+    // SAFETY: three tile slots `Entry::decode` placed inside L1, 1024 words
+    // of datums each.
+    unsafe {
+        match kind {
+            dm::kind::ADD => float::add_n(pd, pa, pb, 1024),
+            dm::kind::SUB => float::sub_n(pd, pa, pb, 1024),
+            dm::kind::MUL => float::mul_n(pd, pa, pb, 1024),
+            dm::kind::MUL_SCALAR => float::mul_scalar_n(pd, pa, s, 1024),
+            _ => per_datum(kind, dst, a, b),
+        }
+    }
+    // The stores must reach L1 before the mover's next NoC write reads it.
+    publish();
+}
+
+/// The kinds that need a datum's position, or integer tests: one at a time.
+fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
     for r in 0..32usize {
         for c in 0..32usize {
             let i = dm::face_index(r, c) as u64 * 4;
             let x = rd(a + i);
             let v = match kind {
-                dm::kind::ADD => float::add(x, rd(b + i)),
-                dm::kind::SUB => float::sub(x, rd(b + i)),
-                dm::kind::MUL => float::mul(x, rd(b + i)),
-                dm::kind::MUL_SCALAR => float::mul(x, s),
                 // `max(x, 0)`: x itself if positive (as a signed integer, which
                 // excludes both zeros, negatives and negative NaNs), +0 for
                 // every negative and zero; a positive NaN is `max`'s other
@@ -108,7 +134,6 @@ fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
             wr(dst + i, v);
         }
     }
-    publish();
 }
 
 /// Run one descriptor to completion.
@@ -137,6 +162,8 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
                 run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
                 publish();
                 transpose_from_scratch(descriptor.l1 as u64);
+                // Visible in L1 before anything else reads the slot.
+                publish();
             }
             Entry::Move { descriptor, .. } => issue(me, descriptor)?,
             Entry::Compute { kind, scalar, dst, a, b } => {

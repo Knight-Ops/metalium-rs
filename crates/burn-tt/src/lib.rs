@@ -26,6 +26,7 @@ mod generated;
 mod ops;
 mod server;
 mod tensor;
+mod topology;
 mod traffic;
 
 pub use server::{
@@ -33,7 +34,8 @@ pub use server::{
     KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
-pub use traffic::{tensor_traffic, TensorTraffic};
+pub use topology::{attach_topology, Topology};
+pub use traffic::{device_time, tensor_traffic, TensorTraffic};
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 

@@ -236,14 +236,19 @@ fn attach_engine(
     device: TtDevice,
     config: Config,
 ) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
-    let (x, y) = crate::backend::GATE_TILE;
-    attach(
-        device,
-        burn_tt::kmd_engine(
-            device,
-            burn_tt::TileChoice::Exactly(x, y),
-            config.route,
-            config.fidelity,
-        ),
-    )
+    // `TT_TOPOLOGY` ("0", "0,1") picks the cards, so one benchmark runs on one
+    // card or several unchanged (`burn_tt::Topology`); unset, the card this
+    // gate was pointed at, on the gate tile.
+    let topology = match burn_tt::Topology::from_env() {
+        Some(t) => t?,
+        None => {
+            let (x, y) = crate::backend::GATE_TILE;
+            burn_tt::Topology::Single {
+                card: device.chip,
+                tile: burn_tt::TileChoice::Exactly(x, y),
+            }
+        }
+    };
+    eprintln!("topology: {topology:?}");
+    burn_tt::attach_topology(device, topology, config.route, config.fidelity)
 }

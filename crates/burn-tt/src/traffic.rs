@@ -53,3 +53,29 @@ pub(crate) fn downloaded(bytes: usize) {
     DOWN.fetch_add(bytes as u64, Ordering::Relaxed);
     DOWNLOADS.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Wall-clock time spent in device calls, by kind: where a training step's
+/// time goes. Measured on the calling thread around each server round trip.
+pub fn device_time() -> Vec<(&'static str, u64, std::time::Duration)> {
+    TIMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(k, (n, d))| (*k, *n, *d))
+        .collect()
+}
+
+static TIMES: std::sync::Mutex<
+    std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn timed<R>(kind: &'static str, f: impl FnOnce() -> R) -> R {
+    let t0 = std::time::Instant::now();
+    let r = f();
+    let d = t0.elapsed();
+    let mut t = TIMES.lock().unwrap_or_else(|p| p.into_inner());
+    let e = t.entry(kind).or_default();
+    e.0 += 1;
+    e.1 += d;
+    r
+}

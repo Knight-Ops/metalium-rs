@@ -677,6 +677,8 @@ pub fn matmul_with(
     let kernel = Kernel {
         stage: &stage,
         read_back: &read_back,
+        // `TILE_SEMAPHORES`: every run leaves them as it found them.
+        restores_semaphores: true,
         ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&TILE_SEMAPHORES))
     };
     let out = run(&kernel)?;

@@ -342,11 +342,22 @@ pub(crate) fn run<R: Send + 'static>(
         .unwrap_or_else(|_| panic!("{device}'s server thread stopped during a job"))
 }
 
+/// [`run`], timed by `kind` (`crate::traffic::device_time`).
+fn timed_run<R: Send + 'static>(
+    kind: &'static str,
+    device: TtDevice,
+    job: impl FnOnce(&mut dyn Engine) -> R + Send + 'static,
+) -> R {
+    crate::traffic::timed(kind, || run(device, job))
+}
+
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
     let (a, b) = (a.to_vec(), b.to_vec());
-    run(device, move |engine| engine.matmul(&a, &b, mkn))
-        .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
+    timed_run("matmul_host", device, move |engine| {
+        engine.matmul(&a, &b, mkn)
+    })
+    .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
 }
 
 /// Does `device`'s engine keep tensors on the device? Asked once per device.
@@ -372,13 +383,15 @@ pub(crate) fn supports_dram(device: TtDevice) -> bool {
 /// Upload, panicking on a device error.
 pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
     crate::traffic::uploaded(values.len() * 4);
-    run(device, move |engine| engine.upload(&values, rows, cols))
-        .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
+    timed_run("upload", device, move |engine| {
+        engine.upload(&values, rows, cols)
+    })
+    .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
 }
 
 /// Download, panicking on a device error.
 pub(crate) fn download(device: TtDevice, id: BufferId) -> Vec<f32> {
-    let v = run(device, move |engine| engine.download(id))
+    let v = timed_run("download", device, move |engine| engine.download(id))
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
     crate::traffic::downloaded(v.len() * 4);
     v
@@ -399,8 +412,10 @@ pub(crate) fn eltwise(
     a: BufferId,
     b: Option<BufferId>,
 ) -> (BufferId, [usize; 2]) {
-    run(device, move |engine| engine.eltwise(kind, scalar, a, b))
-        .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
+    timed_run("eltwise", device, move |engine| {
+        engine.eltwise(kind, scalar, a, b)
+    })
+    .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
 }
 
 /// `op(A) @ op(B)` on the device, panicking on a device error.
@@ -411,7 +426,7 @@ pub(crate) fn matmul_dram(
     b: BufferId,
     b_transposed: bool,
 ) -> (BufferId, [usize; 2]) {
-    run(device, move |engine| {
+    timed_run("matmul_dram", device, move |engine| {
         engine.matmul_dram(a, a_transposed, b, b_transposed)
     })
     .unwrap_or_else(|e| panic!("matmul on {device}: {e}"))

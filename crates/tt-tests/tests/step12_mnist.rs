@@ -377,8 +377,27 @@ fn the_mlp_trains_on_full_mnist() {
     let host_acc = accuracy(&host_model, &test_split, test_split.n, &FlexDevice);
     with_device(Config::default(), |d| {
         let t0 = std::time::Instant::now();
+        let before: std::collections::HashMap<_, _> = burn_tt::device_time()
+            .into_iter()
+            .map(|(k, n, t)| (k, (n, t)))
+            .collect();
         let (tt, model) = train::<Autodiff<TtBackend>>(&train_split, &full, &init, &d);
         let tt_time = t0.elapsed();
+        let mut device = std::time::Duration::ZERO;
+        for (k, n, t) in burn_tt::device_time() {
+            let (n0, t0) = before.get(k).copied().unwrap_or_default();
+            let (n, t) = (n - n0, t - t0);
+            device += t;
+            eprintln!(
+                "MEASURE per step {k:<12} {:>5.2} calls {:>7.3} ms",
+                n as f64 / steps as f64,
+                t.as_secs_f64() * 1e3 / steps as f64
+            );
+        }
+        eprintln!(
+            "MEASURE per step host (Burn, autodiff, loss) {:.3} ms",
+            (tt_time - device).as_secs_f64() * 1e3 / steps as f64
+        );
         let acc = accuracy(&model, &test_split, test_split.n, &d);
         for i in (0..steps).step_by(50) {
             eprintln!("step {i:4}: device {:.4}  host {:.4}", tt[i], host[i]);

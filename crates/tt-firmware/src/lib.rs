@@ -482,4 +482,100 @@ pub mod float {
     binary!(add, "fadd.s");
     binary!(sub, "fsub.s");
     binary!(mul, "fmul.s");
+
+    macro_rules! over {
+        ($name:ident, $insn:literal) => {
+            /// `dst[i] = a[i] (op) b[i]` for `n` words, four at a time, straight
+            /// through the `f` registers.
+            ///
+            /// # Safety
+            /// `dst`, `a`, `b` are word-aligned and valid for `n` words; `n` is
+            /// a multiple of four. `dst` may equal `a` or `b`.
+            #[inline(never)]
+            pub unsafe fn $name(dst: *mut u32, a: *const u32, b: *const u32, n: usize) {
+                // SAFETY: the caller's contract; every access is inside the
+                // three ranges, and only the scratch `f` registers are used.
+                unsafe {
+                    core::arch::asm!(
+                        ".option push",
+                        ".option arch, +f",
+                        "2:",
+                        "beqz {n}, 3f",
+                        "flw ft0, 0({a})",
+                        "flw ft1, 0({b})",
+                        "flw ft2, 4({a})",
+                        "flw ft3, 4({b})",
+                        "flw ft4, 8({a})",
+                        "flw ft5, 8({b})",
+                        "flw ft6, 12({a})",
+                        "flw ft7, 12({b})",
+                        concat!($insn, " ft0, ft0, ft1"),
+                        concat!($insn, " ft2, ft2, ft3"),
+                        concat!($insn, " ft4, ft4, ft5"),
+                        concat!($insn, " ft6, ft6, ft7"),
+                        "fsw ft0, 0({d})",
+                        "fsw ft2, 4({d})",
+                        "fsw ft4, 8({d})",
+                        "fsw ft6, 12({d})",
+                        "addi {a}, {a}, 16",
+                        "addi {b}, {b}, 16",
+                        "addi {d}, {d}, 16",
+                        "addi {n}, {n}, -4",
+                        "j 2b",
+                        "3:",
+                        ".option pop",
+                        a = inout(reg) a => _,
+                        b = inout(reg) b => _,
+                        d = inout(reg) dst => _,
+                        n = inout(reg) n => _,
+                        options(nostack),
+                    );
+                }
+            }
+        };
+    }
+    over!(add_n, "fadd.s");
+    over!(sub_n, "fsub.s");
+    over!(mul_n, "fmul.s");
+
+    /// `dst[i] = a[i] * s` for `n` words, four at a time.
+    ///
+    /// # Safety
+    /// As [`add_n`].
+    #[inline(never)]
+    pub unsafe fn mul_scalar_n(dst: *mut u32, a: *const u32, s: u32, n: usize) {
+        // SAFETY: as `add_n`.
+        unsafe {
+            core::arch::asm!(
+                ".option push",
+                ".option arch, +f",
+                "fmv.w.x ft7, {s}",
+                "2:",
+                "beqz {n}, 3f",
+                "flw ft0, 0({a})",
+                "flw ft1, 4({a})",
+                "flw ft2, 8({a})",
+                "flw ft3, 12({a})",
+                "fmul.s ft0, ft0, ft7",
+                "fmul.s ft1, ft1, ft7",
+                "fmul.s ft2, ft2, ft7",
+                "fmul.s ft3, ft3, ft7",
+                "fsw ft0, 0({d})",
+                "fsw ft1, 4({d})",
+                "fsw ft2, 8({d})",
+                "fsw ft3, 12({d})",
+                "addi {a}, {a}, 16",
+                "addi {d}, {d}, 16",
+                "addi {n}, {n}, -4",
+                "j 2b",
+                "3:",
+                ".option pop",
+                a = inout(reg) a => _,
+                d = inout(reg) dst => _,
+                n = inout(reg) n => _,
+                s = in(reg) s,
+                options(nostack),
+            );
+        }
+    }
 }

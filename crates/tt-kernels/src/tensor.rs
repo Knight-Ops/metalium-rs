@@ -354,17 +354,21 @@ pub fn matmul_dram<T: Transport, N: NocId>(
                     list.push(fetch(b, b_transposed, kk, j0 + j, to));
                 }
             }
-            mover.run_list(dev, w, &list)?;
+            stats::timed("matmul gather", || mover.run_list(dev, w, &list))?;
 
             let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
                 matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
             });
             let [unpack, math, pack] = &*roles;
-            let kernel = Kernel::new(
-                [unpack, math, pack],
-                Schedule::Concurrent(&matmul::TILE_SEMAPHORES),
-            );
-            run(dev, &kernel)?;
+            let kernel = Kernel {
+                // `TILE_SEMAPHORES`: every run leaves them as it found them.
+                restores_semaphores: true,
+                ..Kernel::new(
+                    [unpack, math, pack],
+                    Schedule::Concurrent(&matmul::TILE_SEMAPHORES),
+                )
+            };
+            stats::timed("matmul compute", || run(dev, &kernel))?;
 
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
@@ -389,7 +393,7 @@ pub fn matmul_dram<T: Transport, N: NocId>(
                     ]);
                 }
             }
-            mover.run_list(dev, w, &back)?;
+            stats::timed("matmul scatter", || mover.run_list(dev, w, &back))?;
         }
     }
     Ok(c)
@@ -492,7 +496,37 @@ pub fn eltwise<T: Transport, N: NocId>(
                 0,
             ]);
         }
-        mover.run_list(dev, w, &list)?;
+        stats::timed("eltwise list", || mover.run_list(dev, w, &list))?;
     }
     Ok(out)
+}
+
+/// Host wall-clock time in each stage of the DRAM ops, process-wide: where a
+/// device-resident op's time goes. Read with [`stats::take`].
+pub mod stats {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static TIMES: Mutex<BTreeMap<&'static str, (u64, Duration)>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn timed<R>(what: &'static str, f: impl FnOnce() -> R) -> R {
+        let t0 = Instant::now();
+        let r = f();
+        let d = t0.elapsed();
+        let mut t = TIMES.lock().unwrap_or_else(|p| p.into_inner());
+        let e = t.entry(what).or_default();
+        e.0 += 1;
+        e.1 += d;
+        r
+    }
+
+    /// Every stage's calls and time since the last call, and reset.
+    pub fn take() -> Vec<(&'static str, u64, Duration)> {
+        let mut t = TIMES.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *t)
+            .into_iter()
+            .map(|(k, (n, d))| (k, n, d))
+            .collect()
+    }
 }
