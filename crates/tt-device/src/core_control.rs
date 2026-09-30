@@ -189,6 +189,50 @@ impl<T: Transport> Device<T> {
         image: &[u8],
         load_address: u64,
     ) -> Result<()> {
+        self.load_held(window, tile, core, image, load_address)?;
+        self.set_core_reset(window, tile, core, false)
+    }
+
+    /// [`Device::load_and_start`] for several cores, released by **one** write
+    /// to `SOFT_RESET_0` once every image is in place.
+    ///
+    /// Starting them one after another is not the same thing on silicon: each
+    /// image is kilobytes over the NoC, so a core started first has run a short
+    /// program to completion before the last is even loaded, and cores meant to
+    /// run alongside each other run in sequence instead. That hid a missing
+    /// hand-off between two Tensix threads (`step10_matmul_tile`) which ttsim,
+    /// whose clock does not advance during the host's writes, showed at once.
+    pub fn load_and_start_together<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        cores: &[(Core, &[u8], u64)],
+    ) -> Result<()> {
+        let mut release = 0u32;
+        for &(core, image, load_address) in cores {
+            self.load_held(window, tile, core, image, load_address)?;
+            release |= core.soft_reset_mask();
+        }
+        let current = self.read_soft_reset(window, tile)?;
+        self.write32(window, tile, tensix::SOFT_RESET_0, current & !release)?;
+        let now = std::time::Instant::now();
+        for &(core, _, _) in cores {
+            self.released
+                .insert((N::INDEX, tile.x(), tile.y(), core), now);
+        }
+        Ok(())
+    }
+
+    /// Everything [`Device::load_and_start`] does except the release: the core
+    /// is left held, with its image and reset PC in place.
+    fn load_held<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        core: Core,
+        image: &[u8],
+        load_address: u64,
+    ) -> Result<()> {
         if load_address + image.len() as u64 > tensix::L1_SIZE {
             return Err(TransportError::OutOfBounds {
                 bar: crate::Bar::Bar0,
@@ -217,8 +261,6 @@ impl<T: Transport> Device<T> {
                 reason: "RISCV B always starts at L1 offset 0",
             });
         }
-
-        self.set_core_reset(window, tile, core, false)?;
         Ok(())
     }
 

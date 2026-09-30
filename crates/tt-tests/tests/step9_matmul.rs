@@ -17,23 +17,19 @@
 //! `src_a_row=8` (row 41), which `MVMUL.md`'s `& 0x38` allows.
 
 use tt_isa::backend::{self, Before, ConfigWords};
-use tt_isa::cfg::generated::{alu, thread};
+use tt_isa::cfg::generated::thread;
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
 use tt_isa::matrix::{Banks, Loaded};
 use tt_isa::numerics::mvmul_reference;
 use tt_isa::sfpu;
-use tt_isa::tile::{fp32_to_tf32, L1Format, TileImage};
+use tt_isa::tile::fp32_to_tf32;
 use tt_tests::datapath::{
-    self, config_program, flat_descriptor, pack_config, set_adc_x, src_thread_config, thread_entry,
-    unpack_src_config, Unpacker, OUT, SCRATCH_GPR, STAGE,
+    self, config_program, pack_config, set_adc_x, thread_entry, Unpacker, OUT, STAGE,
 };
 use tt_tests::harness::{self, Run};
 
-const ROW: usize = 16;
-const SRC_A_ROW: usize = 16;
-const SRC_B_ROW: usize = 8;
-const TF32_CODE: u32 = 4;
+use tt_tests::matmul::{self, stage_operand, ROW, SRC_A_ROW, SRC_B_ROW, TF32_CODE};
 
 const STAGE_A: u64 = STAGE;
 const STAGE_B: u64 = STAGE + 0x2000;
@@ -43,20 +39,6 @@ type MatB = [[f32; 16]; 8];
 type Body = Box<dyn FnOnce(Banks<Loaded, Loaded>, &mut Vec<Instruction>)>;
 
 const ZERO_DST: MatB = [[0f32; 16]; 8];
-
-/// Stage `rows` as a flat FP32 run that lands at `Src` row `src_row`, column 0.
-fn stage_operand(src_row: usize, rows: &[[f32; 16]]) -> (Vec<u8>, u32) {
-    let mut datums = vec![0u32; src_row * ROW];
-    datums.extend(rows.iter().flatten().map(|v| v.to_bits()));
-    let n = datums.len() as u32;
-    let image = TileImage::new(flat_descriptor(n), L1Format::Fp32).unwrap();
-    let mut staged = vec![0u8; image.total_bytes()];
-    for (i, d) in datums.iter().enumerate() {
-        let off = image.datum_bit_offset(i) / 8;
-        staged[off..off + 4].copy_from_slice(&d.to_le_bytes());
-    }
-    (staged, n)
-}
 
 /// `value` placed in `i`'s `AddrMod` field, as its (measured) definition draws it.
 /// Entry 4 is the third bit, which only the Blackhole layouts have.
@@ -82,35 +64,14 @@ fn fidelity_base(phase: u16) -> Instruction {
 /// then hand the loaded banks to `body` for the Matrix Unit work.
 fn program(na: u32, nb: u32, body: Body) -> (Vec<Instruction>, Vec<Instruction>) {
     // Split the way LLK splits it (`harness::Roles`): the unpacks on thread 0,
-    // everything the Matrix Unit does on thread 1. The address modifiers, the
-    // fidelity base and the RWCs are the *math* thread's `ThreadConfig` and
-    // counters, so they are set there.
-    let mut up = src_thread_config();
-    let mut words = ConfigWords::new();
-    unpack_src_config(
-        &mut words,
-        Unpacker::SrcA,
-        flat_descriptor(na),
-        STAGE_A,
-        TF32_CODE,
-    );
-    unpack_src_config(
-        &mut words,
-        Unpacker::SrcB,
-        flat_descriptor(nb),
-        STAGE_B,
-        TF32_CODE,
-    );
-    // FP32 `Dst`, and `Zero_Flag_disabled_src` clear: the other setting is the
-    // "keep SrcB denormals" mode `MVMUL.md` says must not be used.
-    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
-    words
-        .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
-        .unwrap();
-    let mut buf = vec![sfpu::nop(); words.program_len()];
-    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
-    up.extend_from_slice(&buf[..k]);
-
+    // everything the Matrix Unit does on thread 1 (`tt_tests::matmul`).
+    let mut up = matmul::unpack_prelude(matmul::Operands {
+        a_addr: STAGE_A,
+        na,
+        b_addr: STAGE_B,
+        nb,
+        out: TF32_CODE,
+    });
     let unpack = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let banks = Banks::after_reset();
     up.push(set_adc_x(Unpacker::SrcA, 0, na - 1));
@@ -122,33 +83,7 @@ fn program(na: u32, nb: u32, body: Body) -> (Vec<Instruction>, Vec<Instruction>)
     up.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
     up.push(backend::wait_for_unpacker1(Before::EVERYTHING).unwrap());
 
-    let mut math = vec![tt_tests::datapath::state_id()];
-    // Address modifier 0 moves nothing; 1 advances the fidelity phase only (with
-    // the measured Blackhole `AddrMod` position; divergence row 42).
-    math.push(thread_entry(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0));
-    math.push(thread_entry(thread::ADDR_MOD_DST_SEC0_DestIncr, 0));
-    math.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
-    math.push(thread_entry(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1));
-    math.push(fidelity_base(0));
-    // `SrcAVal` is four bits, so 16 takes two steps: set 8, then add the carried
-    // 8 (`SETRWC.md`: `if (SrcACr) SrcAVal += RWC.SrcA_Cr`).
-    math.push(encode::Setrwc::ZERO.src_a(1).src_a_val(8).encode().unwrap());
-    math.push(
-        encode::Setrwc::ZERO
-            .src_a(1)
-            .src_a_cr(1)
-            .src_a_val(SRC_A_ROW as u32 - 8)
-            .src_b(1)
-            .src_b_val(SRC_B_ROW as u32)
-            .dst(1)
-            .dst_val(0)
-            .fidelity(1)
-            .encode()
-            .unwrap(),
-    );
-    // All of `Dst`: mode 3 is `CLR_ALL` in LLK's encoding too (row 40).
-    // (mode, use_dst32b, addr_mod, imm10)
-    math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
+    let mut math = matmul::math_prelude();
     body(banks, &mut math);
     math.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
     (up, math)

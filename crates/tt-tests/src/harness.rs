@@ -93,7 +93,13 @@ pub struct Run<'a> {
     /// Split the kernel across the three Tensix threads, as LLK does; see
     /// [`Roles`]. When set, `program` is ignored.
     pub roles: Option<Roles<'a>>,
+    /// Run the roles at the same time rather than in order, with these
+    /// semaphores initialised first; see [`Run::concurrent`].
+    pub concurrent: Option<&'a [SemaphoreInit]>,
 }
+
+/// A semaphore's starting `Value` and `Max`, set before a concurrent run.
+pub type SemaphoreInit = (tt_isa::sync::Semaphore, u8, u8);
 
 /// A kernel split the way tt-metal's LLK splits it: thread 0 unpacks, thread 1
 /// does math (Matrix Unit and SFPU), thread 2 packs, each program pushed by its
@@ -130,6 +136,7 @@ impl<'a> Run<'a> {
             clear_dst: true,
             tile: None,
             roles: None,
+            concurrent: None,
         }
     }
 
@@ -148,6 +155,23 @@ impl<'a> Run<'a> {
 
     pub fn dump_rows(mut self, rows: u32) -> Self {
         self.dump_rows = rows;
+        self
+    }
+
+    /// Release the three roles together and wait for all of them, rather than
+    /// running each to completion in turn.
+    ///
+    /// The in-order schedule deadlocks as soon as one role waits on another:
+    /// an unpacker that fills more `Src` banks than exist waits for a Matrix Unit
+    /// whose thread has not started. Concurrently, the roles synchronise the way
+    /// LLK's do -- `Src` banks by hardware, `Dst` through the semaphores in
+    /// `init` (`tt_isa::sync`). Those are set, and the `Dst` rows about to be
+    /// dumped zeroed, by a setup run on thread 0 that completes before any role
+    /// starts: a semaphore outlives the program that last used it on silicon,
+    /// so a consumer released alongside its own `SEMINIT` could read a stale
+    /// value first.
+    pub fn concurrent(mut self, init: &'a [SemaphoreInit]) -> Self {
+        self.concurrent = Some(init);
         self
     }
 
@@ -310,15 +334,25 @@ pub fn program_bytes(program: &[Instruction]) -> Vec<u8> {
 fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
     use tt_isa::mailbox::role::Mailbox;
 
-    // The `Dst` rows about to be dumped are zeroed before *anything* runs, so it
-    // leads the unpack program: the math role may read what the unpack role wrote
-    // into `Dst`.
-    let mut unpack = if spec.clear_dst {
+    // The `Dst` rows about to be dumped are zeroed before *anything* runs. In
+    // order, that is simply the head of the unpack program (the math role may
+    // read what the unpack role wrote into `Dst`); concurrently it is a run of
+    // its own, with the semaphore initialisation, ahead of all three roles.
+    let clear = if spec.clear_dst {
         dst_clear_prelude(spec.dump_rows)
     } else {
         Vec::new()
     };
-    unpack.extend_from_slice(roles.unpack);
+    let (setup, unpack) = match spec.concurrent {
+        None => (None, [clear.as_slice(), roles.unpack].concat()),
+        Some(init) => {
+            let mut setup = clear;
+            for &(sem, value, max) in init {
+                setup.push(tt_isa::sync::init(sem, value, max).unwrap());
+            }
+            (Some(setup), roles.unpack.to_vec())
+        }
+    };
     let programs: [&[Instruction]; 3] = [&unpack, roles.math, roles.pack];
     for (i, p) in programs.iter().enumerate() {
         assert!(
@@ -340,9 +374,8 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
         dev.write(&w, tile, *addr, data).unwrap();
     }
 
-    for (thread, program) in programs.iter().enumerate() {
+    let stage_role = |dev: &mut Dev<'_>, thread: usize, program: &[Instruction], dump: u32| {
         let mb = Mailbox::of(thread as u32);
-        let dump = if thread == 1 { spec.dump_rows } else { 0 };
         dev.write32(&w, tile, mb.status(), 0).unwrap();
         dev.write32(&w, tile, mb.thread_index(), thread as u32)
             .unwrap();
@@ -360,26 +393,60 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
                     .unwrap();
             }
         }
-    }
-
-    // In order, each to completion.
-    for (thread, (core, image, at)) in crate::firmware::ROLES.iter().enumerate() {
+    };
+    let dump_of = |thread: usize| if thread == 1 { spec.dump_rows } else { 0 };
+    let start = |dev: &mut Dev<'_>, thread: usize| {
+        let (core, image, at) = crate::firmware::ROLES[thread];
+        dev.load_and_start(&w, tile, core, image, at).unwrap();
+    };
+    let wait = |dev: &mut Dev<'_>, thread: usize| -> Result<(), String> {
+        let (core, _, _) = crate::firmware::ROLES[thread];
         let mb = Mailbox::of(thread as u32);
-        dev.load_and_start(&w, tile, *core, image, *at).unwrap();
         match dev
             .wait_for_mailbox(&w, tile, mb.status(), mb.panic_code(), BUDGET, |s| {
                 s == status::DONE
             })
             .unwrap()
         {
-            Ok(_) => {}
-            Err(WaitError::Panicked { code }) => {
-                panic!(
-                    "role {thread} ({}) firmware panicked, code {code}",
-                    core.name()
-                )
+            Ok(_) => Ok(()),
+            Err(WaitError::Panicked { code }) => Err(format!(
+                "role {thread} ({}) firmware panicked, code {code}",
+                core.name()
+            )),
+            Err(e) => Err(format!("role {thread} ({}): {e}", core.name())),
+        }
+    };
+
+    if let Some(setup) = &setup {
+        stage_role(dev, 0, setup, 0);
+        start(dev, 0);
+        if let Err(e) = wait(dev, 0) {
+            panic!("setup run: {e}");
+        }
+    }
+    for (thread, program) in programs.iter().enumerate() {
+        stage_role(dev, thread, program, dump_of(thread));
+    }
+    if setup.is_some() {
+        // Together, by one write to the soft-reset register: released one by
+        // one, each after its image load, the first roles finish a short
+        // program before the last has started, which is a sequential run by
+        // another name (`Device::load_and_start_together`).
+        dev.load_and_start_together(&w, tile, &crate::firmware::ROLES)
+            .unwrap();
+        let stuck: Vec<String> = (0..3).filter_map(|t| wait(dev, t).err()).collect();
+        assert!(
+            stuck.is_empty(),
+            "concurrent roles did not all finish: {}",
+            stuck.join("; ")
+        );
+    } else {
+        // In order, each to completion.
+        for thread in 0..3 {
+            start(dev, thread);
+            if let Err(e) = wait(dev, thread) {
+                panic!("{e}");
             }
-            Err(e) => panic!("role {thread} ({}): {e}", core.name()),
         }
     }
 
@@ -403,6 +470,5 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
         dev.read(&w, tile, *addr, &mut buf).unwrap();
         l1.push(buf);
     }
-    dev.free_window(w);
     Outcome { dst, l1 }
 }

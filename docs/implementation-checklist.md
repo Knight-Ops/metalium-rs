@@ -764,6 +764,22 @@ undocumented.
       Watched failing with the Y step removed (L1 row 4 repeats row 0) and with an
       empty math body. `PCK0_ADDR_BASE_REG_0_Base` is left at reset zero: it is
       register 16, which ttsim does not model (row 28).
+- [x] **Concurrent roles, and the `Dst` hand-off.** `Run::concurrent` runs a
+      setup program on thread 0 (the `Dst` clear and `SEMINIT`s) and then releases
+      all three roles with **one** write to `SOFT_RESET_0`
+      (`Device::load_and_start_together`); `tt_isa::sync` carries the math -> pack
+      hand-off (`post_after` = `STALLWAIT` + `SEMPOST`, `take` = `SEMWAIT` +
+      `SEMGET`, B1 always blocked as `SEMWAIT.md` recommends, `Semaphore` a
+      newtype over `0..8`). Programs now live in fixed slots of
+      `mailbox::PROGRAM_REGION` (8192 words each, up from 256 inside the mailbox);
+      `step9_matmul::a_program_longer_than_the_old_mailbox_limit_runs_to_the_end`
+      pushes 2000 `SFPNOP`s before its `MVMUL`, watched failing with the firmware's
+      bound put back. Gates in `step10_matmul_tile.rs`, ttsim and both cards:
+      three unpack/`MVMUL` rounds through two banks accumulate and pack correctly
+      concurrently; in order, two rounds finish and three deadlock on role 0; and
+      without the semaphore the pack races the math (0/128 right) on both targets
+      -- which silicon showed only after the release was made simultaneous
+      (divergence row 53).
 - [ ] Single 16×16 face → 32×32 tile → blocked → multi-tile. The tile step settles
       the Phase 4 "which `Z` plane is which face" convention.
 - [ ] Budget a standing percentage of the phase for empirical discovery rather

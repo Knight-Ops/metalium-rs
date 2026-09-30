@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod datapath;
 pub mod harness;
+pub mod matmul;
 
 /// Firmware images, built from `crates/tt-firmware` by this crate's `build.rs`
 /// and checked for instructions Blackhole cannot execute.
