@@ -84,6 +84,13 @@ pub const CYCLES_PER_POLL: u32 = 512;
 /// this", not "the host asked too quickly".
 pub const SILICON_MIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Wall-clock allowance for the local-data-RAM zeroing after a release.
+///
+/// [`tensix::LOCAL_RAM_ZEROING_CYCLES`] is 2048 cycles, about 2 µs at the baby
+/// cores' clock; this is fifty times that, which costs nothing next to a single
+/// round trip through a TLB window and does not depend on knowing the clock.
+pub const LOCAL_RAM_ZEROING_WALL: std::time::Duration = std::time::Duration::from_micros(100);
+
 impl<T: Transport> Device<T> {
     /// Read the tile-wide soft-reset register.
     pub fn read_soft_reset<N: NocId>(&mut self, window: &Window, tile: NocCoord<N>) -> Result<u32> {
@@ -112,6 +119,12 @@ impl<T: Transport> Device<T> {
         };
         if updated != current {
             self.write32(window, tile, tensix::SOFT_RESET_0, updated)?;
+            let key = (N::INDEX, tile.x(), tile.y(), core);
+            if held {
+                self.released.remove(&key);
+            } else {
+                self.released.insert(key, std::time::Instant::now());
+            }
         }
         Ok(())
     }
@@ -252,6 +265,131 @@ impl<T: Transport> Device<T> {
             tensix::SOFT_RESET_0,
             current | tensix::BACKEND_RESET_MASK,
         )
+    }
+
+    /// Release `core` into a one-instruction loop, `j .`, placed at `loop_address`
+    /// in L1, so that its local data RAM can be reached over the NoC.
+    ///
+    /// A core's local data RAM does not answer the NoC while the core is held in
+    /// soft reset (see [`Device::local_ram_read`]). This is the documented way
+    /// round it, and the one Tenstorrent's own debugger takes:
+    /// `tt-exalens`' `ensure_private_memory_access` writes `jal x0, 0` at the start
+    /// address, releases the core, and only then touches its private memory. The
+    /// loop touches no memory, so it cannot disturb what the host stages.
+    ///
+    /// For RISCV B `loop_address` must be 0, since B cannot be redirected; the
+    /// word at L1 offset 0 is overwritten.
+    pub fn park_core<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        core: Core,
+        loop_address: u64,
+    ) -> Result<()> {
+        /// `jal x0, 0`.
+        const J_SELF: u32 = 0x0000_006F;
+        self.load_and_start(window, tile, core, &J_SELF.to_le_bytes(), loop_address)
+    }
+
+    /// Read `out.len()` bytes of `core`'s local data RAM, from `offset`, over the
+    /// NoC-visible slow-access path.
+    ///
+    /// # Why this is not just a `read`
+    ///
+    /// The aperture at `0xFFB1_4000..0xFFB1_DFFF` is documented as reachable over
+    /// the NoC (`BabyRISCV/README.md:148`), and the documentation stops there.
+    /// On silicon, word accesses into it with every core held in soft reset hung
+    /// the NoC, and the ARC watchdog's chip reset took the host down with it. The
+    /// RAM does not answer while its core is in reset, which is also why
+    /// `tt-exalens` never touches private memory without first taking the core
+    /// out of reset. So this:
+    ///
+    /// * refuses if `core` is in reset -- use [`Device::park_core`] first;
+    /// * waits out the post-release zeroing (`BabyRISCV/README.md:152`) if this
+    ///   `Device` released the core recently, since NoC accesses are not stalled
+    ///   for it and would be lost or return zeros;
+    /// * refuses anything outside the core's RAM, which for T0/T1/T2 is only the
+    ///   lower 4 KiB of their 8 KiB window;
+    /// * moves one aligned dword per access. The aperture is a register-like
+    ///   path into a RAM behind the core, not L1, and a bulk copy through the
+    ///   BAR becomes multi-flit NoC writes that nothing documents it accepting;
+    ///   dword accesses are what the tile's debug registers, which work, get.
+    pub fn local_ram_read<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        core: Core,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let address = self.local_ram_ready(window, tile, core, offset, out.len())?;
+        for (i, word) in out.chunks_exact_mut(4).enumerate() {
+            self.read_unchecked(window, tile, address + 4 * i as u64, word)?;
+        }
+        Ok(())
+    }
+
+    /// Write `data` into `core`'s local data RAM at `offset`. The same
+    /// preconditions as [`Device::local_ram_read`].
+    pub fn local_ram_write<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        core: Core,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let address = self.local_ram_ready(window, tile, core, offset, data.len())?;
+        for (i, word) in data.chunks_exact(4).enumerate() {
+            self.write_unchecked(window, tile, address + 4 * i as u64, word)?;
+        }
+        Ok(())
+    }
+
+    /// Check the preconditions for touching `core`'s local RAM, wait out any
+    /// zeroing, and return the NoC address of `offset`.
+    fn local_ram_ready<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        core: Core,
+        offset: u64,
+        len: usize,
+    ) -> Result<u64> {
+        let size = u64::from(core.local_data_ram_size());
+        let base = core.local_data_ram_noc_address();
+        if offset % 4 != 0 || len % 4 != 0 {
+            return Err(TransportError::Hazard {
+                address: base + offset,
+                reason: "local data RAM is reached one aligned dword at a time",
+            });
+        }
+        if offset.checked_add(len as u64).is_none_or(|end| end > size) {
+            return Err(TransportError::Hazard {
+                address: base + offset,
+                reason: "outside this core's local data RAM; a T-core's 8 KiB window \
+                         holds only 4 KiB of RAM and the upper half is undocumented",
+            });
+        }
+        if self.is_core_in_reset(window, tile, core)? {
+            return Err(TransportError::Hazard {
+                address: base + offset,
+                reason: "the core is held in soft reset, and its local data RAM does \
+                         not answer the NoC then: the access would hang it. Release \
+                         the core first, e.g. with Device::park_core",
+            });
+        }
+        let key = (N::INDEX, tile.x(), tile.y(), core);
+        if let Some(&released) = self.released.get(&key) {
+            if self.transport().is_simulated() {
+                self.tick(tensix::LOCAL_RAM_ZEROING_CYCLES);
+            } else {
+                let remaining = LOCAL_RAM_ZEROING_WALL.saturating_sub(released.elapsed());
+                std::thread::sleep(remaining);
+            }
+            self.released.remove(&key);
+        }
+        Ok(base + offset)
     }
 
     /// Read the firmware mailbox status word.

@@ -335,17 +335,26 @@ carrying `/proc/sys/kernel/random/boot_id` on each line so a reboot is evidence 
 inference; and running the suite **one test at a time**, which is what identified the
 failing access instead of losing the output with the session.
 
-**`auto_reset_timeout=0` is the debugging posture, and it is now enforced.** It disables
-the ARC watchdog (`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a
-chip reset that drops the PCIe link and kills the host" into "card is wedged, recoverable".
-It removes the safety net that recovers a hung chip, so it is for bring-up, not for keeping.
-A printed warning was not enough: the Phase 2 campaign ran past one and lost the host a
-third time. `backend::open_card` now panics before opening the card unless
-`tt_kmd::auto_reset_timeout()` reads 0, and `cargo xtask silicon` refuses at preflight; the
-overrides are `TT_ALLOW_ARMED_WATCHDOG=1` and `--allow-armed-watchdog`. The parameter is
-read-only at runtime, so make it persistent rather than remembering it:
-`echo "options tenstorrent auto_reset_timeout=0" | sudo tee /etc/modprobe.d/tenstorrent-bringup.conf`,
-then reload the module (`sudo modprobe -r tenstorrent && sudo modprobe tenstorrent`).
+**`auto_reset_timeout=0` is the debugging posture.** It disables the ARC watchdog
+(`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a chip reset that
+drops the PCIe link and kills the host" into "card is wedged, recoverable". It removes the
+safety net that recovers a hung chip, so it is for bring-up, not for keeping. The harness
+and `cargo xtask silicon` report its value; neither refuses to run. The fix for a hang is
+the access that caused it, which is what the next note is.
+
+**A baby RISC-V's local data RAM does not answer the NoC while its core is in soft reset.**
+The slow-path aperture (`0xFFB1_4000..0xFFB1_DFFF`) is documented as NoC-reachable
+(`BabyRISCV/README.md:148`) and the page says nothing about reset. The first silicon probe of
+it wrote all five RAMs on the gate tile with every core held -- the harness's resting state --
+and never completed; the host died under it (run log `START` with no `END`, boot `497d5859`).
+`tt-exalens`, Tenstorrent's own debugger, never makes that access: its
+`ensure_private_memory_access` plants `jal x0, 0`, releases the core, halts it, and only
+then touches private memory, and its ELF loader stages private sections in L1 rather than
+writing them with the core in reset. `tt-device` now encodes the rule: `Device::read`/`write`
+refuse the aperture (`TransportError::Hazard`); `local_ram_read`/`local_ram_write` refuse a
+core in reset, wait out the post-release zeroing, bound T-cores to their 4 KiB, and move one
+dword per access; `park_core` puts a core in the exalens loop. Unit tests watch each refusal,
+and the reset check was watched failing with the check removed.
 
 **Do not run `probe_niu.rs` as a grid oracle.** It opens `Simulator` directly, so it is
 structurally simulator-only and *cannot* reach a card — which is fortunate, because
@@ -381,6 +390,19 @@ misattribution.
       it outright. Watched rejecting a deliberately planted `asm!("fence.i")`.
 - [x] **Gate (sim):** heartbeat climbs monotonically; a core held in reset does
       nothing; releasing one core does not disturb the others.
+- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
+      registers. The test is written and `#[cfg(feature = "silicon")]`.
+- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
+      sequencing, I-cache invalidation and the local-RAM zeroing window are all
+      things a simulator may model loosely, and all three land here.
+      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
+      for the first time: heartbeat, held-in-reset control, reset round trip,
+      `pc` snapshot inside the image, two tiles (the far one now taken from the
+      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
+- [~] **The slow-path local-RAM aperture took the host down** -- because it was accessed
+      with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
+      notes). `silicon_local_ram` now parks each core first; `l0_one_word_on_a_parked_core`
+      is the first thing to run on silicon, alone, to confirm the fix.
 - [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
       registers. The test is written and `#[cfg(feature = "silicon")]`.
 - [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset

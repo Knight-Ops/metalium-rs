@@ -3,9 +3,11 @@
 //! Wraps a [`Transport`] with the two things every caller above it needs: a window
 //! allocator, and transfers that are split so no access ever straddles a window.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 use tt_isa::noc::{niu, ChipId, NocCoord, NocId, TileType};
+use tt_isa::tensix::{self, Core};
 
 use crate::tlb::{
     self, TlbConfig, WindowKind, KERNEL_RESERVED_WINDOW, NUM_2MIB_WINDOWS, NUM_WINDOWS,
@@ -63,6 +65,41 @@ pub struct Device<T: Transport> {
     /// Windows not currently handed out, lowest first.
     free: Vec<u16>,
     shadow: BTreeMap<u16, Shadow>,
+    /// When this `Device` last released each core from reset, keyed by
+    /// `(NoC index, x, y, core)`. Read by the local-data-RAM accessors, which
+    /// must not touch a core's RAM during the zeroing that follows a release.
+    pub(crate) released: HashMap<(u8, u8, u8, Core), Instant>,
+}
+
+/// Refuse a plain access to the local-data-RAM aperture.
+///
+/// A baby RISC-V's local data RAM does not answer the NoC while its core is held
+/// in soft reset: the request is never completed, the NoC hangs, and the ARC
+/// recovers with a chip reset that drops the PCIe link. On a card passed through
+/// to a VM that takes the host down, which is how this was found
+/// (`silicon_local_ram.rs`, 2026-09-30). Whether a core is in reset is state on
+/// the chip, not something a plain `read`/`write` knows, so the aperture is only
+/// reachable through [`Device::local_ram_read`] and [`Device::local_ram_write`],
+/// which check it.
+///
+/// Ethernet tiles map different registers at these addresses; reaching them
+/// will need its own accessor when Phase 8 does.
+fn refuse_local_ram_aperture(address: u64, len: usize) -> Result<()> {
+    if touches_local_ram_aperture(address, len) {
+        return Err(TransportError::Hazard {
+            address,
+            reason: "the local-data-RAM aperture hangs the NoC if the owning core is in \
+                     reset; use Device::local_ram_read / local_ram_write",
+        });
+    }
+    Ok(())
+}
+
+/// Does `[address, address + len)` touch the NoC-visible local-data-RAM
+/// aperture (`0xFFB1_4000..0xFFB1_E000`)?
+fn touches_local_ram_aperture(address: u64, len: usize) -> bool {
+    let end = address.saturating_add(len as u64);
+    address < tensix::LOCAL_DATA_RAM_NOC_END && end > tensix::LOCAL_DATA_RAM_NOC_BASE
 }
 
 impl<T: Transport> Device<T> {
@@ -90,6 +127,7 @@ impl<T: Transport> Device<T> {
             chip,
             free,
             shadow: BTreeMap::new(),
+            released: HashMap::new(),
         })
     }
 
@@ -171,7 +209,22 @@ impl<T: Transport> Device<T> {
     ///
     /// Splits the transfer so that no single access straddles a window boundary,
     /// retargeting the window as it goes.
+    ///
+    /// Refuses the local-data-RAM aperture; see [`Device::local_ram_write`].
     pub fn write<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        refuse_local_ram_aperture(address, data.len())?;
+        self.write_unchecked(window, coord, address, data)
+    }
+
+    /// [`Device::write`] without the aperture refusal, for the accessors that
+    /// have established the access is safe.
+    pub(crate) fn write_unchecked<N: NocId>(
         &mut self,
         window: &Window,
         coord: NocCoord<N>,
@@ -188,7 +241,21 @@ impl<T: Transport> Device<T> {
     }
 
     /// Read from `address` in the tile at `coord` into `out`, through `window`.
+    ///
+    /// Refuses the local-data-RAM aperture; see [`Device::local_ram_read`].
     pub fn read<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        refuse_local_ram_aperture(address, out.len())?;
+        self.read_unchecked(window, coord, address, out)
+    }
+
+    /// [`Device::read`] without the aperture refusal.
+    pub(crate) fn read_unchecked<N: NocId>(
         &mut self,
         window: &Window,
         coord: NocCoord<N>,
@@ -586,5 +653,92 @@ mod tests {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         // The fake serves zeroes, which stands in for "nothing there".
         assert_eq!(d.probe_tile(&w, c(9, 9)).unwrap(), None);
+    }
+
+    // -- The local-data-RAM aperture ------------------------------------------
+
+    fn gate_tile() -> NocCoord<Noc0> {
+        NocCoord::new(3, 4).unwrap()
+    }
+
+    #[test]
+    fn plain_accesses_to_the_local_ram_aperture_are_refused() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        for core in Core::ALL {
+            let at = core.local_data_ram_noc_address();
+            let e = dev.write32(&w, t, at, 1).unwrap_err();
+            assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+            let e = dev.read32(&w, t, at).unwrap_err();
+            assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        }
+        // A transfer that merely overlaps the aperture's first byte is caught too.
+        let e = dev
+            .write(&w, t, tensix::LOCAL_DATA_RAM_NOC_BASE - 2, &[0; 4])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        // And its neighbours are not: the debug registers and the NoC 0 NIU.
+        dev.write32(&w, t, tensix::LOCAL_DATA_RAM_NOC_BASE - 4, 0)
+            .unwrap();
+        dev.read32(&w, t, tensix::LOCAL_DATA_RAM_NOC_END).unwrap();
+        assert!(dev.transport.writes.iter().all(|&(_, off, _)| {
+            // Nothing that reached the transport landed in the aperture.
+            dev.transport
+                .translate(off)
+                .is_none_or(|(_, a)| !touches_local_ram_aperture(a, 1))
+        }));
+    }
+
+    #[test]
+    fn local_ram_is_refused_while_its_core_is_held_in_reset() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        dev.set_core_reset(&w, t, Core::T1, true).unwrap();
+        let before = dev.transport.writes.len();
+        let e = dev
+            .local_ram_write(&w, t, Core::T1, 0, &[1, 2, 3, 4])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        assert_eq!(dev.transport.writes.len(), before, "nothing may be sent");
+        let mut buf = [0u8; 4];
+        let e = dev
+            .local_ram_read(&w, t, Core::T1, 0, &mut buf)
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+    }
+
+    #[test]
+    fn local_ram_round_trips_once_its_core_is_running() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        dev.set_core_reset(&w, t, Core::T1, true).unwrap();
+        dev.park_core(&w, t, Core::T1, 0x4_0000).unwrap();
+        assert!(!dev.is_core_in_reset(&w, t, Core::T1).unwrap());
+        dev.local_ram_write(&w, t, Core::T1, 16, &[9, 8, 7, 6])
+            .unwrap();
+        let mut back = [0u8; 4];
+        dev.local_ram_read(&w, t, Core::T1, 16, &mut back).unwrap();
+        assert_eq!(back, [9, 8, 7, 6]);
+        // Where it landed: T1's slow-path window.
+        let at = Core::T1.local_data_ram_noc_address() + 16;
+        assert_eq!(dev.transport.mem.get(&(t.packed(), at)), Some(&9));
+    }
+
+    #[test]
+    fn local_ram_refuses_the_upper_half_of_a_t_core_window() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        let size = u64::from(Core::T0.local_data_ram_size());
+        let e = dev
+            .local_ram_write(&w, t, Core::T0, size - 4, &[0; 8])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        // B's RAM is 8 KiB, so the same offset is fine there.
+        dev.local_ram_write(&w, t, Core::B, size - 4, &[0; 8])
+            .unwrap();
     }
 }

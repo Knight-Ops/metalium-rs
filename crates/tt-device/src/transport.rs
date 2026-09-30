@@ -107,6 +107,9 @@ pub enum TransportError {
     NotBlackhole { vendor: u16, device: u16 },
     /// An implementation-specific failure (an ioctl, a missing device node).
     Io(std::io::Error),
+    /// The access is addressable but is known to hang or corrupt the chip in the
+    /// current state, so it was refused before reaching the transport.
+    Hazard { address: u64, reason: &'static str },
 }
 
 impl fmt::Display for TransportError {
@@ -132,6 +135,9 @@ impl fmt::Display for TransportError {
                  found {vendor:#06x}:{device:#06x}"
             ),
             TransportError::Io(e) => write!(f, "{e}"),
+            TransportError::Hazard { address, reason } => {
+                write!(f, "refused access at {address:#x}: {reason}")
+            }
         }
     }
 }

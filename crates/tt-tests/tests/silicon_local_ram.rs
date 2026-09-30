@@ -1,21 +1,28 @@
 //! Phase 2 on silicon: the NoC-visible local data RAM, the zeroing window, and
 //! `DISABLE_RESET`.
 //!
-//! ttsim models none of this (divergence rows 25 and 26; `step6_local_ram.rs`
-//! watches it refuse), so these are the first measurements of it anywhere. They
-//! answer open question 6 for reset and zeroing, and the checklist's question
-//! about the upper half of a T-core's slow-path window.
+//! ttsim models none of this (divergence rows 25, 26 and 43; `step6_local_ram.rs`
+//! watches it refuse), so these are the first measurements of it anywhere.
 //!
-//! The core under test runs a single instruction, `j .`, placed in L1. The
-//! heartbeat firmware would do for "something is running", but it keeps its
-//! stack in local data RAM, which is exactly what is being observed here; a loop
-//! that touches no memory cannot confound the result. It also makes the `pc`
-//! snapshot exact rather than speculative, which is a stronger form of step 3's
-//! `pc_snapshot_lands_in_the_loaded_image`.
+//! # The rule these tests exist under
+//!
+//! A core's local data RAM does not answer the NoC while that core is held in
+//! soft reset. The first version of this file wrote all five RAMs with every
+//! core held -- the harness's resting state -- and the access never completed:
+//! the NoC hung, the ARC watchdog reset the chip, and the host went down with the
+//! PCIe link (2026-09-30). Tenstorrent's debugger encodes the same rule:
+//! `tt-exalens`' `ensure_private_memory_access` never touches private memory with
+//! the core in reset, and parks it in a `jal x0, 0` loop first.
+//!
+//! `tt-device` now makes the mistake unrepresentable -- `Device::read`/`write`
+//! refuse the aperture, and `local_ram_read`/`write` refuse a core in reset and
+//! wait out the post-release zeroing -- so every access here goes through
+//! [`Device::park_core`] and those accessors.
 //!
 //! `DISABLE_RESET` outlives the process that sets it, so every test that writes
-//! it puts it back to zero before returning, and a panic is caught first so the
-//! restore still happens.
+//! it puts it back to zero before returning, even on a panic.
+//!
+//! [`Device::park_core`]: tt_device::Device::park_core
 
 #![cfg(feature = "silicon")]
 
@@ -23,76 +30,46 @@ use tt_device::tlb::WindowKind;
 use tt_device::Window;
 use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
-use tt_tests::harness::{self, advance, assert_on_silicon, in_device, Dev};
+use tt_tests::harness::{self, assert_on_silicon, in_device, Dev};
 
-/// Where the one-instruction loop lives: clear of the firmware load address and
-/// of the mailbox.
+/// Where the parked cores' `j .` lives: clear of the firmware load address and
+/// of the mailbox. RISCV B cannot be redirected and parks at 0.
 const LOOP_ADDR: u64 = 0x4_0000;
-/// `jal x0, 0`: jump to itself.
-const J_SELF: u32 = 0x0000_006F;
-/// More than the documented 2048-cycle zeroing window, at any plausible clock.
-const ZEROING_WAIT_CYCLES: u32 = 1_000_000;
 
-/// Why three of these tests are quarantined.
-///
-/// The first silicon run of `l1_each_local_ram_round_trips_over_the_noc` never
-/// finished: the fsync'd run log has its `START` and no `END`, and the host went
-/// down under it with the ARC watchdog armed (boot `497d5859`, 2026-09-30). That
-/// test does nothing but word-sized NoC writes, then reads, into
-/// `0xFFB1_4000..0xFFB1_DFFF` on the gate tile while every core is held in reset,
-/// so the slow-path local-RAM aperture is the prime suspect -- which of the five
-/// cores' ranges, or whether it is the access itself or holding the core in
-/// reset, is not known, because the run bought no finer evidence than that.
-/// `l3` and `l4` use the same aperture.
-///
-/// They stay compiled and are re-runnable, but only deliberately: with the
-/// watchdog disarmed, alone, and with [`APERTURE_OPT_IN_ENV`] set. The next run
-/// should narrow it -- one core, one read, before any write.
-pub const QUARANTINE: () = ();
-
-/// Set to `1` to run the quarantined aperture tests.
-const APERTURE_OPT_IN_ENV: &str = "TT_RISK_LOCAL_RAM_APERTURE";
-
-fn require_aperture_opt_in() {
-    assert!(
-        std::env::var(APERTURE_OPT_IN_ENV).as_deref() == Ok("1"),
-        "quarantined (see QUARANTINE in this file): set {APERTURE_OPT_IN_ENV}=1, \
-         disarm the ARC watchdog, and run this test alone"
-    );
+fn park_address(core: Core) -> u64 {
+    if core == Core::B {
+        0
+    } else {
+        LOOP_ADDR
+    }
 }
 
 fn measure(key: &str, value: impl std::fmt::Display) {
     println!("MEASURE {key} = {value}");
 }
 
-/// A pattern that differs per word and per core, so aliasing between cores or
-/// between halves of a window is visible.
-fn pattern(core: Core, word: u64) -> u32 {
-    0xC0DE_0000 ^ ((core as u32) << 12) ^ (word as u32).wrapping_mul(0x9E37_79B9)
+/// A pattern that differs per word and per core, so aliasing between cores is
+/// visible.
+fn pattern(core: Core, words: usize) -> Vec<u8> {
+    (0..words as u32)
+        .flat_map(|i| {
+            (0xC0DE_0000 ^ ((core as u32) << 12) ^ i.wrapping_mul(0x9E37_79B9)).to_le_bytes()
+        })
+        .collect()
 }
 
-fn fill(dev: &mut Dev<'_>, w: &Window, tile: NocCoord<Noc0>, core: Core, base: u64, words: u64) {
-    for i in 0..words {
-        dev.write32(w, tile, base + 4 * i, pattern(core, i))
-            .unwrap();
-    }
-}
-
-/// How many of `words` still hold the pattern, and how many are zero.
-fn census(
-    dev: &mut Dev<'_>,
-    w: &Window,
-    tile: NocCoord<Noc0>,
-    core: Core,
-    base: u64,
-    words: u64,
-) -> (u64, u64) {
-    let (mut kept, mut zero) = (0, 0);
-    for i in 0..words {
-        let v = dev.read32(w, tile, base + 4 * i).unwrap();
-        kept += u64::from(v == pattern(core, i));
-        zero += u64::from(v == 0);
-    }
+/// How many words of `core`'s RAM still hold its pattern, and how many are zero.
+fn census(dev: &mut Dev<'_>, w: &Window, tile: NocCoord<Noc0>, core: Core) -> (usize, usize) {
+    let bytes = core.local_data_ram_size() as usize;
+    let want = pattern(core, bytes / 4);
+    let mut got = vec![0u8; bytes];
+    dev.local_ram_read(w, tile, core, 0, &mut got).unwrap();
+    let kept = got
+        .chunks_exact(4)
+        .zip(want.chunks_exact(4))
+        .filter(|(a, b)| a == b)
+        .count();
+    let zero = got.chunks_exact(4).filter(|c| c == &[0; 4]).count();
     (kept, zero)
 }
 
@@ -108,39 +85,58 @@ fn with_disable_reset_restored(dev: &mut Dev<'_>, f: impl FnOnce(&mut Dev<'_>)) 
     }
 }
 
+/// The smallest claim the fix rests on: with T1 parked, one word of its RAM
+/// round-trips. Run this first and alone.
+#[test]
+fn l0_one_word_on_a_parked_core() {
+    assert_on_silicon();
+    in_device(|dev| {
+        let tile = harness::tensix_tile();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        // The refusal first, on the chip itself: the harness holds every core,
+        // so this must come back as an error without reaching the NoC.
+        let mut word = [0u8; 4];
+        let refused = dev.local_ram_read(&w, tile, Core::T1, 0, &mut word);
+        assert!(
+            refused.is_err(),
+            "a read of a held core's RAM was not refused"
+        );
+
+        dev.park_core(&w, tile, Core::T1, LOOP_ADDR).unwrap();
+        dev.local_ram_write(&w, tile, Core::T1, 0, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        dev.local_ram_read(&w, tile, Core::T1, 0, &mut word)
+            .unwrap();
+        measure(
+            "local_ram.T1.word0",
+            format!("{:#010x}", u32::from_le_bytes(word)),
+        );
+        assert_eq!(u32::from_le_bytes(word), 0x1234_5678);
+        dev.free_window(w);
+    });
+}
+
 /// Every core's local RAM round-trips through the slow-path aperture while the
-/// core is held in reset, and the five RAMs do not alias one another.
-#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
+/// core is parked, and the five RAMs do not alias one another.
 #[test]
 fn l1_each_local_ram_round_trips_over_the_noc() {
     assert_on_silicon();
-    require_aperture_opt_in();
     in_device(|dev| {
         let tile = harness::tensix_tile();
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
         for core in Core::ALL {
-            let words = u64::from(core.local_data_ram_size()) / 4;
-            fill(
-                dev,
-                &w,
-                tile,
-                core,
-                core.local_data_ram_noc_address(),
-                words,
-            );
+            dev.park_core(&w, tile, core, park_address(core)).unwrap();
         }
-        // Checked only after every core's RAM is written, so a write that landed
-        // in another core's RAM shows up as a mismatch there.
         for core in Core::ALL {
-            let words = u64::from(core.local_data_ram_size()) / 4;
-            let (kept, _) = census(
-                dev,
-                &w,
-                tile,
-                core,
-                core.local_data_ram_noc_address(),
-                words,
-            );
+            let words = core.local_data_ram_size() as usize / 4;
+            dev.local_ram_write(&w, tile, core, 0, &pattern(core, words))
+                .unwrap();
+        }
+        // Checked only after every RAM is written, so a write that landed in
+        // another core's RAM shows up as a mismatch there.
+        for core in Core::ALL {
+            let words = core.local_data_ram_size() as usize / 4;
+            let (kept, _) = census(dev, &w, tile, core);
             measure(
                 &format!("local_ram.{}.round_trip", core.name()),
                 format!("{kept} of {words}"),
@@ -157,7 +153,8 @@ fn l1_each_local_ram_round_trips_over_the_noc() {
 }
 
 /// `DISABLE_RESET` reads back what was written. ttsim refuses both directions
-/// (row 26); the read-modify-write convention needs both.
+/// (row 26); the read-modify-write convention needs both. A tile debug register,
+/// not the aperture.
 #[test]
 fn l2_disable_reset_round_trips() {
     assert_on_silicon();
@@ -181,47 +178,39 @@ fn l2_disable_reset_round_trips() {
     });
 }
 
-/// The zeroing window, both ways: releasing T0 wipes its local RAM unless its
-/// `DISABLE_RESET` bit is set, in which case staged data survives.
+/// The zeroing that follows a release, both ways: re-releasing T0 wipes its
+/// local RAM unless its `DISABLE_RESET` bit is set.
 ///
-/// This is the behaviour `load_and_start_staged` will rest on, measured before
-/// the API is written. It also checks the loop is really what is running, by
-/// asserting the `pc` snapshot is exactly the loop's address.
-#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
+/// Staged with the core parked, then put through reset and released again, and
+/// read only afterwards -- nothing touches the RAM while the core is held. The
+/// accessors wait out the zeroing before reading. The `pc` snapshot confirms T0
+/// is back in the loop, exactly, not merely somewhere.
 #[test]
 fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
     assert_on_silicon();
-    require_aperture_opt_in();
     in_device(|dev| {
         with_disable_reset_restored(dev, |dev| {
             let tile = harness::tensix_tile();
             let core = Core::T0;
             let (ram_bit, _) = core.disable_reset_bits();
-            let base = core.local_data_ram_noc_address();
-            let words = u64::from(core.local_data_ram_size()) / 4;
+            let words = core.local_data_ram_size() as usize / 4;
             let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
 
-            dev.write32(&w, tile, LOOP_ADDR, J_SELF).unwrap();
             for (label, disable) in [("bit_clear", false), ("bit_set", true)] {
-                dev.set_core_reset(&w, tile, core, true).unwrap();
-                dev.write32(
-                    &w,
-                    tile,
-                    tensix::DISABLE_RESET,
-                    if disable { 1 << ram_bit } else { 0 },
-                )
-                .unwrap();
-                fill(dev, &w, tile, core, base, words);
-                let (staged, _) = census(dev, &w, tile, core, base, words);
+                dev.park_core(&w, tile, core, LOOP_ADDR).unwrap();
+                dev.local_ram_write(&w, tile, core, 0, &pattern(core, words))
+                    .unwrap();
+                let (staged, _) = census(dev, &w, tile, core);
                 assert_eq!(staged, words, "staging into T0's local RAM failed");
 
-                dev.set_reset_pc(&w, tile, core, LOOP_ADDR as u32).unwrap();
-                dev.set_core_reset(&w, tile, core, false).unwrap();
-                advance(dev, ZEROING_WAIT_CYCLES);
-                let pc = dev.read_pc_snapshot(&w, tile, core).unwrap();
+                let bits = if disable { 1 << ram_bit } else { 0 };
+                dev.write32(&w, tile, tensix::DISABLE_RESET, bits).unwrap();
+                // Through reset and out again; the reset PC still names the loop.
                 dev.set_core_reset(&w, tile, core, true).unwrap();
+                dev.set_core_reset(&w, tile, core, false).unwrap();
 
-                let (kept, zero) = census(dev, &w, tile, core, base, words);
+                let (kept, zero) = census(dev, &w, tile, core);
+                let pc = dev.read_pc_snapshot(&w, tile, core).unwrap();
                 measure(&format!("zeroing.{label}.pc"), format!("{pc:#x}"));
                 measure(
                     &format!("zeroing.{label}"),
@@ -239,58 +228,5 @@ fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
             }
             dev.free_window(w);
         });
-    });
-}
-
-/// What is in the upper 4 KiB of a T-core's 8 KiB slow-path window?
-///
-/// The memory map gives each T-core two identically-labelled 4 KiB rows while
-/// its RAM is 4 KiB (`tt_isa::tensix::Core::local_data_ram_noc_window`). Three
-/// candidates: an alias of the lower half, a reserved region that reads as a
-/// constant, or something else. Written with a pattern distinct from the lower
-/// half's, then both halves read back, which tells an alias from separate
-/// storage.
-///
-/// **The one probe here that touches an undocumented address.** It is inside
-/// the tile's documented debug aperture, but run it last and alone.
-#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
-#[test]
-fn l4_upper_half_of_a_t_core_window() {
-    assert_on_silicon();
-    require_aperture_opt_in();
-    in_device(|dev| {
-        let tile = harness::tensix_tile();
-        let core = Core::T1;
-        let lower = core.local_data_ram_noc_address();
-        let size = u64::from(core.local_data_ram_size());
-        let upper = lower + size;
-        assert!(upper + size <= lower + core.local_data_ram_noc_window());
-        let words = size / 4;
-        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-
-        let before: Vec<u32> = (0..8)
-            .map(|i| dev.read32(&w, tile, upper + 4 * i).unwrap())
-            .collect();
-        measure("upper_half.first_words_before", format!("{before:08x?}"));
-
-        fill(dev, &w, tile, core, lower, words);
-        let (upper_matches_lower, _) = census(dev, &w, tile, core, upper, words);
-        measure(
-            "upper_half.equals_lower_after_writing_lower",
-            format!("{upper_matches_lower} of {words}"),
-        );
-
-        // A different pattern into the upper half, attributed to NC so it
-        // cannot match T1's.
-        fill(dev, &w, tile, Core::NC, upper, words);
-        let (upper_kept, upper_zero) = census(dev, &w, tile, Core::NC, upper, words);
-        let (lower_kept, _) = census(dev, &w, tile, core, lower, words);
-        measure(
-            "upper_half.after_writing_upper",
-            format!(
-                "upper kept {upper_kept} (zero {upper_zero}), lower kept {lower_kept}, of {words}"
-            ),
-        );
-        dev.free_window(w);
     });
 }
