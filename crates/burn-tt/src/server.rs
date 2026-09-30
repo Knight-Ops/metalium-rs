@@ -233,3 +233,90 @@ pub fn kmd_engine(
         Ok(())
     }
 }
+
+// --- Several chips --------------------------------------------------------------
+
+/// An engine over a [`Fabric`](tt_kernels::shard::Fabric): every matmul split
+/// along `N` across the fabric's chips, bit-identical to the single-chip
+/// product. Attached as *one* Burn device -- the chips are how it computes, not
+/// something Burn sees.
+pub struct MeshEngine<T: tt_device::Transport> {
+    pub fabric: tt_kernels::shard::Fabric<T>,
+    pub route: SrcRoute,
+    pub fidelity: Fidelity,
+    pub budget: u64,
+}
+
+impl<T: tt_device::Transport> Engine for MeshEngine<T> {
+    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError> {
+        self.fabric
+            .matmul(a, b, mkn, self.route, self.fidelity, self.budget)
+            .map_err(|e| EngineError(e.to_string()))
+    }
+}
+
+/// A factory for [`attach`] that opens every card in `cards` (the first is chip
+/// 0, the host's way in and out), computes on `compute` and relays through
+/// `relay` on each, finds the cabled links between them from the chips
+/// (`tt_kernels::link::discover`), and serves a [`MeshEngine`].
+pub fn kmd_mesh_engine(
+    cards: Vec<u16>,
+    compute: (u8, u8),
+    relay: (u8, u8),
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
+    use tt_device::tlb::WindowKind;
+    use tt_kernels::shard::{Chip, Fabric};
+    move |serve| {
+        let e = |e: tt_device::TransportError| EngineError(e.to_string());
+        let mut chips = Vec::new();
+        for &card in &cards {
+            let s = Session::open_card(
+                card,
+                tt_firmware_images::ROLES,
+                TileChoice::Exactly(compute.0, compute.1),
+            )?;
+            if !s.grid().contains(relay.0, relay.1) {
+                return Err(EngineError(format!(
+                    "relay tile {relay:?} is fused off on card {card}"
+                )));
+            }
+            let tile = s.tile();
+            let relay = tt_isa::noc::NocCoord::new(relay.0, relay.1).expect("a Tensix coordinate");
+            chips.push(Chip::new(s.into_device(), tile, relay).map_err(e)?);
+        }
+        let mut links = Vec::new();
+        for p in 0..chips.len() {
+            for q in p + 1..chips.len() {
+                let (l, r) = chips.split_at_mut(q);
+                let (a, b) = (&mut l[p].dev, &mut r[0].dev);
+                let wa = a.alloc_window(WindowKind::TwoMib).map_err(e)?;
+                let wb = b.alloc_window(WindowKind::TwoMib).map_err(e)?;
+                let (ga, gb) = (
+                    a.ethernet_grid(&wa).map_err(e)?,
+                    b.ethernet_grid(&wb).map_err(e)?,
+                );
+                let found = tt_kernels::link::discover(a, &wa, &ga, b, &wb, &gb)
+                    .map_err(|x| EngineError(x.to_string()))?;
+                if let Some(link) = found.first() {
+                    links.push((p, q, *link));
+                }
+            }
+        }
+        let fabric = Fabric::new(
+            chips,
+            &links,
+            tt_firmware_images::ROLES,
+            tt_firmware_images::ETH_E1,
+        )
+        .map_err(|x| EngineError(x.to_string()))?;
+        serve.serve(&mut MeshEngine {
+            fabric,
+            route,
+            fidelity,
+            budget: 400_000,
+        });
+        Ok(())
+    }
+}

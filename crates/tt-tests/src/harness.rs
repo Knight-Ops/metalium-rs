@@ -72,6 +72,16 @@ pub fn tensix_tile() -> NocCoord<Noc0> {
     NocCoord::new(x, y).unwrap()
 }
 
+/// The relay tile of a multi-chip gate ([`crate::backend::RELAY_TILE`]).
+pub fn relay_tile() -> NocCoord<Noc0> {
+    let (x, y) = crate::backend::RELAY_TILE;
+    assert!(
+        grid::is_tensix_geometry(x, y),
+        "the relay tile must be a Tensix tile"
+    );
+    NocCoord::new(x, y).unwrap()
+}
+
 /// What to stage before a run and what to read after it.
 pub struct Run<'a> {
     /// The instruction stream, pushed verbatim by the firmware.

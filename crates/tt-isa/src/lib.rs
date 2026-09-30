@@ -14,6 +14,7 @@
 pub mod arc;
 pub mod backend;
 pub mod cfg;
+pub mod eth;
 pub mod isa;
 pub mod mailbox;
 pub mod matrix;

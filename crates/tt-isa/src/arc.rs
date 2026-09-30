@@ -143,6 +143,12 @@ pub mod tag {
     /// the all-harvested mask are both zero, and zero enabled columns is
     /// self-evidently not a usable chip.
     pub const ENABLED_TENSIX_COL: u16 = 34;
+    /// Bitmask of *enabled* Ethernet tiles, bit `i` for endpoint `Ei`.
+    ///
+    /// `MEASURED`, not from UMD: `0x3edf` on both p150a cards, and its two clear
+    /// bits are exactly the tiles whose `NIU_CFG_0` says harvested
+    /// (`silicon_eth_survey`). See [`crate::eth::Ethernet`].
+    pub const ENABLED_ETH: u16 = 35;
     /// Nonzero when the NoC translates coordinates.
     pub const NOC_TRANSLATION: u16 = 40;
     /// Packed harvesting state. **Published and empty — do not use.**

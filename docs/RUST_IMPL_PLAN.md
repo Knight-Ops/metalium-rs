@@ -906,6 +906,102 @@ it needs no second card and no link training — but confirm on silicon before t
 behaviour for Ethernet reset and the E0 firmware contract specifically, since those are exactly
 the areas a simulator is most likely to model loosely.
 
+#### Spike outcome (2026-09-30)
+
+The spike ran on `bh_x2` and on the two p150a cards, which are cabled through
+one QSFP-DD port. All four unknowns above are closed, and none of them grew the
+estimate. Details are in the checklist's Phase 8 section and divergence rows
+56-60.
+
+1. **Reset is in `ethdump.c`**, not undocumented. E1 is bit `0x1000` of
+   `SOFT_RESET_0` and its reset PC is at `0xFFB1_4008`. Rust ran on E1 next to a
+   live link, and the link stayed trained.
+2. **E0 is never touched.** Customer code runs on E1. The E0 contract is not
+   needed.
+3. **No PIC.** Everything polls.
+4. **No Overlay.** A TT-link L1 write puts bytes into the partner's L1 with
+   resends done in hardware. The host can issue one through a TLB window with
+   no firmware of ours. That gives a working inter-chip path before any data
+   mover exists.
+
+Both the grid and the link map come from the chips: ARC tag 35 for enabled
+tiles, and base firmware's chip-info exchange for who is cabled to whom. ttsim
+models neither, so its map is measured.
+
+**Re-estimate for the rest: 3-5 weeks.**
+- The E1 data mover with NoC hops: about 1-2 weeks. The NIU request initiators
+  are the new surface.
+- The link API and `bh_x4`: about 1 week.
+- `N`-split sharding with the golden loss curve as the oracle: about 1-2 weeks.
+
+That is down from 6-10 weeks, because the Overlay and E0 branches were not
+taken.
+
+#### As built (2026-09-30)
+
+* **No firmware is needed for the first byte.** Ethernet TX-queue registers are
+  NoC-visible, so the host can drive a TT-link L1 write through a TLB window.
+  Every link was proven this way before any E1 code existed
+  (`silicon_eth_link::host_driven_*`).
+* **E1 runs a data mover** (`eth_e1`, contract in `tt_isa::eth::mover`):
+  1. It pulls from a Tensix tile with the NIU request initiator. That is the
+     first device-initiated NoC traffic in this workspace, built by
+     `tt_isa::noc::niu::Command`, which cannot express the NoC hazards.
+  2. It TT-link-writes the data and then a record to the partner.
+  3. On seeing the record, the partner waits for its RX queue's outstanding
+     writes to reach zero, then NoC-writes the data into its own Tensix tile.
+     TT-link delivers a queue's packets in order, but nothing documented orders
+     their L1 commits, so the record alone is not proof the data has landed.
+     (The first version checksummed the whole buffer on both ends instead, which
+     cost ~3.75 us/KiB.)
+  4. The partner acknowledges back over the link, so the host waits on the
+     sending chip only.
+* **Sharding is along `N` with `K` whole** (`tt_kernels::shard::Fabric`), so the
+  sharded product is bit-identical to one chip's. The reduced MNIST run therefore
+  reproduces the Phase 7 golden bit for bit, on 2 and 4 simulated chips and on
+  the two cabled cards.
+  * The data plane is Ethernet only. Operands enter and results leave through
+    chip 0, relayed through intermediate chips on the `bh_x4` ring.
+  * The control plane is each chip's own PCIe: programs, starts, mover
+    descriptors.
+* **One Burn device.** `burn_tt::MeshEngine` puts a whole fabric behind the
+  existing `Engine` trait. The plan's `attach_mesh` was unnecessary: `attach`
+  already runs its factory on the server thread, which can own every chip.
+* **What E1 buys today, measured** (`silicon_eth_bench`, throwaway; medians of
+  20, card 0 to card 1, 128 KiB):
+
+  | Path | Time | Throughput |
+  |---|---|---|
+  | Host writes chip 1's Tensix L1 over PCIe (TLB window) | 7.2 ms | 18 MB/s (reads: 5 MB/s) |
+  | Mover, first version (whole-buffer checksum on both ends) | 669 us | 196 MB/s |
+  | Host drives TT-link itself, 4 KiB commands | 168 us | 0.78 GB/s |
+  | Host drives TT-link itself, one 128 KiB command | 14.4 us | 9.1 GB/s |
+  | Mover, landing wait instead of checksum, staged -> landed | 11.5 us | 11.4 GB/s |
+  | Mover, Tensix -> Tensix across cards | 14.0 us | 9.4 GB/s |
+
+  So the Ethernet path is already *faster* than PCIe for moving tensor data,
+  by about 500x. That reverses what this section said before measuring. The
+  fixed ~9 us floor is the host polling the ack over PCIe. The host-driven
+  rows are bound by the host's per-command register writes; the mover issues
+  its 4 KiB commands locally, so command size no longer matters to it. The
+  PCIe figure is the bigger story: the TLB-window path is uncached MMIO, and
+  it is very probably most of Phase 7's ~435 ms per training step. The
+  mover's other payoffs still stand: chips reachable only over Ethernet
+  (Galaxy-style), device-resident pipelines where one chip's output feeds
+  another's next op with no host round trip (Phase 9), and link bandwidth
+  that does not compete with PCIe.
+* **Posted writes race other agents** (found by the benchmark, not the link).
+  `Device::write` returns while its writes are still in flight, so anything
+  other than the host -- E1, the RX queue of a link -- can see stale bytes in
+  L1 the host just wrote. A zero-fill racing an incoming transfer lost the
+  transfer's tail 57 times in 480, and 0 in 480 once the fill was read back.
+  `Mover::stage` now reads its last word back before returning, and the
+  silicon gates fence what they stage. A general `Device` fence is open.
+* **Not done, deliberately.**
+  * Data-parallel training: an all-reduce reorders sums, so it needs a weaker
+    claim than the golden.
+  * Faster PCIe staging and double-buffered, multi-link Ethernet: Phase 9.
+
 ### Phase 9 — Performance (open-ended, **silicon-only**)
 
 `MOP`/`REPLAY` expansion, three-thread pipelining (unpack on T0, math on T1, pack on T2),

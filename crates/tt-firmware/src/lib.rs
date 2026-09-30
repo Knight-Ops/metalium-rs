@@ -92,10 +92,25 @@ pub unsafe fn l1_read32(offset: u64) -> u32 {
     unsafe { read_volatile(offset as *const u32) }
 }
 
+extern "C" {
+    /// Where this image's mailbox is, set per binary by `build.rs` from
+    /// `tt_isa::mailbox::MAILBOX_BASE` (Tensix) or `tt_isa::eth::MAILBOX_BASE`
+    /// (Ethernet) -- generated, so the host and the image cannot disagree. Only its
+    /// address means anything.
+    static __mailbox: u8;
+}
+
+/// The address of mailbox word `offset` (one of `tt_isa::mailbox::offset`).
+#[inline]
+pub fn mailbox_word(offset: u64) -> u64 {
+    // Taking the address of a linker-defined symbol reads nothing.
+    (core::ptr::addr_of!(__mailbox) as u64) + offset
+}
+
 /// Publish a status word, ensuring it is visible to the host.
 pub fn set_status(value: u32) {
     // SAFETY: the mailbox is a fixed, aligned location inside L1.
-    unsafe { l1_write32(mailbox::STATUS, value) };
+    unsafe { l1_write32(mailbox_word(mailbox::offset::STATUS), value) };
     publish();
 }
 
@@ -115,7 +130,7 @@ pub fn publish() {
 /// Publish a result and mark the firmware finished.
 pub fn finish(result: u32) {
     // SAFETY: fixed aligned mailbox locations.
-    unsafe { l1_write32(mailbox::RESULT, result) };
+    unsafe { l1_write32(mailbox_word(mailbox::offset::RESULT), result) };
     set_status(status::DONE);
 }
 
@@ -123,8 +138,8 @@ pub fn finish(result: u32) {
 pub fn fail(code: u32) -> ! {
     // SAFETY: fixed aligned mailbox locations.
     unsafe {
-        l1_write32(mailbox::PANIC_CODE, code);
-        l1_write32(mailbox::STATUS, status::PANICKED);
+        l1_write32(mailbox_word(mailbox::offset::PANIC_CODE), code);
+        l1_write32(mailbox_word(mailbox::offset::STATUS), status::PANICKED);
     }
     publish();
     spin()
@@ -155,7 +170,11 @@ fn panic(info: &PanicInfo) -> ! {
     // implementation and several KiB of code, on a core with 4 KiB of stack. The
     // panic *location* is what debugging actually needs, and the code below stands
     // in for it until there is a reason to carry more.
-    let code = if info.location().is_some() { panic_code::EXPLICIT } else { panic_code::ARITHMETIC };
+    let code = if info.location().is_some() {
+        panic_code::EXPLICIT
+    } else {
+        panic_code::ARITHMETIC
+    };
     fail(code)
 }
 
@@ -379,5 +398,45 @@ pub mod cfg {
         } else {
             ConfigBank::Bank1
         }
+    }
+}
+
+/// Issuing NoC requests from this core, through NIU #0's request initiator 0.
+pub mod noc {
+    use core::ptr::{read_volatile, write_volatile};
+    use tt_isa::noc::niu::{self, initiator, Command, RequestError, TxnId};
+
+    const INIT: u64 = niu::NOC0_BASE;
+
+    fn reg(off: u64) -> *mut u32 {
+        (INIT + off) as *mut u32
+    }
+
+    /// Issue `cmd` from this tile, at raw coordinate `me`, under `txn`.
+    ///
+    /// Waits for the initiator to be free first (`MemoryMap.md`, `NOC_CMD_CTRL`:
+    /// software must not touch it while the low bit reads 1), and reads
+    /// `CMD_CTRL` back afterwards so a later counter read cannot overtake the
+    /// issue (`Counters.md:42-43`).
+    pub fn issue(cmd: &Command, me: (u8, u8), txn: TxnId) -> Result<(), RequestError> {
+        let regs = cmd.registers(me, txn)?;
+        // SAFETY: NIU #0's initiator registers are MMIO in every Tensix and
+        // Ethernet tile, and these offsets are inside initiator 0.
+        unsafe {
+            while read_volatile(reg(initiator::CMD_CTRL)) & 1 != 0 {}
+            for (off, value) in regs {
+                write_volatile(reg(off), value);
+            }
+            write_volatile(reg(initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(initiator::CMD_CTRL));
+        }
+        Ok(())
+    }
+
+    /// Wait until every response-marked request issued under `txn` has
+    /// completed.
+    pub fn wait(txn: TxnId) {
+        // SAFETY: a read-only NIU counter.
+        unsafe { while read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) & 0xFF != 0 {} }
     }
 }

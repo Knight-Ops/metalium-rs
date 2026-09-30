@@ -21,6 +21,7 @@ const BINARIES: &[&str] = &[
     "role_t0",
     "role_t1",
     "role_t2",
+    "eth_e1",
 ];
 
 const TARGET: &str = "riscv32im-unknown-none-elf";

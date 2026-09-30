@@ -9,6 +9,8 @@ pub mod backend;
 pub mod burn_device;
 pub mod harness;
 pub mod mnist;
+#[cfg(not(feature = "silicon"))]
+pub mod topology;
 
 /// The kernels moved to `tt-kernels`, which ships; re-exported so the gates
 /// that established them still read `tt_tests::datapath`.

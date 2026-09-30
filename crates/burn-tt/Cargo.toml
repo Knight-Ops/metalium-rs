@@ -13,6 +13,7 @@ license.workspace = true
 burn-backend.workspace = true
 burn-flex.workspace = true
 tt-device.workspace = true
+tt-isa.workspace = true
 tt-kernels.workspace = true
 tt-kmd.workspace = true
 tt-firmware-images.workspace = true

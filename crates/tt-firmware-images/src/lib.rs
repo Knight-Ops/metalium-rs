@@ -54,8 +54,11 @@ pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
 /// (divergence row 45).
 pub const CORPUS_T0: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
 
+/// The Ethernet-tile image, for RISCV E1, loaded at `tt_isa::eth::E1_IMAGE`.
+pub const ETH_E1: &[u8] = include_bytes!(env!("FIRMWARE_ETH_E1"));
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 7] = [
+const ENTRIES: [(&str, &str); 8] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -63,6 +66,7 @@ const ENTRIES: [(&str, &str); 7] = [
     ("role_t0", env!("FIRMWARE_ROLE_T0_ENTRY")),
     ("role_t1", env!("FIRMWARE_ROLE_T1_ENTRY")),
     ("role_t2", env!("FIRMWARE_ROLE_T2_ENTRY")),
+    ("eth_e1", env!("FIRMWARE_ETH_E1_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -98,5 +102,15 @@ mod tests {
         for name in ["heartbeat", "sfpu_mul", "corpus", "corpus_t0"] {
             assert_eq!(entry(name).map(u64::from), Some(LOAD_ADDRESS), "{name}");
         }
+    }
+
+    /// `link_e1.x` spells `E1_IMAGE` as a number; this is what holds it to it, and
+    /// to the firmware-owned L1 the image must stay out of.
+    #[test]
+    fn the_ethernet_image_is_linked_where_it_is_loaded() {
+        use tt_isa::eth;
+        assert_eq!(entry("eth_e1").map(u64::from), Some(eth::E1_IMAGE));
+        assert!(ETH_E1.len() as u64 <= eth::E1_IMAGE_MAX);
+        assert!(eth::is_customer_l1(eth::E1_IMAGE, eth::E1_IMAGE_MAX));
     }
 }

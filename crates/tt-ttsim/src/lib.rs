@@ -59,6 +59,9 @@ pub const LIB_PATH_ENV: &str = "TT_TTSIM_LIB";
 /// gate is checked for vacuity without editing any code.
 pub const LIB_PATH_ENV_X2: &str = "TT_TTSIM_LIB_X2";
 
+/// Overrides [`x4_lib_path`], as [`LIB_PATH_ENV_X2`] does for the dual-chip build.
+pub const LIB_PATH_ENV_X4: &str = "TT_TTSIM_LIB_X4";
+
 #[derive(Debug)]
 pub enum OpenError {
     /// [`Simulator::open`] was already called in this process.
@@ -386,6 +389,14 @@ pub fn x2_lib_path() -> PathBuf {
     match std::env::var_os(LIB_PATH_ENV_X2) {
         Some(p) => PathBuf::from(p),
         None => workspace_root().join("vendor").join("libttsim_bh_x2.so"),
+    }
+}
+
+/// The four-chip build (two P300s), overridable with [`LIB_PATH_ENV_X4`].
+pub fn x4_lib_path() -> PathBuf {
+    match std::env::var_os(LIB_PATH_ENV_X4) {
+        Some(p) => PathBuf::from(p),
+        None => workspace_root().join("vendor").join("libttsim_bh_x4.so"),
     }
 }
 

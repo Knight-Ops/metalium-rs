@@ -27,7 +27,10 @@ mod ops;
 mod server;
 mod tensor;
 
-pub use server::{attach, kmd_engine, AttachGuard, Engine, EngineError, KmdEngine, Serve};
+pub use server::{
+    attach, kmd_engine, kmd_mesh_engine, AttachGuard, Engine, EngineError, KmdEngine, MeshEngine,
+    Serve,
+};
 pub use tensor::{TtQTensor, TtTensor};
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;

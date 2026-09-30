@@ -632,6 +632,7 @@ dependencies = [
  "burn-tensor",
  "tt-device",
  "tt-firmware-images",
+ "tt-isa",
  "tt-kernels",
  "tt-kmd",
 ]
