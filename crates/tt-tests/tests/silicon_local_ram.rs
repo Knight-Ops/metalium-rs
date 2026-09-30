@@ -184,7 +184,7 @@ fn l2_disable_reset_round_trips() {
 /// Staged with the core parked, then put through reset and released again, and
 /// read only afterwards -- nothing touches the RAM while the core is held. The
 /// accessors wait out the zeroing before reading. The `pc` snapshot confirms T0
-/// is back in the loop, exactly, not merely somewhere.
+/// is back in the loop: its address or the word after, never anywhere else.
 #[test]
 fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
     assert_on_silicon();
@@ -210,13 +210,22 @@ fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
                 dev.set_core_reset(&w, tile, core, false).unwrap();
 
                 let (kept, zero) = census(dev, &w, tile, core);
-                let pc = dev.read_pc_snapshot(&w, tile, core).unwrap();
-                measure(&format!("zeroing.{label}.pc"), format!("{pc:#x}"));
+                // Speculative (`BabyRISCV/README.md:163-173`): the first silicon
+                // run of a `j .` read loop + 4, the sequential fetch past the jump,
+                // so the snapshot names the loop or the word after it, nothing else.
+                let pcs: std::collections::BTreeSet<u32> = (0..16)
+                    .map(|_| dev.read_pc_snapshot(&w, tile, core).unwrap())
+                    .collect();
+                measure(&format!("zeroing.{label}.pc_samples"), format!("{pcs:#x?}"));
                 measure(
                     &format!("zeroing.{label}"),
                     format!("kept {kept}, zero {zero}, of {words}"),
                 );
-                assert_eq!(pc, LOOP_ADDR as u32, "T0 is not running the loop");
+                let lo = LOOP_ADDR as u32;
+                assert!(
+                    pcs.iter().all(|&pc| pc == lo || pc == lo + 4),
+                    "T0 is not running the loop at {lo:#x}: pc snapshots {pcs:#x?}"
+                );
                 if disable {
                     assert_eq!(
                         kept, words,

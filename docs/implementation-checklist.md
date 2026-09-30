@@ -399,6 +399,24 @@ misattribution.
       for the first time: heartbeat, held-in-reset control, reset round trip,
       `pc` snapshot inside the image, two tiles (the far one now taken from the
       grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
+- [x] **The slow-path local-RAM aperture took the host down** -- because it was accessed
+      with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
+      notes) and **confirmed on both cards**: `silicon_local_ram` 4/4 on each. With cores
+      parked, all five RAMs round-trip in full through the aperture with no aliasing
+      (B/NC 2048 words, T0/T1/T2 1024); `DISABLE_RESET` reads back; releasing T0 with its
+      bit clear zeroes all 1024 words, and with it set keeps all 1024 -- the documented
+      behaviour, observed for the first time (open question 6, zeroing half). The `pc`
+      snapshot of a `j .` loop samples as the loop address *and* loop + 4, which is what
+      "speculative" means in practice.
+- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
+      registers. The test is written and `#[cfg(feature = "silicon")]`.
+- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
+      sequencing, I-cache invalidation and the local-RAM zeroing window are all
+      things a simulator may model loosely, and all three land here.
+      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
+      for the first time: heartbeat, held-in-reset control, reset round trip,
+      `pc` snapshot inside the image, two tiles (the far one now taken from the
+      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
 - [~] **The slow-path local-RAM aperture took the host down** -- because it was accessed
       with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
       notes). `silicon_local_ram` now parks each core first; `l0_one_word_on_a_parked_core`
