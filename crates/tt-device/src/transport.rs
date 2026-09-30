@@ -107,6 +107,9 @@ pub enum TransportError {
     NotBlackhole { vendor: u16, device: u16 },
     /// An implementation-specific failure (an ioctl, a missing device node).
     Io(std::io::Error),
+    /// The access is addressable but is known to hang or corrupt the chip in the
+    /// current state, so it was refused before reaching the transport.
+    Hazard { address: u64, reason: &'static str },
 }
 
 impl fmt::Display for TransportError {
@@ -132,6 +135,9 @@ impl fmt::Display for TransportError {
                  found {vendor:#06x}:{device:#06x}"
             ),
             TransportError::Io(e) => write!(f, "{e}"),
+            TransportError::Hazard { address, reason } => {
+                write!(f, "refused access at {address:#x}: {reason}")
+            }
         }
     }
 }
@@ -179,6 +185,17 @@ pub trait Transport {
     /// above the trait can be written once. The cost is one no-op call per poll on
     /// silicon; the alternative is teaching every caller about the simulator.
     fn tick(&mut self, n: u32);
+
+    /// Does time stand still between calls to [`tick`](Transport::tick)?
+    ///
+    /// Decides what a poll loop's budget means. On the simulator it is simulated
+    /// cycles, which only `tick` spends. On silicon `tick` is a no-op, so a
+    /// budget counted in ticks would be a *poll count* with no bound in time --
+    /// fast MMIO makes it expire early, a slow one makes it wait arbitrarily --
+    /// and the loop needs a wall clock instead.
+    ///
+    /// Required rather than defaulted: each transport has to say which it is.
+    fn is_simulated(&self) -> bool;
 
     /// Read a single dword from a BAR.
     fn bar_read32(&mut self, bar: Bar, offset: u64) -> Result<u32> {

@@ -12,6 +12,9 @@
 //! every body forks, so the process-wide `Simulator` singleton is not a conflict:
 //! this file's children load the dual-chip build and nothing else does.
 
+// Drives the dual-chip simulator directly. The two-card silicon counterpart is `silicon_two_cards.rs`.
+#![cfg(not(feature = "silicon"))]
+
 use tt_device::{tlb::WindowKind, Bar, Device, Transport, Window};
 use tt_isa::noc::{grid, ChipId, Noc0, NocCoord};
 use tt_ttsim::{chip_bar_base, chip_bdf, fork_scope, Simulator};

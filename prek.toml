@@ -19,6 +19,7 @@ repo = "local"
 hooks = [
     { id = "cargo-fmt", name = "cargo fmt", entry = "cargo fmt --all --check", language = "system", types = ["rust"], pass_filenames = false },
     { id = "cargo-clippy", name = "cargo clippy", entry = "cargo clippy --workspace --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "cargo-clippy-silicon", name = "cargo clippy (silicon build)", entry = "cargo clippy --workspace --all-targets --features tt-tests/silicon -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
 
     # The firmware is a separate workspace targeting riscv32im, so the host
     # workspace's clippy never sees it. `--bins --lib` rather than

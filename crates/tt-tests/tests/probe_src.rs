@@ -12,6 +12,10 @@
 //! Run with:
 //! `cargo test -p tt-tests --test probe_src -- --ignored --nocapture`
 
+// The surveys and refusal probes are simulator-only, so their helpers are dead in
+// the silicon build.
+#![cfg_attr(feature = "silicon", allow(dead_code, unused_imports))]
+
 use tt_isa::backend;
 use tt_isa::cfg::generated::{ALL_CONFIG_FIELDS, ALL_THREAD_CONFIG_FIELDS};
 use tt_isa::isa::Instruction;
@@ -78,6 +82,8 @@ fn verdict(zero: bool, one: bool) -> &'static str {
     }
 }
 
+// Writes configuration fields blind at zero and one; simulator only.
+#[cfg(not(feature = "silicon"))]
 #[test]
 #[ignore]
 fn map_the_src_path_configuration_surface() {
@@ -131,28 +137,6 @@ const ROW: usize = 16;
 /// Datums staged by the gates: two `Src` rows.
 const N: usize = 32;
 
-/// The `UNP[n]_ADDR_BASE_REG_1_Base` ttsim holds, **in bytes**, on both unpackers.
-///
-/// Divergence row 30 found this for unpacker 0 on the `Dst` path as "four datums".
-/// The `Src` path pins what it is: with a 32-bit `Src` format the first datum lands
-/// four columns in, and with a 16-bit one it lands **eight** in, which is exactly a
-/// 16-byte base after `OutAddr >>= 2` or `>>= 1` (`UNPACR_Regular.md:258-264`).
-///
-/// **The width is the *input* format's, not the output's.** FP32 staged in L1
-/// and converted to BF16 lands four in; BF16 staged as BF16 lands eight in. The
-/// specification shifts by `OutDataFormat`, so this is part of the same divergence.
-///
-/// On the `SrcA` path this should not appear at all: with `UnpackToDst` clear,
-/// `REG5_Dest_cntx0_address` *replaces* `OutAddr` rather than adding to it
-/// (`UNPACR_Regular.md:265-270`). ttsim adds it regardless; divergence row 35.
-const HIDDEN_BASE_BYTES: usize = 16;
-
-/// How many leading `Src` positions no datum reaches, for an L1 input format of
-/// `in_bytes` bytes per datum.
-const fn hidden_datums(in_bytes: usize) -> usize {
-    HIDDEN_BASE_BYTES / in_bytes
-}
-
 const FP32_CODE: u32 = 0;
 const TF32_CODE: u32 = 4;
 const BF16_CODE: u32 = 5;
@@ -178,24 +162,37 @@ fn stage(format: L1Format, code: u32, datums: &[u32]) -> Vec<u8> {
 }
 
 /// Configure, unpack `N` datums into `unpacker`'s `Src`, hand the bank to the
-/// Matrix Unit, and move `Src` rows 0..8 into `Dst` rows 0..8.
-fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<Instruction> {
-    let mut p = src_thread_config();
+/// Matrix Unit, and move `Src` rows 0..8 into `Dst` rows 0..8 -- split the way
+/// LLK splits it (`harness::Roles`): the unpack on thread 0, the move on thread 1.
+fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> SrcProgram {
+    src_program_of(unpacker, in_code, out, flip, N)
+}
+
+/// [`src_program`] unpacking `n` datums rather than [`N`].
+fn src_program_of(unpacker: Unpacker, in_code: u32, out: u32, flip: bool, n: usize) -> SrcProgram {
+    let mut unpack = src_thread_config();
     let mut words = ConfigWords::new();
-    let descriptor = flat_descriptor(N as u32).with_in_data_format_raw(in_code);
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(in_code);
     unpack_src_config(&mut words, unpacker, descriptor, STAGE, out);
     words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
-    let mut buf = [sfpu::nop(); 64];
+    let mut buf = vec![sfpu::nop(); words.program_len()];
     let k = words.program(GPR, &mut buf).unwrap();
-    p.extend_from_slice(&buf[..k]);
-    p.push(set_adc_x(unpacker, 0, N as u32 - 1));
-    p.push(unpack_src_instruction(unpacker, flip));
+    unpack.extend_from_slice(&buf[..k]);
+    unpack.push(set_adc_x(unpacker, 0, n as u32 - 1));
+    unpack.push(unpack_src_instruction(unpacker, flip));
+    unpack.push(match unpacker {
+        Unpacker::SrcA => backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap(),
+        Unpacker::SrcB => backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap(),
+    });
+
+    // The Matrix Unit waits for the bank by itself (`MOVA2D.md`: the Wait Gate
+    // holds it until `AllowedClient == MatrixUnit`).
+    let mut math = vec![tt_tests::datapath::state_id()];
     match unpacker {
         Unpacker::SrcA => {
-            p.push(backend::wait_for_unpacker0().unwrap());
             // ttsim implements only the eight-row form (`tensix_mova2d:
             // instr_mod=0` is `UnsupportedFunctionality`).
-            p.push(
+            math.push(
                 encode::Mova2D::ZERO
                     .move8_rows(1)
                     .src_row(0)
@@ -205,43 +202,64 @@ fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<In
             );
         }
         Unpacker::SrcB => {
-            p.push(backend::wait_for_unpacker1().unwrap());
             for r in 0..8 {
-                p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                math.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
             }
         }
     }
-    p.push(backend::wait_for_matrix().unwrap());
-    p
+    math.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+    SrcProgram { unpack, math }
+}
+
+/// The two role programs of a `Src` probe.
+struct SrcProgram {
+    unpack: Vec<Instruction>,
+    math: Vec<Instruction>,
 }
 
 /// Run and return `Dst` rows 0..8, flattened.
-fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &[Instruction]) -> Vec<u32> {
-    let out = harness::run(
-        dev,
-        &Run::new(program).stage(&[(STAGE, staged)]).dump_rows(8),
-    );
-    (0..8 * ROW).map(|f| out.dst_at(f / ROW, f % ROW)).collect()
+fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &SrcProgram) -> Vec<u32> {
+    run_src_rows(dev, staged, program, 8)
 }
 
-/// Assert that staged datum `i` landed at flat `Src` position `hidden + i`, as
-/// `expect(i)`, for every datum that lands.
+/// [`run_src`], returning `Dst` rows 0..`rows`.
+fn run_src_rows(
+    dev: &mut harness::Dev<'_>,
+    staged: &[u8],
+    program: &SrcProgram,
+    rows: usize,
+) -> Vec<u32> {
+    let roles = harness::Roles {
+        unpack: &program.unpack,
+        math: &program.math,
+        pack: &[],
+    };
+    let out = harness::run(
+        dev,
+        &Run::roles(roles)
+            .stage(&[(STAGE, staged)])
+            .dump_rows(rows as u32),
+    );
+    (0..rows * ROW)
+        .map(|f| out.dst_at(f / ROW, f % ROW))
+        .collect()
+}
+
+/// Assert that every staged datum `i` landed at flat `Src` position `i`, as
+/// `expect(i)`.
 ///
-/// The last `hidden` staged datums do not land -- the write stops at `OutAddr = N`
-/// rather than running `N` datums, as row 30 found for `Dst` -- and the first
-/// `hidden` positions are reached by nothing, so hold `Src`'s undefined contents
-/// and are not asserted.
-fn assert_landed(dst: &[u32], in_bytes: usize, expect: impl Fn(usize) -> u32) {
-    let hidden = hidden_datums(in_bytes);
-    for i in 0..N - hidden {
-        let got = dst[hidden + i];
+/// There was once a leading offset here -- four datums for a 4-byte input, eight
+/// for a 2-byte one -- with as many dropped from the end, recorded as divergence
+/// row 35. It was the unpacker reading our tile header as datums, because
+/// `REG3_Base_address` pointed one unit early (`datapath::tile_base_units`).
+fn assert_landed(dst: &[u32], expect: impl Fn(usize) -> u32) {
+    for (i, &got) in dst.iter().enumerate().take(N) {
         assert_eq!(
             got,
             expect(i),
-            "staged datum {i} should be at Src flat {} (row {}, col {}); got {got:08x}",
-            hidden + i,
-            (hidden + i) / ROW,
-            (hidden + i) % ROW,
+            "staged datum {i} should be at Src flat {i} (row {}, col {}); got {got:08x}",
+            i / ROW,
+            i % ROW,
         );
     }
 }
@@ -253,9 +271,9 @@ fn fp32_unpacks_into_srca_as_truncated_tf32() {
     let program = src_program(Unpacker::SrcA, FP32_CODE, TF32_CODE, true);
     harness::in_device(|dev| {
         let dst = run_src(dev, &staged, &program);
-        assert_landed(&dst, 4, |i| fp32_to_tf32(bits[i]));
+        assert_landed(&dst, |i| fp32_to_tf32(bits[i]));
         // And the truncation is real: the staged bits differ from what landed.
-        assert_ne!(dst[hidden_datums(4)], bits[0]);
+        assert_ne!(dst[0], bits[0]);
     });
 }
 
@@ -266,7 +284,7 @@ fn fp32_unpacks_into_srcb_as_truncated_tf32() {
     let program = src_program(Unpacker::SrcB, FP32_CODE, TF32_CODE, true);
     harness::in_device(|dev| {
         let dst = run_src(dev, &staged, &program);
-        assert_landed(&dst, 4, |i| fp32_to_tf32(bits[i]));
+        assert_landed(&dst, |i| fp32_to_tf32(bits[i]));
     });
 }
 
@@ -280,7 +298,7 @@ fn fp32_unpacks_into_src_as_truncated_bf16() {
         let program = src_program(unpacker, FP32_CODE, BF16_CODE, true);
         harness::in_device(|dev| {
             let dst = run_src(dev, &staged, &program);
-            assert_landed(&dst, 4, |i| bf16_to_fp32(fp32_to_bf16_truncate(bits[i])));
+            assert_landed(&dst, |i| bf16_to_fp32(fp32_to_bf16_truncate(bits[i])));
         });
     }
 }
@@ -298,7 +316,7 @@ fn bf16_in_l1_unpacks_into_src_unchanged() {
         let program = src_program(unpacker, BF16_CODE, BF16_CODE, true);
         harness::in_device(|dev| {
             let dst = run_src(dev, &staged, &program);
-            assert_landed(&dst, 2, |i| bf16_to_fp32(halves[i] as u16));
+            assert_landed(&dst, |i| bf16_to_fp32(halves[i] as u16));
         });
     }
 }
@@ -306,6 +324,8 @@ fn bf16_in_l1_unpacks_into_src_unchanged() {
 /// `UNPACR_Regular.md:580`: FP32 into `Src` is `UndefinedBehavior`, because a
 /// 19-bit slot cannot hold it. ttsim refuses it; the control with `TF32` out and
 /// everything else identical survives, so the refusal is about the format.
+// `UndefinedBehavior` per `UNPACR_Regular.md:580`; never executed on silicon.
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn fp32_into_src_is_refused() {
     let staged = stage(L1Format::Fp32, FP32_CODE, &operand_bits());
@@ -357,52 +377,176 @@ fn a_corrupted_datum_moves_exactly_one_src_element() {
     let a = dump(&bits);
     let b = dump(&corrupted);
     let differ: Vec<usize> = (0..a.len()).filter(|&f| a[f] != b[f]).collect();
-    assert_eq!(differ, vec![hidden_datums(4) + 7]);
+    assert_eq!(differ, vec![7]);
 }
 
-/// The specification's answer, which ttsim contradicts (row 35): with `UnpackToDst`
-/// clear, `Dest_cntx0` *replaces* `OutAddr`, so the first datum lands at column 0
-/// and all `N` land. A failure here says the hidden base is real hardware, not a
-/// simulator artefact -- a finding either way, and it decides whether the
-/// correction in `assert_landed` survives past the simulator.
+/// `MOVB2D`'s four-row mode is bit 13 on Blackhole, not the Wormhole diagram's
+/// bit 14 -- which on Blackhole is `AddrMod` bit 0 (row 38, which this refutes).
+/// LLK's `MOV_4_ROWS` is `instr_mod` 4 at bit 11.
+///
+/// Four full `Src` rows are staged, so the measured encoding must move exactly
+/// rows 0..4 -- and leave rows 4..8 of the cleared `Dst` alone -- while the
+/// Wormhole encoding of the same request moves row 0 only.
 #[test]
-#[cfg(feature = "silicon")]
-fn on_silicon_srca_has_no_hidden_base() {
-    let bits = operand_bits();
+fn movb2d_move4_rows_is_bit_13_on_blackhole() {
+    let blackhole = encode::Movb2D::ZERO.move4_rows(1).encode().unwrap().word();
+    let wormhole = encode::wormhole::Movb2D::ZERO
+        .move4_rows(1)
+        .encode()
+        .unwrap()
+        .word();
+    assert_eq!(blackhole & 0x00ff_ffff, 1 << 13, "the measured layout");
+    assert_eq!(wormhole & 0x00ff_ffff, 1 << 14, "the Wormhole diagram");
+
+    let n = 4 * ROW;
+    let bits: Vec<u32> = (0..n)
+        .map(|i| (1.0f32 + i as f32).to_bits() | 0x3FFF)
+        .collect();
     let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
-    let program = src_program(Unpacker::SrcA, FP32_CODE, TF32_CODE, true);
-    harness::in_device(|dev| {
-        let dst = run_src(dev, &staged, &program);
-        for (i, b) in bits.iter().enumerate() {
-            assert_eq!(dst[i], fp32_to_tf32(*b), "datum {i}");
+    // `in_device` forks on the simulator, so `check` runs inside it.
+    let run = |move_bits: u32, check: &dyn Fn(&[u32])| {
+        let mut program = src_program_of(Unpacker::SrcB, FP32_CODE, TF32_CODE, true, n);
+        program.math.retain(|i| i.def().mnemonic() != "MOVB2D");
+        let wait = program.math.pop().unwrap();
+        let i = encode::Movb2D::ZERO.encode().unwrap();
+        program
+            .math
+            .push(Instruction::new(i.word() | move_bits, i.def()));
+        program.math.push(wait);
+        harness::in_device(|dev| check(&run_src(dev, &staged, &program)));
+    };
+    let expect = |rows: usize, what: &str, dst: &[u32]| {
+        assert_eq!(dst.len(), 8 * ROW);
+        for (f, &got) in dst.iter().enumerate() {
+            let want = if f < rows * ROW {
+                fp32_to_tf32(bits[f])
+            } else {
+                0
+            };
+            assert_eq!(got, want, "{what}: Dst row {}, col {}", f / ROW, f % ROW);
         }
+    };
+
+    run(blackhole & 0x00ff_ffff, &|dst| {
+        expect(4, "measured Move4Rows", dst)
+    });
+
+    // The Wormhole bit is a one-row move with address modifier 1, whose entry
+    // the thread-state reset left zero: row 0 and nothing else.
+    run(wormhole & 0x00ff_ffff, &|dst| {
+        expect(1, "Wormhole bit 14", dst)
     });
 }
 
-/// `MOVB2D.md` says `Move4Rows` moves four rows; ttsim moves one, silently (row
-/// 38). The silicon gate asserts the documented four.
+/// `MOVA2D`'s and `MOVB2D`'s `AddrMod` sit at bits 14..16 on Blackhole, one bit
+/// lower than the Wormhole diagrams draw them -- as `MVMUL`'s do (row 42), and as
+/// LLK's `addr_mode << 14` has them.
+///
+/// Entry 1 advances `Dst` by `STEP` rows and entry 2 advances nothing. Two moves
+/// that each carry `addr_mod(1)`: with the measured encoding the second lands
+/// `STEP` rows below the first; with the Wormhole encoding (modifier 2) both land
+/// on the same rows.
 #[test]
-#[cfg(feature = "silicon")]
-fn on_silicon_movb2d_move4_rows_moves_four() {
+fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
+    use tt_tests::datapath::{addr_mod_entry, thread_entry};
+
+    let a_bh = encode::Mova2D::ZERO.addr_mod(1).encode().unwrap().word();
+    let a_wh = encode::wormhole::Mova2D::ZERO
+        .addr_mod(1)
+        .encode()
+        .unwrap()
+        .word();
+    let b_bh = encode::Movb2D::ZERO.addr_mod(1).encode().unwrap().word();
+    let b_wh = encode::wormhole::Movb2D::ZERO
+        .addr_mod(1)
+        .encode()
+        .unwrap()
+        .word();
+    // Entry 4: the third `AddrMod` bit, which the Wormhole diagram does not have.
+    let a_bh4 = encode::Mova2D::ZERO.addr_mod(4).encode().unwrap().word();
+    let b_bh4 = encode::Movb2D::ZERO.addr_mod(4).encode().unwrap().word();
+    for (name, bh, bh4, wh) in [("MOVA2D", a_bh, a_bh4, a_wh), ("MOVB2D", b_bh, b_bh4, b_wh)] {
+        assert_eq!(bh & 0x00ff_ffff, 1 << 14, "{name}: the measured layout");
+        assert_eq!(bh4 & 0x00ff_ffff, 1 << 16, "{name}: the measured third bit");
+        assert_eq!(wh & 0x00ff_ffff, 1 << 15, "{name}: the Wormhole diagram");
+    }
+
     let bits = operand_bits();
     let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
-    let mut program = src_program(Unpacker::SrcB, FP32_CODE, TF32_CODE, true);
-    // Replace the single-row moves with one four-row move of rows 0..4.
-    program.retain(|i| i.def().mnemonic() != "MOVB2D");
-    let wait = program.pop().unwrap();
-    program.push(
-        encode::Movb2D::ZERO
-            .move4_rows(1)
-            .src_row(0)
-            .dst_row(0)
-            .encode()
-            .unwrap(),
-    );
-    program.push(wait);
-    harness::in_device(|dev| {
-        let dst = run_src(dev, &staged, &program);
-        // Row 1 is fully written by the unpacker whatever the base turns out to
-        // be, so it tells four rows from one.
-        assert!(dst[ROW..2 * ROW].iter().all(|&v| v != 0));
+    // `unpacker`'s move of `Src` rows 0..rows, twice, each carrying `addr_mod_bits`.
+    // `in_device` forks on the simulator, so `check` runs inside it.
+    let run = |unpacker: Unpacker, step: u16, addr_mod_bits: u32, check: &dyn Fn(&[u32])| {
+        let mut program = src_program(unpacker, FP32_CODE, TF32_CODE, true);
+        let wait = program.math.pop().unwrap();
+        program.math.truncate(1); // keep `state_id`
+                                  // Entries 1 and 4 advance `Dst` by `step`; entry 2 by nothing.
+        for (entry, incr) in [(1, step), (2, 0), (4, step)] {
+            program
+                .math
+                .push(thread_entry(addr_mod_entry(entry).dst_incr, incr));
+        }
+        let one = match unpacker {
+            Unpacker::SrcA => encode::Mova2D::ZERO.move8_rows(1).encode().unwrap(),
+            Unpacker::SrcB => encode::Movb2D::ZERO.encode().unwrap(),
+        };
+        for _ in 0..2 {
+            program
+                .math
+                .push(Instruction::new(one.word() | addr_mod_bits, one.def()));
+        }
+        program.math.push(wait);
+        harness::in_device(|dev| check(&run_src_rows(dev, &staged, &program, 16)));
+    };
+    let row = |dst: &[u32], r: usize| dst[r * ROW..(r + 1) * ROW].to_vec();
+    let src_row = |r: usize| -> Vec<u32> {
+        (r * ROW..(r + 1) * ROW)
+            .map(|i| fp32_to_tf32(bits[i]))
+            .collect()
+    };
+    let zero = vec![0u32; ROW];
+
+    // MOVA2D moves eight rows; step 8 puts the second copy at rows 8..16.
+    for bits in [a_bh, a_bh4] {
+        run(Unpacker::SrcA, 8, bits & 0x00ff_ffff, &|dst| {
+            assert_eq!(row(dst, 0), src_row(0), "MOVA2D measured: first copy");
+            assert_eq!(
+                row(dst, 8),
+                src_row(0),
+                "MOVA2D measured: second copy, 8 rows down"
+            );
+            assert_eq!(
+                row(dst, 9),
+                src_row(1),
+                "MOVA2D measured: second copy, 8 rows down"
+            );
+        });
+    }
+    run(Unpacker::SrcA, 8, a_wh & 0x00ff_ffff, &|dst| {
+        assert_eq!(
+            row(dst, 0),
+            src_row(0),
+            "MOVA2D Wormhole: both copies on row 0"
+        );
+        assert_eq!(row(dst, 8), zero, "MOVA2D Wormhole: nothing 8 rows down");
+    });
+
+    // MOVB2D moves one row; step 4 puts the second at row 4.
+    for bits in [b_bh, b_bh4] {
+        run(Unpacker::SrcB, 4, bits & 0x00ff_ffff, &|dst| {
+            assert_eq!(row(dst, 0), src_row(0), "MOVB2D measured: first copy");
+            assert_eq!(
+                row(dst, 4),
+                src_row(0),
+                "MOVB2D measured: second copy, 4 rows down"
+            );
+        });
+    }
+    run(Unpacker::SrcB, 4, b_wh & 0x00ff_ffff, &|dst| {
+        assert_eq!(
+            row(dst, 0),
+            src_row(0),
+            "MOVB2D Wormhole: both copies on row 0"
+        );
+        assert_eq!(row(dst, 4), zero, "MOVB2D Wormhole: nothing 4 rows down");
     });
 }

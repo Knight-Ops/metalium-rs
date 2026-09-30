@@ -7,6 +7,7 @@ members = [
     "crates/tt-device",
     "crates/tt-kmd",
     "crates/tt-layout",
+    "crates/tt-kernels",
     "crates/tt-tests",
     "xtask",
 ]
@@ -26,5 +27,6 @@ tt-ttsim = { path = "crates/tt-ttsim" }
 tt-device = { path = "crates/tt-device" }
 tt-kmd = { path = "crates/tt-kmd" }
 tt-layout = { path = "crates/tt-layout" }
+tt-kernels = { path = "crates/tt-kernels" }
 libloading = "0.8"
 libc = "0.2"

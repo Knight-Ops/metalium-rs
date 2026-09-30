@@ -9,31 +9,12 @@
 //! the NoC, so the host can neither push the instructions nor read the answer — a
 //! baby RISC-V core has to sit in the middle.
 
-use tt_device::{core_control::WaitError, tlb::WindowKind, Device};
+use tt_device::{core_control::WaitError, tlb::WindowKind};
 use tt_isa::mailbox::{self, status};
 use tt_isa::noc::{grid, Noc0, NocCoord};
 use tt_isa::tensix::Core;
 use tt_tests::firmware;
-use tt_ttsim::{fork_scope, Simulator};
-
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-#[track_caller]
-fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-}
-
-fn tensix_tile(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix_geometry(x, y));
-    NocCoord::new(x, y).unwrap()
-}
+use tt_tests::harness::{in_device, tensix_grid, tile, Dev};
 
 const BUDGET: u64 = 400_000;
 
@@ -105,7 +86,8 @@ const SENTINEL: u32 = 0xDEAD_BEEF;
 #[test]
 fn sfpu_multiplies_three_by_two() {
     in_device(|dev| {
-        let result = multiply_on_device(dev, tensix_tile(3, 4), 3.0, 2.0);
+        let t = tile(dev, 3, 4);
+        let result = multiply_on_device(dev, t, 3.0, 2.0);
         assert_eq!(
             result,
             EXPECTED,
@@ -124,7 +106,8 @@ fn the_result_is_bit_exact_not_approximate() {
     // this area are wrong NaN canonicalisation and flushed denormals, both of
     // which survive an epsilon comparison.
     in_device(|dev| {
-        let result = multiply_on_device(dev, tensix_tile(5, 6), 3.0, 2.0);
+        let t = tile(dev, 5, 6);
+        let result = multiply_on_device(dev, t, 3.0, 2.0);
         assert_eq!(result, 3.0f32.mul_add(2.0, 0.0).to_bits());
         // 6.0 == 1.5 x 2^2, so the mantissa field is 0x400000 and the biased
         // exponent is 129. Spelled out field by field because a swizzle slip in
@@ -141,8 +124,12 @@ fn it_works_on_more_than_one_tile() {
     // Guards against the answer coming from somewhere fixed -- a stale mailbox, or
     // a window that never retargeted -- rather than from the tile under test.
     in_device(|dev| {
-        for (x, y) in [(1u8, 2u8), (16, 11), (7, 5)] {
-            let tile = tensix_tile(x, y);
+        // The far corner comes from this chip's grid. It was a literal
+        // `(16, 11)`, which is fused off on both cards here (divergence row 35).
+        let far_x = tensix_grid(dev).columns().last().unwrap();
+        let far_y = *grid::TENSIX_ROWS.end();
+        for (x, y) in [(1u8, 2u8), (far_x, far_y), (7, 5)] {
+            let tile = tile(dev, x, y);
             assert_eq!(
                 multiply_on_device(dev, tile, 3.0, 2.0),
                 EXPECTED,
@@ -161,7 +148,7 @@ fn it_works_on_more_than_one_tile() {
 #[test]
 fn it_computes_rather_than_returning_a_constant() {
     in_device(|dev| {
-        let tile = tensix_tile(6, 8);
+        let tile = tile(dev, 6, 8);
         let cases: &[(f32, f32)] = &[
             (3.0, 2.0),
             (1.0, 1.0),
@@ -204,7 +191,7 @@ fn it_computes_rather_than_returning_a_constant() {
 #[test]
 fn the_dst_format_configuration_write_takes_effect() {
     in_device(|dev| {
-        let tile = tensix_tile(4, 4);
+        let tile = tile(dev, 4, 4);
         let as_fp32 = multiply_with_fmt(dev, tile, 3.0, 2.0, DST_FMT_FP32);
         assert_eq!(as_fp32, EXPECTED);
 
@@ -229,9 +216,10 @@ fn the_dst_format_configuration_write_takes_effect() {
 #[cfg(feature = "silicon")]
 #[test]
 fn a_held_backend_does_not_produce_the_answer() {
+    tt_tests::harness::assert_on_silicon();
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(2, 3);
+        let tile = tile(dev, 2, 3);
 
         dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits())
             .unwrap();
@@ -243,7 +231,10 @@ fn a_held_backend_does_not_produce_the_answer() {
         dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, DST_FMT_FP32)
             .unwrap();
 
-        // Deliberately skip release_tensix_backend.
+        // Not merely "skip release_tensix_backend": on silicon the backend's
+        // reset state outlives the process that set it, so a tile an earlier
+        // gate released is still released. Hold it explicitly.
+        dev.hold_tensix_backend(&w, tile).unwrap();
         dev.load_and_start(&w, tile, CORE, firmware::SFPU_MUL, firmware::LOAD_ADDRESS)
             .unwrap();
         let outcome = dev
@@ -253,13 +244,16 @@ fn a_held_backend_does_not_produce_the_answer() {
         match outcome {
             Ok(_) => {
                 let result = dev.read32(&w, tile, mailbox::RESULT).unwrap();
+                println!("MEASURE held_backend = reached DONE with result {result:#010x}");
                 assert_ne!(
                     result, EXPECTED,
                     "the SFPU produced the correct answer while held in soft reset, \
                      so releasing the backend is not what makes the real test pass"
                 );
             }
-            Err(WaitError::TimedOut { .. }) => {}
+            Err(e @ WaitError::TimedOut { .. }) => {
+                println!("MEASURE held_backend = {e}");
+            }
             Err(e) => panic!("unexpected failure: {e}"),
         }
     });
@@ -271,7 +265,7 @@ fn the_firmware_reaches_done_not_just_running() {
     // already valid. Pinned because the ordering is the contract.
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(4, 7);
+        let tile = tile(dev, 4, 7);
         dev.release_tensix_backend(&w, tile).unwrap();
         dev.write32(&w, tile, mailbox::OPERAND_A, 3.0f32.to_bits())
             .unwrap();

@@ -41,19 +41,65 @@ pub const DUMP_ROW_COUNT: u64 = MAILBOX_BASE + 0x28;
 /// First `Dst` row to copy.
 pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
 
+/// Non-zero: the firmware records its progress through the tile's timestamper
+/// (`tensix::timestamper`), which the host has configured. Zero on the
+/// simulator, whose timestamper support is probed separately.
+pub const TRACE: u64 = MAILBOX_BASE + 0x30;
+
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x40;
 
-/// A Tensix instruction stream, staged by the host.
+/// Where the host points the timestamper's event buffer: after the program
+/// slots, 256 events.
+pub const TRACE_BUFFER: u64 = PROGRAM_REGION_END;
+/// Bytes in [`TRACE_BUFFER`].
+pub const TRACE_BUFFER_BYTES: u64 = 256 * crate::tensix::timestamper::EVENT_BYTES;
+
+/// What the firmware traces: the event, in the low bits of a token whose bits
+/// 8.. carry the Tensix thread.
+pub mod trace {
+    /// The firmware has read its mailbox and is about to push.
+    pub const START: u32 = 1;
+    /// The last instruction word has been pushed.
+    pub const PUSHED: u32 = 2;
+    /// The coprocessor has retired the program.
+    pub const RETIRED: u32 = 3;
+
+    /// The token for `event` on `thread`.
+    pub const fn token(thread: u32, event: u32) -> u32 {
+        (thread << 8) | event
+    }
+
+    /// `(thread, event)` from a token.
+    pub const fn split(token: u32) -> (u32, u32) {
+        (token >> 8, token & 0xff)
+    }
+}
+
+/// Where Tensix instruction streams are staged by the host: one fixed slot per
+/// mailbox, the single-core one first and then one per role.
 ///
 /// The descriptor lives in the mailbox; the program itself does not, because it is
 /// unbounded in a way the mailbox is not. Putting it here is what makes the corpus
 /// firmware generic: the host encodes a program with `tt_isa::isa`, writes the
 /// words, and the same image runs it. Adding an instruction to the corpus is then a
 /// host-side test case rather than a firmware change.
-pub const PROGRAM: u64 = MAILBOX_BASE + 0x1000;
+///
+/// The slots are fixed rather than named by an address the host writes, so the
+/// firmware never pushes from wherever a stale or corrupt pointer says. They were
+/// once 256 words inside each mailbox, which a 32x32 matmul outgrows several times
+/// over: its flushed configuration alone is a hundred-odd.
+pub const PROGRAM_REGION: u64 = 0x0012_0000;
+/// Bytes in one program slot.
+pub const PROGRAM_SLOT: u64 = 0x8000;
+/// Slots: the single-core mailbox's, then one per Tensix thread.
+pub const PROGRAM_SLOTS: u64 = 4;
+/// End of the program region.
+pub const PROGRAM_REGION_END: u64 = PROGRAM_REGION + PROGRAM_SLOTS * PROGRAM_SLOT;
+/// The single-core mailbox's program.
+pub const PROGRAM: u64 = PROGRAM_REGION;
 /// Most instructions a program may hold.
-pub const PROGRAM_MAX: u32 = 256;
+pub const PROGRAM_MAX: u32 = (PROGRAM_SLOT / 4) as u32;
 
 /// Where the firmware copies `Dst` rows for the host to read.
 ///
@@ -74,11 +120,103 @@ pub const fn dump_offset(row: u32, column: u32) -> u64 {
 // every access to it would be out of bounds, and that should stop the build rather
 // than fail a test run.
 const _: () = assert!(MAILBOX_BASE + MAILBOX_SIZE <= crate::tensix::L1_SIZE);
-const _: () = assert!(PROGRAM + (PROGRAM_MAX as u64) * 4 <= DUMP);
+const _: () = assert!(PROGRAM_REGION_END <= crate::tensix::L1_SIZE);
+const _: () = assert!(PROGRAM_REGION % 16 == 0 && PROGRAM_SLOT % 16 == 0);
 const _: () =
     assert!(dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) + 4 <= crate::tensix::L1_SIZE);
 // The descriptor words have to stay inside the mailbox the firmware owns.
 const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
+const _: () = assert!(TRACE_BUFFER % 16 == 0);
+
+/// One mailbox per Tensix thread, for the three-role datapath.
+///
+/// tt-metal's LLK splits a kernel across the three Tensix threads -- thread 0
+/// unpacks, thread 1 does math, thread 2 packs -- and so does the role harness,
+/// because much of the coprocessor's state is per thread and some of it is tied
+/// to a role by the hardware (`UNPACR` counts with thread 0's ADCs; see
+/// `docs/ttsim-divergence.md` row 45). Each role image runs its own program and
+/// reports through its own mailbox, laid out like the single-core one above:
+/// the same offsets, from a per-thread base.
+pub mod role {
+    /// First role mailbox, clear of the single-core mailbox, program and dump.
+    pub const BASE: u64 = 0x0011_0000;
+    /// Distance between role mailboxes: room for the program and the dump.
+    pub const STRIDE: u64 = 0x4000;
+
+    /// The mailbox of the role that runs on Tensix thread `thread` (0, 1 or 2).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Mailbox {
+        base: u64,
+        program: u64,
+    }
+
+    impl Mailbox {
+        /// The single-core mailbox at [`super::MAILBOX_BASE`], which has the
+        /// same layout.
+        pub const fn single_core() -> Mailbox {
+            Mailbox {
+                base: super::MAILBOX_BASE,
+                program: super::PROGRAM,
+            }
+        }
+        pub const fn of(thread: u32) -> Mailbox {
+            assert!(thread < 3, "there are three Tensix threads");
+            Mailbox {
+                base: BASE + thread as u64 * STRIDE,
+                program: super::PROGRAM_REGION + (1 + thread as u64) * super::PROGRAM_SLOT,
+            }
+        }
+        pub const fn base(self) -> u64 {
+            self.base
+        }
+        pub const fn status(self) -> u64 {
+            self.base + (super::STATUS - super::MAILBOX_BASE)
+        }
+        pub const fn panic_code(self) -> u64 {
+            self.base + (super::PANIC_CODE - super::MAILBOX_BASE)
+        }
+        pub const fn thread_index(self) -> u64 {
+            self.base + (super::THREAD_INDEX - super::MAILBOX_BASE)
+        }
+        pub const fn dst_access_fmt(self) -> u64 {
+            self.base + (super::DST_ACCESS_FMT - super::MAILBOX_BASE)
+        }
+        pub const fn program_len(self) -> u64 {
+            self.base + (super::PROGRAM_LEN - super::MAILBOX_BASE)
+        }
+        pub const fn dump_row_count(self) -> u64 {
+            self.base + (super::DUMP_ROW_COUNT - super::MAILBOX_BASE)
+        }
+        pub const fn dump_row_first(self) -> u64 {
+            self.base + (super::DUMP_ROW_FIRST - super::MAILBOX_BASE)
+        }
+        pub const fn trace(self) -> u64 {
+            self.base + (super::TRACE - super::MAILBOX_BASE)
+        }
+        /// This mailbox's program slot in [`super::PROGRAM_REGION`].
+        pub const fn program(self) -> u64 {
+            self.program
+        }
+        pub const fn dump_offset(self, row: u32, column: u32) -> u64 {
+            self.base + (super::dump_offset(row, column) - super::MAILBOX_BASE)
+        }
+    }
+
+    // The last role's dump must stay inside L1.
+    const _: () = assert!(
+        Mailbox::of(2).dump_offset(super::DUMP_MAX_ROWS - 1, super::DUMP_ROW_WORDS - 1) + 4
+            <= crate::tensix::L1_SIZE
+    );
+    // The role mailboxes end before the program region begins, and the last
+    // role's slot is the region's last.
+    const _: () = assert!(BASE + 3 * STRIDE <= super::PROGRAM_REGION);
+    const _: () =
+        assert!(Mailbox::of(2).program() + super::PROGRAM_SLOT == super::PROGRAM_REGION_END);
+    const _: () =
+        assert!(super::dump_offset(super::DUMP_MAX_ROWS, 0) - super::MAILBOX_BASE <= STRIDE);
+}
 
 /// Values written to [`STATUS`].
 ///
@@ -120,6 +258,25 @@ mod tests {
                 core.name(),
                 core.default_reset_pc()
             );
+        }
+    }
+
+    #[test]
+    fn every_mailbox_has_its_own_program_slot() {
+        let all = [
+            role::Mailbox::single_core(),
+            role::Mailbox::of(0),
+            role::Mailbox::of(1),
+            role::Mailbox::of(2),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            let a_end = a.program() + PROGRAM_SLOT;
+            assert!(a.program() >= PROGRAM_REGION && a_end <= PROGRAM_REGION_END);
+            for b in &all[i + 1..] {
+                assert!(a_end <= b.program() || b.program() + PROGRAM_SLOT <= a.program());
+            }
+            // Nothing else the host stages lands in a slot.
+            assert!(a.dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) < PROGRAM_REGION);
         }
     }
 

@@ -25,105 +25,30 @@
 //! `fork_scope` and an instruction it refuses becomes a recorded result rather than
 //! a dead test runner. That makes this a discovery tool: see
 //! [`instructions_ttsim_declines_to_execute`].
+//!
+//! # Why this stays single-thread
+//!
+//! Each case is one short program against `LReg` and `Dst` on one thread. There
+//! is no unpack or pack to hand work to, so the three-thread split the datapath
+//! gates use (`harness::Roles`) would add two idle roles and nothing else.
 
-use tt_device::{core_control::WaitError, tlb::WindowKind, Device};
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
-use tt_isa::mailbox::{self, status};
-use tt_isa::noc::{grid, Noc0, NocCoord};
 use tt_isa::sfpu::{self, loadi_mode, store_format};
-use tt_isa::tensix::Core;
-use tt_tests::firmware;
-use tt_ttsim::{fork_scope, Simulator};
-
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-/// T1, not T0: ttsim implements the RISC-V view of `Dst` only for `pipe == 1`.
-/// A simulator constraint, not a hardware one. See `docs/ttsim-divergence.md`.
-const CORE: Core = Core::T1;
-const CORE_THREAD: u32 = 1;
-/// `RISC_DEST_ACCESS_CTRL_SEC*.fmt` 0 is `float Dst32b[512][16]`.
-const DST_FMT_FP32: u32 = 0;
-const BUDGET: u64 = 400_000;
-
-fn tile() -> NocCoord<Noc0> {
-    assert!(grid::is_tensix_geometry(3, 4));
-    NocCoord::new(3, 4).unwrap()
-}
+use tt_tests::harness::{self, in_device, Dev, Run, SENTINEL};
 
 /// Run `program` and return the first `rows` rows of `Dst`, 16 datums each.
+///
+/// The shared runner, plus the one assertion every corpus case wants: that the
+/// firmware wrote *something*, so a row it never touched is not mistaken for a
+/// computed zero.
 fn run(dev: &mut Dev<'_>, program: &[Instruction], rows: u32) -> Vec<u32> {
-    assert!(program.len() as u32 <= mailbox::PROGRAM_MAX);
-    assert!(rows <= mailbox::DUMP_MAX_ROWS);
-    let tile = tile();
-    let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-
-    // The backend has to be out of reset before the coprocessor executes anything,
-    // and before the core can start pushing into it.
-    dev.release_tensix_backend(&w, tile).unwrap();
-
-    dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
-    dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, DST_FMT_FP32)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::PROGRAM_LEN, program.len() as u32)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, rows)
-        .unwrap();
-    for (i, insn) in program.iter().enumerate() {
-        dev.write32(&w, tile, mailbox::PROGRAM + (i as u64) * 4, insn.word())
-            .unwrap();
-    }
-    // A sentinel in every datum, so a row the firmware never wrote is not mistaken
-    // for a computed zero.
-    for row in 0..rows {
-        for col in 0..mailbox::DUMP_ROW_WORDS {
-            dev.write32(&w, tile, mailbox::dump_offset(row, col), SENTINEL)
-                .unwrap();
-        }
-    }
-
-    dev.load_and_start(&w, tile, CORE, firmware::CORPUS, firmware::LOAD_ADDRESS)
-        .unwrap();
-    match dev
-        .wait_for_status(&w, tile, BUDGET, |s| s == status::DONE)
-        .unwrap()
-    {
-        Ok(_) => {}
-        Err(WaitError::Panicked { code }) => panic!("firmware panicked, code {code}"),
-        Err(e) => panic!("{e}"),
-    }
-
-    let mut out = Vec::new();
-    for row in 0..rows {
-        for col in 0..mailbox::DUMP_ROW_WORDS {
-            out.push(
-                dev.read32(&w, tile, mailbox::dump_offset(row, col))
-                    .unwrap(),
-            );
-        }
-    }
+    let out = harness::run(dev, &Run::new(program).dump_rows(rows)).dst;
     assert!(
         out.iter().any(|&v| v != SENTINEL),
         "the firmware wrote nothing into Dst"
     );
     out
-}
-
-const SENTINEL: u32 = 0xDEAD_BEEF;
-
-#[track_caller]
-fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
 }
 
 /// `SFPLOADI` an FP32 constant into `LReg[vd]`, as two halves.
@@ -339,16 +264,14 @@ fn sfploadi_modes_convert_the_way_the_page_says() {
 /// terminates that child and is recorded here rather than killing the run. An
 /// instruction that starts passing is as much a finding as one that stops: it means
 /// the simulator gained a model, and the corpus can grow.
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn instructions_ttsim_declines_to_execute() {
     /// Does this program run to completion under the simulator?
     fn survives(program: &[Instruction]) -> bool {
-        fork_scope(|| {
-            let mut sim = Simulator::open().unwrap();
-            let mut dev = Device::open(sim.transport()).unwrap();
-            let _ = run(&mut dev, program, 4);
+        harness::survives(|dev| {
+            let _ = run(dev, program, 4);
         })
-        .is_ok()
     }
 
     // `SFPLOADMACRO` is unsupported in ttsim's SFPU, stated in its own README and
@@ -371,4 +294,53 @@ fn instructions_ttsim_declines_to_execute() {
     p.push(sfpu::nop());
     p.push(store_fp32(0));
     assert!(survives(&p), "the control program must run");
+}
+
+/// What `SFPLOADMACRO` does on silicon, where ttsim cannot say (divergence row 7).
+///
+/// `SFPLOADMACRO.md`: it "starts by executing as per `SFPLOAD`" -- `Dst` into
+/// `LReg[VD]` -- and then schedules whatever the `SFPCONFIG`-written macro holds.
+/// The first silicon run, with every field zero, stored the *previous gate's*
+/// 6.0 where the 1.0 in `LReg[0]` was expected: the load half had replaced it
+/// with `Dst` row 0's leftovers. This pins that, with a value this program seeds
+/// itself so nothing depends on what an earlier run left in `Dst`:
+///
+/// 1. `LReg[1] = 7.0`, stored to `Dst` row group 0;
+/// 2. `LReg[0] = 1.0`;
+/// 3. `SFPLOADMACRO` with `VD = 0`, address 0 -- the load half should make
+///    `LReg[0]` 7.0;
+/// 4. `LReg[0]` stored to row group 1, which the seed never touched.
+///
+/// The control is the same program without step 3, which must store 1.0. With
+/// no macro configured, the scheduled half is not asserted on.
+#[cfg(feature = "silicon")]
+#[test]
+fn sfploadmacro_begins_as_an_sfpload_from_dst() {
+    harness::assert_on_silicon();
+    const GROUP_1: u32 = 4;
+    let program = |with_macro: bool| {
+        let mut p = Vec::new();
+        p.extend(load(1, 7.0));
+        p.push(store_fp32(1));
+        p.extend(load(0, 1.0));
+        if with_macro {
+            p.push(encode::Sfploadmacro::ZERO.encode().unwrap());
+        }
+        p.push(sfpu::store(0, store_format::FP32, 0, GROUP_1).unwrap());
+        p
+    };
+    for (with_macro, want) in [(false, 1.0f32), (true, 7.0f32)] {
+        let p = program(with_macro);
+        in_device(|dev| {
+            let dst = run(dev, &p, 8);
+            // Row 4 is the first row of group 1; `SFPSTORE` fills even columns.
+            let row4: Vec<u32> = (0..16).step_by(2).map(|c| dst[4 * 16 + c]).collect();
+            println!("MEASURE sfploadmacro.with_macro_{with_macro}.row4_even = {row4:08x?}");
+            assert!(
+                row4.iter().all(|&v| v == want.to_bits()),
+                "with_macro={with_macro}: expected {want} ({:#010x}) in row 4, got {row4:08x?}",
+                want.to_bits()
+            );
+        });
+    }
 }

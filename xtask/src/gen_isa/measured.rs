@@ -47,19 +47,182 @@ pub struct Measured {
     pub supersedes: &'static str,
     /// Fields whose position differs from the Wormhole diagram's.
     pub moved: &'static [&'static str],
+    /// Wormhole fields the Blackhole layout does not carry, each with the reason.
+    /// A field whose Wormhole bits the evidence showed to hold something else on
+    /// Blackhole, and whose own Blackhole position is unknown, is dropped rather
+    /// than guessed: an encoder that cannot set it is honest; one that sets a
+    /// guessed bit is not.
+    pub dropped: &'static [(&'static str, &'static str)],
+    /// Fields whose width differs from the Wormhole diagram's. Each must really
+    /// have changed width, and the evidence must exercise the bits it gained.
+    pub widened: &'static [&'static str],
     /// `(file, test function)` pairs that measured the moved fields.
     pub evidence: &'static [(&'static str, &'static str)],
 }
 
-pub const MEASURED: &[Measured] = &[Measured {
-    key: "MVMUL_BH",
-    supersedes: "MVMUL",
-    moved: &["AddrMod"],
-    evidence: &[(
-        "crates/tt-tests/tests/step9_matmul.rs",
-        "mvmul_addr_mod_sits_one_bit_lower_on_blackhole",
-    )],
-}];
+pub const MEASURED: &[Measured] = &[
+    Measured {
+        key: "MVMUL_BH",
+        supersedes: "MVMUL",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mvmul_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVA2D_BH",
+        supersedes: "MOVA2D",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/probe_src.rs",
+            "mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    // `BroadcastCol0` and `Broadcast1RowTo8` move with `Move4Rows`: the three are
+    // LLK's three-bit `instr_mod` at bit 11. Only `Move4Rows` is measured; the
+    // broadcasts' positions rest on LLK (`MOV_1_ROW_D0_BRCST` = 1,
+    // `MOV_8_ROW_BRCST` = 2) until a gate exercises them.
+    Measured {
+        key: "MOVB2D_BH",
+        supersedes: "MOVB2D",
+        moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/probe_src.rs",
+                "movb2d_move4_rows_is_bit_13_on_blackhole",
+            ),
+            (
+                "crates/tt-tests/tests/probe_src.rs",
+                "mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole",
+            ),
+        ],
+    },
+    Measured {
+        key: "MOVD2A_BH",
+        supersedes: "MOVD2A",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVD2B_BH",
+        supersedes: "MOVD2B",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVB2A_BH",
+        supersedes: "MOVB2A",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "ELWADD_BH",
+        supersedes: "ELWADD",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "ELWSUB_BH",
+        supersedes: "ELWSUB",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "ELWMUL_BH",
+        supersedes: "ELWMUL",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "DOTPV_BH",
+        supersedes: "DOTPV",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVDBGA2D_BH",
+        supersedes: "MOVDBGA2D",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "SHIFTXB_BH",
+        supersedes: "SHIFTXB",
+        moved: &["AddrMod"],
+        dropped: &[],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "shiftxb_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    // LLK's Blackhole `ZEROACC` is `clear_mode << 19`, `use_32_bit_mode << 18`,
+    // `clear_zero_flags << 17`, `addr_mode << 14`. `clear_zero_flags` is not drawn:
+    // nothing has measured it, so the encoder cannot set it.
+    Measured {
+        key: "ZEROACC_BH",
+        supersedes: "ZEROACC",
+        moved: &["AddrMod", "UseDst32b"],
+        dropped: &[(
+            "Revert",
+            "its Wormhole bit 18 is `UseDst32b` on Blackhole (measured, and LLK's \
+             `use_32_bit_mode << 18`); LLK has no such field, and Wormhole's \
+             `ZEROACC.md` makes any use of it `UndefinedBehavior`",
+        )],
+        widened: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "zeroacc_addr_mod_and_use_dst32b_on_blackhole",
+        )],
+    },
+];
 
 /// Does `file` (relative to the workspace root) define `fn name(`?
 pub fn gate_exists(root: &Path) -> impl Fn(&str, &str) -> bool + '_ {
@@ -172,6 +335,8 @@ pub fn apply(
                 Provenance::Measured {
                     evidence,
                     moved: m.moved.iter().map(|s| s.to_string()).collect(),
+                    dropped: m.dropped.iter().map(|(s, _)| s.to_string()).collect(),
+                    widened: m.widened.iter().map(|s| s.to_string()).collect(),
                 },
                 page,
             ),
@@ -223,7 +388,24 @@ fn compare(measured: &Diagram, wh: &Diagram, m: &Measured) -> Result<(), String>
             m.key, m.supersedes
         ));
     }
-    let (a, b) = (named(measured), named(wh));
+    let (a, mut b) = (named(measured), named(wh));
+    for (name, why) in m.dropped {
+        if why.trim().is_empty() {
+            return Err(format!("`{}` drops `{name}` without saying why", m.key));
+        }
+        if a.contains_key(*name) {
+            return Err(format!(
+                "`{}` lists `{name}` as dropped, but still draws it",
+                m.key
+            ));
+        }
+        if b.remove(*name).is_none() {
+            return Err(format!(
+                "`{}` drops `{name}`, which `{}` does not have",
+                m.key, m.supersedes
+            ));
+        }
+    }
     if a.keys().ne(b.keys()) {
         return Err(format!(
             "`{}` and `{}` name different fields: {:?} against {:?}",
@@ -241,13 +423,30 @@ fn compare(measured: &Diagram, wh: &Diagram, m: &Measured) -> Result<(), String>
             ));
         }
     }
-    for (name, (bit, width)) in &a {
-        let (wh_bit, wh_width) = b[name];
-        if *width != wh_width {
+    for name in m.widened {
+        if !a.contains_key(*name) {
             return Err(format!(
-                "`{}` changes the width of `{name}`; a relocation keeps widths",
+                "`{}` lists `{name}` as widened, but has no such field",
                 m.key
             ));
+        }
+    }
+    for (name, (bit, width)) in &a {
+        let (wh_bit, wh_width) = b[name];
+        match (m.widened.contains(&name.as_str()), *width == wh_width) {
+            (false, false) => {
+                return Err(format!(
+                    "`{}` changes the width of `{name}` without listing it as widened",
+                    m.key
+                ))
+            }
+            (true, true) => {
+                return Err(format!(
+                    "`{}` lists `{name}` as widened, but it is as wide as in `{}`",
+                    m.key, m.supersedes
+                ))
+            }
+            _ => {}
         }
         let listed = m.moved.contains(&name.as_str());
         match (listed, *bit == wh_bit) {
@@ -305,6 +504,8 @@ local diagrams = {
         key: "FOO_BH",
         supersedes: "FOO",
         moved: &["AddrMod"],
+        dropped: &[],
+        widened: &[],
         evidence: &[("some/test.rs", "measured_it")],
     };
 
@@ -365,6 +566,8 @@ local diagrams = {
             key: "BAR_BH",
             supersedes: "BAR",
             moved: &[],
+            dropped: &[],
+            widened: &[],
             evidence: &[],
         };
         rejects(
@@ -457,6 +660,103 @@ local diagrams = {
             Provenance::WormholeOnly,
             "name different fields",
         );
+    }
+
+    /// `FOO` with a `Revert` bit at 18, which the Blackhole layout below drops.
+    const SPEC_WITH_REVERT: &str = r#"
+local diagrams = {
+  FOO = function()
+    return Bits32{
+      {0, 10, "Imm"},
+      {15, 2, "AddrMod"},
+      {18, 1, "Revert"},
+      {20, 1, "0"},
+      {24, 8, "0x26"},
+    }
+  end,
+}
+"#;
+
+    fn run_with_revert(source: &str, table: &[Measured]) -> Result<(), String> {
+        let mut diagrams = lua::parse(SPEC_WITH_REVERT).unwrap();
+        let mut provenance = BTreeMap::from([(
+            "FOO".to_string(),
+            (Provenance::WormholeOnly, "WH/FOO.md".to_string()),
+        )]);
+        let mut mnemonics = BTreeMap::new();
+        let exists = |f: &str, n: &str| f == "some/test.rs" && n == "measured_it";
+        apply(
+            source,
+            table,
+            &exists,
+            &mut diagrams,
+            &mut provenance,
+            &mut mnemonics,
+        )
+    }
+
+    #[test]
+    fn a_dropped_field_must_be_listed_with_a_reason() {
+        let dropped =
+            |dropped: &'static [(&'static str, &'static str)]| Measured { dropped, ..ROW };
+        // GOOD omits `Revert`: accepted only when the row says so, and why.
+        run_with_revert(
+            GOOD,
+            &[dropped(&[("Revert", "its bit is another field's")])],
+        )
+        .unwrap();
+        let err = run_with_revert(GOOD, &[ROW]).unwrap_err();
+        assert!(err.contains("name different fields"), "{err}");
+        let err = run_with_revert(GOOD, &[dropped(&[("Revert", " ")])]).unwrap_err();
+        assert!(err.contains("without saying why"), "{err}");
+        let err = run_with_revert(GOOD, &[dropped(&[("Nope", "x")])]).unwrap_err();
+        assert!(err.contains("does not have"), "{err}");
+    }
+
+    #[test]
+    fn a_field_still_drawn_cannot_be_dropped() {
+        let row = Measured {
+            dropped: &[("Imm", "x")],
+            ..ROW
+        };
+        rejects(GOOD, &[row], Provenance::WormholeOnly, "still draws it");
+    }
+
+    #[test]
+    fn a_width_change_must_be_listed_and_real() {
+        const WIDE: &str = r#"
+local diagrams = {
+  FOO_BH = function()
+    return Bits32{
+      {0, 10, "Imm"},
+      {14, 3, "AddrMod"},
+      {20, 1, "0"},
+      {24, 8, "0x26"},
+    }
+  end,
+}
+"#;
+        let widened = Measured {
+            widened: &["AddrMod"],
+            ..ROW
+        };
+        run(WIDE, &[widened], Provenance::WormholeOnly).unwrap();
+        rejects(
+            WIDE,
+            &[ROW],
+            Provenance::WormholeOnly,
+            "without listing it as widened",
+        );
+        let stale = Measured {
+            widened: &["AddrMod"],
+            ..ROW
+        };
+        rejects(GOOD, &[stale], Provenance::WormholeOnly, "as wide as");
+        let missing = Measured {
+            widened: &["Nope"],
+            ..ROW
+        };
+        rejects(WIDE, &[missing], Provenance::WormholeOnly, "no such field");
     }
 
     #[test]

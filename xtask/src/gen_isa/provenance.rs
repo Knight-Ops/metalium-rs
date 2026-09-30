@@ -36,6 +36,8 @@ pub enum Provenance {
     Measured {
         evidence: String,
         moved: Vec<String>,
+        dropped: Vec<String>,
+        widened: Vec<String>,
     },
 }
 

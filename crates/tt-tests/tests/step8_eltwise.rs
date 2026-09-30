@@ -99,9 +99,6 @@ fn staged_values(descriptor: TileDescriptor, values: &[f32]) -> Vec<u8> {
 fn check_against_model(packed: &[u32], values: &[f32], model: fn(u32, u32) -> u32) -> usize {
     let mut checked = 0;
     for (flat, &_got) in packed.iter().enumerate().take(GROUP_DATUMS) {
-        // The first four positions hold no staged datum, so operand A there is
-        // `Dst`'s power-on value -- `UnpredictableValue` per `Dst.md:15`. Excluded
-        // rather than asserted against the zero ttsim happens to give.
         let (Some(a_idx), Some(b_idx)) = (
             datum_at_dst_flat(flat),
             datum_at_dst_flat(flat + GROUP_DATUMS),
@@ -170,9 +167,8 @@ fn elementwise_multiply_matches_the_specifications_fma_model() {
         let packed = run_kernel(dev, descriptor, &staged, &binary_kernel(sfpu::mul));
         let checked = check_against_model(&packed, &values, numerics::mul_bh);
         assert_eq!(
-            checked, 60,
-            "the comparison must cover every datum of the group but the four the \
-             unpacker cannot reach"
+            checked, GROUP_DATUMS,
+            "the comparison must cover every datum of the group"
         );
     });
 }
@@ -186,7 +182,7 @@ fn elementwise_add_matches_the_specifications_fma_model() {
     in_device(|dev| {
         let packed = run_kernel(dev, descriptor, &staged, &binary_kernel(sfpu::add));
         let checked = check_against_model(&packed, &values, numerics::add_bh);
-        assert_eq!(checked, 60);
+        assert_eq!(checked, GROUP_DATUMS);
     });
 }
 
@@ -201,7 +197,7 @@ fn elementwise_subtract_matches_the_specifications_fma_model() {
         let checked = check_against_model(&packed, &values, |a, b| {
             numerics::add_bh(a, b ^ 0x8000_0000)
         });
-        assert_eq!(checked, 60);
+        assert_eq!(checked, GROUP_DATUMS);
     });
 }
 
@@ -275,7 +271,7 @@ fn denormals_and_nans_follow_the_model_through_the_whole_datapath() {
     in_device(|dev| {
         let packed = run_kernel(dev, descriptor, &staged, &binary_kernel(sfpu::mul));
         let checked = check_against_model(&packed, &values, numerics::mul_bh);
-        assert_eq!(checked, 60);
+        assert_eq!(checked, GROUP_DATUMS);
 
         // And that the awkward cases actually occurred, so the gate is not passing
         // on ordinary arithmetic that happens to be in the list.
@@ -294,26 +290,27 @@ fn denormals_and_nans_follow_the_model_through_the_whole_datapath() {
     });
 }
 
-/// The `STALLWAIT` between the SFPU and the packer is emitted, in the right order.
+/// Each role waits for the unit it drove before reporting `DONE`.
 ///
-/// Its *effect* is not observable on ttsim -- divergence row 34 records the same
-/// for the packer's own wait -- so this asserts the instruction is in the stream
-/// rather than that removing it breaks anything. A weak gate, and labelled as one:
-/// the real check is on silicon.
+/// The roles run in order, so each wait is what makes the next role's reads
+/// safe: the unpacker's before the kernel's `SFPLOAD`s, the SFPU's before the
+/// packer reads `Dst`, the packer's before the host reads L1. Their *effect* is
+/// not observable on ttsim -- divergence row 34 records the same for the
+/// packer's own wait -- so this asserts the instructions are in the streams
+/// rather than that removing them breaks anything. A weak gate, and labelled as
+/// one: the real check is on silicon.
 #[test]
-fn the_kernel_waits_for_the_sfpu_before_packing() {
-    let program =
-        eltwise_support::kernel_program(flat_descriptor(DATUMS), DATUMS, &binary_kernel(sfpu::mul));
-    let pos = |w: Instruction| program.iter().position(|i| i.word() == w.word());
-    let sfpu_at = pos(backend::wait_for_sfpu().unwrap()).expect("the SFPU wait must be present");
-    let packer_at =
-        pos(backend::wait_for_packer().unwrap()).expect("the packer wait must be present");
-    let unpacker_at =
-        pos(backend::wait_for_unpacker0().unwrap()).expect("the unpacker wait must be present");
-    assert!(
-        unpacker_at < sfpu_at && sfpu_at < packer_at,
-        "the waits must appear in datapath order: unpacker, then SFPU, then packer"
+fn each_role_waits_for_its_unit() {
+    let [unpack, math, pack] =
+        eltwise_support::kernel_roles(flat_descriptor(DATUMS), DATUMS, &binary_kernel(sfpu::mul));
+    let last = |p: &[Instruction]| p.last().unwrap().word();
+    let every = backend::Before::EVERYTHING;
+    assert_eq!(
+        last(&unpack),
+        backend::wait_for_unpacker0(every).unwrap().word()
     );
+    assert_eq!(last(&math), backend::wait_for_sfpu(every).unwrap().word());
+    assert_eq!(last(&pack), backend::wait_for_packer(every).unwrap().word());
 }
 
 /// The tensor-level oracle: `burn-flex` decides which elements pair with which.
@@ -354,7 +351,7 @@ fn the_element_pairing_matches_burn() {
     // Burn computes the whole elementwise product of the two halves, laid out the
     // way the `Dst` lane mapping says the device pairs them.
     let a: Vec<f32> = (0..GROUP_DATUMS)
-        .map(|flat| datum_at_dst_flat(flat).map_or(0.0, |i| values[i]))
+        .map(|flat| values[datum_at_dst_flat(flat).unwrap()])
         .collect();
     let b: Vec<f32> = (0..GROUP_DATUMS)
         .map(|flat| values[datum_at_dst_flat(flat + GROUP_DATUMS).unwrap()])
@@ -374,7 +371,6 @@ fn the_element_pairing_matches_burn() {
             .zip(expected.iter())
             .enumerate()
             .take(GROUP_DATUMS)
-            .skip(4)
         {
             assert_eq!(
                 got,
@@ -386,6 +382,6 @@ fn the_element_pairing_matches_burn() {
             );
             checked += 1;
         }
-        assert_eq!(checked, 60, "the comparison must not be vacuous");
+        assert_eq!(checked, GROUP_DATUMS, "the comparison must not be vacuous");
     });
 }

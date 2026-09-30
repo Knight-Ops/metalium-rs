@@ -23,30 +23,28 @@
 //!
 //! Every case forks, so a refusal is a recorded result rather than a dead runner.
 
-use tt_device::{core_control::WaitError, tlb::WindowKind, Device};
+use tt_device::{core_control::WaitError, tlb::WindowKind};
 use tt_isa::backend;
 use tt_isa::cfg::generated::alu;
 use tt_isa::cfg::ConfigField;
 use tt_isa::isa::Instruction;
 use tt_isa::mailbox::{self, status};
-use tt_isa::noc::{grid, Noc0, NocCoord};
+use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::sfpu::{self, store_format};
 use tt_isa::tensix::{self, Core};
 use tt_tests::firmware;
-use tt_ttsim::{fork_scope, Simulator};
+use tt_tests::harness::{self, advance, in_device, Dev};
 
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-const CORE: Core = Core::T1;
-const CORE_THREAD: u32 = 1;
+/// The harness's choice, which differs by target (T1 on ttsim, T0 on silicon).
+const CORE: Core = harness::CORE;
+const CORE_THREAD: u32 = harness::CORE_THREAD;
 const DST_FMT_FP32: u32 = 0;
 const BUDGET: u64 = 400_000;
 /// A scratch GPR well clear of anything the firmware touches.
 const SCRATCH_GPR: u32 = 8;
 
 fn tile() -> NocCoord<Noc0> {
-    assert!(grid::is_tensix_geometry(3, 4));
-    NocCoord::new(3, 4).unwrap()
+    harness::tensix_tile()
 }
 
 /// Stage and run `program`, returning `Dst` rows 0..4 plus the device, so a caller
@@ -89,13 +87,9 @@ fn run_with<R>(
 }
 
 /// Does this program run to completion under the simulator?
+#[cfg(not(feature = "silicon"))]
 fn survives(program: &[Instruction]) -> bool {
-    fork_scope(|| {
-        let mut sim = Simulator::open().unwrap();
-        let mut dev = Device::open(sim.transport()).unwrap();
-        run_with(&mut dev, program, |_, _, _| ());
-    })
-    .is_ok()
+    harness::survives(|dev| run_with(dev, program, |_, _, _| ()))
 }
 
 /// A program that computes something, so a run that survives has also done work.
@@ -106,6 +100,7 @@ fn control_tail() -> Vec<Instruction> {
     p
 }
 
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn ttsim_executes_setdmareg_and_wrcfg() {
     // The control first: the tail on its own must run, so a failure below is the
@@ -139,6 +134,7 @@ fn ttsim_executes_setdmareg_and_wrcfg() {
     );
 }
 
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn ttsim_executes_setc16() {
     let entry = backend::ThreadConfigEntry::zeroed(
@@ -165,7 +161,7 @@ fn read_config_word(
     dev.write32(w, tile, tensix::CFGREG_RD_CNTL, field.addr32() as u32)
         .unwrap();
     // "a few cycles later" (`BackendConfiguration.md:66`).
-    dev.tick(64);
+    advance(dev, 64);
     dev.read32(w, tile, tensix::CFGREG_RDDATA).unwrap()
 }
 
@@ -200,12 +196,12 @@ fn the_host_can_read_backend_configuration_back() {
     const FP32: u32 = 0;
     const BF16: u32 = 3;
 
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("{e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-
-        let fp32 = stage_then_read_back(&mut dev, FP32);
-        let bf16 = stage_then_read_back(&mut dev, BF16);
+    // On silicon this is also the re-derivation of row E: `CFGREG_RDDATA` was a
+    // pure measurement against ttsim, and this is the first test to read it from
+    // a real chip.
+    in_device(|dev| {
+        let fp32 = stage_then_read_back(dev, FP32);
+        let bf16 = stage_then_read_back(dev, BF16);
 
         assert_eq!(fp32, FP32, "staged {FP32}, read back {fp32}");
         assert_eq!(bf16, BF16, "staged {BF16}, read back {bf16}");
@@ -215,9 +211,6 @@ fn the_host_can_read_backend_configuration_back() {
              something other than the configuration write"
         );
     });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
 }
 
 /// Where in the debug block do `CFGREG_RD_CNTL` and `CFGREG_RDDATA` actually live?
@@ -230,9 +223,17 @@ fn the_host_can_read_backend_configuration_back() {
 /// Two passes rather than a cross product: first hold the control register at the
 /// Wormhole-sourced `0xFFB1_2058` and look for a data register, then, if nothing
 /// answers, walk the control register with the data register one word after it.
+///
+/// **Simulator only, permanently.** It writes a thousand-odd words of the tile's
+/// debug block blind; on ttsim a wrong guess kills a child, on silicon it pokes
+/// whatever register lives there.
+#[cfg(not(feature = "silicon"))]
 #[test]
 #[ignore]
 fn search_for_the_cfgreg_debug_registers() {
+    use tt_device::Device;
+    use tt_ttsim::{fork_scope, Simulator};
+
     const VALUE: u32 = 3;
 
     /// Stage a known `Config` word, then write `cntl` and read `data`.

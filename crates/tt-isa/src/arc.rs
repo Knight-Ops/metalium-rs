@@ -73,6 +73,46 @@ pub const fn is_within_csm(addr: u64, len: u64) -> bool {
     addr >= CSM_BASE && addr <= (CSM_BASE + CSM_SIZE).saturating_sub(len)
 }
 
+/// The ARC firmware's message queues: how software asks the ARC to change the
+/// chip's operating point, among other things.
+///
+/// Not in the ISA documentation; transcribed from UMD, which is how tt-metal
+/// talks to it (`umd/device/arc/blackhole_arc_message_queue.cpp`,
+/// `blackhole_implementation.hpp`, `types/blackhole_arc.hpp`). The one message
+/// this crate needs is [`msg::AICLK_GO_BUSY`], which UMD sends whenever it brings
+/// a chip up: without it the chip stays at its idle operating point, where the
+/// Matrix Unit's reads of `SrcA`/`SrcB` are not reliable -- see
+/// `docs/ttsim-divergence.md` row 48.
+pub mod queue {
+    /// Holds the CSM address of the queue control block (`SCRATCH_RAM_11`).
+    pub const CONTROL_PTR: u64 = super::reset_scratch(11);
+    /// Writing [`FW_INT_VAL`] here tells the ARC a request is waiting.
+    pub const FW_INT: u64 = 0x8003_0100;
+    pub const FW_INT_VAL: u32 = 1 << 16;
+    /// Words in each queue's header: request write pointer at 0, response read
+    /// pointer at 1, request read pointer at 4, response write pointer at 5.
+    pub const HEADER_WORDS: u64 = 8;
+    /// Words in one request or response entry: the message code (or status),
+    /// then up to seven arguments (or return values).
+    pub const ENTRY_WORDS: u64 = 8;
+    pub const REQUEST_WPTR: u64 = 0;
+    pub const RESPONSE_RPTR: u64 = 1;
+    pub const REQUEST_RPTR: u64 = 4;
+    pub const RESPONSE_WPTR: u64 = 5;
+    /// Which queue application software uses (`BlackholeArcMessageQueueIndex`).
+    pub const APPLICATION: u64 = 3;
+    /// A response status below this is success.
+    pub const RESPONSE_OK_LIMIT: u32 = 240;
+}
+
+/// ARC message codes (`types/blackhole_arc.hpp`, `ArcMessageType`).
+pub mod msg {
+    /// Raise AICLK (and the voltage with it) to the busy operating point.
+    pub const AICLK_GO_BUSY: u32 = 0x52;
+    /// Return to the idle operating point.
+    pub const AICLK_GO_LONG_IDLE: u32 = 0x54;
+}
+
 /// Upper bound on telemetry table entries (`telemetry.h:87`).
 pub const TELEMETRY_MAX_ENTRIES: u32 = 1 << 16;
 
@@ -92,6 +132,10 @@ pub const TELEMETRY_MAX_MAJOR_VERSION: u32 = 1;
 /// tags backing a sysfs or hwmon attribute (`telemetry.c:42-77`), so a lookup of
 /// any other tag returns `TELEM_ADDR_INVALID`.
 pub mod tag {
+    /// Core voltage in mV (UMD `TelemetryTag::VCORE`).
+    pub const VCORE: u16 = 6;
+    /// AI clock in MHz (UMD `TelemetryTag::AICLK`).
+    pub const AICLK: u16 = 14;
     /// Bitmask of *enabled* Tensix columns.
     ///
     /// Enabled rather than harvested, so a firmware that does not publish the tag

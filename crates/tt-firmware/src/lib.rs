@@ -160,6 +160,8 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 /// Pushing Tensix instructions from a baby RISC-V core.
+pub mod corpus;
+
 pub mod tensix {
     use tt_isa::sfpu::Instruction;
     use tt_isa::tensix::{self, PushesTo, TensixThread};

@@ -6,6 +6,9 @@
 //! (`EthernetTile/README.md`), and a DRAM tile a whole channel.
 //!
 //! Run with `cargo test -p tt-tests --test probe_niu -- --ignored --nocapture`.
+
+// Simulator only, permanently: bisecting the highest addressable byte at every coordinate is the sweep that hangs on a fused-off tile.
+#![cfg(not(feature = "silicon"))]
 use std::fs;
 use std::path::PathBuf;
 

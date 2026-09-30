@@ -6,6 +6,9 @@
 //! contract violation terminates the process outright, which without forking would
 //! take the whole test binary with it.
 
+// Every test here is about ttsim itself: its PCI surface, its singleton, its validation layer.
+#![cfg(not(feature = "silicon"))]
+
 use tt_device::{Bar, ConfigOffset, Transport};
 use tt_isa::noc::ChipId;
 use tt_ttsim::{fork_scope, Simulator};

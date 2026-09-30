@@ -5,31 +5,12 @@
 //! and `INSTRN_BUF_BASE` are both unmapped to the NoC, so the host cannot push a
 //! Tensix instruction or read a compute result. A core has to sit in the middle.
 
-use tt_device::{core_control::WaitError, tlb::WindowKind, Device};
+use tt_device::{core_control::WaitError, tlb::WindowKind};
 use tt_isa::mailbox::{self, status};
-use tt_isa::noc::{grid, Noc0, NocCoord};
+use tt_isa::noc::grid;
 use tt_isa::tensix::{self, Core};
 use tt_tests::firmware;
-use tt_ttsim::{fork_scope, Simulator};
-
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-#[track_caller]
-fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-}
-
-fn tensix_tile(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(grid::is_tensix_geometry(x, y));
-    NocCoord::new(x, y).unwrap()
-}
+use tt_tests::harness::{advance, in_device, tensix_grid, tile};
 
 /// Budget for the firmware to reach its prologue. Generous: the point of the gate
 /// is whether it runs at all, not how fast.
@@ -39,7 +20,7 @@ const STARTUP_BUDGET: u64 = 200_000;
 fn heartbeat_climbs() {
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(3, 4);
+        let tile = tile(dev, 3, 4);
 
         dev.load_and_start(
             &w,
@@ -66,7 +47,7 @@ fn heartbeat_climbs() {
         let mut samples = Vec::new();
         for _ in 0..8 {
             samples.push(dev.read32(&w, tile, mailbox::HEARTBEAT).unwrap());
-            dev.tick(4096);
+            advance(dev, 4096);
         }
         assert!(
             samples.windows(2).all(|p| p[1] > p[0]),
@@ -83,7 +64,7 @@ fn a_core_held_in_reset_does_nothing() {
     // image were somehow running before the loader released reset.
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(5, 6);
+        let tile = tile(dev, 5, 6);
 
         dev.set_core_reset(&w, tile, Core::T0, true).unwrap();
         dev.write(&w, tile, firmware::LOAD_ADDRESS, firmware::HEARTBEAT)
@@ -94,7 +75,7 @@ fn a_core_held_in_reset_does_nothing() {
         // Clear the mailbox, then let a lot of time pass with the core still held.
         dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
         dev.write32(&w, tile, mailbox::HEARTBEAT, 0).unwrap();
-        dev.tick(100_000);
+        advance(dev, 100_000);
 
         assert_eq!(
             dev.read_status(&w, tile).unwrap(),
@@ -115,7 +96,7 @@ fn a_core_held_in_reset_does_nothing() {
 fn reset_state_round_trips() {
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(1, 2);
+        let tile = tile(dev, 1, 2);
 
         // Out of the box every core is held in reset.
         for core in Core::ALL {
@@ -152,9 +133,10 @@ fn reset_state_round_trips() {
 #[cfg(feature = "silicon")]
 #[test]
 fn pc_snapshot_lands_in_the_loaded_image() {
+    tt_tests::harness::assert_on_silicon();
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(7, 3);
+        let tile = tile(dev, 7, 3);
 
         dev.load_and_start(
             &w,
@@ -178,7 +160,7 @@ fn pc_snapshot_lands_in_the_loaded_image() {
                 (lo..hi).contains(&pc),
                 "T0's pc snapshot {pc:#x} is outside the loaded image {lo:#x}..{hi:#x}"
             );
-            dev.tick(1024);
+            advance(dev, 1024);
         }
     });
 }
@@ -187,8 +169,17 @@ fn pc_snapshot_lands_in_the_loaded_image() {
 fn two_tiles_run_independently() {
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let a = tensix_tile(2, 2);
-        let b = tensix_tile(16, 11);
+        let a = tile(dev, 2, 2);
+        // The far corner of *this chip's* grid. This was a literal `(16, 11)`,
+        // which is fused off on both cards here: addressing it hangs the NoC and
+        // takes the host with it (divergence row 35). On the simulator the last
+        // surviving column is still 16.
+        let far_x = tensix_grid(dev).columns().last().unwrap();
+        let far_y = *grid::TENSIX_ROWS.end();
+        let b = tile(dev, far_x, far_y);
+        // Still held in reset, but L1 outlives a run on silicon, so the mailbox
+        // may hold the previous process's `RUNNING`.
+        dev.write32(&w, b, mailbox::STATUS, 0).unwrap();
 
         dev.load_and_start(&w, a, Core::T0, firmware::HEARTBEAT, firmware::LOAD_ADDRESS)
             .unwrap();
@@ -205,7 +196,7 @@ fn two_tiles_run_independently() {
             .unwrap()
             .unwrap();
 
-        dev.tick(8192);
+        advance(dev, 8192);
         assert!(dev.read32(&w, a, mailbox::HEARTBEAT).unwrap() > 0);
         assert!(dev.read32(&w, b, mailbox::HEARTBEAT).unwrap() > 0);
     });
@@ -217,7 +208,7 @@ fn risc_b_rejects_a_reset_pc_override() {
     // writing to a register that does not exist.
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(3, 2);
+        let tile = tile(dev, 3, 2);
         let err = dev.set_reset_pc(&w, tile, Core::B, 0x6000).unwrap_err();
         assert!(err.to_string().contains("RISCV B"), "{err}");
 
@@ -233,7 +224,7 @@ fn risc_b_rejects_a_reset_pc_override() {
 fn an_image_that_would_not_fit_in_l1_is_refused() {
     in_device(|dev| {
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix_tile(3, 2);
+        let tile = tile(dev, 3, 2);
         let at = tensix::L1_SIZE - 8;
         let err = dev
             .load_and_start(&w, tile, Core::T0, firmware::HEARTBEAT, at)

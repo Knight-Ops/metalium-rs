@@ -157,6 +157,11 @@ pub enum Provenance {
     Measured {
         evidence: &'static str,
         moved: &'static [&'static str],
+        /// Wormhole fields this layout does not carry: their Wormhole bits hold
+        /// another field on Blackhole, and their own position is unknown.
+        dropped: &'static [&'static str],
+        /// Fields whose width differs from the Wormhole diagram's.
+        widened: &'static [&'static str],
     },
 }
 
@@ -474,8 +479,9 @@ mod tests {
     fn the_table_has_the_expected_shape() {
         assert_eq!(
             ALL.len(),
-            149,
-            "instruction encodings: 145 diagrams, of which RMWCIB is four, plus MVMUL_BH"
+            161,
+            "instruction encodings: 145 diagrams, of which RMWCIB is four, plus 13 \
+             measured (`Bits32_BH.lua`)"
         );
         assert_eq!(ALL_LAYOUTS.len(), 19, "Src/Dst/NoC datum layouts");
     }
@@ -497,12 +503,15 @@ mod tests {
         }
         assert_eq!(counts["Blackhole"], 39);
         assert_eq!(counts["SharedWithWormhole"], 24);
-        assert_eq!(counts["SupersededOnBlackhole"], 12);
+        assert_eq!(counts["SupersededOnBlackhole"], 24);
         assert_eq!(
-            counts["WormholeOnly"], 73,
+            counts["WormholeOnly"], 61,
             "half the instruction set is a hypothesis; that is the point of recording it"
         );
-        assert_eq!(counts["Measured"], 1, "MVMUL_BH");
+        assert_eq!(
+            counts["Measured"], 13,
+            "MVMUL, the six MOV*, ELWADD, ELWSUB, ELWMUL, DOTPV, SHIFTXB, ZEROACC"
+        );
     }
 
     #[test]

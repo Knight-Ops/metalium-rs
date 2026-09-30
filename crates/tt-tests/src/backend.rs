@@ -18,6 +18,22 @@ use tt_device::Device;
 /// so a gate that runs somewhere else is responsible for its own hygiene.
 pub const GATE_TILE: (u8, u8) = (3, 4);
 
+/// Fail unless this build's [`Dev`] reaches a real card.
+///
+/// For the silicon-only twins. Several of them once compiled under
+/// `--features silicon` while going through a file-local harness that opened the
+/// *simulator*, so they would have run against ttsim and passed or failed on its
+/// say-so. Asked of the device type itself rather than of the feature flag, so it
+/// checks what the gate will actually talk to.
+#[track_caller]
+pub fn assert_on_silicon() {
+    let dev = std::any::type_name::<Dev<'static>>();
+    assert!(
+        dev.contains("Kmd"),
+        "this gate is silicon-only, but it is running against {dev}"
+    );
+}
+
 #[cfg(feature = "silicon")]
 pub use silicon::*;
 #[cfg(not(feature = "silicon"))]
@@ -27,6 +43,7 @@ pub use simulator::*;
 mod simulator {
     use super::*;
     use tt_isa::noc::grid::Tensix;
+    use tt_isa::noc::{Noc0, NocCoord};
     use tt_ttsim::{fork_scope, Simulator};
 
     /// Which Tensix tiles the simulator has: all of them.
@@ -42,6 +59,26 @@ mod simulator {
 
     /// A device backed by the simulator, for the lifetime of one `fork_scope`.
     pub type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
+
+    /// Is this build's [`Dev`] a real card? See the silicon twin.
+    pub const ON_SILICON: bool = false;
+
+    /// Let `cycles` of device time pass: exactly that many simulated clocks.
+    pub fn advance(dev: &mut Dev<'_>, cycles: u32) {
+        dev.tick(cycles);
+    }
+
+    /// A Tensix tile a gate may use. On the simulator every Tensix coordinate is
+    /// present, so this checks geometry only; see the silicon twin for why the
+    /// call exists at all.
+    #[track_caller]
+    pub fn tile(_dev: &mut Dev<'_>, x: u8, y: u8) -> NocCoord<Noc0> {
+        assert!(
+            Tensix::FULL.contains(x, y),
+            "({x},{y}) is not a Tensix coordinate"
+        );
+        NocCoord::new(x, y).unwrap()
+    }
 
     /// Run `f` against a fresh simulator, inside a fork.
     ///
@@ -99,6 +136,89 @@ mod silicon {
         grid.unwrap_or_else(|e| panic!("could not read this chip's Tensix grid: {e}"))
     }
 
+    /// Is this build's [`Dev`] a real card?
+    ///
+    /// For the silicon-only twins to assert, so that a twin which ends up
+    /// running against the simulator -- the state several of them were in until
+    /// every gate went through this module -- fails instead of passing on
+    /// ttsim's say-so.
+    pub const ON_SILICON: bool = true;
+
+    // Tiles other than [`GATE_TILE`] that this process has started using.
+    //
+    // Each carries its own open `Kmd`, held only for the cleanup write it
+    // registered. tt-kmd keeps exactly **one** cleanup write per open file
+    // (`chardev.c:539` overwrites `priv->noc_cleanup`), so covering a second
+    // tile takes a second file descriptor. Thread-local because `Kmd` owns raw
+    // mappings; every gate runs single-threaded inside its own fork anyway.
+    thread_local! {
+        static CLAIMED: std::cell::RefCell<Vec<(u16, NocCoord<Noc0>, Kmd)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A Tensix tile a gate may use, checked against *this chip's* grid.
+    ///
+    /// The only way a gate should name a tile other than [`GATE_TILE`]. It
+    /// refuses a coordinate the chip does not have before anything is sent to it
+    /// -- `step3_heartbeat` and `step4_tensix` both named `(16, 11)`, fused off on both
+    /// cards here, and addressing it hangs the NoC and takes the host down (row
+    /// 35 of the divergence log). It also registers the same crash-cleanup write
+    /// [`open`] registers for the gate tile, through a file descriptor of its
+    /// own, and [`scrub`] holds the tile's cores in reset at the end.
+    #[track_caller]
+    pub fn tile(dev: &mut Dev<'_>, x: u8, y: u8) -> NocCoord<Noc0> {
+        // The card this device is, not `DEVICE_ENV`: a gate holding both cards
+        // claims tiles on each.
+        let index = dev.chip().0;
+        let grid = tensix_grid(dev);
+        assert!(
+            grid.contains(x, y),
+            "({x},{y}) is not a Tensix tile on /dev/tenstorrent/{index}: this chip has \
+             {} Tensix columns, so X must be one of {:?}",
+            grid.enabled_column_count(),
+            grid.columns().collect::<Vec<_>>()
+        );
+        let coord = NocCoord::new(x, y).unwrap();
+        let claimed = CLAIMED.with(|c| {
+            c.borrow()
+                .iter()
+                .any(|(i, t, _)| *i == index && *t == coord)
+        });
+        if (x, y) != GATE_TILE && !claimed {
+            let guard = Kmd::open(index)
+                .unwrap_or_else(|e| panic!("could not open /dev/tenstorrent/{index}: {e}"));
+            guard
+                .set_cleanup_write(x, y, 0, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
+                .unwrap_or_else(|e| {
+                    panic!("could not register a cleanup write for ({x},{y}): {e}")
+                });
+            CLAIMED.with(|c| c.borrow_mut().push((index, coord, guard)));
+            // Start from the state the simulator starts from: every core held.
+            // Whatever the last process left running on this tile is stopped
+            // before the gate looks at it.
+            let w = dev
+                .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+                .unwrap_or_else(|e| panic!("no TLB window left to claim ({x},{y}): {e}"));
+            reset_tile(dev, &w, coord);
+            dev.free_window(w);
+            // And the configuration and per-thread state, as the gate tile gets
+            // in `in_device`: tt-metal, or an earlier gate, may have left any of
+            // it set on this tile.
+            reset_thread_state_on(dev, Some((x, y)));
+        }
+        coord
+    }
+
+    /// Let roughly `cycles` of device time pass.
+    ///
+    /// `tick` does nothing on silicon, so a gate that ticks between two samples
+    /// to see a counter move would otherwise sample back to back. Converted at a
+    /// nominal 1 GHz: the gates only need *some* time to pass, not a measured
+    /// amount, and no gate may draw a timing conclusion from this.
+    pub fn advance(_dev: &mut Dev<'_>, cycles: u32) {
+        std::thread::sleep(std::time::Duration::from_nanos(cycles as u64));
+    }
+
     /// A device backed by a real card.
     ///
     /// The lifetime is vestigial — `Kmd` owns its file descriptor and borrows
@@ -124,7 +244,13 @@ mod silicon {
     /// — it hangs the NoC, and a cleanup write registered against one would fire
     /// on every close from then on, including the close that follows the hang.
     pub fn open() -> Dev<'static> {
-        let index = device_index();
+        open_card(device_index())
+    }
+
+    /// [`open`], for a card named explicitly rather than by [`DEVICE_ENV`]: for
+    /// the gates that hold both cards at once.
+    pub fn open_card(index: u16) -> Dev<'static> {
+        report_watchdog();
         let kmd = Kmd::open(index)
             .unwrap_or_else(|e| panic!("could not open /dev/tenstorrent/{index}: {e}"));
 
@@ -161,6 +287,26 @@ mod silicon {
         dev
     }
 
+    /// Say, once per card opened, whether the ARC watchdog is armed.
+    ///
+    /// Armed, a gate that hangs the NoC becomes a chip reset that drops the PCIe
+    /// link, which on this passed-through VM is the host. That is a reason to fix
+    /// the access that hangs -- as `Device`'s local-RAM guard now does -- not to
+    /// refuse to run, so this only reports.
+    fn report_watchdog() {
+        match tt_kmd::auto_reset_timeout() {
+            Ok(0) => {}
+            Ok(t) => eprintln!(
+                "note: ARC watchdog armed (auto_reset_timeout={t}); a NoC hang will \
+                 reset the chip and drop the PCIe link"
+            ),
+            Err(e) => eprintln!(
+                "note: cannot read {}: {e}",
+                tt_kmd::AUTO_RESET_TIMEOUT_PARAM
+            ),
+        }
+    }
+
     /// Every baby RISC-V held in reset.
     ///
     /// Assembled from `Core`'s own bits rather than written as a literal, so it
@@ -171,30 +317,65 @@ mod silicon {
         | Core::T2.soft_reset_mask()
         | Core::NC.soft_reset_mask();
 
-    /// Put the gate tile back to a known state.
+    /// Hold every core on `tile`, and put its Tensix backend through a reset
+    /// pulse, leaving the backend released and the cores held.
     ///
-    /// Only the cores, for now. `Dst` is the other piece of state that survives a
-    /// run, and scrubbing it needs a Tensix program rather than a register write;
-    /// the gates that read `Dst` pre-fill their dump area with a sentinel, which
-    /// catches a stale datum but does not remove it.
+    /// Holding the cores alone is not enough. On silicon a program that hangs
+    /// the coprocessor -- a `STALLWAIT` on an unpacker that never finishes --
+    /// leaves the backend stuck after its core is stopped, and every later gate
+    /// on the tile then times out: the first run of the Stage 2 probes wedged the
+    /// gate tile that way and took the rest of the suite down with it. The pulse
+    /// is `SoftReset.md`'s remedy: entering reset aborts in-flight
+    /// `UNPACR`/`PACR`, Matrix Unit and Vector Unit work, resets the `Src` bank
+    /// ownership and zeroes the THCON configuration; the cores being held
+    /// discards anything queued in their Tensix FIFOs. `Dst` survives it.
+    ///
+    /// Silicon only: ttsim accepts only the baby RISC-V bits of `SOFT_RESET_0`
+    /// (divergence row 16).
+    fn reset_tile(dev: &mut Dev<'_>, w: &tt_device::Window, tile: NocCoord<Noc0>) {
+        dev.write32(
+            w,
+            tile,
+            tensix::SOFT_RESET_0,
+            ALL_BABIES_HELD | tensix::BACKEND_RESET_MASK,
+        )
+        .unwrap_or_else(|e| panic!("could not reset {tile:?}'s backend: {e}"));
+        dev.write32(w, tile, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
+            .unwrap_or_else(|e| panic!("could not release {tile:?}'s backend: {e}"));
+    }
+
+    /// Put the gate tile, and every tile claimed through [`tile`], back to a
+    /// known state: cores held, backend reset and released ([`reset_tile`]).
+    ///
+    /// `Dst` is the piece of state that survives this, and scrubbing it needs a
+    /// Tensix program rather than a register write; the gates that read `Dst`
+    /// pre-fill their dump area with a sentinel, which catches a stale datum but
+    /// does not remove it.
     pub fn scrub(dev: &mut Dev<'_>) {
         let (x, y) = GATE_TILE;
-        let tile: NocCoord<Noc0> = NocCoord::new(x, y).unwrap();
-        // Not `.unwrap()`: the way this fails in practice is a gate that took
-        // windows and dropped them instead of freeing them, since `Window` has no
-        // `Drop` that reaches the free list. The bare `OutOfBounds` that produces
-        // says nothing about why, and the simulator never reaches this code at all.
+        let mut tiles: Vec<NocCoord<Noc0>> = vec![NocCoord::new(x, y).unwrap()];
+        let index = dev.chip().0;
+        tiles.extend(CLAIMED.with(|c| {
+            c.borrow()
+                .iter()
+                .filter(|(i, _, _)| *i == index)
+                .map(|(_, t, _)| *t)
+                .collect::<Vec<_>>()
+        }));
+        // Not `.unwrap()`: the only way this fails now is a gate still holding
+        // every window when its body returns, and the bare `OutOfBounds` says
+        // nothing about why. The simulator never reaches this code at all.
         let w = dev
             .alloc_window(tt_device::tlb::WindowKind::TwoMib)
             .unwrap_or_else(|e| {
                 panic!(
                     "no TLB window left to scrub the gate tile with: {e}. A gate \
-                     that allocates windows must `free_window` them; dropping a \
-                     `Window` leaks it from the free list."
+                     is still holding every window."
                 )
             });
-        dev.write32(&w, tile, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
-            .unwrap_or_else(|e| panic!("could not hold the gate tile's cores in reset: {e}"));
+        for tile in tiles {
+            reset_tile(dev, &w, tile);
+        }
         dev.free_window(w);
     }
 
@@ -204,10 +385,33 @@ mod silicon {
     /// terminate the process — but it earns its keep twice over here. A gate that
     /// wedges a core cannot take the runner with it, and the child's file
     /// descriptor closing is what fires the driver's cleanup write.
+    /// Reset the gate thread's own Tensix state before a gate runs:
+    /// [`crate::datapath::thread_state_reset`], run through the harness on the
+    /// gate tile. The per-thread half of the scrub that [`reset_tile`] cannot
+    /// do from outside.
+    fn reset_thread_state(dev: &mut Dev<'_>) {
+        reset_thread_state_on(dev, None);
+    }
+
+    fn reset_thread_state_on(dev: &mut Dev<'_>, tile: Option<(u8, u8)>) {
+        let program = crate::datapath::thread_state_reset();
+        // All three threads: the role harness uses each of them, and the
+        // single-thread path uses thread 0 (`harness::CORE`).
+        let roles = crate::harness::Roles {
+            unpack: &program,
+            math: &program,
+            pack: &program,
+        };
+        let mut run = crate::harness::Run::roles(roles).dump_rows(0);
+        run.tile = tile;
+        let _ = crate::harness::run(dev, &run);
+    }
+
     #[track_caller]
     pub fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
         if let Err(e) = fork_scope(|| {
             let mut dev = open();
+            reset_thread_state(&mut dev);
             f(&mut dev);
             scrub(&mut dev);
         }) {
@@ -223,6 +427,7 @@ mod silicon {
     pub fn survives(f: impl FnOnce(&mut Dev<'_>)) -> bool {
         fork_scope(|| {
             let mut dev = open();
+            reset_thread_state(&mut dev);
             f(&mut dev);
             scrub(&mut dev);
         })

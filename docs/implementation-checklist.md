@@ -30,14 +30,86 @@ gate you have not seen reject something is not yet evidence.
 |--:|---|---|
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
 | 1 — Host addresses the chip | `[x]` | **Gated on simulator and on silicon** (both p150a cards, 7/7). `tt-kmd` done; harvesting read from ARC telemetry |
-| 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
-| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
-| 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
-| 5 — Elementwise binary | `[~]` | Simulator gate done, FP32 only; BF16 blocked on ttsim, silicon gate open |
-| 6 — Matmul | `[~]` | One 8×16·16×16 `MVMUL` block gated with all four fidelity phases; face, tile and multi-tile open |
-| 7 — Burn backend, training | `[ ]` | The milestone |
+| 2 — Rust on a baby RISC-V | `[~]` | **Silicon gate passed on both cards** (heartbeat, reset, `pc` snapshot, local RAM + zeroing); I-cache and hot-reload paths open |
+| 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
+| 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
+| 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
+| 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores. Multi-phase fidelity at tile level not yet exercised |
+| 7 — Burn backend, training | `[ ]` | The milestone. Surface verified against 0.21; `tt-kernels` ships the matmul it will call; fusion is open to a hand-written backend |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
+
+---
+
+## Silicon campaign (2026-09-30)
+
+Run with `cargo xtask silicon` (one test per process, fsync'd log). Every bug below
+passed on ttsim for weeks; each is now fixed in the code, not worked around.
+
+- [x] **Local RAM hung the NoC** when accessed with its core in reset -- `tt-device`
+      refuses it (see Silicon operating notes).
+- [x] **A hung program wedged the tile** until the harness learnt to pulse the Tensix
+      backend reset; **per-thread state and `Dst` leaked between gates** until it reset
+      them too (divergence row 47).
+- [x] **Rows 30/35 were our off-by-one**: `REG3_Base_address` pointed one unit before
+      the tile header. With it fixed, every datum lands where the specification says,
+      on ttsim and silicon.
+- [x] **`UNPACR` counts with thread 0's ADCs** (row 45): silicon programs run on T0.
+- [x] **`STALLWAIT` waits held the wrong units** (row 46): the consumer is now a
+      required argument.
+- [x] **The datapath now mirrors LLK's thread split.** `harness::Roles`: unpack on
+      T0 / thread 0, math on T1 / thread 1, pack on T2 / thread 2, three role images
+      at their cores' default reset PCs (`role_t0..2`), one mailbox each
+      (`mailbox::role`), run in order. It works on ttsim too -- math on T1 is the one
+      thread ttsim lets read `Dst` -- so the T0/T1 target split is only needed by the
+      remaining single-thread gates. `probe_src`, `step9_matmul`, `step8_eltwise`
+      and `probe_pack` all run this way, on ttsim and both cards; the latter two
+      share `datapath::dst_round_trip_roles`. `probe_unpack` and `step5_corpus`
+      stay single-thread on purpose, and say why in their headers.
+- [x] **Every datapath encoding checked against LLK** (`tt-isa/tests/llk_crosscheck.rs`).
+      Two Wormhole layouts were wrong on Blackhole: `MOVB2D`'s `instr_mod` (the
+      whole of row 38) and `MOVA2D`/`MOVB2D`'s `AddrMod` (one bit lower, as
+      `MVMUL`). Both are now measured `Bits32_BH.lua` layouts, each licensed by a
+      `probe_src` gate that passes on ttsim and both cards. `MOVD2A`/`MOVD2B`/`MOVB2A`
+      had the same `AddrMod` shift and are measured layouts too, licensed by
+      `step9_matmul::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`. So are
+      `ELWADD`/`ELWSUB`/`ELWMUL`/`DOTPV`/`MOVDBGA2D`/`SHIFTXB` (`AddrMod`) and
+      `ZEROACC` (`AddrMod`, `UseDst32b` at 18, Wormhole `Revert` dropped -- the
+      generator now takes a `dropped` field list with reasons). `GMPOOL`/`GAPOOL`
+      agree with LLK as drawn. Every Matrix Unit encoding LLK defines now agrees
+      with it. Found on the way, on silicon only: one-row `ZEROACC` in FP32 `Dst`
+      addresses physical rows (row 51), and with an odd `AddrMod` clears eight
+      (row 52).
+- [x] **`AddrMod` is three bits on Blackhole** (entries 0..7). All 13 measured
+      layouts draw 14..16; `gen-isa` takes a `widened` list, held to the same rules
+      as `moved` (listed only if the width really changed). Every `AddrMod` gate also
+      runs `addr_mod(4)` -- the third bit alone -- against entry 4, on ttsim and both
+      cards; `llk_crosscheck` checks all 13 against LLK's `is_valid(addr_mode, 3)`.
+- [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
+      UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
+      did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
+      the Matrix Unit's `Src` reads drop or misplace datums in chip-specific column
+      pairs. Proven with a control: one card sent `GO_BUSY` through UMD passed every
+      gate, the idle one failed exactly as before. Fixed in `tt-device`:
+      `Device::open` sends `GO_BUSY` and waits for AICLK/VCORE to settle, `Drop` sends
+      `GO_LONG_IDLE`, `PowerPolicy::Manual` opts out (divergence row 48). **One
+      `Device` per chip**: busy/idle is chip-wide and not reference-counted.
+      Everything ruled out on the way (tile defect, burst/throttle, timing, config in
+      flight, formats, `LaneConfig`, zero flags, `ZEROSRC`, swizzle, the backend
+      pulse, encodings) is recorded in `silicon_measure.rs` m12-m32.
+- [x] **Stale `Config` between programs.** tt-metal left `SFPU_Fp32_enabled = 1` on
+      a tile and the step 4 gates read the previous run's product. The silicon
+      per-thread reset now starts with `backend::reset_config` (the deliberate
+      `STATE_RESET_EN` write), and runs on every tile a gate claims, not just the gate
+      tile (row 49).
+- [x] **Silicon regression: 146/148 on both cards**, the two failures being the
+      `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
+      replaced by two gates that run on both targets. Unfiltered run since: 116/116 on
+      each card, `silicon_measure` and `fma_oracle` included. After the Phase 6 close-out (window pool,
+      program slots, concurrent roles, tiles, tracing, `tt-kernels`): **129/129 on
+      each card** (258 run, 0 failed), unfiltered.
+- [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
+      "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
 
 ---
 
@@ -102,22 +174,21 @@ no answer.
       separate table entries; the superseded one lives under
       `isa::generated::defs::wormhole`, so using it has to be deliberate.
 - [x] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
-- [ ] **A dropped `Window` silently leaks its TLB window.** `Window` has no `Drop`
-      that returns the index to `Device`'s free list, so a gate that allocates and
-      does not `free_window` shrinks the pool for the rest of the process. Nothing
-      in the type system says so; it is currently a comment on `scrub`, which is
-      exactly the failure this section is about. It cost the Phase 1 silicon gate a
-      run (see Silicon operating notes) and the diagnostic was a bare
-      `OutOfBounds { offset: 0, len: 0 }` from an unrelated function.
-      **Why it is still open:** the obvious fix does not typecheck. `Drop` cannot
-      take `&mut Device`, so returning the index needs either a borrow of the
-      device in `Window` (which makes holding several windows at once — what the
-      exhaustion gate and every multi-window transfer do — a borrow conflict), or
-      shared interior mutability for the free list, or a `Device::scope`-style
-      closure owning the allocation. Pick one deliberately in Phase 2, when the
-      firmware path starts holding windows across calls and the cost of getting it
-      wrong goes up. Until then the exhaustion gate frees explicitly and `scrub`
-      names the cause.
+- [x] **A dropped `Window` silently leaked its TLB window.** It had no `Drop`, so
+      a gate that allocated and did not `free_window` shrank the pool for the rest
+      of the process, and the diagnostic was a bare `OutOfBounds { offset: 0,
+      len: 0 }` from an unrelated function. It cost the Phase 1 silicon gate a run.
+      The obvious fix does not typecheck (`Drop` cannot take `&mut Device`), and a
+      window that borrowed its device would make holding several at once a borrow
+      conflict. **Fixed with a shared pool:** the free list and shadow table live in
+      an `Arc<Mutex<Pool>>`, every `Window` holds a handle, and its `Drop` returns
+      the index and drops the shadow. `free_window` is now the explicit spelling of
+      the same thing. A window from another `Device` is refused
+      (`TransportError::Hazard`) before anything reaches the transport. Unit tests:
+      three passes over the whole pool by dropping, and the cross-device refusal;
+      the first watched failing with the release removed. On silicon,
+      `window_exhaustion_is_an_error_not_a_panic` now *drops* its 201 windows, and
+      the scrub that follows on the same device is the check (both cards).
 - [x] **A fused-off Tensix tile cannot be named by accident.** The predicate that looks
       obvious is the safe one: `grid::is_tensix_geometry(x, y)` answers "could a Tensix
       tile ever be here" and cannot hang anything, while `grid::Tensix::contains(x, y)`
@@ -318,14 +389,11 @@ allocation is global card state, so `window_exhaustion_is_an_error_not_a_panic`'
 `assert_eq!(held.len(), 201)` is only true if nothing else holds a window. The simulator
 hides this by handing out a fresh chip per call.
 
-**`Window` has no `Drop` that reaches the free list.** A gate that allocates must
-`free_window`; dropping leaks it. This surfaced only on silicon, because silicon's
-`in_device` scrubs the gate tile *after* the body and needs a window to do it, while the
-simulator's never scrubs at all. The one gate whose job is to exhaust windows was the one
-that starved the cleanup path. Tracked as an open item under Hazards to encode in the API,
-with the three candidate designs and why the obvious one does not typecheck — not left as
-"worth fixing at some point", which is the phrasing that produced the 140 in the first
-place.
+**`Window` had no `Drop` that reached the free list** (fixed; see Hazards to encode
+in the API). This surfaced only on silicon, because silicon's `in_device` scrubs the
+gate tile *after* the body and needs a window to do it, while the simulator's never
+scrubs at all. The one gate whose job is to exhaust windows was the one that starved
+the cleanup path.
 
 **When a run can take the node down, buy forensics first.** A hard kill loses the
 journal's last minutes *and* unflushed file data — a linked test binary came back as 9.2 MB
@@ -338,7 +406,23 @@ failing access instead of losing the output with the session.
 **`auto_reset_timeout=0` is the debugging posture.** It disables the ARC watchdog
 (`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a chip reset that
 drops the PCIe link and kills the host" into "card is wedged, recoverable". It removes the
-safety net that recovers a hung chip, so it is for bring-up, not for keeping.
+safety net that recovers a hung chip, so it is for bring-up, not for keeping. The harness
+and `cargo xtask silicon` report its value; neither refuses to run. The fix for a hang is
+the access that caused it, which is what the next note is.
+
+**A baby RISC-V's local data RAM does not answer the NoC while its core is in soft reset.**
+The slow-path aperture (`0xFFB1_4000..0xFFB1_DFFF`) is documented as NoC-reachable
+(`BabyRISCV/README.md:148`) and the page says nothing about reset. The first silicon probe of
+it wrote all five RAMs on the gate tile with every core held -- the harness's resting state --
+and never completed; the host died under it (run log `START` with no `END`, boot `497d5859`).
+`tt-exalens`, Tenstorrent's own debugger, never makes that access: its
+`ensure_private_memory_access` plants `jal x0, 0`, releases the core, halts it, and only
+then touches private memory, and its ELF loader stages private sections in L1 rather than
+writing them with the core in reset. `tt-device` now encodes the rule: `Device::read`/`write`
+refuse the aperture (`TransportError::Hazard`); `local_ram_read`/`local_ram_write` refuse a
+core in reset, wait out the post-release zeroing, bound T-cores to their 4 KiB, and move one
+dword per access; `park_core` puts a core in the exalens loop. Unit tests watch each refusal,
+and the reset check was watched failing with the check removed.
 
 **Do not run `probe_niu.rs` as a grid oracle.** It opens `Simulator` directly, so it is
 structurally simulator-only and *cannot* reach a card — which is fortunate, because
@@ -374,11 +458,25 @@ misattribution.
       it outright. Watched rejecting a deliberately planted `asm!("fence.i")`.
 - [x] **Gate (sim):** heartbeat climbs monotonically; a core held in reset does
       nothing; releasing one core does not disturb the others.
-- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
-      registers. The test is written and `#[cfg(feature = "silicon")]`.
-- [ ] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
+- [x] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
+      registers (divergence row 3). `step3_heartbeat::pc_snapshot_lands_in_the_loaded_image`
+      passes on both cards. The snapshot of a `j .` loop samples as the loop address
+      *and* loop + 4, which is what "speculative" means in practice.
+- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
       sequencing, I-cache invalidation and the local-RAM zeroing window are all
       things a simulator may model loosely, and all three land here.
+      **`step3_heartbeat` 7/7 on both cards** (2026-09-30): heartbeat, held-in-reset
+      control, reset round trip, `pc` snapshot inside the image, two tiles (the far
+      one taken from the grid rather than the fused-off `(16, 11)`), and both
+      refusals. Reset sequencing and the zeroing window are closed (below); the
+      I-cache invalidation path is what keeps this `[~]`.
+- [x] **The slow-path local-RAM aperture took the host down** -- because it was accessed
+      with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
+      notes) and **confirmed on both cards**: `silicon_local_ram` 4/4 on each. With cores
+      parked, all five RAMs round-trip in full through the aperture with no aliasing
+      (B/NC 2048 words, T0/T1/T2 1024); `DISABLE_RESET` reads back; releasing T0 with its
+      bit clear zeroes all 1024 words, and with it set keeps all 1024 -- the documented
+      behaviour, observed for the first time (open question 6, zeroing half).
 - [ ] **I-cache invalidation path.** Avoided by construction today — code is
       written before reset is released, and leaving reset invalidates the cache.
       Needed the moment anything reloads a *running* core: write the 5-bit mask to
@@ -460,12 +558,19 @@ misattribution.
       confirmed identical to `0b1111`, which the page's branch-free
       `(1 << RowsRemaining) - 1` advice depends on. `MVMUL` stays open: it needs
       `SrcA`/`SrcB` and is genuinely Phase 6.
-- [ ] **Stand up tracing.** `DebugTimestamper` gives a tile-wide 64-bit counter at
-      `0xFFB1_21F0` plus a hardware event-trace primitive: one store to
-      `RISCV_DEBUG_REG_TIMESTAMP` appends `{29-bit token, 64-bit counter}` to an L1
-      ring buffer. Strictly better than per-core `mcycle` for correlating events
-      across the five babies, and it pays for itself from Phase 5 onward. Use the
-      documented retry loop for concurrent readers.
+- [x] **Stand up tracing** (silicon only; ttsim models the counter and not the
+      stream, divergence row 54). `tt_isa::tensix::timestamper` holds the register
+      map, `tt_device::trace` configures buffer 0 (`configure_trace`: pulse the
+      sticky reset, clear `full`/`overflow`, buffer 1 off), decodes it
+      (`read_trace`, refusing an overflowed stream) and reads the counter with the
+      documented retry loop (`wall_clock`). The role firmware records `START`,
+      `PUSHED` and `RETIRED` as 128-bit events -- whole 16-byte writes, so three
+      cores share one stream -- when its mailbox's `TRACE` word is set;
+      `Run::traced` sets it and returns `Outcome::trace`. First use,
+      `step10_matmul_tile::the_timestamper_shows_the_roles_overlap`, both cards:
+      released together, the three roles start within ~800 cycles and overlap
+      throughout a ~1300-cycle two-round matmul; released in order, ~57 000 cycles
+      of host latency separate them (row 53, measured).
 - [~] **`SFPLOADMACRO`.** The simulator's refusal is now *watched* rather than
       quoted: `step5_corpus.rs` pushes one, asserts the child dies, and runs a
       control program of the same shape that survives. A silicon-side test of what
@@ -550,8 +655,11 @@ specification does not make.
 
 ### Open, and deliberately so
 
-- [ ] **Which `Z` plane is which face of a tile is a convention, not a
-      specification.** The address generator fixes the *order* datums are visited;
+- [x] **Which `Z` plane is which face of a tile is a convention, not a
+      specification.** *Settled by the tile matmul:* the unpacker takes face `z` as
+      the `z`-th `XDim * YDim` datums (its ADC `Z`), `tt_layout` puts face
+      `(z / 2, z % 2)` there, and the product is right on both targets and wrong
+      with the faces transposed. Row-major faces of row-major datums, as LLK. The address generator fixes the *order* datums are visited;
       nothing says which 2-D patch a `Z` plane corresponds to.
       `Layout::tt_metal_32x32` picks row-major faces of row-major datums, and
       `placement.rs` **pins** that choice with a test whose failure means the
@@ -640,7 +748,7 @@ undocumented.
       **returns `None` unless every product and sum is exact**, because `MVMUL.md`
       calls its float model "a rough guide" to order; the gates choose operands in
       that regime, and the reference caught one set that was not.
-- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..15, not
+- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..16, not
       the Wormhole diagram's 15..16 (row 42), so the generated encoder applied the
       wrong modifier for every non-zero value, silently. **Now fixed through the
       generator, not beside it:** `xtask/src/gen_isa/Bits32_BH.lua` holds measured
@@ -655,22 +763,80 @@ undocumented.
       **Open:** sweep every other Matrix Unit instruction with an `AddrMod` or a
       mode field — `ZEROACC` first, whose refused `UseDst32b` (row 40) is probably
       the same shift.
-- [ ] `PACR` out of a `MVMUL` result. The `Dst` dump suffices for one block; the
-      packer path exists from Phase 5 and needs only the `Dst` offsets.
-- [ ] Single 16×16 face → 32×32 tile → blocked → multi-tile. The tile step settles
-      the Phase 4 "which `Z` plane is which face" convention.
+- [x] **`PACR` out of a `MVMUL` result**, on ttsim and both cards -- the first
+      gate in which all three roles work. `datapath::pack_rows` packs any number
+      of `Dst` rows as one `PACR` per aligned group of four: the packer's input
+      `Ystride` is one FP32 row (64 bytes), a pack `AddrMod` entry steps ADC Y by
+      four between `PACR`s, and only the last carries `Last`, so the output
+      address generator keeps appending rather than restarting at `L1_Dest_addr`.
+      A final partial group gets `(1 << remaining) - 1`. Gates:
+      `step9_matmul::the_packer_writes_the_matmul_result_to_l1` (L1 = `Dst` dump
+      = `mvmul_reference`, sentinel intact past row 8) and
+      `a_partial_final_group_packs_only_its_rows` (six rows, nothing past them).
+      Watched failing with the Y step removed (L1 row 4 repeats row 0) and with an
+      empty math body. `PCK0_ADDR_BASE_REG_0_Base` is left at reset zero: it is
+      register 16, which ttsim does not model (row 28).
+- [x] **Concurrent roles, and the `Dst` hand-off.** `Run::concurrent` runs a
+      setup program on thread 0 (the `Dst` clear and `SEMINIT`s) and then releases
+      all three roles with **one** write to `SOFT_RESET_0`
+      (`Device::load_and_start_together`); `tt_isa::sync` carries the math -> pack
+      hand-off (`post_after` = `STALLWAIT` + `SEMPOST`, `take` = `SEMWAIT` +
+      `SEMGET`, B1 always blocked as `SEMWAIT.md` recommends, `Semaphore` a
+      newtype over `0..8`). Programs now live in fixed slots of
+      `mailbox::PROGRAM_REGION` (8192 words each, up from 256 inside the mailbox);
+      `step9_matmul::a_program_longer_than_the_old_mailbox_limit_runs_to_the_end`
+      pushes 2000 `SFPNOP`s before its `MVMUL`, watched failing with the firmware's
+      bound put back. Gates in `step10_matmul_tile.rs`, ttsim and both cards:
+      three unpack/`MVMUL` rounds through two banks accumulate and pack correctly
+      concurrently; in order, two rounds finish and three deadlock on role 0; and
+      without the semaphore the pack races the math (0/128 right) on both targets
+      -- which silicon showed only after the release was made simultaneous
+      (divergence row 53).
+- [x] **One 32×32 tile**, from `tt_layout` tile images to `tt_layout` de-tiling,
+      on ttsim and both cards (`step10_matmul_tile::a_32x32_tile_matmul_matches_the_model_and_burn`):
+      every datum equals `numerics::matmul_tile_reference` (face-composed
+      `mvmul_reference`) and `burn-flex`, which agree first; transpose control.
+      `matmul::tile_roles`: faces selected by the unpack thread's ADC `Z`
+      (`SETADCZW`, one of the eight backlog ADC instructions -- now exercised on
+      both targets) with `X` over all 256 datums; in0 -> `SrcB`, in1 -> `SrcA` as
+      LLK; 16 unpack pairs and 32 `MVMUL`s per tile, `SETRWC` choosing the `SrcB`
+      half; 64 `Dst` rows packed in 16 `PACR`s. Watched failing with `B`'s faces
+      transposed and with the `Z` select removed. Operands now sit at `Src` row 0:
+      the row-16/row-8 placement and its staged zero rows were a leftover of the
+      header off-by-one, and row 0 passes on both targets.
+- [x] **BF16 `Src`**, both routes (FP32 in L1 converted, BF16 in L1 as is), same
+      tile, both targets (`a_32x32_tile_matmul_through_bf16_src`). The operands are
+      exact in BF16, so this shows the routes work end to end, not that the
+      conversion truncates; the truncation itself is `probe_src`'s gate.
+- [x] **Multi-tile**, ttsim and both cards: `K` depth 2 and 4 (the unpacker
+      re-pointed at each pair's images with `WRCFG` of both `REG3_Base_address`
+      words between pairs, drained before and `CONFIG_BUSY`-waited after), `M`×`N`
+      output tiles (2×3), and padded shapes (`[13,47]@[47,29]`, `[1,64]@[64,96]`)
+      through `tt_layout`'s zero padding and cropping. `matmul::matmul_roles`:
+      one output tile in `Dst` at a time, `DST_FREE` (pack -> math, starts at 1)
+      guarding the `ZEROACC` and `DST_READY` (math -> pack) the `PACR`s; both
+      semaphores end where they started. `pack_rows` now resets the packer's ADC Y
+      first. Watched failing three ways: no re-pointing (K depth wrong), no
+      `DST_FREE` wait (output tile 0 packed as zeros), no Y reset (tile 1 packed
+      from the wrong rows).
 - [ ] Budget a standing percentage of the phase for empirical discovery rather
       than implementation. *(Borne out: six of the eight new divergence rows were
       found while building the first block.)*
 - [x] Do unpacker/packer bring-up **entirely in the simulator** — every refusal so
       far has been a specification question, answered and logged before moving on.
-- [ ] **Gate (sim):** matches **`burn-flex`** (not `burn-ndarray`, which is
-      deprecated) across shapes, dtypes, fidelity phases, accumulation depths. One
-      block, TF32, all phases, depth 2: done. Shapes, BF16 and depth: open.
-- [ ] **Gate (silicon):** same suite. Expect divergence here more than anywhere
-      else — this is where Wormhole-sourced assumptions will be wrong. Silicon twins
-      written for the two ttsim artefacts the gates correct for (the hidden base,
-      `MOVB2D` `Move4Rows`).
+- [x] **Gate (sim):** `step10_matmul_tile::a_shape_format_and_depth_sweep` --
+      four shapes (depth one to three tiles, three of them padded) by three `Src`
+      routes (FP32->TF32, FP32->BF16, BF16->BF16), each bit-exact against the
+      integer product; `burn-flex` checks the pairing on the single tile. Fidelity
+      phases are gated per block (`step9_matmul`, all four through
+      `FIDELITY_BASE` and through the RWC); the tile path runs phase 0 on operands
+      phase 0 represents exactly, so multi-phase *tiles* are not yet exercised.
+      Noted rather than ticked separately: nothing a Burn backend needs first
+      depends on it.
+- [x] **Gate (silicon):** the same suite, unreduced, passes on both cards --
+      18/18 in `step10_matmul_tile` per card, with no divergence from ttsim. The
+      one silicon-only finding on the way was the harness's (row 53): cores
+      released one by one ran in sequence.
 
 ---
 
@@ -679,19 +845,35 @@ undocumented.
 **This is the milestone.** Everything before it is infrastructure; everything after
 is reach or speed.
 
-- [ ] Verify the `Backend` supertrait list against the **pinned** Burn version —
-      it moves quickly, and `QTensorOps`/`TransactionOps`/`BackendTypes` are recent
-      additions.
-- [ ] Implement a narrow core: matmul, add/sub/mul, relu, reshape, transpose,
-      reduce sum/mean, broadcast. Let Burn's defaults compose the rest — slow but
-      correct. Replace defaults by profiling, not by guess.
+- [x] **Verify the `Backend` supertrait list against the pinned Burn version**
+      (0.21.0, from source): see `RUST_IMPL_PLAN.md`, "The Burn surface, as
+      pinned". Associated types live on `BackendTypes`; `Backend` requires only
+      `name`, `seed`, `dtype_usage`, `device_count`.
+- [ ] ~~Implement a narrow core and let Burn's defaults compose the rest.~~ **Not
+      possible in 0.21:** about two hundred op methods have no default. Instead,
+      `burn-tt` v0 delegates every op to `burn-flex` on the host and routes matmul
+      to `tt_kernels::matmul::matmul`; ops move to the device one at a time, each
+      gated against the delegate it replaces.
+- [ ] **Four-phase (HiFi) matmul at tile level** before training on real data:
+      `tt_kernels::matmul` runs phase 0 only.
+- [x] **`tt-kernels`, the shippable half of the test harness.** `datapath` and
+      `matmul` moved out of `tt-tests` (re-exported there, so the gates read the
+      same); `runtime::run` is the role runner -- stage, program slots, in-order
+      or concurrent schedule, trace, read back -- returning `RunError` rather than
+      panicking, and holding the role cores in reset again on every path.
+      `harness::run_roles` is now a thin wrapper that panics on error.
+      `matmul::matmul(dev, tile, images, a, b, [m, k, n], route, budget)` is the
+      entry point a backend calls; `step10_matmul_tile`'s sweep goes through it.
+      `tt-kernels` is `SHIPPABLE` in `xtask/src/ship.rs` and passes
+      `check-no-sim-in-ship`. **Open:** the role firmware images are still built by
+      `tt-tests/build.rs` and passed in; a shipped runtime needs them from
+      somewhere it owns. A tiled eltwise kernel is not written yet.
 - [ ] `QTensorOps` may start unsupported if quantization is out of scope.
-- [ ] **Resolve open question 3 before designing kernel dispatch:** does
-      `burn-fusion` compose with a hand-written backend? CubeCL-based backends
-      compose with autodiff *and* fusion; external ones likely with autodiff only.
-      Tensix strongly wants fused unpack→math→pack chains, so fusion must either
-      live inside `burn-tt` or be revisited as a CubeCL-target question. **This
-      shapes Phase 9.**
+- [x] **Open question 3: `burn-fusion` does compose with a hand-written
+      backend.** `Fusion<B: FusionBackend>`, where `FusionBackend` is `BackendIr` +
+      a `FusionRuntime` supplying `OperationFuser`s over `OperationIr`. Fused
+      unpack -> math -> pack chains are a `burn-tt` fuser (Phase 9), not a CubeCL
+      question.
 - [ ] **Gate (sim):** MNIST MLP trains through `burn-autodiff` on a reduced
       dataset — loss descends, final weights match ndarray within tolerance,
       optimizer step correct. Determinism makes this a regression test too.
@@ -851,8 +1033,8 @@ Documented, not speculative. These bite in Phases 2–4.
 - [ ] **2.** Blackhole debug-interface parity is unverified — the four `RISC_DBG_*`
       registers are named at Wormhole's base but no Blackhole bit layouts exist.
       Prototype against silicon before committing to a GDB-stub architecture.
-- [ ] **3.** Does `burn-fusion` compose with a hand-written backend? Decide before
-      designing kernel dispatch (Phase 7); it shapes Phase 9.
+- [x] **3.** Does `burn-fusion` compose with a hand-written backend? **Yes** --
+      see Phase 7 and `RUST_IMPL_PLAN.md`, "The Burn surface, as pinned".
 - [ ] **4.** Is the NoC Overlay required for multi-chip? Resolve in the Phase 8 spike.
 - [ ] **5.** PCIe DMA engines have no register-level documentation anywhere in the
       repo. Plan on TLB-window MMIO for bulk transfer; revisit only if bandwidth

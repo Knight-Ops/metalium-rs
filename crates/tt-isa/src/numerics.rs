@@ -284,9 +284,71 @@ pub fn mvmul_reference(
     Some(out)
 }
 
+/// A 32x32 tile matmul, `dst += a @ b`, composed from [`mvmul_reference`] the
+/// way the Matrix Unit composes it: output face `(i, j)` accumulates
+/// `a` face `(i, k)` (as `SrcB`, eight rows at a time) against `b` face
+/// `(k, j)` (as `SrcA`), for `k = 0, 1`, in that order.
+///
+/// Faces are the four 16x16 quadrants, row-major. `None` wherever
+/// [`mvmul_reference`] would be: the composition is only a model while every
+/// product and sum stays exact.
+pub fn matmul_tile_reference(
+    dst: &[[f32; 32]; 32],
+    a: &[[f32; 32]; 32],
+    b: &[[f32; 32]; 32],
+    phases: &[u32],
+) -> Option<[[f32; 32]; 32]> {
+    let mut out = *dst;
+    for fi in 0..2 {
+        for fj in 0..2 {
+            for half in 0..2 {
+                let r0 = 16 * fi + 8 * half;
+                let mut acc = [[0f32; 16]; 8];
+                for (i, row) in acc.iter_mut().enumerate() {
+                    row.copy_from_slice(&out[r0 + i][16 * fj..16 * fj + 16]);
+                }
+                for k in 0..2 {
+                    let mut src_b = [[0f32; 16]; 8];
+                    for (i, row) in src_b.iter_mut().enumerate() {
+                        row.copy_from_slice(&a[r0 + i][16 * k..16 * k + 16]);
+                    }
+                    let mut src_a = [[0f32; 16]; 16];
+                    for (i, row) in src_a.iter_mut().enumerate() {
+                        row.copy_from_slice(&b[16 * k + i][16 * fj..16 * fj + 16]);
+                    }
+                    acc = mvmul_reference(&acc, &src_b, &src_a, phases)?;
+                }
+                for (i, row) in acc.iter().enumerate() {
+                    out[r0 + i][16 * fj..16 * fj + 16].copy_from_slice(row);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tile_reference_is_the_integer_product() {
+        let mut a = [[0f32; 32]; 32];
+        let mut b = [[0f32; 32]; 32];
+        for i in 0..32 {
+            for j in 0..32 {
+                a[i][j] = ((i * 7 + j * 3) % 23) as f32 - 11.0;
+                b[i][j] = ((i * 5 + j * 11) % 17) as f32 - 8.0;
+            }
+        }
+        let got = matmul_tile_reference(&[[0f32; 32]; 32], &a, &b, &[0]).unwrap();
+        for i in 0..32 {
+            for j in 0..32 {
+                let want: f32 = (0..32).map(|k| a[i][k] * b[k][j]).sum();
+                assert_eq!(got[i][j], want, "[{i}][{j}]");
+            }
+        }
+    }
 
     #[test]
     fn fidelity_phases_split_each_operand_exactly() {

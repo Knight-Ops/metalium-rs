@@ -20,5 +20,6 @@ pub mod matrix;
 pub mod noc;
 pub mod numerics;
 pub mod sfpu;
+pub mod sync;
 pub mod tensix;
 pub mod tile;

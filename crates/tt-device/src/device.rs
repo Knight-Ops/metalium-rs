@@ -3,9 +3,12 @@
 //! Wraps a [`Transport`] with the two things every caller above it needs: a window
 //! allocator, and transfers that are split so no access ever straddles a window.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use tt_isa::noc::{niu, ChipId, NocCoord, NocId, TileType};
+use tt_isa::tensix::{self, Core};
 
 use crate::tlb::{
     self, TlbConfig, WindowKind, KERNEL_RESERVED_WINDOW, NUM_2MIB_WINDOWS, NUM_WINDOWS,
@@ -14,13 +17,47 @@ use crate::{Bar, Result, Transport, TransportError};
 
 /// A TLB window reserved for this `Device`'s use.
 ///
-/// Returned by [`Device::alloc_window`] and released with [`Device::free_window`].
-/// Not `Copy`: two callers holding the same index would retarget the window under
+/// Returned by [`Device::alloc_window`]. Dropping it returns the index to the
+/// `Device`'s pool; [`Device::free_window`] does the same, explicitly. Not
+/// `Copy`: two callers holding the same index would retarget the window under
 /// each other.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// The pool is shared rather than borrowed because `Drop` cannot take
+/// `&mut Device`, and a window that borrowed its device would make holding
+/// several at once -- what every multi-window transfer does -- a borrow
+/// conflict. Before this, a dropped window was lost to the pool for the rest of
+/// the process, silently; that cost the Phase 1 silicon gate a run.
 pub struct Window {
     index: u16,
     kind: WindowKind,
+    pool: Arc<Mutex<Pool>>,
+}
+
+impl std::fmt::Debug for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Window")
+            .field("index", &self.index)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl PartialEq for Window {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && Arc::ptr_eq(&self.pool, &other.pool)
+    }
+}
+
+impl Eq for Window {}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // A poisoned pool means a panic while it was held; the index is lost,
+        // which is the old behaviour and no worse than the panic itself.
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.release(self.index);
+        }
+    }
 }
 
 impl Window {
@@ -46,6 +83,28 @@ struct Shadow {
     readable: bool,
 }
 
+/// The windows a `Device` has not handed out, and what each configured one
+/// points at. Shared with every [`Window`] so that dropping one can return it.
+#[derive(Debug)]
+struct Pool {
+    /// Windows not currently handed out, lowest first.
+    free: Vec<u16>,
+    shadow: BTreeMap<u16, Shadow>,
+}
+
+impl Pool {
+    /// Return `index` to the free list, dropping its shadow entry so the next
+    /// holder cannot inherit a stale belief about where it points. The hardware
+    /// configuration is left as it was: there is no "unconfigured" state to
+    /// restore it to, and the next holder reconfigures before use.
+    fn release(&mut self, index: u16) {
+        self.shadow.remove(&index);
+        let insert_at = self.free.partition_point(|&i| i < index);
+        debug_assert!(self.free.get(insert_at) != Some(&index), "double release");
+        self.free.insert(insert_at, index);
+    }
+}
+
 /// A tile found by [`Device::discover_tiles`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tile<N: NocId> {
@@ -60,9 +119,87 @@ pub struct Tile<N: NocId> {
 pub struct Device<T: Transport> {
     transport: T,
     chip: ChipId,
-    /// Windows not currently handed out, lowest first.
-    free: Vec<u16>,
-    shadow: BTreeMap<u16, Shadow>,
+    pool: Arc<Mutex<Pool>>,
+    /// When this `Device` last released each core from reset, keyed by
+    /// `(NoC index, x, y, core)`. Read by the local-data-RAM accessors, which
+    /// must not touch a core's RAM during the zeroing that follows a release.
+    pub(crate) released: HashMap<(u8, u8, u8, Core), Instant>,
+    /// Did [`Device::open`] raise the chip to its busy operating point? If so,
+    /// dropping the `Device` returns it to idle.
+    busy: bool,
+}
+
+/// Who manages the chip's operating point (ARC `AICLK_GO_BUSY` / `GO_LONG_IDLE`).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum PowerPolicy {
+    /// Raise the chip to busy on open, and return it to idle on drop. The
+    /// default, and what UMD does.
+    #[default]
+    Busy,
+    /// Send nothing: the caller calls [`Device::set_busy`] itself, before any
+    /// compute. For explicit power management.
+    Manual,
+}
+
+/// Return the chip to its idle operating point if [`Device::open`] raised it.
+///
+/// **One `Device` per chip.** Busy/idle is chip-wide ARC state with no
+/// reference count: if two `Device`s -- in this process or another, tt-metal
+/// included -- hold the same chip, the first to drop idles it under the other,
+/// which then computes at the operating point where the Matrix Unit's `Src`
+/// reads are unreliable (divergence row 48). A failure here can only be
+/// reported, not returned; the worst case is a chip left busy, which is safe.
+impl<T: Transport> Drop for Device<T> {
+    fn drop(&mut self) {
+        if !self.busy {
+            return;
+        }
+        let Ok(w) = self.alloc_window(crate::tlb::WindowKind::TwoMib) else {
+            eprintln!(
+                "tt-device: no TLB window to return chip {:?} to idle",
+                self.chip
+            );
+            return;
+        };
+        if let Err(e) = self.set_busy(&w, false) {
+            eprintln!(
+                "tt-device: could not return chip {:?} to idle: {e}",
+                self.chip
+            );
+        }
+        self.free_window(w);
+    }
+}
+
+/// Refuse a plain access to the local-data-RAM aperture.
+///
+/// A baby RISC-V's local data RAM does not answer the NoC while its core is held
+/// in soft reset: the request is never completed, the NoC hangs, and the ARC
+/// recovers with a chip reset that drops the PCIe link. On a card passed through
+/// to a VM that takes the host down, which is how this was found
+/// (`silicon_local_ram.rs`, 2026-09-30). Whether a core is in reset is state on
+/// the chip, not something a plain `read`/`write` knows, so the aperture is only
+/// reachable through [`Device::local_ram_read`] and [`Device::local_ram_write`],
+/// which check it.
+///
+/// Ethernet tiles map different registers at these addresses; reaching them
+/// will need its own accessor when Phase 8 does.
+fn refuse_local_ram_aperture(address: u64, len: usize) -> Result<()> {
+    if touches_local_ram_aperture(address, len) {
+        return Err(TransportError::Hazard {
+            address,
+            reason: "the local-data-RAM aperture hangs the NoC if the owning core is in \
+                     reset; use Device::local_ram_read / local_ram_write",
+        });
+    }
+    Ok(())
+}
+
+/// Does `[address, address + len)` touch the NoC-visible local-data-RAM
+/// aperture (`0xFFB1_4000..0xFFB1_E000`)?
+fn touches_local_ram_aperture(address: u64, len: usize) -> bool {
+    let end = address.saturating_add(len as u64);
+    address < tensix::LOCAL_DATA_RAM_NOC_END && end > tensix::LOCAL_DATA_RAM_NOC_BASE
 }
 
 impl<T: Transport> Device<T> {
@@ -70,7 +207,18 @@ impl<T: Transport> Device<T> {
     ///
     /// Every address constant in this crate is Blackhole-specific; against another
     /// part they are merely plausible, which is the worst kind of wrong.
-    pub fn open(mut transport: T) -> Result<Self> {
+    pub fn open(transport: T) -> Result<Self> {
+        Self::open_with_power(transport, PowerPolicy::Busy)
+    }
+
+    /// [`Device::open`], choosing who manages the chip's operating point.
+    ///
+    /// [`PowerPolicy::Busy`] is what `open` does. [`PowerPolicy::Manual`] sends no
+    /// power message on open or on drop: the caller owns the operating point and
+    /// must call [`Device::set_busy`] before any compute, because at idle the
+    /// Matrix Unit's `Src` reads are unreliable (divergence row 48). For power
+    /// management that raises the clock only around work.
+    pub fn open_with_power(mut transport: T, power: PowerPolicy) -> Result<Self> {
         transport.verify_is_blackhole()?;
 
         // Window 201 belongs to the kernel driver and must never be handed out --
@@ -85,12 +233,29 @@ impl<T: Transport> Device<T> {
         // would let a `Device` claim to be a chip it does not address.
         let chip = transport.chip();
 
-        Ok(Device {
+        let mut dev = Device {
             transport,
             chip,
-            free,
-            shadow: BTreeMap::new(),
-        })
+            pool: Arc::new(Mutex::new(Pool {
+                free,
+                shadow: BTreeMap::new(),
+            })),
+            released: HashMap::new(),
+            busy: false,
+        };
+
+        // Compute needs the busy operating point; see `Device::set_busy`. Held
+        // for the life of the `Device`, and given back by `Drop`, as UMD's
+        // `LocalChip` does. The ARC message touches only the ARC tile, which is
+        // safe before the harvesting mask or the translation state is known.
+        if power == PowerPolicy::Busy && !dev.transport.is_simulated() {
+            let w = dev.alloc_window(crate::tlb::WindowKind::TwoMib)?;
+            let result = dev.set_busy(&w, true);
+            dev.free_window(w);
+            result?;
+            dev.busy = true;
+        }
+        Ok(dev)
     }
 
     pub fn chip(&self) -> ChipId {
@@ -106,16 +271,42 @@ impl<T: Transport> Device<T> {
         self.transport.tick(n);
     }
 
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        // Poisoning needs a panic inside `Pool::release` or the few lines below
+        // that hold the lock, none of which can panic; recover rather than
+        // propagate a panic from an unrelated thread.
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Refuse a window handed out by a different `Device`: its index means a
+    /// different window of a different chip's BAR here.
+    fn check_owned(&self, window: &Window) -> Result<()> {
+        if Arc::ptr_eq(&window.pool, &self.pool) {
+            Ok(())
+        } else {
+            Err(TransportError::Hazard {
+                address: 0,
+                reason: "this window was allocated by a different Device",
+            })
+        }
+    }
+
     /// Reserve a window of the requested geometry.
     pub fn alloc_window(&mut self, kind: WindowKind) -> Result<Window> {
-        let position = self
+        let mut pool = self.pool();
+        let position = pool
             .free
             .iter()
             .position(|&i| tlb::window_kind(i) == Some(kind));
         match position {
             Some(p) => {
-                let index = self.free.remove(p);
-                Ok(Window { index, kind })
+                let index = pool.free.remove(p);
+                drop(pool);
+                Ok(Window {
+                    index,
+                    kind,
+                    pool: Arc::clone(&self.pool),
+                })
             }
             None => Err(TransportError::OutOfBounds {
                 bar: kind.bar(),
@@ -125,17 +316,14 @@ impl<T: Transport> Device<T> {
         }
     }
 
-    /// Return a window to the pool.
-    ///
-    /// The hardware configuration is left as it was: there is no "unconfigured"
-    /// state to restore it to, and the next allocator will reconfigure before use.
-    /// The shadow entry is dropped so the next holder cannot inherit a stale belief
-    /// about where it points.
+    /// Return a window to the pool now. Dropping it does the same; this is the
+    /// spelling for a caller that wants the release to be visible.
     pub fn free_window(&mut self, window: Window) {
-        self.shadow.remove(&window.index);
-        let index = window.index;
-        let insert_at = self.free.partition_point(|&i| i < index);
-        self.free.insert(insert_at, index);
+        debug_assert!(
+            Arc::ptr_eq(&window.pool, &self.pool),
+            "freed a window allocated by a different Device"
+        );
+        drop(window);
     }
 
     /// Point a window at a device address in a tile, if it is not already there.
@@ -145,6 +333,7 @@ impl<T: Transport> Device<T> {
         coord: NocCoord<N>,
         base_address: u64,
     ) -> Result<()> {
+        self.check_owned(window)?;
         let config = TlbConfig::unicast(base_address, coord);
         let words = config
             .encode(window.kind)
@@ -159,11 +348,11 @@ impl<T: Transport> Device<T> {
             readable: config.is_readable(),
         };
 
-        if self.shadow.get(&window.index) == Some(&shadow) {
+        if self.pool().shadow.get(&window.index) == Some(&shadow) {
             return Ok(());
         }
         tlb::write_config(&mut self.transport, window.index, &config)?;
-        self.shadow.insert(window.index, shadow);
+        self.pool().shadow.insert(window.index, shadow);
         Ok(())
     }
 
@@ -171,7 +360,22 @@ impl<T: Transport> Device<T> {
     ///
     /// Splits the transfer so that no single access straddles a window boundary,
     /// retargeting the window as it goes.
+    ///
+    /// Refuses the local-data-RAM aperture; see [`Device::local_ram_write`].
     pub fn write<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        refuse_local_ram_aperture(address, data.len())?;
+        self.write_unchecked(window, coord, address, data)
+    }
+
+    /// [`Device::write`] without the aperture refusal, for the accessors that
+    /// have established the access is safe.
+    pub(crate) fn write_unchecked<N: NocId>(
         &mut self,
         window: &Window,
         coord: NocCoord<N>,
@@ -188,7 +392,21 @@ impl<T: Transport> Device<T> {
     }
 
     /// Read from `address` in the tile at `coord` into `out`, through `window`.
+    ///
+    /// Refuses the local-data-RAM aperture; see [`Device::local_ram_read`].
     pub fn read<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        refuse_local_ram_aperture(address, out.len())?;
+        self.read_unchecked(window, coord, address, out)
+    }
+
+    /// [`Device::read`] without the aperture refusal.
+    pub(crate) fn read_unchecked<N: NocId>(
         &mut self,
         window: &Window,
         coord: NocCoord<N>,
@@ -430,6 +648,10 @@ mod tests {
         }
 
         fn tick(&mut self, _n: u32) {}
+
+        fn is_simulated(&self) -> bool {
+            true
+        }
     }
 
     fn device() -> Device<FakeTransport> {
@@ -461,11 +683,11 @@ mod tests {
     #[test]
     fn kernel_window_is_never_allocated() {
         let mut d = device();
-        let mut seen = Vec::new();
-        // Drain every 2 MiB window.
-        for _ in 0..USABLE_2MIB_WINDOWS {
-            seen.push(d.alloc_window(WindowKind::TwoMib).unwrap().index);
-        }
+        // Drain every 2 MiB window, holding them: a dropped window goes back.
+        let held: Vec<Window> = (0..USABLE_2MIB_WINDOWS)
+            .map(|_| d.alloc_window(WindowKind::TwoMib).unwrap())
+            .collect();
+        let seen: Vec<u16> = held.iter().map(Window::index).collect();
         assert!(!seen.contains(&KERNEL_RESERVED_WINDOW));
         assert_eq!(seen.len(), 201);
         // And the pool is now empty for that geometry, but not for the other.
@@ -497,6 +719,49 @@ mod tests {
             config_write_count(&d) > before,
             "reconfiguration must be repeated"
         );
+    }
+
+    #[test]
+    fn a_dropped_window_returns_to_the_pool() {
+        let mut d = device();
+        // Several passes over the whole pool, dropping each window rather than
+        // freeing it. Before `Window` had a `Drop`, the second pass failed.
+        for _ in 0..3 {
+            let held: Vec<Window> = (0..USABLE_2MIB_WINDOWS)
+                .map(|_| d.alloc_window(WindowKind::TwoMib).unwrap())
+                .collect();
+            assert!(d.alloc_window(WindowKind::TwoMib).is_err());
+            drop(held);
+        }
+        // And a dropped window loses its shadow, as a freed one does.
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        d.write(&w, c(1, 2), 0, &[1; 4]).unwrap();
+        let before = config_write_count(&d);
+        drop(w);
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        d.write(&w, c(1, 2), 0, &[1; 4]).unwrap();
+        assert!(
+            config_write_count(&d) > before,
+            "reconfiguration must repeat"
+        );
+    }
+
+    #[test]
+    fn a_window_from_another_device_is_refused() {
+        let mut a = device();
+        let mut b = device();
+        let wa = a.alloc_window(WindowKind::TwoMib).unwrap();
+        let wb = b.alloc_window(WindowKind::TwoMib).unwrap();
+        // Same index, different chips' pools.
+        assert_eq!(wa.index(), wb.index());
+        assert_ne!(wa, wb);
+        let before = b.transport.writes.len();
+        let e = b.write32(&wa, c(1, 2), 0x100, 1).unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        let e = b.read32(&wa, c(1, 2), 0x100).unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        assert_eq!(b.transport.writes.len(), before, "nothing may be sent");
+        b.write32(&wb, c(1, 2), 0x100, 1).unwrap();
     }
 
     #[test]
@@ -582,5 +847,106 @@ mod tests {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         // The fake serves zeroes, which stands in for "nothing there".
         assert_eq!(d.probe_tile(&w, c(9, 9)).unwrap(), None);
+    }
+
+    // -- The local-data-RAM aperture ------------------------------------------
+
+    fn gate_tile() -> NocCoord<Noc0> {
+        NocCoord::new(3, 4).unwrap()
+    }
+
+    #[test]
+    fn plain_accesses_to_the_local_ram_aperture_are_refused() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        for core in Core::ALL {
+            let at = core.local_data_ram_noc_address();
+            let e = dev.write32(&w, t, at, 1).unwrap_err();
+            assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+            let e = dev.read32(&w, t, at).unwrap_err();
+            assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        }
+        // A transfer that merely overlaps the aperture's first byte is caught too.
+        let e = dev
+            .write(&w, t, tensix::LOCAL_DATA_RAM_NOC_BASE - 2, &[0; 4])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        // And its neighbours are not: the debug registers and the NoC 0 NIU.
+        dev.write32(&w, t, tensix::LOCAL_DATA_RAM_NOC_BASE - 4, 0)
+            .unwrap();
+        dev.read32(&w, t, tensix::LOCAL_DATA_RAM_NOC_END).unwrap();
+        assert!(dev.transport.writes.iter().all(|&(_, off, _)| {
+            // Nothing that reached the transport landed in the aperture.
+            dev.transport
+                .translate(off)
+                .is_none_or(|(_, a)| !touches_local_ram_aperture(a, 1))
+        }));
+    }
+
+    #[test]
+    fn local_ram_is_refused_while_its_core_is_held_in_reset() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        dev.set_core_reset(&w, t, Core::T1, true).unwrap();
+        let before = dev.transport.writes.len();
+        let e = dev
+            .local_ram_write(&w, t, Core::T1, 0, &[1, 2, 3, 4])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        assert_eq!(dev.transport.writes.len(), before, "nothing may be sent");
+        let mut buf = [0u8; 4];
+        let e = dev
+            .local_ram_read(&w, t, Core::T1, 0, &mut buf)
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+    }
+
+    #[test]
+    fn local_ram_round_trips_once_its_core_is_running() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        dev.set_core_reset(&w, t, Core::T1, true).unwrap();
+        dev.park_core(&w, t, Core::T1, 0x4_0000).unwrap();
+        assert!(!dev.is_core_in_reset(&w, t, Core::T1).unwrap());
+        dev.local_ram_write(&w, t, Core::T1, 16, &[9, 8, 7, 6])
+            .unwrap();
+        let mut back = [0u8; 4];
+        dev.local_ram_read(&w, t, Core::T1, 16, &mut back).unwrap();
+        assert_eq!(back, [9, 8, 7, 6]);
+        // Where it landed: T1's slow-path window.
+        let at = Core::T1.local_data_ram_noc_address() + 16;
+        assert_eq!(dev.transport.mem.get(&(t.packed(), at)), Some(&9));
+    }
+
+    #[test]
+    fn local_ram_refuses_the_upper_half_of_a_t_core_window() {
+        let mut dev = device();
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = gate_tile();
+        let size = u64::from(Core::T0.local_data_ram_size());
+        let e = dev
+            .local_ram_write(&w, t, Core::T0, size - 4, &[0; 8])
+            .unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        // B's RAM is 8 KiB, so the same offset is fine there.
+        dev.local_ram_write(&w, t, Core::B, size - 4, &[0; 8])
+            .unwrap();
+    }
+
+    // -- Power policy ----------------------------------------------------------
+
+    /// A simulated transport never sends power messages, under either policy;
+    /// and the policy is what `open` defaults to.
+    #[test]
+    fn power_policy_is_busy_by_default_and_inert_on_the_simulator() {
+        assert_eq!(PowerPolicy::default(), PowerPolicy::Busy);
+        let dev = device();
+        assert!(!dev.busy, "no ARC to message on a simulated transport");
+        let manual =
+            Device::open_with_power(FakeTransport::default(), PowerPolicy::Manual).unwrap();
+        assert!(!manual.busy);
     }
 }

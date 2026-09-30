@@ -267,6 +267,10 @@ impl Transport for LibTtsim<'_> {
         unsafe { (self.lib.clock)(n) }
     }
 
+    fn is_simulated(&self) -> bool {
+        true
+    }
+
     fn chip(&self) -> ChipId {
         self.chip
     }

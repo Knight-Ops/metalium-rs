@@ -6,8 +6,11 @@
 //! `build.rs` can build the device firmware and hand the images to the tests.
 
 pub mod backend;
-pub mod datapath;
 pub mod harness;
+
+/// The kernels moved to `tt-kernels`, which ships; re-exported so the gates
+/// that established them still read `tt_tests::datapath`.
+pub use tt_kernels::{datapath, matmul};
 
 /// Firmware images, built from `crates/tt-firmware` by this crate's `build.rs`
 /// and checked for instructions Blackhole cannot execute.
@@ -24,7 +27,35 @@ pub mod firmware {
     ///
     /// Adding a case to the instruction corpus is a host-side change, not a
     /// firmware one.
+    ///
+    /// Built for the core [`crate::harness::CORE`] names: T1 on the simulator, T0
+    /// on silicon. See `tt_firmware::corpus`.
+    #[cfg(not(feature = "silicon"))]
     pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
+    #[cfg(feature = "silicon")]
+    pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
+
+    /// The three role images of the LLK-shaped datapath -- unpack on T0, math on
+    /// T1, pack on T2 -- each linked at its core's default reset PC so all three
+    /// fit in one tile's L1 at once. See `tt_firmware::corpus` and
+    /// `tt_isa::mailbox::role`.
+    pub const ROLES: [(tt_isa::tensix::Core, &[u8], u64); 3] = [
+        (
+            tt_isa::tensix::Core::T0,
+            include_bytes!(env!("FIRMWARE_ROLE_T0")),
+            0x6000,
+        ),
+        (
+            tt_isa::tensix::Core::T1,
+            include_bytes!(env!("FIRMWARE_ROLE_T1")),
+            0xA000,
+        ),
+        (
+            tt_isa::tensix::Core::T2,
+            include_bytes!(env!("FIRMWARE_ROLE_T2")),
+            0xE000,
+        ),
+    ];
 
     /// Where a firmware image must be loaded in L1.
     ///

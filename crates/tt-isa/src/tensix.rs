@@ -254,6 +254,54 @@ pub const NCRISC_RESET_PC: u64 = 0xFFB1_2238;
 /// Bit 0 enables the override.
 pub const NCRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_223C;
 
+/// The tile's debug timestamper (`TensixTile/DebugTimestamper.md`, identical to
+/// Wormhole's): a 64-bit cycle counter, and an event stream that appends
+/// `{token, counter}` records to a buffer in L1, one store per event.
+///
+/// Reachable from every baby RISC-V and over the NoC.
+pub mod timestamper {
+    /// `RISCV_DEBUG_REG_WALL_CLOCK_L`: the counter's low half. Reading it also
+    /// latches the high half for [`WALL_CLOCK_H`].
+    pub const WALL_CLOCK_L: u64 = 0xFFB1_21F0;
+    /// The counter's live high half, for the multi-reader retry loop.
+    pub const WALL_CLOCK_L_PLUS_4: u64 = 0xFFB1_21F4;
+    /// The high half latched by the last [`WALL_CLOCK_L`] read.
+    pub const WALL_CLOCK_H: u64 = 0xFFB1_21F8;
+    /// `RISCV_DEBUG_REG_TIMESTAMP`: a store appends an event; the low three bits
+    /// choose its size.
+    pub const TIMESTAMP: u64 = 0xFFB1_21FC;
+    /// Buffer enables (bits 0, 1) and the sticky stream reset (bit 31).
+    pub const CNTL: u64 = 0xFFB1_2200;
+    /// `RISCV_DEBUG_REG_TIMESTAMP_STATUS`: sticky full/overflow bits and buffer
+    /// 0's write position (bits 14..32, in 16-byte units).
+    pub const STATUS: u64 = 0xFFB1_2204;
+    /// Buffer 0's first and last 16-byte unit.
+    pub const BUF0_START: u64 = 0xFFB1_2208;
+    pub const BUF0_END: u64 = 0xFFB1_220C;
+
+    /// Low three bits of a 128-bit event, `{header, counter_lo, counter_hi, 0}`:
+    /// the size that needs no write-accumulation buffer, so events from
+    /// several cores cannot interleave within one another.
+    pub const APPEND_128B: u32 = 0;
+    /// Bytes one 128-bit event occupies in L1.
+    pub const EVENT_BYTES: u64 = 16;
+
+    /// The header for an event carrying `token`: the 29 bits above the size.
+    pub const fn event_128(token: u32) -> u32 {
+        (token << 3) | APPEND_128B
+    }
+
+    /// Buffer 0's write position from a [`STATUS`] read, in events.
+    pub const fn buf0_position(status: u32) -> u32 {
+        status >> 14
+    }
+
+    /// [`STATUS`] bit 4: buffer 0 overflowed; events were dropped.
+    pub const fn buf0_overflowed(status: u32) -> bool {
+        status & (1 << 4) != 0
+    }
+}
+
 /// First byte of the NoC-visible local-data-RAM aperture
 /// (`BabyRISCV/README.md:109`).
 pub const LOCAL_DATA_RAM_NOC_BASE: u64 = 0xFFB1_4000;

@@ -11,33 +11,11 @@
 //! shape sweep belongs in `tt-layout`, where it costs nothing; here each case forks
 //! a process and boots a simulator.
 
-use tt_device::{tlb::WindowKind, Device};
-use tt_isa::noc::{grid, Noc0, NocCoord};
+use tt_device::tlb::WindowKind;
+use tt_isa::noc::grid;
 use tt_isa::tile::L1Format;
 use tt_layout::{detilize, tilize, HostDtype, Layout, TensorView, TensorViewMut};
-use tt_ttsim::{fork_scope, Simulator};
-
-type Dev<'a> = Device<tt_ttsim::LibTtsim<'a>>;
-
-#[track_caller]
-fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
-    let result = fork_scope(|| {
-        let mut sim = Simulator::open().unwrap_or_else(|e| panic!("could not open simulator: {e}"));
-        let mut dev = Device::open(sim.transport()).unwrap_or_else(|e| panic!("{e}"));
-        f(&mut dev);
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-}
-
-fn tensix(x: u8, y: u8) -> NocCoord<Noc0> {
-    assert!(
-        grid::is_tensix_geometry(x, y),
-        "({x},{y}) is not a Tensix tile"
-    );
-    NocCoord::new(x, y).unwrap()
-}
+use tt_tests::harness::{in_device, tile, Dev};
 
 /// Where the tiled buffer is staged.
 ///
@@ -73,7 +51,7 @@ fn source(dtype: HostDtype, count: usize) -> Vec<u8> {
 fn stage_and_recover(dev: &mut Dev<'_>, dtype: HostDtype, shape: [usize; 3]) -> (Vec<u8>, Vec<u8>) {
     let write_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
     let read_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
-    let tile = tensix(3, 4);
+    let tile = tile(dev, 3, 4);
 
     let layout = Layout::tt_metal_32x32(dtype.identical_l1_format(), dtype, shape).unwrap();
     let src_bytes = source(dtype, shape[0] * shape[1] * shape[2]);
@@ -122,7 +100,7 @@ fn a_large_tile_grid_at_the_top_of_l1_survives() {
     in_device(|dev| {
         let write_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
         let read_window = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix(5, 6);
+        let tile = tile(dev, 5, 6);
 
         let dtype = HostDtype::Bf16;
         let shape = [1usize, 128, 128];
@@ -156,7 +134,7 @@ fn a_large_tile_grid_at_the_top_of_l1_survives() {
 fn a_single_corrupted_datum_is_detected() {
     in_device(|dev| {
         let window = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix(3, 4);
+        let tile = tile(dev, 3, 4);
 
         let dtype = HostDtype::F32;
         let shape = [1usize, 32, 32];
@@ -216,6 +194,7 @@ fn a_single_corrupted_datum_is_detected() {
 #[cfg(feature = "silicon")]
 #[test]
 fn a_tiled_tensor_round_trips_on_silicon() {
+    tt_tests::harness::assert_on_silicon();
     in_device(|dev| {
         for dtype in [HostDtype::F32, HostDtype::Bf16, HostDtype::F16] {
             for shape in [[1usize, 32, 32], [1, 13, 47], [1, 1, 1024], [2, 33, 65]] {
@@ -249,9 +228,10 @@ fn a_tiled_tensor_round_trips_on_silicon() {
 #[cfg(feature = "silicon")]
 #[test]
 fn the_host_path_tolerates_any_tile_base_alignment() {
+    tt_tests::harness::assert_on_silicon();
     in_device(|dev| {
         let window = dev.alloc_window(WindowKind::TwoMib).unwrap();
-        let tile = tensix(3, 4);
+        let tile = tile(dev, 3, 4);
 
         let dtype = HostDtype::F32;
         let shape = [1usize, 32, 32];

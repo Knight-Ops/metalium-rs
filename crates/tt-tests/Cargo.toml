@@ -37,6 +37,7 @@ silicon = []
 tt-isa.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
+tt-kernels.workspace = true
 tt-ttsim.workspace = true
 tt-kmd.workspace = true
 

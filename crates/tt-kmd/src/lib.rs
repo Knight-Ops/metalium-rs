@@ -44,6 +44,25 @@ pub const PINNED_API_VERSION: u32 = 2;
 /// Where the device nodes live.
 pub const DEV_DIR: &str = "/dev/tenstorrent";
 
+/// Where the loaded module publishes `auto_reset_timeout`.
+pub const AUTO_RESET_TIMEOUT_PARAM: &str = "/sys/module/tenstorrent/parameters/auto_reset_timeout";
+
+/// The ARC watchdog timeout the loaded driver was given, in seconds; 0 disarms it.
+///
+/// The one driver setting that decides whether a bring-up mistake costs a test
+/// run or the machine. Armed, a hung NoC escalates to a chip reset
+/// (`blackhole.c:704`) that drops the PCIe link, and with the card passed through
+/// to a VM that takes the host down -- which it has, three times. Disarmed
+/// (`wormhole.c:489` treats 0 that way), the card is left wedged and the host
+/// survives. It is a module parameter, read-only at runtime, so changing it means
+/// reloading the driver.
+pub fn auto_reset_timeout() -> std::io::Result<u32> {
+    std::fs::read_to_string(AUTO_RESET_TIMEOUT_PARAM)?
+        .trim()
+        .parse()
+        .map_err(std::io::Error::other)
+}
+
 /// One Blackhole, reached through one `/dev/tenstorrent/N`.
 pub struct Kmd {
     fd: File,
@@ -323,6 +342,10 @@ impl Transport for Kmd {
 
     /// Nothing to do: silicon advances time by itself.
     fn tick(&mut self, _n: u32) {}
+
+    fn is_simulated(&self) -> bool {
+        false
+    }
 
     fn chip(&self) -> ChipId {
         self.chip

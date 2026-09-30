@@ -83,6 +83,11 @@ jobs:
       - name: Type-check the silicon-only suite
         run: cargo test --workspace --features tt-tests/silicon --no-run
 
+      # Linted too, not just compiled: the silicon build cfg's out every
+      # simulator-only probe, and what that leaves dead is only visible here.
+      - name: Clippy (silicon build)
+        run: cargo clippy --workspace --all-targets --features tt-tests/silicon
+
       # tt-ttsim binds a third-party .so. Binding it for development does not
       # compromise the native-Rust goal; shipping it would.
       - name: Simulator binding stays out of shippable crates

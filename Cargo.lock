@@ -2427,6 +2427,15 @@ name = "tt-isa"
 version = "0.1.0"
 
 [[package]]
+name = "tt-kernels"
+version = "0.1.0"
+dependencies = [
+ "tt-device",
+ "tt-isa",
+ "tt-layout",
+]
+
+[[package]]
 name = "tt-kmd"
 version = "0.1.0"
 dependencies = [
@@ -2451,6 +2460,7 @@ dependencies = [
  "burn-tensor",
  "tt-device",
  "tt-isa",
+ "tt-kernels",
  "tt-kmd",
  "tt-layout",
  "tt-ttsim",

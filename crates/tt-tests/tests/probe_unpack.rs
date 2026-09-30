@@ -19,6 +19,19 @@
 //! `UNPACR_Regular.md` as a shared-document redirect, so it is authoritative rather
 //! than a hypothesis — but the surrounding `Unpackers/` directory does not exist on
 //! Blackhole at all, and every fact taken from it is `UNVERIFIED`.
+//!
+//! # Why this stays single-thread
+//!
+//! The datapath gates split their work across the three Tensix threads
+//! (`harness::Roles`), as LLK does. This file does not, on purpose: it probes the
+//! unpacker as a single issuing thread sees it -- its refusals, its format
+//! codes, its address formula -- and several of its findings are *about* which
+//! thread's state the unpacker reads (divergence row 45). Splitting it would
+//! change the thing it measures.
+
+// The surveys and refusal probes are simulator-only, so their helpers are dead in
+// the silicon build.
+#![cfg_attr(feature = "silicon", allow(dead_code, unused_imports))]
 
 use tt_isa::backend::{self, ConfigWords, ThreadConfigEntry};
 use tt_isa::cfg::generated::{thcon, thread, unpack1};
@@ -121,15 +134,14 @@ fn unpack_config(
 ) -> ConfigWords {
     let mut w = ConfigWords::new();
 
-    // `InAddr = (REG3_Base_address + REG7_Offset_address + 1 + DigestSize) * 16`
-    // (`UNPACR_Regular.md:98-112`). With `DigestSize = 0` that is
-    // `(base + 1) * 16`, so the register holds the address in 16-byte units, less
-    // one for the tile header the unpacker skips.
-    let base_units = l1_base / (TileImage::ALIGNMENT as u64);
-    w.set(thcon::THCON_SEC0_REG3_Base_address, (base_units - 1) as u32)
-        .unwrap()
-        .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
-        .unwrap();
+    // The image's own start, header included: see `datapath::tile_base_units`.
+    w.set(
+        thcon::THCON_SEC0_REG3_Base_address,
+        tt_tests::datapath::tile_base_units(l1_base),
+    )
+    .unwrap()
+    .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
+    .unwrap();
 
     // `XDim` comes from `REG5_Tile_x_dim_cntx[WhichContext & 3]` rather than from
     // the descriptor, for unpacker 0 in context mode (`UNPACR_Regular.md:62-66`).
@@ -275,7 +287,7 @@ fn unpack_program_with_base(
     p.extend_from_slice(&staged[..n]);
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -312,7 +324,7 @@ fn unpack_program_with_ystride(
     );
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -325,7 +337,7 @@ fn unpack_program(descriptor: TileDescriptor, out_format: u32, datums: u32) -> V
     p.extend_from_slice(&staged[..n]);
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -431,6 +443,8 @@ fn does_the_output_address_formula_respond_to_the_adc() {
     }
 }
 
+// Sweeps format pairs the specification does not list, which are UB on silicon.
+#[cfg(not(feature = "silicon"))]
 #[test]
 #[ignore]
 fn survey_the_data_format_codes() {
@@ -458,37 +472,24 @@ fn survey_the_data_format_codes() {
     }
 }
 
-/// Where the measured model says datum `i` lands, as a flat `row * 16 + col`.
+/// Where staged datum `i` lands: `OutAddr = dst_base + i`, split as
+/// `Row = OutAddr / 16 - 4`, `Col = OutAddr & 15` (`UNPACR_Regular.md:394-396`).
 ///
-/// `UNPACR_Regular.md:394-396` gives `Row = OutAddr / 16`, `Col = OutAddr & 15`,
-/// then `Row -= 4` for the `UnpackToDst` path. `OutAddr` is
-/// `UNP0_ADDR_BASE_REG_1_Base + ADC terms`, shifted right by two for a 32-bit
-/// output format, plus `REG5_Dest_cntx0_address`.
-///
-/// The `+ 4` is measured, not documented. With every stride zeroed the ADC terms
-/// vanish and the only term left is the base — which ttsim refuses to let us write
-/// (register 49 is not modelled; see `probe_config_coverage.rs`) and which it
-/// evidently holds at 16, since `16 >> 2 == 4`. That this is the base and not
-/// something else is pinned by `does_the_output_address_formula_respond_to_the_adc`:
-/// giving channel 1 a `Y` and a `Ystride` moves the landing position by exactly
-/// `Y * Ystride >> 2`, leaving 4 as the residual.
-const HIDDEN_BASE_DATUMS: u32 = 4;
-
+/// This once carried a measured `+ 4`, attributed to ttsim holding
+/// `UNP0_ADDR_BASE_REG_1_Base` at 16, with the last four datums dropped. Silicon
+/// showed the same shape with that register reading 0; the cause was our
+/// `REG3_Base_address` pointing one unit before the tile header, so the unpacker
+/// read the header as datums (`datapath::tile_base_units`).
 fn expected_flat(dst_base: u32, i: u32) -> usize {
-    let out_addr = dst_base + HIDDEN_BASE_DATUMS + i;
+    let out_addr = dst_base + i;
     let row = out_addr / 16 - 4;
     let col = out_addr % 16;
     (row * 16 + col) as usize
 }
 
-/// How many of `staged` datums actually reach `Dst`.
-///
-/// Measured: the write runs from `dst_base + 4` up to but not including
-/// `dst_base + N`, so the last four are dropped. Recorded as a named quantity
-/// rather than a magic subtraction so that a simulator bump changing it fails the
-/// gate loudly.
+/// How many of `staged` datums reach `Dst`: all of them.
 fn expected_datums(staged: u32) -> u32 {
-    staged - HIDDEN_BASE_DATUMS
+    staged
 }
 
 #[test]
@@ -585,6 +586,8 @@ fn a_single_corrupted_l1_datum_moves_exactly_one_dst_element() {
 /// specification's diagram does not label it. ttsim calls it `last` and refuses the
 /// instruction outright without it. Watched, so that the `unspecified` mask is
 /// evidence of a real gap rather than a bookkeeping field nothing reads.
+// Executes a refused UNPACR; on silicon that is undefined, not a refusal.
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn unpacr_without_the_undocumented_last_bit_is_refused() {
     let staged_count = 20u32;
@@ -601,7 +604,7 @@ fn unpacr_without_the_undocumented_last_bit_is_refused() {
             p.extend_from_slice(&buf[..n]);
             p.push(set_adc_x(0, count - 1));
             p.push(unpack_instruction(last));
-            p.push(backend::wait_for_unpacker0().unwrap());
+            p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
             let _ = run(dev, &staged, &p, 4);
         })
     }
@@ -614,4 +617,46 @@ fn unpacr_without_the_undocumented_last_bit_is_refused() {
         !attempt(descriptor, &staged, staged_count, false),
         "ttsim refuses UNPACR with bit 0 clear (`tensix_unpacr: last=0`). If this          now runs, the simulator has changed and the note on UNPACR_LAST needs          revisiting"
     );
+}
+
+/// The non-`SETC16` tail of `datapath::thread_state_reset` executes on ttsim.
+///
+/// That reset only runs on silicon, where it is the per-thread scrub, so without
+/// this nothing checks that `SETRWC`, `SETADCXY` and `SETADCZW` -- all
+/// Wormhole-sourced and `UNVERIFIED` in the table -- are accepted at all. The
+/// `SETC16` half is left out because ttsim refuses some entries at any value.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn the_thread_state_reset_tail_executes() {
+    let reset = tt_tests::datapath::thread_state_reset();
+    let tail: Vec<Instruction> = reset
+        .into_iter()
+        .filter(|i| ["SETRWC", "SETADCXY", "SETADCZW"].contains(&i.def().mnemonic()))
+        .collect();
+    assert_eq!(tail.len(), 3, "SETRWC, SETADCXY, SETADCZW");
+    assert!(survives(|dev| {
+        let _ = run(dev, &[], &tail, 1);
+    }));
+}
+
+/// ttsim does not model `STATE_RESET_EN` (`tensix_cfg_wr32: reg=4`,
+/// divergence row 49), which is one reason `backend::reset_config` runs only in
+/// the silicon per-thread reset. Watched with a control of the same shape.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn ttsim_does_not_model_state_reset_en() {
+    let tail = |p: &mut Vec<Instruction>| {
+        p.extend(sfpu::load_f32(0, 1.5f32.to_bits()).unwrap());
+        p.push(sfpu::store(0, sfpu::store_format::FP32, 0, 0).unwrap());
+    };
+    let mut reset = tt_isa::backend::reset_config(SCRATCH_GPR).unwrap().to_vec();
+    tail(&mut reset);
+    assert!(!survives(|dev| {
+        let _ = run(dev, &[], &reset, 1);
+    }));
+    let mut control = Vec::new();
+    tail(&mut control);
+    assert!(survives(|dev| {
+        let _ = run(dev, &[], &control, 1);
+    }));
 }

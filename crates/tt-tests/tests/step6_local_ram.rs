@@ -14,6 +14,10 @@
 //! the refusal itself: if either ever starts working, the simulator has gained a
 //! model and these tests say so rather than silently passing.
 
+// Every test here asserts what ttsim *refuses*. The behaviour itself is measured
+// on silicon by `silicon_local_ram.rs`.
+#![cfg(not(feature = "silicon"))]
+
 use tt_device::{tlb::WindowKind, Device};
 use tt_isa::noc::{grid, Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
@@ -37,30 +41,39 @@ fn tile() -> NocCoord<Noc0> {
 
 #[test]
 fn ttsim_does_not_decode_the_local_ram_noc_aperture() {
-    // The control comes first and is not decoration: without it, "every access
-    // died" is equally consistent with a misconfigured window, a bad tile, or a
-    // broken harness, and the refusals below would prove nothing.
-    assert!(
-        survives(|dev| {
-            let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-            dev.read_soft_reset(&w, tile()).unwrap();
-        }),
-        "the control must reach the device: this window and tile are fine"
-    );
-
-    for core in Core::ALL {
-        let base = core.local_data_ram_noc_address();
+    // Through the checked accessors, which is now the only way to address the
+    // aperture: `Device::read`/`write` refuse it outright, because on silicon an
+    // access while the core is in reset hangs the NoC. So each core is parked
+    // first -- running `j .` out of L1 -- and the park alone is the control:
+    // without it, "every access died" is equally consistent with a core ttsim
+    // will not release, a misconfigured window, or a broken harness.
+    //
+    // Not NC: parking it needs its reset-PC override, and ttsim refuses
+    // `NCRISC_RESET_PC_OVERRIDE` in both directions (divergence row 43).
+    for core in [Core::B, Core::T0, Core::T1, Core::T2] {
+        let park_at = if core == Core::B { 0 } else { 0x4_0000 };
+        assert!(
+            survives(|dev| {
+                let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+                dev.park_core(&w, tile(), core, park_at).unwrap();
+            }),
+            "the control must survive: parking {} is fine on ttsim",
+            core.name()
+        );
         assert!(
             !survives(|dev| {
                 let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
-                dev.write32(&w, tile(), base, 0x5A5A_5A5A).unwrap();
+                dev.park_core(&w, tile(), core, park_at).unwrap();
+                dev.local_ram_write(&w, tile(), core, 0, &0x5A5A_5A5Au32.to_le_bytes())
+                    .unwrap();
             }),
-            "ttsim now decodes {}'s local data RAM at {base:#x}. Its tile MMIO \
+            "ttsim now decodes {}'s local data RAM at {:#x}. Its tile MMIO \
              switch had arms for the TDMA, debug, NoC, overlay, Dst, regfile, \
              PCBuf, mailbox and config regions and nothing for local RAM; if that \
              has changed, divergence row 25 needs revisiting and the silicon-only \
-             staging tests below can move to the simulator.",
-            core.name()
+             tests in silicon_local_ram.rs can move to the simulator.",
+            core.name(),
+            core.local_data_ram_noc_address()
         );
     }
 }
@@ -96,4 +109,19 @@ fn ttsim_does_not_model_the_disable_reset_register() {
              UnsupportedFunctionality). Divergence row 26 needs revisiting."
         );
     }
+}
+
+#[test]
+fn ttsim_does_not_model_the_ncrisc_reset_pc_override() {
+    // Found by the aperture test above, which could not park NC. If this starts
+    // surviving, NC can join that test.
+    assert!(!survives(|dev| {
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        dev.park_core(&w, tile(), Core::NC, 0x4_0000).unwrap();
+    }));
+    // The control: the same park on T0 runs.
+    assert!(survives(|dev| {
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        dev.park_core(&w, tile(), Core::T0, 0x4_0000).unwrap();
+    }));
 }

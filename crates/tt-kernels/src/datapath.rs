@@ -34,10 +34,6 @@ pub const SCRATCH_GPR: u32 = 8;
 /// See `probe_unpack.rs`: the smallest `REG5_Dest_cntx0_address` the unpacker
 /// accepts, which is `Dst` row 0.
 pub const DST_BASE: u32 = 64;
-/// ttsim holds `UNP0_ADDR_BASE_REG_1_Base` at 16 and will not let it be written, so
-/// the unpacker's first datum lands four columns into the row and the last four
-/// datums are dropped. Divergence row 30.
-pub const HIDDEN_BASE_DATUMS: u32 = 4;
 
 pub const UNPACR_LAST: u32 = 1;
 
@@ -87,11 +83,26 @@ pub fn thread_config() -> Vec<Instruction> {
     ]
 }
 
+/// `REG3_Base_address` for a tile image staged at `l1_base`.
+///
+/// `InAddr = (Base_address + 1 + DigestSize) * 16` (`UNPACR_Regular.md:112-115`):
+/// the `+ 1` is the unpacker stepping over the tile header, so `Base_address`
+/// names the *start of the image, header included* -- which is where
+/// [`TileImage`] puts the header. This was once `l1_base / 16 - 1`, subtracting
+/// the header a second time: the unpacker then read the header's 16 zero bytes
+/// as the first datums and dropped as many from the end. That is the whole of
+/// what divergence rows 30 and 35 recorded as a "hidden output base" scaling
+/// with the input width -- ttsim, silicon and the specification all agreed, and
+/// the error was here.
+pub fn tile_base_units(l1_base: u64) -> u32 {
+    (l1_base / TileImage::ALIGNMENT as u64) as u32
+}
+
 /// Unpacker configuration, as established by `probe_unpack.rs`.
 pub fn unpack_config(words: &mut ConfigWords, descriptor: TileDescriptor, l1_base: u64) {
-    let base_units = l1_base / (TileImage::ALIGNMENT as u64);
+    let base_units = tile_base_units(l1_base);
     words
-        .set(thcon::THCON_SEC0_REG3_Base_address, (base_units - 1) as u32)
+        .set(thcon::THCON_SEC0_REG3_Base_address, base_units)
         .unwrap()
         .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
         .unwrap()
@@ -194,7 +205,7 @@ pub fn unpack_src_config(
     l1_base: u64,
     out: u32,
 ) {
-    let base_units = (l1_base / (TileImage::ALIGNMENT as u64) - 1) as u32;
+    let base_units = tile_base_units(l1_base);
     let descriptor_span = match unpacker {
         Unpacker::SrcA => {
             words
@@ -328,8 +339,17 @@ pub fn pack_config(words: &mut ConfigWords, l1_dest: u64) {
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_1_Zstride, 0)
         .unwrap()
-        // The input (`Dst`) side's strides.
+        // The input (`Dst`) side's strides. `Ystride` is in bytes and divided
+        // by the datum size (`Packers/InputAddressGenerator.md`), so one FP32
+        // `Dst` row is 64: ADC Y then counts rows, which is how [`pack_rows`]
+        // walks `Dst` a group of four at a time. With Y at zero -- every single
+        // `PACR` here -- it contributes nothing. `PCK0_ADDR_BASE_REG_0_Base`
+        // is left at its reset zero rather than written: it is register 16,
+        // which ttsim does not model (`tensix_cfg_wr32: reg=16`, divergence
+        // row 28), and the silicon per-thread reset zeroes all of `Config`.
         .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Xstride, 0)
+        .unwrap()
+        .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride, DST_ROW_BYTES)
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_0_Zstride, 0)
         .unwrap()
@@ -399,6 +419,58 @@ pub fn unpack_instruction() -> Instruction {
     Instruction::new(base.word() | UNPACR_LAST, &defs::UNPACR_Regular)
 }
 
+/// Bytes in one row of FP32 `Dst`: the packer's input `Ystride` per row.
+pub const DST_ROW_BYTES: u32 = 16 * 4;
+
+/// The pack `AddrMod` entry [`pack_rows`] uses to step ADC Y by four rows.
+pub const PACK_ADDR_MOD_NEXT_GROUP: u32 = 1;
+
+/// Pack `rows` rows of FP32 `Dst`, from row 0, to the L1 run [`pack_config`]
+/// set up, contiguously.
+///
+/// One `PACR` reads one aligned group of four rows (`PACR.md`), so this issues
+/// one per group, with `AddrMod` stepping the input ADC's Y by four between
+/// them (`Packers/InputAddressGenerator.md`) and `Last` only on the final one:
+/// without `Last` the output address generator keeps appending to the same run
+/// rather than starting at `L1_Dest_addr` again (`OutputAddressGenerator.md`).
+/// A final partial group gets the mask `(1 << remaining) - 1`, as `PACR.md`
+/// recommends. Runs on the pack thread, whose `ThreadConfig` it sets.
+pub fn pack_rows(rows: u32) -> Vec<Instruction> {
+    assert!(rows > 0, "nothing to pack");
+    let groups = rows.div_ceil(4);
+    let mut p = vec![
+        state_id(),
+        thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0),
+        thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4),
+        set_adc_x_pack(0, 15),
+        // From row 0, whatever an earlier `pack_rows` on this thread left Y at.
+        encode::Setadcxy::ZERO
+            .pk(1)
+            .y0(1)
+            .y0_val(0)
+            .encode()
+            .unwrap(),
+    ];
+    for g in 0..groups {
+        let last = g + 1 == groups;
+        let remaining = rows - 4 * g;
+        let mask = if remaining >= 4 {
+            0b1111
+        } else {
+            (1 << remaining) - 1
+        };
+        p.push(
+            encode::Pacr::ZERO
+                .read_intf_sel(mask)
+                .addr_mod(if last { 0 } else { PACK_ADDR_MOD_NEXT_GROUP })
+                .last(u32::from(last))
+                .encode()
+                .unwrap(),
+        );
+    }
+    p
+}
+
 /// One `PACR` enabling `read_intf_sel` read interfaces.
 pub fn pack_instruction(read_intf_sel: u32, last: bool) -> Instruction {
     encode::Pacr::ZERO
@@ -406,4 +478,190 @@ pub fn pack_instruction(read_intf_sel: u32, last: bool) -> Instruction {
         .last(u32::from(last))
         .encode()
         .unwrap()
+}
+
+/// Put the tile's configuration and the issuing thread's own Tensix state back to
+/// what ttsim starts with: `Config` below the global block zero, every
+/// `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.
+///
+/// None of it is touched by anything the host can do from outside -- the
+/// backend soft-reset pulse resets the units, not the per-thread state -- so on
+/// silicon one gate inherits the last one's. The first silicon run of the `Src`
+/// probes after `step9_matmul` had configured thread 0's address modifiers and
+/// RWCs moved nothing into the rows they dumped. ttsim starts every run from
+/// zero, which is what every gate is written against.
+///
+/// **Silicon only.** ttsim refuses `SETC16` to some entries at any value
+/// (`SRCB_SET_Base`, divergence row 36), and has nothing to reset.
+pub fn thread_state_reset() -> Vec<Instruction> {
+    let entries: std::collections::BTreeSet<u16> = tt_isa::cfg::generated::ALL_THREAD_CONFIG_FIELDS
+        .iter()
+        .map(|(_, f)| f.addr32())
+        .collect();
+    // `Config` first: it is shared, and tt-metal (or an earlier gate) may have
+    // left any of it set (`backend::reset_config`).
+    let mut p: Vec<Instruction> = tt_isa::backend::reset_config(SCRATCH_GPR).unwrap().to_vec();
+    p.extend(
+        entries
+            .into_iter()
+            .map(|addr32| ThreadConfigEntry::zeroed(addr32).encode().unwrap()),
+    );
+    // RWCs: set each counter (and its carry register) to zero, and the fidelity
+    // phase; no bank flips (`SETRWC.md`).
+    p.push(
+        encode::Setrwc::ZERO
+            .src_a(1)
+            .src_b(1)
+            .dst(1)
+            .fidelity(1)
+            .encode()
+            .unwrap(),
+    );
+    // ADCs: X, Y, Z, W of both channels, for both unpackers and the packers.
+    p.push(
+        encode::Setadcxy::ZERO
+            .u0(1)
+            .u1(1)
+            .pk(1)
+            .x0(1)
+            .y0(1)
+            .x1(1)
+            .y1(1)
+            .encode()
+            .unwrap(),
+    );
+    p.push(
+        encode::Setadczw::ZERO
+            .u0(1)
+            .u1(1)
+            .pk(1)
+            .z0(1)
+            .w0(1)
+            .z1(1)
+            .w1(1)
+            .encode()
+            .unwrap(),
+    );
+    p
+}
+
+/// The first `ThreadConfig` write any thread must make (`SETC16.md`): its
+/// configuration state ID. Every role program starts with it, because each
+/// thread has its own.
+pub fn state_id() -> Instruction {
+    ThreadConfigEntry::zeroed(thread::CFG_STATE_ID_StateID.addr32())
+        .set(thread::CFG_STATE_ID_StateID, 0)
+        .unwrap()
+        .encode()
+        .unwrap()
+}
+
+/// The `ThreadConfig` increments of address modifier `entry` (0..8): what an
+/// instruction's `AddrMod` selects. Blackhole has eight entries and a three-bit
+/// `AddrMod` to reach them (divergence row 42).
+pub struct AddrModEntry {
+    pub src_a_incr: tt_isa::cfg::ThreadConfigField,
+    pub src_b_incr: tt_isa::cfg::ThreadConfigField,
+    pub dst_incr: tt_isa::cfg::ThreadConfigField,
+}
+
+pub fn addr_mod_entry(entry: usize) -> AddrModEntry {
+    use thread::*;
+    let src_a = [
+        ADDR_MOD_AB_SEC0_SrcAIncr,
+        ADDR_MOD_AB_SEC1_SrcAIncr,
+        ADDR_MOD_AB_SEC2_SrcAIncr,
+        ADDR_MOD_AB_SEC3_SrcAIncr,
+        ADDR_MOD_AB_SEC4_SrcAIncr,
+        ADDR_MOD_AB_SEC5_SrcAIncr,
+        ADDR_MOD_AB_SEC6_SrcAIncr,
+        ADDR_MOD_AB_SEC7_SrcAIncr,
+    ];
+    let src_b = [
+        ADDR_MOD_AB_SEC0_SrcBIncr,
+        ADDR_MOD_AB_SEC1_SrcBIncr,
+        ADDR_MOD_AB_SEC2_SrcBIncr,
+        ADDR_MOD_AB_SEC3_SrcBIncr,
+        ADDR_MOD_AB_SEC4_SrcBIncr,
+        ADDR_MOD_AB_SEC5_SrcBIncr,
+        ADDR_MOD_AB_SEC6_SrcBIncr,
+        ADDR_MOD_AB_SEC7_SrcBIncr,
+    ];
+    let dst = [
+        ADDR_MOD_DST_SEC0_DestIncr,
+        ADDR_MOD_DST_SEC1_DestIncr,
+        ADDR_MOD_DST_SEC2_DestIncr,
+        ADDR_MOD_DST_SEC3_DestIncr,
+        ADDR_MOD_DST_SEC4_DestIncr,
+        ADDR_MOD_DST_SEC5_DestIncr,
+        ADDR_MOD_DST_SEC6_DestIncr,
+        ADDR_MOD_DST_SEC7_DestIncr,
+    ];
+    AddrModEntry {
+        src_a_incr: src_a[entry],
+        src_b_incr: src_b[entry],
+        dst_incr: dst[entry],
+    }
+}
+
+/// A `SETC16` giving one `ThreadConfig` field `value`, every other field of its
+/// word zero.
+pub fn thread_entry(field: tt_isa::cfg::ThreadConfigField, value: u16) -> Instruction {
+    ThreadConfigEntry::zeroed(field.addr32())
+        .set(field, value)
+        .unwrap()
+        .encode()
+        .unwrap()
+}
+
+/// The instructions that write `words` into `Config`, sized to fit.
+pub fn config_program(words: &ConfigWords) -> Vec<Instruction> {
+    let mut buf = vec![tt_isa::sfpu::nop(); words.program_len()];
+    let n = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    buf.truncate(n);
+    buf
+}
+
+/// The three role programs of an L1 -> `Dst` -> L1 round trip, with `kernel`
+/// running on the math thread between the unpack and the pack.
+///
+/// Split the way LLK splits it (`harness::Roles`): thread 0 configures both
+/// halves of the datapath and unpacks `datums` of `descriptor` from [`STAGE`]
+/// into `Dst`; thread 1 runs `kernel`; thread 2 packs four `Dst` rows through
+/// the read interfaces in `read_intf_sel` to [`OUT`]. Each role ends by waiting
+/// for the unit it drove, so its work is complete when its firmware reports
+/// `DONE` and the next role starts.
+pub fn dst_round_trip_roles(
+    descriptor: TileDescriptor,
+    datums: u32,
+    kernel: &[Instruction],
+    read_intf_sel: u32,
+) -> [Vec<Instruction>; 3] {
+    use tt_isa::backend::{self, Before};
+
+    let mut unpack = thread_config();
+    let mut words = ConfigWords::new();
+    unpack_config(&mut words, descriptor, STAGE);
+    pack_config(&mut words, OUT);
+    unpack.extend(config_program(&words));
+    unpack.push(set_adc_x_unpack(0, datums - 1));
+    unpack.push(unpack_instruction());
+    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+
+    let mut math = vec![state_id()];
+    if !kernel.is_empty() {
+        math.extend_from_slice(kernel);
+        math.push(backend::wait_for_sfpu(Before::EVERYTHING).unwrap());
+    }
+
+    let pack = vec![
+        state_id(),
+        set_adc_x_pack(0, 15),
+        pack_instruction(read_intf_sel, true),
+        // Without this the host can read L1 before the packer has drained: the
+        // thread unblocks once the packer has *accepted* the work, not finished
+        // it (`Packers/README.md`).
+        backend::wait_for_packer(Before::EVERYTHING).unwrap(),
+    ];
+    [unpack, math, pack]
 }

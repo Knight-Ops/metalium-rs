@@ -1,4 +1,7 @@
 //! Exploratory: what does SOFT_RESET_0 read at simulator start?
+
+// Reads ttsim's reset state; on silicon the reset state is whatever the last process left.
+#![cfg(not(feature = "silicon"))]
 use tt_device::{tlb::WindowKind, Device};
 use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
