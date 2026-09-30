@@ -478,3 +478,14 @@ pub fn thread_state_reset() -> Vec<Instruction> {
     );
     p
 }
+
+/// The first `ThreadConfig` write any thread must make (`SETC16.md`): its
+/// configuration state ID. Every role program starts with it, because each
+/// thread has its own.
+pub fn state_id() -> Instruction {
+    ThreadConfigEntry::zeroed(thread::CFG_STATE_ID_StateID.addr32())
+        .set(thread::CFG_STATE_ID_StateID, 0)
+        .unwrap()
+        .encode()
+        .unwrap()
+}

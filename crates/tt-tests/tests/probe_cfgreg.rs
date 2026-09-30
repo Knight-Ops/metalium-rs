@@ -35,8 +35,9 @@ use tt_isa::tensix::{self, Core};
 use tt_tests::firmware;
 use tt_tests::harness::{self, advance, in_device, Dev};
 
-const CORE: Core = Core::T1;
-const CORE_THREAD: u32 = 1;
+/// The harness's choice, which differs by target (T1 on ttsim, T0 on silicon).
+const CORE: Core = harness::CORE;
+const CORE_THREAD: u32 = harness::CORE_THREAD;
 const DST_FMT_FP32: u32 = 0;
 const BUDGET: u64 = 400_000;
 /// A scratch GPR well clear of anything the firmware touches.

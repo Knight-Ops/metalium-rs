@@ -11,7 +11,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Binaries in `tt-firmware/src/bin` to build and expose.
-const BINARIES: &[&str] = &["heartbeat", "sfpu_mul", "corpus", "corpus_t0"];
+const BINARIES: &[&str] = &[
+    "heartbeat",
+    "sfpu_mul",
+    "corpus",
+    "corpus_t0",
+    "role_t0",
+    "role_t1",
+    "role_t2",
+];
 
 const TARGET: &str = "riscv32im-unknown-none-elf";
 

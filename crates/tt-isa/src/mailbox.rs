@@ -80,6 +80,87 @@ const _: () =
 // The descriptor words have to stay inside the mailbox the firmware owns.
 const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 
+/// One mailbox per Tensix thread, for the three-role datapath.
+///
+/// tt-metal's LLK splits a kernel across the three Tensix threads -- thread 0
+/// unpacks, thread 1 does math, thread 2 packs -- and so does the role harness,
+/// because much of the coprocessor's state is per thread and some of it is tied
+/// to a role by the hardware (`UNPACR` counts with thread 0's ADCs; see
+/// `docs/ttsim-divergence.md` row 45). Each role image runs its own program and
+/// reports through its own mailbox, laid out like the single-core one above:
+/// the same offsets, from a per-thread base.
+pub mod role {
+    /// First role mailbox, clear of the single-core mailbox, program and dump.
+    pub const BASE: u64 = 0x0011_0000;
+    /// Distance between role mailboxes: room for the program and the dump.
+    pub const STRIDE: u64 = 0x4000;
+
+    /// The mailbox of the role that runs on Tensix thread `thread` (0, 1 or 2).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Mailbox {
+        base: u64,
+    }
+
+    impl Mailbox {
+        /// The single-core mailbox at [`super::MAILBOX_BASE`], which has the
+        /// same layout.
+        pub const fn single_core() -> Mailbox {
+            Mailbox {
+                base: super::MAILBOX_BASE,
+            }
+        }
+        pub const fn of(thread: u32) -> Mailbox {
+            assert!(thread < 3, "there are three Tensix threads");
+            Mailbox {
+                base: BASE + thread as u64 * STRIDE,
+            }
+        }
+        pub const fn base(self) -> u64 {
+            self.base
+        }
+        pub const fn status(self) -> u64 {
+            self.base + (super::STATUS - super::MAILBOX_BASE)
+        }
+        pub const fn panic_code(self) -> u64 {
+            self.base + (super::PANIC_CODE - super::MAILBOX_BASE)
+        }
+        pub const fn thread_index(self) -> u64 {
+            self.base + (super::THREAD_INDEX - super::MAILBOX_BASE)
+        }
+        pub const fn dst_access_fmt(self) -> u64 {
+            self.base + (super::DST_ACCESS_FMT - super::MAILBOX_BASE)
+        }
+        pub const fn program_len(self) -> u64 {
+            self.base + (super::PROGRAM_LEN - super::MAILBOX_BASE)
+        }
+        pub const fn dump_row_count(self) -> u64 {
+            self.base + (super::DUMP_ROW_COUNT - super::MAILBOX_BASE)
+        }
+        pub const fn dump_row_first(self) -> u64 {
+            self.base + (super::DUMP_ROW_FIRST - super::MAILBOX_BASE)
+        }
+        pub const fn program(self) -> u64 {
+            self.base + (super::PROGRAM - super::MAILBOX_BASE)
+        }
+        pub const fn dump_offset(self, row: u32, column: u32) -> u64 {
+            self.base + (super::dump_offset(row, column) - super::MAILBOX_BASE)
+        }
+    }
+
+    // The last role's dump must stay inside L1.
+    const _: () = assert!(
+        Mailbox::of(2).dump_offset(super::DUMP_MAX_ROWS - 1, super::DUMP_ROW_WORDS - 1) + 4
+            <= crate::tensix::L1_SIZE
+    );
+    // And every role's program must fit before its dump.
+    const _: () = assert!(
+        super::PROGRAM - super::MAILBOX_BASE + (super::PROGRAM_MAX as u64) * 4
+            <= super::DUMP - super::MAILBOX_BASE
+    );
+    const _: () =
+        assert!(super::dump_offset(super::DUMP_MAX_ROWS, 0) - super::MAILBOX_BASE <= STRIDE);
+}
+
 /// Values written to [`STATUS`].
 ///
 /// Distinctive constants rather than small integers, so that a zero, a stale

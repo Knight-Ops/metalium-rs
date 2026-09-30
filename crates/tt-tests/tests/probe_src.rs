@@ -162,24 +162,32 @@ fn stage(format: L1Format, code: u32, datums: &[u32]) -> Vec<u8> {
 }
 
 /// Configure, unpack `N` datums into `unpacker`'s `Src`, hand the bank to the
-/// Matrix Unit, and move `Src` rows 0..8 into `Dst` rows 0..8.
-fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<Instruction> {
-    let mut p = src_thread_config();
+/// Matrix Unit, and move `Src` rows 0..8 into `Dst` rows 0..8 -- split the way
+/// LLK splits it (`harness::Roles`): the unpack on thread 0, the move on thread 1.
+fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> SrcProgram {
+    let mut unpack = src_thread_config();
     let mut words = ConfigWords::new();
     let descriptor = flat_descriptor(N as u32).with_in_data_format_raw(in_code);
     unpack_src_config(&mut words, unpacker, descriptor, STAGE, out);
     words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
-    let mut buf = [sfpu::nop(); 64];
+    let mut buf = vec![sfpu::nop(); words.program_len()];
     let k = words.program(GPR, &mut buf).unwrap();
-    p.extend_from_slice(&buf[..k]);
-    p.push(set_adc_x(unpacker, 0, N as u32 - 1));
-    p.push(unpack_src_instruction(unpacker, flip));
+    unpack.extend_from_slice(&buf[..k]);
+    unpack.push(set_adc_x(unpacker, 0, N as u32 - 1));
+    unpack.push(unpack_src_instruction(unpacker, flip));
+    unpack.push(match unpacker {
+        Unpacker::SrcA => backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap(),
+        Unpacker::SrcB => backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap(),
+    });
+
+    // The Matrix Unit waits for the bank by itself (`MOVA2D.md`: the Wait Gate
+    // holds it until `AllowedClient == MatrixUnit`).
+    let mut math = vec![tt_tests::datapath::state_id()];
     match unpacker {
         Unpacker::SrcA => {
-            p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
             // ttsim implements only the eight-row form (`tensix_mova2d:
             // instr_mod=0` is `UnsupportedFunctionality`).
-            p.push(
+            math.push(
                 encode::Mova2D::ZERO
                     .move8_rows(1)
                     .src_row(0)
@@ -189,21 +197,31 @@ fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<In
             );
         }
         Unpacker::SrcB => {
-            p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
             for r in 0..8 {
-                p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                math.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
             }
         }
     }
-    p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
-    p
+    math.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+    SrcProgram { unpack, math }
+}
+
+/// The two role programs of a `Src` probe.
+struct SrcProgram {
+    unpack: Vec<Instruction>,
+    math: Vec<Instruction>,
 }
 
 /// Run and return `Dst` rows 0..8, flattened.
-fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &[Instruction]) -> Vec<u32> {
+fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &SrcProgram) -> Vec<u32> {
+    let roles = harness::Roles {
+        unpack: &program.unpack,
+        math: &program.math,
+        pack: &[],
+    };
     let out = harness::run(
         dev,
-        &Run::new(program).stage(&[(STAGE, staged)]).dump_rows(8),
+        &Run::roles(roles).stage(&[(STAGE, staged)]).dump_rows(8),
     );
     (0..8 * ROW).map(|f| out.dst_at(f / ROW, f % ROW)).collect()
 }
@@ -352,9 +370,9 @@ fn on_silicon_movb2d_move4_rows_moves_four() {
     let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
     let mut program = src_program(Unpacker::SrcB, FP32_CODE, TF32_CODE, true);
     // Replace the single-row moves with one four-row move of rows 0..4.
-    program.retain(|i| i.def().mnemonic() != "MOVB2D");
-    let wait = program.pop().unwrap();
-    program.push(
+    program.math.retain(|i| i.def().mnemonic() != "MOVB2D");
+    let wait = program.math.pop().unwrap();
+    program.math.push(
         encode::Movb2D::ZERO
             .move4_rows(1)
             .src_row(0)
@@ -362,7 +380,7 @@ fn on_silicon_movb2d_move4_rows_moves_four() {
             .encode()
             .unwrap(),
     );
-    program.push(wait);
+    program.math.push(wait);
     harness::in_device(|dev| {
         let dst = run_src(dev, &staged, &program);
         // Row 1 is fully written by the unpacker whatever the base turns out to

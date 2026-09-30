@@ -57,16 +57,30 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
 - [x] **`UNPACR` counts with thread 0's ADCs** (row 45): silicon programs run on T0.
 - [x] **`STALLWAIT` waits held the wrong units** (row 46): the consumer is now a
       required argument.
-- [~] **`Src` -> `Dst` column losses, open.** FP32 -> TF32 into `SrcA` (and, on card 1,
-      `SrcB`) comes back with fixed *columns* wrong -- the same column in every row,
-      the top mantissa bits cleared or the whole datum zero -- on every tile of both
-      cards, so not a defect. Ruled out, each by measurement in `silicon_measure.rs`:
-      burst size and throttle (m12), read-after-write timing (m15), stale thread state
-      (fixed; m16), the unpacker alone (card 0 still loses column 9 when `SrcA` is
-      filled by `MOVD2A`, m18), configuration corrupted in flight (m19), undeclared
-      `Src` formats (m20). Next: compare LLK's full-face `SrcA` unpack and its
-      `SRCA_SET_Base`/`ADD_DEST_ADDR_CNTR` settings, and `MOVA2D` against `MVMUL`.
-      `probe_src` and `step9_matmul` stay red on silicon until then.
+- [x] **The datapath now mirrors LLK's thread split.** `harness::Roles`: unpack on
+      T0 / thread 0, math on T1 / thread 1, pack on T2 / thread 2, three role images
+      at their cores' default reset PCs (`role_t0..2`), one mailbox each
+      (`mailbox::role`), run in order. It works on ttsim too -- math on T1 is the one
+      thread ttsim lets read `Dst` -- so the T0/T1 target split is only needed by the
+      remaining single-thread gates. `probe_src` is converted; `step9_matmul` and the
+      eltwise path are next.
+- [x] **Every datapath encoding checked against LLK** (`tt-isa/tests/llk_crosscheck.rs`).
+      Two Wormhole layouts are wrong on Blackhole: `MOVB2D Move4Rows` (the whole of
+      row 38) and `MOVA2D AddrMod` (one bit lower, as `MVMUL`). Neither is on a
+      passing gate's path; both need `Bits32_BH.lua` overrides with a silicon gate.
+- [~] **`Src` -> `Dst` mantissa losses, open.** FP32 -> TF32 through `Src` and back
+      out with `MOVA2D`/`MOVB2D` returns some datums with sign and exponent intact
+      and the *whole mantissa* zero (10.0 -> 8.0, 26.0 -> 16.0), at fixed `Src`
+      columns -- the same column in every row -- which differ by card; card 1's
+      `SrcB` column 13 comes back 0. With the thread split both cards lose `SrcA`
+      column 9. Ruled out, each by a probe in `silicon_measure.rs`: tile defect (m17),
+      burst/throttle (m12), read-after-write timing (m15), stale thread state (m16,
+      fixed), the unpacker alone (m18: card 0's column 9 survives `MOVD2A` ->
+      `MOVA2D`), configuration corrupted in flight (m19), undeclared `Src` formats
+      (m20), stale `LaneConfig.BLOCK_DEST_MOV` (m21), stale `Dst` zero flags (m22),
+      encodings (all match LLK). Next: run tt-metal's own datacopy on these cards to
+      split "our driving" from "the chip", and compare `MVMUL`, which reads `Src`
+      without `MOV*`. `probe_src` and `step9_matmul` stay red on silicon until then.
 
 ---
 

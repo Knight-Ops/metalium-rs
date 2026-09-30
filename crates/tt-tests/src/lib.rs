@@ -32,6 +32,28 @@ pub mod firmware {
     #[cfg(feature = "silicon")]
     pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
 
+    /// The three role images of the LLK-shaped datapath -- unpack on T0, math on
+    /// T1, pack on T2 -- each linked at its core's default reset PC so all three
+    /// fit in one tile's L1 at once. See `tt_firmware::corpus` and
+    /// `tt_isa::mailbox::role`.
+    pub const ROLES: [(tt_isa::tensix::Core, &[u8], u64); 3] = [
+        (
+            tt_isa::tensix::Core::T0,
+            include_bytes!(env!("FIRMWARE_ROLE_T0")),
+            0x6000,
+        ),
+        (
+            tt_isa::tensix::Core::T1,
+            include_bytes!(env!("FIRMWARE_ROLE_T1")),
+            0xA000,
+        ),
+        (
+            tt_isa::tensix::Core::T2,
+            include_bytes!(env!("FIRMWARE_ROLE_T2")),
+            0xE000,
+        ),
+    ];
+
     /// Where a firmware image must be loaded in L1.
     ///
     /// Fixed by `crates/tt-firmware/link.x`, which places `.text` at RISCV T0's

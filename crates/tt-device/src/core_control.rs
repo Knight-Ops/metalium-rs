@@ -409,6 +409,27 @@ impl<T: Transport> Device<T> {
         window: &Window,
         tile: NocCoord<N>,
         budget_cycles: u64,
+        predicate: impl FnMut(u32) -> bool,
+    ) -> Result<std::result::Result<u32, WaitError>> {
+        self.wait_for_mailbox(
+            window,
+            tile,
+            mailbox::STATUS,
+            mailbox::PANIC_CODE,
+            budget_cycles,
+            predicate,
+        )
+    }
+
+    /// [`Device::wait_for_status`] against an arbitrary status word and its panic
+    /// code: for the role mailboxes (`tt_isa::mailbox::role`), one per core.
+    pub fn wait_for_mailbox<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        status_addr: u64,
+        panic_code_addr: u64,
+        budget_cycles: u64,
         mut predicate: impl FnMut(u32) -> bool,
     ) -> Result<std::result::Result<u32, WaitError>> {
         let mut waited = 0u64;
@@ -418,14 +439,14 @@ impl<T: Transport> Device<T> {
             (started, started + limit)
         });
         loop {
-            let value = self.read_status(window, tile)?;
+            let value = self.read32(window, tile, status_addr)?;
             if predicate(value) {
                 return Ok(Ok(value));
             }
             // Report a panic as itself rather than letting it time out: the
             // firmware has already said what went wrong.
             if value == status::PANICKED {
-                let code = self.read32(window, tile, mailbox::PANIC_CODE)?;
+                let code = self.read32(window, tile, panic_code_addr)?;
                 return Ok(Err(WaitError::Panicked { code }));
             }
             let expired = match deadline {

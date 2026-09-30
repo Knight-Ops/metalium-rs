@@ -389,7 +389,14 @@ mod silicon {
     /// do from outside.
     fn reset_thread_state(dev: &mut Dev<'_>) {
         let program = crate::datapath::thread_state_reset();
-        let _ = crate::harness::run(dev, &crate::harness::Run::new(&program).dump_rows(0));
+        // All three threads: the role harness uses each of them, and the
+        // single-thread path uses thread 0 (`harness::CORE`).
+        let roles = crate::harness::Roles {
+            unpack: &program,
+            math: &program,
+            pack: &program,
+        };
+        let _ = crate::harness::run(dev, &crate::harness::Run::roles(roles).dump_rows(0));
     }
 
     #[track_caller]

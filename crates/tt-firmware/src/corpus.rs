@@ -13,7 +13,8 @@ use crate::cfg::write_config_field;
 use crate::tensix::{push_word, read_dst32, wait_for_coprocessor};
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
-use tt_isa::mailbox::{self, panic_code};
+use tt_isa::mailbox::role::Mailbox;
+use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
 
@@ -22,13 +23,45 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
+    run_in::<Riscv, Thread>(Mailbox::single_core())
+}
+
+/// The same runner, reporting through a role mailbox: one of three cores each
+/// running its own part of a kernel (`tt_isa::mailbox::role`).
+pub fn run_role<Riscv, Thread>() -> !
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX))
+}
+
+/// Stop, having said why in `mb` as well as in the single-core mailbox the
+/// panic path always uses.
+fn fail_in(mb: Mailbox, code: u32) -> ! {
+    // SAFETY: fixed aligned mailbox locations inside L1.
+    unsafe {
+        l1_write32(mb.panic_code(), code);
+        l1_write32(mb.status(), status::PANICKED);
+    }
+    fail(code)
+}
+
+fn run_in<Riscv, Thread>(mb: Mailbox) -> !
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    // SAFETY: fixed aligned mailbox locations inside L1.
+    unsafe { l1_write32(mb.status(), status::RUNNING) };
+    publish();
     // SAFETY: fixed, aligned mailbox locations written by the host before this core
     // left reset.
-    let thread = unsafe { l1_read32(mailbox::THREAD_INDEX) };
-    let fmt = unsafe { l1_read32(mailbox::DST_ACCESS_FMT) };
-    let program_len = unsafe { l1_read32(mailbox::PROGRAM_LEN) };
-    let dump_first = unsafe { l1_read32(mailbox::DUMP_ROW_FIRST) };
-    let dump_rows = unsafe { l1_read32(mailbox::DUMP_ROW_COUNT) };
+    let thread = unsafe { l1_read32(mb.thread_index()) };
+    let fmt = unsafe { l1_read32(mb.dst_access_fmt()) };
+    let program_len = unsafe { l1_read32(mb.program_len()) };
+    let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
+    let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -40,7 +73,7 @@ where
         || program_len > mailbox::PROGRAM_MAX
         || dump_rows > mailbox::DUMP_MAX_ROWS
     {
-        fail(panic_code::EXPLICIT);
+        fail_in(mb, panic_code::EXPLICIT);
     }
 
     // Set the shape of the Dst mapping deliberately rather than inheriting whatever
@@ -55,7 +88,7 @@ where
         // here changes it and its reset value is 0.
         let field = Thread::DST_ACCESS_FMT;
         if !field.fits(fmt) {
-            fail(panic_code::EXPLICIT);
+            fail_in(mb, panic_code::EXPLICIT);
         }
         write_config_field(field, ConfigBank::Bank0, fmt);
     }
@@ -69,7 +102,7 @@ where
         // SAFETY: the word is inside the staged program, whose length was checked
         // above; `Riscv` may push to `Thread`, which the type system checked; the
         // backend is out of reset.
-        unsafe { push_word::<Riscv, Thread>(l1_read32(mailbox::PROGRAM + (i as u64) * 4)) }
+        unsafe { push_word::<Riscv, Thread>(l1_read32(mb.program() + (i as u64) * 4)) }
         i += 1;
     }
 
@@ -85,7 +118,7 @@ where
             // shape, and the destination is inside the dump region.
             unsafe {
                 let value = read_dst32(dst32_address(dump_first + row, column));
-                l1_write32(mailbox::dump_offset(row, column), value);
+                l1_write32(mb.dump_offset(row, column), value);
             }
             column += 1;
         }
@@ -93,6 +126,12 @@ where
     }
 
     // The dump is what carries the result; this only says it is complete.
-    finish(program_len);
+    if mb == Mailbox::single_core() {
+        finish(program_len);
+    } else {
+        // SAFETY: fixed aligned mailbox location inside L1.
+        unsafe { l1_write32(mb.status(), status::DONE) };
+        publish();
+    }
     spin()
 }

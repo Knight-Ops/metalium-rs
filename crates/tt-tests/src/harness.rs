@@ -90,6 +90,32 @@ pub struct Run<'a> {
     /// Run somewhere other than the gate tile. Claimed through [`tile`], so it
     /// is checked against the chip's grid and scrubbed afterwards.
     pub tile: Option<(u8, u8)>,
+    /// Split the kernel across the three Tensix threads, as LLK does; see
+    /// [`Roles`]. When set, `program` is ignored.
+    pub roles: Option<Roles<'a>>,
+}
+
+/// A kernel split the way tt-metal's LLK splits it: thread 0 unpacks, thread 1
+/// does math (Matrix Unit and SFPU), thread 2 packs, each program pushed by its
+/// own core (T0, T1, T2) and reporting through its own mailbox
+/// (`tt_isa::mailbox::role`).
+///
+/// Much of the coprocessor's state is per thread -- ADCs, RWCs, address
+/// modifiers, `ThreadConfig` -- and the hardware ties some of it to a role:
+/// `UNPACR` counts with thread 0's ADCs whichever thread issues it (divergence
+/// row 45). A single-thread program shares one set of all of it between roles
+/// LLK keeps apart.
+///
+/// The roles run **in order**, each to completion -- unpack, then math, then
+/// pack -- which is one valid schedule of the same three programs, and needs
+/// no cross-thread semaphores. Work crosses threads the way it does in LLK: an
+/// unpack into `Src` hands the bank to the Matrix Unit (`FlipSrc`), and `Dst`
+/// is shared.
+#[derive(Copy, Clone)]
+pub struct Roles<'a> {
+    pub unpack: &'a [Instruction],
+    pub math: &'a [Instruction],
+    pub pack: &'a [Instruction],
 }
 
 impl<'a> Run<'a> {
@@ -103,6 +129,15 @@ impl<'a> Run<'a> {
             dst_fmt: DST_FMT_FP32,
             clear_dst: true,
             tile: None,
+            roles: None,
+        }
+    }
+
+    /// A kernel split across the three threads; see [`Roles`].
+    pub fn roles(roles: Roles<'a>) -> Self {
+        Run {
+            roles: Some(roles),
+            ..Run::new(&[])
         }
     }
 
@@ -177,6 +212,9 @@ fn dst_clear_prelude(dump_rows: u32) -> Vec<Instruction> {
 /// Panics rather than returning an error: every failure here is a broken gate, not
 /// a condition a caller could handle.
 pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
+    if let Some(roles) = spec.roles {
+        return run_roles(dev, spec, roles);
+    }
     let mut program = if spec.clear_dst {
         dst_clear_prelude(spec.dump_rows)
     } else {
@@ -258,5 +296,108 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
         dev.read(&w, tile, *addr, &mut buf).unwrap();
         l1.push(buf);
     }
+    Outcome { dst, l1 }
+}
+
+/// [`run`] for a [`Roles`] kernel.
+fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
+    use tt_isa::mailbox::role::Mailbox;
+
+    // The `Dst` rows about to be dumped are zeroed before *anything* runs, so it
+    // leads the unpack program: the math role may read what the unpack role wrote
+    // into `Dst`.
+    let mut unpack = if spec.clear_dst {
+        dst_clear_prelude(spec.dump_rows)
+    } else {
+        Vec::new()
+    };
+    unpack.extend_from_slice(roles.unpack);
+    let programs: [&[Instruction]; 3] = [&unpack, roles.math, roles.pack];
+    for (i, p) in programs.iter().enumerate() {
+        assert!(
+            p.len() as u32 <= mailbox::PROGRAM_MAX,
+            "role {i} program is {} instructions; a role mailbox holds {}",
+            p.len(),
+            mailbox::PROGRAM_MAX
+        );
+    }
+    assert!(spec.dump_rows <= mailbox::DUMP_MAX_ROWS);
+
+    let tile = match spec.tile {
+        Some((x, y)) => crate::backend::tile(dev, x, y),
+        None => tensix_tile(),
+    };
+    let w: Window = dev.alloc_window(WindowKind::TwoMib).unwrap();
+    dev.release_tensix_backend(&w, tile).unwrap();
+    for (addr, data) in spec.stage {
+        dev.write(&w, tile, *addr, data).unwrap();
+    }
+
+    for (thread, program) in programs.iter().enumerate() {
+        let mb = Mailbox::of(thread as u32);
+        let dump = if thread == 1 { spec.dump_rows } else { 0 };
+        dev.write32(&w, tile, mb.status(), 0).unwrap();
+        dev.write32(&w, tile, mb.thread_index(), thread as u32)
+            .unwrap();
+        dev.write32(&w, tile, mb.dst_access_fmt(), spec.dst_fmt)
+            .unwrap();
+        dev.write32(&w, tile, mb.program_len(), program.len() as u32)
+            .unwrap();
+        dev.write32(&w, tile, mb.dump_row_first(), 0).unwrap();
+        dev.write32(&w, tile, mb.dump_row_count(), dump).unwrap();
+        for (i, insn) in program.iter().enumerate() {
+            dev.write32(&w, tile, mb.program() + (i as u64) * 4, insn.word())
+                .unwrap();
+        }
+        for row in 0..dump {
+            for col in 0..mailbox::DUMP_ROW_WORDS {
+                dev.write32(&w, tile, mb.dump_offset(row, col), SENTINEL)
+                    .unwrap();
+            }
+        }
+    }
+
+    // In order, each to completion.
+    for (thread, (core, image, at)) in crate::firmware::ROLES.iter().enumerate() {
+        let mb = Mailbox::of(thread as u32);
+        dev.load_and_start(&w, tile, *core, image, *at).unwrap();
+        match dev
+            .wait_for_mailbox(&w, tile, mb.status(), mb.panic_code(), BUDGET, |s| {
+                s == status::DONE
+            })
+            .unwrap()
+        {
+            Ok(_) => {}
+            Err(WaitError::Panicked { code }) => {
+                panic!(
+                    "role {thread} ({}) firmware panicked, code {code}",
+                    core.name()
+                )
+            }
+            Err(e) => panic!("role {thread} ({}): {e}", core.name()),
+        }
+    }
+
+    // Leave the three cores the way the harness found them: held. They are
+    // spinning after `DONE`, and a gate that runs next may depend on a core being
+    // in reset (`Device::local_ram_read` refuses otherwise, rightly).
+    for (core, _, _) in crate::firmware::ROLES.iter() {
+        dev.set_core_reset(&w, tile, *core, true).unwrap();
+    }
+
+    let math = Mailbox::of(1);
+    let mut dst = Vec::new();
+    for row in 0..spec.dump_rows {
+        for col in 0..mailbox::DUMP_ROW_WORDS {
+            dst.push(dev.read32(&w, tile, math.dump_offset(row, col)).unwrap());
+        }
+    }
+    let mut l1 = Vec::new();
+    for (addr, len) in spec.read_back {
+        let mut buf = vec![0u8; *len];
+        dev.read(&w, tile, *addr, &mut buf).unwrap();
+        l1.push(buf);
+    }
+    dev.free_window(w);
     Outcome { dst, l1 }
 }

@@ -1207,3 +1207,85 @@ fn m21_lane_config_zeroed_before_the_move() {
         }
     }
 }
+
+/// Does clearing `Dst`'s zero flags before the move fix the column losses?
+///
+/// LLK precedes every FP32 datacopy with `ZEROACC(CLR_16, use_32_bit_mode = 1,
+/// clear_zero_flags = 1)` over the `Dst` face it is about to write
+/// (`llk_math_eltwise_unary_datacopy.h`). Nothing here has ever cleared them:
+/// the harness zeroes `Dst` through the SFPU, which does not touch them. The
+/// Blackhole encoding is LLK's (`ckernel_ops.h`: mode 19..21, 32-bit 18, clear
+/// zero flags 17), built as a raw word because the table's `ZEROACC` is the
+/// Wormhole diagram (divergence row 40). Split across threads as LLK does:
+/// unpack on thread 0, clear and move on thread 1.
+#[test]
+fn m22_zero_flags_cleared_before_the_move() {
+    use tt_isa::isa::generated::defs;
+    use tt_isa::isa::Instruction;
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let clear_face0 = Instruction::new(
+        (0x10 << 24) | (1 << 19) | (1 << 18) | (1 << 17),
+        &defs::ZEROACC,
+    );
+    for clear in [false, true] {
+        for unpacker in [Unpacker::SrcA, Unpacker::SrcB] {
+            for attempt in 0..3 {
+                let mut unpack = src_thread_config();
+                let mut words = ConfigWords::new();
+                let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+                unpack_src_config(&mut words, unpacker, descriptor, STAGE, 4);
+                words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+                let mut buf = vec![sfpu::nop(); words.program_len()];
+                let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+                unpack.extend_from_slice(&buf[..k]);
+                unpack.push(set_adc_x(unpacker, 0, n as u32 - 1));
+                unpack.push(unpack_src_instruction(unpacker, true));
+                unpack.push(match unpacker {
+                    Unpacker::SrcA => {
+                        backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap()
+                    }
+                    Unpacker::SrcB => {
+                        backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap()
+                    }
+                });
+                let mut math = vec![tt_tests::datapath::state_id()];
+                if clear {
+                    math.push(clear_face0);
+                    math.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+                }
+                match unpacker {
+                    Unpacker::SrcA => {
+                        math.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap())
+                    }
+                    Unpacker::SrcB => {
+                        for r in 0..2 {
+                            math.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                        }
+                    }
+                }
+                math.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+                in_device(|dev| {
+                    let stage = [(STAGE, staged.as_slice())];
+                    let roles = harness::Roles {
+                        unpack: &unpack,
+                        math: &math,
+                        pack: &[],
+                    };
+                    let out = harness::run(dev, &Run::roles(roles).stage(&stage).dump_rows(2));
+                    let bad: Vec<String> = (0..n)
+                        .filter(|&i| out.dst[i] != datums[i])
+                        .map(|i| format!("{i}:{:08x}", out.dst[i]))
+                        .collect();
+                    let key = format!("{unpacker:?}").to_lowercase();
+                    measure(
+                        &format!("zero_flags_cleared_{clear}.{key}.run{attempt}"),
+                        format!("bad [{}]", bad.join(" ")),
+                    );
+                });
+            }
+        }
+    }
+}
