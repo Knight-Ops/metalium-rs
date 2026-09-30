@@ -411,41 +411,41 @@ fn a_32x32_tile_matmul_through_bf16_src() {
 // --- Multi-tile ----------------------------------------------------------------
 
 /// `C = A @ B` on the device for row-major `a` (`m` x `k`) and `b` (`k` x `n`),
-/// through `tt_layout`'s padding, [`matmul::matmul_roles`] and de-tiling.
+/// through `tt_kernels::matmul::matmul` -- the entry point a backend calls.
 fn device_matmul(
     a: &[f32],
     b: &[f32],
     m: usize,
     k: usize,
     n: usize,
-    in_fmt: L1Format,
-    out_fmt: u32,
+    route: matmul::SrcRoute,
 ) -> Vec<f32> {
-    let staged = matmul::stage_matmul(a, b, m, k, n, in_fmt);
-    let [unpack, math, pack] = matmul::matmul_roles(&staged.outputs, in_fmt, out_fmt);
     let path = std::env::temp_dir().join(format!(
         "ttmm-{}-{:?}.bin",
         std::process::id(),
         std::thread::current().id()
     ));
     harness::in_device(|dev| {
-        let out = harness::run(
+        let c = matmul::matmul(
             dev,
-            &Run::roles(Roles {
-                unpack: &unpack,
-                math: &math,
-                pack: &pack,
-            })
-            .concurrent(&matmul::TILE_SEMAPHORES)
-            .stage(&[(matmul::MATMUL_STAGE, &staged.a), (staged.b_at, &staged.b)])
-            .dump_rows(0)
-            .read_back(&[(matmul::MATMUL_OUT, staged.out_bytes())]),
-        );
-        std::fs::write(&path, &out.l1[0]).unwrap();
+            harness::tensix_tile(),
+            &tt_tests::firmware::ROLES,
+            a,
+            b,
+            [m, k, n],
+            route,
+            harness::BUDGET,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let bytes: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
     });
-    let packed = std::fs::read(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    matmul::detilize_packed(&packed, staged.m, staged.n)
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Small integers, `|A| <= 127` and `|B| <= 31` as for one tile: every
@@ -469,18 +469,18 @@ fn exact_product(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
     c
 }
 
-fn assert_matmul(m: usize, k: usize, n: usize, in_fmt: L1Format, out_fmt: u32, seed: u64) {
+fn assert_matmul(m: usize, k: usize, n: usize, route: matmul::SrcRoute, seed: u64) {
     let mut rng = Lcg(seed);
     let a = int_matrix(&mut rng, m, k, 127);
     let b = int_matrix(&mut rng, k, n, 31);
     let want = exact_product(&a, &b, m, k, n);
-    let got = device_matmul(&a, &b, m, k, n, in_fmt, out_fmt);
+    let got = device_matmul(&a, &b, m, k, n, route);
     assert_eq!(got.len(), m * n);
     for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(
             g.to_bits(),
             w.to_bits(),
-            "[{m}x{k}] @ [{k}x{n}] {in_fmt:?}: C[{}][{}] is {g}, want {w}",
+            "[{m}x{k}] @ [{k}x{n}] {route:?}: C[{}][{}] is {g}, want {w}",
             idx / n,
             idx % n
         );
@@ -492,23 +492,23 @@ fn assert_matmul(m: usize, k: usize, n: usize, in_fmt: L1Format, out_fmt: u32, s
 /// cleared in between.
 #[test]
 fn k_depth_accumulates_across_tiles() {
-    assert_matmul(32, 64, 32, L1Format::Fp32, TF32_CODE, 1);
-    assert_matmul(32, 128, 32, L1Format::Fp32, TF32_CODE, 2);
+    assert_matmul(32, 64, 32, matmul::SrcRoute::Tf32FromFp32, 1);
+    assert_matmul(32, 128, 32, matmul::SrcRoute::Tf32FromFp32, 2);
 }
 
 /// `M` x `N` output tiles, each cleared only once the packer has finished the
 /// last (`matmul::DST_FREE`) and packed to its own place.
 #[test]
 fn m_by_n_output_tiles() {
-    assert_matmul(64, 32, 96, L1Format::Fp32, TF32_CODE, 3);
+    assert_matmul(64, 32, 96, matmul::SrcRoute::Tf32FromFp32, 3);
 }
 
 /// Shapes that are not multiples of the tile, padded with zeros by `tt_layout`
 /// on the way in and cropped on the way out.
 #[test]
 fn awkward_shapes_are_padded_and_cropped() {
-    assert_matmul(13, 47, 29, L1Format::Fp32, TF32_CODE, 4);
-    assert_matmul(1, 64, 96, L1Format::Fp32, TF32_CODE, 5);
+    assert_matmul(13, 47, 29, matmul::SrcRoute::Tf32FromFp32, 4);
+    assert_matmul(1, 64, 96, matmul::SrcRoute::Tf32FromFp32, 5);
 }
 
 /// The sweep: shapes, both `Src` formats by both routes, depths one to three,
@@ -516,14 +516,14 @@ fn awkward_shapes_are_padded_and_cropped() {
 #[test]
 fn a_shape_format_and_depth_sweep() {
     let shapes = [(32, 32, 32), (40, 70, 33), (64, 96, 32), (17, 32, 64)];
-    let formats = [
-        (L1Format::Fp32, TF32_CODE),
-        (L1Format::Fp32, matmul::BF16_CODE),
-        (L1Format::Bf16, matmul::BF16_CODE),
+    let routes = [
+        matmul::SrcRoute::Tf32FromFp32,
+        matmul::SrcRoute::Bf16FromFp32,
+        matmul::SrcRoute::Bf16FromBf16,
     ];
     for (s, &(m, k, n)) in shapes.iter().enumerate() {
-        for (f, &(in_fmt, out_fmt)) in formats.iter().enumerate() {
-            assert_matmul(m, k, n, in_fmt, out_fmt, 100 + (s * 3 + f) as u64);
+        for (f, &route) in routes.iter().enumerate() {
+            assert_matmul(m, k, n, route, 100 + (s * 3 + f) as u64);
         }
     }
 }

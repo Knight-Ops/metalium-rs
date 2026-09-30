@@ -473,3 +473,67 @@ pub fn stage_matmul(
         outputs,
     }
 }
+
+/// How operands reach `Src`, and so the precision the Matrix Unit multiplies
+/// at (`UNPACR_Regular.md:495-520`; codes measured, divergence rows G and H).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SrcRoute {
+    /// FP32 in L1, truncated to TF32 by the unpacker.
+    Tf32FromFp32,
+    /// FP32 in L1, converted to BF16 by the unpacker.
+    Bf16FromFp32,
+    /// BF16 in L1, moved as is.
+    Bf16FromBf16,
+}
+
+impl SrcRoute {
+    /// The L1 format the operands are staged in, and the `OutDataFormat` code.
+    pub const fn formats(self) -> (L1Format, u32) {
+        match self {
+            SrcRoute::Tf32FromFp32 => (L1Format::Fp32, TF32_CODE),
+            SrcRoute::Bf16FromFp32 => (L1Format::Fp32, BF16_CODE),
+            SrcRoute::Bf16FromBf16 => (L1Format::Bf16, BF16_CODE),
+        }
+    }
+}
+
+/// `C[m, n] = A[m, k] @ B[k, n]` for row-major `f32` operands, on the Tensix
+/// tile at `tile`: tiled and zero-padded by `tt_layout`, multiplied with
+/// fidelity phase 0 through `route`, accumulated in FP32 `Dst`, packed as FP32
+/// and de-tiled.
+///
+/// Phase 0 is exact for operands whose `Src` values carry at most five
+/// significant bits in `B` and seven in `A` (`MatrixUnit.md:143-165`); beyond
+/// that it is the fastest and least precise of the four phases, which is what a
+/// first training backend runs and what Phase 9 revisits.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
+    dev: &mut tt_device::Device<T>,
+    tile: tt_isa::noc::NocCoord<N>,
+    images: &crate::runtime::RoleImages<'_>,
+    a: &[f32],
+    b: &[f32],
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    budget: u64,
+) -> Result<Vec<f32>, crate::runtime::RunError> {
+    use crate::runtime::{self, Kernel, Schedule};
+    let (in_fmt, out_fmt) = route.formats();
+    let staged = stage_matmul(a, b, m, k, n, in_fmt);
+    let [unpack, math, pack] = matmul_roles(&staged.outputs, in_fmt, out_fmt);
+    let stage = [
+        (MATMUL_STAGE, staged.a.as_slice()),
+        (staged.b_at, staged.b.as_slice()),
+    ];
+    let read_back = [(MATMUL_OUT, staged.out_bytes())];
+    let kernel = Kernel {
+        stage: &stage,
+        read_back: &read_back,
+        ..Kernel::new(
+            [&unpack, &math, &pack],
+            Schedule::Concurrent(&TILE_SEMAPHORES),
+        )
+    };
+    let out = runtime::run(dev, tile, images, &kernel, budget)?;
+    Ok(detilize_packed(&out.l1[0], m, n))
+}

@@ -1,0 +1,14 @@
+[package]
+name = "tt-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Host-side kernels: the instruction streams the three Tensix roles run, and the
+# runner that stages, launches and collects them on a `tt_device::Device`.
+# Shippable -- no simulator dependency (`cargo xtask check-no-sim-in-ship`).
+[dependencies]
+tt-isa.workspace = true
+tt-device.workspace = true
+tt-layout.workspace = true

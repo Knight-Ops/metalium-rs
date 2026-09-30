@@ -766,20 +766,61 @@ As of the current Burn release, `Backend` requires: `BackendTypes`, `FloatTensor
 **Verify this surface against the Burn version you pin** — it moves quickly, and
 `QTensorOps`/`TransactionOps`/`BackendTypes` are relatively recent additions.
 
-**Strategy:** implement a narrow core (matmul, add/sub/mul, relu, reshape, transpose, reduce
+**Strategy** (*corrected below*, "The Burn surface, as pinned": 0.21 leaves about two hundred op methods without defaults, so `burn-tt` starts by delegating to `burn-flex`)**:** implement a narrow core (matmul, add/sub/mul, relu, reshape, transpose, reduce
 sum/mean, broadcast) and let Burn's default implementations compose the rest — slow but
 correct. Replace defaults by profiling, not by guess. `QTensorOps` can start as unsupported
 if quantization is out of scope for the milestone.
 
-**Important limitation:** Burn's CubeCL-based backends compose with autodiff **and** fusion;
+**Important limitation** (*answered below: not one* -- `burn-fusion` is generic over any `FusionBackend`)**:** Burn's CubeCL-based backends compose with autodiff **and** fusion;
 external/hand-written backends compose with **autodiff only**. So `burn-autodiff` gives you
 backward passes largely for free, but `burn-fusion` likely will **not** apply. Since Tensix
 strongly wants fused unpack→math→pack chains, fusion must either be implemented inside
 `burn-tt` itself or revisited as a CubeCL-target question. Confirm against the pinned Burn
 version before designing the kernel dispatch layer — this decision shapes Phase 9.
 
+#### The Burn surface, as pinned (0.21.0, read from source 2026-09-30)
+
+Verified against `burn-backend 0.21.0`, `burn-ir 0.21.0` and `burn-fusion 0.21.0`
+rather than taken from the paragraphs above, two of which it corrects.
+
+* **`Backend: BackendTypes + FloatTensorOps<Self> + BoolTensorOps<Self> +
+  IntTensorOps<Self> + ModuleOps<Self> + ActivationOps<Self> + QTensorOps<Self> +
+  TransactionOps<Self> + Clone + Default + Sized + Send + Sync + Debug + 'static`.**
+  `BackendTypes` carries every associated type: `Device: DeviceOps`, the float,
+  int, bool and quantized tensor primitives (each `TensorMetadata + 'static`), and
+  `FloatElem`, `IntElem`, `BoolElem`. `Backend` itself requires only `name`, `seed`,
+  `dtype_usage` and `device_count`; `sync`, `memory_cleanup`,
+  `memory_persistent_allocations`, `ad_enabled` and the rest have defaults.
+* **The "narrow core" does not exist.** The op traits have roughly two hundred
+  methods with no default: `FloatTensorOps` 80 of 124, `IntTensorOps` 67 of 104,
+  `BoolTensorOps` 28 of 39, `ModuleOps` 18 of 73, `QTensorOps` 13 of 80;
+  `ActivationOps` and `TransactionOps` are all defaults. Burn does not compose the
+  rest from a handful of primitives, so "implement matmul, add, relu, reshape and let
+  the defaults do the rest" cannot typecheck. **Consequence for Phase 7:** `burn-tt`
+  starts as a *delegating* backend -- its tensor primitive wraps a `burn-flex`
+  tensor, every required op delegates to `burn-flex` on the host, and the ops worth
+  running on Tensix (matmul first, via `tt_kernels::matmul::matmul`) are routed to
+  the device. Correct from day one, and each op moved to the device is a change
+  behind an unchanged interface, gated against the delegate it replaces.
+* **Open question 3 is answered: `burn-fusion` composes with a hand-written
+  backend.** `Fusion<B>` is generic over `B: FusionBackend`, which is `BackendIr`
+  (conversions between the backend's primitives and a `Handle`) plus a
+  `FusionRuntime`: an `Optimization` type, a handle and device type, and
+  `fusers(device) -> Vec<Box<dyn OperationFuser<Optimization>>>`. A fuser is shown
+  each `OperationIr` in the stream (`fuse`), reports whether it can take more
+  (`status`), and produces an `Optimization` whose `execute` runs against the
+  handles. Nothing in it is CubeCL: the CubeCL backends are one implementation.
+  So Tensix's natural unit -- one unpack -> math -> pack chain, `matmul` + bias +
+  activation in one pass through `Dst` -- is a `burn-tt` fuser, not a question of
+  retargeting CubeCL. It is still Phase 9 work; Phase 7 needs only that the door
+  is open, and it is.
+* **Precision.** `tt_kernels::matmul` runs fidelity phase 0 only, which is exact
+  for small integers and otherwise the lowest-fidelity product the Matrix Unit
+  offers. Training needs the four-phase product available (`MatrixUnit.md:143-165`);
+  the phases are gated per block in `step9_matmul` and not yet at tile level.
+
 **Gate (simulator):** an MNIST MLP trains through `burn-autodiff` — loss descends, final weights
-match the ndarray backend within tolerance, optimizer step is correct. Use a reduced dataset;
+match the `burn-flex` backend within tolerance, optimizer step is correct. Use a reduced dataset;
 the simulator is "slower than silicon but still fast enough" and a full training run is not the
 point. Determinism means this doubles as a regression test.
 

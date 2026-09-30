@@ -6,9 +6,11 @@
 //! `build.rs` can build the device firmware and hand the images to the tests.
 
 pub mod backend;
-pub mod datapath;
 pub mod harness;
-pub mod matmul;
+
+/// The kernels moved to `tt-kernels`, which ships; re-exported so the gates
+/// that established them still read `tt_tests::datapath`.
+pub use tt_kernels::{datapath, matmul};
 
 /// Firmware images, built from `crates/tt-firmware` by this crate's `build.rs`
 /// and checked for instructions Blackhole cannot execute.

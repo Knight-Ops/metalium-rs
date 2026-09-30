@@ -35,7 +35,7 @@ gate you have not seen reject something is not yet evidence.
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores. Multi-phase fidelity at tile level not yet exercised |
-| 7 — Burn backend, training | `[ ]` | The milestone |
+| 7 — Burn backend, training | `[ ]` | The milestone. Surface verified against 0.21; `tt-kernels` ships the matmul it will call; fusion is open to a hand-written backend |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
 
@@ -105,7 +105,9 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
 - [x] **Silicon regression: 146/148 on both cards**, the two failures being the
       `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
       replaced by two gates that run on both targets. Unfiltered run since: 116/116 on
-      each card, `silicon_measure` and `fma_oracle` included.
+      each card, `silicon_measure` and `fma_oracle` included. After the Phase 6 close-out (window pool,
+      program slots, concurrent roles, tiles, tracing, `tt-kernels`): **129/129 on
+      each card** (258 run, 0 failed), unfiltered.
 - [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
       "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
 
@@ -843,19 +845,35 @@ undocumented.
 **This is the milestone.** Everything before it is infrastructure; everything after
 is reach or speed.
 
-- [ ] Verify the `Backend` supertrait list against the **pinned** Burn version —
-      it moves quickly, and `QTensorOps`/`TransactionOps`/`BackendTypes` are recent
-      additions.
-- [ ] Implement a narrow core: matmul, add/sub/mul, relu, reshape, transpose,
-      reduce sum/mean, broadcast. Let Burn's defaults compose the rest — slow but
-      correct. Replace defaults by profiling, not by guess.
+- [x] **Verify the `Backend` supertrait list against the pinned Burn version**
+      (0.21.0, from source): see `RUST_IMPL_PLAN.md`, "The Burn surface, as
+      pinned". Associated types live on `BackendTypes`; `Backend` requires only
+      `name`, `seed`, `dtype_usage`, `device_count`.
+- [ ] ~~Implement a narrow core and let Burn's defaults compose the rest.~~ **Not
+      possible in 0.21:** about two hundred op methods have no default. Instead,
+      `burn-tt` v0 delegates every op to `burn-flex` on the host and routes matmul
+      to `tt_kernels::matmul::matmul`; ops move to the device one at a time, each
+      gated against the delegate it replaces.
+- [ ] **Four-phase (HiFi) matmul at tile level** before training on real data:
+      `tt_kernels::matmul` runs phase 0 only.
+- [x] **`tt-kernels`, the shippable half of the test harness.** `datapath` and
+      `matmul` moved out of `tt-tests` (re-exported there, so the gates read the
+      same); `runtime::run` is the role runner -- stage, program slots, in-order
+      or concurrent schedule, trace, read back -- returning `RunError` rather than
+      panicking, and holding the role cores in reset again on every path.
+      `harness::run_roles` is now a thin wrapper that panics on error.
+      `matmul::matmul(dev, tile, images, a, b, [m, k, n], route, budget)` is the
+      entry point a backend calls; `step10_matmul_tile`'s sweep goes through it.
+      `tt-kernels` is `SHIPPABLE` in `xtask/src/ship.rs` and passes
+      `check-no-sim-in-ship`. **Open:** the role firmware images are still built by
+      `tt-tests/build.rs` and passed in; a shipped runtime needs them from
+      somewhere it owns. A tiled eltwise kernel is not written yet.
 - [ ] `QTensorOps` may start unsupported if quantization is out of scope.
-- [ ] **Resolve open question 3 before designing kernel dispatch:** does
-      `burn-fusion` compose with a hand-written backend? CubeCL-based backends
-      compose with autodiff *and* fusion; external ones likely with autodiff only.
-      Tensix strongly wants fused unpack→math→pack chains, so fusion must either
-      live inside `burn-tt` or be revisited as a CubeCL-target question. **This
-      shapes Phase 9.**
+- [x] **Open question 3: `burn-fusion` does compose with a hand-written
+      backend.** `Fusion<B: FusionBackend>`, where `FusionBackend` is `BackendIr` +
+      a `FusionRuntime` supplying `OperationFuser`s over `OperationIr`. Fused
+      unpack -> math -> pack chains are a `burn-tt` fuser (Phase 9), not a CubeCL
+      question.
 - [ ] **Gate (sim):** MNIST MLP trains through `burn-autodiff` on a reduced
       dataset — loss descends, final weights match ndarray within tolerance,
       optimizer step correct. Determinism makes this a regression test too.
@@ -1015,8 +1033,8 @@ Documented, not speculative. These bite in Phases 2–4.
 - [ ] **2.** Blackhole debug-interface parity is unverified — the four `RISC_DBG_*`
       registers are named at Wormhole's base but no Blackhole bit layouts exist.
       Prototype against silicon before committing to a GDB-stub architecture.
-- [ ] **3.** Does `burn-fusion` compose with a hand-written backend? Decide before
-      designing kernel dispatch (Phase 7); it shapes Phase 9.
+- [x] **3.** Does `burn-fusion` compose with a hand-written backend? **Yes** --
+      see Phase 7 and `RUST_IMPL_PLAN.md`, "The Burn surface, as pinned".
 - [ ] **4.** Is the NoC Overlay required for multi-chip? Resolve in the Phase 8 spike.
 - [ ] **5.** PCIe DMA engines have no register-level documentation anywhere in the
       repo. Plan on TLB-window MMIO for bulk transfer; revisit only if bandwidth

@@ -60,7 +60,7 @@ pub const DST_FMT_FP32: u32 = 0;
 pub const BUDGET: u64 = 400_000;
 /// Pre-filled into every dumped `Dst` datum, so a datum the firmware never wrote
 /// is distinguishable from a computed zero.
-pub const SENTINEL: u32 = 0xDEAD_BEEF;
+pub const SENTINEL: u32 = tt_kernels::runtime::DUMP_SENTINEL;
 
 /// The Tensix tile the gates use.
 pub fn tensix_tile() -> NocCoord<Noc0> {
@@ -101,8 +101,7 @@ pub struct Run<'a> {
     pub trace: bool,
 }
 
-/// A semaphore's starting `Value` and `Max`, set before a concurrent run.
-pub type SemaphoreInit = (tt_isa::sync::Semaphore, u8, u8);
+pub use tt_kernels::runtime::SemaphoreInit;
 
 /// A kernel split the way tt-metal's LLK splits it: thread 0 unpacks, thread 1
 /// does math (Matrix Unit and SFPU), thread 2 packs, each program pushed by its
@@ -347,157 +346,33 @@ pub fn program_bytes(program: &[Instruction]) -> Vec<u8> {
         .collect()
 }
 
-/// [`run`] for a [`Roles`] kernel.
+/// [`run`] for a [`Roles`] kernel: `tt_kernels::runtime::run`, with a failure
+/// turned into a panic naming the stuck roles.
 fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
-    use tt_isa::mailbox::role::Mailbox;
-
-    // The `Dst` rows about to be dumped are zeroed before *anything* runs. In
-    // order, that is simply the head of the unpack program (the math role may
-    // read what the unpack role wrote into `Dst`); concurrently it is a run of
-    // its own, with the semaphore initialisation, ahead of all three roles.
-    let clear = if spec.clear_dst {
-        dst_clear_prelude(spec.dump_rows)
-    } else {
-        Vec::new()
-    };
-    let (setup, unpack) = match spec.concurrent {
-        None => (None, [clear.as_slice(), roles.unpack].concat()),
-        Some(init) => {
-            let mut setup = clear;
-            for &(sem, value, max) in init {
-                setup.push(tt_isa::sync::init(sem, value, max).unwrap());
-            }
-            (Some(setup), roles.unpack.to_vec())
-        }
-    };
-    let programs: [&[Instruction]; 3] = [&unpack, roles.math, roles.pack];
-    for (i, p) in programs.iter().enumerate() {
-        assert!(
-            p.len() as u32 <= mailbox::PROGRAM_MAX,
-            "role {i} program is {} instructions; a program slot holds {}",
-            p.len(),
-            mailbox::PROGRAM_MAX
-        );
-    }
-    assert!(spec.dump_rows <= mailbox::DUMP_MAX_ROWS);
-
+    use tt_kernels::runtime::{self, Kernel, Schedule};
     let tile = match spec.tile {
         Some((x, y)) => crate::backend::tile(dev, x, y),
         None => tensix_tile(),
     };
-    let w: Window = dev.alloc_window(WindowKind::TwoMib).unwrap();
-    dev.release_tensix_backend(&w, tile).unwrap();
-    for (addr, data) in spec.stage {
-        dev.write(&w, tile, *addr, data).unwrap();
-    }
-
-    let stage_role =
-        |dev: &mut Dev<'_>, thread: usize, program: &[Instruction], dump: u32, traced: bool| {
-            let mb = Mailbox::of(thread as u32);
-            dev.write32(&w, tile, mb.status(), 0).unwrap();
-            dev.write32(&w, tile, mb.thread_index(), thread as u32)
-                .unwrap();
-            dev.write32(&w, tile, mb.dst_access_fmt(), spec.dst_fmt)
-                .unwrap();
-            dev.write32(&w, tile, mb.program_len(), program.len() as u32)
-                .unwrap();
-            dev.write32(&w, tile, mb.dump_row_first(), 0).unwrap();
-            dev.write32(&w, tile, mb.dump_row_count(), dump).unwrap();
-            dev.write32(&w, tile, mb.trace(), u32::from(traced))
-                .unwrap();
-            dev.write(&w, tile, mb.program(), &program_bytes(program))
-                .unwrap();
-            for row in 0..dump {
-                for col in 0..mailbox::DUMP_ROW_WORDS {
-                    dev.write32(&w, tile, mb.dump_offset(row, col), SENTINEL)
-                        .unwrap();
-                }
-            }
-        };
-    let dump_of = |thread: usize| if thread == 1 { spec.dump_rows } else { 0 };
-    let start = |dev: &mut Dev<'_>, thread: usize| {
-        let (core, image, at) = crate::firmware::ROLES[thread];
-        dev.load_and_start(&w, tile, core, image, at).unwrap();
+    let schedule = match spec.concurrent {
+        Some(init) => Schedule::Concurrent(init),
+        None => Schedule::InOrder,
     };
-    let wait = |dev: &mut Dev<'_>, thread: usize| -> Result<(), String> {
-        let (core, _, _) = crate::firmware::ROLES[thread];
-        let mb = Mailbox::of(thread as u32);
-        match dev
-            .wait_for_mailbox(&w, tile, mb.status(), mb.panic_code(), BUDGET, |s| {
-                s == status::DONE
-            })
-            .unwrap()
-        {
-            Ok(_) => Ok(()),
-            Err(WaitError::Panicked { code }) => Err(format!(
-                "role {thread} ({}) firmware panicked, code {code}",
-                core.name()
-            )),
-            Err(e) => Err(format!("role {thread} ({}): {e}", core.name())),
-        }
+    let kernel = Kernel {
+        stage: spec.stage,
+        read_back: spec.read_back,
+        dump_rows: spec.dump_rows,
+        clear_dst: spec.clear_dst,
+        dst_fmt: spec.dst_fmt,
+        trace: spec.trace,
+        ..Kernel::new([roles.unpack, roles.math, roles.pack], schedule)
     };
-
-    if let Some(setup) = &setup {
-        stage_role(dev, 0, setup, 0, false);
-        start(dev, 0);
-        if let Err(e) = wait(dev, 0) {
-            panic!("setup run: {e}");
-        }
+    match runtime::run(dev, tile, &crate::firmware::ROLES, &kernel, BUDGET) {
+        Ok(out) => Outcome {
+            dst: out.dst,
+            l1: out.l1,
+            trace: out.trace,
+        },
+        Err(e) => panic!("{e}"),
     }
-    for (thread, program) in programs.iter().enumerate() {
-        stage_role(dev, thread, program, dump_of(thread), spec.trace);
-    }
-    if spec.trace {
-        dev.configure_trace(&w, tile, mailbox::TRACE_BUFFER, mailbox::TRACE_BUFFER_BYTES)
-            .unwrap();
-    }
-    if setup.is_some() {
-        // Together, by one write to the soft-reset register: released one by
-        // one, each after its image load, the first roles finish a short
-        // program before the last has started, which is a sequential run by
-        // another name (`Device::load_and_start_together`).
-        dev.load_and_start_together(&w, tile, &crate::firmware::ROLES)
-            .unwrap();
-        let stuck: Vec<String> = (0..3).filter_map(|t| wait(dev, t).err()).collect();
-        assert!(
-            stuck.is_empty(),
-            "concurrent roles did not all finish: {}",
-            stuck.join("; ")
-        );
-    } else {
-        // In order, each to completion.
-        for thread in 0..3 {
-            start(dev, thread);
-            if let Err(e) = wait(dev, thread) {
-                panic!("{e}");
-            }
-        }
-    }
-
-    // Leave the three cores the way the harness found them: held. They are
-    // spinning after `DONE`, and a gate that runs next may depend on a core being
-    // in reset (`Device::local_ram_read` refuses otherwise, rightly).
-    for (core, _, _) in crate::firmware::ROLES.iter() {
-        dev.set_core_reset(&w, tile, *core, true).unwrap();
-    }
-
-    let math = Mailbox::of(1);
-    let mut dst = Vec::new();
-    for row in 0..spec.dump_rows {
-        for col in 0..mailbox::DUMP_ROW_WORDS {
-            dst.push(dev.read32(&w, tile, math.dump_offset(row, col)).unwrap());
-        }
-    }
-    let trace = if spec.trace {
-        dev.read_trace(&w, tile, mailbox::TRACE_BUFFER).unwrap()
-    } else {
-        Vec::new()
-    };
-    let mut l1 = Vec::new();
-    for (addr, len) in spec.read_back {
-        let mut buf = vec![0u8; *len];
-        dev.read(&w, tile, *addr, &mut buf).unwrap();
-        l1.push(buf);
-    }
-    Outcome { dst, l1, trace }
 }
