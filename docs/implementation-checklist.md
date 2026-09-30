@@ -556,12 +556,19 @@ misattribution.
       confirmed identical to `0b1111`, which the page's branch-free
       `(1 << RowsRemaining) - 1` advice depends on. `MVMUL` stays open: it needs
       `SrcA`/`SrcB` and is genuinely Phase 6.
-- [ ] **Stand up tracing.** `DebugTimestamper` gives a tile-wide 64-bit counter at
-      `0xFFB1_21F0` plus a hardware event-trace primitive: one store to
-      `RISCV_DEBUG_REG_TIMESTAMP` appends `{29-bit token, 64-bit counter}` to an L1
-      ring buffer. Strictly better than per-core `mcycle` for correlating events
-      across the five babies, and it pays for itself from Phase 5 onward. Use the
-      documented retry loop for concurrent readers.
+- [x] **Stand up tracing** (silicon only; ttsim models the counter and not the
+      stream, divergence row 54). `tt_isa::tensix::timestamper` holds the register
+      map, `tt_device::trace` configures buffer 0 (`configure_trace`: pulse the
+      sticky reset, clear `full`/`overflow`, buffer 1 off), decodes it
+      (`read_trace`, refusing an overflowed stream) and reads the counter with the
+      documented retry loop (`wall_clock`). The role firmware records `START`,
+      `PUSHED` and `RETIRED` as 128-bit events -- whole 16-byte writes, so three
+      cores share one stream -- when its mailbox's `TRACE` word is set;
+      `Run::traced` sets it and returns `Outcome::trace`. First use,
+      `step10_matmul_tile::the_timestamper_shows_the_roles_overlap`, both cards:
+      released together, the three roles start within ~800 cycles and overlap
+      throughout a ~1300-cycle two-round matmul; released in order, ~57 000 cycles
+      of host latency separate them (row 53, measured).
 - [~] **`SFPLOADMACRO`.** The simulator's refusal is now *watched* rather than
       quoted: `step5_corpus.rs` pushes one, asserts the child dies, and runs a
       control program of the same shape that survives. A silicon-side test of what

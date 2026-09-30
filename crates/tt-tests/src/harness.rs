@@ -96,6 +96,9 @@ pub struct Run<'a> {
     /// Run the roles at the same time rather than in order, with these
     /// semaphores initialised first; see [`Run::concurrent`].
     pub concurrent: Option<&'a [SemaphoreInit]>,
+    /// Record each role's progress through the tile's timestamper; see
+    /// [`Run::traced`].
+    pub trace: bool,
 }
 
 /// A semaphore's starting `Value` and `Max`, set before a concurrent run.
@@ -137,6 +140,7 @@ impl<'a> Run<'a> {
             tile: None,
             roles: None,
             concurrent: None,
+            trace: false,
         }
     }
 
@@ -175,6 +179,14 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Have each role record `START`, `PUSHED` and `RETIRED` through the
+    /// tile's timestamper (`tt_isa::mailbox::trace`), returned in
+    /// [`Outcome::trace`]. Silicon only: ttsim's support is its own probe.
+    pub fn traced(mut self) -> Self {
+        self.trace = true;
+        self
+    }
+
     pub fn read_back(mut self, ranges: &'a [(u64, usize)]) -> Self {
         self.read_back = ranges;
         self
@@ -187,6 +199,8 @@ pub struct Outcome {
     pub dst: Vec<u32>,
     /// One buffer per [`Run::read_back`] range, in order.
     pub l1: Vec<Vec<u8>>,
+    /// The timestamper events of a [`Run::traced`] run, in order.
+    pub trace: Vec<tt_device::trace::TraceEvent>,
 }
 
 impl Outcome {
@@ -277,6 +291,8 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
     dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
     dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, spec.dump_rows)
         .unwrap();
+    assert!(!spec.trace, "tracing is for role runs");
+    dev.write32(&w, tile, mailbox::TRACE, 0).unwrap();
     dev.write(&w, tile, mailbox::PROGRAM, &program_bytes(&program))
         .unwrap();
     for row in 0..spec.dump_rows {
@@ -312,13 +328,14 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
             );
         }
     }
+    let trace = Vec::new();
     let mut l1 = Vec::new();
     for (addr, len) in spec.read_back {
         let mut buf = vec![0u8; *len];
         dev.read(&w, tile, *addr, &mut buf).unwrap();
         l1.push(buf);
     }
-    Outcome { dst, l1 }
+    Outcome { dst, l1, trace }
 }
 
 /// A program as the little-endian words the firmware pushes, for one bulk
@@ -374,26 +391,29 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
         dev.write(&w, tile, *addr, data).unwrap();
     }
 
-    let stage_role = |dev: &mut Dev<'_>, thread: usize, program: &[Instruction], dump: u32| {
-        let mb = Mailbox::of(thread as u32);
-        dev.write32(&w, tile, mb.status(), 0).unwrap();
-        dev.write32(&w, tile, mb.thread_index(), thread as u32)
-            .unwrap();
-        dev.write32(&w, tile, mb.dst_access_fmt(), spec.dst_fmt)
-            .unwrap();
-        dev.write32(&w, tile, mb.program_len(), program.len() as u32)
-            .unwrap();
-        dev.write32(&w, tile, mb.dump_row_first(), 0).unwrap();
-        dev.write32(&w, tile, mb.dump_row_count(), dump).unwrap();
-        dev.write(&w, tile, mb.program(), &program_bytes(program))
-            .unwrap();
-        for row in 0..dump {
-            for col in 0..mailbox::DUMP_ROW_WORDS {
-                dev.write32(&w, tile, mb.dump_offset(row, col), SENTINEL)
-                    .unwrap();
+    let stage_role =
+        |dev: &mut Dev<'_>, thread: usize, program: &[Instruction], dump: u32, traced: bool| {
+            let mb = Mailbox::of(thread as u32);
+            dev.write32(&w, tile, mb.status(), 0).unwrap();
+            dev.write32(&w, tile, mb.thread_index(), thread as u32)
+                .unwrap();
+            dev.write32(&w, tile, mb.dst_access_fmt(), spec.dst_fmt)
+                .unwrap();
+            dev.write32(&w, tile, mb.program_len(), program.len() as u32)
+                .unwrap();
+            dev.write32(&w, tile, mb.dump_row_first(), 0).unwrap();
+            dev.write32(&w, tile, mb.dump_row_count(), dump).unwrap();
+            dev.write32(&w, tile, mb.trace(), u32::from(traced))
+                .unwrap();
+            dev.write(&w, tile, mb.program(), &program_bytes(program))
+                .unwrap();
+            for row in 0..dump {
+                for col in 0..mailbox::DUMP_ROW_WORDS {
+                    dev.write32(&w, tile, mb.dump_offset(row, col), SENTINEL)
+                        .unwrap();
+                }
             }
-        }
-    };
+        };
     let dump_of = |thread: usize| if thread == 1 { spec.dump_rows } else { 0 };
     let start = |dev: &mut Dev<'_>, thread: usize| {
         let (core, image, at) = crate::firmware::ROLES[thread];
@@ -418,14 +438,18 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
     };
 
     if let Some(setup) = &setup {
-        stage_role(dev, 0, setup, 0);
+        stage_role(dev, 0, setup, 0, false);
         start(dev, 0);
         if let Err(e) = wait(dev, 0) {
             panic!("setup run: {e}");
         }
     }
     for (thread, program) in programs.iter().enumerate() {
-        stage_role(dev, thread, program, dump_of(thread));
+        stage_role(dev, thread, program, dump_of(thread), spec.trace);
+    }
+    if spec.trace {
+        dev.configure_trace(&w, tile, mailbox::TRACE_BUFFER, mailbox::TRACE_BUFFER_BYTES)
+            .unwrap();
     }
     if setup.is_some() {
         // Together, by one write to the soft-reset register: released one by
@@ -464,11 +488,16 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
             dst.push(dev.read32(&w, tile, math.dump_offset(row, col)).unwrap());
         }
     }
+    let trace = if spec.trace {
+        dev.read_trace(&w, tile, mailbox::TRACE_BUFFER).unwrap()
+    } else {
+        Vec::new()
+    };
     let mut l1 = Vec::new();
     for (addr, len) in spec.read_back {
         let mut buf = vec![0u8; *len];
         dev.read(&w, tile, *addr, &mut buf).unwrap();
         l1.push(buf);
     }
-    Outcome { dst, l1 }
+    Outcome { dst, l1, trace }
 }

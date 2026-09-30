@@ -527,3 +527,121 @@ fn a_shape_format_and_depth_sweep() {
         }
     }
 }
+
+// --- Tracing -------------------------------------------------------------------
+
+/// ttsim models the timestamper's cycle counter and not its event stream:
+/// configuring the buffer dies with `riscv_debug_regs_wr32:
+/// TIMESTAMP_DUMP_CNTL` (`UnsupportedFunctionality`, divergence row 54), while
+/// the retry-loop read of the counter works. So tracing is silicon-only, and
+/// the firmware only traces when the mailbox asks it to.
+#[test]
+#[cfg(not(feature = "silicon"))]
+fn ttsim_models_the_timestamper_clock_but_not_its_event_stream() {
+    use tt_device::tlb::WindowKind;
+    let configure = harness::survives(|dev| {
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = harness::tensix_tile();
+        dev.configure_trace(
+            &w,
+            t,
+            tt_isa::mailbox::TRACE_BUFFER,
+            tt_isa::mailbox::TRACE_BUFFER_BYTES,
+        )
+        .unwrap();
+    });
+    let clock = harness::survives(|dev| {
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = harness::tensix_tile();
+        dev.wall_clock(&w, t).unwrap();
+    });
+    // The control: the same window, the same tile, a register ttsim does model.
+    let control = harness::survives(|dev| {
+        let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = harness::tensix_tile();
+        dev.read_soft_reset(&w, t).unwrap();
+    });
+    assert!(control, "the harness itself must work");
+    assert!(clock, "ttsim models WALL_CLOCK");
+    assert!(!configure, "ttsim declines the event stream");
+}
+
+/// Each role's `(START, RETIRED)` interval, by thread, from a traced run.
+#[cfg(feature = "silicon")]
+fn role_intervals(trace: &[tt_device::trace::TraceEvent]) -> [(u64, u64); 3] {
+    use tt_isa::mailbox::trace as ev;
+    let at = |thread: u32, event: u32| {
+        let hits: Vec<u64> = trace
+            .iter()
+            .filter(|e| ev::split(e.token) == (thread, event))
+            .map(|e| e.cycles)
+            .collect();
+        assert_eq!(hits.len(), 1, "thread {thread} event {event}: {trace:?}");
+        hits[0]
+    };
+    let mut out = [(0, 0); 3];
+    for (t, slot) in out.iter_mut().enumerate() {
+        let t = t as u32;
+        let (start, pushed, retired) = (at(t, ev::START), at(t, ev::PUSHED), at(t, ev::RETIRED));
+        assert!(
+            start <= pushed && pushed <= retired,
+            "thread {t} out of order"
+        );
+        *slot = (start, retired);
+    }
+    out
+}
+
+/// The timestamper shows what the results only imply: released together, the
+/// three roles of a tile matmul run *at the same time* -- every role starts
+/// before any has retired -- and released in order, they do not. Nine events
+/// per run, one counter, three cores.
+#[test]
+#[cfg(feature = "silicon")]
+fn the_timestamper_shows_the_roles_overlap() {
+    let (a, b) = small_integer_operands(0x71ce);
+    let concurrent = Staged::new(&a, &b, 2, Handoff::Semaphore);
+    let sequential = Staged::new(&a, &b, 2, Handoff::Unsynchronised);
+    harness::in_device(|dev| {
+        let [unpack, math, pack] = &concurrent.programs;
+        let stage = [
+            (STAGE_A, concurrent.sa.as_slice()),
+            (STAGE_B, concurrent.sb.as_slice()),
+        ];
+        let out = harness::run(
+            dev,
+            &Run::roles(Roles { unpack, math, pack })
+                .concurrent(&SEMAPHORES)
+                .stage(&stage)
+                .dump_rows(0)
+                .traced(),
+        );
+        let roles = role_intervals(&out.trace);
+        let last_start = roles.iter().map(|r| r.0).max().unwrap();
+        let first_retire = roles.iter().map(|r| r.1).min().unwrap();
+        println!("concurrent (start, retired) cycles: {roles:?}");
+        assert!(
+            last_start < first_retire,
+            "concurrently released roles must overlap: {roles:?}"
+        );
+
+        let [unpack, math, pack] = &sequential.programs;
+        let stage = [
+            (STAGE_A, sequential.sa.as_slice()),
+            (STAGE_B, sequential.sb.as_slice()),
+        ];
+        let out = harness::run(
+            dev,
+            &Run::roles(Roles { unpack, math, pack })
+                .stage(&stage)
+                .dump_rows(0)
+                .traced(),
+        );
+        let roles = role_intervals(&out.trace);
+        println!("in order (start, retired) cycles: {roles:?}");
+        assert!(
+            roles[0].1 < roles[1].0 && roles[1].1 < roles[2].0,
+            "roles run in order must not overlap: {roles:?}"
+        );
+    });
+}

@@ -47,6 +47,26 @@ fn fail_in(mb: Mailbox, code: u32) -> ! {
     fail(code)
 }
 
+/// Record `event` through the tile's timestamper, if the host asked for it.
+///
+/// One store per event, of a 128-bit event, which the timestamper writes to L1
+/// whole -- so the three role cores can share one stream without their events
+/// interleaving (`DebugTimestamper.md`). Off unless the mailbox says so:
+/// whether ttsim models the timestamper is a question with its own probe, and
+/// a register it does not model is fatal there.
+fn trace(on: bool, thread: u32, event: u32) {
+    if on {
+        // SAFETY: a documented, aligned timestamper register; a store has no
+        // effect beyond appending the event.
+        unsafe {
+            l1_write32(
+                tt_isa::tensix::timestamper::TIMESTAMP,
+                tt_isa::tensix::timestamper::event_128(mailbox::trace::token(thread, event)),
+            )
+        };
+    }
+}
+
 fn run_in<Riscv, Thread>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
@@ -62,6 +82,7 @@ where
     let program_len = unsafe { l1_read32(mb.program_len()) };
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
+    let tracing = unsafe { l1_read32(mb.trace()) } != 0;
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -97,6 +118,7 @@ where
     // before pushing anything that depends on the new value.
     publish();
 
+    trace(tracing, Thread::INDEX, mailbox::trace::START);
     let mut i = 0;
     while i < program_len {
         // SAFETY: the word is inside the staged program, whose length was checked
@@ -106,9 +128,12 @@ where
         i += 1;
     }
 
+    trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
+
     // The pushes above have only reached a FIFO. Wait for them to retire before
     // looking at Dst.
     wait_for_coprocessor();
+    trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
 
     let mut row = 0;
     while row < dump_rows {

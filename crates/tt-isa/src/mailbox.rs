@@ -41,8 +41,40 @@ pub const DUMP_ROW_COUNT: u64 = MAILBOX_BASE + 0x28;
 /// First `Dst` row to copy.
 pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
 
+/// Non-zero: the firmware records its progress through the tile's timestamper
+/// (`tensix::timestamper`), which the host has configured. Zero on the
+/// simulator, whose timestamper support is probed separately.
+pub const TRACE: u64 = MAILBOX_BASE + 0x30;
+
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x40;
+
+/// Where the host points the timestamper's event buffer: after the program
+/// slots, 256 events.
+pub const TRACE_BUFFER: u64 = PROGRAM_REGION_END;
+/// Bytes in [`TRACE_BUFFER`].
+pub const TRACE_BUFFER_BYTES: u64 = 256 * crate::tensix::timestamper::EVENT_BYTES;
+
+/// What the firmware traces: the event, in the low bits of a token whose bits
+/// 8.. carry the Tensix thread.
+pub mod trace {
+    /// The firmware has read its mailbox and is about to push.
+    pub const START: u32 = 1;
+    /// The last instruction word has been pushed.
+    pub const PUSHED: u32 = 2;
+    /// The coprocessor has retired the program.
+    pub const RETIRED: u32 = 3;
+
+    /// The token for `event` on `thread`.
+    pub const fn token(thread: u32, event: u32) -> u32 {
+        (thread << 8) | event
+    }
+
+    /// `(thread, event)` from a token.
+    pub const fn split(token: u32) -> (u32, u32) {
+        (token >> 8, token & 0xff)
+    }
+}
 
 /// Where Tensix instruction streams are staged by the host: one fixed slot per
 /// mailbox, the single-core one first and then one per role.
@@ -94,6 +126,9 @@ const _: () =
     assert!(dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) + 4 <= crate::tensix::L1_SIZE);
 // The descriptor words have to stay inside the mailbox the firmware owns.
 const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
+const _: () = assert!(TRACE_BUFFER % 16 == 0);
 
 /// One mailbox per Tensix thread, for the three-role datapath.
 ///
@@ -156,6 +191,9 @@ pub mod role {
         }
         pub const fn dump_row_first(self) -> u64 {
             self.base + (super::DUMP_ROW_FIRST - super::MAILBOX_BASE)
+        }
+        pub const fn trace(self) -> u64 {
+            self.base + (super::TRACE - super::MAILBOX_BASE)
         }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {

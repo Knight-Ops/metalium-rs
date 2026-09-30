@@ -11,6 +11,7 @@ pub mod core_control;
 pub mod device;
 pub mod telemetry;
 pub mod tlb;
+pub mod trace;
 pub mod transport;
 
 pub use device::{Device, PowerPolicy, Tile, Window};
