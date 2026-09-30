@@ -849,3 +849,298 @@ fn m15_dst_read_after_matrix_write() {
         }
     }
 }
+
+/// With the unpacker properly waited for, `MOVA2D` reads zeros.
+///
+/// m15 with a full barrier after the `SrcA` unpack moved nothing but zeros,
+/// where a B3-only wait (the old `wait_for_unpacker0`) moved nearly everything.
+/// So the old near-miss was `MOVA2D` racing the unpacker, and the real question
+/// is which bank it reads once it does not. Three waits: B3 only, B3 + B6, and
+/// a full barrier; row 0 of `Dst` printed for each.
+#[test]
+fn m16_srca_move_versus_wait_mask() {
+    assert_on_silicon();
+    let n = 20usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    for (label, mask, clear) in [
+        ("b3", backend::block::UNPACKER, true),
+        (
+            "b3_b6",
+            backend::block::UNPACKER | backend::block::MATRIX,
+            true,
+        ),
+        ("all", backend::Before::EVERYTHING.mask(), true),
+        ("b3.no_prelude", backend::block::UNPACKER, false),
+        ("all.no_prelude", backend::Before::EVERYTHING.mask(), false),
+    ] {
+        let mut p = src_thread_config();
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+        words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+        let mut buf = [sfpu::nop(); 64];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        p.extend_from_slice(&buf[..k]);
+        p.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        p.push(unpack_src_instruction(Unpacker::SrcA, true));
+        p.push(backend::stallwait(mask, backend::cond::UNPACKER0_BUSY).unwrap());
+        p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+        in_device(|dev| {
+            let stage = [(STAGE, staged.as_slice())];
+            let mut run = Run::new(&p)
+                .stage(&stage)
+                .dump_rows(tt_isa::mailbox::DUMP_MAX_ROWS);
+            run.clear_dst = clear;
+            let out = harness::run(dev, &run);
+            let nonzero: Vec<String> = out
+                .dst_nonzero()
+                .iter()
+                .map(|(f, v)| format!("[{}][{}]={v:08x}", f / ROW, f % ROW))
+                .collect();
+            measure(&format!("srca_wait.{label}.nonzero"), nonzero.join(" "));
+        });
+    }
+}
+
+/// Is the `SrcA` truncation a property of the gate tile?
+///
+/// With the thread state reset and a full barrier, card 0's gate tile still
+/// returns columns 9 and 13 of an FP32 -> TF32 `SrcA` unpack with their top
+/// mantissa bits cleared, every run, while `SrcB` is clean; card 1 shows other
+/// columns. If the columns follow the tile, it is the tile's storage. Same
+/// program on several tiles of this chip.
+#[test]
+fn m17_srca_truncation_across_tiles() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let reset = tt_tests::datapath::thread_state_reset();
+    let mut p = src_thread_config();
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let mut buf = [sfpu::nop(); 64];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    p.extend_from_slice(&buf[..k]);
+    p.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+    p.push(unpack_src_instruction(Unpacker::SrcA, true));
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+    p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+    p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+    for (x, y) in [(3u8, 4u8), (1, 2), (5, 6), (7, 9), (11, 3), (2, 10)] {
+        in_device(|dev| {
+            let mut r = Run::new(&reset).dump_rows(0);
+            r.tile = Some((x, y));
+            let _ = harness::run(dev, &r);
+            let stage = [(STAGE, staged.as_slice())];
+            let mut r = Run::new(&p).stage(&stage).dump_rows(2);
+            r.tile = Some((x, y));
+            let out = harness::run(dev, &r);
+            let bad: Vec<String> = (0..n)
+                .filter(|&i| out.dst[i] != datums[i])
+                .map(|i| format!("c{}:{:08x}", i % ROW, out.dst[i]))
+                .collect();
+            measure(
+                &format!("srca_tiles.({x},{y})"),
+                format!("{} bad: {}", bad.len(), bad.join(" ")),
+            );
+        });
+    }
+}
+
+/// Unpacker's `SrcA` write, or the Matrix Unit's `SrcA` read?
+///
+/// m17: FP32 -> TF32 into `SrcA` loses fixed columns on every tile of both
+/// cards, so it is not a defect but something about how the path is driven.
+/// This fills `SrcA` without the unpacker: `UnpackToDst` (clean on silicon)
+/// puts the datums in `Dst` rows 0..2, `MOVD2A` copies them into `SrcA` rows
+/// 0..2, and `MOVA2D` brings them back to `Dst` rows 8..10. A bank is first
+/// handed to the Matrix Unit by an ordinary flip-unpack into `SrcA`, whose own
+/// contents `MOVD2A` then overwrites. Clean rows 8..10 put the fault in the
+/// unpacker's `SrcA` write; bad ones put it on the Matrix side.
+#[test]
+fn m18_srca_filled_by_movd2a() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let barrier = |p: &mut Vec<tt_isa::isa::Instruction>| {
+        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+    };
+
+    // 1. Datums into Dst rows 0..2, through the clean path.
+    let mut p = thread_config();
+    let mut words = ConfigWords::new();
+    unpack_config(&mut words, flat_descriptor(n as u32), STAGE);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let mut buf = [sfpu::nop(); 64];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    p.extend_from_slice(&buf[..k]);
+    p.push(set_adc_x_unpack(0, n as u32 - 1));
+    p.push(unpack_instruction());
+    barrier(&mut p);
+
+    // 2. Hand a SrcA bank to the Matrix Unit.
+    p.extend(src_thread_config());
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    p.extend_from_slice(&buf[..k]);
+    p.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+    p.push(unpack_src_instruction(Unpacker::SrcA, true));
+    barrier(&mut p);
+
+    // 3. Overwrite SrcA rows 0..2 from Dst, then move SrcA back to Dst row 8.
+    for r in 0..2u32 {
+        p.push(encode::Movd2A::ZERO.src_row(r).dst_row(r).encode().unwrap());
+    }
+    barrier(&mut p);
+    p.push(
+        encode::Mova2D::ZERO
+            .move8_rows(1)
+            .src_row(0)
+            .dst_row(8)
+            .encode()
+            .unwrap(),
+    );
+    barrier(&mut p);
+
+    in_device(|dev| {
+        let stage = [(STAGE, staged.as_slice())];
+        let out = harness::run(dev, &Run::new(&p).stage(&stage).dump_rows(16));
+        let bad = |base: usize| -> Vec<String> {
+            (0..n)
+                .filter(|&i| out.dst[base + i] != datums[i])
+                .map(|i| format!("c{}:{:08x}", i % ROW, out.dst[base + i]))
+                .collect()
+        };
+        measure("movd2a.dst_rows_0_2.bad", bad(0).join(" "));
+        measure("movd2a.back_rows_8_10.bad", bad(8 * ROW).join(" "));
+    });
+}
+
+/// Does `ConfigWords::program` write the configuration it was given?
+///
+/// It loads each word into one scratch GPR with a `SETDMAREG` pair (Scalar
+/// Unit) and immediately `WRCFG`s it (Configuration Unit), with no fence either
+/// side, trusting each word to be consumed before the next overwrites the GPR.
+/// LLK never does that: it waits for the Scalar Unit before every `WRCFG` and
+/// separates each from what follows. This runs the `SrcA` path's configuration
+/// program alone and reads every word back through `CFGREG`, several times.
+#[test]
+fn m19_config_words_land_as_written() {
+    assert_on_silicon();
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(20).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let mut buf = vec![sfpu::nop(); words.program_len()];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    let mut p = src_thread_config();
+    p.extend_from_slice(&buf[..k]);
+    p.push(
+        backend::stallwait(
+            backend::Before::EVERYTHING.mask(),
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    let intended: Vec<(u16, u32)> = words.words().to_vec();
+    for attempt in 0..4 {
+        in_device(|dev| {
+            let _ = harness::run(dev, &Run::new(&p).dump_rows(0));
+            let tile = harness::tensix_tile();
+            let w = dev
+                .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+                .unwrap();
+            let mut wrong = Vec::new();
+            for &(addr32, want) in &intended {
+                dev.write32(&w, tile, tensix::CFGREG_RD_CNTL, addr32 as u32)
+                    .unwrap();
+                harness::advance(dev, 64);
+                let got = dev.read32(&w, tile, tensix::CFGREG_RDDATA).unwrap();
+                if got != want {
+                    wrong.push(format!("{addr32}:want {want:#x} got {got:#x}"));
+                }
+            }
+            dev.free_window(w);
+            measure(
+                &format!("cfg_program.run{attempt}"),
+                format!(
+                    "{} of {} wrong: {}",
+                    wrong.len(),
+                    intended.len(),
+                    wrong.join("; ")
+                ),
+            );
+        });
+    }
+}
+
+/// Does declaring the `Src` formats to the Matrix Unit fix the column losses?
+///
+/// LLK always sets `ALU_FORMAT_SPEC_REG0_SrcA` / `REG1_SrcB` to the format it
+/// unpacks; the datapath here never has, because ttsim did not care. The Matrix
+/// Unit decodes the 19-bit `Src` storage by that format, and card 0's column-9
+/// loss survives `MOVD2A` -> `MOVA2D` without the unpacker (m18), so it is on
+/// the Matrix side. Same path as m15, both unpackers, with and without.
+#[test]
+fn m20_src_formats_declared_to_the_matrix_unit() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    for declare in [false, true] {
+        for unpacker in [Unpacker::SrcA, Unpacker::SrcB] {
+            for attempt in 0..3 {
+                let mut p = src_thread_config();
+                let mut words = ConfigWords::new();
+                let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+                unpack_src_config(&mut words, unpacker, descriptor, STAGE, 4);
+                words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+                if declare {
+                    words
+                        .set(alu::ALU_FORMAT_SPEC_REG0_SrcA, 4)
+                        .unwrap()
+                        .set(alu::ALU_FORMAT_SPEC_REG1_SrcB, 4)
+                        .unwrap();
+                }
+                let mut buf = vec![sfpu::nop(); words.program_len()];
+                let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+                p.extend_from_slice(&buf[..k]);
+                p.push(set_adc_x(unpacker, 0, n as u32 - 1));
+                p.push(unpack_src_instruction(unpacker, true));
+                match unpacker {
+                    Unpacker::SrcA => {
+                        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+                        p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+                    }
+                    Unpacker::SrcB => {
+                        p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+                        for r in 0..2 {
+                            p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                        }
+                    }
+                }
+                p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+                in_device(|dev| {
+                    let stage = [(STAGE, staged.as_slice())];
+                    let out = harness::run(dev, &Run::new(&p).stage(&stage).dump_rows(2));
+                    let bad: Vec<usize> = (0..n).filter(|&i| out.dst[i] != datums[i]).collect();
+                    let key = format!("{unpacker:?}").to_lowercase();
+                    measure(
+                        &format!("declared_{declare}.{key}.run{attempt}"),
+                        format!("bad {bad:?}"),
+                    );
+                });
+            }
+        }
+    }
+}

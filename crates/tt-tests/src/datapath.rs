@@ -418,3 +418,63 @@ pub fn pack_instruction(read_intf_sel: u32, last: bool) -> Instruction {
         .encode()
         .unwrap()
 }
+
+/// Put the issuing thread's own Tensix state back to what ttsim starts with:
+/// every `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.
+///
+/// None of it is touched by anything the host can do from outside -- the
+/// backend soft-reset pulse resets the units, not the per-thread state -- so on
+/// silicon one gate inherits the last one's. The first silicon run of the `Src`
+/// probes after `step9_matmul` had configured thread 0's address modifiers and
+/// RWCs moved nothing into the rows they dumped. ttsim starts every run from
+/// zero, which is what every gate is written against.
+///
+/// **Silicon only.** ttsim refuses `SETC16` to some entries at any value
+/// (`SRCB_SET_Base`, divergence row 36), and has nothing to reset.
+pub fn thread_state_reset() -> Vec<Instruction> {
+    let entries: std::collections::BTreeSet<u16> = tt_isa::cfg::generated::ALL_THREAD_CONFIG_FIELDS
+        .iter()
+        .map(|(_, f)| f.addr32())
+        .collect();
+    let mut p: Vec<Instruction> = entries
+        .into_iter()
+        .map(|addr32| ThreadConfigEntry::zeroed(addr32).encode().unwrap())
+        .collect();
+    // RWCs: set each counter (and its carry register) to zero, and the fidelity
+    // phase; no bank flips (`SETRWC.md`).
+    p.push(
+        encode::Setrwc::ZERO
+            .src_a(1)
+            .src_b(1)
+            .dst(1)
+            .fidelity(1)
+            .encode()
+            .unwrap(),
+    );
+    // ADCs: X, Y, Z, W of both channels, for both unpackers and the packers.
+    p.push(
+        encode::Setadcxy::ZERO
+            .u0(1)
+            .u1(1)
+            .pk(1)
+            .x0(1)
+            .y0(1)
+            .x1(1)
+            .y1(1)
+            .encode()
+            .unwrap(),
+    );
+    p.push(
+        encode::Setadczw::ZERO
+            .u0(1)
+            .u1(1)
+            .pk(1)
+            .z0(1)
+            .w0(1)
+            .z1(1)
+            .w1(1)
+            .encode()
+            .unwrap(),
+    );
+    p
+}

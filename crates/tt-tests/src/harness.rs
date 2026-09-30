@@ -84,6 +84,12 @@ pub struct Run<'a> {
     pub read_back: &'a [(u64, usize)],
     /// `RISC_DEST_ACCESS_CTRL_SEC*.fmt`.
     pub dst_fmt: u32,
+    /// Zero the dumped `Dst` rows before the program ([`dst_clear_prelude`]).
+    /// On by default; a probe of the prelude itself turns it off.
+    pub clear_dst: bool,
+    /// Run somewhere other than the gate tile. Claimed through [`tile`], so it
+    /// is checked against the chip's grid and scrubbed afterwards.
+    pub tile: Option<(u8, u8)>,
 }
 
 impl<'a> Run<'a> {
@@ -95,6 +101,8 @@ impl<'a> Run<'a> {
             dump_rows: 4,
             read_back: &[],
             dst_fmt: DST_FMT_FP32,
+            clear_dst: true,
+            tile: None,
         }
     }
 
@@ -169,7 +177,11 @@ fn dst_clear_prelude(dump_rows: u32) -> Vec<Instruction> {
 /// Panics rather than returning an error: every failure here is a broken gate, not
 /// a condition a caller could handle.
 pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
-    let mut program = dst_clear_prelude(spec.dump_rows);
+    let mut program = if spec.clear_dst {
+        dst_clear_prelude(spec.dump_rows)
+    } else {
+        Vec::new()
+    };
     program.extend_from_slice(spec.program);
     assert!(
         program.len() as u32 <= mailbox::PROGRAM_MAX,
@@ -179,7 +191,10 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
     );
     assert!(spec.dump_rows <= mailbox::DUMP_MAX_ROWS);
 
-    let tile = tensix_tile();
+    let tile = match spec.tile {
+        Some((x, y)) => crate::backend::tile(dev, x, y),
+        None => tensix_tile(),
+    };
     let w: Window = dev.alloc_window(WindowKind::TwoMib).unwrap();
 
     // The backend has to be out of reset before the coprocessor executes anything,

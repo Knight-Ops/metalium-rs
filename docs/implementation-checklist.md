@@ -30,14 +30,43 @@ gate you have not seen reject something is not yet evidence.
 |--:|---|---|
 | 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
 | 1 — Host addresses the chip | `[x]` | **Gated on simulator and on silicon** (both p150a cards, 7/7). `tt-kmd` done; harvesting read from ARC telemetry |
-| 2 — Rust on a baby RISC-V | `[~]` | Heartbeat runs; silicon gate and hot-reload path open |
-| 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
-| 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
-| 5 — Elementwise binary | `[~]` | Simulator gate done, FP32 only; BF16 blocked on ttsim, silicon gate open |
-| 6 — Matmul | `[~]` | One 8×16·16×16 `MVMUL` block gated with all four fidelity phases; face, tile and multi-tile open |
+| 2 — Rust on a baby RISC-V | `[~]` | **Silicon gate passed on both cards** (heartbeat, reset, `pc` snapshot, local RAM + zeroing); I-cache and hot-reload paths open |
+| 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
+| 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
+| 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
+| 6 — Matmul | `[~]` | Sim gates pass; **silicon open**: the `Src` -> `Dst` move path loses fixed columns (see Silicon campaign) |
 | 7 — Burn backend, training | `[ ]` | The milestone |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
+
+---
+
+## Silicon campaign (2026-09-30)
+
+Run with `cargo xtask silicon` (one test per process, fsync'd log). Every bug below
+passed on ttsim for weeks; each is now fixed in the code, not worked around.
+
+- [x] **Local RAM hung the NoC** when accessed with its core in reset -- `tt-device`
+      refuses it (see Silicon operating notes).
+- [x] **A hung program wedged the tile** until the harness learnt to pulse the Tensix
+      backend reset; **per-thread state and `Dst` leaked between gates** until it reset
+      them too (divergence row 47).
+- [x] **Rows 30/35 were our off-by-one**: `REG3_Base_address` pointed one unit before
+      the tile header. With it fixed, every datum lands where the specification says,
+      on ttsim and silicon.
+- [x] **`UNPACR` counts with thread 0's ADCs** (row 45): silicon programs run on T0.
+- [x] **`STALLWAIT` waits held the wrong units** (row 46): the consumer is now a
+      required argument.
+- [~] **`Src` -> `Dst` column losses, open.** FP32 -> TF32 into `SrcA` (and, on card 1,
+      `SrcB`) comes back with fixed *columns* wrong -- the same column in every row,
+      the top mantissa bits cleared or the whole datum zero -- on every tile of both
+      cards, so not a defect. Ruled out, each by measurement in `silicon_measure.rs`:
+      burst size and throttle (m12), read-after-write timing (m15), stale thread state
+      (fixed; m16), the unpacker alone (card 0 still loses column 9 when `SrcA` is
+      filled by `MOVD2A`, m18), configuration corrupted in flight (m19), undeclared
+      `Src` formats (m20). Next: compare LLK's full-face `SrcA` unpack and its
+      `SRCA_SET_Base`/`ADD_DEST_ADDR_CNTR` settings, and `MOVA2D` against `MVMUL`.
+      `probe_src` and `step9_matmul` stay red on silicon until then.
 
 ---
 

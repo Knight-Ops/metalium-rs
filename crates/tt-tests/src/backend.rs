@@ -383,10 +383,20 @@ mod silicon {
     /// terminate the process — but it earns its keep twice over here. A gate that
     /// wedges a core cannot take the runner with it, and the child's file
     /// descriptor closing is what fires the driver's cleanup write.
+    /// Reset the gate thread's own Tensix state before a gate runs:
+    /// [`crate::datapath::thread_state_reset`], run through the harness on the
+    /// gate tile. The per-thread half of the scrub that [`reset_tile`] cannot
+    /// do from outside.
+    fn reset_thread_state(dev: &mut Dev<'_>) {
+        let program = crate::datapath::thread_state_reset();
+        let _ = crate::harness::run(dev, &crate::harness::Run::new(&program).dump_rows(0));
+    }
+
     #[track_caller]
     pub fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
         if let Err(e) = fork_scope(|| {
             let mut dev = open();
+            reset_thread_state(&mut dev);
             f(&mut dev);
             scrub(&mut dev);
         }) {
@@ -402,6 +412,7 @@ mod silicon {
     pub fn survives(f: impl FnOnce(&mut Dev<'_>)) -> bool {
         fork_scope(|| {
             let mut dev = open();
+            reset_thread_state(&mut dev);
             f(&mut dev);
             scrub(&mut dev);
         })

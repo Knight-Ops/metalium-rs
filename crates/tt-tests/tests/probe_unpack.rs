@@ -609,3 +609,23 @@ fn unpacr_without_the_undocumented_last_bit_is_refused() {
         "ttsim refuses UNPACR with bit 0 clear (`tensix_unpacr: last=0`). If this          now runs, the simulator has changed and the note on UNPACR_LAST needs          revisiting"
     );
 }
+
+/// The non-`SETC16` tail of `datapath::thread_state_reset` executes on ttsim.
+///
+/// That reset only runs on silicon, where it is the per-thread scrub, so without
+/// this nothing checks that `SETRWC`, `SETADCXY` and `SETADCZW` -- all
+/// Wormhole-sourced and `UNVERIFIED` in the table -- are accepted at all. The
+/// `SETC16` half is left out because ttsim refuses some entries at any value.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn the_thread_state_reset_tail_executes() {
+    let reset = tt_tests::datapath::thread_state_reset();
+    let tail: Vec<Instruction> = reset
+        .into_iter()
+        .filter(|i| i.def().mnemonic() != "SETC16")
+        .collect();
+    assert_eq!(tail.len(), 3, "SETRWC, SETADCXY, SETADCZW");
+    assert!(survives(|dev| {
+        let _ = run(dev, &[], &tail, 1);
+    }));
+}
