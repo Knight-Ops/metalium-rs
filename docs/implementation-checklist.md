@@ -62,8 +62,10 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       at their cores' default reset PCs (`role_t0..2`), one mailbox each
       (`mailbox::role`), run in order. It works on ttsim too -- math on T1 is the one
       thread ttsim lets read `Dst` -- so the T0/T1 target split is only needed by the
-      remaining single-thread gates. `probe_src` is converted; `step9_matmul` and the
-      eltwise path are next.
+      remaining single-thread gates. `probe_src`, `step9_matmul`, `step8_eltwise`
+      and `probe_pack` all run this way, on ttsim and both cards; the latter two
+      share `datapath::dst_round_trip_roles`. `probe_unpack` and `step5_corpus`
+      stay single-thread on purpose, and say why in their headers.
 - [x] **Every datapath encoding checked against LLK** (`tt-isa/tests/llk_crosscheck.rs`).
       Two Wormhole layouts were wrong on Blackhole: `MOVB2D`'s `instr_mod` (the
       whole of row 38) and `MOVA2D`/`MOVB2D`'s `AddrMod` (one bit lower, as
@@ -170,22 +172,21 @@ no answer.
       separate table entries; the superseded one lives under
       `isa::generated::defs::wormhole`, so using it has to be deliberate.
 - [x] **`INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` from T0/T1/T2 hangs the core.**
-- [ ] **A dropped `Window` silently leaks its TLB window.** `Window` has no `Drop`
-      that returns the index to `Device`'s free list, so a gate that allocates and
-      does not `free_window` shrinks the pool for the rest of the process. Nothing
-      in the type system says so; it is currently a comment on `scrub`, which is
-      exactly the failure this section is about. It cost the Phase 1 silicon gate a
-      run (see Silicon operating notes) and the diagnostic was a bare
-      `OutOfBounds { offset: 0, len: 0 }` from an unrelated function.
-      **Why it is still open:** the obvious fix does not typecheck. `Drop` cannot
-      take `&mut Device`, so returning the index needs either a borrow of the
-      device in `Window` (which makes holding several windows at once — what the
-      exhaustion gate and every multi-window transfer do — a borrow conflict), or
-      shared interior mutability for the free list, or a `Device::scope`-style
-      closure owning the allocation. Pick one deliberately in Phase 2, when the
-      firmware path starts holding windows across calls and the cost of getting it
-      wrong goes up. Until then the exhaustion gate frees explicitly and `scrub`
-      names the cause.
+- [x] **A dropped `Window` silently leaked its TLB window.** It had no `Drop`, so
+      a gate that allocated and did not `free_window` shrank the pool for the rest
+      of the process, and the diagnostic was a bare `OutOfBounds { offset: 0,
+      len: 0 }` from an unrelated function. It cost the Phase 1 silicon gate a run.
+      The obvious fix does not typecheck (`Drop` cannot take `&mut Device`), and a
+      window that borrowed its device would make holding several at once a borrow
+      conflict. **Fixed with a shared pool:** the free list and shadow table live in
+      an `Arc<Mutex<Pool>>`, every `Window` holds a handle, and its `Drop` returns
+      the index and drops the shadow. `free_window` is now the explicit spelling of
+      the same thing. A window from another `Device` is refused
+      (`TransportError::Hazard`) before anything reaches the transport. Unit tests:
+      three passes over the whole pool by dropping, and the cross-device refusal;
+      the first watched failing with the release removed. On silicon,
+      `window_exhaustion_is_an_error_not_a_panic` now *drops* its 201 windows, and
+      the scrub that follows on the same device is the check (both cards).
 - [x] **A fused-off Tensix tile cannot be named by accident.** The predicate that looks
       obvious is the safe one: `grid::is_tensix_geometry(x, y)` answers "could a Tensix
       tile ever be here" and cannot hang anything, while `grid::Tensix::contains(x, y)`
@@ -386,14 +387,11 @@ allocation is global card state, so `window_exhaustion_is_an_error_not_a_panic`'
 `assert_eq!(held.len(), 201)` is only true if nothing else holds a window. The simulator
 hides this by handing out a fresh chip per call.
 
-**`Window` has no `Drop` that reaches the free list.** A gate that allocates must
-`free_window`; dropping leaks it. This surfaced only on silicon, because silicon's
-`in_device` scrubs the gate tile *after* the body and needs a window to do it, while the
-simulator's never scrubs at all. The one gate whose job is to exhaust windows was the one
-that starved the cleanup path. Tracked as an open item under Hazards to encode in the API,
-with the three candidate designs and why the obvious one does not typecheck — not left as
-"worth fixing at some point", which is the phrasing that produced the 140 in the first
-place.
+**`Window` had no `Drop` that reached the free list** (fixed; see Hazards to encode
+in the API). This surfaced only on silicon, because silicon's `in_device` scrubs the
+gate tile *after* the body and needs a window to do it, while the simulator's never
+scrubs at all. The one gate whose job is to exhaust windows was the one that starved
+the cleanup path.
 
 **When a run can take the node down, buy forensics first.** A hard kill loses the
 journal's last minutes *and* unflushed file data — a linked test binary came back as 9.2 MB
@@ -458,54 +456,25 @@ misattribution.
       it outright. Watched rejecting a deliberately planted `asm!("fence.i")`.
 - [x] **Gate (sim):** heartbeat climbs monotonically; a core held in reset does
       nothing; releasing one core does not disturb the others.
-- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
-      registers. The test is written and `#[cfg(feature = "silicon")]`.
+- [x] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
+      registers (divergence row 3). `step3_heartbeat::pc_snapshot_lands_in_the_loaded_image`
+      passes on both cards. The snapshot of a `j .` loop samples as the loop address
+      *and* loop + 4, which is what "speculative" means in practice.
 - [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
       sequencing, I-cache invalidation and the local-RAM zeroing window are all
       things a simulator may model loosely, and all three land here.
-      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
-      for the first time: heartbeat, held-in-reset control, reset round trip,
-      `pc` snapshot inside the image, two tiles (the far one now taken from the
-      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
+      **`step3_heartbeat` 7/7 on both cards** (2026-09-30): heartbeat, held-in-reset
+      control, reset round trip, `pc` snapshot inside the image, two tiles (the far
+      one taken from the grid rather than the fused-off `(16, 11)`), and both
+      refusals. Reset sequencing and the zeroing window are closed (below); the
+      I-cache invalidation path is what keeps this `[~]`.
 - [x] **The slow-path local-RAM aperture took the host down** -- because it was accessed
       with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
       notes) and **confirmed on both cards**: `silicon_local_ram` 4/4 on each. With cores
       parked, all five RAMs round-trip in full through the aperture with no aliasing
       (B/NC 2048 words, T0/T1/T2 1024); `DISABLE_RESET` reads back; releasing T0 with its
       bit clear zeroes all 1024 words, and with it set keeps all 1024 -- the documented
-      behaviour, observed for the first time (open question 6, zeroing half). The `pc`
-      snapshot of a `j .` loop samples as the loop address *and* loop + 4, which is what
-      "speculative" means in practice.
-- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
-      registers. The test is written and `#[cfg(feature = "silicon")]`.
-- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
-      sequencing, I-cache invalidation and the local-RAM zeroing window are all
-      things a simulator may model loosely, and all three land here.
-      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
-      for the first time: heartbeat, held-in-reset control, reset round trip,
-      `pc` snapshot inside the image, two tiles (the far one now taken from the
-      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
-- [~] **The slow-path local-RAM aperture took the host down** -- because it was accessed
-      with the owning cores held in reset. Encoded in `tt-device` (see Silicon operating
-      notes). `silicon_local_ram` now parks each core first; `l0_one_word_on_a_parked_core`
-      is the first thing to run on silicon, alone, to confirm the fix.
-- [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
-      registers. The test is written and `#[cfg(feature = "silicon")]`.
-- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
-      sequencing, I-cache invalidation and the local-RAM zeroing window are all
-      things a simulator may model loosely, and all three land here.
-      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
-      for the first time: heartbeat, held-in-reset control, reset round trip,
-      `pc` snapshot inside the image, two tiles (the far one now taken from the
-      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
-- [ ] **The slow-path local-RAM aperture took the host down.**
-      `silicon_local_ram::l1_each_local_ram_round_trips_over_the_noc` -- word
-      writes then reads into `0xFFB1_4000..0xFFB1_DFFF` on the gate tile, every
-      core held in reset -- has a `START` and no `END` in the fsync'd run log, and
-      the host died under it with the watchdog armed. Which core's range, and
-      whether reads alone are safe, is unknown. The three aperture tests are
-      quarantined (`#[ignore]` plus `TT_RISK_LOCAL_RAM_APERTURE=1`); narrow it
-      next with the watchdog off: one core, one read, before any write.
+      behaviour, observed for the first time (open question 6, zeroing half).
 - [ ] **I-cache invalidation path.** Avoided by construction today — code is
       written before reset is released, and leaving reset invalidates the cache.
       Needed the moment anything reloads a *running* core: write the 5-bit mask to

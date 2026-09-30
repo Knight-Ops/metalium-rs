@@ -19,6 +19,15 @@
 //! `UNPACR_Regular.md` as a shared-document redirect, so it is authoritative rather
 //! than a hypothesis — but the surrounding `Unpackers/` directory does not exist on
 //! Blackhole at all, and every fact taken from it is `UNVERIFIED`.
+//!
+//! # Why this stays single-thread
+//!
+//! The datapath gates split their work across the three Tensix threads
+//! (`harness::Roles`), as LLK does. This file does not, on purpose: it probes the
+//! unpacker as a single issuing thread sees it -- its refusals, its format
+//! codes, its address formula -- and several of its findings are *about* which
+//! thread's state the unpacker reads (divergence row 45). Splitting it would
+//! change the thing it measures.
 
 // The surveys and refusal probes are simulator-only, so their helpers are dead in
 // the silicon build.

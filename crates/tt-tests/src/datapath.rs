@@ -552,3 +552,55 @@ pub fn thread_entry(field: tt_isa::cfg::ThreadConfigField, value: u16) -> Instru
         .encode()
         .unwrap()
 }
+
+/// The instructions that write `words` into `Config`, sized to fit.
+pub fn config_program(words: &ConfigWords) -> Vec<Instruction> {
+    let mut buf = vec![tt_isa::sfpu::nop(); words.program_len()];
+    let n = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    buf.truncate(n);
+    buf
+}
+
+/// The three role programs of an L1 -> `Dst` -> L1 round trip, with `kernel`
+/// running on the math thread between the unpack and the pack.
+///
+/// Split the way LLK splits it (`harness::Roles`): thread 0 configures both
+/// halves of the datapath and unpacks `datums` of `descriptor` from [`STAGE`]
+/// into `Dst`; thread 1 runs `kernel`; thread 2 packs four `Dst` rows through
+/// the read interfaces in `read_intf_sel` to [`OUT`]. Each role ends by waiting
+/// for the unit it drove, so its work is complete when its firmware reports
+/// `DONE` and the next role starts.
+pub fn dst_round_trip_roles(
+    descriptor: TileDescriptor,
+    datums: u32,
+    kernel: &[Instruction],
+    read_intf_sel: u32,
+) -> [Vec<Instruction>; 3] {
+    use tt_isa::backend::{self, Before};
+
+    let mut unpack = thread_config();
+    let mut words = ConfigWords::new();
+    unpack_config(&mut words, descriptor, STAGE);
+    pack_config(&mut words, OUT);
+    unpack.extend(config_program(&words));
+    unpack.push(set_adc_x_unpack(0, datums - 1));
+    unpack.push(unpack_instruction());
+    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+
+    let mut math = vec![state_id()];
+    if !kernel.is_empty() {
+        math.extend_from_slice(kernel);
+        math.push(backend::wait_for_sfpu(Before::EVERYTHING).unwrap());
+    }
+
+    let pack = vec![
+        state_id(),
+        set_adc_x_pack(0, 15),
+        pack_instruction(read_intf_sel, true),
+        // Without this the host can read L1 before the packer has drained: the
+        // thread unblocks once the packer has *accepted* the work, not finished
+        // it (`Packers/README.md`).
+        backend::wait_for_packer(Before::EVERYTHING).unwrap(),
+    ];
+    [unpack, math, pack]
+}

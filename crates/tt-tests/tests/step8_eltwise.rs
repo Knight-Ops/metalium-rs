@@ -290,27 +290,27 @@ fn denormals_and_nans_follow_the_model_through_the_whole_datapath() {
     });
 }
 
-/// The `STALLWAIT` between the SFPU and the packer is emitted, in the right order.
+/// Each role waits for the unit it drove before reporting `DONE`.
 ///
-/// Its *effect* is not observable on ttsim -- divergence row 34 records the same
-/// for the packer's own wait -- so this asserts the instruction is in the stream
-/// rather than that removing it breaks anything. A weak gate, and labelled as one:
-/// the real check is on silicon.
+/// The roles run in order, so each wait is what makes the next role's reads
+/// safe: the unpacker's before the kernel's `SFPLOAD`s, the SFPU's before the
+/// packer reads `Dst`, the packer's before the host reads L1. Their *effect* is
+/// not observable on ttsim -- divergence row 34 records the same for the
+/// packer's own wait -- so this asserts the instructions are in the streams
+/// rather than that removing them breaks anything. A weak gate, and labelled as
+/// one: the real check is on silicon.
 #[test]
-fn the_kernel_waits_for_the_sfpu_before_packing() {
-    let program =
-        eltwise_support::kernel_program(flat_descriptor(DATUMS), DATUMS, &binary_kernel(sfpu::mul));
-    let pos = |w: Instruction| program.iter().position(|i| i.word() == w.word());
-    let sfpu_at = pos(backend::wait_for_sfpu(backend::Before::PACKER).unwrap())
-        .expect("the SFPU wait must be present");
-    let packer_at = pos(backend::wait_for_packer(backend::Before::EVERYTHING).unwrap())
-        .expect("the packer wait must be present");
-    let unpacker_at = pos(backend::wait_for_unpacker0(backend::Before::SFPU).unwrap())
-        .expect("the unpacker wait must be present");
-    assert!(
-        unpacker_at < sfpu_at && sfpu_at < packer_at,
-        "the waits must appear in datapath order: unpacker, then SFPU, then packer"
+fn each_role_waits_for_its_unit() {
+    let [unpack, math, pack] =
+        eltwise_support::kernel_roles(flat_descriptor(DATUMS), DATUMS, &binary_kernel(sfpu::mul));
+    let last = |p: &[Instruction]| p.last().unwrap().word();
+    let every = backend::Before::EVERYTHING;
+    assert_eq!(
+        last(&unpack),
+        backend::wait_for_unpacker0(every).unwrap().word()
     );
+    assert_eq!(last(&math), backend::wait_for_sfpu(every).unwrap().word());
+    assert_eq!(last(&pack), backend::wait_for_packer(every).unwrap().word());
 }
 
 /// The tensor-level oracle: `burn-flex` decides which elements pair with which.

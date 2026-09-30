@@ -220,14 +220,15 @@ fn window_exhaustion_is_an_error_not_a_panic() {
             .iter()
             .all(|w| w.index() != tt_device::tlb::KERNEL_RESERVED_WINDOW));
 
-        // Hand them back. `Window` has no `Drop` that reaches the free list, so
-        // dropping them here would leave the device with none -- which the
-        // simulator does not notice, because its `in_device` hands out a fresh
+        // Dropped, not freed: `Window`'s `Drop` returns each index. Before it
+        // had one, dropping here left the device with no windows -- which the
+        // simulator did not notice, because its `in_device` hands out a fresh
         // chip per call and never scrubs, while silicon's scrubs the gate tile
-        // after the body and needs a window to do it. That divergence is exactly
-        // what this gate found on its first real run.
-        for w in held {
-            dev.free_window(w);
-        }
+        // after the body and needs a window to do it. That divergence is what
+        // this gate found on its first real run; the silicon scrub is now the
+        // check that the drop reaches the pool.
+        drop(held);
+        let again = dev.alloc_window(WindowKind::TwoMib).unwrap();
+        assert_eq!(again.index(), 0, "the lowest window comes back first");
     });
 }

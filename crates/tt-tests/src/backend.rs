@@ -362,17 +362,15 @@ mod silicon {
                 .map(|(_, t, _)| *t)
                 .collect::<Vec<_>>()
         }));
-        // Not `.unwrap()`: the way this fails in practice is a gate that took
-        // windows and dropped them instead of freeing them, since `Window` has no
-        // `Drop` that reaches the free list. The bare `OutOfBounds` that produces
-        // says nothing about why, and the simulator never reaches this code at all.
+        // Not `.unwrap()`: the only way this fails now is a gate still holding
+        // every window when its body returns, and the bare `OutOfBounds` says
+        // nothing about why. The simulator never reaches this code at all.
         let w = dev
             .alloc_window(tt_device::tlb::WindowKind::TwoMib)
             .unwrap_or_else(|e| {
                 panic!(
                     "no TLB window left to scrub the gate tile with: {e}. A gate \
-                     that allocates windows must `free_window` them; dropping a \
-                     `Window` leaks it from the free list."
+                     is still holding every window."
                 )
             });
         for tile in tiles {

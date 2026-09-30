@@ -19,37 +19,20 @@
 //! pages are still written in terms of `Packers[i]`, so "packer 0's configuration"
 //! is `THCON_SEC0_REG1_*` and that is what this configures.
 
-use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::isa::Instruction;
 use tt_isa::mailbox;
-use tt_isa::sfpu;
 use tt_isa::tile::{L1Format, TileDescriptor, TileImage};
-use tt_tests::datapath::{
-    flat_descriptor, pack_config, pack_instruction, set_adc_x_pack, set_adc_x_unpack, staged_image,
-    thread_config, unpack_config, unpack_instruction, OUT, SCRATCH_GPR, STAGE,
-};
-use tt_tests::harness::{self, in_device, Run};
+use tt_tests::datapath::{dst_round_trip_roles, flat_descriptor, staged_image, OUT, STAGE};
+use tt_tests::harness::{self, in_device, Roles, Run};
 
-/// The whole round trip: L1 -> `Dst` -> L1.
-fn round_trip_program(descriptor: TileDescriptor, datums: u32, rows: u32) -> Vec<Instruction> {
-    let mut p = thread_config();
-    let mut words = ConfigWords::new();
-    unpack_config(&mut words, descriptor, STAGE);
-    pack_config(&mut words, OUT);
-    let mut staged = [sfpu::nop(); 96];
-    let n = words.program(SCRATCH_GPR, &mut staged).unwrap();
-    p.extend_from_slice(&staged[..n]);
-
-    p.push(set_adc_x_unpack(0, datums - 1));
-    p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0(Before::PACKER).unwrap());
-
-    // The packer reads 16 datums per row per enabled interface.
-    p.push(set_adc_x_pack(0, 15));
-    p.push(pack_instruction(0b1111, true));
-    p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
-    let _ = rows;
-    p
+/// The whole round trip, L1 -> `Dst` -> L1, split across the three threads as
+/// LLK splits it; see `datapath::dst_round_trip_roles`.
+fn round_trip_run<'a>(roles: &'a [Vec<Instruction>; 3]) -> Run<'a> {
+    Run::roles(Roles {
+        unpack: &roles[0],
+        math: &roles[1],
+        pack: &roles[2],
+    })
 }
 
 /// L1 words the packer writes for one `PACR` with all four read interfaces
@@ -100,37 +83,11 @@ fn round_trip_with_kernel(
     read_intf_sel: u32,
     kernel: &[Instruction],
 ) -> (Vec<u32>, Vec<u32>) {
-    let mut p = thread_config();
-    let mut words = ConfigWords::new();
-    unpack_config(&mut words, descriptor, STAGE);
-    pack_config(&mut words, OUT);
-    let mut buf = [sfpu::nop(); 128];
-    let n = words.program(SCRATCH_GPR, &mut buf).unwrap();
-    p.extend_from_slice(&buf[..n]);
-
-    p.push(set_adc_x_unpack(0, datums - 1));
-    p.push(unpack_instruction());
-    // Held back until the unpack lands: the kernel's SFPU reads, or else the pack.
-    p.push(backend::wait_for_unpacker0(Before::SFPU.and(Before::PACKER)).unwrap());
-
-    if !kernel.is_empty() {
-        p.extend_from_slice(kernel);
-        // The packer must not start reading `Dst` before the SFPU has finished
-        // writing it: C11, holding the packer back.
-        p.push(backend::wait_for_sfpu(Before::PACKER).unwrap());
-    }
-
-    p.push(set_adc_x_pack(0, 15));
-    p.push(pack_instruction(read_intf_sel, true));
-    // Without this the host can read L1 before the packer has drained. The thread
-    // unblocks once the packer has *accepted* the work, not finished it
-    // (`Packers/README.md`).
-    p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
-
+    let roles = dst_round_trip_roles(descriptor, datums, kernel, read_intf_sel);
     let sentinel = sentinel_bytes(PACKED_DATUMS);
     let out = harness::run(
         dev,
-        &Run::new(&p)
+        &round_trip_run(&roles)
             .stage(&[(STAGE, staged), (OUT, &sentinel)])
             .dump_rows(4)
             .read_back(&[(OUT, PACKED_DATUMS * 4)]),
@@ -288,10 +245,10 @@ fn survey_the_round_trip() {
     let descriptor = flat_descriptor(datums);
     let staged = staged_image(descriptor, datums);
     in_device(|dev| {
-        let program = round_trip_program(descriptor, datums, 1);
+        let roles = dst_round_trip_roles(descriptor, datums, &[], 0b1111);
         let out = harness::run(
             dev,
-            &Run::new(&program)
+            &round_trip_run(&roles)
                 .stage(&[(STAGE, &staged)])
                 .dump_rows(mailbox::DUMP_MAX_ROWS)
                 .read_back(&[(OUT, 256)]),

@@ -4,6 +4,7 @@
 //! allocator, and transfers that are split so no access ever straddles a window.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use tt_isa::noc::{niu, ChipId, NocCoord, NocId, TileType};
@@ -16,13 +17,47 @@ use crate::{Bar, Result, Transport, TransportError};
 
 /// A TLB window reserved for this `Device`'s use.
 ///
-/// Returned by [`Device::alloc_window`] and released with [`Device::free_window`].
-/// Not `Copy`: two callers holding the same index would retarget the window under
+/// Returned by [`Device::alloc_window`]. Dropping it returns the index to the
+/// `Device`'s pool; [`Device::free_window`] does the same, explicitly. Not
+/// `Copy`: two callers holding the same index would retarget the window under
 /// each other.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// The pool is shared rather than borrowed because `Drop` cannot take
+/// `&mut Device`, and a window that borrowed its device would make holding
+/// several at once -- what every multi-window transfer does -- a borrow
+/// conflict. Before this, a dropped window was lost to the pool for the rest of
+/// the process, silently; that cost the Phase 1 silicon gate a run.
 pub struct Window {
     index: u16,
     kind: WindowKind,
+    pool: Arc<Mutex<Pool>>,
+}
+
+impl std::fmt::Debug for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Window")
+            .field("index", &self.index)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl PartialEq for Window {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && Arc::ptr_eq(&self.pool, &other.pool)
+    }
+}
+
+impl Eq for Window {}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // A poisoned pool means a panic while it was held; the index is lost,
+        // which is the old behaviour and no worse than the panic itself.
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.release(self.index);
+        }
+    }
 }
 
 impl Window {
@@ -48,6 +83,28 @@ struct Shadow {
     readable: bool,
 }
 
+/// The windows a `Device` has not handed out, and what each configured one
+/// points at. Shared with every [`Window`] so that dropping one can return it.
+#[derive(Debug)]
+struct Pool {
+    /// Windows not currently handed out, lowest first.
+    free: Vec<u16>,
+    shadow: BTreeMap<u16, Shadow>,
+}
+
+impl Pool {
+    /// Return `index` to the free list, dropping its shadow entry so the next
+    /// holder cannot inherit a stale belief about where it points. The hardware
+    /// configuration is left as it was: there is no "unconfigured" state to
+    /// restore it to, and the next holder reconfigures before use.
+    fn release(&mut self, index: u16) {
+        self.shadow.remove(&index);
+        let insert_at = self.free.partition_point(|&i| i < index);
+        debug_assert!(self.free.get(insert_at) != Some(&index), "double release");
+        self.free.insert(insert_at, index);
+    }
+}
+
 /// A tile found by [`Device::discover_tiles`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tile<N: NocId> {
@@ -62,9 +119,7 @@ pub struct Tile<N: NocId> {
 pub struct Device<T: Transport> {
     transport: T,
     chip: ChipId,
-    /// Windows not currently handed out, lowest first.
-    free: Vec<u16>,
-    shadow: BTreeMap<u16, Shadow>,
+    pool: Arc<Mutex<Pool>>,
     /// When this `Device` last released each core from reset, keyed by
     /// `(NoC index, x, y, core)`. Read by the local-data-RAM accessors, which
     /// must not touch a core's RAM during the zeroing that follows a release.
@@ -181,8 +236,10 @@ impl<T: Transport> Device<T> {
         let mut dev = Device {
             transport,
             chip,
-            free,
-            shadow: BTreeMap::new(),
+            pool: Arc::new(Mutex::new(Pool {
+                free,
+                shadow: BTreeMap::new(),
+            })),
             released: HashMap::new(),
             busy: false,
         };
@@ -214,16 +271,42 @@ impl<T: Transport> Device<T> {
         self.transport.tick(n);
     }
 
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        // Poisoning needs a panic inside `Pool::release` or the few lines below
+        // that hold the lock, none of which can panic; recover rather than
+        // propagate a panic from an unrelated thread.
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Refuse a window handed out by a different `Device`: its index means a
+    /// different window of a different chip's BAR here.
+    fn check_owned(&self, window: &Window) -> Result<()> {
+        if Arc::ptr_eq(&window.pool, &self.pool) {
+            Ok(())
+        } else {
+            Err(TransportError::Hazard {
+                address: 0,
+                reason: "this window was allocated by a different Device",
+            })
+        }
+    }
+
     /// Reserve a window of the requested geometry.
     pub fn alloc_window(&mut self, kind: WindowKind) -> Result<Window> {
-        let position = self
+        let mut pool = self.pool();
+        let position = pool
             .free
             .iter()
             .position(|&i| tlb::window_kind(i) == Some(kind));
         match position {
             Some(p) => {
-                let index = self.free.remove(p);
-                Ok(Window { index, kind })
+                let index = pool.free.remove(p);
+                drop(pool);
+                Ok(Window {
+                    index,
+                    kind,
+                    pool: Arc::clone(&self.pool),
+                })
             }
             None => Err(TransportError::OutOfBounds {
                 bar: kind.bar(),
@@ -233,17 +316,14 @@ impl<T: Transport> Device<T> {
         }
     }
 
-    /// Return a window to the pool.
-    ///
-    /// The hardware configuration is left as it was: there is no "unconfigured"
-    /// state to restore it to, and the next allocator will reconfigure before use.
-    /// The shadow entry is dropped so the next holder cannot inherit a stale belief
-    /// about where it points.
+    /// Return a window to the pool now. Dropping it does the same; this is the
+    /// spelling for a caller that wants the release to be visible.
     pub fn free_window(&mut self, window: Window) {
-        self.shadow.remove(&window.index);
-        let index = window.index;
-        let insert_at = self.free.partition_point(|&i| i < index);
-        self.free.insert(insert_at, index);
+        debug_assert!(
+            Arc::ptr_eq(&window.pool, &self.pool),
+            "freed a window allocated by a different Device"
+        );
+        drop(window);
     }
 
     /// Point a window at a device address in a tile, if it is not already there.
@@ -253,6 +333,7 @@ impl<T: Transport> Device<T> {
         coord: NocCoord<N>,
         base_address: u64,
     ) -> Result<()> {
+        self.check_owned(window)?;
         let config = TlbConfig::unicast(base_address, coord);
         let words = config
             .encode(window.kind)
@@ -267,11 +348,11 @@ impl<T: Transport> Device<T> {
             readable: config.is_readable(),
         };
 
-        if self.shadow.get(&window.index) == Some(&shadow) {
+        if self.pool().shadow.get(&window.index) == Some(&shadow) {
             return Ok(());
         }
         tlb::write_config(&mut self.transport, window.index, &config)?;
-        self.shadow.insert(window.index, shadow);
+        self.pool().shadow.insert(window.index, shadow);
         Ok(())
     }
 
@@ -602,11 +683,11 @@ mod tests {
     #[test]
     fn kernel_window_is_never_allocated() {
         let mut d = device();
-        let mut seen = Vec::new();
-        // Drain every 2 MiB window.
-        for _ in 0..USABLE_2MIB_WINDOWS {
-            seen.push(d.alloc_window(WindowKind::TwoMib).unwrap().index);
-        }
+        // Drain every 2 MiB window, holding them: a dropped window goes back.
+        let held: Vec<Window> = (0..USABLE_2MIB_WINDOWS)
+            .map(|_| d.alloc_window(WindowKind::TwoMib).unwrap())
+            .collect();
+        let seen: Vec<u16> = held.iter().map(Window::index).collect();
         assert!(!seen.contains(&KERNEL_RESERVED_WINDOW));
         assert_eq!(seen.len(), 201);
         // And the pool is now empty for that geometry, but not for the other.
@@ -638,6 +719,49 @@ mod tests {
             config_write_count(&d) > before,
             "reconfiguration must be repeated"
         );
+    }
+
+    #[test]
+    fn a_dropped_window_returns_to_the_pool() {
+        let mut d = device();
+        // Several passes over the whole pool, dropping each window rather than
+        // freeing it. Before `Window` had a `Drop`, the second pass failed.
+        for _ in 0..3 {
+            let held: Vec<Window> = (0..USABLE_2MIB_WINDOWS)
+                .map(|_| d.alloc_window(WindowKind::TwoMib).unwrap())
+                .collect();
+            assert!(d.alloc_window(WindowKind::TwoMib).is_err());
+            drop(held);
+        }
+        // And a dropped window loses its shadow, as a freed one does.
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        d.write(&w, c(1, 2), 0, &[1; 4]).unwrap();
+        let before = config_write_count(&d);
+        drop(w);
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        d.write(&w, c(1, 2), 0, &[1; 4]).unwrap();
+        assert!(
+            config_write_count(&d) > before,
+            "reconfiguration must repeat"
+        );
+    }
+
+    #[test]
+    fn a_window_from_another_device_is_refused() {
+        let mut a = device();
+        let mut b = device();
+        let wa = a.alloc_window(WindowKind::TwoMib).unwrap();
+        let wb = b.alloc_window(WindowKind::TwoMib).unwrap();
+        // Same index, different chips' pools.
+        assert_eq!(wa.index(), wb.index());
+        assert_ne!(wa, wb);
+        let before = b.transport.writes.len();
+        let e = b.write32(&wa, c(1, 2), 0x100, 1).unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        let e = b.read32(&wa, c(1, 2), 0x100).unwrap_err();
+        assert!(matches!(e, TransportError::Hazard { .. }), "{e}");
+        assert_eq!(b.transport.writes.len(), before, "nothing may be sent");
+        b.write32(&wb, c(1, 2), 0x100, 1).unwrap();
     }
 
     #[test]

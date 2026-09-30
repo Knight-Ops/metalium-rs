@@ -16,9 +16,8 @@
 //! point `MVMUL` at. `SrcA` goes at row 16 rather than 8 because ttsim refuses
 //! `src_a_row=8` (row 41), which `MVMUL.md`'s `& 0x38` allows.
 
-use tt_isa::backend::{self, Before, ConfigWords, ThreadConfigEntry};
+use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::cfg::generated::{alu, thread};
-use tt_isa::cfg::ThreadConfigField;
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
 use tt_isa::matrix::{Banks, Loaded};
@@ -26,7 +25,8 @@ use tt_isa::numerics::mvmul_reference;
 use tt_isa::sfpu;
 use tt_isa::tile::{fp32_to_tf32, L1Format, TileImage};
 use tt_tests::datapath::{
-    flat_descriptor, set_adc_x, src_thread_config, unpack_src_config, Unpacker, SCRATCH_GPR, STAGE,
+    flat_descriptor, set_adc_x, src_thread_config, thread_entry, unpack_src_config, Unpacker,
+    SCRATCH_GPR, STAGE,
 };
 use tt_tests::harness::{self, Run};
 
@@ -56,14 +56,6 @@ fn stage_operand(src_row: usize, rows: &[[f32; 16]]) -> (Vec<u8>, u32) {
         staged[off..off + 4].copy_from_slice(&d.to_le_bytes());
     }
     (staged, n)
-}
-
-fn thread_entry(field: ThreadConfigField, value: u16) -> Instruction {
-    ThreadConfigEntry::zeroed(field.addr32())
-        .set(field, value)
-        .unwrap()
-        .encode()
-        .unwrap()
 }
 
 /// `value` placed in `i`'s `AddrMod` field, as its (measured) definition draws it.

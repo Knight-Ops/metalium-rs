@@ -25,6 +25,12 @@
 //! `fork_scope` and an instruction it refuses becomes a recorded result rather than
 //! a dead test runner. That makes this a discovery tool: see
 //! [`instructions_ttsim_declines_to_execute`].
+//!
+//! # Why this stays single-thread
+//!
+//! Each case is one short program against `LReg` and `Dst` on one thread. There
+//! is no unpack or pack to hand work to, so the three-thread split the datapath
+//! gates use (`harness::Roles`) would add two idle roles and nothing else.
 
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
