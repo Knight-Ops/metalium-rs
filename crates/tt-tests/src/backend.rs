@@ -152,7 +152,7 @@ mod silicon {
     // tile takes a second file descriptor. Thread-local because `Kmd` owns raw
     // mappings; every gate runs single-threaded inside its own fork anyway.
     thread_local! {
-        static CLAIMED: std::cell::RefCell<Vec<(NocCoord<Noc0>, Kmd)>> =
+        static CLAIMED: std::cell::RefCell<Vec<(u16, NocCoord<Noc0>, Kmd)>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -167,18 +167,24 @@ mod silicon {
     /// own, and [`scrub`] holds the tile's cores in reset at the end.
     #[track_caller]
     pub fn tile(dev: &mut Dev<'_>, x: u8, y: u8) -> NocCoord<Noc0> {
+        // The card this device is, not `DEVICE_ENV`: a gate holding both cards
+        // claims tiles on each.
+        let index = dev.chip().0;
         let grid = tensix_grid(dev);
         assert!(
             grid.contains(x, y),
-            "({x},{y}) is not a Tensix tile on /dev/tenstorrent/{}: this chip has \
+            "({x},{y}) is not a Tensix tile on /dev/tenstorrent/{index}: this chip has \
              {} Tensix columns, so X must be one of {:?}",
-            device_index(),
             grid.enabled_column_count(),
             grid.columns().collect::<Vec<_>>()
         );
         let coord = NocCoord::new(x, y).unwrap();
-        if (x, y) != GATE_TILE && !CLAIMED.with(|c| c.borrow().iter().any(|(t, _)| *t == coord)) {
-            let index = device_index();
+        let claimed = CLAIMED.with(|c| {
+            c.borrow()
+                .iter()
+                .any(|(i, t, _)| *i == index && *t == coord)
+        });
+        if (x, y) != GATE_TILE && !claimed {
             let guard = Kmd::open(index)
                 .unwrap_or_else(|e| panic!("could not open /dev/tenstorrent/{index}: {e}"));
             guard
@@ -186,7 +192,7 @@ mod silicon {
                 .unwrap_or_else(|e| {
                     panic!("could not register a cleanup write for ({x},{y}): {e}")
                 });
-            CLAIMED.with(|c| c.borrow_mut().push((coord, guard)));
+            CLAIMED.with(|c| c.borrow_mut().push((index, coord, guard)));
             // Start from the state the simulator starts from: every core held.
             // Whatever the last process left running on this tile is stopped
             // before the gate looks at it.
@@ -235,7 +241,12 @@ mod silicon {
     /// — it hangs the NoC, and a cleanup write registered against one would fire
     /// on every close from then on, including the close that follows the hang.
     pub fn open() -> Dev<'static> {
-        let index = device_index();
+        open_card(device_index())
+    }
+
+    /// [`open`], for a card named explicitly rather than by [`DEVICE_ENV`]: for
+    /// the gates that hold both cards at once.
+    pub fn open_card(index: u16) -> Dev<'static> {
         let kmd = Kmd::open(index)
             .unwrap_or_else(|e| panic!("could not open /dev/tenstorrent/{index}: {e}"));
 
@@ -292,7 +303,14 @@ mod silicon {
     pub fn scrub(dev: &mut Dev<'_>) {
         let (x, y) = GATE_TILE;
         let mut tiles: Vec<NocCoord<Noc0>> = vec![NocCoord::new(x, y).unwrap()];
-        tiles.extend(CLAIMED.with(|c| c.borrow().iter().map(|(t, _)| *t).collect::<Vec<_>>()));
+        let index = dev.chip().0;
+        tiles.extend(CLAIMED.with(|c| {
+            c.borrow()
+                .iter()
+                .filter(|(i, _, _)| *i == index)
+                .map(|(_, t, _)| *t)
+                .collect::<Vec<_>>()
+        }));
         // Not `.unwrap()`: the way this fails in practice is a gate that took
         // windows and dropped them instead of freeing them, since `Window` has no
         // `Drop` that reaches the free list. The bare `OutOfBounds` that produces
