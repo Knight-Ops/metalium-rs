@@ -67,6 +67,136 @@ pub mod op {
     pub const READ: u32 = 1;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
+    /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
+    /// in order. The other descriptor words are unused.
+    pub const LIST: u32 = 3;
+    /// As [`READ`], of exactly one tile slot ([`super::TILE_SLOT`]), transposing
+    /// the tile on the way: the slot lands in [`super::SCRATCH`] and the mover
+    /// writes its transpose to the destination. Only in a list entry.
+    pub const READ_TRANSPOSED: u32 = 4;
+    /// Element-wise arithmetic on whole tiles already in L1, by the mover's
+    /// own FP32 unit: `[COMPUTE, kind, scalar, 0, dst, a, b, 0]`, each address a
+    /// tile slot. See [`super::kind`]. Only in a list entry.
+    pub const COMPUTE: u32 = 5;
+}
+
+/// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
+/// (`dst`, `a`, `b` are slots; `s` is the entry's scalar, as FP32 bits).
+///
+/// Done with the baby RISC-V's `fadd.s`/`fsub.s`/`fmul.s`, which round to
+/// nearest even and flush denormals (`BabyRISCV/InstructionSet.md:18-22`) --
+/// the IEEE result for every normal operand and result. Never `fmadd.s`: its
+/// semantics are neither fused nor separate, and the firmware's instruction
+/// gate refuses it.
+pub mod kind {
+    /// `a + b`.
+    pub const ADD: u32 = 1;
+    /// `a - b`.
+    pub const SUB: u32 = 2;
+    /// `a * b`.
+    pub const MUL: u32 = 3;
+    /// `a * s`.
+    pub const MUL_SCALAR: u32 = 4;
+    /// `max(a, 0)`, as `burn-flex` has it.
+    pub const RELU: u32 = 5;
+    /// `a > 0 ? b : 0`: `a` the forward output, `b` the gradient.
+    pub const RELU_BACKWARD: u32 = 6;
+    /// `a[r, c] + b[0, c]`: `b`'s first row broadcast down the tile.
+    pub const ADD_ROW: u32 = 7;
+    pub const LAST: u32 = ADD_ROW;
+}
+
+/// Where a descriptor list lives, and how many entries it may hold.
+///
+/// Between NC's default reset PC region (NC is not used) and the matmul
+/// staging area (`tt_kernels::matmul::MATMUL_STAGE`, `0x2_0000`).
+pub const LIST: u64 = 0x1_4000;
+pub const LIST_MAX: u32 = 512;
+/// Bytes per list entry: eight words, `[op, channel, port, offset, l1, len, 0, 0]`.
+pub const ENTRY_BYTES: u64 = 32;
+/// The transpose scratch slot, after the list.
+pub const SCRATCH: u64 = LIST + LIST_MAX as u64 * ENTRY_BYTES;
+const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
+
+/// One FP32 32x32 tile as it is stored on the device: the 16-byte header
+/// (zero, as `tt_layout` writes it), 1024 datums in face order, and padding to
+/// a multiple of [`crate::dram::ALIGN`] -- so every slot is 64-byte aligned
+/// wherever it sits, and any slot may be copied to any other under the C64
+/// read rule (divergence row 64).
+pub const TILE_SLOT: u64 = 4160;
+/// Where a tile's datums start within its slot.
+pub const TILE_DATA: u64 = 16;
+const _: () = assert!(TILE_SLOT % crate::dram::ALIGN == 0);
+const _: () = assert!(TILE_DATA + 4096 <= TILE_SLOT);
+
+/// The datum index of tile position `(row, col)` in the face order `tt_layout`
+/// and the packer use: four 16x16 faces, `[0 1; 2 3]`, each row-major.
+pub const fn face_index(row: usize, col: usize) -> usize {
+    ((row / 16) * 2 + col / 16) * 256 + (row % 16) * 16 + (col % 16)
+}
+
+/// A decoded list entry: a move ([`Descriptor`], possibly a transposed tile
+/// read), or element-wise compute on tiles in L1.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Entry {
+    Move {
+        descriptor: Descriptor,
+        transpose: bool,
+    },
+    Compute {
+        kind: u32,
+        scalar: u32,
+        dst: u32,
+        a: u32,
+        b: u32,
+    },
+}
+
+impl Entry {
+    /// Decode entry words against the `usable` mask. A transposed read must be
+    /// exactly one slot into a 16-aligned L1 slot inside L1.
+    pub fn decode(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
+        let transpose = w[0] == op::READ_TRANSPOSED;
+        if transpose {
+            if w[5] as u64 != TILE_SLOT || w[4] % 16 != 0 {
+                return Err(error::LENGTH);
+            }
+            // The NoC half lands in the scratch slot, 64-aligned; check it so.
+            let d = Descriptor::decode(usable, op::READ, w[1], w[2], w[3], SCRATCH as u32, w[5])?;
+            if w[4] as u64 + TILE_SLOT > crate::tensix::L1_SIZE {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Move {
+                descriptor: Descriptor { l1: w[4], ..d },
+                transpose,
+            });
+        }
+        if w[0] == op::LIST {
+            return Err(error::OP);
+        }
+        if w[0] == op::COMPUTE {
+            let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
+            if w[1] == 0 || w[1] > kind::LAST {
+                return Err(error::OP);
+            }
+            if !slot(w[4]) || !slot(w[5]) || !slot(w[6]) {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Compute {
+                kind: w[1],
+                scalar: w[2],
+                dst: w[4],
+                a: w[5],
+                b: w[6],
+            });
+        }
+        Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(|descriptor| {
+            Entry::Move {
+                descriptor,
+                transpose,
+            }
+        })
+    }
 }
 
 pub mod error {
@@ -108,6 +238,7 @@ impl Descriptor {
         if op != op::READ && op != op::WRITE {
             return Err(error::OP);
         }
+        // (`op::LIST` is dispatched before a descriptor is decoded.)
         if len == 0 {
             return Err(error::LENGTH);
         }
@@ -149,6 +280,102 @@ mod tests {
         let d = Descriptor::decode(ALL, op::READ, 3, 2, 0x40, 0x2_0040, 4096).unwrap();
         assert_eq!(d.range.channel().index(), 3);
         assert_eq!((d.range.offset(), d.range.len(), d.port), (0x40, 4096, 2));
+    }
+
+    #[test]
+    fn face_index_matches_the_four_face_order() {
+        assert_eq!(face_index(0, 0), 0);
+        assert_eq!(face_index(0, 16), 256);
+        assert_eq!(face_index(16, 0), 512);
+        assert_eq!(face_index(31, 31), 1023);
+        assert_eq!(face_index(1, 2), 18);
+    }
+
+    #[test]
+    fn list_entries_decode_and_refuse() {
+        let e = Entry::decode(
+            ALL,
+            [
+                op::READ_TRANSPOSED,
+                2,
+                0,
+                0x1040,
+                0x2_0010,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ],
+        )
+        .unwrap();
+        let Entry::Move {
+            descriptor,
+            transpose,
+        } = e
+        else {
+            panic!("{e:?}")
+        };
+        assert!(transpose);
+        assert_eq!(
+            (descriptor.l1, descriptor.range.offset()),
+            (0x2_0010, 0x1040)
+        );
+        // A transposed read is one whole slot, 64-aligned in DRAM (the scratch is).
+        assert!(Entry::decode(
+            ALL,
+            [op::READ_TRANSPOSED, 2, 0, 0x1040, 0x2_0000, 4096, 0, 0]
+        )
+        .is_err());
+        assert!(Entry::decode(
+            ALL,
+            [
+                op::READ_TRANSPOSED,
+                2,
+                0,
+                0x1010,
+                0x2_0000,
+                TILE_SLOT as u32,
+                0,
+                0
+            ]
+        )
+        .is_err());
+        // No lists inside lists.
+        assert_eq!(
+            Entry::decode(ALL, [op::LIST, 0, 0, 0, 0, 1, 0, 0]),
+            Err(error::OP)
+        );
+        let w = Entry::decode(ALL, [op::WRITE, 1, 1, 0x40, 0x2_0040, 64, 0, 0]).unwrap();
+        assert!(matches!(
+            w,
+            Entry::Move {
+                transpose: false,
+                ..
+            }
+        ));
+        // Compute: a known kind, three slots inside L1.
+        let c = [
+            op::COMPUTE,
+            kind::ADD,
+            0,
+            0,
+            0x2_0000,
+            0x2_1040,
+            0x2_2080,
+            0,
+        ];
+        assert!(matches!(
+            Entry::decode(ALL, c),
+            Ok(Entry::Compute {
+                kind: kind::ADD,
+                ..
+            })
+        ));
+        let mut bad = c;
+        bad[1] = kind::LAST + 1;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::OP));
+        let mut bad = c;
+        bad[6] = crate::tensix::L1_SIZE as u32 - 64;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
     }
 
     #[test]

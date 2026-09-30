@@ -141,8 +141,54 @@ fn attach_engine(
     struct Sim<'a> {
         session: tt_kernels::session::Session<tt_ttsim::LibTtsim<'a>>,
         config: Config,
+        buffers: burn_tt::DramBuffers,
     }
     impl Engine for Sim<'_> {
+        fn supports_dram(&self) -> bool {
+            true
+        }
+        fn upload(
+            &mut self,
+            v: &[f32],
+            r: usize,
+            c: usize,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers.upload(&mut self.session, v, r, c)
+        }
+        fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
+            self.buffers.download(&mut self.session, id)
+        }
+        fn free(&mut self, id: burn_tt::BufferId) {
+            self.buffers.free(&mut self.session, id)
+        }
+        fn matmul_dram(
+            &mut self,
+            a: burn_tt::BufferId,
+            ta: bool,
+            b: burn_tt::BufferId,
+            tb: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            let c = &self.config;
+            self.buffers.matmul(
+                &mut self.session,
+                a,
+                ta,
+                b,
+                tb,
+                c.route,
+                c.fidelity,
+                c.budget,
+            )
+        }
+        fn eltwise(
+            &mut self,
+            kind: u32,
+            scalar: f32,
+            a: burn_tt::BufferId,
+            b: Option<burn_tt::BufferId>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
+        }
         fn matmul(
             &mut self,
             a: &[f32],
@@ -172,7 +218,15 @@ fn attach_engine(
             |_, _| Ok(()),
         )
         .map_err(|e| EngineError(e.to_string()))?;
-        serve.serve(&mut Sim { session, config });
+        let mut session = session;
+        session
+            .enable_dram(tt_firmware_images::DM_B.1)
+            .map_err(|e| EngineError(e.to_string()))?;
+        serve.serve(&mut Sim {
+            session,
+            config,
+            buffers: Default::default(),
+        });
         Ok(())
     })
 }

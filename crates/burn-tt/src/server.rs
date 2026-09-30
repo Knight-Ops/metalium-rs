@@ -28,6 +28,162 @@ use crate::TtDevice;
 pub trait Engine {
     /// `A[m, k] @ B[k, n]`, row-major.
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
+
+    /// Can this engine keep tensors on the device (Phase 9)? If not, every
+    /// tensor stays on the host and only `matmul` runs on the device.
+    fn supports_dram(&self) -> bool {
+        false
+    }
+    /// Put a row-major `[rows, cols]` matrix on the device.
+    fn upload(
+        &mut self,
+        _values: &[f32],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<BufferId, EngineError> {
+        Err(unsupported())
+    }
+    /// Read one back, row-major.
+    fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, EngineError> {
+        Err(unsupported())
+    }
+    /// Forget one.
+    fn free(&mut self, _id: BufferId) {}
+    /// `op(A) @ op(B)`, each operand transposed if asked, result left on the
+    /// device, as `(id, [rows, cols])`.
+    fn matmul_dram(
+        &mut self,
+        _a: BufferId,
+        _a_transposed: bool,
+        _b: BufferId,
+        _b_transposed: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_isa::dm::kind`),
+    /// result left on the device.
+    fn eltwise(
+        &mut self,
+        _kind: u32,
+        _scalar: f32,
+        _a: BufferId,
+        _b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+}
+
+fn unsupported() -> EngineError {
+    EngineError("this engine keeps no tensors on the device".into())
+}
+
+/// A tensor kept on the device, by the engine's own numbering.
+pub type BufferId = u64;
+
+/// The device-resident tensors of one engine: a [`Session`]'s `DramTensor`s by
+/// id. The engines built on a `Session` -- [`KmdEngine`], and the simulator's in
+/// `tt-tests` -- forward their DRAM methods here.
+#[derive(Default)]
+pub struct DramBuffers {
+    next: BufferId,
+    live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
+}
+
+impl DramBuffers {
+    pub fn upload<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<BufferId, EngineError> {
+        let t = s
+            .upload(values, rows, cols)
+            .map_err(|e| EngineError(e.to_string()))?;
+        self.next += 1;
+        self.live.insert(self.next, t);
+        Ok(self.next)
+    }
+
+    pub fn download<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+    ) -> Result<Vec<f32>, EngineError> {
+        let t = self.get(id)?;
+        s.download(t).map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
+        if let Some(t) = self.live.remove(&id) {
+            let _ = s.free(t);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let c = s
+            .matmul_dram(
+                &ta,
+                a_transposed,
+                &tb,
+                b_transposed,
+                route,
+                fidelity,
+                budget,
+            )
+            .map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
+    }
+
+    pub fn eltwise<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        kind: u32,
+        scalar: f32,
+        a: BufferId,
+        b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let tb = b.map(|b| self.get(b).cloned()).transpose()?;
+        let op = tt_kernels::tensor::Eltwise { kind, scalar };
+        let c = s
+            .eltwise(op, &ta, tb.as_ref())
+            .map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
+    }
+
+    /// How many are live.
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, EngineError> {
+        self.live
+            .get(&id)
+            .ok_or_else(|| EngineError(format!("no device buffer {id}")))
+    }
 }
 
 /// Why an engine could not start or finish a job.
@@ -193,6 +349,74 @@ pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) ->
         .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
 }
 
+/// Does `device`'s engine keep tensors on the device? Asked once per device.
+pub(crate) fn supports_dram(device: TtDevice) -> bool {
+    static KNOWN: Mutex<Option<HashMap<TtDevice, bool>>> = Mutex::new(None);
+    if let Some(&k) = KNOWN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&device)
+    {
+        return k;
+    }
+    let k = run(device, |engine| engine.supports_dram());
+    KNOWN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(device, k);
+    k
+}
+
+/// Upload, panicking on a device error.
+pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
+    crate::traffic::uploaded(values.len() * 4);
+    run(device, move |engine| engine.upload(&values, rows, cols))
+        .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
+}
+
+/// Download, panicking on a device error.
+pub(crate) fn download(device: TtDevice, id: BufferId) -> Vec<f32> {
+    let v = run(device, move |engine| engine.download(id))
+        .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
+    crate::traffic::downloaded(v.len() * 4);
+    v
+}
+
+/// Free, without waiting; nothing to do if the device has gone.
+pub(crate) fn free(device: TtDevice, id: BufferId) {
+    if let Some(sender) = with_attached(|a| a.get(&device).map(|d| d.jobs.clone())) {
+        let _ = sender.send(Box::new(move |engine| engine.free(id)));
+    }
+}
+
+/// Element-wise on the device, panicking on a device error.
+pub(crate) fn eltwise(
+    device: TtDevice,
+    kind: u32,
+    scalar: f32,
+    a: BufferId,
+    b: Option<BufferId>,
+) -> (BufferId, [usize; 2]) {
+    run(device, move |engine| engine.eltwise(kind, scalar, a, b))
+        .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
+}
+
+/// `op(A) @ op(B)` on the device, panicking on a device error.
+pub(crate) fn matmul_dram(
+    device: TtDevice,
+    a: BufferId,
+    a_transposed: bool,
+    b: BufferId,
+    b_transposed: bool,
+) -> (BufferId, [usize; 2]) {
+    run(device, move |engine| {
+        engine.matmul_dram(a, a_transposed, b, b_transposed)
+    })
+    .unwrap_or_else(|e| panic!("matmul on {device}: {e}"))
+}
+
 // --- Silicon ------------------------------------------------------------------
 
 /// The silicon engine: a [`Session`] on `/dev/tenstorrent/N`.
@@ -203,6 +427,8 @@ pub struct KmdEngine {
     /// Per-role budget for each run; on silicon, a floor of one second applies
     /// (`tt_kernels::runtime::run`).
     pub budget: u64,
+    /// Tensors kept in GDDR, if the session has it enabled.
+    pub buffers: Option<DramBuffers>,
 }
 
 impl Engine for KmdEngine {
@@ -210,6 +436,51 @@ impl Engine for KmdEngine {
         Ok(self
             .session
             .matmul(a, b, mkn, self.route, self.fidelity, self.budget)?)
+    }
+    fn supports_dram(&self) -> bool {
+        self.buffers.is_some()
+    }
+    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.upload(&mut self.session, v, rows, cols)
+    }
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.download(&mut self.session, id)
+    }
+    fn free(&mut self, id: BufferId) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.free(&mut self.session, id);
+        }
+    }
+    fn matmul_dram(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul(
+            &mut self.session,
+            a,
+            ta,
+            b,
+            tb,
+            self.route,
+            self.fidelity,
+            self.budget,
+        )
+    }
+    fn eltwise(
+        &mut self,
+        kind: u32,
+        scalar: f32,
+        a: BufferId,
+        b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise(&mut self.session, kind, scalar, a, b)
     }
 }
 
@@ -222,12 +493,18 @@ pub fn kmd_engine(
     fidelity: Fidelity,
 ) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
     move |serve| {
-        let session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
+        let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
+        // Tensors live in GDDR (Phase 9). Bit-identical to the host-staged path
+        // (`step18_dram_matmul`), so on by default.
+        session
+            .enable_dram(tt_firmware_images::DM_B.1)
+            .map_err(|e| EngineError(e.to_string()))?;
         let mut engine = KmdEngine {
             session,
             route,
             fidelity,
             budget: 400_000,
+            buffers: Some(DramBuffers::default()),
         };
         serve.serve(&mut engine);
         Ok(())

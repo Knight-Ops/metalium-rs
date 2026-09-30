@@ -270,7 +270,7 @@ pub fn tile_roles(
 /// wherever the `Src` values and their FP32 sums are, and [`Fidelity::Lo`] keeps
 /// only the high slices -- exact for operands with at most seven significant bits
 /// in `A` and five in `B`, and otherwise the least precise product on offer.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Fidelity {
     /// Phase 0 only.
     Lo,
@@ -492,13 +492,46 @@ pub fn tile_image_bytes(format: L1Format) -> u64 {
 /// Refuses a shape whose operands would overrun [`MATMUL_OUT`] or whose output
 /// would overrun the mailbox, as [`RunError::DoesNotFit`](crate::runtime::RunError).
 pub fn plan_layout(
-    [mt, kt, nt]: [usize; 3],
+    tiles: [usize; 3],
     in_fmt: L1Format,
 ) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
+    plan_layout_in(tiles, in_fmt, Staging::Host)
+}
+
+/// How a run's tiles sit in L1.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Staging {
+    /// Tile images back to back, as the host tilizes them, and packed output
+    /// tiles back to back: [`plan_layout`].
+    Host,
+    /// One `tt_isa::dm::TILE_SLOT` per tile, operands and outputs alike, with
+    /// each output's datums at `TILE_DATA` into its slot -- so the data mover
+    /// can copy any tile between GDDR and L1 under the C64 rule, and an output
+    /// slot is an operand slot. FP32 in L1 only.
+    Slots,
+}
+
+/// [`plan_layout`] for either [`Staging`].
+pub fn plan_layout_in(
+    [mt, kt, nt]: [usize; 3],
+    in_fmt: L1Format,
+    staging: Staging,
+) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
     use crate::runtime::RunError;
-    let img = tile_image_bytes(in_fmt);
+    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    let (img, align, out_stride, out_skip) = match staging {
+        Staging::Host => (tile_image_bytes(in_fmt), 16, 1024 * 4, 0),
+        Staging::Slots => {
+            assert_eq!(
+                tile_image_bytes(in_fmt),
+                TILE_DATA + 4096,
+                "slot staging holds FP32 tiles"
+            );
+            (TILE_SLOT, TILE_SLOT, TILE_SLOT, TILE_DATA)
+        }
+    };
     let a_bytes = (mt * kt) as u64 * img;
-    let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(16);
+    let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(align);
     let b_end = b_at + (kt * nt) as u64 * img;
     if b_end > MATMUL_OUT {
         return Err(RunError::DoesNotFit {
@@ -507,7 +540,7 @@ pub fn plan_layout(
             limit: MATMUL_OUT - MATMUL_STAGE,
         });
     }
-    let out_bytes = (mt * nt) as u64 * 1024 * 4;
+    let out_bytes = (mt * nt) as u64 * out_stride;
     if MATMUL_OUT + out_bytes > tt_isa::mailbox::MAILBOX_BASE {
         return Err(RunError::DoesNotFit {
             what: "the output tiles",
@@ -528,7 +561,7 @@ pub fn plan_layout(
                 .collect();
             outputs.push(OutputTile {
                 pairs,
-                out: MATMUL_OUT + (i * nt + j) as u64 * 1024 * 4,
+                out: MATMUL_OUT + (i * nt + j) as u64 * out_stride + out_skip,
             });
         }
     }
@@ -568,7 +601,7 @@ pub fn stage_matmul(
 
 /// How operands reach `Src`, and so the precision the Matrix Unit multiplies
 /// at (`UNPACR_Regular.md:495-520`; codes measured, divergence rows G and H).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SrcRoute {
     /// FP32 in L1, truncated to TF32 by the unpacker.
     Tf32FromFp32,
@@ -631,7 +664,11 @@ pub fn matmul_with(
     use crate::runtime::{Kernel, Schedule};
     let (in_fmt, out_fmt) = route.formats();
     let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
-    let [unpack, math, pack] = matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity);
+    let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    let roles = programs((tiles, Staging::Host), route, fidelity, || {
+        matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity)
+    });
+    let [unpack, math, pack] = &*roles;
     let stage = [
         (MATMUL_STAGE, staged.a.as_slice()),
         (staged.b_at, staged.b.as_slice()),
@@ -640,10 +677,7 @@ pub fn matmul_with(
     let kernel = Kernel {
         stage: &stage,
         read_back: &read_back,
-        ..Kernel::new(
-            [&unpack, &math, &pack],
-            Schedule::Concurrent(&TILE_SEMAPHORES),
-        )
+        ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&TILE_SEMAPHORES))
     };
     let out = run(&kernel)?;
     Ok(detilize_packed(&out.l1[0], m, n))
@@ -662,14 +696,56 @@ pub struct ChunkShape {
 /// every role program in its slot, measured by building the programs rather than
 /// by a formula that could drift from them.
 pub fn chunk_fits(tiles: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> bool {
+    chunk_fits_in(tiles, route, fidelity, Staging::Host)
+}
+
+/// [`chunk_fits`] for either [`Staging`].
+pub fn chunk_fits_in(
+    tiles: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    staging: Staging,
+) -> bool {
     let (in_fmt, out_fmt) = route.formats();
-    let Ok((_, outputs)) = plan_layout(tiles, in_fmt) else {
+    if staging == Staging::Slots && in_fmt != L1Format::Fp32 {
+        return false;
+    }
+    let Ok((_, outputs)) = plan_layout_in(tiles, in_fmt, staging) else {
         return false;
     };
-    let roles = matmul_roles(&outputs, in_fmt, out_fmt, fidelity);
+    let roles = programs((tiles, staging), route, fidelity, || {
+        matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
+    });
     roles
         .iter()
         .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
+}
+
+/// The three role programs of a `tiles`-shaped run, built once per process.
+///
+/// They depend on nothing but the shape, the route and the fidelity -- the L1
+/// layout is a function of the shape ([`plan_layout`]) -- and building them was
+/// most of a chunk's host time: [`plan`] builds every candidate it probes, on
+/// every call. `build` must be `matmul_roles` over that shape's layout.
+pub(crate) fn programs(
+    tiles: ([usize; 3], Staging),
+    route: SrcRoute,
+    fidelity: Fidelity,
+    build: impl FnOnce() -> [Vec<Instruction>; 3],
+) -> std::sync::Arc<[Vec<Instruction>; 3]> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = (([usize; 3], Staging), SrcRoute, Fidelity);
+    type Roles = Arc<[Vec<Instruction>; 3]>;
+    static CACHE: OnceLock<Mutex<HashMap<Key, Roles>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (tiles, route, fidelity);
+    if let Some(p) = cache.lock().unwrap().get(&key) {
+        return p.clone();
+    }
+    let built = Arc::new(build());
+    cache.lock().unwrap().insert(key, built.clone());
+    built
 }
 
 /// The chunk shape for `A[m, k] @ B[k, n]`: `K` whole if at all possible,
@@ -678,7 +754,37 @@ pub fn chunk_fits(tiles: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> boo
 ///
 /// `None` only if not even a single `[1, 1, 1]`-tile run fits, which would be a
 /// bug in this crate.
-pub fn plan([m, k, n]: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> Option<ChunkShape> {
+pub fn plan(mkn: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> Option<ChunkShape> {
+    plan_in(mkn, route, fidelity, Staging::Host)
+}
+
+/// [`plan`] for either [`Staging`], cached per process.
+pub fn plan_in(
+    mkn: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    staging: Staging,
+) -> Option<ChunkShape> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = ([usize; 3], SrcRoute, Fidelity, Staging);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Option<ChunkShape>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (mkn, route, fidelity, staging);
+    if let Some(p) = cache.lock().unwrap().get(&key) {
+        return *p;
+    }
+    let p = plan_uncached(mkn, route, fidelity, staging);
+    cache.lock().unwrap().insert(key, p);
+    p
+}
+
+fn plan_uncached(
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    staging: Staging,
+) -> Option<ChunkShape> {
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)].map(|t| t.max(1));
     let mut kc = kt;
     loop {
@@ -691,7 +797,7 @@ pub fn plan([m, k, n]: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> Optio
                     break;
                 }
             }
-            let fits = |mc: usize| chunk_fits([mc, kc, nc], route, fidelity);
+            let fits = |mc: usize| chunk_fits_in([mc, kc, nc], route, fidelity, staging);
             if !fits(1) {
                 continue;
             }

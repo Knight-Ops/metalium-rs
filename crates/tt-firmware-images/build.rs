@@ -147,7 +147,12 @@ fn tool(name: &str) -> PathBuf {
 /// damage. There is no illegal-instruction trap to fall back on.
 fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
     let out = Command::new(objdump)
-        .args(["-d", "--no-show-raw-insn"])
+        // `F` on top of the image's own attributes (rv32im): firmware reaches
+        // the FP32 unit through inline assembly (`tt_firmware::float`), and
+        // those instructions must decode so this gate can judge them -- it
+        // refuses the ones Blackhole lacks or gets wrong, below -- rather than
+        // meet them as `<unknown>`.
+        .args(["-d", "--no-show-raw-insn", "--mattr=+f"])
         .arg(elf)
         .output()
         .expect("could not run llvm-objdump");
@@ -251,6 +256,16 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
     }
     if mnemonic.starts_with("fsqrt") {
         return Some("floating-point square root is not implemented");
+    }
+    if ["fmadd", "fmsub", "fnmadd", "fnmsub"]
+        .iter()
+        .any(|m| mnemonic.starts_with(m))
+    {
+        return Some(
+            "fused multiply-add executes, but is neither fused nor separate \
+             (Miscellaneous/FMA/README.md); every FP32 result here must be \
+             IEEE's, so only fadd.s/fsub.s/fmul.s are used",
+        );
     }
     if matches!(mnemonic, "div" | "divu" | "rem" | "remu") {
         return Some(

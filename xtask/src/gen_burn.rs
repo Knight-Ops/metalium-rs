@@ -69,6 +69,12 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
         "FloatTensorOps",
         &[
             "float_matmul",
+            "float_add",
+            "float_sub",
+            "float_mul",
+            "float_mul_scalar",
+            "float_swap_dims",
+            "float_transpose",
             "float_device",
             "float_to_device",
             "float_into_data",
@@ -87,6 +93,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "bool_argwhere",
         ],
     ),
+    ("ActivationOps", &["relu", "relu_backward"]),
     ("QTensorOps", &["q_device", "q_to_device", "q_into_data"]),
     ("TransactionOps", &["tr_execute"]),
 ];

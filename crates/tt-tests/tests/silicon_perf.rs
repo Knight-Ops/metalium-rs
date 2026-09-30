@@ -145,3 +145,83 @@ fn pcie_dram() {
         }
     });
 }
+
+/// One MNIST training step's matmuls on a resident `Session`: where the time
+/// goes, split into host preparation (planning, program building, tilizing)
+/// and each run phase, with the bytes each moved.
+#[test]
+#[ignore = "benchmark"]
+fn mnist_step_breakdown() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::runtime::Phase;
+    use tt_kernels::session::{Session, TileChoice};
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let (x, y) = tt_tests::backend::GATE_TILE;
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Exactly(x, y))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Forward: x@W1, h@W2. Backward: g2@W2^T, h^T@g2, x^T@g1.
+        let shapes = [
+            ("fwd x@W1", [64, 784, 128]),
+            ("fwd h@W2", [64, 128, 10]),
+            ("bwd g2@W2t", [64, 10, 128]),
+            ("bwd ht@g2", [128, 64, 10]),
+            ("bwd xt@g1", [784, 64, 128]),
+        ];
+        let mut total = Duration::ZERO;
+        for (label, [m, k, n]) in shapes {
+            let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
+            let _ = s.matmul(
+                &a,
+                &b,
+                [m, k, n],
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                400_000,
+            );
+            let _ = s.take_profile();
+            let before = s.device().traffic();
+            let t0 = Instant::now();
+            s.matmul(
+                &a,
+                &b,
+                [m, k, n],
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                400_000,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let wall = t0.elapsed();
+            total += wall;
+            let traffic = s.device().traffic() - before;
+            let p = s.take_profile();
+            let runs = p.phases.iter().filter(|x| x.0 == Phase::Stage).count();
+            let mut line = format!(
+                "MEASURE step {label:<11} {wall:>9.2?} {runs:>2} runs, {:>8} B out {:>7} B in |",
+                traffic.bytes_written, traffic.bytes_read
+            );
+            let mut device = Duration::ZERO;
+            for ph in [
+                Phase::Stage,
+                Phase::Setup,
+                Phase::Programs,
+                Phase::Launch,
+                Phase::Wait,
+                Phase::ReadBack,
+            ] {
+                let (d, t) = p.of(ph);
+                device += d;
+                line += &format!(" {ph:?} {d:.2?}/{}B", t.bytes_written + t.bytes_read);
+            }
+            line += &format!(" | host {:.2?}", wall.saturating_sub(device));
+            println!("{line}");
+        }
+        println!("MEASURE step total {total:.2?}");
+    }) {
+        panic!("{e}");
+    }
+}

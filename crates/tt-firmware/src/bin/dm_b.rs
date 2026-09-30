@@ -8,8 +8,8 @@
 #![no_std]
 #![no_main]
 
-use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, Descriptor};
+use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
+use tt_isa::dm::{self, op, Descriptor, Entry};
 use tt_isa::mailbox::offset;
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
 
@@ -19,7 +19,9 @@ const TXN: TxnId = match TxnId::new(2) {
 };
 
 fn rd(addr: u64) -> u32 {
-    // SAFETY: every address used is a fixed, aligned word of the mover's mailbox.
+    // SAFETY: every address used is an aligned word of the mover's mailbox, its
+    // list, its scratch slot, or a destination slot `Entry::decode` placed
+    // inside L1.
     unsafe { l1_read32(addr) }
 }
 
@@ -28,10 +30,11 @@ fn wr(addr: u64, v: u32) {
     unsafe { l1_write32(addr, v) }
 }
 
-/// Move one descriptor's bytes, in requests of at most 16 KiB, and wait for all
-/// of them. Every request's range is a sub-range of the checked descriptor, so
-/// it is inside the channel and inside L1, with the congruence preserved.
-fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
+/// Issue one descriptor's bytes as NIU requests of at most 16 KiB, without
+/// waiting for them. Every request's range is a sub-range of the checked
+/// descriptor, so it is inside the channel and inside L1, with the congruence
+/// preserved.
+fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     let len = d.range.len() as u32;
     let mut done = 0u32;
     while done < len {
@@ -49,6 +52,100 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
         };
         noc::issue(&cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)?;
         done += n;
+    }
+    Ok(())
+}
+
+/// Transpose the tile in the scratch slot into the slot at `dst`: header
+/// copied, datum `(r, c)` from `(c, r)`, both in face order.
+fn transpose_from_scratch(dst: u64) {
+    for w in 0..(dm::TILE_DATA / 4) {
+        wr(dst + w * 4, rd(dm::SCRATCH + w * 4));
+    }
+    let (src, out) = (dm::SCRATCH + dm::TILE_DATA, dst + dm::TILE_DATA);
+    for r in 0..32 {
+        for c in 0..32 {
+            let v = rd(src + dm::face_index(c, r) as u64 * 4);
+            wr(out + dm::face_index(r, c) as u64 * 4, v);
+        }
+    }
+}
+
+/// One compute entry over the 1024 datums of three tile slots (`dm::kind`).
+fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
+    let (dst, a, b) = (dst + dm::TILE_DATA, a + dm::TILE_DATA, b + dm::TILE_DATA);
+    for r in 0..32usize {
+        for c in 0..32usize {
+            let i = dm::face_index(r, c) as u64 * 4;
+            let x = rd(a + i);
+            let v = match kind {
+                dm::kind::ADD => float::add(x, rd(b + i)),
+                dm::kind::SUB => float::sub(x, rd(b + i)),
+                dm::kind::MUL => float::mul(x, rd(b + i)),
+                dm::kind::MUL_SCALAR => float::mul(x, s),
+                // `max(x, 0)`: x itself if positive (as a signed integer, which
+                // excludes both zeros, negatives and negative NaNs), +0 for
+                // every negative and zero; a positive NaN is `max`'s other
+                // argument, +0, too.
+                dm::kind::RELU => {
+                    if (x as i32) > 0 && x <= 0x7F80_0000 {
+                        x
+                    } else {
+                        0
+                    }
+                }
+                // `out > 0 ? g : 0` in IEEE terms: positive, not zero, not NaN.
+                dm::kind::RELU_BACKWARD => {
+                    if (x as i32) > 0 && x <= 0x7F80_0000 {
+                        rd(b + i)
+                    } else {
+                        0
+                    }
+                }
+                dm::kind::ADD_ROW => float::add(x, rd(b + dm::face_index(0, c) as u64 * 4)),
+                _ => x,
+            };
+            wr(dst + i, v);
+        }
+    }
+    publish();
+}
+
+/// Run one descriptor to completion.
+fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
+    issue(me, d)?;
+    noc::wait(TXN);
+    Ok(())
+}
+
+/// Run the list at `dm::LIST`: plain entries are issued back to back and waited
+/// for together; a transposed read waits for its own tile before rearranging it.
+fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
+    if count > dm::LIST_MAX {
+        return Err(dm::error::LENGTH);
+    }
+    for i in 0..count as u64 {
+        let at = dm::LIST + i * dm::ENTRY_BYTES;
+        let mut w = [0u32; 8];
+        for (k, word) in w.iter_mut().enumerate() {
+            *word = rd(at + k as u64 * 4);
+        }
+        match Entry::decode(usable, w)? {
+            Entry::Move { descriptor, transpose: true } => {
+                // Everything before it has landed, and the scratch is free.
+                noc::wait(TXN);
+                run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
+                publish();
+                transpose_from_scratch(descriptor.l1 as u64);
+            }
+            Entry::Move { descriptor, .. } => issue(me, descriptor)?,
+            Entry::Compute { kind, scalar, dst, a, b } => {
+                // Its operands may still be arriving.
+                noc::wait(TXN);
+                publish();
+                compute(kind, scalar, dst as u64, a as u64, b as u64);
+            }
+        }
     }
     noc::wait(TXN);
     Ok(())
@@ -71,16 +168,20 @@ pub extern "Rust" fn firmware_main() -> ! {
         if seq == 0 || seq == rd(dm::DONE) {
             continue;
         }
-        let d = Descriptor::decode(
-            usable,
-            rd(dm::OP),
-            rd(dm::CHANNEL),
-            rd(dm::PORT),
-            rd(dm::DRAM_OFFSET),
-            rd(dm::L1_ADDR),
-            rd(dm::LEN),
-        );
-        let result = d.and_then(|d| run(me, d));
+        let result = if rd(dm::OP) == op::LIST {
+            run_list(me, usable, rd(dm::LEN))
+        } else {
+            Descriptor::decode(
+                usable,
+                rd(dm::OP),
+                rd(dm::CHANNEL),
+                rd(dm::PORT),
+                rd(dm::DRAM_OFFSET),
+                rd(dm::L1_ADDR),
+                rd(dm::LEN),
+            )
+            .and_then(|d| run(me, d))
+        };
         wr(dm::ERROR, result.err().unwrap_or(dm::error::NONE));
         // The data is in L1 (a read) or acknowledged by the DRAM tile (a write,
         // response-marked) before DONE is published.

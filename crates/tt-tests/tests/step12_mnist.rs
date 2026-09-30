@@ -230,7 +230,21 @@ fn the_mlp_trains_on_a_reduced_dataset() {
     let bless = std::env::var_os("TT_BLESS").is_some();
     let want = golden();
     with_device(Config::default(), |d| {
+        let before = burn_tt::tensor_traffic();
         let (tt, _) = train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d);
+        let moved = burn_tt::tensor_traffic() - before;
+        let n = tt.len() as u64;
+        println!(
+            "MEASURE tensor traffic per step: {} B up in {} uploads, {} B down in {} downloads",
+            moved.uploaded / n,
+            moved.uploads / n,
+            moved.downloaded / n,
+            moved.downloads / n
+        );
+        assert!(
+            moved.uploads > 0,
+            "the matmuls must have run on device-resident tensors"
+        );
         for (i, (t, h)) in tt.iter().zip(&host).enumerate() {
             eprintln!("step {i:2}: device {t:.6}  host {h:.6}");
         }

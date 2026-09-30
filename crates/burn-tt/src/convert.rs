@@ -36,17 +36,19 @@ pub trait HasDevice {
 
 // --- Tensors ------------------------------------------------------------------
 
+// A device tensor's host copy is downloaded here, the first time an op that
+// runs on the host needs it (`tensor.rs`), and counted (`traffic.rs`).
 impl IntoFlex for TtTensor {
     type Flex = FlexTensor;
     fn into_flex(self) -> FlexTensor {
-        self.inner
+        self.into_host()
     }
 }
 
 impl<'a> IntoFlex for &'a TtTensor {
     type Flex = &'a FlexTensor;
     fn into_flex(self) -> &'a FlexTensor {
-        &self.inner
+        self.host()
     }
 }
 
@@ -170,7 +172,7 @@ impl IntoFlex for TensorPrimitive<TtBackend> {
     type Flex = TensorPrimitive<Flex>;
     fn into_flex(self) -> TensorPrimitive<Flex> {
         match self {
-            TensorPrimitive::Float(t) => TensorPrimitive::Float(t.inner),
+            TensorPrimitive::Float(t) => TensorPrimitive::Float(t.into_host()),
             TensorPrimitive::QFloat(t) => TensorPrimitive::QFloat(t.inner),
         }
     }
@@ -198,7 +200,7 @@ impl IntoFlex for QuantizationParametersPrimitive<TtBackend> {
     type Flex = QuantizationParametersPrimitive<Flex>;
     fn into_flex(self) -> Self::Flex {
         QuantizationParametersPrimitive {
-            scales: self.scales.inner,
+            scales: self.scales.into_host(),
         }
     }
 }

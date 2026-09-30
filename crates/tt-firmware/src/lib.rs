@@ -440,3 +440,46 @@ pub mod noc {
         unsafe { while read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) & 0xFF != 0 {} }
     }
 }
+
+/// FP32 arithmetic on the baby RISC-V's own floating-point unit, on bit
+/// patterns.
+///
+/// The firmware is built for `riscv32im`, so the compiler emits no floating
+/// point at all; these reach `fadd.s`/`fsub.s`/`fmul.s` through inline assembly
+/// that enables `F` for its own few instructions. The compiler neither
+/// allocates nor saves `f` registers, so the `ft0`/`ft1` these use are free.
+/// Round to nearest even always, denormals flushed
+/// (`BabyRISCV/InstructionSet.md:18-22`): the IEEE result wherever operands
+/// and result are normal. `fmadd.s` and its family are deliberately absent, and
+/// the instruction gate in `tt-firmware-images/build.rs` refuses them.
+pub mod float {
+    macro_rules! binary {
+        ($name:ident, $insn:literal) => {
+            #[inline(always)]
+            pub fn $name(a: u32, b: u32) -> u32 {
+                let out: u32;
+                // SAFETY: register-to-register moves and one arithmetic
+                // instruction on the two scratch `f` registers; no memory.
+                unsafe {
+                    core::arch::asm!(
+                        ".option push",
+                        ".option arch, +f",
+                        "fmv.w.x ft0, {a}",
+                        "fmv.w.x ft1, {b}",
+                        concat!($insn, " ft0, ft0, ft1"),
+                        "fmv.x.w {out}, ft0",
+                        ".option pop",
+                        a = in(reg) a,
+                        b = in(reg) b,
+                        out = lateout(reg) out,
+                        options(nomem, nostack, pure),
+                    );
+                }
+                out
+            }
+        };
+    }
+    binary!(add, "fadd.s");
+    binary!(sub, "fsub.s");
+    binary!(mul, "fmul.s");
+}

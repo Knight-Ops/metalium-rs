@@ -23,3 +23,4 @@ pub mod matmul;
 pub mod runtime;
 pub mod session;
 pub mod shard;
+pub mod tensor;

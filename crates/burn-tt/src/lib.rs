@@ -26,12 +26,14 @@ mod generated;
 mod ops;
 mod server;
 mod tensor;
+mod traffic;
 
 pub use server::{
-    attach, kmd_engine, kmd_mesh_engine, AttachGuard, Engine, EngineError, KmdEngine, MeshEngine,
-    Serve,
+    attach, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Engine, EngineError,
+    KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
+pub use traffic::{tensor_traffic, TensorTraffic};
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 

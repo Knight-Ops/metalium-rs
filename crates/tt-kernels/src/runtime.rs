@@ -479,6 +479,11 @@ pub struct Resident<N: NocId> {
     window: tt_device::Window,
     generation: u32,
     poisoned: bool,
+    /// What each role's program slot holds, as last written: a slot already
+    /// holding the program is not written again. Consecutive chunks of one
+    /// matmul usually share their programs, which were most of what a
+    /// DRAM-resident matmul still sent over PCIe.
+    slots: std::cell::RefCell<[Vec<Instruction>; 3]>,
 }
 
 impl<N: NocId> Resident<N> {
@@ -497,6 +502,7 @@ impl<N: NocId> Resident<N> {
             window,
             generation: 1,
             poisoned: false,
+            slots: Default::default(),
         };
         for thread in 0..3 {
             r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
@@ -683,9 +689,14 @@ impl<N: NocId> Resident<N> {
         dev.write32(w, tile, mb.dump_row_count(), dump)?;
         dev.write32(w, tile, mb.trace(), u32::from(traced))?;
         dev.write32(w, tile, mb.push_window(), push_window)?;
-        if !program.is_empty() {
+        let mut slots = self.slots.borrow_mut();
+        if !program.is_empty() && slots[thread] != program {
+            // Forget the slot first: if the write fails, it holds neither.
+            slots[thread].clear();
             dev.l1_write(w, tile, mb.program(), &program_bytes(program))?;
+            slots[thread] = program.to_vec();
         }
+        drop(slots);
         for row in 0..dump {
             for col in 0..mailbox::DUMP_ROW_WORDS {
                 dev.write32(w, tile, mb.dump_offset(row, col), DUMP_SENTINEL)?;

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
-use tt_isa::dm::{self, op, Descriptor};
+use tt_isa::dm::{self, op, Descriptor, Entry};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::{NocCoord, NocId};
@@ -134,6 +134,37 @@ impl<N: NocId> DataMover<N> {
         port: u8,
     ) -> Result<()> {
         self.run(d, w, op::WRITE, to, port, from_l1)
+    }
+
+    /// Run a list of entries ([`Entry`]: reads, writes, transposed tile reads)
+    /// as one descriptor: the list is written to L1 in one bulk write, and the
+    /// mover waits for all of it before reporting done.
+    pub fn run_list<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for chunk in entries.chunks(dm::LIST_MAX as usize) {
+            for e in chunk {
+                Entry::decode(self.usable as u32, *e).map_err(DmError::Invalid)?;
+            }
+            let bytes: Vec<u8> = chunk
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            d.l1_write(w, self.tile, dm::LIST, &bytes)?;
+            d.write32(w, self.tile, dm::OP, op::LIST)?;
+            d.write32(w, self.tile, dm::LEN, chunk.len() as u32)?;
+            self.seq = self.seq.wrapping_add(1).max(1);
+            d.write32(w, self.tile, dm::SEQ, self.seq)?;
+            self.wait(d, w)?;
+        }
+        Ok(())
     }
 
     fn run<T: Transport>(

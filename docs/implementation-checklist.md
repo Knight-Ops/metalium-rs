@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 38.5 ms/step (Flex: 0.5); device-resident tensors next |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 16.8 ms/step (Flex: 0.5) with weights and activations resident in GDDR |
 
 ---
 
@@ -1169,9 +1169,42 @@ tensors in `burn-tt`, 9.5 gates.
       cards and sharded over the two. Silicon regression before the resident
       change: 316/316; the Phase 9 gates with matmul, burn, MNIST and multi-chip
       after it: 82/82.
-- [ ] **9.3c** Cached programs and plans (the host still rebuilds them per
-      chunk); operands still staged over PCIe per chunk (1.35 MB for the MNIST
-      first layer) -- 9.4 replaces that with the data mover.
+- [x] **9.3c** Programs and chunk plans memoised per process
+      (`matmul::programs`, `plan_in`); a resident program slot already holding
+      the program is not rewritten.
+- [x] **9.4a Tensors in GDDR** (`tt_kernels::tensor`). A `DramTensor` is
+      FP32 tiles in 4160-byte slots (zero header, datums, padding to 64, so any
+      slot copies to any other under C64), interleaved over the channels, by a
+      coalescing per-channel allocator. Upload and download are one bulk
+      transfer per channel. The mover takes descriptor **lists**, with a
+      transposed tile read (the B core transposes the tile in L1) and FP32
+      **compute** entries. Gates: `step18_dram_matmul` (round trips; MNIST's
+      forward and backward products, transposed operands included,
+      bit-identical to the host-staged matmul; a tile header's contents are
+      never read) and `step19_eltwise` (add/sub/mul/mul-scalar/relu/relu-backward/
+      broadcast row add against `burn-flex` bit for bit over +-0, +-inf, NaN,
+      huge and tiny values; the denormal flush recorded), ttsim and both cards.
+- [x] **Element-wise on the baby RISC-V's FP32 unit**, not the SFPU:
+      `fadd.s`/`fsub.s`/`fmul.s` round to nearest even with denormals flushed
+      (`InstructionSet.md:18-22`), IEEE for every normal case -- `fma_bh`
+      agreed with the host on 10^6 random `mul`, `add` and SGD updates each.
+      Reached through inline asm (the images stay `riscv32im`); the instruction
+      gate now decodes `F` and refuses `fmadd`/`fmsub`/`fnmadd`/`fnmsub` (watched
+      refusing a planted one). The SFPU path is the faster follow-up.
+- [x] **9.4b `burn-tt` keeps tensors on the device.** `TtTensor` is a shared
+      cell with lazily filled host and device copies (clones share both, so what
+      the forward pass uploads the backward pass finds); a 2-D transpose of a
+      device tensor is a view. On device: `float_matmul`, `float_add` (with the
+      `[1, n]` bias broadcast), `float_sub`, `float_mul`, `float_mul_scalar`,
+      `relu`, `relu_backward` -- whenever an operand is already there. Anything
+      else downloads once, counted by `burn_tt::tensor_traffic`
+      (`TT_TRACE_FALLBACK=1` says which op). Both engines keep tensors in GDDR.
+- [x] **Result: full MNIST 38.5 -> 16.8 ms/step** on both cards, accuracy
+      unchanged, the reduced golden bit for bit on ttsim and both cards. Tensor
+      traffic per step 675 KB up / 475 KB down -> 216 KB up / 35 KB down.
+- [ ] **Left per step:** the batch `x` (200 KB up: preload the dataset, a batch
+      is a row-slice view), `g1` for the bias gradient's row sum (32 KB down),
+      logits and `g2` (2.5 KB each, the loss stays on the host).
 - [ ] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
       allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum / SGD on
       device, with fallback counted by `Device::traffic`.
