@@ -292,24 +292,49 @@ fn instructions_ttsim_declines_to_execute() {
 
 /// What `SFPLOADMACRO` does on silicon, where ttsim cannot say (divergence row 7).
 ///
-/// A smoke test, not a semantic one: with no macro configured, the pages specify
-/// nothing this could assert about the result. What it does establish is that
-/// the instruction retires and the core reaches `DONE` -- that an unconfigured
-/// macro neither hangs the coprocessor nor wedges the pushing core -- and it
-/// prints what `Dst` holds so the first run is a measurement.
+/// `SFPLOADMACRO.md`: it "starts by executing as per `SFPLOAD`" -- `Dst` into
+/// `LReg[VD]` -- and then schedules whatever the `SFPCONFIG`-written macro holds.
+/// The first silicon run, with every field zero, stored the *previous gate's*
+/// 6.0 where the 1.0 in `LReg[0]` was expected: the load half had replaced it
+/// with `Dst` row 0's leftovers. This pins that, with a value this program seeds
+/// itself so nothing depends on what an earlier run left in `Dst`:
+///
+/// 1. `LReg[1] = 7.0`, stored to `Dst` row group 0;
+/// 2. `LReg[0] = 1.0`;
+/// 3. `SFPLOADMACRO` with `VD = 0`, address 0 -- the load half should make
+///    `LReg[0]` 7.0;
+/// 4. `LReg[0]` stored to row group 1, which the seed never touched.
+///
+/// The control is the same program without step 3, which must store 1.0. With
+/// no macro configured, the scheduled half is not asserted on.
 #[cfg(feature = "silicon")]
 #[test]
-fn sfploadmacro_retires_on_silicon() {
-    tt_tests::harness::assert_on_silicon();
-    in_device(|dev| {
+fn sfploadmacro_begins_as_an_sfpload_from_dst() {
+    harness::assert_on_silicon();
+    const GROUP_1: u32 = 4;
+    let program = |with_macro: bool| {
         let mut p = Vec::new();
+        p.extend(load(1, 7.0));
+        p.push(store_fp32(1));
         p.extend(load(0, 1.0));
-        p.push(encode::Sfploadmacro::ZERO.encode().unwrap());
-        p.push(store_fp32(0));
-        let dst = run(dev, &p, 4);
-        println!(
-            "SFPLOADMACRO then SFPSTORE LReg[0]: Dst row 0 = {:08x?}",
-            &dst[..16]
-        );
-    });
+        if with_macro {
+            p.push(encode::Sfploadmacro::ZERO.encode().unwrap());
+        }
+        p.push(sfpu::store(0, store_format::FP32, 0, GROUP_1).unwrap());
+        p
+    };
+    for (with_macro, want) in [(false, 1.0f32), (true, 7.0f32)] {
+        let p = program(with_macro);
+        in_device(|dev| {
+            let dst = run(dev, &p, 8);
+            // Row 4 is the first row of group 1; `SFPSTORE` fills even columns.
+            let row4: Vec<u32> = (0..16).step_by(2).map(|c| dst[4 * 16 + c]).collect();
+            println!("MEASURE sfploadmacro.with_macro_{with_macro}.row4_even = {row4:08x?}");
+            assert!(
+                row4.iter().all(|&v| v == want.to_bits()),
+                "with_macro={with_macro}: expected {want} ({:#010x}) in row 4, got {row4:08x?}",
+                want.to_bits()
+            );
+        });
+    }
 }

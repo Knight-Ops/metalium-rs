@@ -244,13 +244,16 @@ fn a_held_backend_does_not_produce_the_answer() {
         match outcome {
             Ok(_) => {
                 let result = dev.read32(&w, tile, mailbox::RESULT).unwrap();
+                println!("MEASURE held_backend = reached DONE with result {result:#010x}");
                 assert_ne!(
                     result, EXPECTED,
                     "the SFPU produced the correct answer while held in soft reset, \
                      so releasing the backend is not what makes the real test pass"
                 );
             }
-            Err(WaitError::TimedOut { .. }) => {}
+            Err(e @ WaitError::TimedOut { .. }) => {
+                println!("MEASURE held_backend = {e}");
+            }
             Err(e) => panic!("unexpected failure: {e}"),
         }
     });
