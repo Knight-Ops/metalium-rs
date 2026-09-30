@@ -494,3 +494,61 @@ pub fn state_id() -> Instruction {
         .encode()
         .unwrap()
 }
+
+/// The `ThreadConfig` increments of address modifier `entry` (0..8): what an
+/// instruction's `AddrMod` selects. Blackhole has eight entries and a three-bit
+/// `AddrMod` to reach them (divergence row 42).
+pub struct AddrModEntry {
+    pub src_a_incr: tt_isa::cfg::ThreadConfigField,
+    pub src_b_incr: tt_isa::cfg::ThreadConfigField,
+    pub dst_incr: tt_isa::cfg::ThreadConfigField,
+}
+
+pub fn addr_mod_entry(entry: usize) -> AddrModEntry {
+    use thread::*;
+    let src_a = [
+        ADDR_MOD_AB_SEC0_SrcAIncr,
+        ADDR_MOD_AB_SEC1_SrcAIncr,
+        ADDR_MOD_AB_SEC2_SrcAIncr,
+        ADDR_MOD_AB_SEC3_SrcAIncr,
+        ADDR_MOD_AB_SEC4_SrcAIncr,
+        ADDR_MOD_AB_SEC5_SrcAIncr,
+        ADDR_MOD_AB_SEC6_SrcAIncr,
+        ADDR_MOD_AB_SEC7_SrcAIncr,
+    ];
+    let src_b = [
+        ADDR_MOD_AB_SEC0_SrcBIncr,
+        ADDR_MOD_AB_SEC1_SrcBIncr,
+        ADDR_MOD_AB_SEC2_SrcBIncr,
+        ADDR_MOD_AB_SEC3_SrcBIncr,
+        ADDR_MOD_AB_SEC4_SrcBIncr,
+        ADDR_MOD_AB_SEC5_SrcBIncr,
+        ADDR_MOD_AB_SEC6_SrcBIncr,
+        ADDR_MOD_AB_SEC7_SrcBIncr,
+    ];
+    let dst = [
+        ADDR_MOD_DST_SEC0_DestIncr,
+        ADDR_MOD_DST_SEC1_DestIncr,
+        ADDR_MOD_DST_SEC2_DestIncr,
+        ADDR_MOD_DST_SEC3_DestIncr,
+        ADDR_MOD_DST_SEC4_DestIncr,
+        ADDR_MOD_DST_SEC5_DestIncr,
+        ADDR_MOD_DST_SEC6_DestIncr,
+        ADDR_MOD_DST_SEC7_DestIncr,
+    ];
+    AddrModEntry {
+        src_a_incr: src_a[entry],
+        src_b_incr: src_b[entry],
+        dst_incr: dst[entry],
+    }
+}
+
+/// A `SETC16` giving one `ThreadConfig` field `value`, every other field of its
+/// word zero.
+pub fn thread_entry(field: tt_isa::cfg::ThreadConfigField, value: u16) -> Instruction {
+    ThreadConfigEntry::zeroed(field.addr32())
+        .set(field, value)
+        .unwrap()
+        .encode()
+        .unwrap()
+}

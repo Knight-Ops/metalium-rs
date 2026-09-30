@@ -19,7 +19,7 @@ local diagrams = {
   MVMUL_BH = function()
     return Bits32{
       {0, 10, "DstRow"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {19, 1, "BroadcastSrcBRow"},
       {22, 1, "FlipSrcA"},
       {23, 1, "FlipSrcB"},
@@ -30,7 +30,7 @@ local diagrams = {
     return Bits32{
       {0, 10, "DstRow"},
       {13, 1, "Move8Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcRow"},
       {23, 1, "UseDst32bLo"},
       {24, 8, "0x12"},
@@ -42,7 +42,7 @@ local diagrams = {
       {11, 1, "BroadcastCol0"},
       {12, 1, "Broadcast1RowTo8"},
       {13, 1, "Move4Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcRow"},
       {23, 1, "UseDst32bLo"},
       {24, 8, "0x13"},
@@ -52,7 +52,7 @@ local diagrams = {
     return Bits32{
       {0, 10, "DstRow"},
       {13, 1, "Move4Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcRow"},
       {23, 1, "UseDst32bLo"},
       {24, 8, "0x08"},
@@ -62,7 +62,7 @@ local diagrams = {
     return Bits32{
       {0, 10, "DstRow"},
       {13, 1, "Move4Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcRow"},
       {23, 1, "UseDst32bLo"},
       {24, 8, "0x0A"},
@@ -72,7 +72,7 @@ local diagrams = {
     return Bits32{
       {0, 6, "SrcBRow"},
       {13, 1, "Move4Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcARow"},
       {24, 8, "0x0B"},
     }
@@ -80,7 +80,7 @@ local diagrams = {
   ELWADD_BH = function()
     return Bits32{
       {0, 10, "DstRow"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {19, 1, "BroadcastSrcBCol0"},
       {20, 1, "BroadcastSrcBRow"},
       {21, 1, "AddDst"},
@@ -92,7 +92,7 @@ local diagrams = {
   ELWSUB_BH = function()
     return Bits32{
       {0, 10, "DstRow"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {19, 1, "BroadcastSrcBCol0"},
       {20, 1, "BroadcastSrcBRow"},
       {21, 1, "AddDst"},
@@ -104,7 +104,7 @@ local diagrams = {
   ELWMUL_BH = function()
     return Bits32{
       {0, 10, "DstRow"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {19, 1, "BroadcastSrcBCol0"},
       {20, 1, "BroadcastSrcBRow"},
       {22, 1, "FlipSrcA"},
@@ -115,7 +115,7 @@ local diagrams = {
   DOTPV_BH = function()
     return Bits32{
       {0, 10, "DstRow"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {22, 1, "FlipSrcA"},
       {23, 1, "FlipSrcB"},
       {24, 8, "0x29"},
@@ -125,7 +125,7 @@ local diagrams = {
     return Bits32{
       {0, 10, "DstRow"},
       {13, 1, "Move8Rows"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {17, 6, "SrcRow"},
       {23, 1, "UseDst32bLo"},
       {24, 8, "0x09"},
@@ -135,14 +135,14 @@ local diagrams = {
     return Bits32{
       {0, 6, "SrcRow"},
       {10, 1, "ShiftInZero"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {24, 8, "0x18"},
     }
   end,
   ZEROACC_BH = function()
     return Bits32{
       {0, 10, "Imm10"},
-      {14, 2, "AddrMod"},
+      {14, 3, "AddrMod"},
       {18, 1, "UseDst32b"},
       {19, 2, "Mode"},
       {24, 8, "0x10"},

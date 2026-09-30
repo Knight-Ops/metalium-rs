@@ -328,6 +328,7 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
             evidence,
             moved,
             dropped,
+            widened,
         } => {
             let quoted = |v: &Vec<String>| {
                 v.iter()
@@ -336,9 +337,10 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
                     .join(", ")
             };
             format!(
-                "Provenance::Measured {{ evidence: \"{evidence}\", moved: &[{}], dropped: &[{}] }}",
+                "Provenance::Measured {{ evidence: \"{evidence}\", moved: &[{}], dropped: &[{}], widened: &[{}] }}",
                 quoted(moved),
-                quoted(dropped)
+                quoted(dropped),
+                quoted(widened)
             )
         }
         other => format!("Provenance::{}", other.variant_name()),
@@ -362,6 +364,7 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
             evidence,
             moved,
             dropped,
+            widened,
         } => {
             let ticked = |v: &Vec<String>| {
                 v.iter()
@@ -381,9 +384,18 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
                     if dropped.len() == 1 { "its" } else { "their" },
                 )
             };
+            let widened = if widened.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {} {} a different width on Blackhole.",
+                    ticked(widened),
+                    if widened.len() == 1 { "has" } else { "have" },
+                )
+            };
             format!(
                 "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
-                 diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere.{dropped} \
+                 diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere.{widened}{dropped} \
                  Every other field is carried from that diagram and is as unverified as it \
                  was. Re-derive on silicon.",
                 ticked(moved),

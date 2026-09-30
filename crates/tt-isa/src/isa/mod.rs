@@ -160,6 +160,8 @@ pub enum Provenance {
         /// Wormhole fields this layout does not carry: their Wormhole bits hold
         /// another field on Blackhole, and their own position is unknown.
         dropped: &'static [&'static str],
+        /// Fields whose width differs from the Wormhole diagram's.
+        widened: &'static [&'static str],
     },
 }
 

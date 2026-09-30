@@ -78,10 +78,11 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       with it. Found on the way, on silicon only: one-row `ZEROACC` in FP32 `Dst`
       addresses physical rows (row 51), and with an odd `AddrMod` clears eight
       (row 52).
-- [ ] **`AddrMod` is three bits on Blackhole** (entries 0..7; measured on
-      `ZEROACC`). The `_BH` layouts draw two, because a measured layout may not
-      change a width. Needs a generator rule for measured widths and per-instruction
-      gates.
+- [x] **`AddrMod` is three bits on Blackhole** (entries 0..7). All 13 measured
+      layouts draw 14..16; `gen-isa` takes a `widened` list, held to the same rules
+      as `moved` (listed only if the width really changed). Every `AddrMod` gate also
+      runs `addr_mod(4)` -- the third bit alone -- against entry 4, on ttsim and both
+      cards; `llk_crosscheck` checks all 13 against LLK's `is_valid(addr_mode, 3)`.
 - [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
       UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
       did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
@@ -766,7 +767,7 @@ undocumented.
       **returns `None` unless every product and sum is exact**, because `MVMUL.md`
       calls its float model "a rough guide" to order; the gates choose operands in
       that regime, and the reference caught one set that was not.
-- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..15, not
+- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..16, not
       the Wormhole diagram's 15..16 (row 42), so the generated encoder applied the
       wrong modifier for every non-zero value, silently. **Now fixed through the
       generator, not beside it:** `xtask/src/gen_isa/Bits32_BH.lua` holds measured

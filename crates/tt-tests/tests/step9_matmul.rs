@@ -66,6 +66,22 @@ fn thread_entry(field: ThreadConfigField, value: u16) -> Instruction {
         .unwrap()
 }
 
+/// `value` placed in `i`'s `AddrMod` field, as its (measured) definition draws it.
+/// Entry 4 is the third bit, which only the Blackhole layouts have.
+fn addr_mod_bits(i: Instruction, value: u32) -> u32 {
+    let f = i.def().field("AddrMod").unwrap();
+    assert!(
+        f.fits(value),
+        "{}: AddrMod {value} does not fit",
+        i.def().key()
+    );
+    let bits = f.place(value);
+    if value == 4 {
+        assert_eq!(bits, 1 << 16, "{}: the third AddrMod bit", i.def().key());
+    }
+    bits
+}
+
 fn fidelity_base(phase: u16) -> Instruction {
     thread_entry(thread::FIDELITY_BASE_Phase, phase)
 }
@@ -412,7 +428,7 @@ fn four_phases_through_the_rwc_recover_the_exact_product() {
     assert_block(&dst, 0, &full, "phases 0..4 via ADDR_MOD FidelityIncr");
 }
 
-/// **`MVMUL`'s `AddrMod` is bits 14..15 on Blackhole, not the 15..16 of
+/// **`MVMUL`'s `AddrMod` is bits 14..16 on Blackhole, not the 15..16 of
 /// `Bits32.lua`.** The only diagram in the pinned specification is Wormhole's, and
 /// it is wrong here: its `addr_mod(1)` sets bit 15, which Blackhole reads as index
 /// **2**, so it applies the wrong modifier and says nothing (divergence row 42).
@@ -444,6 +460,7 @@ fn mvmul_addr_mod_sits_one_bit_lower_on_blackhole() {
         Box::new(move |banks, p| {
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 8));
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, 8));
             let (i, banks) = banks.mvmul(encode::Mvmul::ZERO).unwrap();
             p.push(Instruction::new(i.word() | addr_mod_bits, i.def()));
             let (i, _) = banks.mvmul_release_both(encode::Mvmul::ZERO).unwrap();
@@ -460,6 +477,12 @@ fn mvmul_addr_mod_sits_one_bit_lower_on_blackhole() {
     let dst = run(&identity(), &b, body(blackhole & 0x0001_c000));
     assert_block(&dst, 0, &b, "first MVMUL, Blackhole addr_mod(1)");
     assert_block(&dst, 8, &b, "second MVMUL after modifier 1");
+
+    // The third bit alone: entry 4, set up as entry 1.
+    let four = addr_mod_bits(encode::Mvmul::ZERO.encode().unwrap(), 4);
+    let dst = run(&identity(), &b, body(four));
+    assert_block(&dst, 0, &b, "first MVMUL, Blackhole addr_mod(4)");
+    assert_block(&dst, 8, &b, "second MVMUL after modifier 4");
 
     // The Wormhole encoding of the same request: modifier 2, which moves nothing,
     // so both land on row 0.
@@ -487,7 +510,7 @@ fn dump_the_identity_block() {
     }
 }
 
-/// `MOVD2A`'s, `MOVD2B`'s and `MOVB2A`'s `AddrMod` sit at bits 14..15 on
+/// `MOVD2A`'s, `MOVD2B`'s and `MOVB2A`'s `AddrMod` sit at bits 14..16 on
 /// Blackhole, one bit lower than the Wormhole diagrams draw them -- as `MVMUL`'s,
 /// `MOVA2D`'s and `MOVB2D`'s do (row 42), and as LLK's `addr_mode << 14` has them.
 ///
@@ -552,13 +575,23 @@ fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
         p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, d_incr));
         p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcBIncr, 0));
         p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+        // Entry 4, reached by the third bit alone, as entry 1.
+        p.push(thread_entry(thread::ADDR_MOD_AB_SEC4_SrcBIncr, b_incr));
+        p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, d_incr));
     };
     let raw = |i: Instruction, bits: u32| Instruction::new(i.word() | bits, i.def());
     let dst_rwc_zero = || encode::Setrwc::ZERO.dst(1).dst_val(0).encode().unwrap();
 
-    for (addr_mod, encoding) in [(words[0].1, "measured"), (words[0].2, "Wormhole")] {
+    for (addr_mod, encoding) in [
+        (words[0].1, "measured"),
+        (
+            addr_mod_bits(encode::Movd2A::ZERO.encode().unwrap(), 4),
+            "measured entry 4",
+        ),
+        (words[0].2, "Wormhole"),
+    ] {
         let bits = addr_mod & 0x00ff_ffff;
-        let second = if encoding == "measured" { 4 } else { 0 };
+        let second = if encoding == "Wormhole" { 0 } else { 4 };
 
         // MOVD2A: B rows 0..8 into `Dst` 0..8; `Dst` 0..4, then `Dst` RWC..+4,
         // into `SrcA` 24..28 and 28..32; `SrcA` 24..32 back into `Dst` 8..16.
@@ -608,9 +641,16 @@ fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
         );
     }
 
-    for (addr_mod, encoding) in [(words[1].1, "measured"), (words[1].2, "Wormhole")] {
+    for (addr_mod, encoding) in [
+        (words[1].1, "measured"),
+        (
+            addr_mod_bits(encode::Movd2B::ZERO.encode().unwrap(), 4),
+            "measured entry 4",
+        ),
+        (words[1].2, "Wormhole"),
+    ] {
         let bits = addr_mod & 0x00ff_ffff;
-        let second = if encoding == "measured" { 4 } else { 0 };
+        let second = if encoding == "Wormhole" { 0 } else { 4 };
 
         // MOVD2B: A rows 0..8 into `Dst` 0..8; `Dst` 0..4, then `Dst` RWC..+4,
         // into `SrcB` 16..20 and 20..24; those back into `Dst` 8..16.
@@ -653,9 +693,16 @@ fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
         );
     }
 
-    for (addr_mod, encoding) in [(words[2].1, "measured"), (words[2].2, "Wormhole")] {
+    for (addr_mod, encoding) in [
+        (words[2].1, "measured"),
+        (
+            addr_mod_bits(encode::movb2_a(0, 0, 0, 0).unwrap(), 4),
+            "measured entry 4",
+        ),
+        (words[2].2, "Wormhole"),
+    ] {
         let bits = addr_mod & 0x00ff_ffff;
-        let second = if encoding == "measured" { 4 } else { 0 };
+        let second = if encoding == "Wormhole" { 0 } else { 4 };
 
         // MOVB2A: `SrcB` 8..12, then `SrcB` RWC..+4 (B rows 0..4, then 4..8 or
         // 0..4 again), into `SrcA` 24..28 and 28..32; `SrcA` 24..32 back into
@@ -693,7 +740,7 @@ fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
 }
 
 /// The other Matrix Unit instructions that write `Dst` -- `ELWADD`, `ELWSUB`,
-/// `ELWMUL`, `DOTPV`, `MOVDBGA2D` -- have their `AddrMod` at bits 14..15 on
+/// `ELWMUL`, `DOTPV`, `MOVDBGA2D` -- have their `AddrMod` at bits 14..16 on
 /// Blackhole too, where LLK's `addr_mode << 14` has it; the Wormhole diagrams
 /// draw 15..16.
 ///
@@ -786,6 +833,8 @@ fn matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole() {
                 p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, step));
                 p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcAIncr, 0));
                 p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+                p.push(thread_entry(thread::ADDR_MOD_AB_SEC4_SrcAIncr, 0));
+                p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, step));
                 for _ in 0..2 {
                     p.push(Instruction::new(one.word() | bits, one.def()));
                 }
@@ -802,12 +851,14 @@ fn matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole() {
             "{name}: the reference run wrote past eight rows"
         );
 
-        let dst = run(&a, &b, twice(8, bh & 0x00ff_ffff));
-        assert_eq!(
-            block(&dst, 8),
-            written,
-            "{name} measured: second copy 8 rows down"
-        );
+        for bits in [bh & 0x00ff_ffff, addr_mod_bits(one, 4)] {
+            let dst = run(&a, &b, twice(8, bits));
+            assert_eq!(
+                block(&dst, 8),
+                written,
+                "{name} measured, AddrMod bits {bits:#x}: second copy 8 rows down"
+            );
+        }
 
         let dst = run(&a, &b, twice(8, wh & 0x00ff_ffff));
         assert!(
@@ -817,7 +868,7 @@ fn matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole() {
     }
 }
 
-/// `SHIFTXB`'s `AddrMod` sits at bits 14..15 on Blackhole, as LLK's
+/// `SHIFTXB`'s `AddrMod` sits at bits 14..16 on Blackhole, as LLK's
 /// `addr_mode << 14` has it; the Wormhole diagram draws 15..16.
 ///
 /// `SHIFTXB` rotates one `SrcB` row left by a column (`ShiftInZero` clear). Two of
@@ -852,6 +903,8 @@ fn shiftxb_addr_mod_sits_one_bit_lower_on_blackhole() {
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 0));
             p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcBIncr, 0));
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC4_SrcBIncr, 1));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, 0));
             let i = encode::shiftxb(0, 0, 0).unwrap();
             for _ in 0..2 {
                 p.push(Instruction::new(i.word() | bits, i.def()));
@@ -868,17 +921,22 @@ fn shiftxb_addr_mod_sits_one_bit_lower_on_blackhole() {
         })
     };
 
-    let dst = run(&a, &b, body(bh & 0x00ff_ffff));
-    assert_eq!(
-        dst_row(&dst, 0),
-        rotated(&b[0], 1),
-        "measured: row 8 rotated once"
-    );
-    assert_eq!(
-        dst_row(&dst, 1),
-        rotated(&b[1], 1),
-        "measured: row 9 rotated once"
-    );
+    for bits in [
+        bh & 0x00ff_ffff,
+        addr_mod_bits(encode::shiftxb(0, 0, 0).unwrap(), 4),
+    ] {
+        let dst = run(&a, &b, body(bits));
+        assert_eq!(
+            dst_row(&dst, 0),
+            rotated(&b[0], 1),
+            "measured: row 8 rotated once"
+        );
+        assert_eq!(
+            dst_row(&dst, 1),
+            rotated(&b[1], 1),
+            "measured: row 9 rotated once"
+        );
+    }
 
     let dst = run(&a, &b, body(wh & 0x00ff_ffff));
     assert_eq!(
@@ -936,7 +994,7 @@ fn ttsim_implements_no_dotpv_shiftxb_or_movdbga2d() {
     })));
 }
 
-/// `ZEROACC` on Blackhole, measured: `AddrMod` at bits 14..15 and `UseDst32b` at
+/// `ZEROACC` on Blackhole, measured: `AddrMod` at bits 14..16 and `UseDst32b` at
 /// bit 18, where LLK's `addr_mode << 14` and `use_32_bit_mode << 18` have them.
 /// The Wormhole diagram draws 15..16 and 21, and puts `Revert` at 18.
 ///
@@ -1015,7 +1073,7 @@ fn zeroacc_addr_mod_and_use_dst32b_on_blackhole() {
 
     // AddrMod, read back through the RWC it advances: a sixteen-row clear of
     // block 1 (32-bit rows 8..16) carrying the modifier, where entry 1 advances
-    // `Dst` by 2 and entry 2 by 3, then a plain one-row clear at the RWC. Not
+    // `Dst` by 2, entry 2 by 3 and entry 4 by 6, then a plain one-row clear at the RWC. Not
     // one-row mode for the first clear: on silicon an odd modifier changes what
     // one-row mode clears (row 52).
     let advanced_by = move |bits: u32| -> Body {
@@ -1025,6 +1083,8 @@ fn zeroacc_addr_mod_and_use_dst32b_on_blackhole() {
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 2));
             p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcAIncr, 0));
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 3));
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC4_SrcAIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, 6));
             let i = encode::zeroacc(1, 0, 0, 1).unwrap();
             p.push(Instruction::new(i.word() | bits, i.def()));
             p.push(encode::zeroacc(0, 0, 0, 0).unwrap());
@@ -1036,6 +1096,13 @@ fn zeroacc_addr_mod_and_use_dst32b_on_blackhole() {
         &dst,
         &[&[2][..], &block_1].concat(),
         "AddrMod measured: entry 1",
+    );
+    let four = addr_mod_bits(encode::zeroacc(0, 0, 0, 0).unwrap(), 4);
+    let dst = run(&a, &b, advanced_by(four));
+    check(
+        &dst,
+        &[&[6][..], &block_1].concat(),
+        "AddrMod measured: entry 4, by the third bit",
     );
     let dst = run(&a, &b, advanced_by(wh & 0x00ff_ffff));
     check(

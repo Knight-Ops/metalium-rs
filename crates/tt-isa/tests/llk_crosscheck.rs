@@ -314,3 +314,23 @@ fn the_datapath_encodings_agree_with_llk() {
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// LLK's Blackhole `addr_mode` is three bits at 14 in every Matrix Unit macro
+/// that has one (`TT_*_VALID`: `is_valid(addr_mode, 3)`), selecting entries 0..7.
+/// Every measured layout draws it so; the gates measured the third bit.
+#[test]
+fn every_measured_addr_mod_is_llks_three_bits_at_14() {
+    use tt_isa::isa::generated::ALL;
+    use tt_isa::isa::Provenance;
+    let measured: Vec<_> = ALL
+        .iter()
+        .filter(|d| matches!(d.provenance(), Provenance::Measured { .. }))
+        .collect();
+    assert_eq!(measured.len(), 13);
+    for d in measured {
+        let f = d
+            .field("AddrMod")
+            .unwrap_or_else(|| panic!("{} has no AddrMod", d.key()));
+        assert_eq!((f.first_bit(), f.width()), (14, 3), "{}", d.key());
+    }
+}

@@ -438,7 +438,7 @@ fn movb2d_move4_rows_is_bit_13_on_blackhole() {
     });
 }
 
-/// `MOVA2D`'s and `MOVB2D`'s `AddrMod` sit at bits 14..15 on Blackhole, one bit
+/// `MOVA2D`'s and `MOVB2D`'s `AddrMod` sit at bits 14..16 on Blackhole, one bit
 /// lower than the Wormhole diagrams draw them -- as `MVMUL`'s do (row 42), and as
 /// LLK's `addr_mode << 14` has them.
 ///
@@ -448,17 +448,7 @@ fn movb2d_move4_rows_is_bit_13_on_blackhole() {
 /// on the same rows.
 #[test]
 fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
-    use tt_isa::backend::ThreadConfigEntry;
-    use tt_isa::cfg::generated::thread;
-    use tt_isa::cfg::ThreadConfigField;
-
-    fn thread_entry(field: ThreadConfigField, value: u16) -> Instruction {
-        ThreadConfigEntry::zeroed(field.addr32())
-            .set(field, value)
-            .unwrap()
-            .encode()
-            .unwrap()
-    }
+    use tt_tests::datapath::{addr_mod_entry, thread_entry};
 
     let a_bh = encode::Mova2D::ZERO.addr_mod(1).encode().unwrap().word();
     let a_wh = encode::wormhole::Mova2D::ZERO
@@ -472,8 +462,12 @@ fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
         .encode()
         .unwrap()
         .word();
-    for (name, bh, wh) in [("MOVA2D", a_bh, a_wh), ("MOVB2D", b_bh, b_wh)] {
+    // Entry 4: the third `AddrMod` bit, which the Wormhole diagram does not have.
+    let a_bh4 = encode::Mova2D::ZERO.addr_mod(4).encode().unwrap().word();
+    let b_bh4 = encode::Movb2D::ZERO.addr_mod(4).encode().unwrap().word();
+    for (name, bh, bh4, wh) in [("MOVA2D", a_bh, a_bh4, a_wh), ("MOVB2D", b_bh, b_bh4, b_wh)] {
         assert_eq!(bh & 0x00ff_ffff, 1 << 14, "{name}: the measured layout");
+        assert_eq!(bh4 & 0x00ff_ffff, 1 << 16, "{name}: the measured third bit");
         assert_eq!(wh & 0x00ff_ffff, 1 << 15, "{name}: the Wormhole diagram");
     }
 
@@ -485,12 +479,12 @@ fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
         let mut program = src_program(unpacker, FP32_CODE, TF32_CODE, true);
         let wait = program.math.pop().unwrap();
         program.math.truncate(1); // keep `state_id`
-        program
-            .math
-            .push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, step));
-        program
-            .math
-            .push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+                                  // Entries 1 and 4 advance `Dst` by `step`; entry 2 by nothing.
+        for (entry, incr) in [(1, step), (2, 0), (4, step)] {
+            program
+                .math
+                .push(thread_entry(addr_mod_entry(entry).dst_incr, incr));
+        }
         let one = match unpacker {
             Unpacker::SrcA => encode::Mova2D::ZERO.move8_rows(1).encode().unwrap(),
             Unpacker::SrcB => encode::Movb2D::ZERO.encode().unwrap(),
@@ -512,19 +506,21 @@ fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
     let zero = vec![0u32; ROW];
 
     // MOVA2D moves eight rows; step 8 puts the second copy at rows 8..16.
-    run(Unpacker::SrcA, 8, a_bh & 0x00ff_ffff, &|dst| {
-        assert_eq!(row(dst, 0), src_row(0), "MOVA2D measured: first copy");
-        assert_eq!(
-            row(dst, 8),
-            src_row(0),
-            "MOVA2D measured: second copy, 8 rows down"
-        );
-        assert_eq!(
-            row(dst, 9),
-            src_row(1),
-            "MOVA2D measured: second copy, 8 rows down"
-        );
-    });
+    for bits in [a_bh, a_bh4] {
+        run(Unpacker::SrcA, 8, bits & 0x00ff_ffff, &|dst| {
+            assert_eq!(row(dst, 0), src_row(0), "MOVA2D measured: first copy");
+            assert_eq!(
+                row(dst, 8),
+                src_row(0),
+                "MOVA2D measured: second copy, 8 rows down"
+            );
+            assert_eq!(
+                row(dst, 9),
+                src_row(1),
+                "MOVA2D measured: second copy, 8 rows down"
+            );
+        });
+    }
     run(Unpacker::SrcA, 8, a_wh & 0x00ff_ffff, &|dst| {
         assert_eq!(
             row(dst, 0),
@@ -535,14 +531,16 @@ fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
     });
 
     // MOVB2D moves one row; step 4 puts the second at row 4.
-    run(Unpacker::SrcB, 4, b_bh & 0x00ff_ffff, &|dst| {
-        assert_eq!(row(dst, 0), src_row(0), "MOVB2D measured: first copy");
-        assert_eq!(
-            row(dst, 4),
-            src_row(0),
-            "MOVB2D measured: second copy, 4 rows down"
-        );
-    });
+    for bits in [b_bh, b_bh4] {
+        run(Unpacker::SrcB, 4, bits & 0x00ff_ffff, &|dst| {
+            assert_eq!(row(dst, 0), src_row(0), "MOVB2D measured: first copy");
+            assert_eq!(
+                row(dst, 4),
+                src_row(0),
+                "MOVB2D measured: second copy, 4 rows down"
+            );
+        });
+    }
     run(Unpacker::SrcB, 4, b_wh & 0x00ff_ffff, &|dst| {
         assert_eq!(
             row(dst, 0),

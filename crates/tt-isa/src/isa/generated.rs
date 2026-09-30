@@ -2096,159 +2096,159 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md",
     );
 
-    /// `MVMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MVMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MVMUL: InstructionDef = InstructionDef::new(
         "MVMUL_BH",
         "MVMUL",
         0x26,
-        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 19, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00373c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00363c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md",
     );
 
-    /// `MOVA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVA2D: InstructionDef = InstructionDef::new(
         "MOVA2D_BH",
         "MOVA2D",
         0x12,
-        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move8Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move8Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00011c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00001c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md",
     );
 
-    /// `MOVB2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md`), and on Blackhole `BroadcastCol0`, `Broadcast1RowTo8`, `Move4Rows`, `AddrMod` sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVB2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md`), and on Blackhole `BroadcastCol0`, `Broadcast1RowTo8`, `Move4Rows`, `AddrMod` sit elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVB2D: InstructionDef = InstructionDef::new(
         "MOVB2D_BH",
         "MOVB2D",
         0x13,
-        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("Broadcast1RowTo8", 12, 1, false, None), Field::new("BroadcastCol0", 11, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("Broadcast1RowTo8", 12, 1, false, None), Field::new("BroadcastCol0", 11, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00010400,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"], dropped: &[] },
+        0x00000400,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md",
     );
 
-    /// `MOVD2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVD2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVD2A: InstructionDef = InstructionDef::new(
         "MOVD2A_BH",
         "MOVD2A",
         0x08,
-        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00011c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00001c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md",
     );
 
-    /// `MOVD2B_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVD2B_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVD2B: InstructionDef = InstructionDef::new(
         "MOVD2B_BH",
         "MOVD2B",
         0x0a,
-        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00011c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00001c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md",
     );
 
-    /// `MOVB2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVB2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVB2A: InstructionDef = InstructionDef::new(
         "MOVB2A_BH",
         "MOVB2A",
         0x0b,
-        &[Field::new("SrcARow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("SrcBRow", 0, 6, false, None)],
+        &[Field::new("SrcARow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("SrcBRow", 0, 6, false, None)],
         &[],
-        0x00811fc0,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00801fc0,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
     );
 
-    /// `ELWADD_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWADD_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static ELWADD: InstructionDef = InstructionDef::new(
         "ELWADD_BH",
         "ELWADD",
         0x28,
-        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00073c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00063c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md",
     );
 
-    /// `ELWSUB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWSUB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static ELWSUB: InstructionDef = InstructionDef::new(
         "ELWSUB_BH",
         "ELWSUB",
         0x30,
-        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00073c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00063c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md",
     );
 
-    /// `ELWMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static ELWMUL: InstructionDef = InstructionDef::new(
         "ELWMUL_BH",
         "ELWMUL",
         0x27,
-        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00273c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00263c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md",
     );
 
-    /// `DOTPV_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `DOTPV_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static DOTPV: InstructionDef = InstructionDef::new(
         "DOTPV_BH",
         "DOTPV",
         0x29,
-        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x003f3c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x003e3c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md",
     );
 
-    /// `MOVDBGA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVDBGA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVDBGA2D: InstructionDef = InstructionDef::new(
         "MOVDBGA2D_BH",
         "MOVDBGA2D",
         0x09,
-        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move8Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Move8Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
-        0x00011c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00001c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md",
     );
 
-    /// `SHIFTXB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `SHIFTXB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static SHIFTXB: InstructionDef = InstructionDef::new(
         "SHIFTXB_BH",
         "SHIFTXB",
         0x18,
-        &[Field::new("AddrMod", 14, 2, false, None), Field::new("ShiftInZero", 10, 1, false, None), Field::new("SrcRow", 0, 6, false, None)],
+        &[Field::new("AddrMod", 14, 3, false, None), Field::new("ShiftInZero", 10, 1, false, None), Field::new("SrcRow", 0, 6, false, None)],
         &[],
-        0x00ff3bc0,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[] },
+        0x00fe3bc0,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md",
     );
 
-    /// `ZEROACC_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md`), and on Blackhole `AddrMod`, `UseDst32b` sit elsewhere. `Revert` is not carried: its bits hold something else on Blackhole and its own position is unknown. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ZEROACC_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md`), and on Blackhole `AddrMod`, `UseDst32b` sit elsewhere. `AddrMod` has a different width on Blackhole. `Revert` is not carried: its bits hold something else on Blackhole and its own position is unknown. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static ZEROACC: InstructionDef = InstructionDef::new(
         "ZEROACC_BH",
         "ZEROACC",
         0x10,
-        &[Field::new("Mode", 19, 2, false, None), Field::new("UseDst32b", 18, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Imm10", 0, 10, false, None)],
+        &[Field::new("Mode", 19, 2, false, None), Field::new("UseDst32b", 18, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("Imm10", 0, 10, false, None)],
         &[],
-        0x00e33c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole", moved: &["AddrMod", "UseDst32b"], dropped: &["Revert"] },
+        0x00e23c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole", moved: &["AddrMod", "UseDst32b"], dropped: &["Revert"], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md",
     );
 
