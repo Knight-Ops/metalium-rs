@@ -5,8 +5,9 @@
 //! Matrix Unit and the ADC/RWC instructions those diagrams are Wormhole's
 //! (`Provenance::WormholeOnly`). Twice now a field has sat one bit lower on
 //! Blackhole and applied the wrong operand silently: `MVMUL`'s `AddrMod`
-//! (divergence row 42, since fixed by measurement), and `MOVB2D`'s `Move4Rows`,
-//! found here -- the whole of what row 38 recorded as ttsim "moving one row". The
+//! (divergence row 42), and `MOVB2D`'s `Move4Rows`, found here -- the whole of
+//! what row 38 recorded as ttsim "moving one row" -- along with `MOVA2D`'s and
+//! `MOVB2D`'s `AddrMod`. All are now measured layouts (`Bits32_BH.lua`). The
 //! LLK macros are a second, independent source that runs on these chips, so every
 //! encoding the datapath emits is checked against one.
 //!
@@ -41,7 +42,41 @@ fn the_datapath_encodings_agree_with_llk() {
                 .word(),
             op(0x12, (5 << 17) | 8),
         ),
+        (
+            "MOVA2D AddrMod",
+            encode::Mova2D::ZERO.addr_mod(1).encode().unwrap().word(),
+            op(0x12, 1 << 14),
+        ),
         // TT_OP_MOVB2D(dest_32b_lo<<23, src<<17, addr_mode<<14, instr_mod<<11, dst)
+        // MOV_1_ROW_D0_BRCST = 1, MOV_8_ROW_BRCST = 2, MOV_4_ROWS = 4
+        (
+            "MOVB2D Move4Rows",
+            encode::Movb2D::ZERO.move4_rows(1).encode().unwrap().word(),
+            op(0x13, 4 << 11),
+        ),
+        (
+            "MOVB2D BroadcastCol0",
+            encode::Movb2D::ZERO
+                .broadcast_col0(1)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x13, 1 << 11),
+        ),
+        (
+            "MOVB2D Broadcast1RowTo8",
+            encode::Movb2D::ZERO
+                .broadcast1_row_to8(1)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x13, 2 << 11),
+        ),
+        (
+            "MOVB2D AddrMod",
+            encode::Movb2D::ZERO.addr_mod(1).encode().unwrap().word(),
+            op(0x13, 1 << 14),
+        ),
         (
             "MOVB2D rows",
             encode::Movb2D::ZERO
@@ -157,20 +192,4 @@ fn the_datapath_encodings_agree_with_llk() {
         .map(|(n, ours, llk)| format!("{n}: ours {ours:#010x}, LLK {llk:#010x}"))
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-/// The two known disagreements, pinned so that fixing either (through
-/// `xtask/src/gen_isa/Bits32_BH.lua`, with a silicon gate, as `MVMUL` was) turns
-/// this test red and moves the case into the one above.
-#[test]
-fn known_wormhole_layouts_llk_contradicts() {
-    // MOVB2D: LLK's MOV_4_ROWS is instr_mod 4 at bit 11, i.e. bit 13. The
-    // Wormhole diagram's Move4Rows is bit 14 -- which on Blackhole is AddrMod bit 0.
-    let ours = encode::Movb2D::ZERO.move4_rows(1).encode().unwrap().word();
-    assert_eq!(ours, op(0x13, 1 << 14));
-    assert_ne!(ours, op(0x13, 4 << 11));
-    // MOVA2D: AddrMod at bit 14 on Blackhole (as MVMUL), 15 in the diagram.
-    let ours = encode::Mova2D::ZERO.addr_mod(1).encode().unwrap().word();
-    assert_eq!(ours, op(0x12, 1 << 15));
-    assert_ne!(ours, op(0x12, 1 << 14));
 }

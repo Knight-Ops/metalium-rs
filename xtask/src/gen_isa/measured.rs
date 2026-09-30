@@ -51,15 +51,45 @@ pub struct Measured {
     pub evidence: &'static [(&'static str, &'static str)],
 }
 
-pub const MEASURED: &[Measured] = &[Measured {
-    key: "MVMUL_BH",
-    supersedes: "MVMUL",
-    moved: &["AddrMod"],
-    evidence: &[(
-        "crates/tt-tests/tests/step9_matmul.rs",
-        "mvmul_addr_mod_sits_one_bit_lower_on_blackhole",
-    )],
-}];
+pub const MEASURED: &[Measured] = &[
+    Measured {
+        key: "MVMUL_BH",
+        supersedes: "MVMUL",
+        moved: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mvmul_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVA2D_BH",
+        supersedes: "MOVA2D",
+        moved: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/probe_src.rs",
+            "mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    // `BroadcastCol0` and `Broadcast1RowTo8` move with `Move4Rows`: the three are
+    // LLK's three-bit `instr_mod` at bit 11. Only `Move4Rows` is measured; the
+    // broadcasts' positions rest on LLK (`MOV_1_ROW_D0_BRCST` = 1,
+    // `MOV_8_ROW_BRCST` = 2) until a gate exercises them.
+    Measured {
+        key: "MOVB2D_BH",
+        supersedes: "MOVB2D",
+        moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/probe_src.rs",
+                "movb2d_move4_rows_is_bit_13_on_blackhole",
+            ),
+            (
+                "crates/tt-tests/tests/probe_src.rs",
+                "mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole",
+            ),
+        ],
+    },
+];
 
 /// Does `file` (relative to the workspace root) define `fn name(`?
 pub fn gate_exists(root: &Path) -> impl Fn(&str, &str) -> bool + '_ {

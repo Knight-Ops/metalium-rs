@@ -474,8 +474,9 @@ mod tests {
     fn the_table_has_the_expected_shape() {
         assert_eq!(
             ALL.len(),
-            149,
-            "instruction encodings: 145 diagrams, of which RMWCIB is four, plus MVMUL_BH"
+            151,
+            "instruction encodings: 145 diagrams, of which RMWCIB is four, plus the \
+             measured MVMUL_BH, MOVA2D_BH and MOVB2D_BH"
         );
         assert_eq!(ALL_LAYOUTS.len(), 19, "Src/Dst/NoC datum layouts");
     }
@@ -497,12 +498,12 @@ mod tests {
         }
         assert_eq!(counts["Blackhole"], 39);
         assert_eq!(counts["SharedWithWormhole"], 24);
-        assert_eq!(counts["SupersededOnBlackhole"], 12);
+        assert_eq!(counts["SupersededOnBlackhole"], 14);
         assert_eq!(
-            counts["WormholeOnly"], 73,
+            counts["WormholeOnly"], 71,
             "half the instruction set is a hypothesis; that is the point of recording it"
         );
-        assert_eq!(counts["Measured"], 1, "MVMUL_BH");
+        assert_eq!(counts["Measured"], 3, "MVMUL_BH, MOVA2D_BH, MOVB2D_BH");
     }
 
     #[test]

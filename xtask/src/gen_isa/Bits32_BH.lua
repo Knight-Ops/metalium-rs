@@ -26,4 +26,26 @@ local diagrams = {
       {24, 8, "0x26"},
     }
   end,
+  MOVA2D_BH = function()
+    return Bits32{
+      {0, 10, "DstRow"},
+      {13, 1, "Move8Rows"},
+      {14, 2, "AddrMod"},
+      {17, 6, "SrcRow"},
+      {23, 1, "UseDst32bLo"},
+      {24, 8, "0x12"},
+    }
+  end,
+  MOVB2D_BH = function()
+    return Bits32{
+      {0, 10, "DstRow"},
+      {11, 1, "BroadcastCol0"},
+      {12, 1, "Broadcast1RowTo8"},
+      {13, 1, "Move4Rows"},
+      {14, 2, "AddrMod"},
+      {17, 6, "SrcRow"},
+      {23, 1, "UseDst32bLo"},
+      {24, 8, "0x13"},
+    }
+  end,
 }

@@ -65,9 +65,12 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       remaining single-thread gates. `probe_src` is converted; `step9_matmul` and the
       eltwise path are next.
 - [x] **Every datapath encoding checked against LLK** (`tt-isa/tests/llk_crosscheck.rs`).
-      Two Wormhole layouts are wrong on Blackhole: `MOVB2D Move4Rows` (the whole of
-      row 38) and `MOVA2D AddrMod` (one bit lower, as `MVMUL`). Neither is on a
-      passing gate's path; both need `Bits32_BH.lua` overrides with a silicon gate.
+      Two Wormhole layouts were wrong on Blackhole: `MOVB2D`'s `instr_mod` (the
+      whole of row 38) and `MOVA2D`/`MOVB2D`'s `AddrMod` (one bit lower, as
+      `MVMUL`). Both are now measured `Bits32_BH.lua` layouts, each licensed by a
+      `probe_src` gate that passes on ttsim and both cards. Still Wormhole-drawn and
+      contradicted by LLK: `MOVD2A`/`MOVD2B`/`MOVB2A`'s `AddrMod` (not on any gate's
+      path yet).
 - [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
       UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
       did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
@@ -85,9 +88,10 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       per-thread reset now starts with `backend::reset_config` (the deliberate
       `STATE_RESET_EN` write), and runs on every tile a gate claims, not just the gate
       tile (row 49).
-- [x] **Silicon regression: 146/148 on both cards.** The two failures are the `MOVB2D`
-      `Move4Rows` twin, blocked on the known Blackhole encoding (row 38); fix through
-      `Bits32_BH.lua` with a gate, as `MVMUL` was.
+- [x] **Silicon regression: 146/148 on both cards**, the two failures being the
+      `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
+      replaced by two gates that run on both targets. Unfiltered run since: 110/110 on
+      each card, `silicon_measure` and `fma_oracle` included.
 - [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
       "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
 
@@ -780,8 +784,8 @@ undocumented.
       block, TF32, all phases, depth 2: done. Shapes, BF16 and depth: open.
 - [ ] **Gate (silicon):** same suite. Expect divergence here more than anywhere
       else — this is where Wormhole-sourced assumptions will be wrong. Silicon twins
-      written for the two ttsim artefacts the gates correct for (the hidden base,
-      `MOVB2D` `Move4Rows`).
+      written for the two ttsim artefacts the gates corrected for (the hidden base,
+      `MOVB2D` `Move4Rows`); both turned out to be our bugs, not ttsim's.
 
 ---
 

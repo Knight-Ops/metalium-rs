@@ -165,15 +165,20 @@ fn stage(format: L1Format, code: u32, datums: &[u32]) -> Vec<u8> {
 /// Matrix Unit, and move `Src` rows 0..8 into `Dst` rows 0..8 -- split the way
 /// LLK splits it (`harness::Roles`): the unpack on thread 0, the move on thread 1.
 fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> SrcProgram {
+    src_program_of(unpacker, in_code, out, flip, N)
+}
+
+/// [`src_program`] unpacking `n` datums rather than [`N`].
+fn src_program_of(unpacker: Unpacker, in_code: u32, out: u32, flip: bool, n: usize) -> SrcProgram {
     let mut unpack = src_thread_config();
     let mut words = ConfigWords::new();
-    let descriptor = flat_descriptor(N as u32).with_in_data_format_raw(in_code);
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(in_code);
     unpack_src_config(&mut words, unpacker, descriptor, STAGE, out);
     words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
     let mut buf = vec![sfpu::nop(); words.program_len()];
     let k = words.program(GPR, &mut buf).unwrap();
     unpack.extend_from_slice(&buf[..k]);
-    unpack.push(set_adc_x(unpacker, 0, N as u32 - 1));
+    unpack.push(set_adc_x(unpacker, 0, n as u32 - 1));
     unpack.push(unpack_src_instruction(unpacker, flip));
     unpack.push(match unpacker {
         Unpacker::SrcA => backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap(),
@@ -214,6 +219,16 @@ struct SrcProgram {
 
 /// Run and return `Dst` rows 0..8, flattened.
 fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &SrcProgram) -> Vec<u32> {
+    run_src_rows(dev, staged, program, 8)
+}
+
+/// [`run_src`], returning `Dst` rows 0..`rows`.
+fn run_src_rows(
+    dev: &mut harness::Dev<'_>,
+    staged: &[u8],
+    program: &SrcProgram,
+    rows: usize,
+) -> Vec<u32> {
     let roles = harness::Roles {
         unpack: &program.unpack,
         math: &program.math,
@@ -221,9 +236,13 @@ fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &SrcProgram) -> V
     };
     let out = harness::run(
         dev,
-        &Run::roles(roles).stage(&[(STAGE, staged)]).dump_rows(8),
+        &Run::roles(roles)
+            .stage(&[(STAGE, staged)])
+            .dump_rows(rows as u32),
     );
-    (0..8 * ROW).map(|f| out.dst_at(f / ROW, f % ROW)).collect()
+    (0..rows * ROW)
+        .map(|f| out.dst_at(f / ROW, f % ROW))
+        .collect()
 }
 
 /// Assert that every staged datum `i` landed at flat `Src` position `i`, as
@@ -361,30 +380,175 @@ fn a_corrupted_datum_moves_exactly_one_src_element() {
     assert_eq!(differ, vec![7]);
 }
 
-/// `MOVB2D.md` says `Move4Rows` moves four rows; ttsim moves one, silently (row
-/// 38). The silicon gate asserts the documented four.
+/// `MOVB2D`'s four-row mode is bit 13 on Blackhole, not the Wormhole diagram's
+/// bit 14 -- which on Blackhole is `AddrMod` bit 0 (row 38, which this refutes).
+/// LLK's `MOV_4_ROWS` is `instr_mod` 4 at bit 11.
+///
+/// Four full `Src` rows are staged, so the measured encoding must move exactly
+/// rows 0..4 -- and leave rows 4..8 of the cleared `Dst` alone -- while the
+/// Wormhole encoding of the same request moves row 0 only.
 #[test]
-#[cfg(feature = "silicon")]
-fn on_silicon_movb2d_move4_rows_moves_four() {
+fn movb2d_move4_rows_is_bit_13_on_blackhole() {
+    let blackhole = encode::Movb2D::ZERO.move4_rows(1).encode().unwrap().word();
+    let wormhole = encode::wormhole::Movb2D::ZERO
+        .move4_rows(1)
+        .encode()
+        .unwrap()
+        .word();
+    assert_eq!(blackhole & 0x00ff_ffff, 1 << 13, "the measured layout");
+    assert_eq!(wormhole & 0x00ff_ffff, 1 << 14, "the Wormhole diagram");
+
+    let n = 4 * ROW;
+    let bits: Vec<u32> = (0..n)
+        .map(|i| (1.0f32 + i as f32).to_bits() | 0x3FFF)
+        .collect();
+    let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
+    // `in_device` forks on the simulator, so `check` runs inside it.
+    let run = |move_bits: u32, check: &dyn Fn(&[u32])| {
+        let mut program = src_program_of(Unpacker::SrcB, FP32_CODE, TF32_CODE, true, n);
+        program.math.retain(|i| i.def().mnemonic() != "MOVB2D");
+        let wait = program.math.pop().unwrap();
+        let i = encode::Movb2D::ZERO.encode().unwrap();
+        program
+            .math
+            .push(Instruction::new(i.word() | move_bits, i.def()));
+        program.math.push(wait);
+        harness::in_device(|dev| check(&run_src(dev, &staged, &program)));
+    };
+    let expect = |rows: usize, what: &str, dst: &[u32]| {
+        assert_eq!(dst.len(), 8 * ROW);
+        for (f, &got) in dst.iter().enumerate() {
+            let want = if f < rows * ROW {
+                fp32_to_tf32(bits[f])
+            } else {
+                0
+            };
+            assert_eq!(got, want, "{what}: Dst row {}, col {}", f / ROW, f % ROW);
+        }
+    };
+
+    run(blackhole & 0x00ff_ffff, &|dst| {
+        expect(4, "measured Move4Rows", dst)
+    });
+
+    // The Wormhole bit is a one-row move with address modifier 1, whose entry
+    // the thread-state reset left zero: row 0 and nothing else.
+    run(wormhole & 0x00ff_ffff, &|dst| {
+        expect(1, "Wormhole bit 14", dst)
+    });
+}
+
+/// `MOVA2D`'s and `MOVB2D`'s `AddrMod` sit at bits 14..15 on Blackhole, one bit
+/// lower than the Wormhole diagrams draw them -- as `MVMUL`'s do (row 42), and as
+/// LLK's `addr_mode << 14` has them.
+///
+/// Entry 1 advances `Dst` by `STEP` rows and entry 2 advances nothing. Two moves
+/// that each carry `addr_mod(1)`: with the measured encoding the second lands
+/// `STEP` rows below the first; with the Wormhole encoding (modifier 2) both land
+/// on the same rows.
+#[test]
+fn mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole() {
+    use tt_isa::backend::ThreadConfigEntry;
+    use tt_isa::cfg::generated::thread;
+    use tt_isa::cfg::ThreadConfigField;
+
+    fn thread_entry(field: ThreadConfigField, value: u16) -> Instruction {
+        ThreadConfigEntry::zeroed(field.addr32())
+            .set(field, value)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    let a_bh = encode::Mova2D::ZERO.addr_mod(1).encode().unwrap().word();
+    let a_wh = encode::wormhole::Mova2D::ZERO
+        .addr_mod(1)
+        .encode()
+        .unwrap()
+        .word();
+    let b_bh = encode::Movb2D::ZERO.addr_mod(1).encode().unwrap().word();
+    let b_wh = encode::wormhole::Movb2D::ZERO
+        .addr_mod(1)
+        .encode()
+        .unwrap()
+        .word();
+    for (name, bh, wh) in [("MOVA2D", a_bh, a_wh), ("MOVB2D", b_bh, b_wh)] {
+        assert_eq!(bh & 0x00ff_ffff, 1 << 14, "{name}: the measured layout");
+        assert_eq!(wh & 0x00ff_ffff, 1 << 15, "{name}: the Wormhole diagram");
+    }
+
     let bits = operand_bits();
     let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
-    let mut program = src_program(Unpacker::SrcB, FP32_CODE, TF32_CODE, true);
-    // Replace the single-row moves with one four-row move of rows 0..4.
-    program.math.retain(|i| i.def().mnemonic() != "MOVB2D");
-    let wait = program.math.pop().unwrap();
-    program.math.push(
-        encode::Movb2D::ZERO
-            .move4_rows(1)
-            .src_row(0)
-            .dst_row(0)
-            .encode()
-            .unwrap(),
-    );
-    program.math.push(wait);
-    harness::in_device(|dev| {
-        let dst = run_src(dev, &staged, &program);
-        // Row 1 is fully written by the unpacker whatever the base turns out to
-        // be, so it tells four rows from one.
-        assert!(dst[ROW..2 * ROW].iter().all(|&v| v != 0));
+    // `unpacker`'s move of `Src` rows 0..rows, twice, each carrying `addr_mod_bits`.
+    // `in_device` forks on the simulator, so `check` runs inside it.
+    let run = |unpacker: Unpacker, step: u16, addr_mod_bits: u32, check: &dyn Fn(&[u32])| {
+        let mut program = src_program(unpacker, FP32_CODE, TF32_CODE, true);
+        let wait = program.math.pop().unwrap();
+        program.math.truncate(1); // keep `state_id`
+        program
+            .math
+            .push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, step));
+        program
+            .math
+            .push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+        let one = match unpacker {
+            Unpacker::SrcA => encode::Mova2D::ZERO.move8_rows(1).encode().unwrap(),
+            Unpacker::SrcB => encode::Movb2D::ZERO.encode().unwrap(),
+        };
+        for _ in 0..2 {
+            program
+                .math
+                .push(Instruction::new(one.word() | addr_mod_bits, one.def()));
+        }
+        program.math.push(wait);
+        harness::in_device(|dev| check(&run_src_rows(dev, &staged, &program, 16)));
+    };
+    let row = |dst: &[u32], r: usize| dst[r * ROW..(r + 1) * ROW].to_vec();
+    let src_row = |r: usize| -> Vec<u32> {
+        (r * ROW..(r + 1) * ROW)
+            .map(|i| fp32_to_tf32(bits[i]))
+            .collect()
+    };
+    let zero = vec![0u32; ROW];
+
+    // MOVA2D moves eight rows; step 8 puts the second copy at rows 8..16.
+    run(Unpacker::SrcA, 8, a_bh & 0x00ff_ffff, &|dst| {
+        assert_eq!(row(dst, 0), src_row(0), "MOVA2D measured: first copy");
+        assert_eq!(
+            row(dst, 8),
+            src_row(0),
+            "MOVA2D measured: second copy, 8 rows down"
+        );
+        assert_eq!(
+            row(dst, 9),
+            src_row(1),
+            "MOVA2D measured: second copy, 8 rows down"
+        );
+    });
+    run(Unpacker::SrcA, 8, a_wh & 0x00ff_ffff, &|dst| {
+        assert_eq!(
+            row(dst, 0),
+            src_row(0),
+            "MOVA2D Wormhole: both copies on row 0"
+        );
+        assert_eq!(row(dst, 8), zero, "MOVA2D Wormhole: nothing 8 rows down");
+    });
+
+    // MOVB2D moves one row; step 4 puts the second at row 4.
+    run(Unpacker::SrcB, 4, b_bh & 0x00ff_ffff, &|dst| {
+        assert_eq!(row(dst, 0), src_row(0), "MOVB2D measured: first copy");
+        assert_eq!(
+            row(dst, 4),
+            src_row(0),
+            "MOVB2D measured: second copy, 4 rows down"
+        );
+    });
+    run(Unpacker::SrcB, 4, b_wh & 0x00ff_ffff, &|dst| {
+        assert_eq!(
+            row(dst, 0),
+            src_row(0),
+            "MOVB2D Wormhole: both copies on row 0"
+        );
+        assert_eq!(row(dst, 4), zero, "MOVB2D Wormhole: nothing 4 rows down");
     });
 }
