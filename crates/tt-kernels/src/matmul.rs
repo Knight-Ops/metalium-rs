@@ -248,6 +248,7 @@ pub fn tile_roles(
     pairs: &[(u64, u64)],
     in_fmt: L1Format,
     out_fmt: u32,
+    fidelity: Fidelity,
     out: u64,
 ) -> [Vec<Instruction>; 3] {
     matmul_roles(
@@ -257,7 +258,40 @@ pub fn tile_roles(
         }],
         in_fmt,
         out_fmt,
+        fidelity,
     )
+}
+
+/// How many of the Matrix Unit's four fidelity phases each `MVMUL` block runs
+/// (`MatrixUnit.md:143-165`; LLK's `MathFidelity`).
+///
+/// Phase `p` multiplies one slice of `SrcA`'s mantissa by one slice of `SrcB`'s,
+/// and the four together are the whole product: [`Fidelity::HiFi4`] is exact
+/// wherever the `Src` values and their FP32 sums are, and [`Fidelity::Lo`] keeps
+/// only the high slices -- exact for operands with at most seven significant bits
+/// in `A` and five in `B`, and otherwise the least precise product on offer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Fidelity {
+    /// Phase 0 only.
+    Lo,
+    /// Phases 0 and 1.
+    HiFi2,
+    /// Phases 0, 1 and 2.
+    HiFi3,
+    /// All four phases.
+    HiFi4,
+}
+
+impl Fidelity {
+    /// The number of phases, 1 to 4.
+    pub const fn phases(self) -> u32 {
+        match self {
+            Fidelity::Lo => 1,
+            Fidelity::HiFi2 => 2,
+            Fidelity::HiFi3 => 3,
+            Fidelity::HiFi4 => 4,
+        }
+    }
 }
 
 /// [`tile_roles`] for several output tiles, one after another through `Dst`.
@@ -266,10 +300,17 @@ pub fn tile_roles(
 /// finished reading the last one ([`DST_FREE`]), and the pack role packs each
 /// only once the math role has finished writing it ([`DST_READY`]). One output
 /// tile is in `Dst` at a time; double-buffering it is Phase 9.
+///
+/// With more than one fidelity phase, each `SrcB` half gets one `MVMUL` per
+/// phase on the same banks, each with address modifier 1, whose only effect is
+/// `FidelityIncr` ([`math_prelude`]; `RWCs.md`, `ApplyAddrMod`), and the
+/// `SETRWC` that selects the next half also puts the phase back to zero -- so
+/// nothing depends on whether the phase counter wraps.
 pub fn matmul_roles(
     outputs: &[OutputTile],
     in_fmt: L1Format,
     out_fmt: u32,
+    fidelity: Fidelity,
 ) -> [Vec<Instruction>; 3] {
     assert!(
         outputs.iter().all(|o| !o.pairs.is_empty()),
@@ -312,13 +353,30 @@ pub fn matmul_roles(
                         unpack.push(i);
 
                         let dst = 16 * (2 * fi + fj);
-                        math.push(set_src_b_row(0));
-                        let (i, loaded) = loaded.mvmul(encode::Mvmul::ZERO.dst_row(dst)).unwrap();
-                        math.push(i);
-                        math.push(set_src_b_row(8));
-                        let (i, empty) = loaded
-                            .mvmul_release_both(encode::Mvmul::ZERO.dst_row(dst + 8))
-                            .unwrap();
+                        let phases = fidelity.phases();
+                        // Lo keeps the encoding the gates established; with more
+                        // phases, each MVMUL steps the phase (addr_mod 1).
+                        let step = |row: u32| {
+                            let m = encode::Mvmul::ZERO.dst_row(row);
+                            if phases > 1 {
+                                m.addr_mod(1)
+                            } else {
+                                m
+                            }
+                        };
+                        let mut loaded = loaded;
+                        for half in 0..2u32 {
+                            math.push(set_src_b_row(8 * half, phases > 1));
+                            for phase in 0..phases {
+                                if half == 1 && phase + 1 == phases {
+                                    break;
+                                }
+                                let (i, next) = loaded.mvmul(step(dst + 8 * half)).unwrap();
+                                math.push(i);
+                                loaded = next;
+                            }
+                        }
+                        let (i, empty) = loaded.mvmul_release_both(step(dst + 8)).unwrap();
                         math.push(i);
                         banks = empty;
                     }
@@ -340,12 +398,14 @@ pub fn matmul_roles(
     [unpack, math, pack]
 }
 
-/// `SETRWC` of the `SrcB` counter alone: which eight-row half of `SrcB` the
-/// next `MVMUL` reads (`SETRWC.md`; `MVMUL.md` takes `RWCs.SrcB & 0x38`).
-fn set_src_b_row(row: u32) -> Instruction {
+/// `SETRWC` of the `SrcB` counter: which eight-row half of `SrcB` the next
+/// `MVMUL` reads (`SETRWC.md`; `MVMUL.md` takes `RWCs.SrcB & 0x38`), and, with
+/// `reset_phase`, the fidelity phase back to zero.
+fn set_src_b_row(row: u32, reset_phase: bool) -> Instruction {
     encode::Setrwc::ZERO
         .src_b(1)
         .src_b_val(row)
+        .fidelity(u32::from(reset_phase))
         .encode()
         .unwrap()
 }
@@ -418,39 +478,51 @@ impl StagedMatmul {
     }
 }
 
-/// Tile `a` and `b` (row-major) in `in_fmt` and plan one [`OutputTile`] per
-/// output tile, row-major, each accumulating its `k / 32` tile pairs in order.
+/// Bytes of one `tt_metal_32x32` tile image in `format`, header included.
+pub fn tile_image_bytes(format: L1Format) -> u64 {
+    tt_layout::Layout::tt_metal_32x32(format, tt_layout::HostDtype::F32, [1, 32, 32])
+        .expect("one 32x32 tile is a valid layout")
+        .image()
+        .total_bytes() as u64
+}
+
+/// Where a `[mt, kt] @ [kt, nt]`-tile matmul's operands and outputs go in L1,
+/// without the data: `B`'s first byte, and one [`OutputTile`] per output tile.
 ///
-/// Padding is `tt_layout`'s zero, which is the identity for the accumulation.
-pub fn stage_matmul(
-    a: &[f32],
-    b: &[f32],
-    m: usize,
-    k: usize,
-    n: usize,
+/// Refuses a shape whose operands would overrun [`MATMUL_OUT`] or whose output
+/// would overrun the mailbox, as [`RunError::DoesNotFit`](crate::runtime::RunError).
+pub fn plan_layout(
+    [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
-) -> StagedMatmul {
-    let (ta, la) = tilize_f32(a, m, k, in_fmt);
-    let (tb, lb) = tilize_f32(b, k, n, in_fmt);
-    let (mt, kt) = (m.div_ceil(32), k.div_ceil(32));
-    let nt = n.div_ceil(32);
-    assert_eq!(la.tiles_per_matrix(), mt * kt);
-    assert_eq!(lb.tiles_per_matrix(), kt * nt);
-    let a_img = la.image().total_bytes() as u64;
-    let b_img = lb.image().total_bytes() as u64;
-    let b_at = (MATMUL_STAGE + ta.len() as u64).next_multiple_of(16);
-    assert!(
-        b_at + tb.len() as u64 <= MATMUL_OUT,
-        "operands overrun the output region"
-    );
-    let mut outputs = Vec::new();
+) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
+    use crate::runtime::RunError;
+    let img = tile_image_bytes(in_fmt);
+    let a_bytes = (mt * kt) as u64 * img;
+    let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(16);
+    let b_end = b_at + (kt * nt) as u64 * img;
+    if b_end > MATMUL_OUT {
+        return Err(RunError::DoesNotFit {
+            what: "the operand tiles",
+            bytes: b_end - MATMUL_STAGE,
+            limit: MATMUL_OUT - MATMUL_STAGE,
+        });
+    }
+    let out_bytes = (mt * nt) as u64 * 1024 * 4;
+    if MATMUL_OUT + out_bytes > tt_isa::mailbox::MAILBOX_BASE {
+        return Err(RunError::DoesNotFit {
+            what: "the output tiles",
+            bytes: out_bytes,
+            limit: tt_isa::mailbox::MAILBOX_BASE - MATMUL_OUT,
+        });
+    }
+    let mut outputs = Vec::with_capacity(mt * nt);
     for i in 0..mt {
         for j in 0..nt {
             let pairs = (0..kt)
                 .map(|kk| {
                     (
-                        MATMUL_STAGE + (i * kt + kk) as u64 * a_img,
-                        b_at + (kk * nt + j) as u64 * b_img,
+                        MATMUL_STAGE + (i * kt + kk) as u64 * img,
+                        b_at + (kk * nt + j) as u64 * img,
                     )
                 })
                 .collect();
@@ -460,18 +532,38 @@ pub fn stage_matmul(
             });
         }
     }
-    assert!(
-        MATMUL_OUT + (outputs.len() * 1024 * 4) as u64 <= tt_isa::mailbox::MAILBOX_BASE,
-        "the output tiles overrun the mailbox"
-    );
-    StagedMatmul {
+    Ok((b_at, outputs))
+}
+
+/// Tile `a` and `b` (row-major) in `in_fmt` and plan one [`OutputTile`] per
+/// output tile, row-major, each accumulating its `k / 32` tile pairs in order
+/// ([`plan_layout`]).
+///
+/// Padding is `tt_layout`'s zero, which is the identity for the accumulation.
+pub fn stage_matmul(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    in_fmt: L1Format,
+) -> Result<StagedMatmul, crate::runtime::RunError> {
+    let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    let (b_at, outputs) = plan_layout(tiles, in_fmt)?;
+    let (ta, la) = tilize_f32(a, m, k, in_fmt);
+    let (tb, lb) = tilize_f32(b, k, n, in_fmt);
+    assert_eq!(la.tiles_per_matrix(), tiles[0] * tiles[1]);
+    assert_eq!(lb.tiles_per_matrix(), tiles[1] * tiles[2]);
+    assert_eq!(la.image().total_bytes() as u64, tile_image_bytes(in_fmt));
+    debug_assert_eq!(b_at, (MATMUL_STAGE + ta.len() as u64).next_multiple_of(16));
+    Ok(StagedMatmul {
         m,
         n,
         a: ta,
         b: tb,
         b_at,
         outputs,
-    }
+    })
 }
 
 /// How operands reach `Src`, and so the precision the Matrix Unit multiplies
@@ -498,14 +590,15 @@ impl SrcRoute {
 }
 
 /// `C[m, n] = A[m, k] @ B[k, n]` for row-major `f32` operands, on the Tensix
-/// tile at `tile`: tiled and zero-padded by `tt_layout`, multiplied with
-/// fidelity phase 0 through `route`, accumulated in FP32 `Dst`, packed as FP32
-/// and de-tiled.
+/// tile at `tile`, in one run: tiled and zero-padded by `tt_layout`, multiplied
+/// through `route` at `fidelity`, accumulated in FP32 `Dst`, packed as FP32 and
+/// de-tiled.
 ///
-/// Phase 0 is exact for operands whose `Src` values carry at most five
-/// significant bits in `B` and seven in `A` (`MatrixUnit.md:143-165`); beyond
-/// that it is the fastest and least precise of the four phases, which is what a
-/// first training backend runs and what Phase 9 revisits.
+/// A shape too large for one run is refused ([`RunError::DoesNotFit`],
+/// [`RunError::ProgramTooLong`]); [`plan`] and [`matmul_chunked`] split one.
+///
+/// [`RunError::DoesNotFit`]: crate::runtime::RunError::DoesNotFit
+/// [`RunError::ProgramTooLong`]: crate::runtime::RunError::ProgramTooLong
 #[allow(clippy::too_many_arguments)]
 pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
     dev: &mut tt_device::Device<T>,
@@ -515,12 +608,13 @@ pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
     b: &[f32],
     [m, k, n]: [usize; 3],
     route: SrcRoute,
+    fidelity: Fidelity,
     budget: u64,
 ) -> Result<Vec<f32>, crate::runtime::RunError> {
     use crate::runtime::{self, Kernel, Schedule};
     let (in_fmt, out_fmt) = route.formats();
-    let staged = stage_matmul(a, b, m, k, n, in_fmt);
-    let [unpack, math, pack] = matmul_roles(&staged.outputs, in_fmt, out_fmt);
+    let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
+    let [unpack, math, pack] = matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity);
     let stage = [
         (MATMUL_STAGE, staged.a.as_slice()),
         (staged.b_at, staged.b.as_slice()),
@@ -536,4 +630,245 @@ pub fn matmul<T: tt_device::Transport, N: tt_isa::noc::NocId>(
     };
     let out = runtime::run(dev, tile, images, &kernel, budget)?;
     Ok(detilize_packed(&out.l1[0], m, n))
+}
+
+// --- Chunking -----------------------------------------------------------------
+
+/// The shape of every run a large matmul is split into, in 32x32 tiles:
+/// `[mc, kc, nc]`. The last chunk along each axis may be smaller.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ChunkShape {
+    pub tiles: [usize; 3],
+}
+
+/// Whether a `[mc, kc, nc]`-tile run fits: its L1 layout ([`plan_layout`]) and
+/// every role program in its slot, measured by building the programs rather than
+/// by a formula that could drift from them.
+pub fn chunk_fits(tiles: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> bool {
+    let (in_fmt, out_fmt) = route.formats();
+    let Ok((_, outputs)) = plan_layout(tiles, in_fmt) else {
+        return false;
+    };
+    let roles = matmul_roles(&outputs, in_fmt, out_fmt, fidelity);
+    roles
+        .iter()
+        .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
+}
+
+/// The chunk shape for `A[m, k] @ B[k, n]`: `K` whole if at all possible,
+/// because splitting it moves part of the accumulation to the host; then the
+/// largest `mc * nc` that fits.
+///
+/// `None` only if not even a single `[1, 1, 1]`-tile run fits, which would be a
+/// bug in this crate.
+pub fn plan([m, k, n]: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> Option<ChunkShape> {
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)].map(|t| t.max(1));
+    let mut kc = kt;
+    loop {
+        // For each nc, the largest mc that fits, by bisection: fitting is
+        // monotone in each axis.
+        let mut best: Option<[usize; 3]> = None;
+        for nc in (1..=nt).rev() {
+            if let Some(b) = best {
+                if nc * mt <= b[0] * b[2] {
+                    break;
+                }
+            }
+            let fits = |mc: usize| chunk_fits([mc, kc, nc], route, fidelity);
+            if !fits(1) {
+                continue;
+            }
+            let (mut lo, mut hi) = (1, mt);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if fits(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if best.is_none_or(|b| lo * nc > b[0] * b[2]) {
+                best = Some([lo, kc, nc]);
+            }
+        }
+        if let Some(tiles) = best {
+            return Some(ChunkShape { tiles });
+        }
+        if kc == 1 {
+            return None;
+        }
+        kc = kc.div_ceil(2);
+    }
+}
+
+/// `A[m, k] @ B[k, n]`, row-major, in as many runs of `run` as [`plan`] says,
+/// each on a row-major block `A[mi, ki] @ B[ki, nj]` given as `(a, b, [rows,
+/// inner, cols])`.
+///
+/// When `K` is split, the partial products are summed on the host in FP32, in
+/// `K` order, **which is not the accumulation order of one run** -- the device
+/// sums the whole of `K` in `Dst` -- so a split matmul is not bit-identical to an
+/// unsplit one unless every partial sum is exact. [`plan`] keeps `K` whole
+/// whenever it can.
+pub fn matmul_chunked<E>(
+    a: &[f32],
+    b: &[f32],
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    mut run: impl FnMut(&[f32], &[f32], [usize; 3]) -> Result<Vec<f32>, E>,
+) -> Result<Vec<f32>, E>
+where
+    E: From<crate::runtime::RunError>,
+{
+    assert_eq!(a.len(), m * k, "A is not [m, k]");
+    assert_eq!(b.len(), k * n, "B is not [k, n]");
+    let mut c = vec![0f32; m * n];
+    if m == 0 || n == 0 {
+        return Ok(c);
+    }
+    if k == 0 {
+        return Ok(c);
+    }
+    let ChunkShape {
+        tiles: [mc, kc, nc],
+    } = plan([m, k, n], route, fidelity).ok_or(crate::runtime::RunError::DoesNotFit {
+        what: "a single-tile matmul",
+        bytes: 0,
+        limit: 0,
+    })?;
+    let [mr, kr, nr] = [mc * 32, kc * 32, nc * 32];
+    for i0 in (0..m).step_by(mr) {
+        let rows = mr.min(m - i0);
+        for j0 in (0..n).step_by(nr) {
+            let cols = nr.min(n - j0);
+            for (step, k0) in (0..k).step_by(kr).enumerate() {
+                let inner = kr.min(k - k0);
+                let sub_a: Vec<f32> = (i0..i0 + rows)
+                    .flat_map(|r| a[r * k + k0..r * k + k0 + inner].iter().copied())
+                    .collect();
+                let sub_b: Vec<f32> = (k0..k0 + inner)
+                    .flat_map(|r| b[r * n + j0..r * n + j0 + cols].iter().copied())
+                    .collect();
+                let part = run(&sub_a, &sub_b, [rows, inner, cols])?;
+                for r in 0..rows {
+                    for q in 0..cols {
+                        let dst = &mut c[(i0 + r) * n + j0 + q];
+                        let v = part[r * cols + q];
+                        *dst = if step == 0 { v } else { *dst + v };
+                    }
+                }
+            }
+        }
+    }
+    Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lo_fidelity_is_the_established_encoding() {
+        // Two MVMULs per face pair, neither with an address modifier, and a
+        // SETRWC without a fidelity reset before each: what every gate before
+        // fidelity was a parameter ran.
+        let (b_at, outputs) = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
+        let _ = b_at;
+        let [_, math, _] = matmul_roles(&outputs, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+        let mvmuls = math
+            .iter()
+            .filter(|i| i.word() >> 24 == encode::Mvmul::ZERO.encode().unwrap().word() >> 24)
+            .count();
+        assert_eq!(mvmuls, 16);
+    }
+
+    #[test]
+    fn each_phase_is_one_more_mvmul_per_half() {
+        let (_, outputs) = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
+        let opcode = encode::Mvmul::ZERO.encode().unwrap().word() >> 24;
+        for f in [
+            Fidelity::Lo,
+            Fidelity::HiFi2,
+            Fidelity::HiFi3,
+            Fidelity::HiFi4,
+        ] {
+            let [_, math, _] = matmul_roles(&outputs, L1Format::Fp32, TF32_CODE, f);
+            let n = math.iter().filter(|i| i.word() >> 24 == opcode).count();
+            assert_eq!(n as u32, 16 * f.phases(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn layout_refuses_rather_than_overrunning() {
+        use crate::runtime::RunError;
+        // 64 FP32 A tiles alone are 263 KiB; with 64 B tiles they overrun.
+        assert!(matches!(
+            plan_layout([8, 8, 8], L1Format::Fp32),
+            Err(RunError::DoesNotFit {
+                what: "the operand tiles",
+                ..
+            })
+        ));
+        // 129 output tiles overrun the mailbox.
+        assert!(matches!(
+            plan_layout([129, 1, 1], L1Format::Fp32),
+            Err(RunError::DoesNotFit { .. })
+        ));
+        assert!(plan_layout([2, 2, 2], L1Format::Fp32).is_ok());
+    }
+
+    #[test]
+    fn the_plan_fits_and_is_maximal_along_n() {
+        for (shape, fid) in [
+            ([64, 784, 128], Fidelity::HiFi4),
+            ([64, 784, 128], Fidelity::Lo),
+            ([64, 128, 10], Fidelity::HiFi4),
+            ([1, 1, 1], Fidelity::HiFi4),
+            ([2048, 32, 2048], Fidelity::Lo),
+        ] {
+            let ChunkShape { tiles } = plan(shape, SrcRoute::Tf32FromFp32, fid).unwrap();
+            assert!(
+                chunk_fits(tiles, SrcRoute::Tf32FromFp32, fid),
+                "{shape:?} {tiles:?}"
+            );
+            let nt = shape[2].div_ceil(32);
+            if tiles[2] < nt {
+                let wider = [tiles[0], tiles[1], tiles[2] + 1];
+                assert!(
+                    !chunk_fits(wider, SrcRoute::Tf32FromFp32, fid),
+                    "{shape:?} {tiles:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunking_reassembles_the_whole_product() {
+        // Small-integer operands, so every order of summation is exact and the
+        // host reference is the answer. The "device" here is the host.
+        let [m, k, n] = [70, 900, 150];
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7) % 5) as f32 - 2.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i * 3) % 7) as f32 - 3.0).collect();
+        let host = |a: &[f32], b: &[f32], [m, k, n]: [usize; 3]| -> Vec<f32> {
+            (0..m * n)
+                .map(|x| (0..k).map(|q| a[x / n * k + q] * b[q * n + x % n]).sum())
+                .collect()
+        };
+        let mut runs = 0;
+        let c = matmul_chunked::<crate::runtime::RunError>(
+            &a,
+            &b,
+            [m, k, n],
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            |a, b, mkn| {
+                runs += 1;
+                Ok(host(a, b, mkn))
+            },
+        )
+        .unwrap();
+        assert!(runs > 1, "the shape must need more than one run");
+        assert_eq!(c, host(&a, &b, [m, k, n]));
+    }
 }

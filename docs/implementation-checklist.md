@@ -34,8 +34,8 @@ gate you have not seen reject something is not yet evidence.
 | 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
-| 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores. Multi-phase fidelity at tile level not yet exercised |
-| 7 — Burn backend, training | `[ ]` | The milestone. Surface verified against 0.21; `tt-kernels` ships the matmul it will call; fusion is open to a hand-written backend |
+| 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
+| 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
 
@@ -845,39 +845,123 @@ undocumented.
 **This is the milestone.** Everything before it is infrastructure; everything after
 is reach or speed.
 
+**Closed on ttsim and both cards** (2026-09-30): a `784-128-10` MLP built from
+Burn's own `nn::Linear`, `CrossEntropyLoss` and `Sgd` trains on MNIST through
+`burn-autodiff` with every forward and backward matmul on a Tensix tile, and the
+reduced run's loss curve is the same 32 `f32`s on ttsim and on silicon.
+
 - [x] **Verify the `Backend` supertrait list against the pinned Burn version**
       (0.21.0, from source): see `RUST_IMPL_PLAN.md`, "The Burn surface, as
       pinned". Associated types live on `BackendTypes`; `Backend` requires only
       `name`, `seed`, `dtype_usage`, `device_count`.
-- [ ] ~~Implement a narrow core and let Burn's defaults compose the rest.~~ **Not
-      possible in 0.21:** about two hundred op methods have no default. Instead,
-      `burn-tt` v0 delegates every op to `burn-flex` on the host and routes matmul
-      to `tt_kernels::matmul::matmul`; ops move to the device one at a time, each
-      gated against the delegate it replaces.
-- [ ] **Four-phase (HiFi) matmul at tile level** before training on real data:
-      `tt_kernels::matmul` runs phase 0 only.
-- [x] **`tt-kernels`, the shippable half of the test harness.** `datapath` and
-      `matmul` moved out of `tt-tests` (re-exported there, so the gates read the
-      same); `runtime::run` is the role runner -- stage, program slots, in-order
-      or concurrent schedule, trace, read back -- returning `RunError` rather than
-      panicking, and holding the role cores in reset again on every path.
-      `harness::run_roles` is now a thin wrapper that panics on error.
-      `matmul::matmul(dev, tile, images, a, b, [m, k, n], route, budget)` is the
-      entry point a backend calls; `step10_matmul_tile`'s sweep goes through it.
-      `tt-kernels` is `SHIPPABLE` in `xtask/src/ship.rs` and passes
-      `check-no-sim-in-ship`. **Open:** the role firmware images are still built by
-      `tt-tests/build.rs` and passed in; a shipped runtime needs them from
-      somewhere it owns. A tiled eltwise kernel is not written yet.
-- [ ] `QTensorOps` may start unsupported if quantization is out of scope.
+- [x] **`burn-tt` delegates to `burn-flex`, generated rather than written.**
+      `cargo xtask gen-burn-delegate` reads the pinned `burn-backend`'s seven op
+      traits (418 methods, 206 without a default) and `burn-flex`'s own `impl ... for
+      Flex` blocks, and emits `crates/burn-tt/src/generated/delegate.rs`: every
+      method Flex implements forwards to Flex; every default Flex does *not*
+      override is left to its default, which then composes `burn-tt`'s own ops;
+      the ones in `OVERRIDDEN` (device ops, device tags, futures) call
+      `burn-tt/src/ops.rs`. The generator is syntactic; what each type converts
+      to is three traits in `convert.rs` (`IntoFlex`, `FromFlex`, `HasDevice`),
+      which rustc checks. It refuses an unparsable signature, generics, a `where`
+      clause, an unknown identifier, an unforwarded future, a result with no
+      device to tag, an `OVERRIDDEN` entry that is not a method, and a required
+      method it cannot find in Flex; each refusal has a unit test. `--check` is in
+      CI and `prek.toml`. Burn pinned exactly (`=0.21.0`, `PINS.toml`).
+  - [x] **The default rule was found the hard way.** The first generator
+        forwarded defaults too, and `ModuleOps::linear` -- a default over
+        `float_matmul` that Flex does not override, and what `nn::Linear` calls --
+        ran on Flex's matmul, so no `Linear` layer ever reached the device. Caught
+        by `step12_mnist::the_first_forward_pass_is_within_the_derived_bound`,
+        which asserts the device ran, and pinned by
+        `burn-tt/tests/server.rs::a_linear_layer_reaches_the_engine`.
+- [x] **Gate (host): the delegation is inert.** `burn-tt/tests/delegation.rs`: an op
+      battery (elementwise, scalar, reductions, shape ops, activations, int and
+      bool ops, seeded random) gives Flex's bytes exactly, and an F32 matmul on an
+      unattached device panics rather than quietly running on the host. Watched
+      failing with `float_add` forwarded to `float_sub`: exactly the elementwise
+      battery fails.
+- [x] **Devices and the server thread.** `TtDevice { chip }`; its hardware lives
+      on a thread started by `burn_tt::attach(device, factory)`, which runs the
+      factory *on* that thread, so the `!Send` simulator serves a `Send + Sync`
+      backend. Dropping the `AttachGuard` drops the hardware (chip back to idle).
+      A device attached twice is refused; a factory error is `attach`'s error and
+      leaves the device free; an engine error panics with its message
+      (`burn-tt/tests/server.rs`, eight tests, with a host engine). `kmd_engine`
+      is the silicon engine; the ttsim one is `tt_tests::burn_device`, so
+      `burn-tt` never depends on the simulator (`SHIPPABLE`, checked).
+- [x] **Four-phase (HiFi) matmul at tile level.** `matmul::Fidelity { Lo, HiFi2,
+      HiFi3, HiFi4 }`: one `MVMUL` per phase per `SrcB` half, `addr_mod(1)`
+      stepping `FidelityIncr`, the half's `SETRWC` putting the phase back so
+      nothing depends on the counter wrapping; `Lo` keeps the established
+      encoding (unit-tested). `step10_matmul_tile::a_32x32_tile_at_hifi4_recovers_the_exact_product`
+      (HiFi4 = the exact product, HiFi2 = phases 0 and 1, Lo = phase 0) and
+      `hifi4_is_exact_across_k_where_lo_is_not`, on ttsim and both cards; the
+      sweep runs HiFi4 too. Watched failing with the `addr_mod` removed.
+- [x] **Large matmuls are planned, not refused.** The L1 staging `assert!`s are
+      `RunError::DoesNotFit`; `matmul::plan` picks the largest `[mc, kc, nc]`
+      chunk that fits the staging and output regions *and* every program slot --
+      measured by building the programs, not by a formula -- keeping `K` whole
+      whenever it can; `matmul_chunked` runs and reassembles them.
+      `a_matmul_larger_than_one_run_is_chunked` (`[64, 784] @ [784, 128]`,
+      HiFi4), ttsim and both cards. It found divergence row 55: ttsim kills the
+      process on a full instruction FIFO where silicon stalls, now handled by
+      `mailbox::PUSH_WINDOW` on the simulator only.
+- [x] **The device path is shippable.** `tt-firmware-images` builds and checks
+      the firmware (moved out of `tt-tests/build.rs`) and exposes `ROLES`, with
+      each image's ELF entry checked against its core's reset PC (watched
+      failing). `tt_kernels::session` holds the silicon bring-up order -- ARC
+      grid, tile check, cleanup write, backend pulse, per-thread reset -- which
+      the harness now calls instead of owning. Full silicon regression after the
+      move: **132/132 on each card**.
+- [x] **Gate (sim + silicon): matmul against Flex.** `step11_burn`: small-integer
+      matmuls (plain, padded, batched, broadcast, transposed view) bit-exact;
+      random floats within a bound **derived from the formats** -- TF32 operand
+      truncation, `4k + k` truncating `Dst`/host additions, Flex's `k`
+      round-to-nearest ones, documented in the file -- at worst 0.08-0.36 of it;
+      the control, `Fidelity::Lo`, breaks it on 897 of 1320 elements. An
+      `Autodiff<TtBackend>` linear layer's `dL/dx` and `dL/dw` within their own
+      products' bounds. Identical ratios on ttsim and both cards.
+  - [x] **A generator confined to `[-1, 0)`** made the first version of these
+        gates weaker than they read (no sign cancellation) and killed every ReLU
+        in step 12 (all-negative weights: no gradient, no training, and a host
+        run that looked like a Burn bug until bisected). Both generators now
+        assert they cover `[-1, 1)`.
+- [x] **Gate (sim): MNIST trains, reduced.** `step12_mnist::the_mlp_trains_on_a_reduced_dataset`:
+      512 images, batch 64, 4 epochs, SGD at 0.5. The loss falls from 2.321 to
+      0.540 (host: 0.538), past the stated factor of 0.5, which the host run of
+      the same setup is held to as well. The first forward pass is within a bound
+      carried through the network from step 11's (worst 0.027 of it). Data is
+      `cargo xtask fetch-mnist`, pinned by both `.gz` and IDX digests.
+  - [-] **Final weights within a bound of the host's: not claimed.** Two runs whose
+        first steps differ by rounding follow different trajectories; a bound that
+        honestly covered that would say nothing. The first step is bounded, the
+        curves are printed side by side, and the next item is the stronger claim.
+- [x] **Determinism, and ttsim = silicon.** The reduced run's 32 losses are pinned
+      as `f32` bits in `crates/tt-tests/tests/golden/mnist_reduced.txt` (written
+      by the ttsim run with `TT_BLESS=1`); ttsim reproduces it run after run, and
+      **both p150a cards reproduce it exactly** (divergence row I).
+- [x] **Gate (silicon): full MNIST.** `the_mlp_trains_on_full_mnist`, one epoch of
+      all 60 000 images, then the 10 000 test images, on both cards: loss 2.321 ->
+      0.373 by step 900 (host 0.372), **test accuracy 91.96% on the device against
+      91.97% on the host**, identical on the two cards. ~435 ms/step on the device
+      against ~49 ms/step for Flex on the host: every chunk re-stages its operands
+      and re-runs the tile reset, and the data crosses PCIe for every matmul.
+      That is the Phase 9 baseline, not a gate.
+- [ ] `QTensorOps` stays Flex's, on the host. Quantization is out of scope for the
+      milestone.
 - [x] **Open question 3: `burn-fusion` does compose with a hand-written
       backend.** `Fusion<B: FusionBackend>`, where `FusionBackend` is `BackendIr` +
       a `FusionRuntime` supplying `OperationFuser`s over `OperationIr`. Fused
       unpack -> math -> pack chains are a `burn-tt` fuser (Phase 9), not a CubeCL
       question.
-- [ ] **Gate (sim):** MNIST MLP trains through `burn-autodiff` on a reduced
-      dataset — loss descends, final weights match ndarray within tolerance,
-      optimizer step correct. Determinism makes this a regression test too.
-- [ ] **Gate (silicon):** full MNIST run matching the simulator's loss curve.
+- [ ] **Next ops for the device**, each gated against the delegate it replaces:
+      elementwise add/mul (Phase 5's kernel, tiled), then the ReLU and the
+      softmax reductions. Today everything but matmul is on the host, and the
+      data lives there between ops.
+- [ ] **Per-run cost.** Every chunk re-stages both operands and re-runs the tile
+      reset; device-resident tensors and one reset per session are Phase 9, and
+      the first silicon numbers are in the full-run item above.
 
 ---
 

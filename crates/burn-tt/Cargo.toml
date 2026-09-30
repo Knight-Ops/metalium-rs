@@ -1,0 +1,21 @@
+[package]
+name = "burn-tt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A Burn backend for Tenstorrent Blackhole. Every op delegates to burn-flex on
+# the host except the ones routed to a Tensix tile (matmul first). Shippable --
+# no simulator dependency (`cargo xtask check-no-sim-in-ship`); the simulator
+# engine the gates use lives in tt-tests.
+[dependencies]
+burn-backend.workspace = true
+burn-flex.workspace = true
+tt-device.workspace = true
+tt-kernels.workspace = true
+tt-kmd.workspace = true
+tt-firmware-images.workspace = true
+
+[dev-dependencies]
+burn-tensor.workspace = true

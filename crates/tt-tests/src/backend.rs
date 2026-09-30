@@ -117,7 +117,7 @@ mod silicon {
     use super::*;
     use tt_isa::noc::grid::Tensix;
     use tt_isa::noc::{Noc0, NocCoord};
-    use tt_isa::tensix::{self, Core};
+    use tt_isa::tensix;
     use tt_kmd::Kmd;
     use tt_ttsim::fork_scope;
 
@@ -128,12 +128,8 @@ mod silicon {
     /// is a chip reset that drops the PCIe link. On a card passed through to a VM
     /// that takes the host down with it.
     pub fn tensix_grid(dev: &mut Dev<'_>) -> Tensix {
-        let w = dev
-            .alloc_window(tt_device::tlb::WindowKind::TwoMib)
-            .unwrap_or_else(|e| panic!("could not get a window to read telemetry: {e}"));
-        let grid = dev.tensix_grid(&w);
-        dev.free_window(w);
-        grid.unwrap_or_else(|e| panic!("could not read this chip's Tensix grid: {e}"))
+        tt_kernels::session::tensix_grid(dev)
+            .unwrap_or_else(|e| panic!("could not read this chip's Tensix grid: {e}"))
     }
 
     /// Is this build's [`Dev`] a real card?
@@ -196,11 +192,7 @@ mod silicon {
             // Start from the state the simulator starts from: every core held.
             // Whatever the last process left running on this tile is stopped
             // before the gate looks at it.
-            let w = dev
-                .alloc_window(tt_device::tlb::WindowKind::TwoMib)
-                .unwrap_or_else(|e| panic!("no TLB window left to claim ({x},{y}): {e}"));
-            reset_tile(dev, &w, coord);
-            dev.free_window(w);
+            reset_tile(dev, coord);
             // And the configuration and per-thread state, as the gate tile gets
             // in `in_device`: tt-metal, or an earlier gate, may have left any of
             // it set on this tile.
@@ -307,15 +299,8 @@ mod silicon {
         }
     }
 
-    /// Every baby RISC-V held in reset.
-    ///
-    /// Assembled from `Core`'s own bits rather than written as a literal, so it
-    /// cannot drift from the masks `set_core_reset` uses.
-    const ALL_BABIES_HELD: u32 = Core::B.soft_reset_mask()
-        | Core::T0.soft_reset_mask()
-        | Core::T1.soft_reset_mask()
-        | Core::T2.soft_reset_mask()
-        | Core::NC.soft_reset_mask();
+    /// Every baby RISC-V held in reset (`tt_kernels::session`).
+    use tt_kernels::session::ALL_BABIES_HELD;
 
     /// Hold every core on `tile`, and put its Tensix backend through a reset
     /// pulse, leaving the backend released and the cores held.
@@ -332,16 +317,11 @@ mod silicon {
     ///
     /// Silicon only: ttsim accepts only the baby RISC-V bits of `SOFT_RESET_0`
     /// (divergence row 16).
-    fn reset_tile(dev: &mut Dev<'_>, w: &tt_device::Window, tile: NocCoord<Noc0>) {
-        dev.write32(
-            w,
-            tile,
-            tensix::SOFT_RESET_0,
-            ALL_BABIES_HELD | tensix::BACKEND_RESET_MASK,
-        )
-        .unwrap_or_else(|e| panic!("could not reset {tile:?}'s backend: {e}"));
-        dev.write32(w, tile, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
-            .unwrap_or_else(|e| panic!("could not release {tile:?}'s backend: {e}"));
+    fn reset_tile(dev: &mut Dev<'_>, tile: NocCoord<Noc0>) {
+        tt_kernels::session::reset_tile(dev, tile)
+            .unwrap_or_else(|e| {
+                panic!("could not reset {tile:?}'s backend: {e} (is a gate still holding every TLB window?)")
+            });
     }
 
     /// Put the gate tile, and every tile claimed through [`tile`], back to a
@@ -362,21 +342,9 @@ mod silicon {
                 .map(|(_, t, _)| *t)
                 .collect::<Vec<_>>()
         }));
-        // Not `.unwrap()`: the only way this fails now is a gate still holding
-        // every window when its body returns, and the bare `OutOfBounds` says
-        // nothing about why. The simulator never reaches this code at all.
-        let w = dev
-            .alloc_window(tt_device::tlb::WindowKind::TwoMib)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "no TLB window left to scrub the gate tile with: {e}. A gate \
-                     is still holding every window."
-                )
-            });
         for tile in tiles {
-            reset_tile(dev, &w, tile);
+            reset_tile(dev, tile);
         }
-        dev.free_window(w);
     }
 
     /// Run `f` against the card, inside a fork.

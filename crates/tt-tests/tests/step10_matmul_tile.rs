@@ -18,7 +18,7 @@ use tt_isa::sync::{self, Semaphore, Unit};
 use tt_isa::tile::L1Format;
 use tt_tests::datapath::{self, config_program, pack_config, set_adc_x, Unpacker, OUT, STAGE};
 use tt_tests::harness::{self, Roles, Run, SemaphoreInit};
-use tt_tests::matmul::{self, stage_operand, ROW, SRC_A_ROW, SRC_B_ROW, TF32_CODE};
+use tt_tests::matmul::{self, stage_operand, Fidelity, ROW, SRC_A_ROW, SRC_B_ROW, TF32_CODE};
 
 const STAGE_A: u64 = STAGE;
 const STAGE_B: u64 = STAGE + 0x2000;
@@ -312,11 +312,16 @@ fn flat(m: &Tile) -> Vec<f32> {
 /// `C = A @ B` for 32x32 tiles staged by `tt_layout` in `in_fmt`, converted to
 /// `out_fmt` in `Src`, through [`matmul::tile_roles`], de-tiled on the host.
 fn run_tile(a: &Tile, b: &Tile, in_fmt: L1Format, out_fmt: u32) -> Vec<f32> {
+    run_tile_at(a, b, in_fmt, out_fmt, Fidelity::Lo)
+}
+
+/// [`run_tile`] with `fidelity` phases per block.
+fn run_tile_at(a: &Tile, b: &Tile, in_fmt: L1Format, out_fmt: u32, fidelity: Fidelity) -> Vec<f32> {
     let (ta, _) = matmul::tilize_f32(&flat(a), 32, 32, in_fmt);
     let (tb, _) = matmul::tilize_f32(&flat(b), 32, 32, in_fmt);
     const A_AT: u64 = STAGE;
     const B_AT: u64 = STAGE + 0x2000;
-    let [unpack, math, pack] = matmul::tile_roles(&[(A_AT, B_AT)], in_fmt, out_fmt, OUT);
+    let [unpack, math, pack] = matmul::tile_roles(&[(A_AT, B_AT)], in_fmt, out_fmt, fidelity, OUT);
     let path = std::env::temp_dir().join(format!(
         "tttile-{}-{:?}.bin",
         std::process::id(),
@@ -408,17 +413,85 @@ fn a_32x32_tile_matmul_through_bf16_src() {
     }
 }
 
+/// Tile operands that need every fidelity phase: an integer part phase 0
+/// sees, plus a fraction only the later phases see -- `2^-7` on `A`, which
+/// becomes `SrcB`, and `2^-5` on `B`, which becomes `SrcA` (as
+/// `step9_matmul::fidelity_operands`). Narrow enough that every 16-term block
+/// sum and 32-term tile sum stays exact in FP32, so the model answers.
+fn fidelity_tiles(seed: u64) -> (Tile, Tile) {
+    let mut rng = Lcg(seed);
+    let mut a = [[0f32; 32]; 32];
+    let mut b = [[0f32; 32]; 32];
+    a.iter_mut()
+        .flatten()
+        .for_each(|v| *v = 1.0 + rng.int(3).abs() + 2f32.powi(-7));
+    b.iter_mut()
+        .flatten()
+        .for_each(|v| *v = 1.0 + rng.int(3).abs() + 2f32.powi(-5));
+    (a, b)
+}
+
+fn assert_tile_bits(got: &[f32], want: &[f32], what: &str) {
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "{what}: C[{}][{}] is {g}, want {w}",
+            k / 32,
+            k % 32
+        );
+    }
+}
+
+/// **HiFi4 at tile level.** With every `MVMUL` block run once per phase
+/// (`Fidelity::HiFi4`: address modifier 1 steps `FidelityIncr`, the `SrcB`
+/// half's `SETRWC` puts the phase back), a whole tile equals the four-phase
+/// model -- which, on these operands, is the exact product. The control is the
+/// same tile at `Fidelity::Lo`, which gives phase 0's answer and not the exact
+/// one; and HiFi2 gives phases 0 and 1, which pins the phase order too.
+#[test]
+fn a_32x32_tile_at_hifi4_recovers_the_exact_product() {
+    let zero = [[0f32; 32]; 32];
+    let (a, b) = fidelity_tiles(0xf1f1);
+    let reference = |phases: &[u32]| {
+        flat(
+            &tt_isa::numerics::matmul_tile_reference(&zero, &a, &b, phases)
+                .expect("the operands keep every sum exact"),
+        )
+    };
+    let full = reference(&[0, 1, 2, 3]);
+    let exact: Vec<f32> = (0..32 * 32)
+        .map(|x| {
+            (0..32)
+                .map(|q| f64::from(a[x / 32][q]) * f64::from(b[q][x % 32]))
+                .sum::<f64>() as f32
+        })
+        .collect();
+    assert_eq!(full, exact, "four phases are the whole product");
+    let lo = reference(&[0]);
+    let hifi2 = reference(&[0, 1]);
+    assert_ne!(lo, full, "the operands must exercise the later phases");
+    assert_ne!(hifi2, full);
+
+    let got = run_tile_at(&a, &b, L1Format::Fp32, TF32_CODE, Fidelity::HiFi4);
+    assert_tile_bits(&got, &full, "HiFi4");
+    let got = run_tile_at(&a, &b, L1Format::Fp32, TF32_CODE, Fidelity::HiFi2);
+    assert_tile_bits(&got, &hifi2, "HiFi2");
+    let got = run_tile_at(&a, &b, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+    assert_tile_bits(&got, &lo, "Lo (the control)");
+}
+
 // --- Multi-tile ----------------------------------------------------------------
 
 /// `C = A @ B` on the device for row-major `a` (`m` x `k`) and `b` (`k` x `n`),
-/// through `tt_kernels::matmul::matmul` -- the entry point a backend calls.
-fn device_matmul(
+/// at `fidelity`, through `tt_kernels::matmul::matmul` -- the entry point a
+/// backend calls.
+fn device_matmul_at(
     a: &[f32],
     b: &[f32],
-    m: usize,
-    k: usize,
-    n: usize,
+    [m, k, n]: [usize; 3],
     route: matmul::SrcRoute,
+    fidelity: Fidelity,
 ) -> Vec<f32> {
     let path = std::env::temp_dir().join(format!(
         "ttmm-{}-{:?}.bin",
@@ -434,6 +507,7 @@ fn device_matmul(
             b,
             [m, k, n],
             route,
+            fidelity,
             harness::BUDGET,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -470,11 +544,22 @@ fn exact_product(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
 }
 
 fn assert_matmul(m: usize, k: usize, n: usize, route: matmul::SrcRoute, seed: u64) {
+    assert_matmul_at(m, k, n, route, Fidelity::Lo, seed);
+}
+
+fn assert_matmul_at(
+    m: usize,
+    k: usize,
+    n: usize,
+    route: matmul::SrcRoute,
+    fidelity: Fidelity,
+    seed: u64,
+) {
     let mut rng = Lcg(seed);
     let a = int_matrix(&mut rng, m, k, 127);
     let b = int_matrix(&mut rng, k, n, 31);
     let want = exact_product(&a, &b, m, k, n);
-    let got = device_matmul(&a, &b, m, k, n, route);
+    let got = device_matmul_at(&a, &b, [m, k, n], route, fidelity);
     assert_eq!(got.len(), m * n);
     for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(
@@ -496,6 +581,110 @@ fn k_depth_accumulates_across_tiles() {
     assert_matmul(32, 128, 32, matmul::SrcRoute::Tf32FromFp32, 2);
 }
 
+/// HiFi4 across tiles in `K`, padded: operands carrying fractions only the
+/// later phases see (as [`fidelity_tiles`]), in a padded `[40, 64] @ [64, 33]`,
+/// give the exact product -- every sum is exact in FP32 here, so the `f64`
+/// product is the answer in any order -- and Lo, the control, does not.
+#[test]
+fn hifi4_is_exact_across_k_where_lo_is_not() {
+    let [m, k, n] = [40, 64, 33];
+    let mut rng = Lcg(0x4f14);
+    let a: Vec<f32> = (0..m * k)
+        .map(|_| 1.0 + rng.int(3).abs() + 2f32.powi(-7))
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|_| 1.0 + rng.int(3).abs() + 2f32.powi(-5))
+        .collect();
+    // In f64, where these sums are exact; the gate below asserts the FP32
+    // conversion lost nothing, so this is the FP32 answer in any order.
+    let want: Vec<f32> = (0..m * n)
+        .map(|x| {
+            let s: f64 = (0..k)
+                .map(|q| f64::from(a[x / n * k + q]) * f64::from(b[q * n + x % n]))
+                .sum();
+            assert_eq!(
+                f64::from(s as f32),
+                s,
+                "the product must stay exact in FP32"
+            );
+            s as f32
+        })
+        .collect();
+    let got = device_matmul_at(
+        &a,
+        &b,
+        [m, k, n],
+        matmul::SrcRoute::Tf32FromFp32,
+        Fidelity::HiFi4,
+    );
+    for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "HiFi4: C[{}][{}]",
+            idx / n,
+            idx % n
+        );
+    }
+    let lo = device_matmul_at(
+        &a,
+        &b,
+        [m, k, n],
+        matmul::SrcRoute::Tf32FromFp32,
+        Fidelity::Lo,
+    );
+    assert!(
+        lo.iter().zip(&want).any(|(g, w)| g != w),
+        "the control: phase 0 alone must drop the fractions"
+    );
+}
+
+/// **A matmul too large for one run**, split by `matmul::plan` and reassembled
+/// by `matmul_chunked`, with the tile reset before every run
+/// (`session::matmul_on`, the path a backend takes): an MNIST-sized first layer,
+/// `[64, 784] @ [784, 128]`, at HiFi4. Small-integer operands, so every order
+/// of summation is exact and the answer is the exact product whether or not `K`
+/// was split.
+#[test]
+fn a_matmul_larger_than_one_run_is_chunked() {
+    let [m, k, n] = [64, 784, 128];
+    let route = matmul::SrcRoute::Tf32FromFp32;
+    let shape = matmul::plan([m, k, n], route, Fidelity::HiFi4).unwrap();
+    let whole = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    assert_ne!(shape.tiles, whole, "the gate must need more than one run");
+    let mut rng = Lcg(0xc4c4);
+    let a = int_matrix(&mut rng, m, k, 7);
+    let b = int_matrix(&mut rng, k, n, 7);
+    let want = exact_product(&a, &b, m, k, n);
+    let path = std::env::temp_dir().join(format!("ttchunk-{}.bin", std::process::id()));
+    harness::in_device(|dev| {
+        let c = tt_kernels::session::matmul_on(
+            dev,
+            harness::tensix_tile(),
+            &tt_tests::firmware::ROLES,
+            &a,
+            &b,
+            [m, k, n],
+            route,
+            Fidelity::HiFi4,
+            harness::BUDGET,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let bytes: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+    });
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let got: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(got.len(), m * n);
+    for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "C[{}][{}]", idx / n, idx % n);
+    }
+}
+
 /// `M` x `N` output tiles, each cleared only once the packer has finished the
 /// last (`matmul::DST_FREE`) and packed to its own place.
 #[test]
@@ -515,6 +704,24 @@ fn awkward_shapes_are_padded_and_cropped() {
 /// against the exact product. Deterministic; the simulator gate.
 #[test]
 fn a_shape_format_and_depth_sweep() {
+    // HiFi4 over the same shapes, TF32 only: the operands are integers every
+    // fidelity multiplies exactly, so this checks the multi-phase program's
+    // structure across depths and padding, not its precision
+    // (`a_32x32_tile_at_hifi4_recovers_the_exact_product` and
+    // `hifi4_is_exact_across_k_where_lo_is_not` do that).
+    for (s, &(m, k, n)) in [(32, 32, 32), (40, 70, 33), (64, 96, 32), (17, 32, 64)]
+        .iter()
+        .enumerate()
+    {
+        assert_matmul_at(
+            m,
+            k,
+            n,
+            matmul::SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            200 + s as u64,
+        );
+    }
     let shapes = [(32, 32, 32), (40, 70, 33), (64, 96, 32), (17, 32, 64)];
     let routes = [
         matmul::SrcRoute::Tf32FromFp32,

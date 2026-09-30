@@ -46,6 +46,29 @@ pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
 /// simulator, whose timestamper support is probed separately.
 pub const TRACE: u64 = MAILBOX_BASE + 0x30;
 
+/// Non-zero `n`: after every `n` instruction words pushed, the firmware waits
+/// for the coprocessor to retire everything it has pushed so far. Zero: it
+/// never does.
+///
+/// Silicon needs no flow control -- a push into a full FIFO stalls the pushing
+/// core until there is room (`PushTensixInstruction.md:11`). ttsim does not
+/// model that stall: the push is fatal (`tensix_push_inst_fifo: pipe N inst
+/// fifo full`, divergence row 55), and a thread blocked on another -- an
+/// unpacker waiting for the Matrix Unit to hand a bank back -- reaches it as
+/// soon as it gets more than a FIFO's depth ahead. The register the page offers
+/// for watching the FIFO, `RISCV_DEBUG_REG_INSTRN_BUF_STATUS`, is refused by
+/// ttsim too, so the window uses Manual TTSync, which it does model. The host
+/// sets [`SIM_PUSH_WINDOW`] on the simulator and zero on silicon.
+///
+/// Waiting for the thread's own pushes to retire cannot deadlock a correct
+/// schedule: every instruction already pushed depends only on instructions the
+/// other threads push before theirs, in program order.
+pub const PUSH_WINDOW: u64 = MAILBOX_BASE + 0x34;
+
+/// The [`PUSH_WINDOW`] the host uses on the simulator: well under the 28
+/// instructions the first frontend FIFO holds (`PushTensixInstruction.md:15`).
+pub const SIM_PUSH_WINDOW: u32 = 16;
+
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x40;
 
@@ -127,6 +150,7 @@ const _: () =
 // The descriptor words have to stay inside the mailbox the firmware owns.
 const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(PUSH_WINDOW + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
 
@@ -194,6 +218,9 @@ pub mod role {
         }
         pub const fn trace(self) -> u64 {
             self.base + (super::TRACE - super::MAILBOX_BASE)
+        }
+        pub const fn push_window(self) -> u64 {
+            self.base + (super::PUSH_WINDOW - super::MAILBOX_BASE)
         }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {

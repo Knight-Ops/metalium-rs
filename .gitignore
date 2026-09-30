@@ -22,3 +22,7 @@
 # GPL-2.0-only-WITH-Linux-syscall-note header; verified on arrival rather than
 # vendored, like every other pinned input.
 /vendor/ioctl.h
+
+# Fetched by `cargo xtask fetch-mnist`, pinned by SHA-256 in PINS.toml; the
+# Phase 7 training gate's data.
+/vendor/mnist/

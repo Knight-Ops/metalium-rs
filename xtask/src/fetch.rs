@@ -252,3 +252,60 @@ pub fn fetch_kmd(force: bool) -> Result<(), String> {
     println!("wrote {} ({})", dest.display(), pin::TTKMD_TAG);
     Ok(())
 }
+
+/// Fetch MNIST into `vendor/mnist/`, decompressed, each file checked against
+/// both of its pins.
+///
+/// Data rather than a specification, but pinned for the same reason: the
+/// training gate's loss curve is a function of it, and a silently different
+/// dataset would move the curve without any code changing.
+pub fn fetch_mnist(force: bool) -> Result<(), String> {
+    let dir = workspace_root().join("vendor").join("mnist");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    for f in pin::MNIST_FILES {
+        let dest = dir.join(f.name);
+        if dest.exists() && !force {
+            let h = sha256(&dest)?;
+            if h == f.sha256 {
+                println!("{} is already present and matches the pin", dest.display());
+                continue;
+            }
+            return Err(format!(
+                "{} exists but hashes {h}, not the pinned {}. Re-run with --force.",
+                dest.display(),
+                f.sha256
+            ));
+        }
+        let gz = dir.join(format!("{}.gz", f.name));
+        let url = format!("{}/{}.gz", pin::MNIST_URL, f.name);
+        download(&url, &gz)?;
+        let h = sha256(&gz)?;
+        if h != f.gz_sha256 {
+            let _ = std::fs::remove_file(&gz);
+            return Err(format!("{url} hashes {h}, not the pinned {}", f.gz_sha256));
+        }
+        let out = Command::new("gzip")
+            .arg("-dc")
+            .arg(&gz)
+            .output()
+            .map_err(|e| format!("could not run gzip: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("gzip could not decompress {}", gz.display()));
+        }
+        let tmp = dest.with_extension("partial");
+        std::fs::write(&tmp, &out.stdout).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        let h = sha256(&tmp)?;
+        if h != f.sha256 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "{} decompresses to a file hashing {h}, not the pinned {}",
+                f.name, f.sha256
+            ));
+        }
+        std::fs::rename(&tmp, &dest)
+            .map_err(|e| format!("renaming into {}: {e}", dest.display()))?;
+        let _ = std::fs::remove_file(&gz);
+        println!("{} verified", dest.display());
+    }
+    Ok(())
+}

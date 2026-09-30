@@ -292,6 +292,13 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
         .unwrap();
     assert!(!spec.trace, "tracing is for role runs");
     dev.write32(&w, tile, mailbox::TRACE, 0).unwrap();
+    let push_window = if ON_SILICON {
+        0
+    } else {
+        mailbox::SIM_PUSH_WINDOW
+    };
+    dev.write32(&w, tile, mailbox::PUSH_WINDOW, push_window)
+        .unwrap();
     dev.write(&w, tile, mailbox::PROGRAM, &program_bytes(&program))
         .unwrap();
     for row in 0..spec.dump_rows {

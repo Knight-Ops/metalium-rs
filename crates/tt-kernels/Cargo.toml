@@ -12,3 +12,4 @@ license.workspace = true
 tt-isa.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
+tt-kmd.workspace = true

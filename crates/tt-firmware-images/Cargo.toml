@@ -1,0 +1,15 @@
+[package]
+name = "tt-firmware-images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The baby RISC-V firmware images, built from `crates/tt-firmware` by `build.rs`
+# and checked for instructions Blackhole cannot execute. Shippable: the role
+# images are what `tt-kernels` runs, so a backend needs them from a crate it can
+# depend on, not from the test harness (`cargo xtask check-no-sim-in-ship`).
+build = "build.rs"
+
+[dependencies]
+tt-isa.workspace = true

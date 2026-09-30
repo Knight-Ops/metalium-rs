@@ -83,6 +83,7 @@ where
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
+    let push_window = unsafe { l1_read32(mb.push_window()) };
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -120,12 +121,24 @@ where
 
     trace(tracing, Thread::INDEX, mailbox::trace::START);
     let mut i = 0;
+    // A countdown rather than `i % push_window`: T2 has no remainder
+    // instruction, and the instruction-set gate refuses one.
+    let mut until_drain = push_window;
     while i < program_len {
         // SAFETY: the word is inside the staged program, whose length was checked
         // above; `Riscv` may push to `Thread`, which the type system checked; the
         // backend is out of reset.
         unsafe { push_word::<Riscv, Thread>(l1_read32(mb.program() + (i as u64) * 4)) }
         i += 1;
+        // Flow control for the simulator (`mailbox::PUSH_WINDOW`): silicon
+        // stalls a push into a full FIFO, ttsim kills the process.
+        if push_window != 0 {
+            until_drain -= 1;
+            if until_drain == 0 {
+                wait_for_coprocessor();
+                until_drain = push_window;
+            }
+        }
     }
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);

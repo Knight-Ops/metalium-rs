@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 
 mod fetch;
+mod gen_burn;
 mod gen_cfg;
 mod gen_isa;
 mod pin;
@@ -25,8 +26,10 @@ fn main() -> ExitCode {
         Some("gen-cfg") => gen_cfg::gen_cfg(args.any(|a| a == "--check")),
         Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
         Some("fetch-kmd") => fetch::fetch_kmd(args.any(|a| a == "--force")),
+        Some("fetch-mnist") => fetch::fetch_mnist(args.any(|a| a == "--force")),
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
+        Some("gen-burn-delegate") => gen_burn::generate(args.any(|a| a == "--check")),
         Some("silicon") => silicon::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
@@ -49,6 +52,9 @@ tasks:
                           and verify it against the pinned content digest
   fetch-kmd [--force]     download the pinned tt-kmd ioctl.h into vendor/; this is
                           the driver ABI tt-kmd binds, not a specification
+  fetch-mnist [--force]   download MNIST into vendor/mnist/, decompressed and
+                          verified against the pinned hashes; the Phase 7
+                          training gate reads it
   gen-cfg [--check]       regenerate tt-isa's backend-configuration field table
                           from the pinned cfg_defines.h; --check fails if the
                           committed file is out of date rather than rewriting it
@@ -56,6 +62,10 @@ tasks:
                           Bits32.lua, cross-checked against the specification's
                           syntax blocks; --check fails if the committed file is
                           out of date rather than rewriting it
+  gen-burn-delegate [--check]
+                          regenerate burn-tt's forwarding of every burn-backend
+                          op to burn-flex from the pinned burn-backend source;
+                          --check fails if the committed file is out of date
   check-isa-sources       parse the pinned Bits32.lua and report what it holds,
                           without generating anything
   check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs

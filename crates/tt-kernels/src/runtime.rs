@@ -135,6 +135,12 @@ pub enum RunError {
     /// Roles that did not finish, as `(thread, core, why)`. The cores are held
     /// in reset again before this is returned.
     Roles(Vec<(usize, Core, WaitError)>),
+    /// Something staged in L1 does not fit the region reserved for it.
+    DoesNotFit {
+        what: &'static str,
+        bytes: u64,
+        limit: u64,
+    },
 }
 
 impl From<TransportError> for RunError {
@@ -158,6 +164,10 @@ impl std::fmt::Display for RunError {
                 mailbox::DUMP_MAX_ROWS
             ),
             RunError::Setup(e) => write!(f, "setup run: {e}"),
+            RunError::DoesNotFit { what, bytes, limit } => write!(
+                f,
+                "{what} need {bytes} bytes of L1; the region holds {limit}"
+            ),
             RunError::Roles(stuck) => {
                 let parts: Vec<String> = stuck
                     .iter()
@@ -249,6 +259,11 @@ pub fn run<T: Transport, N: NocId>(
         dev.write(&w, tile, *addr, data)?;
     }
 
+    let push_window = if dev.transport().is_simulated() {
+        mailbox::SIM_PUSH_WINDOW
+    } else {
+        0
+    };
     let stage_role = |dev: &mut Device<T>,
                       thread: usize,
                       program: &[Instruction],
@@ -263,6 +278,7 @@ pub fn run<T: Transport, N: NocId>(
         dev.write32(&w, tile, mb.dump_row_first(), 0)?;
         dev.write32(&w, tile, mb.dump_row_count(), dump)?;
         dev.write32(&w, tile, mb.trace(), u32::from(traced))?;
+        dev.write32(&w, tile, mb.push_window(), push_window)?;
         dev.write(&w, tile, mb.program(), &program_bytes(program))?;
         for row in 0..dump {
             for col in 0..mailbox::DUMP_ROW_WORDS {

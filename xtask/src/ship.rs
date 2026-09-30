@@ -5,7 +5,15 @@ use std::process::Command;
 use crate::util::workspace_root;
 
 /// Crates whose dependency tree must stay free of the simulator binding.
-const SHIPPABLE: &[&str] = &["tt-isa", "tt-device", "tt-kmd", "tt-layout", "tt-kernels"];
+const SHIPPABLE: &[&str] = &[
+    "tt-isa",
+    "tt-device",
+    "tt-kmd",
+    "tt-layout",
+    "tt-kernels",
+    "tt-firmware-images",
+    "burn-tt",
+];
 
 /// Crates that exist only for development, and so are exempt.
 ///

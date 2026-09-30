@@ -3,64 +3,27 @@
 //! Carries no production code. It exists so that `tests/` has a home that may
 //! depend on both `tt-device` and `tt-ttsim` — `tt-device` must never depend on
 //! the simulator binding, so cross-cutting gates cannot live there — and so that
-//! `build.rs` can build the device firmware and hand the images to the tests.
+//! the gates can share one harness.
 
 pub mod backend;
+pub mod burn_device;
 pub mod harness;
+pub mod mnist;
 
 /// The kernels moved to `tt-kernels`, which ships; re-exported so the gates
 /// that established them still read `tt_tests::datapath`.
 pub use tt_kernels::{datapath, matmul};
 
-/// Firmware images, built from `crates/tt-firmware` by this crate's `build.rs`
-/// and checked for instructions Blackhole cannot execute.
+/// Firmware images, built from `crates/tt-firmware` by `tt-firmware-images`
+/// and checked there for instructions Blackhole cannot execute.
 pub mod firmware {
-    /// The step 3 heartbeat: increments a counter in L1 forever.
-    pub const HEARTBEAT: &[u8] = include_bytes!(env!("FIRMWARE_HEARTBEAT"));
+    pub use tt_firmware_images::{HEARTBEAT, LOAD_ADDRESS, ROLES, SFPU_MUL};
 
-    /// The step 4 gate: computes 3.0 x 2.0 on the Vector Unit and publishes the
-    /// FP32 bit pattern.
-    pub const SFPU_MUL: &[u8] = include_bytes!(env!("FIRMWARE_SFPU_MUL"));
-
-    /// A generic Tensix program runner: pushes the instruction stream the host
-    /// staged in L1 and copies the requested `Dst` rows back out.
-    ///
-    /// Adding a case to the instruction corpus is a host-side change, not a
-    /// firmware one.
-    ///
-    /// Built for the core [`crate::harness::CORE`] names: T1 on the simulator, T0
-    /// on silicon. See `tt_firmware::corpus`.
+    /// The generic single-thread Tensix program runner, built for the core
+    /// [`crate::harness::CORE`] names: T1 on the simulator, T0 on silicon. See
+    /// `tt_firmware::corpus`.
     #[cfg(not(feature = "silicon"))]
-    pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
+    pub const CORPUS: &[u8] = tt_firmware_images::CORPUS;
     #[cfg(feature = "silicon")]
-    pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
-
-    /// The three role images of the LLK-shaped datapath -- unpack on T0, math on
-    /// T1, pack on T2 -- each linked at its core's default reset PC so all three
-    /// fit in one tile's L1 at once. See `tt_firmware::corpus` and
-    /// `tt_isa::mailbox::role`.
-    pub const ROLES: [(tt_isa::tensix::Core, &[u8], u64); 3] = [
-        (
-            tt_isa::tensix::Core::T0,
-            include_bytes!(env!("FIRMWARE_ROLE_T0")),
-            0x6000,
-        ),
-        (
-            tt_isa::tensix::Core::T1,
-            include_bytes!(env!("FIRMWARE_ROLE_T1")),
-            0xA000,
-        ),
-        (
-            tt_isa::tensix::Core::T2,
-            include_bytes!(env!("FIRMWARE_ROLE_T2")),
-            0xE000,
-        ),
-    ];
-
-    /// Where a firmware image must be loaded in L1.
-    ///
-    /// Fixed by `crates/tt-firmware/link.x`, which places `.text` at RISCV T0's
-    /// default reset PC so the image runs whether or not the loader programs the
-    /// reset-PC override.
-    pub const LOAD_ADDRESS: u64 = 0x6000;
+    pub const CORPUS: &[u8] = tt_firmware_images::CORPUS_T0;
 }
