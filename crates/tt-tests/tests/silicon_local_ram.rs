@@ -33,6 +33,34 @@ const J_SELF: u32 = 0x0000_006F;
 /// More than the documented 2048-cycle zeroing window, at any plausible clock.
 const ZEROING_WAIT_CYCLES: u32 = 1_000_000;
 
+/// Why three of these tests are quarantined.
+///
+/// The first silicon run of `l1_each_local_ram_round_trips_over_the_noc` never
+/// finished: the fsync'd run log has its `START` and no `END`, and the host went
+/// down under it with the ARC watchdog armed (boot `497d5859`, 2026-09-30). That
+/// test does nothing but word-sized NoC writes, then reads, into
+/// `0xFFB1_4000..0xFFB1_DFFF` on the gate tile while every core is held in reset,
+/// so the slow-path local-RAM aperture is the prime suspect -- which of the five
+/// cores' ranges, or whether it is the access itself or holding the core in
+/// reset, is not known, because the run bought no finer evidence than that.
+/// `l3` and `l4` use the same aperture.
+///
+/// They stay compiled and are re-runnable, but only deliberately: with the
+/// watchdog disarmed, alone, and with [`APERTURE_OPT_IN_ENV`] set. The next run
+/// should narrow it -- one core, one read, before any write.
+pub const QUARANTINE: () = ();
+
+/// Set to `1` to run the quarantined aperture tests.
+const APERTURE_OPT_IN_ENV: &str = "TT_RISK_LOCAL_RAM_APERTURE";
+
+fn require_aperture_opt_in() {
+    assert!(
+        std::env::var(APERTURE_OPT_IN_ENV).as_deref() == Ok("1"),
+        "quarantined (see QUARANTINE in this file): set {APERTURE_OPT_IN_ENV}=1, \
+         disarm the ARC watchdog, and run this test alone"
+    );
+}
+
 fn measure(key: &str, value: impl std::fmt::Display) {
     println!("MEASURE {key} = {value}");
 }
@@ -82,9 +110,11 @@ fn with_disable_reset_restored(dev: &mut Dev<'_>, f: impl FnOnce(&mut Dev<'_>)) 
 
 /// Every core's local RAM round-trips through the slow-path aperture while the
 /// core is held in reset, and the five RAMs do not alias one another.
+#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
 #[test]
 fn l1_each_local_ram_round_trips_over_the_noc() {
     assert_on_silicon();
+    require_aperture_opt_in();
     in_device(|dev| {
         let tile = harness::tensix_tile();
         let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
@@ -157,9 +187,11 @@ fn l2_disable_reset_round_trips() {
 /// This is the behaviour `load_and_start_staged` will rest on, measured before
 /// the API is written. It also checks the loop is really what is running, by
 /// asserting the `pc` snapshot is exactly the loop's address.
+#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
 #[test]
 fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
     assert_on_silicon();
+    require_aperture_opt_in();
     in_device(|dev| {
         with_disable_reset_restored(dev, |dev| {
             let tile = harness::tensix_tile();
@@ -221,9 +253,11 @@ fn l3_release_zeroes_local_ram_unless_disable_reset_is_set() {
 ///
 /// **The one probe here that touches an undocumented address.** It is inside
 /// the tile's documented debug aperture, but run it last and alone.
+#[ignore = "quarantined: the first access to the slow-path aperture took the host down; see QUARANTINE"]
 #[test]
 fn l4_upper_half_of_a_t_core_window() {
     assert_on_silicon();
+    require_aperture_opt_in();
     in_device(|dev| {
         let tile = harness::tensix_tile();
         let core = Core::T1;

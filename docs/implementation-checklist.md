@@ -335,10 +335,17 @@ carrying `/proc/sys/kernel/random/boot_id` on each line so a reboot is evidence 
 inference; and running the suite **one test at a time**, which is what identified the
 failing access instead of losing the output with the session.
 
-**`auto_reset_timeout=0` is the debugging posture.** It disables the ARC watchdog
-(`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a chip reset that
-drops the PCIe link and kills the host" into "card is wedged, recoverable". It removes the
-safety net that recovers a hung chip, so it is for bring-up, not for keeping.
+**`auto_reset_timeout=0` is the debugging posture, and it is now enforced.** It disables
+the ARC watchdog (`wormhole.c:489` treats 0 that way), converting "hung NoC escalates to a
+chip reset that drops the PCIe link and kills the host" into "card is wedged, recoverable".
+It removes the safety net that recovers a hung chip, so it is for bring-up, not for keeping.
+A printed warning was not enough: the Phase 2 campaign ran past one and lost the host a
+third time. `backend::open_card` now panics before opening the card unless
+`tt_kmd::auto_reset_timeout()` reads 0, and `cargo xtask silicon` refuses at preflight; the
+overrides are `TT_ALLOW_ARMED_WATCHDOG=1` and `--allow-armed-watchdog`. The parameter is
+read-only at runtime, so make it persistent rather than remembering it:
+`echo "options tenstorrent auto_reset_timeout=0" | sudo tee /etc/modprobe.d/tenstorrent-bringup.conf`,
+then reload the module (`sudo modprobe -r tenstorrent && sudo modprobe tenstorrent`).
 
 **Do not run `probe_niu.rs` as a grid oracle.** It opens `Simulator` directly, so it is
 structurally simulator-only and *cannot* reach a card — which is fortunate, because
@@ -376,9 +383,21 @@ misattribution.
       nothing; releasing one core does not disturb the others.
 - [ ] **`pc` snapshot cross-check** — silicon only, ttsim does not model the
       registers. The test is written and `#[cfg(feature = "silicon")]`.
-- [ ] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
+- [~] **Gate (silicon): the highest-value silicon gate in the plan.** Reset
       sequencing, I-cache invalidation and the local-RAM zeroing window are all
       things a simulator may model loosely, and all three land here.
+      **`step3_heartbeat` 7/7 on card 0** (2026-09-30), through the shared harness
+      for the first time: heartbeat, held-in-reset control, reset round trip,
+      `pc` snapshot inside the image, two tiles (the far one now taken from the
+      grid rather than the fused-off `(16, 11)`), and both refusals. Card 1 open.
+- [ ] **The slow-path local-RAM aperture took the host down.**
+      `silicon_local_ram::l1_each_local_ram_round_trips_over_the_noc` -- word
+      writes then reads into `0xFFB1_4000..0xFFB1_DFFF` on the gate tile, every
+      core held in reset -- has a `START` and no `END` in the fsync'd run log, and
+      the host died under it with the watchdog armed. Which core's range, and
+      whether reads alone are safe, is unknown. The three aperture tests are
+      quarantined (`#[ignore]` plus `TT_RISK_LOCAL_RAM_APERTURE=1`); narrow it
+      next with the watchdog off: one core, one read, before any write.
 - [ ] **I-cache invalidation path.** Avoided by construction today — code is
       written before reset is released, and leaving reset invalidates the cache.
       Needed the moment anything reloads a *running* core: write the 5-bit mask to

@@ -33,6 +33,7 @@ struct Opts {
     filters: Vec<String>,
     include_ignored: bool,
     keep_going: bool,
+    allow_armed_watchdog: bool,
     list_only: bool,
     timeout: Duration,
 }
@@ -43,6 +44,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         filters: Vec::new(),
         include_ignored: false,
         keep_going: false,
+        allow_armed_watchdog: false,
         list_only: false,
         timeout: Duration::from_secs(120),
     };
@@ -73,6 +75,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             }
             "--include-ignored" => o.include_ignored = true,
             "--keep-going" => o.keep_going = true,
+            "--allow-armed-watchdog" => o.allow_armed_watchdog = true,
             "--list" => o.list_only = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
@@ -90,6 +93,8 @@ usage: cargo xtask silicon [options]
                         repeatable, and the selection runs in filter order
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
+  --allow-armed-watchdog  run even though auto_reset_timeout is not 0; a hung
+                        NoC then resets the chip and can take the host down
   --timeout-secs N      per-test wall-clock limit (default 120)
   --list                print the selection and exit without touching a card";
 
@@ -142,7 +147,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         return Ok(());
     }
 
-    preflight(&o.devices)?;
+    preflight(&o.devices, o.allow_armed_watchdog)?;
 
     let dir = root.join("target/silicon");
     std::fs::create_dir_all(dir.join("out")).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -163,7 +168,15 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                 .join("out")
                 .join(format!("{stamp}-dev{dev}-{}.txt", full.replace("::", "__")));
             let started = Instant::now();
-            let verdict = run_one(&root, exe, test, dev, o.timeout, &out_path)?;
+            let verdict = run_one(
+                o.allow_armed_watchdog,
+                &root,
+                exe,
+                test,
+                dev,
+                o.timeout,
+                &out_path,
+            )?;
             let secs = started.elapsed().as_secs_f64();
             log.line(&format!(
                 "{} boot={boot} dev={dev} END {full} {verdict} {secs:.2}s",
@@ -286,6 +299,7 @@ fn run_list(exe: &Path, ignored_only: bool) -> Result<Vec<String>, String> {
 }
 
 fn run_one(
+    allow_armed_watchdog: bool,
     root: &Path,
     exe: &Path,
     test: &str,
@@ -304,6 +318,12 @@ fn run_one(
             "--nocapture",
         ])
         .env("TT_SILICON_DEVICE", dev.to_string())
+        // The harness refuses an armed watchdog on its own; `--allow-armed-watchdog`
+        // is what lifts that, so it has to reach the child.
+        .env(
+            "TT_ALLOW_ARMED_WATCHDOG",
+            if allow_armed_watchdog { "1" } else { "0" },
+        )
         // `cargo test` runs a package's tests from its own directory.
         .current_dir(root.join("crates/tt-tests"))
         .stdout(out)
@@ -335,27 +355,34 @@ fn run_one(
 
 /// Refuse to start against a card that is not there, and say out loud whether the
 /// ARC watchdog is armed.
-fn preflight(devices: &[u16]) -> Result<(), String> {
+fn preflight(devices: &[u16], allow_armed_watchdog: bool) -> Result<(), String> {
     for d in devices {
         let p = format!("/dev/tenstorrent/{d}");
         if !Path::new(&p).exists() {
             return Err(format!("{p} does not exist"));
         }
     }
-    match std::fs::read_to_string("/sys/module/tenstorrent/parameters/auto_reset_timeout") {
-        Ok(v) if v.trim() == "0" => {
-            println!("auto_reset_timeout=0: a hung NoC wedges the card, not the host")
+    let param = "/sys/module/tenstorrent/parameters/auto_reset_timeout";
+    match std::fs::read_to_string(param).map(|v| v.trim().to_string()) {
+        Ok(v) if v == "0" => {
+            println!("auto_reset_timeout=0: a hung NoC wedges the card, not the host");
+            Ok(())
         }
-        Ok(v) => println!(
-            "WARNING: auto_reset_timeout={} -- the ARC watchdog is armed, so a hung NoC \
-             escalates to a chip reset that drops the PCIe link and, with the card \
-             passed through, the host. For bring-up, reload the driver with \
-             auto_reset_timeout=0.",
-            v.trim()
-        ),
-        Err(_) => println!("could not read auto_reset_timeout; is the tenstorrent module loaded?"),
+        _ if allow_armed_watchdog => {
+            println!("WARNING: running with the ARC watchdog armed, as asked");
+            Ok(())
+        }
+        Ok(v) => Err(format!(
+            "the ARC watchdog is armed (auto_reset_timeout={v}): a hung NoC escalates \
+             to a chip reset that drops the PCIe link and, with the card passed \
+             through, the host. Reload the driver with auto_reset_timeout=0, or pass \
+             --allow-armed-watchdog to accept that."
+        )),
+        Err(e) => Err(format!(
+            "cannot read {param} ({e}); is the tenstorrent module loaded? \
+             --allow-armed-watchdog proceeds without knowing."
+        )),
     }
-    Ok(())
 }
 
 struct Log(File);

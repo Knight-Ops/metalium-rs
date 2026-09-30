@@ -247,6 +247,7 @@ mod silicon {
     /// [`open`], for a card named explicitly rather than by [`DEVICE_ENV`]: for
     /// the gates that hold both cards at once.
     pub fn open_card(index: u16) -> Dev<'static> {
+        refuse_armed_watchdog();
         let kmd = Kmd::open(index)
             .unwrap_or_else(|e| panic!("could not open /dev/tenstorrent/{index}: {e}"));
 
@@ -281,6 +282,38 @@ mod silicon {
 
         scrub(&mut dev);
         dev
+    }
+
+    /// Set to `1` to run against a card whose ARC watchdog is armed anyway.
+    pub const ALLOW_ARMED_WATCHDOG_ENV: &str = "TT_ALLOW_ARMED_WATCHDOG";
+
+    /// Refuse to touch a card while the ARC watchdog is armed.
+    ///
+    /// A warning was tried first: `cargo xtask silicon` printed one, the run went
+    /// ahead, and a probe that hung the NoC took the host down for the third
+    /// time. Every silicon gate comes through here, however it is launched, so
+    /// this is where the precondition lives. Overriding it takes an explicit
+    /// [`ALLOW_ARMED_WATCHDOG_ENV`].
+    fn refuse_armed_watchdog() {
+        if std::env::var(ALLOW_ARMED_WATCHDOG_ENV).as_deref() == Ok("1") {
+            return;
+        }
+        match tt_kmd::auto_reset_timeout() {
+            Ok(0) => {}
+            Ok(t) => panic!(
+                "refusing to touch the card: the ARC watchdog is armed \
+                 (auto_reset_timeout={t}), so a hung NoC becomes a chip reset that \
+                 drops the PCIe link and, with the card passed through, the host. \
+                 Reload the driver with auto_reset_timeout=0 (see \
+                 docs/implementation-checklist.md, Silicon operating notes), or set \
+                 {ALLOW_ARMED_WATCHDOG_ENV}=1 to accept that."
+            ),
+            Err(e) => panic!(
+                "refusing to touch the card: cannot read {}: {e}. Set \
+                 {ALLOW_ARMED_WATCHDOG_ENV}=1 to proceed without knowing.",
+                tt_kmd::AUTO_RESET_TIMEOUT_PARAM
+            ),
+        }
     }
 
     /// Every baby RISC-V held in reset.
