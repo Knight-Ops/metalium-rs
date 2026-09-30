@@ -15,6 +15,9 @@
 //! Addresses are literals rather than `tt_isa` constants on purpose: this runs
 //! before any of them are written, so that the design follows the measurement.
 
+// Probes what ttsim declines. The silicon measurements are in `silicon_local_ram.rs`.
+#![cfg(not(feature = "silicon"))]
+
 use tt_device::{tlb::WindowKind, Device};
 use tt_isa::noc::{Noc0, NocCoord};
 use tt_ttsim::{fork_scope, Simulator};

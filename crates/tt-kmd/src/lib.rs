@@ -324,6 +324,10 @@ impl Transport for Kmd {
     /// Nothing to do: silicon advances time by itself.
     fn tick(&mut self, _n: u32) {}
 
+    fn is_simulated(&self) -> bool {
+        false
+    }
+
     fn chip(&self) -> ChipId {
         self.chip
     }

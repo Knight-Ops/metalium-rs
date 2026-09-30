@@ -180,6 +180,17 @@ pub trait Transport {
     /// silicon; the alternative is teaching every caller about the simulator.
     fn tick(&mut self, n: u32);
 
+    /// Does time stand still between calls to [`tick`](Transport::tick)?
+    ///
+    /// Decides what a poll loop's budget means. On the simulator it is simulated
+    /// cycles, which only `tick` spends. On silicon `tick` is a no-op, so a
+    /// budget counted in ticks would be a *poll count* with no bound in time --
+    /// fast MMIO makes it expire early, a slow one makes it wait arbitrarily --
+    /// and the loop needs a wall clock instead.
+    ///
+    /// Required rather than defaulted: each transport has to say which it is.
+    fn is_simulated(&self) -> bool;
+
     /// Read a single dword from a BAR.
     fn bar_read32(&mut self, bar: Bar, offset: u64) -> Result<u32> {
         let mut buf = [0u8; 4];

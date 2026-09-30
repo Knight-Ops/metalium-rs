@@ -28,7 +28,9 @@ use tt_isa::tensix::Core;
 
 /// Re-exported so a gate can say `harness::Dev` without caring which target it
 /// is built for. [`crate::backend`] is where the choice is made.
-pub use crate::backend::{in_device, survives, tensix_grid, Dev};
+pub use crate::backend::{
+    advance, assert_on_silicon, in_device, survives, tensix_grid, tile, Dev, ON_SILICON,
+};
 
 /// T1, not T0: ttsim implements the RISC-V view of `Dst` only for `pipe == 1`
 /// (`docs/ttsim-divergence.md` row 12). A simulator constraint, not a hardware one.

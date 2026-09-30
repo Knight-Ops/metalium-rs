@@ -15,6 +15,9 @@
 //! Run with:
 //! `cargo test -p tt-tests --test probe_config_coverage -- --ignored --nocapture`
 
+// Simulator only, permanently: it writes every `Config` register blind, which on silicon is a whole-backend reconfiguration.
+#![cfg(not(feature = "silicon"))]
+
 use tt_isa::backend;
 use tt_isa::isa::Instruction;
 use tt_isa::sfpu;

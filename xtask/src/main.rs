@@ -12,6 +12,7 @@ mod gen_cfg;
 mod gen_isa;
 mod pin;
 mod ship;
+mod silicon;
 mod spec;
 mod util;
 
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
         Some("fetch-kmd") => fetch::fetch_kmd(args.any(|a| a == "--force")),
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
+        Some("silicon") => silicon::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -56,4 +58,6 @@ tasks:
                           out of date rather than rewriting it
   check-isa-sources       parse the pinned Bits32.lua and report what it holds,
                           without generating anything
-  check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs";
+  check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs
+  silicon [options]       run the silicon suite one test per process, with an
+                          fsync'd log; `cargo xtask silicon --help` for options";

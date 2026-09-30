@@ -430,6 +430,10 @@ mod tests {
         }
 
         fn tick(&mut self, _n: u32) {}
+
+        fn is_simulated(&self) -> bool {
+            true
+        }
     }
 
     fn device() -> Device<FakeTransport> {

@@ -14,6 +14,10 @@
 //! the refusal itself: if either ever starts working, the simulator has gained a
 //! model and these tests say so rather than silently passing.
 
+// Every test here asserts what ttsim *refuses*. The behaviour itself is measured
+// on silicon by `silicon_local_ram.rs`.
+#![cfg(not(feature = "silicon"))]
+
 use tt_device::{tlb::WindowKind, Device};
 use tt_isa::noc::{grid, Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};

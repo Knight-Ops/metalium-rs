@@ -12,6 +12,10 @@
 //! Run with:
 //! `cargo test -p tt-tests --test probe_src -- --ignored --nocapture`
 
+// The surveys and refusal probes are simulator-only, so their helpers are dead in
+// the silicon build.
+#![cfg_attr(feature = "silicon", allow(dead_code, unused_imports))]
+
 use tt_isa::backend;
 use tt_isa::cfg::generated::{ALL_CONFIG_FIELDS, ALL_THREAD_CONFIG_FIELDS};
 use tt_isa::isa::Instruction;
@@ -78,6 +82,8 @@ fn verdict(zero: bool, one: bool) -> &'static str {
     }
 }
 
+// Writes configuration fields blind at zero and one; simulator only.
+#[cfg(not(feature = "silicon"))]
 #[test]
 #[ignore]
 fn map_the_src_path_configuration_surface() {
@@ -306,6 +312,8 @@ fn bf16_in_l1_unpacks_into_src_unchanged() {
 /// `UNPACR_Regular.md:580`: FP32 into `Src` is `UndefinedBehavior`, because a
 /// 19-bit slot cannot hold it. ttsim refuses it; the control with `TF32` out and
 /// everything else identical survives, so the refusal is about the format.
+// `UndefinedBehavior` per `UNPACR_Regular.md:580`; never executed on silicon.
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn fp32_into_src_is_refused() {
     let staged = stage(L1Format::Fp32, FP32_CODE, &operand_bits());

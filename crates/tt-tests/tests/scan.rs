@@ -11,6 +11,9 @@
 //!   L1 round-trip work here".
 //! * Asking that question of the wrong tile is fatal, so each coordinate is probed
 //!   in its own forked process.
+
+// Simulator only, permanently: a blind grid walk is the sweep that hangs on a fused-off tile.
+#![cfg(not(feature = "silicon"))]
 use std::fs;
 use std::path::PathBuf;
 

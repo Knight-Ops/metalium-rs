@@ -20,6 +20,10 @@
 //! than a hypothesis — but the surrounding `Unpackers/` directory does not exist on
 //! Blackhole at all, and every fact taken from it is `UNVERIFIED`.
 
+// The surveys and refusal probes are simulator-only, so their helpers are dead in
+// the silicon build.
+#![cfg_attr(feature = "silicon", allow(dead_code, unused_imports))]
+
 use tt_isa::backend::{self, ConfigWords, ThreadConfigEntry};
 use tt_isa::cfg::generated::{thcon, thread, unpack1};
 use tt_isa::isa::generated::{defs, encode};
@@ -431,6 +435,8 @@ fn does_the_output_address_formula_respond_to_the_adc() {
     }
 }
 
+// Sweeps format pairs the specification does not list, which are UB on silicon.
+#[cfg(not(feature = "silicon"))]
 #[test]
 #[ignore]
 fn survey_the_data_format_codes() {
@@ -585,6 +591,8 @@ fn a_single_corrupted_l1_datum_moves_exactly_one_dst_element() {
 /// specification's diagram does not label it. ttsim calls it `last` and refuses the
 /// instruction outright without it. Watched, so that the `unspecified` mask is
 /// evidence of a real gap rather than a bookkeeping field nothing reads.
+// Executes a refused UNPACR; on silicon that is undefined, not a refusal.
+#[cfg(not(feature = "silicon"))]
 #[test]
 fn unpacr_without_the_undocumented_last_bit_is_refused() {
     let staged_count = 20u32;
