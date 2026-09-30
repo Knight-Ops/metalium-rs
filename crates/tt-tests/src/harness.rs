@@ -253,10 +253,8 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
     dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
     dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, spec.dump_rows)
         .unwrap();
-    for (i, insn) in program.iter().enumerate() {
-        dev.write32(&w, tile, mailbox::PROGRAM + (i as u64) * 4, insn.word())
-            .unwrap();
-    }
+    dev.write(&w, tile, mailbox::PROGRAM, &program_bytes(&program))
+        .unwrap();
     for row in 0..spec.dump_rows {
         for col in 0..mailbox::DUMP_ROW_WORDS {
             dev.write32(&w, tile, mailbox::dump_offset(row, col), SENTINEL)
@@ -299,6 +297,15 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
     Outcome { dst, l1 }
 }
 
+/// A program as the little-endian words the firmware pushes, for one bulk
+/// write rather than an MMIO round trip per instruction.
+pub fn program_bytes(program: &[Instruction]) -> Vec<u8> {
+    program
+        .iter()
+        .flat_map(|i| i.word().to_le_bytes())
+        .collect()
+}
+
 /// [`run`] for a [`Roles`] kernel.
 fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
     use tt_isa::mailbox::role::Mailbox;
@@ -316,7 +323,7 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
     for (i, p) in programs.iter().enumerate() {
         assert!(
             p.len() as u32 <= mailbox::PROGRAM_MAX,
-            "role {i} program is {} instructions; a role mailbox holds {}",
+            "role {i} program is {} instructions; a program slot holds {}",
             p.len(),
             mailbox::PROGRAM_MAX
         );
@@ -345,10 +352,8 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
             .unwrap();
         dev.write32(&w, tile, mb.dump_row_first(), 0).unwrap();
         dev.write32(&w, tile, mb.dump_row_count(), dump).unwrap();
-        for (i, insn) in program.iter().enumerate() {
-            dev.write32(&w, tile, mb.program() + (i as u64) * 4, insn.word())
-                .unwrap();
-        }
+        dev.write(&w, tile, mb.program(), &program_bytes(program))
+            .unwrap();
         for row in 0..dump {
             for col in 0..mailbox::DUMP_ROW_WORDS {
                 dev.write32(&w, tile, mb.dump_offset(row, col), SENTINEL)

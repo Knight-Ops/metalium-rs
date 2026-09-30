@@ -375,6 +375,25 @@ fn a_partial_final_group_packs_only_its_rows() {
     );
 }
 
+/// A math program far longer than the 256 words a mailbox once held runs to the
+/// end: two thousand `SFPNOP`s and then the `MVMUL`, whose product is exact
+/// only if every word before it was pushed from the program slot
+/// (`mailbox::PROGRAM_REGION`) in order.
+#[test]
+fn a_program_longer_than_the_old_mailbox_limit_runs_to_the_end() {
+    let (a, b) = small_integer_operands(0xbeef);
+    let model = mvmul_reference(&ZERO_DST, &b, &a, &[0]).expect("small integers are exact");
+    let body: Body = Box::new(|banks, p| {
+        p.extend(std::iter::repeat_n(sfpu::nop(), 2000));
+        let (i, _) = banks
+            .mvmul_release_both(encode::Mvmul::ZERO.dst_row(0))
+            .unwrap();
+        p.push(i);
+    });
+    let dst = run(&a, &b, body);
+    assert_block(&dst, 0, &model, "after 2000 SFPNOPs");
+}
+
 fn small_integer_operands(seed: u64) -> (MatA, MatB) {
     let mut rng = Lcg(seed);
     let mut a = [[0f32; 16]; 16];
