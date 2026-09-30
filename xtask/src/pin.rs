@@ -14,8 +14,9 @@ pub struct TtsimAsset {
 /// The simulator builds this repository fetches, all from [`TTSIM_TAG`].
 ///
 /// One tag covers every build, so the single-chip and dual-chip simulators
-/// cannot drift apart. `bh_x4` and `bh_x32` exist in the same release and are
-/// deliberately not pinned until something needs them.
+/// cannot drift apart. `bh_x4` joined for Phase 8's sharding gate; `bh_x32`
+/// exists in the same release and is deliberately not pinned until something
+/// needs it.
 pub const TTSIM_ASSETS: &[TtsimAsset] = &[
     TtsimAsset {
         name: "libttsim_bh.so",
@@ -24,6 +25,10 @@ pub const TTSIM_ASSETS: &[TtsimAsset] = &[
     TtsimAsset {
         name: "libttsim_bh_x2.so",
         sha256: "e1ffbaf39c7d071a2f64d7072a586da5f9a7bef55907459edbdb185189d23108",
+    },
+    TtsimAsset {
+        name: "libttsim_bh_x4.so",
+        sha256: "942a7a2a210259b77d1c44a7b13ac98fe672aec28d28e4385fcd30f6967756c1",
     },
 ];
 

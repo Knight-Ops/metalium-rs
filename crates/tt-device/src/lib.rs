@@ -9,6 +9,7 @@
 pub mod arc_msg;
 pub mod core_control;
 pub mod device;
+pub mod ethernet;
 pub mod telemetry;
 pub mod tlb;
 pub mod trace;

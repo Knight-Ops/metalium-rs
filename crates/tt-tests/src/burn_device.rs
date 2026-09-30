@@ -43,6 +43,81 @@ pub fn with_device(config: Config, f: impl FnOnce(TtDevice)) {
     }
 }
 
+/// [`with_device`], but the device computes across `chips` chips joined by
+/// Ethernet (`burn_tt::MeshEngine`): on the simulator the `bh_x2` or `bh_x4`
+/// build, on silicon cards `0..chips`.
+#[track_caller]
+pub fn with_mesh_device(config: Config, chips: usize, f: impl FnOnce(TtDevice)) {
+    if let Err(e) = tt_ttsim::fork_scope(|| {
+        let device = TtDevice::new(0);
+        let _guard = attach_mesh(device, config, chips)
+            .unwrap_or_else(|e| panic!("could not attach a {chips}-chip {device}: {e}"));
+        f(device);
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[cfg(not(feature = "silicon"))]
+fn attach_mesh(
+    device: TtDevice,
+    config: Config,
+    chips: usize,
+) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
+    use burn_tt::{EngineError, MeshEngine};
+    use tt_device::Device;
+    use tt_kernels::shard::{Chip, Fabric};
+    let (lib, table): (_, &[_]) = match chips {
+        2 => (tt_ttsim::x2_lib_path(), &crate::topology::BH_X2),
+        4 => (tt_ttsim::x4_lib_path(), &crate::topology::BH_X4),
+        n => return Err(EngineError(format!("no {n}-chip simulator build"))),
+    };
+    attach(device, move |serve| {
+        let err = |e: &dyn std::fmt::Display| EngineError(e.to_string());
+        let mut sim = tt_ttsim::Simulator::open_path(lib).map_err(|e| err(&e))?;
+        let (compute, relay) = (crate::harness::tensix_tile(), crate::harness::relay_tile());
+        let mut list = Vec::new();
+        for t in sim.transports() {
+            let dev = Device::open(t).map_err(|e| err(&e))?;
+            list.push(Chip::new(dev, compute, relay).map_err(|e| err(&e))?);
+        }
+        let links = crate::topology::links(table);
+        let fabric = Fabric::new(
+            list,
+            &links,
+            tt_firmware_images::ROLES,
+            tt_firmware_images::ETH_E1,
+        )
+        .map_err(|e| err(&e))?;
+        let mut engine = MeshEngine {
+            fabric,
+            route: config.route,
+            fidelity: config.fidelity,
+            budget: config.budget,
+        };
+        serve.serve(&mut engine);
+        Ok(())
+    })
+}
+
+#[cfg(feature = "silicon")]
+fn attach_mesh(
+    device: TtDevice,
+    config: Config,
+    chips: usize,
+) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
+    attach(
+        device,
+        burn_tt::kmd_mesh_engine(
+            (0..chips as u16).collect(),
+            crate::backend::GATE_TILE,
+            crate::backend::RELAY_TILE,
+            config.route,
+            config.fidelity,
+        ),
+    )
+}
+
 #[cfg(not(feature = "silicon"))]
 fn device() -> TtDevice {
     TtDevice::new(0)

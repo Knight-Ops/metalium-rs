@@ -17,6 +17,8 @@
 //! to a device, returns [`runtime::RunError`] instead.
 
 pub mod datapath;
+pub mod link;
 pub mod matmul;
 pub mod runtime;
 pub mod session;
+pub mod shard;

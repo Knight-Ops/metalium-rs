@@ -229,6 +229,283 @@ pub mod niu {
 
     /// Translated X/Y of this tile, packed `x | (y << 6)` (`MemoryMap.md:219`).
     pub const NOC_ID_LOGICAL: u64 = 0x0148;
+
+    /// One of the NIU's four request initiators (`MemoryMap.md`, "NIU Request
+    /// Initiators"), as offsets from its base, `NIU_BASE + i * STRIDE`.
+    pub mod initiator {
+        pub const STRIDE: u64 = 0x800;
+        pub const TARG_ADDR_LO: u64 = 0x00;
+        pub const TARG_ADDR_MID: u64 = 0x04;
+        pub const TARG_ADDR_HI: u64 = 0x08;
+        pub const RET_ADDR_LO: u64 = 0x0C;
+        pub const RET_ADDR_MID: u64 = 0x10;
+        pub const RET_ADDR_HI: u64 = 0x14;
+        pub const PACKET_TAG: u64 = 0x18;
+        pub const CTRL: u64 = 0x1C;
+        pub const AT_LEN_BE: u64 = 0x20;
+        pub const AT_DATA: u64 = 0x28;
+        /// Write 1 to issue; hardware clears it once the request has a VC.
+        /// Software must not touch the initiator while it reads 1.
+        pub const CMD_CTRL: u64 = 0x40;
+    }
+
+    /// `NIU_MST_REQS_OUTSTANDING_ID(id)` (`Counters.md`): back to zero once every
+    /// response-marked request with this transaction ID has completed. Read
+    /// `CMD_CTRL` back first (`Counters.md:42-43`).
+    pub const fn reqs_outstanding(id: TxnId) -> u64 {
+        0x0200 + (16 + id.0 as u64) * 4
+    }
+
+    /// `NOC_PACKET_TRANSACTION_ID`, `0..16` (`MemoryMap.md`, `NOC_PACKET_TAG`).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct TxnId(u8);
+
+    impl TxnId {
+        pub const fn new(id: u8) -> Option<Self> {
+            if id < 16 {
+                Some(TxnId(id))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Largest length one request may carry between L1 addresses. Larger ones
+    /// are split by hardware, but then one request moves the 8-bit outstanding
+    /// counter by more than one, so this refuses them instead.
+    pub const MAX_REQUEST_BYTES: u32 = 16384;
+    /// In Tensix and Ethernet tiles, L1 is below this and MMIO at or above it
+    /// (WH `NoC/Alignment.md`).
+    pub const MMIO_START: u32 = 0xFF00_0000;
+
+    /// An address in a tile, with that tile's NoC #0 coordinate as the initiating
+    /// NIU would name it.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Endpoint {
+        pub x: u8,
+        pub y: u8,
+        pub addr: u32,
+    }
+
+    impl Endpoint {
+        const fn hi(self) -> u32 {
+            (self.x as u32 & 0x3F) | ((self.y as u32 & 0x3F) << 6)
+        }
+    }
+
+    /// A request, in the only shapes this workspace issues.
+    ///
+    /// There is no field for `NOC_CMD_L1_ACC_AT_EN` (`MemoryMap.md`: unusable,
+    /// must be `false`), for broadcast, or for linked VCs, so none of them can be
+    /// set by accident. Writes are always response-marked, so completion is
+    /// observable on [`reqs_outstanding`].
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum Command {
+        /// Read `len` bytes of `from` into this tile's L1 at `to_local`.
+        Read {
+            from: Endpoint,
+            to_local: u32,
+            len: u32,
+        },
+        /// Write `len` bytes of this tile's L1 at `from_local` to `to`.
+        Write {
+            from_local: u32,
+            to: Endpoint,
+            len: u32,
+        },
+        /// Store `data` to an MMIO register. `NOC_CMD_WR_INLINE` to an L1 address
+        /// is unsafe on Blackhole (`MemoryMap.md`, `NOC_CTRL` bit 3), so the
+        /// destination must be MMIO.
+        MmioInline { to: Endpoint, data: u32 },
+    }
+
+    /// Why a [`Command`] was refused.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum RequestError {
+        /// An L1 copy whose two addresses are not congruent mod 16, or not both L1
+        /// (WH `NoC/Alignment.md`: `UndefinedBehavior`).
+        Alignment,
+        /// Zero, or more than [`MAX_REQUEST_BYTES`].
+        Length,
+        /// An inline write aimed at L1, or at an unaligned MMIO address.
+        InlineToL1,
+    }
+
+    const CMD_WR: u32 = 2;
+    const CMD_RD: u32 = 0;
+    const WR_INLINE: u32 = 1 << 3;
+    const RESP_MARKED: u32 = 1 << 4;
+
+    impl Command {
+        /// The initiator registers to write, in order, before `CMD_CTRL`.
+        /// `me` is the initiating tile's coordinate, which reads name as their
+        /// return address and writes as the source of their data.
+        pub fn registers(
+            &self,
+            me: (u8, u8),
+            txn: TxnId,
+        ) -> Result<[(u64, u32); 10], RequestError> {
+            use initiator::*;
+            let local = |addr: u32| Endpoint {
+                x: me.0,
+                y: me.1,
+                addr,
+            };
+            let (targ, ret, ctrl, len_be, data) = match *self {
+                Command::Read {
+                    from,
+                    to_local,
+                    len,
+                } => {
+                    check_copy(from.addr, to_local, len)?;
+                    // `MemoryMap.md` says `RESP_MARKED` is ignored for reads
+                    // (they always respond); ttsim refuses a read without it
+                    // (divergence row 61), so it is set.
+                    (from, local(to_local), CMD_RD | RESP_MARKED, len, 0)
+                }
+                Command::Write {
+                    from_local,
+                    to,
+                    len,
+                } => {
+                    check_copy(from_local, to.addr, len)?;
+                    (local(from_local), to, CMD_WR | RESP_MARKED, len, 0)
+                }
+                Command::MmioInline { to, data } => {
+                    if to.addr < MMIO_START || to.addr % 4 != 0 {
+                        return Err(RequestError::InlineToL1);
+                    }
+                    (to, local(0), CMD_WR | WR_INLINE | RESP_MARKED, 0, data)
+                }
+            };
+            Ok([
+                (TARG_ADDR_LO, targ.addr),
+                (TARG_ADDR_MID, 0),
+                (TARG_ADDR_HI, targ.hi()),
+                (RET_ADDR_LO, ret.addr),
+                (RET_ADDR_MID, 0),
+                (RET_ADDR_HI, ret.hi()),
+                (PACKET_TAG, (txn.0 as u32) << 10),
+                (CTRL, ctrl),
+                (AT_LEN_BE, len_be),
+                (AT_DATA, data),
+            ])
+        }
+    }
+
+    fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
+        if len == 0 || len > MAX_REQUEST_BYTES {
+            return Err(RequestError::Length);
+        }
+        if src >= MMIO_START || dst >= MMIO_START || src % 16 != dst % 16 {
+            return Err(RequestError::Alignment);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const T: TxnId = match TxnId::new(3) {
+            Some(t) => t,
+            None => panic!(),
+        };
+        fn at(x: u8, y: u8, addr: u32) -> Endpoint {
+            Endpoint { x, y, addr }
+        }
+        fn reg(r: &[(u64, u32); 10], off: u64) -> u32 {
+            r.iter().find(|(o, _)| *o == off).unwrap().1
+        }
+
+        #[test]
+        fn a_write_names_the_local_source_as_target() {
+            // MemoryMap.md:99-104: for a non-inline write NOC_TARG_ADDR is the
+            // *source* and NOC_RET_ADDR the destination -- the reverse of a read.
+            let w = Command::Write {
+                from_local: 0x2_0000,
+                to: at(4, 5, 0x3_0000),
+                len: 64,
+            };
+            let r = w.registers((3, 1), T).unwrap();
+            assert_eq!(reg(&r, initiator::TARG_ADDR_LO), 0x2_0000);
+            assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 3 | (1 << 6));
+            assert_eq!(reg(&r, initiator::RET_ADDR_LO), 0x3_0000);
+            assert_eq!(reg(&r, initiator::RET_ADDR_HI), 4 | (5 << 6));
+            assert_eq!(reg(&r, initiator::CTRL), CMD_WR | RESP_MARKED);
+            assert_eq!(reg(&r, initiator::PACKET_TAG), 3 << 10);
+        }
+
+        #[test]
+        fn a_read_returns_to_the_initiator() {
+            let rd = Command::Read {
+                from: at(4, 5, 0x3_0010),
+                to_local: 0x2_0010,
+                len: 16,
+            };
+            let r = rd.registers((3, 1), T).unwrap();
+            assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 4 | (5 << 6));
+            assert_eq!(reg(&r, initiator::RET_ADDR_HI), 3 | (1 << 6));
+            assert_eq!(reg(&r, initiator::CTRL), CMD_RD | RESP_MARKED);
+        }
+
+        #[test]
+        fn no_request_sets_l1_accumulate() {
+            let cmds = [
+                Command::Write {
+                    from_local: 0,
+                    to: at(1, 2, 0),
+                    len: 16,
+                },
+                Command::Read {
+                    from: at(1, 2, 0),
+                    to_local: 0,
+                    len: 16,
+                },
+                Command::MmioInline {
+                    to: at(1, 2, 0xFFB2_0100),
+                    data: 1,
+                },
+            ];
+            for c in cmds {
+                assert_eq!(
+                    reg(&c.registers((0, 0), T).unwrap(), initiator::CTRL) & (1 << 31),
+                    0
+                );
+            }
+        }
+
+        #[test]
+        fn hazards_are_refused() {
+            let inline_l1 = Command::MmioInline {
+                to: at(1, 2, 0x1000),
+                data: 1,
+            };
+            assert_eq!(
+                inline_l1.registers((0, 0), T),
+                Err(RequestError::InlineToL1)
+            );
+            let skew = Command::Write {
+                from_local: 0x10,
+                to: at(1, 2, 0x18),
+                len: 16,
+            };
+            assert_eq!(skew.registers((0, 0), T), Err(RequestError::Alignment));
+            let big = Command::Read {
+                from: at(1, 2, 0),
+                to_local: 0,
+                len: 16385,
+            };
+            assert_eq!(big.registers((0, 0), T), Err(RequestError::Length));
+            let mmio_copy = Command::Write {
+                from_local: 0,
+                to: at(1, 2, 0xFFB0_0000),
+                len: 16,
+            };
+            assert_eq!(mmio_copy.registers((0, 0), T), Err(RequestError::Alignment));
+            assert!(TxnId::new(16).is_none());
+        }
+    }
 }
 
 /// The Blackhole NoC #0 grid: which raw coordinates hold which kind of tile.

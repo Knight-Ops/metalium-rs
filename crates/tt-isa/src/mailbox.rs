@@ -11,14 +11,24 @@
 /// Byte offset of the mailbox within a tile's L1.
 pub const MAILBOX_BASE: u64 = 0x0010_0000;
 
+/// Offsets of the words the firmware runtime itself writes, from whichever base
+/// the image was linked with: [`MAILBOX_BASE`] for Tensix images,
+/// [`crate::eth::MAILBOX_BASE`] for the Ethernet one.
+pub mod offset {
+    pub const STATUS: u64 = 0x00;
+    pub const HEARTBEAT: u64 = 0x04;
+    pub const PANIC_CODE: u64 = 0x08;
+    pub const RESULT: u64 = 0x0C;
+}
+
 /// Firmware liveness and status. See [`status`].
-pub const STATUS: u64 = MAILBOX_BASE;
+pub const STATUS: u64 = MAILBOX_BASE + offset::STATUS;
 /// Monotonically incrementing counter, the heartbeat proper.
-pub const HEARTBEAT: u64 = MAILBOX_BASE + 0x04;
+pub const HEARTBEAT: u64 = MAILBOX_BASE + offset::HEARTBEAT;
 /// Set alongside [`status::PANICKED`] to say where.
-pub const PANIC_CODE: u64 = MAILBOX_BASE + 0x08;
+pub const PANIC_CODE: u64 = MAILBOX_BASE + offset::PANIC_CODE;
 /// Where a computation leaves its answer.
-pub const RESULT: u64 = MAILBOX_BASE + 0x0C;
+pub const RESULT: u64 = MAILBOX_BASE + offset::RESULT;
 /// Second result word, for results wider than 32 bits.
 pub const RESULT_HI: u64 = MAILBOX_BASE + 0x10;
 /// First operand, written by the host before the core is released.

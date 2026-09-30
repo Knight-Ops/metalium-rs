@@ -36,7 +36,7 @@ gate you have not seen reject something is not yet evidence.
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
-| 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
+| 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
 | 9 — Performance | `[ ]` | Silicon-only |
 
 ---
@@ -239,9 +239,10 @@ no answer.
       into bank 1 while the move read bank 0 again, and the first run's data back
       with no diagnostic. `SETDVALID` and `CLEARDVALID(Reset)` are left out of the
       safe surface on ttsim's and tt-metal#22383's say-so.
-- [ ] `NOC_CMD_WR_INLINE` must never target an L1 address. *(Needed once a core
-      drives an NIU; the host path does not.)*
-- [ ] `NOC_CMD_L1_ACC_AT_EN` must always be `false`.
+- [x] `NOC_CMD_WR_INLINE` must never target an L1 address. `niu::Command::MmioInline`
+      refuses an L1 destination (Phase 8).
+- [x] `NOC_CMD_L1_ACC_AT_EN` must always be `false`: `niu::Command` has no way to
+      set it.
 
 ### Tolerance policy
 
@@ -971,30 +972,113 @@ Widest uncertainty band in the plan, and sequenced last on purpose: building
 inter-chip transport before single-chip compute is correct is the most common way
 projects of this shape stall.
 
-- [ ] **Run a 2-week timeboxed spike against `bh_x2` first, then re-estimate.**
-      Far cheaper than originally scoped — no second card, no link training, and
-      cheaper again now that the spike no longer starts from enumeration: opening
-      `bh_x2` and getting one `Device` per chip is done and gated (Phase 1). What
-      remains is inter-chip *transport*.
-- [ ] Resolve: **Ethernet-tile reset sequencing is undocumented for Blackhole.**
-      There is no `BlackholeA0/EthernetTile/SoftReset.md`.
-- [ ] Resolve: **RISCV E0 is cooperatively shared with Tenstorrent firmware** — it
-      owns link training and calls into customer code. You cannot simply take it;
-      `ethdump` uses E1 exclusively. The contract is documented only in the
-      Wormhole tree.
-- [ ] Resolve: **the Blackhole Ethernet PIC is effectively undocumented.**
-- [ ] Resolve (open question 4): **is the NoC Overlay required?** There is no
-      `BlackholeA0/NoC/Overlay/` directory at all, yet five Blackhole pages link
-      into it. If it is needed, this is Wormhole-docs-plus-silicon work and the
-      estimate grows substantially.
-- [ ] Note: Ethernet tiles lack the Tensix conveniences — local data RAM is **not**
-      NoC-accessible and there are **no `pc` snapshots**.
-- [ ] **Gate (sim):** transfers between two chips under `bh_x2`; a model shards
-      across `bh_x4` and matches the single-chip run.
-- [ ] **Gate (silicon):** the same across two physical cards. Confirm Ethernet
-      reset and the E0 firmware contract on silicon specifically — exactly the
-      areas a simulator is most likely to model loosely, and ttsim's own README
-      flags multichip as less mature than single-chip.
+- [x] **Spike, on `bh_x2` and on the two cabled cards** (2026-09-30). All four
+      open unknowns are closed. Probes: `probe_eth.rs` (ttsim) and
+      `silicon_eth_survey.rs` (silicon, read-only), in steps that each touch
+      strictly more than the last. Findings: divergence rows 56-60, measurements
+      J and K.
+- [x] Resolved: **Ethernet reset.** `ethdump.c:362-451` has it: E1 is bit
+      `0x1000` of `SOFT_RESET_0` at `0xFFB1_21B0`, and its reset PC is at
+      `0xFFB1_4008`. Silicon reads `0x47000` (E0 running, E1 held), so changes are
+      a read-modify-write of E1's bit, never ethdump's whole-word `0`.
+      `step13_ethernet::rust_runs_on_e1` and
+      `silicon_eth_link::e1_heartbeat_on_a_{portless,live_link}_tile` pass. On the
+      live tile the link stayed Up and training Complete.
+- [x] Resolved: **the E0 contract is avoided.** E0 is never reset or loaded:
+      `EthCore::E0` has no load path, and every reset change touches one bit.
+      Customer code runs on E1, as ethdump does. WH `CallingIntoCustomerCode.md`
+      is not used.
+- [x] Resolved: **the Ethernet PIC is not needed.** Everything polls.
+- [x] Resolved (open question 4): **the NoC Overlay is not needed.** A TT-link
+      *L1 write* (`ETH_TXQ_CMD = 2`) writes straight into the partner's L1, with
+      sequence numbers and automatic resends. The host can drive one through a
+      TLB window with no firmware at all: `silicon_eth_link::host_driven_*`,
+      4/4 directions, 4096/4096 bytes, sentinel intact.
+- [x] **The Ethernet grid comes from the chip.** It is ARC tag 35
+      (`arc::tag::ENABLED_ETH`) giving `eth::Ethernet`, and an `EthTile` can only
+      be obtained from one, so a harvested tile cannot be named (the row-35
+      lesson). ttsim does not publish the tag, so the simulator uses
+      `Ethernet::FULL` and says so.
+- [x] **The link map comes from the chip.** `Device::eth_link_state` reads the
+      port status and the base firmware's chip-info exchange: `BOOT_RESULTS`
+      240..246 is the tile itself and 248..254 its partner. On the cabled pair
+      that gives E4 <-> E4 and E7 <-> E7. ttsim does not model the exchange
+      (row 58), so its map is measured (`step13_ethernet::BH_X2_LINKS`).
+- [x] **Firmware-owned Ethernet L1 is refused, not noted.**
+      `eth::FIRMWARE_L1` (measured, K) is checked by `eth_read`/`eth_write`/
+      `eth_tt_link_write`. `E1_RESET_PC` is inside the *Tensix* local-RAM aperture
+      guard, and is reached by one unchecked write on an Ethernet-by-construction
+      tile.
+- [x] The runtime's own mailbox is now a link-time symbol (`--defsym` from
+      `tt-isa`), so one runtime serves Tensix images (`0x100000`) and the
+      Ethernet image (`0x1F000`, inside the 512 KiB Ethernet L1 that `0x100000` overruns). The E1 gate was watched
+      failing with the release removed.
+- [x] Note: Ethernet tiles lack the Tensix conveniences. Local data RAM is **not**
+      NoC-accessible and there are **no `pc` snapshots**. The heartbeat therefore
+      lives in L1, and so will everything E1 reports.
+- [x] **8.1 The NIU request initiator**, `tt_isa::noc::niu::Command`. It is the
+      first device-initiated NoC traffic in this workspace. A command is an L1
+      read, an L1 write, or an inline MMIO store, and that is all it can be.
+      There is no field for `L1_ACC_AT_EN`, broadcast or linked VCs. An inline
+      write to L1 (the Blackhole bug), an L1 copy whose addresses are not
+      congruent mod 16, and a length over 16 KiB are all refused. For a write, the
+      source sits in `NOC_TARG_ADDR`, as `MemoryMap.md:99-104` has it. Unit tests
+      cover each refusal. ttsim refuses a read without `RESP_MARKED` (row 61),
+      so every command sets it, which the specification makes harmless.
+- [x] **8.2 `tt_device::ethernet`:** `ethernet_grid`, `eth_link_state`,
+      `eth_read`/`eth_write` (both refuse firmware L1), `eth_tt_link_write`
+      (refuses misalignment and firmware L1 at either end), and
+      `load_and_start_e1` / `park_e1` (a read-modify-write of E1's bit only).
+- [x] **8.3 The `eth_e1` data mover** (`tt_isa::eth::mover` is the shared
+      contract). Tensix L1 -> NoC read -> TT-link -> checksum wait -> NoC write
+      -> Tensix L1, then an acknowledgement back over the link, so the host
+      waits on the *sending* chip only. The receiver will not forward until the
+      landed data matches the record's checksum, because nothing documented
+      orders RX-queue L1 writes. The record carries its sequence number in both
+      16-byte halves. The cross-chip gate was watched failing with the
+      receiver's forward removed.
+- [x] **8.4 `tt_kernels::link`:** `discover` pairs tiles from both chips'
+      chip-info exchange, and requires each side to name the other. `Mover`
+      provides `start`, `stage`, `send` (with a host deadline, returning
+      `TimedOut` rather than hanging) and `landed`. `bh_x4` is pinned
+      (`libttsim_bh_x4.so`, same tag) and mapped: it is a ring 0-1-2-3-0 with
+      two links per pair (`tt_tests::topology`).
+- [x] **8.5 Sharded matmul and training.** `tt_kernels::shard::Fabric` splits
+      `N` in 32-column tiles across chips. Each chip's share runs through
+      `matmul::plan`'s chunking with `K` whole, so the result is
+      **bit-identical** to single-chip. Operands enter and results leave through
+      chip 0 over Ethernet only, relayed through intermediate chips (chip 2 of
+      the ring goes through chip 1). Programs and descriptors go to each chip
+      over its own PCIe (the control plane). In `burn-tt`, `MeshEngine` puts a
+      whole fabric behind the existing `Engine` trait as one Burn device, so no
+      `attach_mesh` was needed (`kmd_mesh_engine` on silicon). The shard gate
+      was watched failing with `B` delivered 16 bytes off.
+- [x] **Gate (sim):** `step13_ethernet` (11 gates: link state, TT-link writes
+      both ways, a corrupted byte moves exactly one byte, the wrong tile
+      receives nothing, refusals, E1 heartbeat and its held control, the mover
+      staged both ways, Tensix -> Tensix across chips, no receiver means a
+      timeout). `step14_shard`: the MNIST first layer on `bh_x2`, and a
+      four-chip ring matmul with relays, both bit-identical to single-chip.
+      `step12_mnist::the_mlp_trains_sharded_*`: the reduced run on 2 and on 4
+      chips reproduces `mnist_reduced.txt` bit for bit.
+- [x] **Gate (silicon), across the cable:** `silicon_eth_link`, 10/10:
+      - host-driven TT-link, 4 directions;
+      - E1 on a port-less tile and on a live one;
+      - the mover staged both ways at 128 KiB;
+      - 128 KiB Tensix -> Tensix across cards, acknowledged in 0.67 ms;
+      - no receiver means a timeout;
+      - the sharded `[64,784] @ [784,128]` HiFi4 matmul, bit-identical to
+        single-chip.
+
+      `step12_mnist::the_mlp_trains_sharded_over_two_chips_matching_the_golden`
+      passes on the two cards: **the loss curve is the golden, bit for bit.**
+- [ ] **Throughput.** 128 KiB in 0.67 ms is about 195 MB/s against 400 GbE, spent
+      mostly on the E1 checksum wait, 4 KiB TT-link commands and host polling.
+      Pipelining (double-buffered `TX_STAGE`/`RX_LAND`, larger TT-link commands,
+      several links at once) is Phase 9.
+- [ ] **Data-parallel training** (a gradient all-reduce over the links) is not
+      done. It reorders sums, so it needs a weaker claim than the golden, and
+      `N`-sharding already makes Ethernet load-bearing.
 
 ---
 
@@ -1119,7 +1203,7 @@ Documented, not speculative. These bite in Phases 2–4.
       Prototype against silicon before committing to a GDB-stub architecture.
 - [x] **3.** Does `burn-fusion` compose with a hand-written backend? **Yes** --
       see Phase 7 and `RUST_IMPL_PLAN.md`, "The Burn surface, as pinned".
-- [ ] **4.** Is the NoC Overlay required for multi-chip? Resolve in the Phase 8 spike.
+- [x] **4.** Is the NoC Overlay required for multi-chip? **No.** TT-link L1 writes carry the data (Phase 8).
 - [ ] **5.** PCIe DMA engines have no register-level documentation anywhere in the
       repo. Plan on TLB-window MMIO for bulk transfer; revisit only if bandwidth
       demands it, and expect driver-source reverse engineering.

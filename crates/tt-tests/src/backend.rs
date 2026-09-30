@@ -18,6 +18,12 @@ use tt_device::Device;
 /// so a gate that runs somewhere else is responsible for its own hygiene.
 pub const GATE_TILE: (u8, u8) = (3, 4);
 
+/// The second tile a multi-chip gate uses on every chip: relay scratch for
+/// data passing through, and on chip 0 the inbox results return to
+/// (`tt_kernels::shard`). Inside the surviving columns of both cards here (X 1..7
+/// and 10..14 of translated space).
+pub const RELAY_TILE: (u8, u8) = (4, 4);
+
 /// Fail unless this build's [`Dev`] reaches a real card.
 ///
 /// For the silicon-only twins. Several of them once compiled under

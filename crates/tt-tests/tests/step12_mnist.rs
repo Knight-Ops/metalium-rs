@@ -392,3 +392,39 @@ fn the_mlp_trains_on_full_mnist() {
         assert!(acc >= 0.9, "the device-trained model must reach 90%: {acc}");
     });
 }
+
+/// Phase 8: the reduced run with every matmul split along `N` across `chips`
+/// chips joined by Ethernet (`tt_kernels::shard`), operands entering and
+/// results leaving through chip 0. The claim is the strong one: the loss curve
+/// is the single-chip golden, bit for bit -- sharding along `N` with `K` whole
+/// changes no accumulation order.
+fn sharded_training_matches_the_golden(chips: usize) {
+    let split = mnist::load(true);
+    let init = init();
+    let want = golden().unwrap_or_else(|| {
+        panic!(
+            "{} is missing: run the_mlp_trains_on_a_reduced_dataset with TT_BLESS=1",
+            golden_path().display()
+        )
+    });
+    tt_tests::burn_device::with_mesh_device(Config::default(), chips, |d| {
+        let (tt, _) = train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d);
+        let got: Vec<u32> = tt.iter().map(|l| l.to_bits()).collect();
+        let first = got.iter().zip(&want).position(|(g, w)| g != w);
+        assert_eq!(
+            got, want,
+            "the {chips}-chip loss curve differs from the golden, first at step {first:?}"
+        );
+    });
+}
+
+#[test]
+fn the_mlp_trains_sharded_over_two_chips_matching_the_golden() {
+    sharded_training_matches_the_golden(2);
+}
+
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn the_mlp_trains_sharded_round_a_four_chip_ring_matching_the_golden() {
+    sharded_training_matches_the_golden(4);
+}
