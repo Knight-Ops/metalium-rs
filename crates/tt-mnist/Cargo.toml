@@ -1,0 +1,21 @@
+[package]
+name = "tt-mnist"
+description = "Train an MNIST classifier in pure Rust on a Tenstorrent Blackhole card: one self-contained binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tt-mnist"
+path = "src/main.rs"
+
+[dependencies]
+burn.workspace = true
+burn-flex.workspace = true
+burn-tt.workspace = true
+miniz_oxide = "0.8"
+
+[build-dependencies]
+miniz_oxide = "0.8"

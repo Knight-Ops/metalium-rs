@@ -1019,6 +1019,18 @@ two findings shape it: the GDDR is reachable and gated on both cards (divergence
 and under this VM the host's MMIO is uncached whatever the guest maps (measurement M), so bulk
 upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off the step.
 
+**Where it stands, and what is next (2026-09-30).** Full MNIST trains at **5.8 ms/step on one
+card** (from 224 at the start of the phase), bit for bit on the Phase 7 golden, with the dataset,
+weights, activations and gradients resident in GDDR. About 16 KB crosses PCIe per step (`g2`, the
+two biases and their gradients, and the logits); the loss stays on the host. What is left is
+almost all compute on **a single Tensix tile**, sequenced by the host one round trip at a time. In
+order: spread matmul and element-wise work over many tiles (9.6); let each tile's B mover sequence
+gather, compute and scatter from an L1 work queue so an op is one host descriptor (9.7); double-
+buffer so data movement overlaps compute (9.8); move element-wise from the B core's FP32 unit to
+the SFPU (9.9); tilize on the device to cut the 2.7 s preload (9.10); make the two-card mesh
+device-resident and concurrent (9.11); and put the loss on the SFPU (9.12). The checklist's Phase 9
+section tracks each.
+
 **ttsim does not model cycle-accurate timing.** It remains useful here for *correctness* of the
 more aggressive pipelined kernels — which is where correctness is hardest — but every
 performance number must come from hardware. Keep using the simulator as the correctness gate

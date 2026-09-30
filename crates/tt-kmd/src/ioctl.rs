@@ -7,12 +7,20 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 
 use crate::abi;
 
+/// `ioctl`'s request argument, as the libc declares it: `c_ulong` in glibc,
+/// `c_int` in musl (which the static `tt-mnist` build uses). Every request
+/// here is `_IO(0xFA, n)`, which fits either.
+#[cfg(target_env = "musl")]
+type Request = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type Request = libc::c_ulong;
+
 /// Issue an ioctl whose argument is a single `#[repr(C)]` struct.
 fn call<T>(fd: BorrowedFd<'_>, request: u64, arg: &mut T) -> std::io::Result<()> {
     // SAFETY: `arg` is a live, correctly-sized, correctly-aligned instance of the
     // struct this request number expects — which is what
     // `crates/tt-kmd/tests/abi_layout.rs` checks against the real header.
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request as libc::c_ulong, arg as *mut T) };
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request as Request, arg as *mut T) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -57,7 +65,7 @@ pub fn query_mappings(fd: BorrowedFd<'_>, count: u32) -> std::io::Result<Vec<abi
     let rc = unsafe {
         libc::ioctl(
             fd.as_raw_fd(),
-            abi::QUERY_MAPPINGS as libc::c_ulong,
+            abi::QUERY_MAPPINGS as Request,
             buf.as_mut_ptr(),
         )
     };

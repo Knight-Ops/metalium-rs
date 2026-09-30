@@ -4849,6 +4849,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-mnist"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-flex",
+ "burn-tt",
+ "miniz_oxide 0.8.9",
+]
+
+[[package]]
 name = "tt-tests"
 version = "0.1.0"
 dependencies = [

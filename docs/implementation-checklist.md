@@ -1246,6 +1246,54 @@ tensors in `burn-tt`, 9.5 gates.
       device, with fallback counted by `Device::traffic`.
 - [ ] **9.5** Reduced MNIST golden bit for bit with everything resident; PCIe
       bytes per steady-state step asserted.
+- [x] **`tt-mnist`: the milestone as one binary.** A shippable crate whose
+      binary trains the MNIST MLP through Burn on the card, with MNIST
+      (deflated at build time, `miniz_oxide`) and the firmware embedded, and
+      optionally the same run on the host for comparison. Builds static for
+      `x86_64-unknown-linux-musl` (15 MB stripped; `tt-kmd`'s ioctl request type
+      follows the libc). Full epoch on one card: 91.96% test accuracy, 6.8
+      ms/step static, 5.8 with glibc. See `crates/tt-mnist/README.md`.
+
+### Phase 9 -- next steps, in order
+
+At 5.8 ms/step nearly everything left is compute on **one** of 120 Tensix
+tiles, done in turn. The next slices, each gated as the ones above were
+(ttsim for correctness, bit for bit against the golden and `burn-flex`; both
+cards for time):
+
+- [ ] **9.6 Many tiles.** A `Session` over a set of tiles, each with its
+      resident roles and its own B mover. Matmul split by output tile blocks
+      (`M` and `N`, `K` whole, so still bit-identical), element-wise and
+      column sums split by tile. The movers already read any channel, so the
+      interleaved placement feeds them all. Expected: matmul and element-wise
+      (4.8 ms of the 5.8) scale with tile count until the host's descriptor
+      round trips dominate -- which is the next item.
+- [ ] **9.7 One launch per op, not per chunk.** Today the host submits every
+      mover list and every kernel generation and polls for each: tens of
+      microseconds per round trip, several per op. Move the sequencing onto
+      the device: a per-tile work queue in L1 that the B mover drains (gather
+      -> signal the roles -> scatter), with the roles waiting on an L1 flag
+      rather than on the host. The host then writes one descriptor per op and
+      polls once.
+- [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
+      next chunk while the roles compute this one, and scatters the previous
+      one (the `Src`/`Dst` double buffering and the hazards-as-data wait
+      planner from the plan belong here).
+- [ ] **9.9 Element-wise on the SFPU.** Unpack to `Dst`, `SFPADD`/`SFPMUL`,
+      pack: the same IEEE results for normals (`fma_bh` measured it), at vector
+      width instead of one datum at a time on the B core. Needs whole-tile
+      `UnpackToDst`/pack, which Phase 5 did for 128 datums only.
+- [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
+      host tilizing: tilize in parallel, or upload row-major and let the movers
+      tilize on the device.
+- [ ] **9.11 The mesh, device-resident.** Per-chip `Session`s with GDDR and
+      resident roles, chips running concurrently, the Ethernet movers moving
+      tiles between GDDR rather than host-staged operands; data-parallel
+      training over the two cards. First find why the full two-card run's
+      accuracy is 0.9195 against one card's 0.9196.
+- [ ] **9.12 Loss on the device**: softmax and log on the SFPU, so the logits
+      stop crossing PCIe (the last per-step download bigger than a bias).
+
 - [ ] A `Device` write fence as API (Phase 8's open item).
 - [ ] `MOP`/`REPLAY` expansion.
 - [ ] Three-thread pipelining: unpack on T0, math on T1, pack on T2.
