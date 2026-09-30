@@ -1144,3 +1144,66 @@ fn m20_src_formats_declared_to_the_matrix_unit() {
         }
     }
 }
+
+/// Is stale `LaneConfig.BLOCK_DEST_MOV` what drops the columns?
+///
+/// `MOVA2D`/`MOVB2D`/`MOVD2A` skip column `c` when bit `c & 1` of
+/// `LaneConfig[c / 2].BLOCK_DEST_MOV` is set (`SFPCONFIG.md`, `MOVA2D.md:91`), a
+/// per-column-pair mechanism that fits losses fixed by column across rows and
+/// tiles. `LaneConfig` is Vector Unit state that leaving SFPU soft reset should
+/// zero; this zeroes it explicitly -- `SFPCONFIG` with `VD = 15`,
+/// `MOD1_IMM16_IS_VALUE`, `Imm16 = 0` -- before the m20 path.
+#[test]
+fn m21_lane_config_zeroed_before_the_move() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    for zero_lane_config in [false, true] {
+        for unpacker in [Unpacker::SrcA, Unpacker::SrcB] {
+            for attempt in 0..3 {
+                let mut p = Vec::new();
+                if zero_lane_config {
+                    p.push(tt_isa::isa::generated::encode::sfpconfig(0, 15, 1).unwrap());
+                    p.push(backend::wait_for_sfpu(backend::Before::EVERYTHING).unwrap());
+                }
+                p.extend(src_thread_config());
+                let mut words = ConfigWords::new();
+                let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+                unpack_src_config(&mut words, unpacker, descriptor, STAGE, 4);
+                words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+                let mut buf = vec![sfpu::nop(); words.program_len()];
+                let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+                p.extend_from_slice(&buf[..k]);
+                p.push(set_adc_x(unpacker, 0, n as u32 - 1));
+                p.push(unpack_src_instruction(unpacker, true));
+                match unpacker {
+                    Unpacker::SrcA => {
+                        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+                        p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+                    }
+                    Unpacker::SrcB => {
+                        p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+                        for r in 0..2 {
+                            p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                        }
+                    }
+                }
+                p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+                in_device(|dev| {
+                    let stage = [(STAGE, staged.as_slice())];
+                    let out = harness::run(dev, &Run::new(&p).stage(&stage).dump_rows(2));
+                    let bad: Vec<String> = (0..n)
+                        .filter(|&i| out.dst[i] != datums[i])
+                        .map(|i| format!("{i}:{:08x}", out.dst[i]))
+                        .collect();
+                    let key = format!("{unpacker:?}").to_lowercase();
+                    measure(
+                        &format!("lane_config_zeroed_{zero_lane_config}.{key}.run{attempt}"),
+                        format!("bad [{}]", bad.join(" ")),
+                    );
+                });
+            }
+        }
+    }
+}
