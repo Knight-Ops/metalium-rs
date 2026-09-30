@@ -201,6 +201,35 @@ pub const fn write_word(gpr: u32, addr32: u16) -> Result<Instruction, EncodeErro
     }
 }
 
+/// Zero every `Config` word below `GLOBAL_CFGREG_BASE_ADDR32`, on purpose.
+///
+/// The spec's own whole-configuration reset: any write to `STATE_RESET_EN` other
+/// than by `RMWCIB` does it (`BackendConfiguration.md:40`). [`write_word`] refuses
+/// that write because an *accidental* one looks like an ordinary field write;
+/// this is the deliberate form. Needed on silicon, where `Config` outlives the
+/// program that wrote it -- including tt-metal's: a tile it had used still held
+/// `ALU_ACC_CTRL_SFPU_Fp32_enabled = 1`, which changes how `SFPSTORE` lays FP32
+/// into `Dst`, and the step 4 gates read the previous run's product. ttsim starts
+/// each run with `Config` zero.
+///
+/// `SETDMAREG` x2, `WRCFG`, then a wait on the Configuration Unit (C12) that
+/// holds every following instruction back until the reset has landed.
+pub const fn reset_config(gpr: u32) -> Result<[Instruction; 4], EncodeError> {
+    let pair = match set_gpr(gpr, 0) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let reset = match encode::wrcfg(gpr, 0, STATE_RESET_EN_ADDR32 as u32) {
+        Ok(i) => i,
+        Err(e) => return Err(EncodeError::from_isa(e)),
+    };
+    let wait = match stallwait(Before::EVERYTHING.mask(), cond::CONFIG_BUSY) {
+        Ok(i) => i,
+        Err(e) => return Err(e),
+    };
+    Ok([pair[0], pair[1], reset, wait])
+}
+
 /// `WRCFG` in its 128-bit form: copy GPRs `gpr..gpr+4` into the four `Config` words
 /// of `span`.
 ///

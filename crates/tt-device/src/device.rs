@@ -69,6 +69,51 @@ pub struct Device<T: Transport> {
     /// `(NoC index, x, y, core)`. Read by the local-data-RAM accessors, which
     /// must not touch a core's RAM during the zeroing that follows a release.
     pub(crate) released: HashMap<(u8, u8, u8, Core), Instant>,
+    /// Did [`Device::open`] raise the chip to its busy operating point? If so,
+    /// dropping the `Device` returns it to idle.
+    busy: bool,
+}
+
+/// Who manages the chip's operating point (ARC `AICLK_GO_BUSY` / `GO_LONG_IDLE`).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum PowerPolicy {
+    /// Raise the chip to busy on open, and return it to idle on drop. The
+    /// default, and what UMD does.
+    #[default]
+    Busy,
+    /// Send nothing: the caller calls [`Device::set_busy`] itself, before any
+    /// compute. For explicit power management.
+    Manual,
+}
+
+/// Return the chip to its idle operating point if [`Device::open`] raised it.
+///
+/// **One `Device` per chip.** Busy/idle is chip-wide ARC state with no
+/// reference count: if two `Device`s -- in this process or another, tt-metal
+/// included -- hold the same chip, the first to drop idles it under the other,
+/// which then computes at the operating point where the Matrix Unit's `Src`
+/// reads are unreliable (divergence row 48). A failure here can only be
+/// reported, not returned; the worst case is a chip left busy, which is safe.
+impl<T: Transport> Drop for Device<T> {
+    fn drop(&mut self) {
+        if !self.busy {
+            return;
+        }
+        let Ok(w) = self.alloc_window(crate::tlb::WindowKind::TwoMib) else {
+            eprintln!(
+                "tt-device: no TLB window to return chip {:?} to idle",
+                self.chip
+            );
+            return;
+        };
+        if let Err(e) = self.set_busy(&w, false) {
+            eprintln!(
+                "tt-device: could not return chip {:?} to idle: {e}",
+                self.chip
+            );
+        }
+        self.free_window(w);
+    }
 }
 
 /// Refuse a plain access to the local-data-RAM aperture.
@@ -107,7 +152,18 @@ impl<T: Transport> Device<T> {
     ///
     /// Every address constant in this crate is Blackhole-specific; against another
     /// part they are merely plausible, which is the worst kind of wrong.
-    pub fn open(mut transport: T) -> Result<Self> {
+    pub fn open(transport: T) -> Result<Self> {
+        Self::open_with_power(transport, PowerPolicy::Busy)
+    }
+
+    /// [`Device::open`], choosing who manages the chip's operating point.
+    ///
+    /// [`PowerPolicy::Busy`] is what `open` does. [`PowerPolicy::Manual`] sends no
+    /// power message on open or on drop: the caller owns the operating point and
+    /// must call [`Device::set_busy`] before any compute, because at idle the
+    /// Matrix Unit's `Src` reads are unreliable (divergence row 48). For power
+    /// management that raises the clock only around work.
+    pub fn open_with_power(mut transport: T, power: PowerPolicy) -> Result<Self> {
         transport.verify_is_blackhole()?;
 
         // Window 201 belongs to the kernel driver and must never be handed out --
@@ -122,13 +178,27 @@ impl<T: Transport> Device<T> {
         // would let a `Device` claim to be a chip it does not address.
         let chip = transport.chip();
 
-        Ok(Device {
+        let mut dev = Device {
             transport,
             chip,
             free,
             shadow: BTreeMap::new(),
             released: HashMap::new(),
-        })
+            busy: false,
+        };
+
+        // Compute needs the busy operating point; see `Device::set_busy`. Held
+        // for the life of the `Device`, and given back by `Drop`, as UMD's
+        // `LocalChip` does. The ARC message touches only the ARC tile, which is
+        // safe before the harvesting mask or the translation state is known.
+        if power == PowerPolicy::Busy && !dev.transport.is_simulated() {
+            let w = dev.alloc_window(crate::tlb::WindowKind::TwoMib)?;
+            let result = dev.set_busy(&w, true);
+            dev.free_window(w);
+            result?;
+            dev.busy = true;
+        }
+        Ok(dev)
     }
 
     pub fn chip(&self) -> ChipId {
@@ -740,5 +810,19 @@ mod tests {
         // B's RAM is 8 KiB, so the same offset is fine there.
         dev.local_ram_write(&w, t, Core::B, size - 4, &[0; 8])
             .unwrap();
+    }
+
+    // -- Power policy ----------------------------------------------------------
+
+    /// A simulated transport never sends power messages, under either policy;
+    /// and the policy is what `open` defaults to.
+    #[test]
+    fn power_policy_is_busy_by_default_and_inert_on_the_simulator() {
+        assert_eq!(PowerPolicy::default(), PowerPolicy::Busy);
+        let dev = device();
+        assert!(!dev.busy, "no ARC to message on a simulated transport");
+        let manual =
+            Device::open_with_power(FakeTransport::default(), PowerPolicy::Manual).unwrap();
+        assert!(!manual.busy);
     }
 }

@@ -894,6 +894,32 @@ silicon-discovery work that the docs may have obviated.
 
 ---
 
+### Hazards as data (design item, from the silicon campaign)
+
+Every ordering requirement found on silicon -- a consumer must not start before a
+producer's result is visible -- has so far been met with a hand-chosen `STALLWAIT`,
+and once with a fixed run of `nop`s that was both wrong and expensive. A kernel
+compiler needs these as *facts* it can schedule around, not as barriers:
+
+- **Per-instruction effects**, generated alongside the encoding table: which unit
+  executes it (unpacker 0/1, packer, Matrix Unit, SFPU, Configuration, Scalar,
+  Mover, Sync), and which state it reads and writes (`Src` A/B bank and rows,
+  `Dst` rows, `Config` words, `ThreadConfig` entries, GPRs, ADCs, RWCs).
+- **Visibility rules** between them, each with its source: `WRCFG` lands 2 cycles
+  later (`ConfigurationUnit.md`); a `Dst` write is unreadable for 4 cycles and only
+  Matrix Unit and `PACR` readers are stalled for it (`Dst.md:101`); an unpack into
+  `Src` is consumable once the bank is handed over (`FlipSrc`), which the Matrix
+  Unit waits for by itself; `SFPMAD` results and the cases automatic stalling misses
+  (`Instruction::stalls_automatically_after_mad`, already data).
+- **A wait planner** that, for each producer->consumer pair, emits the minimal
+  `STALLWAIT` -- the producer's condition, the *consumer's* block bits
+  (`backend::Before`) -- so everything independent keeps flowing, and places
+  independent instructions into fixed-latency windows instead of `nop`s.
+
+Correctness of the planner is checked on ttsim, which models the dependencies but
+not the timing; the windows' lengths and the throughput gained are silicon-only
+(Phase 9).
+
 ## Hardware bug and caveat register
 
 Every item is documented in the spec. **These are not speculative.** Tier 1 will bite in

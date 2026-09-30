@@ -419,8 +419,9 @@ pub fn pack_instruction(read_intf_sel: u32, last: bool) -> Instruction {
         .unwrap()
 }
 
-/// Put the issuing thread's own Tensix state back to what ttsim starts with:
-/// every `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.
+/// Put the tile's configuration and the issuing thread's own Tensix state back to
+/// what ttsim starts with: `Config` below the global block zero, every
+/// `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.
 ///
 /// None of it is touched by anything the host can do from outside -- the
 /// backend soft-reset pulse resets the units, not the per-thread state -- so on
@@ -436,10 +437,14 @@ pub fn thread_state_reset() -> Vec<Instruction> {
         .iter()
         .map(|(_, f)| f.addr32())
         .collect();
-    let mut p: Vec<Instruction> = entries
-        .into_iter()
-        .map(|addr32| ThreadConfigEntry::zeroed(addr32).encode().unwrap())
-        .collect();
+    // `Config` first: it is shared, and tt-metal (or an earlier gate) may have
+    // left any of it set (`backend::reset_config`).
+    let mut p: Vec<Instruction> = tt_isa::backend::reset_config(SCRATCH_GPR).unwrap().to_vec();
+    p.extend(
+        entries
+            .into_iter()
+            .map(|addr32| ThreadConfigEntry::zeroed(addr32).encode().unwrap()),
+    );
     // RWCs: set each counter (and its carry register) to zero, and the fidelity
     // phase; no bank flips (`SETRWC.md`).
     p.push(

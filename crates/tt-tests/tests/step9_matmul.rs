@@ -72,16 +72,12 @@ fn fidelity_base(phase: u16) -> Instruction {
 
 /// Configure, stage both operands, zero `Dst`, point the RWCs at the operands,
 /// then hand the loaded banks to `body` for the Matrix Unit work.
-fn program(na: u32, nb: u32, body: Body) -> Vec<Instruction> {
-    let mut p = src_thread_config();
-    // Address modifier 0 moves nothing; 1 advances the fidelity phase only (with
-    // the measured Blackhole `AddrMod` position; divergence row 42).
-    p.push(thread_entry(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0));
-    p.push(thread_entry(thread::ADDR_MOD_DST_SEC0_DestIncr, 0));
-    p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
-    p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1));
-    p.push(fidelity_base(0));
-
+fn program(na: u32, nb: u32, body: Body) -> (Vec<Instruction>, Vec<Instruction>) {
+    // Split the way LLK splits it (`harness::Roles`): the unpacks on thread 0,
+    // everything the Matrix Unit does on thread 1. The address modifiers, the
+    // fidelity base and the RWCs are the *math* thread's `ThreadConfig` and
+    // counters, so they are set there.
+    let mut up = src_thread_config();
     let mut words = ConfigWords::new();
     unpack_src_config(
         &mut words,
@@ -103,27 +99,33 @@ fn program(na: u32, nb: u32, body: Body) -> Vec<Instruction> {
     words
         .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
         .unwrap();
-    let mut buf = [sfpu::nop(); 80];
+    let mut buf = vec![sfpu::nop(); words.program_len()];
     let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
-    p.extend_from_slice(&buf[..k]);
+    up.extend_from_slice(&buf[..k]);
 
     let unpack = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let banks = Banks::after_reset();
-    p.push(set_adc_x(Unpacker::SrcA, 0, na - 1));
+    up.push(set_adc_x(Unpacker::SrcA, 0, na - 1));
     let (i, banks) = banks.unpack_a(unpack).unwrap();
-    p.push(i);
-    p.push(set_adc_x(Unpacker::SrcB, 0, nb - 1));
+    up.push(i);
+    up.push(set_adc_x(Unpacker::SrcB, 0, nb - 1));
     let (i, banks) = banks.unpack_b(unpack).unwrap();
-    p.push(i);
-    // `MVMUL` waits for bank ownership by itself, but `ZEROACC` and the RWC
-    // setup do not; hold the Matrix Unit until both unpacks land.
-    p.push(backend::wait_for_unpacker0(Before::MATRIX).unwrap());
-    p.push(backend::wait_for_unpacker1(Before::MATRIX).unwrap());
+    up.push(i);
+    up.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+    up.push(backend::wait_for_unpacker1(Before::EVERYTHING).unwrap());
 
+    let mut math = vec![tt_tests::datapath::state_id()];
+    // Address modifier 0 moves nothing; 1 advances the fidelity phase only (with
+    // the measured Blackhole `AddrMod` position; divergence row 42).
+    math.push(thread_entry(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0));
+    math.push(thread_entry(thread::ADDR_MOD_DST_SEC0_DestIncr, 0));
+    math.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
+    math.push(thread_entry(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1));
+    math.push(fidelity_base(0));
     // `SrcAVal` is four bits, so 16 takes two steps: set 8, then add the carried
     // 8 (`SETRWC.md`: `if (SrcACr) SrcAVal += RWC.SrcA_Cr`).
-    p.push(encode::Setrwc::ZERO.src_a(1).src_a_val(8).encode().unwrap());
-    p.push(
+    math.push(encode::Setrwc::ZERO.src_a(1).src_a_val(8).encode().unwrap());
+    math.push(
         encode::Setrwc::ZERO
             .src_a(1)
             .src_a_cr(1)
@@ -136,12 +138,11 @@ fn program(na: u32, nb: u32, body: Body) -> Vec<Instruction> {
             .encode()
             .unwrap(),
     );
-    // All of `Dst`: ttsim refuses `UseDst32b` in every mode (row 40), and mode 3
-    // is the one whose meaning does not depend on it.
-    p.push(encode::Zeroacc::ZERO.mode(3).encode().unwrap());
-    body(banks, &mut p);
-    p.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
-    p
+    // All of `Dst`: mode 3 is `CLR_ALL` in LLK's encoding too (row 40).
+    math.push(encode::Zeroacc::ZERO.mode(3).encode().unwrap());
+    body(banks, &mut math);
+    math.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
+    (up, math)
 }
 
 /// One `MVMUL` at `dst_row`, releasing both operands.
@@ -158,7 +159,7 @@ fn once(dst_row: u32) -> Body {
 fn run(a: &MatA, b: &MatB, body: Body) -> Vec<u32> {
     let (sa, na) = stage_operand(SRC_A_ROW, a);
     let (sb, nb) = stage_operand(SRC_B_ROW, b);
-    let p = program(na, nb, body);
+    let (unpack, math) = program(na, nb, body);
     // `fork_scope` gives the child no return channel.
     let path = std::env::temp_dir().join(format!(
         "ttmvmul-{}-{:?}.bin",
@@ -166,9 +167,14 @@ fn run(a: &MatA, b: &MatB, body: Body) -> Vec<u32> {
         std::thread::current().id()
     ));
     harness::in_device(|dev| {
+        let roles = harness::Roles {
+            unpack: &unpack,
+            math: &math,
+            pack: &[],
+        };
         let out = harness::run(
             dev,
-            &Run::new(&p)
+            &Run::roles(roles)
                 .stage(&[(STAGE_A, &sa), (STAGE_B, &sb)])
                 .dump_rows(16),
         );
@@ -458,4 +464,24 @@ fn mvmul_addr_mod_sits_one_bit_lower_on_blackhole() {
     // so both land on row 0.
     let dst = run(&identity(), &b, body(wormhole & 0x0001_c000));
     assert_block(&dst, 0, &doubled, "both MVMULs, Wormhole addr_mod(1)");
+}
+
+/// The whole identity result, printed next to what it should be. Silicon only:
+/// a diagnostic for the open `Src`-path losses, not a claim.
+#[cfg(feature = "silicon")]
+#[test]
+fn dump_the_identity_block() {
+    let mut b = [[0f32; 16]; 8];
+    for (k, v) in b.iter_mut().flatten().enumerate() {
+        *v = 1.0 + k as f32;
+    }
+    let dst = run(&identity(), &b, once(0));
+    for (r, want_row) in b.iter().enumerate() {
+        let got: Vec<String> = (0..16)
+            .map(|c| format!("{:5}", f32::from_bits(dst[r * ROW + c])))
+            .collect();
+        let want: Vec<String> = want_row.iter().map(|w| format!("{w:5}")).collect();
+        println!("row {r} got  {}", got.join(" "));
+        println!("row {r} want {}", want.join(" "));
+    }
 }

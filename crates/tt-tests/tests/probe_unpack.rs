@@ -622,10 +622,32 @@ fn the_thread_state_reset_tail_executes() {
     let reset = tt_tests::datapath::thread_state_reset();
     let tail: Vec<Instruction> = reset
         .into_iter()
-        .filter(|i| i.def().mnemonic() != "SETC16")
+        .filter(|i| ["SETRWC", "SETADCXY", "SETADCZW"].contains(&i.def().mnemonic()))
         .collect();
     assert_eq!(tail.len(), 3, "SETRWC, SETADCXY, SETADCZW");
     assert!(survives(|dev| {
         let _ = run(dev, &[], &tail, 1);
+    }));
+}
+
+/// ttsim does not model `STATE_RESET_EN` (`tensix_cfg_wr32: reg=4`,
+/// divergence row 49), which is one reason `backend::reset_config` runs only in
+/// the silicon per-thread reset. Watched with a control of the same shape.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn ttsim_does_not_model_state_reset_en() {
+    let tail = |p: &mut Vec<Instruction>| {
+        p.extend(sfpu::load_f32(0, 1.5f32.to_bits()).unwrap());
+        p.push(sfpu::store(0, sfpu::store_format::FP32, 0, 0).unwrap());
+    };
+    let mut reset = tt_isa::backend::reset_config(SCRATCH_GPR).unwrap().to_vec();
+    tail(&mut reset);
+    assert!(!survives(|dev| {
+        let _ = run(dev, &[], &reset, 1);
+    }));
+    let mut control = Vec::new();
+    tail(&mut control);
+    assert!(survives(|dev| {
+        let _ = run(dev, &[], &control, 1);
     }));
 }

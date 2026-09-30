@@ -12,6 +12,7 @@
 
 use tt_firmware::cfg::write_config_field;
 use tt_firmware::tensix::{push, read_dst32, wait_for_coprocessor};
+use tt_isa::backend;
 use tt_firmware::{fail, finish, l1_read32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::{self, panic_code};
@@ -96,6 +97,9 @@ pub extern "Rust" fn firmware_main() -> ! {
     let Ok(store) = sfpu::store(2, store_format::FP32, 0, 0) else {
         fail(panic_code::EXPLICIT)
     };
+    let Ok(sfpu_barrier) = backend::wait_for_sfpu(backend::Before::EVERYTHING) else {
+        fail(panic_code::EXPLICIT)
+    };
 
     // SAFETY: `Riscv` may push to `Thread` -- the type system checked it; the host
     // released the Tensix
@@ -111,6 +115,9 @@ pub extern "Rust" fn firmware_main() -> ! {
         // of the documented cases that stalling fails to detect. See
         // `Instruction::stalls_automatically_after_mad`.
         push::<Riscv, Thread>(store);
+        // Hold everything after this until the SFPU has finished, so the
+        // coprocessor does not report done with the store still in flight.
+        push::<Riscv, Thread>(sfpu_barrier);
     }
 
     // The pushes above have only reached a FIFO. Wait for them to retire before

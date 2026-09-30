@@ -34,7 +34,7 @@ gate you have not seen reject something is not yet evidence.
 | 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
-| 6 — Matmul | `[~]` | Sim gates pass; **silicon open**: the `Src` -> `Dst` move path loses fixed columns (see Silicon campaign) |
+| 6 — Matmul | `[~]` | One-block `MVMUL` gates pass on **silicon, both cards**, split across threads as LLK does; face, tile and multi-tile open |
 | 7 — Burn backend, training | `[ ]` | The milestone |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
@@ -68,19 +68,28 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       Two Wormhole layouts are wrong on Blackhole: `MOVB2D Move4Rows` (the whole of
       row 38) and `MOVA2D AddrMod` (one bit lower, as `MVMUL`). Neither is on a
       passing gate's path; both need `Bits32_BH.lua` overrides with a silicon gate.
-- [~] **`Src` -> `Dst` mantissa losses, open.** FP32 -> TF32 through `Src` and back
-      out with `MOVA2D`/`MOVB2D` returns some datums with sign and exponent intact
-      and the *whole mantissa* zero (10.0 -> 8.0, 26.0 -> 16.0), at fixed `Src`
-      columns -- the same column in every row -- which differ by card; card 1's
-      `SrcB` column 13 comes back 0. With the thread split both cards lose `SrcA`
-      column 9. Ruled out, each by a probe in `silicon_measure.rs`: tile defect (m17),
-      burst/throttle (m12), read-after-write timing (m15), stale thread state (m16,
-      fixed), the unpacker alone (m18: card 0's column 9 survives `MOVD2A` ->
-      `MOVA2D`), configuration corrupted in flight (m19), undeclared `Src` formats
-      (m20), stale `LaneConfig.BLOCK_DEST_MOV` (m21), stale `Dst` zero flags (m22),
-      encodings (all match LLK). Next: run tt-metal's own datacopy on these cards to
-      split "our driving" from "the chip", and compare `MVMUL`, which reads `Src`
-      without `MOV*`. `probe_src` and `step9_matmul` stay red on silicon until then.
+- [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
+      UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
+      did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
+      the Matrix Unit's `Src` reads drop or misplace datums in chip-specific column
+      pairs. Proven with a control: one card sent `GO_BUSY` through UMD passed every
+      gate, the idle one failed exactly as before. Fixed in `tt-device`:
+      `Device::open` sends `GO_BUSY` and waits for AICLK/VCORE to settle, `Drop` sends
+      `GO_LONG_IDLE`, `PowerPolicy::Manual` opts out (divergence row 48). **One
+      `Device` per chip**: busy/idle is chip-wide and not reference-counted.
+      Everything ruled out on the way (tile defect, burst/throttle, timing, config in
+      flight, formats, `LaneConfig`, zero flags, `ZEROSRC`, swizzle, the backend
+      pulse, encodings) is recorded in `silicon_measure.rs` m12-m32.
+- [x] **Stale `Config` between programs.** tt-metal left `SFPU_Fp32_enabled = 1` on
+      a tile and the step 4 gates read the previous run's product. The silicon
+      per-thread reset now starts with `backend::reset_config` (the deliberate
+      `STATE_RESET_EN` write), and runs on every tile a gate claims, not just the gate
+      tile (row 49).
+- [x] **Silicon regression: 146/148 on both cards.** The two failures are the `MOVB2D`
+      `Move4Rows` twin, blocked on the known Blackhole encoding (row 38); fix through
+      `Bits32_BH.lua` with a gate, as `MVMUL` was.
+- [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
+      "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
 
 ---
 

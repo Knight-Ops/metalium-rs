@@ -1289,3 +1289,726 @@ fn m22_zero_flags_cleared_before_the_move() {
         }
     }
 }
+
+/// Is the `Src` -> `Dst` corruption state *we* left on the tiles we used?
+///
+/// tt-metal's own `ttnn.matmul` now fails on both cards with the same column-pair
+/// signature, reading 6.0-in-even / 0.0-in-odd leftovers -- exactly what the
+/// step 4 SFPU gate stores to `Dst`. So writes are being dropped persistently.
+/// Same program as m22's `SrcA` case, on tiles nothing here has run a Tensix
+/// program on (only `step2_tlb`'s plain L1 writes have touched them), role-split.
+#[test]
+fn m23_untouched_tiles() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let reset = tt_tests::datapath::thread_state_reset();
+    let mut unpack = src_thread_config();
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let mut buf = vec![sfpu::nop(); words.program_len()];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    unpack.extend_from_slice(&buf[..k]);
+    unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+    unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+    unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+    let math = vec![
+        tt_tests::datapath::state_id(),
+        encode::Mova2D::ZERO.move8_rows(1).encode().unwrap(),
+        backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+    ];
+    for (x, y) in [(12u8, 7u8), (10, 9), (13, 5), (6, 10), (3, 4)] {
+        in_device(|dev| {
+            let r = [reset.as_slice(); 3];
+            let mut run = Run::roles(harness::Roles {
+                unpack: r[0],
+                math: r[1],
+                pack: r[2],
+            })
+            .dump_rows(0);
+            run.tile = Some((x, y));
+            let _ = harness::run(dev, &run);
+            let stage = [(STAGE, staged.as_slice())];
+            let mut run = Run::roles(harness::Roles {
+                unpack: &unpack,
+                math: &math,
+                pack: &[],
+            })
+            .stage(&stage)
+            .dump_rows(2);
+            run.tile = Some((x, y));
+            let out = harness::run(dev, &run);
+            let bad: Vec<String> = (0..n)
+                .filter(|&i| out.dst[i] != datums[i])
+                .map(|i| format!("{i}:{:08x}", out.dst[i]))
+                .collect();
+            measure(
+                &format!("untouched.({x},{y})"),
+                format!("bad [{}]", bad.join(" ")),
+            );
+        });
+    }
+}
+
+/// Read one word through the `CFGREG` debug pair, in LLK's address space
+/// (`ckernel_debug.h`, `dbg_read_cfgreg`): `Config` bank 0 at 0..187, bank 1 at
+/// 187.., then thread `t`'s `ThreadConfig` at `374 + t * 68`.
+fn creg(
+    dev: &mut harness::Dev<'_>,
+    w: &tt_device::Window,
+    tile: tt_isa::noc::NocCoord<tt_isa::noc::Noc0>,
+    hw_addr: u32,
+) -> u32 {
+    dev.write32(w, tile, tensix::CFGREG_RD_CNTL, hw_addr)
+        .unwrap();
+    harness::advance(dev, 64);
+    dev.read32(w, tile, tensix::CFGREG_RDDATA).unwrap()
+}
+
+const HW_CFG_SIZE: u32 = 187;
+const THD_STATE_SIZE: u32 = 68;
+
+/// Every non-zero `Config` (bank 0) and `ThreadConfig` word on `tile`, one line.
+fn state_line(
+    dev: &mut harness::Dev<'_>,
+    tile: tt_isa::noc::NocCoord<tt_isa::noc::Noc0>,
+) -> String {
+    let w = dev
+        .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+        .unwrap();
+    let mut parts = Vec::new();
+    for a in 0..HW_CFG_SIZE {
+        let v = creg(dev, &w, tile, a);
+        if v != 0 {
+            parts.push(format!("c{a}={v:#x}"));
+        }
+    }
+    for t in 0..3 {
+        for a in 0..THD_STATE_SIZE {
+            let v = creg(dev, &w, tile, 2 * HW_CFG_SIZE + t * THD_STATE_SIZE + a);
+            if v != 0 {
+                parts.push(format!("t{t}.{a}={v:#x}"));
+            }
+        }
+    }
+    dev.free_window(w);
+    parts.join(" ")
+}
+
+/// The state tt-metal leaves behind: run straight after a ttnn kernel. Opens the
+/// card *without* the harness, so nothing is scrubbed or pulsed first, and
+/// reports every tile whose `Config`/`ThreadConfig` is not all zero.
+#[test]
+#[ignore = "run explicitly, straight after a tt-metal kernel"]
+fn m24_state_left_by_the_last_program() {
+    assert_on_silicon();
+    let index = harness_device_index();
+    let kmd = tt_kmd::Kmd::open(index).unwrap();
+    let mut dev = tt_device::Device::open(kmd).unwrap();
+    let grid = harness::tensix_grid(&mut dev);
+    for x in grid.columns() {
+        for y in tt_isa::noc::grid::TENSIX_ROWS {
+            let tile = tt_isa::noc::NocCoord::new(x, y).unwrap();
+            let line = state_line(&mut dev, tile);
+            if !line.is_empty() {
+                measure(&format!("state.({x},{y})"), line);
+            }
+        }
+    }
+}
+
+fn harness_device_index() -> u16 {
+    std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The same state, as *our* identity-matmul-shaped program leaves it: the
+/// `SrcA`/`SrcB` unpack on thread 0 and a `MOVA2D` on thread 1, captured before
+/// the harness scrubs.
+#[test]
+fn m25_state_left_by_our_src_program() {
+    assert_on_silicon();
+    let n = 32usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let mut unpack = src_thread_config();
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    let mut buf = vec![sfpu::nop(); words.program_len()];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    unpack.extend_from_slice(&buf[..k]);
+    unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+    unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+    unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+    let math = vec![
+        tt_tests::datapath::state_id(),
+        encode::Mova2D::ZERO.move8_rows(1).encode().unwrap(),
+        backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+    ];
+    in_device(|dev| {
+        let stage = [(STAGE, staged.as_slice())];
+        let _ = harness::run(
+            dev,
+            &Run::roles(harness::Roles {
+                unpack: &unpack,
+                math: &math,
+                pack: &[],
+            })
+            .stage(&stage)
+            .dump_rows(2),
+        );
+        let tile = harness::tensix_tile();
+        measure("ours.(3,4)", state_line(dev, tile));
+    });
+}
+
+/// Your tile question, tested directly: a whole 16x16 face into `SrcA`, the way
+/// LLK unpacks, against the partial runs every probe here has used.
+///
+/// LLK never unpacks part of a face: `Tile_x_dim_cntx = 256`, X end 255, one
+/// face per `UNPACR` (`cunpack_common.h`, `configure_unpack_AB`). The datapath
+/// here has always unpacked 20- or 32-datum runs, which fill part of a 16-row
+/// `SrcA` face. Same configuration, same thread split, 256 datums versus 32;
+/// `Zero_Flag_disabled_src` pinned to LLK's 0 (it had been left at 1).
+#[test]
+fn m26_whole_face_versus_partial_run() {
+    assert_on_silicon();
+    for n in [256usize, 32] {
+        let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+        let staged = stage(L1Format::Fp32, 0, &datums);
+        let mut unpack = src_thread_config();
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+        words
+            .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+            .unwrap()
+            .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+            .unwrap();
+        let mut buf = vec![sfpu::nop(); words.program_len()];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        unpack.extend_from_slice(&buf[..k]);
+        unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+        unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        let math = vec![
+            tt_tests::datapath::state_id(),
+            encode::Mova2D::ZERO
+                .move8_rows(1)
+                .src_row(0)
+                .dst_row(0)
+                .encode()
+                .unwrap(),
+            encode::Mova2D::ZERO
+                .move8_rows(1)
+                .src_row(8)
+                .dst_row(8)
+                .encode()
+                .unwrap(),
+            backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+        ];
+        for attempt in 0..2 {
+            in_device(|dev| {
+                let stage = [(STAGE, staged.as_slice())];
+                let out = harness::run(
+                    dev,
+                    &Run::roles(harness::Roles {
+                        unpack: &unpack,
+                        math: &math,
+                        pack: &[],
+                    })
+                    .stage(&stage)
+                    .dump_rows(16),
+                );
+                let bad: Vec<String> = (0..n)
+                    .filter(|&i| out.dst[i] != datums[i])
+                    .map(|i| format!("[{}][{}]={}", i / ROW, i % ROW, f32::from_bits(out.dst[i])))
+                    .collect();
+                measure(
+                    &format!("face.n{n}.run{attempt}"),
+                    format!("{} bad: {}", bad.len(), bad.join(" ")),
+                );
+            });
+        }
+    }
+}
+
+/// LLK's unpacker settings that ours leave at zero, applied to the whole-face
+/// `SrcA` path of m26, one at a time and together.
+///
+/// From the `Config` diff against what tt-metal leaves after its (correct)
+/// matmul: `Throttle_mode = 2` on both unpackers (ours 0; the model says
+/// Blackhole substitutes x4 unless overridden, but silicon may honour the
+/// field), and `Disable_zero_compress` set for all eight contexts (ours: context
+/// 0 only).
+#[test]
+fn m27_llk_unpacker_settings() {
+    use tt_isa::cfg::generated::thcon as t;
+    assert_on_silicon();
+    let n = 256usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let uncompress = [
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx0,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx1,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx2,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx3,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx4,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx5,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx6,
+        t::THCON_SEC0_REG2_Disable_zero_compress_cntx7,
+    ];
+    for (label, throttle, all_contexts) in [
+        ("baseline", false, false),
+        ("throttle2", true, false),
+        ("uncompress_all", false, true),
+        ("both", true, true),
+    ] {
+        let mut unpack = src_thread_config();
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+        words
+            .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+            .unwrap()
+            .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+            .unwrap();
+        if throttle {
+            words.set(t::THCON_SEC0_REG2_Throttle_mode, 2).unwrap();
+        }
+        if all_contexts {
+            for f in uncompress {
+                words.set(f, 1).unwrap();
+            }
+        }
+        let mut buf = vec![sfpu::nop(); words.program_len()];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        unpack.extend_from_slice(&buf[..k]);
+        unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+        unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        let math = vec![
+            tt_tests::datapath::state_id(),
+            encode::Mova2D::ZERO
+                .move8_rows(1)
+                .src_row(0)
+                .dst_row(0)
+                .encode()
+                .unwrap(),
+            encode::Mova2D::ZERO
+                .move8_rows(1)
+                .src_row(8)
+                .dst_row(8)
+                .encode()
+                .unwrap(),
+            backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+        ];
+        in_device(|dev| {
+            let stage = [(STAGE, staged.as_slice())];
+            let out = harness::run(
+                dev,
+                &Run::roles(harness::Roles {
+                    unpack: &unpack,
+                    math: &math,
+                    pack: &[],
+                })
+                .stage(&stage)
+                .dump_rows(16),
+            );
+            let bad: Vec<usize> = (0..n).filter(|&i| out.dst[i] != datums[i]).collect();
+            let cols: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % ROW).collect();
+            measure(
+                &format!("llk_settings.{label}"),
+                format!("{} bad, columns {cols:?}", bad.len()),
+            );
+        });
+    }
+}
+
+/// Is it the *observation*? `Src` -> `Dst` results read by the packer instead
+/// of by a RISC-V core's `Dst` view.
+///
+/// Every `Src`-path result here has been read back through the RISC-V `Dst`
+/// window (`Dst.md`, "RISCV access to Dst"). LLK never reads a Matrix Unit
+/// result that way: the packer on thread 2 does. Whole-face FP32 -> TF32 unpack
+/// on thread 0, `MOVA2D` on thread 1, and a `PACR` of `Dst` rows 0..4 to L1 on
+/// thread 2 (the packer path `probe_pack` proves clean); both readings compared.
+#[test]
+fn m28_packer_reads_the_matrix_result() {
+    use tt_tests::datapath::{pack_config, pack_instruction, set_adc_x_pack, OUT};
+    assert_on_silicon();
+    let n = 256usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    let mut unpack = src_thread_config();
+    let mut words = ConfigWords::new();
+    let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+    words
+        .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+        .unwrap()
+        .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+        .unwrap();
+    let mut buf = vec![sfpu::nop(); words.program_len()];
+    let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    unpack.extend_from_slice(&buf[..k]);
+    unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+    unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+    unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+    let math = vec![
+        tt_tests::datapath::state_id(),
+        encode::Mova2D::ZERO
+            .move8_rows(1)
+            .src_row(0)
+            .dst_row(0)
+            .encode()
+            .unwrap(),
+        backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+    ];
+    let mut pack = vec![tt_tests::datapath::state_id()];
+    let mut pw = ConfigWords::new();
+    pack_config(&mut pw, OUT);
+    let mut pbuf = vec![sfpu::nop(); pw.program_len()];
+    let k = pw.program(SCRATCH_GPR, &mut pbuf).unwrap();
+    pack.extend_from_slice(&pbuf[..k]);
+    pack.push(set_adc_x_pack(0, 15));
+    pack.push(pack_instruction(0b1111, true));
+    pack.push(backend::wait_for_packer(backend::Before::EVERYTHING).unwrap());
+
+    const PACKED: usize = 64;
+    let sentinel: Vec<u8> = 0xA5A5_5A5Au32
+        .to_le_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(PACKED * 4)
+        .collect();
+    in_device(|dev| {
+        let stage = [(STAGE, staged.as_slice()), (OUT, sentinel.as_slice())];
+        let out = harness::run(
+            dev,
+            &Run::roles(harness::Roles {
+                unpack: &unpack,
+                math: &math,
+                pack: &pack,
+            })
+            .stage(&stage)
+            .dump_rows(4)
+            .read_back(&[(OUT, PACKED * 4)]),
+        );
+        let packed: Vec<u32> = out.l1[0]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let bad_riscv: Vec<String> = (0..PACKED)
+            .filter(|&i| out.dst[i] != datums[i])
+            .map(|i| format!("[{}][{}]={}", i / ROW, i % ROW, f32::from_bits(out.dst[i])))
+            .collect();
+        let bad_packer: Vec<String> = (0..PACKED)
+            .filter(|&i| packed[i] != datums[i])
+            .map(|i| format!("[{}][{}]={}", i / ROW, i % ROW, f32::from_bits(packed[i])))
+            .collect();
+        measure(
+            "observe.riscv_dst_view",
+            format!("{} bad: {}", bad_riscv.len(), bad_riscv.join(" ")),
+        );
+        measure(
+            "observe.packer",
+            format!("{} bad: {}", bad_packer.len(), bad_packer.join(" ")),
+        );
+    });
+}
+
+/// Reading `SrcA` the way LLK does in FP32-`Dst` mode: `ELWADD` with a zeroed
+/// `SrcB`, not `MOVA2D`.
+///
+/// LLK's A2D datacopy never issues `MOVA2D` when `Dst` is FP32; it switches to
+/// `ELWADD` "to handle unpacking data into src A ... but dest is in fp32 mode"
+/// (`llk_math_eltwise_unary_datacopy.h`, `eltwise_unary_configure_mop`). Every
+/// `Src` observation here used `MOV*2D` with `ALU_ACC_CTRL_Fp32_enabled`. Same
+/// whole-face FP32 -> TF32 `SrcA` unpack; zeros unpacked into `SrcB`; eight rows
+/// out by each route. `ELWADD` built from LLK's `TT_OP_ELWADD`.
+#[test]
+fn m29_elwadd_reads_srca_in_fp32_mode() {
+    use tt_isa::isa::generated::defs;
+    use tt_isa::isa::Instruction;
+    assert_on_silicon();
+    const STAGE_B: u64 = STAGE + 0x2000;
+    let n = 256usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged_a = stage(L1Format::Fp32, 0, &datums);
+    let staged_b = stage(L1Format::Fp32, 0, &vec![0u32; n]);
+    let elwadd = Instruction::new(0x28 << 24, &defs::ELWADD);
+    for (label, use_elwadd) in [("mova2d", false), ("elwadd", true)] {
+        let mut unpack = src_thread_config();
+        let mut words = ConfigWords::new();
+        let d = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, d, STAGE, 4);
+        unpack_src_config(&mut words, Unpacker::SrcB, d, STAGE_B, 4);
+        words
+            .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+            .unwrap()
+            .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+            .unwrap();
+        let mut buf = vec![sfpu::nop(); words.program_len()];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        unpack.extend_from_slice(&buf[..k]);
+        unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+        unpack.push(set_adc_x(Unpacker::SrcB, 0, n as u32 - 1));
+        unpack.push(unpack_src_instruction(Unpacker::SrcB, true));
+        unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        unpack.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+        let mut math = vec![tt_tests::datapath::state_id()];
+        math.push(if use_elwadd {
+            elwadd
+        } else {
+            encode::Mova2D::ZERO.move8_rows(1).encode().unwrap()
+        });
+        math.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+        in_device(|dev| {
+            let stage = [(STAGE, staged_a.as_slice()), (STAGE_B, staged_b.as_slice())];
+            let out = harness::run(
+                dev,
+                &Run::roles(harness::Roles {
+                    unpack: &unpack,
+                    math: &math,
+                    pack: &[],
+                })
+                .stage(&stage)
+                .dump_rows(8),
+            );
+            let bad: Vec<String> = (0..8 * ROW)
+                .filter(|&i| out.dst[i] != datums[i])
+                .map(|i| format!("[{}][{}]={}", i / ROW, i % ROW, f32::from_bits(out.dst[i])))
+                .collect();
+            measure(
+                &format!("read_srca.{label}"),
+                format!("{} bad: {}", bad.len(), bad.join(" ")),
+            );
+        });
+    }
+}
+
+/// `RISCV_DEBUG_REG_DEST_CG_CTRL` (`0xFFB1_2240`) on every tile, read-only.
+///
+/// tt-metal's BRISC firmware writes 0 to it on Blackhole in `device_setup` --
+/// "Disable DEST CG", `Dst` clock gating -- before any kernel runs. The ISA
+/// documentation does not mention the register, so nothing here ever wrote it.
+/// Also `RISCV_DEBUG_REG_DBG_FEATURE_DISABLE` (`+0x68`), for comparison.
+#[test]
+#[ignore = "run explicitly: a raw read of every tile, no harness"]
+fn m30_dest_clock_gating_register() {
+    assert_on_silicon();
+    let index = harness_device_index();
+    let kmd = tt_kmd::Kmd::open(index).unwrap();
+    let mut dev = tt_device::Device::open(kmd).unwrap();
+    let grid = harness::tensix_grid(&mut dev);
+    let w = dev
+        .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+        .unwrap();
+    let mut seen = std::collections::BTreeMap::<(u32, u32), Vec<String>>::new();
+    for x in grid.columns() {
+        for y in tt_isa::noc::grid::TENSIX_ROWS {
+            let tile = tt_isa::noc::NocCoord::<tt_isa::noc::Noc0>::new(x, y).unwrap();
+            let cg = dev.read32(&w, tile, 0xFFB1_2240).unwrap();
+            let fd = dev.read32(&w, tile, 0xFFB1_2068).unwrap();
+            seen.entry((cg, fd)).or_default().push(format!("({x},{y})"));
+        }
+    }
+    for ((cg, fd), tiles) in seen {
+        measure(
+            &format!("dest_cg_ctrl={cg:#x} dbg_feature_disable={fd:#x}"),
+            format!("{} tiles: {}", tiles.len(), tiles.join(" ")),
+        );
+    }
+}
+
+/// LLK's unpack thread starts every kernel with `ZEROSRC` (`0x11000007`: zero
+/// both `SrcA` and `SrcB`, both banks), which nothing here has ever issued. The
+/// same `SrcA` + zero-`SrcB` `ELWADD` read as m29, and the `MOVA2D` read, with
+/// and without it.
+#[test]
+fn m31_zerosrc_first() {
+    use tt_isa::isa::generated::defs;
+    use tt_isa::isa::Instruction;
+    assert_on_silicon();
+    const STAGE_B: u64 = STAGE + 0x2000;
+    let n = 256usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged_a = stage(L1Format::Fp32, 0, &datums);
+    let staged_b = stage(L1Format::Fp32, 0, &vec![0u32; n]);
+    let elwadd = Instruction::new(0x28 << 24, &defs::ELWADD);
+    let zerosrc = Instruction::new(0x1100_0007, &defs::ZEROSRC);
+    for zero in [false, true] {
+        for (label, use_elwadd) in [("mova2d", false), ("elwadd", true)] {
+            let mut unpack = src_thread_config();
+            if zero {
+                unpack.push(zerosrc);
+                unpack.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+            }
+            let mut words = ConfigWords::new();
+            let d = flat_descriptor(n as u32).with_in_data_format_raw(0);
+            unpack_src_config(&mut words, Unpacker::SrcA, d, STAGE, 4);
+            unpack_src_config(&mut words, Unpacker::SrcB, d, STAGE_B, 4);
+            words
+                .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+                .unwrap()
+                .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+                .unwrap();
+            let mut buf = vec![sfpu::nop(); words.program_len()];
+            let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+            unpack.extend_from_slice(&buf[..k]);
+            unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+            unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+            unpack.push(set_adc_x(Unpacker::SrcB, 0, n as u32 - 1));
+            unpack.push(unpack_src_instruction(Unpacker::SrcB, true));
+            unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+            unpack.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+            let math = vec![
+                tt_tests::datapath::state_id(),
+                if use_elwadd {
+                    elwadd
+                } else {
+                    encode::Mova2D::ZERO.move8_rows(1).encode().unwrap()
+                },
+                backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+            ];
+            in_device(|dev| {
+                let stage = [(STAGE, staged_a.as_slice()), (STAGE_B, staged_b.as_slice())];
+                let out = harness::run(
+                    dev,
+                    &Run::roles(harness::Roles {
+                        unpack: &unpack,
+                        math: &math,
+                        pack: &[],
+                    })
+                    .stage(&stage)
+                    .dump_rows(8),
+                );
+                let bad = (0..8 * ROW).filter(|&i| out.dst[i] != datums[i]).count();
+                measure(
+                    &format!("zerosrc_{zero}.{label}"),
+                    format!("{bad} bad of {}", 8 * ROW),
+                );
+            });
+        }
+    }
+}
+
+/// `SRCA_SET_SetOvrdWithAddr` is what LLK calls the "address bit swizzle"
+/// (`cunpack_common.h`: `SETC16(SRCA_SET_Base_ADDR32, 0x4)` "re-enable address bit
+/// swizzle"). Row r <-> r+4 exchanges in column groups look like a row-address
+/// permutation. The `SrcA` unpack with it set (as always so far) and clear, read
+/// by `ELWADD` + zero `SrcB` and by `MOVA2D`.
+#[test]
+fn m32_srca_address_swizzle() {
+    use tt_isa::backend::ThreadConfigEntry;
+    use tt_isa::cfg::generated::thread;
+    use tt_isa::isa::generated::defs;
+    use tt_isa::isa::Instruction;
+    assert_on_silicon();
+    const STAGE_B: u64 = STAGE + 0x2000;
+    let n = 256usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged_a = stage(L1Format::Fp32, 0, &datums);
+    let staged_b = stage(L1Format::Fp32, 0, &vec![0u32; n]);
+    let elwadd = Instruction::new(0x28 << 24, &defs::ELWADD);
+    for swizzle in [1u16, 0] {
+        for (label, use_elwadd) in [("mova2d", false), ("elwadd", true)] {
+            let mut unpack = src_thread_config();
+            unpack.push(
+                ThreadConfigEntry::zeroed(thread::SRCA_SET_SetOvrdWithAddr.addr32())
+                    .set(thread::SRCA_SET_SetOvrdWithAddr, swizzle)
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            );
+            let mut words = ConfigWords::new();
+            let d = flat_descriptor(n as u32).with_in_data_format_raw(0);
+            unpack_src_config(&mut words, Unpacker::SrcA, d, STAGE, 4);
+            unpack_src_config(&mut words, Unpacker::SrcB, d, STAGE_B, 4);
+            words
+                .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+                .unwrap()
+                .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+                .unwrap();
+            let mut buf = vec![sfpu::nop(); words.program_len()];
+            let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+            unpack.extend_from_slice(&buf[..k]);
+            unpack.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+            unpack.push(unpack_src_instruction(Unpacker::SrcA, true));
+            unpack.push(set_adc_x(Unpacker::SrcB, 0, n as u32 - 1));
+            unpack.push(unpack_src_instruction(Unpacker::SrcB, true));
+            unpack.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+            unpack.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+            let math = vec![
+                tt_tests::datapath::state_id(),
+                if use_elwadd {
+                    elwadd
+                } else {
+                    encode::Mova2D::ZERO.move8_rows(1).encode().unwrap()
+                },
+                backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap(),
+            ];
+            in_device(|dev| {
+                let stage = [(STAGE, staged_a.as_slice()), (STAGE_B, staged_b.as_slice())];
+                let out = harness::run(
+                    dev,
+                    &Run::roles(harness::Roles {
+                        unpack: &unpack,
+                        math: &math,
+                        pack: &[],
+                    })
+                    .stage(&stage)
+                    .dump_rows(8),
+                );
+                let bad: Vec<String> = (0..8 * ROW)
+                    .filter(|&i| out.dst[i] != datums[i])
+                    .map(|i| format!("[{}][{}]={}", i / ROW, i % ROW, f32::from_bits(out.dst[i])))
+                    .collect();
+                measure(
+                    &format!("swizzle_{swizzle}.{label}"),
+                    format!("{} bad: {}", bad.len(), bad.join(" ")),
+                );
+            });
+        }
+    }
+}
+
+/// What `GO_BUSY` does to the chip, and how fast: AICLK (telemetry tag 14) and
+/// VCORE (tag 6) sampled from just after the harness's `open` -- which now sends
+/// `AICLK_GO_BUSY` -- for a second.
+#[test]
+fn m33_busy_transition() {
+    assert_on_silicon();
+    in_device(|dev| {
+        let w = dev
+            .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+            .unwrap();
+        let table = tt_device::telemetry::TelemetryTable::read(dev, &w).unwrap();
+        let start = std::time::Instant::now();
+        let mut samples = Vec::new();
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            let aiclk = table.read_tag(dev, &w, 14).unwrap();
+            let vcore = table.read_tag(dev, &w, 6).unwrap();
+            samples.push((start.elapsed().as_millis(), aiclk, vcore));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        dev.free_window(w);
+        let mut last = None;
+        for (t, a, v) in samples {
+            if last != Some((a, v)) {
+                measure(&format!("busy.t{t}ms"), format!("aiclk={a:?} vcore={v:?}"));
+                last = Some((a, v));
+            }
+        }
+    });
+}

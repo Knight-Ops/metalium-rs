@@ -201,6 +201,10 @@ mod silicon {
                 .unwrap_or_else(|e| panic!("no TLB window left to claim ({x},{y}): {e}"));
             reset_tile(dev, &w, coord);
             dev.free_window(w);
+            // And the configuration and per-thread state, as the gate tile gets
+            // in `in_device`: tt-metal, or an earlier gate, may have left any of
+            // it set on this tile.
+            reset_thread_state_on(dev, Some((x, y)));
         }
         coord
     }
@@ -388,6 +392,10 @@ mod silicon {
     /// gate tile. The per-thread half of the scrub that [`reset_tile`] cannot
     /// do from outside.
     fn reset_thread_state(dev: &mut Dev<'_>) {
+        reset_thread_state_on(dev, None);
+    }
+
+    fn reset_thread_state_on(dev: &mut Dev<'_>, tile: Option<(u8, u8)>) {
         let program = crate::datapath::thread_state_reset();
         // All three threads: the role harness uses each of them, and the
         // single-thread path uses thread 0 (`harness::CORE`).
@@ -396,7 +404,9 @@ mod silicon {
             math: &program,
             pack: &program,
         };
-        let _ = crate::harness::run(dev, &crate::harness::Run::roles(roles).dump_rows(0));
+        let mut run = crate::harness::Run::roles(roles).dump_rows(0);
+        run.tile = tile;
+        let _ = crate::harness::run(dev, &run);
     }
 
     #[track_caller]
