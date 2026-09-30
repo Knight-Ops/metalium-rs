@@ -139,7 +139,8 @@ fn program(na: u32, nb: u32, body: Body) -> (Vec<Instruction>, Vec<Instruction>)
             .unwrap(),
     );
     // All of `Dst`: mode 3 is `CLR_ALL` in LLK's encoding too (row 40).
-    math.push(encode::Zeroacc::ZERO.mode(3).encode().unwrap());
+    // (mode, use_dst32b, addr_mod, imm10)
+    math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
     body(banks, &mut math);
     math.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
     (up, math)
@@ -688,5 +689,442 @@ fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
             row_bits(&b[second]),
             "MOVB2A {encoding}: second"
         );
+    }
+}
+
+/// The other Matrix Unit instructions that write `Dst` -- `ELWADD`, `ELWSUB`,
+/// `ELWMUL`, `DOTPV`, `MOVDBGA2D` -- have their `AddrMod` at bits 14..15 on
+/// Blackhole too, where LLK's `addr_mode << 14` has it; the Wormhole diagrams
+/// draw 15..16.
+///
+/// Semantics-free, so it holds whatever each instruction computes: a reference
+/// run of one instruction gives the eight rows it writes at `Dst` row 0. Then two
+/// copies, each carrying `addr_mod(1)`, where entry 1 advances `Dst` by 8 and
+/// entry 2 by nothing: with the measured encoding the second copy writes the same
+/// rows again 8 rows lower; with the Wormhole one (modifier 2) nothing reaches row
+/// 8. The `Src` counters stay put, so both copies read the same operands.
+#[test]
+fn matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole() {
+    // (src_a_row, addr_mod, move8_rows, ...) orders follow the generated encoders.
+    let cases: [(&str, Instruction, u32, u32); 5] = [
+        (
+            "ELWADD",
+            encode::Elwadd::ZERO.encode().unwrap(),
+            encode::Elwadd::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Elwadd::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+        (
+            "ELWSUB",
+            encode::Elwsub::ZERO.encode().unwrap(),
+            encode::Elwsub::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Elwsub::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+        (
+            "ELWMUL",
+            encode::Elwmul::ZERO.encode().unwrap(),
+            encode::Elwmul::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Elwmul::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+        (
+            "DOTPV",
+            // (flip_src_b, flip_src_a, addr_mod, dst_row)
+            encode::dotpv(0, 0, 0, 0).unwrap(),
+            encode::dotpv(0, 0, 1, 0).unwrap().word(),
+            encode::wormhole::dotpv(0, 0, 1, 0).unwrap().word(),
+        ),
+        (
+            "MOVDBGA2D",
+            // ttsim implements only the eight-row form of `MOVA2D` (row 37).
+            encode::Movdbga2D::ZERO.move8_rows(1).encode().unwrap(),
+            encode::Movdbga2D::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Movdbga2D::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+    ];
+    for (name, _, bh, wh) in &cases {
+        assert_eq!(bh & 0x00ff_ffff, 1 << 14, "{name}: the measured layout");
+        assert_eq!(wh & 0x00ff_ffff, 1 << 15, "{name}: the Wormhole diagram");
+    }
+
+    // Distinct, nonzero, and far enough apart that neither `A - B` nor `A * B`
+    // is zero anywhere.
+    let mut a = [[0f32; 16]; 16];
+    for (k, v) in a.iter_mut().flatten().enumerate() {
+        *v = 1.0 + k as f32;
+    }
+    let mut b = [[0f32; 16]; 8];
+    for (k, v) in b.iter_mut().flatten().enumerate() {
+        *v = 1000.0 + k as f32;
+    }
+    let block = |dst: &[u32], r: usize| dst[r * ROW..(r + 8) * ROW].to_vec();
+
+    for (name, one, bh, wh) in cases {
+        if matches!(name, "DOTPV" | "MOVDBGA2D") && !cfg!(feature = "silicon") {
+            // `tensix_decode_dotpv`/`_movdbga2d` are `UnsupportedFunctionality`;
+            // `ttsim_implements_no_dotpv_shiftxb_or_movdbga2d` pins that.
+            continue;
+        }
+        // Entry 1 advances `Dst` by `step`, entry 2 by nothing, neither touches `Src`.
+        let twice = move |step: u16, bits: u32| -> Body {
+            Box::new(move |_banks, p| {
+                p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
+                p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, step));
+                p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcAIncr, 0));
+                p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+                for _ in 0..2 {
+                    p.push(Instruction::new(one.word() | bits, one.def()));
+                }
+            })
+        };
+        let reference = run(&a, &b, Box::new(move |_banks, p| p.push(one)));
+        let written = block(&reference, 0);
+        assert!(
+            written.iter().any(|&v| v != 0),
+            "{name}: the reference run wrote nothing"
+        );
+        assert!(
+            block(&reference, 8).iter().all(|&v| v == 0),
+            "{name}: the reference run wrote past eight rows"
+        );
+
+        let dst = run(&a, &b, twice(8, bh & 0x00ff_ffff));
+        assert_eq!(
+            block(&dst, 8),
+            written,
+            "{name} measured: second copy 8 rows down"
+        );
+
+        let dst = run(&a, &b, twice(8, wh & 0x00ff_ffff));
+        assert!(
+            block(&dst, 8).iter().all(|&v| v == 0),
+            "{name} Wormhole: nothing should reach row 8"
+        );
+    }
+}
+
+/// `SHIFTXB`'s `AddrMod` sits at bits 14..15 on Blackhole, as LLK's
+/// `addr_mode << 14` has it; the Wormhole diagram draws 15..16.
+///
+/// `SHIFTXB` rotates one `SrcB` row left by a column (`ShiftInZero` clear). Two of
+/// them at `SrcB` row 8 (offset 0 from the RWC), each carrying `addr_mod(1)`,
+/// where entry 1 advances `SrcB` by one: the measured encoding rotates rows 8 and
+/// 9 once each; the Wormhole one (modifier 2) rotates row 8 twice and leaves 9.
+/// Read back with `MOVB2D`.
+///
+/// Silicon only: ttsim does not implement `SHIFTXB`
+/// (`ttsim_implements_no_dotpv_shiftxb_or_movdbga2d`).
+#[test]
+#[cfg(feature = "silicon")]
+fn shiftxb_addr_mod_sits_one_bit_lower_on_blackhole() {
+    // (addr_mod, shift_in_zero, src_row)
+    let bh = encode::shiftxb(1, 0, 0).unwrap().word();
+    let wh = encode::wormhole::shiftxb(1, 0, 0).unwrap().word();
+    assert_eq!(bh & 0x00ff_ffff, 1 << 14, "the measured layout");
+    assert_eq!(wh & 0x00ff_ffff, 1 << 15, "the Wormhole diagram");
+
+    let a = identity();
+    let mut b = [[0f32; 16]; 8];
+    for (k, v) in b.iter_mut().flatten().enumerate() {
+        *v = 1000.0 + k as f32;
+    }
+    let rotated = |row: &[f32; 16], by: usize| -> Vec<u32> {
+        (0..16).map(|c| row[(c + by) % 16].to_bits()).collect()
+    };
+    let dst_row = |dst: &[u32], r: usize| dst[r * ROW..(r + 1) * ROW].to_vec();
+    let body = |bits: u32| -> Body {
+        Box::new(move |_banks, p| {
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcBIncr, 1));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcBIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+            let i = encode::shiftxb(0, 0, 0).unwrap();
+            for _ in 0..2 {
+                p.push(Instruction::new(i.word() | bits, i.def()));
+            }
+            // Back to row 8 and copy `SrcB` 8..12 into `Dst` 0..4.
+            p.push(
+                encode::Setrwc::ZERO
+                    .src_b(1)
+                    .src_b_val(SRC_B_ROW as u32)
+                    .encode()
+                    .unwrap(),
+            );
+            p.push(encode::Movb2D::ZERO.move4_rows(1).encode().unwrap());
+        })
+    };
+
+    let dst = run(&a, &b, body(bh & 0x00ff_ffff));
+    assert_eq!(
+        dst_row(&dst, 0),
+        rotated(&b[0], 1),
+        "measured: row 8 rotated once"
+    );
+    assert_eq!(
+        dst_row(&dst, 1),
+        rotated(&b[1], 1),
+        "measured: row 9 rotated once"
+    );
+
+    let dst = run(&a, &b, body(wh & 0x00ff_ffff));
+    assert_eq!(
+        dst_row(&dst, 0),
+        rotated(&b[0], 2),
+        "Wormhole: row 8 rotated twice"
+    );
+    assert_eq!(
+        dst_row(&dst, 1),
+        rotated(&b[1], 0),
+        "Wormhole: row 9 untouched"
+    );
+}
+
+/// Does ttsim run `body` over the step's operands to completion?
+#[cfg(not(feature = "silicon"))]
+fn survives_body(body: Body) -> bool {
+    let (sa, na) = stage_operand(SRC_A_ROW, &identity());
+    let (sb, nb) = stage_operand(SRC_B_ROW, &ZERO_DST);
+    let (unpack, math) = program(na, nb, body);
+    harness::survives(|dev| {
+        let roles = harness::Roles {
+            unpack: &unpack,
+            math: &math,
+            pack: &[],
+        };
+        harness::run(
+            dev,
+            &Run::roles(roles)
+                .stage(&[(STAGE_A, &sa), (STAGE_B, &sb)])
+                .dump_rows(16),
+        );
+    })
+}
+
+/// ttsim implements none of `DOTPV`, `SHIFTXB` and `MOVDBGA2D`
+/// (`tensix_decode_dotpv`, `_shiftxb`, `_movdbga2d`: `UnsupportedFunctionality`),
+/// so their `AddrMod` gates are silicon-only. Pinned so that ttsim learning any
+/// of them shows up here.
+#[test]
+#[cfg(not(feature = "silicon"))]
+fn ttsim_implements_no_dotpv_shiftxb_or_movdbga2d() {
+    // A body that runs, so the refusals below are the instructions' own.
+    assert!(survives_body(Box::new(|_banks, p| {
+        p.push(encode::Elwadd::ZERO.encode().unwrap())
+    })));
+    assert!(!survives_body(Box::new(|_banks, p| {
+        p.push(encode::dotpv(0, 0, 0, 0).unwrap())
+    })));
+    assert!(!survives_body(Box::new(|_banks, p| {
+        p.push(encode::shiftxb(0, 0, 0).unwrap())
+    })));
+    assert!(!survives_body(Box::new(|_banks, p| {
+        p.push(encode::Movdbga2D::ZERO.move8_rows(1).encode().unwrap())
+    })));
+}
+
+/// `ZEROACC` on Blackhole, measured: `AddrMod` at bits 14..15 and `UseDst32b` at
+/// bit 18, where LLK's `addr_mode << 14` and `use_32_bit_mode << 18` have them.
+/// The Wormhole diagram draws 15..16 and 21, and puts `Revert` at 18.
+///
+/// Bit 21 is not tried: ttsim calls it undefined (row 40), and on Blackhole it
+/// is the top of LLK's three-bit `clear_mode`, whose `_32B` modes nothing uses.
+///
+/// `Dst` is FP32 here (`program`), so a 32-bit row `r` consults the valid bit of
+/// physical row `Adj32(r) = 2 * (r & !7) + (r & 7)` (`Dst.md`), and reads zero once
+/// that bit is cleared.
+#[test]
+fn zeroacc_addr_mod_and_use_dst32b_on_blackhole() {
+    // (mode, use_dst32b, addr_mod, imm10); the Wormhole one also takes `revert`.
+    let bh = encode::zeroacc(0, 0, 1, 0).unwrap().word();
+    let wh = encode::wormhole::Zeroacc::ZERO
+        .addr_mod(1)
+        .encode()
+        .unwrap()
+        .word();
+    assert_eq!(bh & 0x00ff_ffff, 1 << 14, "AddrMod: the measured layout");
+    assert_eq!(wh & 0x00ff_ffff, 1 << 15, "AddrMod: the Wormhole diagram");
+    let wide = encode::zeroacc(0, 1, 0, 0).unwrap().word();
+    let wh_wide = encode::wormhole::Zeroacc::ZERO
+        .use_dst32b(1)
+        .encode()
+        .unwrap()
+        .word();
+    assert_eq!(
+        wide & 0x00ff_ffff,
+        1 << 18,
+        "UseDst32b: the measured layout"
+    );
+    assert_eq!(
+        wh_wide & 0x00ff_ffff,
+        1 << 21,
+        "UseDst32b: the Wormhole diagram"
+    );
+
+    let a = identity();
+    let mut b = [[0f32; 16]; 8];
+    for (k, v) in b.iter_mut().flatten().enumerate() {
+        *v = 1000.0 + k as f32;
+    }
+    // `Dst` rows 0..16 filled from `SrcA` rows 16..32 (the identity).
+    let fill = |p: &mut Vec<Instruction>| {
+        for (src, dst) in [(0, 0), (8, 8)] {
+            p.push(
+                encode::Mova2D::ZERO
+                    .move8_rows(1)
+                    .src_row(src)
+                    .dst_row(dst)
+                    .encode()
+                    .unwrap(),
+            );
+        }
+    };
+    let filled: Vec<u32> = truncated(&a)
+        .iter()
+        .flatten()
+        .map(|v| v.to_bits())
+        .collect();
+    let rows_read_zero = |dst: &[u32]| -> Vec<usize> {
+        (0..16)
+            .filter(|&r| dst[r * ROW..(r + 1) * ROW].iter().all(|&v| v == 0))
+            .collect()
+    };
+    let check = |dst: &[u32], cleared: &[usize], what: &str| {
+        assert_eq!(rows_read_zero(dst), cleared, "{what}: rows reading zero");
+        for r in (0..16).filter(|r| !cleared.contains(r)) {
+            assert_eq!(
+                &dst[r * ROW..(r + 1) * ROW],
+                &filled[r * ROW..(r + 1) * ROW],
+                "{what}: row {r} should be untouched"
+            );
+        }
+    };
+
+    // AddrMod, read back through the RWC it advances: a sixteen-row clear of
+    // block 1 (32-bit rows 8..16) carrying the modifier, where entry 1 advances
+    // `Dst` by 2 and entry 2 by 3, then a plain one-row clear at the RWC. Not
+    // one-row mode for the first clear: on silicon an odd modifier changes what
+    // one-row mode clears (row 52).
+    let advanced_by = move |bits: u32| -> Body {
+        Box::new(move |_banks, p| {
+            fill(p);
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 2));
+            p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcAIncr, 0));
+            p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 3));
+            let i = encode::zeroacc(1, 0, 0, 1).unwrap();
+            p.push(Instruction::new(i.word() | bits, i.def()));
+            p.push(encode::zeroacc(0, 0, 0, 0).unwrap());
+        })
+    };
+    let block_1: Vec<usize> = (8..16).collect();
+    let dst = run(&a, &b, advanced_by(bh & 0x00ff_ffff));
+    check(
+        &dst,
+        &[&[2][..], &block_1].concat(),
+        "AddrMod measured: entry 1",
+    );
+    let dst = run(&a, &b, advanced_by(wh & 0x00ff_ffff));
+    check(
+        &dst,
+        &[&[3][..], &block_1].concat(),
+        "AddrMod Wormhole: entry 2",
+    );
+
+    // UseDst32b: sixteen-row mode, block 0. 16-bit, it clears physical rows
+    // 0..16 -- 32-bit rows 0..8; 32-bit, physical 0..8 and 16..24 -- rows 0..16.
+    let block_0 = move |bits: u32| -> Body {
+        Box::new(move |_banks, p| {
+            fill(p);
+            let i = encode::zeroacc(1, 0, 0, 0).unwrap();
+            p.push(Instruction::new(i.word() | bits, i.def()));
+        })
+    };
+    let dst = run(&a, &b, block_0(0));
+    check(&dst, &(0..8).collect::<Vec<_>>(), "UseDst32b clear");
+    let dst = run(&a, &b, block_0(wide & 0x00ff_ffff));
+    check(&dst, &(0..16).collect::<Vec<_>>(), "UseDst32b at bit 18");
+}
+
+/// `Dst` rows reading zero after `body` runs over a `Dst` whose rows 0..16 hold
+/// the identity.
+fn zeroacc_leaves_zero(body: impl FnOnce(&mut Vec<Instruction>) + 'static) -> Vec<usize> {
+    let dst = run(
+        &identity(),
+        &ZERO_DST,
+        Box::new(move |_banks, p| {
+            for (src, dst) in [(0, 0), (8, 8)] {
+                p.push(
+                    encode::Mova2D::ZERO
+                        .move8_rows(1)
+                        .src_row(src)
+                        .dst_row(dst)
+                        .encode()
+                        .unwrap(),
+                );
+            }
+            body(p);
+        }),
+    );
+    (0..16)
+        .filter(|&r| dst[r * ROW..(r + 1) * ROW].iter().all(|&v| v == 0))
+        .collect()
+}
+
+/// `ZEROACC.md` says one-row mode clears `DstRowValid[Adj32(Row)]` when `Dst` is
+/// 32-bit, and ttsim does: `Imm10 = 9` empties 32-bit row 9. Silicon clears
+/// physical row 9 instead -- the low half of 32-bit row 1, whose valid bit nothing
+/// consults -- so no row reads zero; `Imm10 = 3` (physical 3 is `Adj32(3)`) looks
+/// the same on both (row 51).
+#[test]
+fn zeroacc_one_row_in_32_bit_dst() {
+    // (mode, use_dst32b, addr_mod, imm10)
+    let three = zeroacc_leaves_zero(|p| p.push(encode::zeroacc(0, 0, 0, 3).unwrap()));
+    assert_eq!(three, [3]);
+    let nine = zeroacc_leaves_zero(|p| p.push(encode::zeroacc(0, 0, 0, 9).unwrap()));
+    if cfg!(feature = "silicon") {
+        assert_eq!(nine, [] as [usize; 0], "silicon: physical row 9");
+    } else {
+        assert_eq!(nine, [9], "ttsim: Adj32(9)");
+    }
+}
+
+/// On silicon, one-row `ZEROACC` with an odd `AddrMod` also clears the eight
+/// physical rows from its target -- entries 1, 3 and 5 alike, whatever the entry
+/// holds -- while still applying the entry. Even modifiers clear one row. ttsim
+/// clears one row either way, and neither `ZEROACC.md` nor LLK (which issues
+/// one-row `ZEROACC` only with `ADDR_MOD_0`) says anything about it (row 52).
+#[test]
+fn zeroacc_one_row_with_an_odd_addr_mod() {
+    for addr_mod in [1, 2, 3] {
+        let zero = zeroacc_leaves_zero(move |p| {
+            for f in [
+                thread::ADDR_MOD_DST_SEC1_DestIncr,
+                thread::ADDR_MOD_DST_SEC2_DestIncr,
+                thread::ADDR_MOD_DST_SEC3_DestIncr,
+            ] {
+                p.push(thread_entry(f, 0));
+            }
+            p.push(encode::zeroacc(0, 0, addr_mod, 0).unwrap());
+        });
+        let want: Vec<usize> = if cfg!(feature = "silicon") && addr_mod % 2 == 1 {
+            (0..8).collect()
+        } else {
+            vec![0]
+        };
+        assert_eq!(zero, want, "one-row ZEROACC with addr_mod {addr_mod}");
     }
 }

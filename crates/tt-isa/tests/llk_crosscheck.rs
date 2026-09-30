@@ -7,8 +7,9 @@
 //! Blackhole and applied the wrong operand silently: `MVMUL`'s `AddrMod`
 //! (divergence row 42), and `MOVB2D`'s `Move4Rows`, found here -- the whole of
 //! what row 38 recorded as ttsim "moving one row" -- along with the `AddrMod` of
-//! every `MOV*` between `Src` and `Dst`. All are now measured layouts
-//! (`Bits32_BH.lua`). The
+//! every Matrix Unit instruction LLK encodes with `addr_mode << 14`, and
+//! `ZEROACC`'s `use_32_bit_mode`. All are now measured layouts (`Bits32_BH.lua`).
+//! `GMPOOL`/`GAPOOL` keep `AddrMod` at 15 in LLK too, so their diagrams stand. The
 //! LLK macros are a second, independent source that runs on these chips, so every
 //! encoding the datapath emits is checked against one.
 //!
@@ -140,8 +141,89 @@ fn the_datapath_encodings_agree_with_llk() {
         // TT_OP_ZEROACC(clear_mode<<19, use_32_bit_mode<<18, clear_zero_flags<<17, addr_mode<<14, where); CLR_ALL = 3
         (
             "ZEROACC CLR_ALL",
-            encode::Zeroacc::ZERO.mode(3).encode().unwrap().word(),
+            // (mode, use_dst32b, addr_mod, imm10)
+            encode::zeroacc(3, 0, 0, 0).unwrap().word(),
             op(0x10, 3 << 19),
+        ),
+        // TT_OP_ZEROACC: use_32_bit_mode<<18, addr_mode<<14, where
+        (
+            "ZEROACC use_32_bit_mode",
+            encode::zeroacc(0, 1, 0, 0).unwrap().word(),
+            op(0x10, 1 << 18),
+        ),
+        (
+            "ZEROACC AddrMod",
+            encode::zeroacc(0, 0, 1, 5).unwrap().word(),
+            op(0x10, (1 << 14) | 5),
+        ),
+        // TT_OP_ELWADD/ELWSUB/ELWMUL(clear_dvalid<<22, dest_accum_en<<21, instr_mod19<<19, addr_mode<<14, dst)
+        (
+            "ELWADD",
+            encode::Elwadd::ZERO
+                .add_dst(1)
+                .broadcast_src_b_row(1)
+                .addr_mod(1)
+                .dst_row(3)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x28, (1 << 21) | (2 << 19) | (1 << 14) | 3),
+        ),
+        (
+            "ELWSUB",
+            encode::Elwsub::ZERO
+                .broadcast_src_b_col0(1)
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x30, (1 << 19) | (1 << 14)),
+        ),
+        (
+            "ELWMUL",
+            encode::Elwmul::ZERO.addr_mod(1).encode().unwrap().word(),
+            op(0x27, 1 << 14),
+        ),
+        // TT_OP_DOTPV: as ELWADD, opcode 0x29
+        (
+            "DOTPV",
+            encode::dotpv(0, 0, 1, 2).unwrap().word(),
+            op(0x29, (1 << 14) | 2),
+        ),
+        // TT_OP_SHIFTXB(addr_mode<<14, rot_shift<<10, shift_row)
+        (
+            "SHIFTXB",
+            encode::shiftxb(1, 1, 7).unwrap().word(),
+            op(0x18, (1 << 14) | (1 << 10) | 7),
+        ),
+        // TT_OP_MOVDBGA2D: as MOVA2D, opcode 0x09
+        (
+            "MOVDBGA2D",
+            encode::Movdbga2D::ZERO
+                .move8_rows(1)
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x09, (2 << 12) | (1 << 14)),
+        ),
+        // TT_OP_GMPOOL/GAPOOL(clear_dvalid<<22, instr_mod19<<19, pool_addr_mode<<15, max_pool_index_en<<14, dst):
+        // the Wormhole diagrams' `AddrMod` at 15 is right for these two.
+        (
+            "GMPOOL",
+            encode::Gmpool::ZERO
+                .addr_mod(1)
+                .arg_max(1)
+                .dst_row(4)
+                .encode()
+                .unwrap()
+                .word(),
+            op(0x33, (1 << 15) | (1 << 14) | 4),
+        ),
+        (
+            "GAPOOL",
+            encode::gapool(0, 0, 1, 4).unwrap().word(),
+            op(0x34, (1 << 15) | 4),
         ),
         // TT_OP_MVMUL(clear_dvalid<<22, instr_mod19<<19, addr_mode<<14, dst)
         (

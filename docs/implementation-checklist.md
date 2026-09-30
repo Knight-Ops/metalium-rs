@@ -70,8 +70,18 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       `MVMUL`). Both are now measured `Bits32_BH.lua` layouts, each licensed by a
       `probe_src` gate that passes on ttsim and both cards. `MOVD2A`/`MOVD2B`/`MOVB2A`
       had the same `AddrMod` shift and are measured layouts too, licensed by
-      `step9_matmul::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`. No
-      datapath encoding now disagrees with LLK.
+      `step9_matmul::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`. So are
+      `ELWADD`/`ELWSUB`/`ELWMUL`/`DOTPV`/`MOVDBGA2D`/`SHIFTXB` (`AddrMod`) and
+      `ZEROACC` (`AddrMod`, `UseDst32b` at 18, Wormhole `Revert` dropped -- the
+      generator now takes a `dropped` field list with reasons). `GMPOOL`/`GAPOOL`
+      agree with LLK as drawn. Every Matrix Unit encoding LLK defines now agrees
+      with it. Found on the way, on silicon only: one-row `ZEROACC` in FP32 `Dst`
+      addresses physical rows (row 51), and with an odd `AddrMod` clears eight
+      (row 52).
+- [ ] **`AddrMod` is three bits on Blackhole** (entries 0..7; measured on
+      `ZEROACC`). The `_BH` layouts draw two, because a measured layout may not
+      change a width. Needs a generator rule for measured widths and per-instruction
+      gates.
 - [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
       UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
       did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
@@ -91,7 +101,7 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       tile (row 49).
 - [x] **Silicon regression: 146/148 on both cards**, the two failures being the
       `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
-      replaced by two gates that run on both targets. Unfiltered run since: 111/111 on
+      replaced by two gates that run on both targets. Unfiltered run since: 116/116 on
       each card, `silicon_measure` and `fma_oracle` included.
 - [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
       "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.

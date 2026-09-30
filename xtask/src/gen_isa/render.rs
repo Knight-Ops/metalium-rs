@@ -324,11 +324,21 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
         Provenance::SupersededOnBlackhole { by } => {
             format!("Provenance::SupersededOnBlackhole {{ by: \"{by}\" }}")
         }
-        Provenance::Measured { evidence, moved } => {
-            let moved: Vec<String> = moved.iter().map(|m| format!("\"{m}\"")).collect();
+        Provenance::Measured {
+            evidence,
+            moved,
+            dropped,
+        } => {
+            let quoted = |v: &Vec<String>| {
+                v.iter()
+                    .map(|m| format!("\"{m}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             format!(
-                "Provenance::Measured {{ evidence: \"{evidence}\", moved: &[{}] }}",
-                moved.join(", ")
+                "Provenance::Measured {{ evidence: \"{evidence}\", moved: &[{}], dropped: &[{}] }}",
+                quoted(moved),
+                quoted(dropped)
             )
         }
         other => format!("Provenance::{}", other.variant_name()),
@@ -348,18 +358,38 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
             "**`UNVERIFIED`.** `{page}` is a Wormhole page and Blackhole has none, so this \
              layout is a hypothesis until silicon or the simulator confirms it."
         ),
-        Provenance::Measured { evidence, moved } => format!(
-            "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
-             diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere. \
-             Every other field is carried from that diagram and is as unverified as it \
-             was. Re-derive on silicon.",
-            moved
-                .iter()
-                .map(|m| format!("`{m}`"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            if moved.len() == 1 { "s" } else { "" }
-        ),
+        Provenance::Measured {
+            evidence,
+            moved,
+            dropped,
+        } => {
+            let ticked = |v: &Vec<String>| {
+                v.iter()
+                    .map(|m| format!("`{m}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let dropped = if dropped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {} {} not carried: {} bits hold something else on Blackhole and \
+                     {} own position is unknown.",
+                    ticked(dropped),
+                    if dropped.len() == 1 { "is" } else { "are" },
+                    if dropped.len() == 1 { "its" } else { "their" },
+                    if dropped.len() == 1 { "its" } else { "their" },
+                )
+            };
+            format!(
+                "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
+                 diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere.{dropped} \
+                 Every other field is carried from that diagram and is as unverified as it \
+                 was. Re-derive on silicon.",
+                ticked(moved),
+                if moved.len() == 1 { "s" } else { "" }
+            )
+        }
     };
 
     writeln!(out, "{pad}/// `{}`. {doc}", e.key).unwrap();
