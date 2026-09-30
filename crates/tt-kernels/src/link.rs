@@ -153,6 +153,11 @@ fn start_end<T: Transport>(d: &mut Device<T>, w: &Window, t: EthTile, image: &[u
     let c = t.coord();
     put(&mut mb, mover::MY_X, c.x() as u32);
     put(&mut mb, mover::MY_Y, c.y() as u32);
+    put(
+        &mut mb,
+        mover::LANDING_WAIT,
+        u32::from(!d.transport().is_simulated()),
+    );
     d.eth_write(w, t, tt_isa::eth::MAILBOX_BASE, &mb)?;
     d.load_and_start_e1(w, t, image)?;
     match d.wait_for_e1_status(w, t, 400_000, |s| s == status::RUNNING)? {
@@ -203,7 +208,16 @@ impl Mover {
         if data.len() > mover::MAX_LEN as usize {
             return Err(LinkError::Invalid("more than one transfer's worth"));
         }
-        d.eth_write(w, self.end(dir).0, mover::TX_STAGE, data)?;
+        let t = self.end(dir).0;
+        d.eth_write(w, t, mover::TX_STAGE, data)?;
+        // Host writes are posted: without a read back, E1 can be told to send
+        // before the last of them has landed, and would send stale bytes. This
+        // is the silicon hazard `silicon_eth_bench::raw_no_receiver_polling`
+        // measured (57 of 480 transfers with a late tail, 0 of 480 fenced).
+        if let Some(last) = data.len().checked_sub(4) {
+            let mut word = [0u8; 4];
+            d.eth_read(w, t, mover::TX_STAGE + last as u64, &mut word)?;
+        }
         Ok(())
     }
 

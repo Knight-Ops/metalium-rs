@@ -83,10 +83,6 @@ fn fail(code: u32) -> ! {
     tt_firmware::fail(code)
 }
 
-fn sum(base: u64, len: u32) -> u32 {
-    mover::checksum((0..len as u64 / 4).map(|i| rd(base + i * 4)))
-}
-
 fn send(me: (u8, u8), seq: u32) {
     let len = rd(mover::SEND_LEN);
     if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
@@ -106,7 +102,7 @@ fn send(me: (u8, u8), seq: u32) {
         rd(mover::SEND_DST_X),
         rd(mover::SEND_DST_Y),
         rd(mover::SEND_DST_ADDR),
-        sum(mover::TX_STAGE, len),
+        0,
         0,
         seq,
     ];
@@ -124,16 +120,17 @@ fn receive(me: (u8, u8), seq: u32) {
     if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
         fail(mover::error::LENGTH);
     }
-    let want = rd(mover::INBOX + 20);
-    // The data may still be landing; the checksum says when it has. Bounded so
-    // a transfer that never completes is reported as `CHECKSUM` within a few
-    // seconds even at `MAX_LEN` (one pass is ~32K loads), not left to hang.
-    let mut tries = 0u32;
-    while sum(mover::RX_LAND, len) != want {
-        publish();
-        tries += 1;
-        if tries > 10_000 {
-            fail(mover::error::CHECKSUM);
+    // Every data packet was accepted before the record (TT-link is in order);
+    // once none of the RX queue's writes are outstanding, all of them are in
+    // L1. Bounded, so a queue that never drains is reported, not hung on.
+    if rd(mover::LANDING_WAIT) != 0 {
+        let outstanding = eth::rxq_base(eth::DATA_QUEUE) + eth::rxq::OUTSTANDING_WR_CNT;
+        let mut tries = 0u32;
+        while rd(outstanding) != 0 {
+            tries += 1;
+            if tries > 10_000_000 {
+                fail(mover::error::LANDING);
+            }
         }
     }
     let (dx, dy, da) = (rd(mover::INBOX + 8), rd(mover::INBOX + 12), rd(mover::INBOX + 16));

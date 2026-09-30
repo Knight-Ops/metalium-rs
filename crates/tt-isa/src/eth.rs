@@ -182,6 +182,9 @@ pub mod txq {
 /// RX queue register offsets (`EthernetTxRx.md`).
 pub mod rxq {
     pub const CTRL: u64 = 0x00;
+    /// `ETH_RXQ_OUTSTANDING_WR_CNT`: writes received from the network and not
+    /// yet committed to L1. Read-only; not decoded by ttsim (divergence row 62).
+    pub const OUTSTANDING_WR_CNT: u64 = 0x50;
     /// `ETH_RXQ_CTRL_PACKET_MODE`: the queue expects TT-link packets.
     pub const CTRL_PACKET_MODE: u32 = 1 << 1;
 }
@@ -356,16 +359,21 @@ mod tests {
 /// 2. The sender pulls the data from a Tensix tile into [`TX_STAGE`] (or takes
 ///    it as the host staged it), TT-link-writes it to the partner's
 ///    [`RX_LAND`], and then TT-link-writes an [`INBOX`] record: sequence number,
-///    length, destination and [`checksum`].
-/// 3. The receiver sees a new record, waits until [`RX_LAND`] checksums to it,
-///    NoC-writes it into the destination Tensix tile (or leaves it), and
-///    TT-link-writes an [`ACK`] back into the sender's mailbox.
+///    length and destination.
+/// 3. The receiver sees a new record, waits until its RX queue has no writes
+///    outstanding, NoC-writes [`RX_LAND`] into the destination Tensix tile (or
+///    leaves it), and TT-link-writes an [`ACK`] back into the sender's mailbox.
 ///
-/// The checksum is what makes step 3 safe. Nothing documented says a TT-link
-/// packet sent after another lands in L1 after it (an RX queue can have writes
-/// outstanding, `EthernetTxRx.md`, `ETH_RXQ_OUTSTANDING_WR_CNT`), so the record
-/// is not taken as proof that the data is there. The host, on the sending chip,
-/// learns of delivery from [`ACKED`], and never has to talk to the other chip.
+/// The wait is what makes step 3 safe. TT-link delivers one queue's packets in
+/// order -- the receiver discards anything out of sequence -- so every data
+/// packet was *accepted* before the record was. Nothing documented says it was
+/// *committed to L1* before the record was, but `ETH_RXQ_OUTSTANDING_WR_CNT`
+/// counts exactly the accepted-but-uncommitted writes (`EthernetTxRx.md`). Once
+/// the record is visible and that count is zero, everything before it is in L1.
+/// An earlier version checksummed the whole buffer on both ends instead, which
+/// cost ~3.75 us per KiB and held the mover to ~195 MB/s. The host, on the
+/// sending chip, learns of delivery from [`ACKED`], and never has to talk to the
+/// other chip.
 pub mod mover {
     use super::MAILBOX_BASE as M;
 
@@ -373,6 +381,10 @@ pub mod mover {
     /// core identity is not discoverable at run time.
     pub const MY_X: u64 = M + 0x10;
     pub const MY_Y: u64 = M + 0x14;
+    /// Nonzero: wait for the RX queue's outstanding writes to drain before
+    /// forwarding. Set by the host on silicon; zero on ttsim, which commits RX
+    /// writes synchronously and does not decode the counter (row 62).
+    pub const LANDING_WAIT: u64 = M + 0x18;
 
     /// Send descriptor. `SEND_SEQ` is written last and is nonzero.
     pub const SEND_SEQ: u64 = M + 0x40;
@@ -406,7 +418,7 @@ pub mod mover {
     pub const ACK_STAGE: u64 = M + 0x1C0;
 
     pub const RECORD_BYTES: usize = 32;
-    /// Words of a record: seq, len, dst x, dst y, dst addr, checksum, 0, seq.
+    /// Words of a record: seq, len, dst x, dst y, dst addr, 0, 0, seq.
     pub const RECORD_WORDS: usize = 8;
 
     /// "No tile": in `SEND_SRC_X`, the data is already in [`TX_STAGE`]; in
@@ -430,8 +442,8 @@ pub mod mover {
         /// A Tensix address not 16-byte aligned (the NoC copy needs it
         /// congruent with the 16-aligned staging buffers).
         pub const ALIGNMENT: u32 = 2;
-        /// The landed data never matched the record's checksum.
-        pub const CHECKSUM: u32 = 3;
+        /// The RX queue never reported its writes committed.
+        pub const LANDING: u32 = 3;
     }
 
     // The layout stays inside the mailbox page and the customer buffers, and
@@ -443,27 +455,4 @@ pub mod mover {
         assert!(INBOX % 16 == 0 && ACK % 16 == 0 && RECORD_STAGE % 16 == 0);
         assert!(ACK_STAGE % 16 == 0 && TX_STAGE % 16 == 0 && RX_LAND % 16 == 0);
     };
-
-    /// The checksum both ends compute over a transfer's words: Fletcher-style,
-    /// so a reordering or a missing word changes it, not only a flipped bit.
-    pub fn checksum(words: impl Iterator<Item = u32>) -> u32 {
-        let (mut a, mut b) = (0x1234_5678u32, 0u32);
-        for w in words {
-            a = a.wrapping_add(w);
-            b = b.wrapping_add(a);
-        }
-        a ^ b.rotate_left(16)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn checksum_sees_order_not_only_content() {
-            let a = checksum([1, 2, 3].into_iter());
-            assert_ne!(a, checksum([2, 1, 3].into_iter()));
-            assert_ne!(a, checksum([1, 2, 3, 0].into_iter()));
-        }
-    }
 }

@@ -1030,13 +1030,16 @@ projects of this shape stall.
       (refuses misalignment and firmware L1 at either end), and
       `load_and_start_e1` / `park_e1` (a read-modify-write of E1's bit only).
 - [x] **8.3 The `eth_e1` data mover** (`tt_isa::eth::mover` is the shared
-      contract). Tensix L1 -> NoC read -> TT-link -> checksum wait -> NoC write
+      contract). Tensix L1 -> NoC read -> TT-link -> landing wait -> NoC write
       -> Tensix L1, then an acknowledgement back over the link, so the host
-      waits on the *sending* chip only. The receiver will not forward until the
-      landed data matches the record's checksum, because nothing documented
-      orders RX-queue L1 writes. The record carries its sequence number in both
-      16-byte halves. The cross-chip gate was watched failing with the
-      receiver's forward removed.
+      waits on the *sending* chip only. The receiver will not forward until its
+      RX queue has no writes outstanding (`ETH_RXQ_OUTSTANDING_WR_CNT`), because
+      nothing documented orders RX-queue L1 commits. It does this on silicon
+      only, since ttsim cannot be asked and commits synchronously (row 62). The
+      record carries its sequence number in both 16-byte halves. The cross-chip
+      gate was watched failing with the receiver's forward removed. The first
+      version checksummed the whole buffer on both ends, which held the mover
+      to 196 MB/s.
 - [x] **8.4 `tt_kernels::link`:** `discover` pairs tiles from both chips'
       chip-info exchange, and requires each side to name the other. `Mover`
       provides `start`, `stage`, `send` (with a host deadline, returning
@@ -1065,17 +1068,33 @@ projects of this shape stall.
       - host-driven TT-link, 4 directions;
       - E1 on a port-less tile and on a live one;
       - the mover staged both ways at 128 KiB;
-      - 128 KiB Tensix -> Tensix across cards, acknowledged in 0.67 ms;
+      - 128 KiB Tensix -> Tensix across cards, acknowledged in 14 us;
       - no receiver means a timeout;
       - the sharded `[64,784] @ [784,128]` HiFi4 matmul, bit-identical to
         single-chip.
 
       `step12_mnist::the_mlp_trains_sharded_over_two_chips_matching_the_golden`
       passes on the two cards: **the loss curve is the golden, bit for bit.**
-- [ ] **Throughput.** 128 KiB in 0.67 ms is about 195 MB/s against 400 GbE, spent
-      mostly on the E1 checksum wait, 4 KiB TT-link commands and host polling.
-      Pipelining (double-buffered `TX_STAGE`/`RX_LAND`, larger TT-link commands,
-      several links at once) is Phase 9.
+- [x] **Throughput, measured** (`RUST_IMPL_PLAN.md`, Phase 8 "As built", for
+      the table). The mover moves 128 KiB Tensix -> Tensix across cards in
+      14 us, 9.4 GB/s; 11.4 GB/s from staging to landing. A ~9 us floor is the
+      host polling the ack. The host-driven TT-link reaches 9.1 GB/s with one
+      128 KiB command. **PCIe through the TLB windows manages 18 MB/s writing
+      and 5 MB/s reading**, so Ethernet is already about 500x faster for tensor
+      data. The PCIe path is Phase 9's first target. Integrity: 200 transfers of
+      mixed size, each with fresh data and a fenced sentinel, all correct
+      (`silicon_eth_bench::mover_integrity`). With the landing wait disabled, 400
+      more were also all correct, so the record's in-order arrival suffices in
+      practice. The wait stays, because it is what the documentation licenses.
+- [x] **The "128 KiB never arrives" benchmark failure was the benchmark's.**
+      Its zero-fill of the destination is posted PCIe writes, and some landed
+      *after* the TT-link data, zeroing the transfer's tail. 57 of 480 failed
+      unfenced, 0 of 480 fenced, and the link has no size limit (40 x 4 KiB
+      commands fine). It exposed a real hazard: `Device::write` does not order
+      against agents other than the host. `Mover::stage` now reads back, and
+      the silicon gates fence what they stage.
+- [ ] **A `Device` write fence** as API, rather than read-backs at call sites.
+- [ ] Double-buffered `TX_STAGE`/`RX_LAND`, and both links at once.
 - [ ] **Data-parallel training** (a gradient all-reduce over the links) is not
       done. It reorders sums, so it needs a weaker claim than the golden, and
       `N`-sharding already makes Ethernet load-bearing.

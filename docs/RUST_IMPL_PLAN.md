@@ -948,9 +948,12 @@ taken.
      first device-initiated NoC traffic in this workspace, built by
      `tt_isa::noc::niu::Command`, which cannot express the NoC hazards.
   2. It TT-link-writes the data and then a record to the partner.
-  3. The partner waits for the record's checksum before it NoC-writes the data
-     into its own Tensix tile. Nothing documented orders RX-queue L1 writes, so
-     the record alone is not proof the data has landed.
+  3. On seeing the record, the partner waits for its RX queue's outstanding
+     writes to reach zero, then NoC-writes the data into its own Tensix tile.
+     TT-link delivers a queue's packets in order, but nothing documented orders
+     their L1 commits, so the record alone is not proof the data has landed.
+     (The first version checksummed the whole buffer on both ends instead, which
+     cost ~3.75 us/KiB.)
   4. The partner acknowledges back over the link, so the host waits on the
      sending chip only.
 * **Sharding is along `N` with `K` whole** (`tt_kernels::shard::Fabric`), so the
@@ -964,20 +967,40 @@ taken.
 * **One Burn device.** `burn_tt::MeshEngine` puts a whole fabric behind the
   existing `Engine` trait. The plan's `attach_mesh` was unnecessary: `attach`
   already runs its factory on the server thread, which can own every chip.
-* **What E1 buys today, stated plainly.** The mover takes the host out of the
-  *data* path to every chip but chip 0. On two p150a cards, each with its own
-  PCIe link, that is a structural claim, not a speedup. The host could write
-  chip 1's operands over chip 1's PCIe, possibly faster than the mover's current
-  195 MB/s (unmeasured), and it still loads programs on every chip. The payoff
-  comes later: chips reachable only over Ethernet (Galaxy-style), device-resident
-  pipelines where one chip's output feeds another's next op with no host round
-  trip (Phase 9), and link bandwidth that does not compete with PCIe. A
-  host-PCIe-to-chip-1 baseline belongs with the Phase 9 measurements.
+* **What E1 buys today, measured** (`silicon_eth_bench`, throwaway; medians of
+  20, card 0 to card 1, 128 KiB):
+
+  | Path | Time | Throughput |
+  |---|---|---|
+  | Host writes chip 1's Tensix L1 over PCIe (TLB window) | 7.2 ms | 18 MB/s (reads: 5 MB/s) |
+  | Mover, first version (whole-buffer checksum on both ends) | 669 us | 196 MB/s |
+  | Host drives TT-link itself, 4 KiB commands | 168 us | 0.78 GB/s |
+  | Host drives TT-link itself, one 128 KiB command | 14.4 us | 9.1 GB/s |
+  | Mover, landing wait instead of checksum, staged -> landed | 11.5 us | 11.4 GB/s |
+  | Mover, Tensix -> Tensix across cards | 14.0 us | 9.4 GB/s |
+
+  So the Ethernet path is already *faster* than PCIe for moving tensor data,
+  by about 500x. That reverses what this section said before measuring. The
+  fixed ~9 us floor is the host polling the ack over PCIe. The host-driven
+  rows are bound by the host's per-command register writes; the mover issues
+  its 4 KiB commands locally, so command size no longer matters to it. The
+  PCIe figure is the bigger story: the TLB-window path is uncached MMIO, and
+  it is very probably most of Phase 7's ~435 ms per training step. The
+  mover's other payoffs still stand: chips reachable only over Ethernet
+  (Galaxy-style), device-resident pipelines where one chip's output feeds
+  another's next op with no host round trip (Phase 9), and link bandwidth
+  that does not compete with PCIe.
+* **Posted writes race other agents** (found by the benchmark, not the link).
+  `Device::write` returns while its writes are still in flight, so anything
+  other than the host -- E1, the RX queue of a link -- can see stale bytes in
+  L1 the host just wrote. A zero-fill racing an incoming transfer lost the
+  transfer's tail 57 times in 480, and 0 in 480 once the fill was read back.
+  `Mover::stage` now reads its last word back before returning, and the
+  silicon gates fence what they stage. A general `Device` fence is open.
 * **Not done, deliberately.**
   * Data-parallel training: an all-reduce reorders sums, so it needs a weaker
     claim than the golden.
-  * Throughput: 195 MB/s for 128 KiB, spent on the E1 checksum wait, 4 KiB
-    TT-link commands and host polling. Pipelining is Phase 9.
+  * Faster PCIe staging and double-buffered, multi-link Ethernet: Phase 9.
 
 ### Phase 9 — Performance (open-ended, **silicon-only**)
 

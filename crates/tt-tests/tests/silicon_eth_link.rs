@@ -229,6 +229,10 @@ mod mover {
             let data = pattern(0x77).repeat(LEN / 4096);
             a.write(&wa, src, 0x8_0000, &data).unwrap();
             b.write(&wb, dst, 0x9_0000, &vec![0xEE; LEN + 256]).unwrap();
+            // Posted writes: read each back so neither the E1 pulling the source
+            // nor the link writing the destination can overtake them.
+            let _ = a.read32(&wa, src, 0x8_0000 + LEN as u64 - 4).unwrap();
+            let _ = b.read32(&wb, dst, 0x9_0000 + LEN as u64 + 252).unwrap();
             let mut m = Mover::start(a, &wa, b, &wb, l, tt_firmware_images::ETH_E1).unwrap();
             let t0 = Instant::now();
             m.send(

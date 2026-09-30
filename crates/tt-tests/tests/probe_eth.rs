@@ -242,3 +242,22 @@ fn bh_x4_link_map() {
     });
     println!("child: {r:?}");
 }
+
+/// Does ttsim decode the RX queue counters the mover's landing check reads?
+#[test]
+#[ignore = "exploratory"]
+fn rxq_counters_on_ttsim() {
+    let dir = PathBuf::from(std::env::var_os("CARGO_TARGET_TMPDIR").unwrap_or("/tmp".into()))
+        .join("eth-rxq");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    for (n, o) in [
+        ("BYTE_CNT", 0x04u64),
+        ("PKT_START", 0x24),
+        ("PKT_END", 0x28),
+        ("DROP", 0x4C),
+        ("OUTSTANDING_WR_CNT", 0x50),
+    ] {
+        println!("RXQ2_{n} = {}", show(read(1, 12, RXQ + 0x2000 + o, &dir)));
+    }
+}
