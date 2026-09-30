@@ -34,7 +34,7 @@ gate you have not seen reject something is not yet evidence.
 | 3 — Encoder + first Tensix round-trip | `[~]` | SFPU round-trip, `tt-isa-gen` and the encoding corpus done; tracing and the silicon diff open |
 | 4 — Layout | `[~]` | Host-side tilization and the L1 image done; silicon gate open |
 | 5 — Elementwise binary | `[~]` | Simulator gate done, FP32 only; BF16 blocked on ttsim, silicon gate open |
-| 6 — Matmul | `[ ]` | The schedule risk |
+| 6 — Matmul | `[~]` | One 8×16·16×16 `MVMUL` block gated with all four fidelity phases; face, tile and multi-tile open |
 | 7 — Burn backend, training | `[ ]` | The milestone |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
@@ -57,7 +57,8 @@ Set up early; retrofitting is expensive.
       `Translated`, plus `ChipId` from day one. `ChipId` is now load-bearing rather
       than merely present: it is the bdf device field *and* the stride multiplier
       for a chip's BAR windows, so the day-one decision cost nothing to collect on.
-- [x] **Divergence log** — `docs/ttsim-divergence.md`, 26 entries and counting.
+- [x] **Divergence log** — `docs/ttsim-divergence.md`, 42 numbered rows plus eight
+      measurements, and counting.
 - [x] **Silicon-only suite exists** — `--features silicon`, compiled always so it
       cannot rot.
 - [x] **Version control**, so the pinning discipline above is enforceable.
@@ -69,7 +70,9 @@ Set up early; retrofitting is expensive.
 - [x] **CI: `cargo xtask gen-isa --check`**, likewise for the instruction table —
       and it re-runs the cross-check between the specification's two descriptions
       of the instruction set, so an exception edited without looking at what it
-      explains fails there.
+      explains fails there. It also checks every measured Blackhole override
+      (`xtask/src/gen_isa/Bits32_BH.lua`) against the diagram it supersedes and
+      against the gate that licenses it.
 - [x] **Pre-commit hooks** (`prek.toml`) running fmt, clippy for both workspaces,
       and the generated-table check — the same things CI runs, so a push does not
       fail on something a commit could have caught.
@@ -150,11 +153,21 @@ no answer.
 - [x] **A misaligned 128-bit `WRCFG` is refused rather than rounded.** The
       instruction masks both indices with `& ~3` instead of faulting, so an
       unaligned request silently writes four words elsewhere.
-- [ ] **`UnpackToDst` clobbers `SrcA[Bank]`** — `UNPACR_Regular.md:441`, rows not
-      characterised. Not load-bearing yet (nothing reads `SrcA`), but it makes the
-      two unpack modes mutually exclusive and Phase 6 must encode that.
+- [x] **`UnpackToDst` clobbers `SrcA[Bank]`** — `UNPACR_Regular.md:441`.
+      `tt_isa::matrix::Banks::unpack_to_dst` requires `SrcA` to be `Empty`, so it
+      cannot run between the partial unpacks of one operand; a `compile_fail`
+      doctest watches it, and goes red when the rule is removed.
 - [ ] `Dst` exclusivity across the three Tensix threads. *(Phase 5–6.)*
-- [ ] `SrcA`/`SrcB` bank ownership handshake. *(Phase 6.)*
+- [x] **`SrcA`/`SrcB` bank ownership handshake.** `tt_isa::matrix::Banks<A, B>`
+      tracks each operand as `Empty` / `Filling` / `Loaded` under a lockstep
+      discipline: every bank the unpacker hands over is handed back by exactly one
+      flipping consumer before the unpacker writes again. Four `compile_fail`
+      doctests, each watched turning red when its forbidden impl is added. The
+      discipline was not hypothetical: the `Src` probes hit the mix-up it forbids
+      by accident — a `FlipSrc` unpack, a non-flipping `MOVA2D`, a second unpack
+      into bank 1 while the move read bank 0 again, and the first run's data back
+      with no diagnostic. `SETDVALID` and `CLEARDVALID(Reset)` are left out of the
+      safe surface on ttsim's and tt-metal#22383's say-so.
 - [ ] `NOC_CMD_WR_INLINE` must never target an L1 address. *(Needed once a core
       drives an NIU; the host path does not.)*
 - [ ] `NOC_CMD_L1_ACC_AT_EN` must always be `false`.
@@ -577,6 +590,8 @@ Eltwise before matmul deliberately: it exercises unpack → SFPU → pack with n
   - [-] **BF16 is not reachable on the simulator.** ttsim declines `UnpackToDst` for
         every 16-bit and block-float input format (divergence row 31), so the BF16
         kernel is silicon-only until the packer offers another route into `Dst`.
+        Phase 6 found a BF16 route into `Src`, which the Matrix Unit can use but the
+        SFPU cannot.
       **Controls watched failing:** expecting the host's `f32` multiply instead of
       the model; an empty kernel; swapped operand row groups; a reversed Burn
       operand.
@@ -594,22 +609,68 @@ fidelity phases are documented in exactly one place and it is the wrong tree. BH
 `PACR.md` is self-labelled "basic" and admits its `ReadIntfSel` interaction is
 undocumented.
 
-- [ ] `UNPACR` into `SrcA`/`SrcB`.
-- [ ] Double-bank `SETDVALID`/`CLEARDVALID` handshake.
-- [ ] `MVMUL`, fidelity phases.
-- [ ] `PACR` out.
-- [ ] Single 32×32 tile → blocked → multi-tile.
+- [x] **`UNPACR` into `SrcA`/`SrcB`.** `crates/tt-tests/tests/probe_src.rs`: FP32 in
+      L1 → TF32 or BF16 in `Src` on both unpackers, and BF16 in L1 → BF16 in `Src`,
+      each observed through `MOVA2D`/`MOVB2D` and asserted bit for bit against the
+      documented truncation (`tt_isa::tile::fp32_to_tf32`). FP32 *into* `Src` is
+      refused as the `UndefinedBehavior` `UNPACR_Regular.md:580` says it is, and
+      that refusal is a gate with a surviving control. Negative control: one
+      corrupted staged datum moves exactly one `Src` element. Watched failing with
+      the truncation removed and with the hidden base mis-sized.
+  - [x] **Configuration surface mapped per field**, at zero and at one — row 28's
+        register sweep cannot see value-dependent refusals. Unpacker 1 is mostly
+        refused (row 36) but none of the refused fields is read on this path.
+  - [x] **The hidden output base is 16 bytes, applies on the `Src` path too, and
+        scales with the *input* width** (row 35). Corrected on the data side.
+  - [x] **A BF16 route exists** — FP32 or BF16 in L1 into `Src` — which the `Dst`
+        path never had (row 31). It serves the Matrix Unit, not the SFPU, so the
+        Phase 5 BF16 eltwise gate is still silicon-only.
+- [x] **Double-bank handshake** — via `UNPACR` `FlipSrc` and `MVMUL`/`SETRWC` flips,
+      not `SETDVALID`/`CLEARDVALID`; see the hazard list above.
+- [x] **`MVMUL`, one block.** `crates/tt-tests/tests/step9_matmul.rs`, eight gates:
+      identity; small integers against the model *and* `burn-flex` (with a
+      transpose control); `+=` accumulation; `DstRow` placement with the untouched
+      rows asserted zero; phase 0 alone; all four phases through
+      `FIDELITY_BASE_Phase`; all four through the RWC `FidelityIncr`; and the
+      Blackhole `AddrMod` position. Watched failing with the operands transposed and
+      with the full-precision answer expected from phase 0.
+- [x] **Fidelity phases, and a bit-exact oracle for them.** ttsim models the phases
+      exactly as `MatrixUnit.md:143-165` describes — each phase alone gives exactly
+      its partial product. `tt_isa::numerics::mvmul_reference` ports the model and
+      **returns `None` unless every product and sum is exact**, because `MVMUL.md`
+      calls its float model "a rough guide" to order; the gates choose operands in
+      that regime, and the reference caught one set that was not.
+- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..15, not
+      the Wormhole diagram's 15..16 (row 42), so the generated encoder applied the
+      wrong modifier for every non-zero value, silently. **Now fixed through the
+      generator, not beside it:** `xtask/src/gen_isa/Bits32_BH.lua` holds measured
+      Blackhole layouts in `Bits32.lua`'s own dialect, each with a row in
+      `measured.rs` naming what it supersedes, which fields moved, and the gate that
+      measured them. `gen-isa` refuses an override that supersedes anything but a
+      `WormholeOnly` diagram, moves a field it does not list (or lists one it does
+      not move), cites a gate that does not exist, or survives the specification
+      documenting the instruction for Blackhole. Each refusal has a mutation test,
+      and the missing-gate one was watched end to end. The result is
+      `Provenance::Measured`, a third status beside documented and `UNVERIFIED`.
+      **Open:** sweep every other Matrix Unit instruction with an `AddrMod` or a
+      mode field — `ZEROACC` first, whose refused `UseDst32b` (row 40) is probably
+      the same shift.
+- [ ] `PACR` out of a `MVMUL` result. The `Dst` dump suffices for one block; the
+      packer path exists from Phase 5 and needs only the `Dst` offsets.
+- [ ] Single 16×16 face → 32×32 tile → blocked → multi-tile. The tile step settles
+      the Phase 4 "which `Z` plane is which face" convention.
 - [ ] Budget a standing percentage of the phase for empirical discovery rather
-      than implementation.
-- [ ] Do unpacker/packer bring-up **entirely in the simulator** — ttsim is
-      intentionally more restrictive than silicon and raises `UndefinedBehavior` on
-      misconfigured state, turning the largest documentation gap in the project
-      into loud, deterministic failures instead of silent wrong data. Treat each
-      raise as a specification question to answer before moving on.
-- [ ] **Gate (sim):** matches `burn-ndarray` across shapes, dtypes, fidelity
-      phases, accumulation depths.
+      than implementation. *(Borne out: six of the eight new divergence rows were
+      found while building the first block.)*
+- [x] Do unpacker/packer bring-up **entirely in the simulator** — every refusal so
+      far has been a specification question, answered and logged before moving on.
+- [ ] **Gate (sim):** matches **`burn-flex`** (not `burn-ndarray`, which is
+      deprecated) across shapes, dtypes, fidelity phases, accumulation depths. One
+      block, TF32, all phases, depth 2: done. Shapes, BF16 and depth: open.
 - [ ] **Gate (silicon):** same suite. Expect divergence here more than anywhere
-      else — this is where Wormhole-sourced assumptions will be wrong.
+      else — this is where Wormhole-sourced assumptions will be wrong. Silicon twins
+      written for the two ttsim artefacts the gates correct for (the hidden base,
+      `MOVB2D` `Move4Rows`).
 
 ---
 
@@ -812,9 +873,10 @@ Documented, not speculative. These bite in Phases 2–4.
       `0 = FP32`, `4 = TF32`, `8 = INT32`. Recorded on `tt_isa::tile::L1Format::code`
       as `MEASURED`, a deliberately different marker from `UNVERIFIED`: the latter
       is a hypothesis from a document, this is a measurement where no document
-      exists. **Still open:** every 16-bit and block-float code, because ttsim
-      declines `UnpackToDst` for them entirely (divergence row 31); they must be
-      pinned through the packer instead. Divergence row G; re-derive on silicon.
+      exists. **`1 = FP16` and `5 = BF16` since measured the same way through the
+      `Src` path** (divergence row H), which ttsim does not decline. **Still
+      open:** the block-float and 8-bit codes. Divergence rows G and H; re-derive
+      on silicon.
 
 - [ ] **8.** *(New.)* The Tensix grid topology in `tt_isa::noc::grid` was **measured
       against ttsim**, not quoted — `NOC_ENDPOINT_ID` is unimplemented there, so the

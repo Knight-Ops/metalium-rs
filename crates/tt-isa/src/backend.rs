@@ -547,6 +547,11 @@ pub const fn wait_for_unpacker0() -> Result<Instruction, EncodeError> {
     stallwait(block::UNPACKER, cond::UNPACKER0_BUSY)
 }
 
+/// Wait until this thread has drained unpacker 1 (C2, blocking B3).
+pub const fn wait_for_unpacker1() -> Result<Instruction, EncodeError> {
+    stallwait(block::UNPACKER, cond::UNPACKER1_BUSY)
+}
+
 /// Wait until this thread has drained the packer (C3, blocking B2).
 pub const fn wait_for_packer() -> Result<Instruction, EncodeError> {
     stallwait(block::PACKER, cond::PACKER_BUSY)

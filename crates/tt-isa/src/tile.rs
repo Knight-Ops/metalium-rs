@@ -82,12 +82,6 @@ pub enum L1Format {
 }
 
 impl L1Format {
-    /// Width of one datum **in bits**.
-    ///
-    /// Bits rather than bytes because BFP4 packs two datums per byte and BFP2 packs
-    /// four (`Packers/FormatConversion.md:103`), so a byte-valued accessor could not
-    /// describe them. The unpacker's own model has the same shape, carrying
-    /// `DatumSizeBytes` as a fraction (`UNPACR_Regular.md:92-98`).
     /// The 4-bit `InDataFormat` / `OutDataFormat` code, where it has been measured.
     ///
     /// **`MEASURED`, not documented** — a different status from the `UNVERIFIED`
@@ -119,19 +113,34 @@ impl L1Format {
     ///   also notes that "when unpacking to `Dst`, TF32 means FP32", which is why
     ///   `(0, 4)` returns FP32 bits unchanged rather than truncating a mantissa.
     ///
+    /// # BF16 and FP16, through the `Src` path
+    ///
+    /// ttsim declines `UnpackToDst` for every 16-bit input (`UnimplementedFunctionality:
+    /// tensix_unpacr: unpack_to_dst=1 in_data_format=1`), but not an unpack into
+    /// `SrcA`/`SrcB`. `probe_src.rs::survey_src_out_formats` unpacks FP32 datums
+    /// carrying mantissa bits on both sides of every candidate cut into `Src` once
+    /// per `OutDataFormat`, and moves the row into `Dst` with `MOVA2D`/`MOVB2D`. Of
+    /// the sixteen, exactly three run: 4 keeps the top ten mantissa bits (TF32, as
+    /// before), 5 keeps the top seven (BF16), and 1 rebiases the exponent to five
+    /// bits (FP16, `FP32ToFP16` in `UNPACR_Regular.md:515`). Code 0 is refused as
+    /// `UndefinedBehavior`, which is what `UNPACR_Regular.md:580` says FP32 into
+    /// `Src` is. `survey_src_16bit_inputs` then stages BF16 and FP16 datums in L1
+    /// under the same two codes as the *input* format and gets them back bit for
+    /// bit, so the codes name the L1 formats as well as the `Src` ones.
+    ///
     /// # What is deliberately still `None`
     ///
-    /// Every 16-bit and block-float code. ttsim declines `UnpackToDst` for them
-    /// outright (`UnimplementedFunctionality: tensix_unpacr: unpack_to_dst=1
-    /// in_data_format=1`), so this path cannot measure them and guessing from
-    /// tt-metal's `DataFormat` enum would be transcription. They are reachable
-    /// through the packer instead, which is where they should be pinned.
+    /// Every block-float and 8-bit code. Guessing them from tt-metal's `DataFormat`
+    /// enum would be transcription; they should be pinned by measurement, like
+    /// these.
     ///
     /// Re-derive all of it at the first silicon gate; a mismatch is a finding.
     pub const fn code(self) -> Option<u32> {
         match self {
             L1Format::Fp32 => Some(0),
+            L1Format::Fp16 => Some(1),
             L1Format::Tf32 => Some(4),
+            L1Format::Bf16 => Some(5),
             L1Format::Int32 => Some(8),
             _ => None,
         }
@@ -141,12 +150,20 @@ impl L1Format {
     pub const fn from_code(code: u32) -> Option<L1Format> {
         match code {
             0 => Some(L1Format::Fp32),
+            1 => Some(L1Format::Fp16),
             4 => Some(L1Format::Tf32),
+            5 => Some(L1Format::Bf16),
             8 => Some(L1Format::Int32),
             _ => None,
         }
     }
 
+    /// Width of one datum **in bits**.
+    ///
+    /// Bits rather than bytes because BFP4 packs two datums per byte and BFP2 packs
+    /// four (`Packers/FormatConversion.md:103`), so a byte-valued accessor could not
+    /// describe them. The unpacker's own model has the same shape, carrying
+    /// `DatumSizeBytes` as a fraction (`UNPACR_Regular.md:92-98`).
     pub const fn datum_bits(self) -> u32 {
         match self {
             L1Format::Bfp2 | L1Format::Bfp2a => 2,
@@ -656,6 +673,18 @@ pub const fn bfp4a_to_fp16(datum_bits: u8, exp_bits: u8) -> Option<u16> {
 /// Decode one BFP2a datum to FP16 (`FloatBitPatterns.md:162-164`).
 pub const fn bfp2a_to_fp16(datum_bits: u8, exp_bits: u8) -> Option<u16> {
     bfp8a_to_fp16(datum_bits << 6, exp_bits)
+}
+
+/// Narrow FP32 to TF32 the way the unpacker does on the way into `SrcA`/`SrcB`:
+/// drop the low 13 mantissa bits (`WriteSrcTF32(DatumBits >> 13)`,
+/// `UNPACR_Regular.md:507`). Truncation, not rounding. Returned as the FP32 bit
+/// pattern of the TF32 value, which is what a `MOVA2D` back into 32-bit `Dst`
+/// yields.
+///
+/// No denormal flush here: the unpacker does not flush on this conversion, and the
+/// consumers that do (`MOVA2D`, `MVMUL`) flush on the way *out* of `Src`.
+pub const fn fp32_to_tf32(bits: u32) -> u32 {
+    bits & !0x1FFF
 }
 
 /// Widen a BF16 bit pattern to FP32. Always exact: BF16 *is* FP32 with the low 16
@@ -1276,6 +1305,15 @@ mod format_code_tests {
         assert_eq!(L1Format::Fp32.code(), Some(0));
         assert_eq!(L1Format::Tf32.code(), Some(4));
         assert_eq!(L1Format::Int32.code(), Some(8));
+        assert_eq!(L1Format::Fp16.code(), Some(1));
+        assert_eq!(L1Format::Bf16.code(), Some(5));
+    }
+
+    #[test]
+    fn tf32_truncates_thirteen_bits_and_keeps_the_fourteenth() {
+        assert_eq!(fp32_to_tf32(0x3F80_3FFF), 0x3F80_2000);
+        assert_eq!(fp32_to_tf32(0x3F80_1FFF), 0x3F80_0000);
+        assert_eq!(fp32_to_tf32(0x8000_0001), 0x8000_0000);
     }
 
     /// Every code this crate claims must round-trip, and every format it does not
@@ -1283,14 +1321,18 @@ mod format_code_tests {
     /// measurement.
     #[test]
     fn codes_round_trip_and_nothing_else_is_claimed() {
-        let claimed = [L1Format::Fp32, L1Format::Tf32, L1Format::Int32];
+        let claimed = [
+            L1Format::Fp32,
+            L1Format::Tf32,
+            L1Format::Int32,
+            L1Format::Bf16,
+            L1Format::Fp16,
+        ];
         for f in claimed {
             let code = f.code().expect("claimed formats have a code");
             assert_eq!(L1Format::from_code(code), Some(f));
         }
         for f in [
-            L1Format::Bf16,
-            L1Format::Fp16,
             L1Format::Fp8,
             L1Format::Bfp8,
             L1Format::Bfp8a,

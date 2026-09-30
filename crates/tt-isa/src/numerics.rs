@@ -187,3 +187,149 @@ pub const fn mul_bh(x: u32, y: u32) -> u32 {
 pub const fn add_bh(x: u32, y: u32) -> u32 {
     fma_bh(0x3f80_0000, x, y)
 }
+
+// ---------------------------------------------------------------------------
+// Matrix Unit
+// ---------------------------------------------------------------------------
+
+/// The part of an FP32-valued `SrcA` operand one fidelity phase consumes.
+///
+/// A port of `SrcAFidelityBits` (`WormholeB0/.../MatrixUnit.md:143`). Even phases
+/// take the sign, exponent, implicit bit and top four mantissa bits; odd phases
+/// take the next five, as the difference `x - (x & 0xfff83fff)`. The last TF32
+/// mantissa bit (bit 13) is consumed by no phase, which is `MVMUL.md`'s "the
+/// least significant bit of the ... TF32 mantissa is ignored".
+///
+/// Operates on the value `SrcDecodeTF32` produces, i.e. the FP32 bit pattern of a
+/// TF32 or BF16 `Src` datum; BF16 needs no separate case because its low mantissa
+/// bits are zero.
+pub fn src_a_fidelity_bits(x: f32, phase: u32) -> f32 {
+    if phase & 1 == 0 {
+        f32::from_bits(x.to_bits() & 0xfff8_0000)
+    } else {
+        x - f32::from_bits(x.to_bits() & 0xfff8_3fff)
+    }
+}
+
+/// The part of an FP32-valued `SrcB` operand one fidelity phase consumes.
+///
+/// A port of `SrcBFidelityBits` (`MatrixUnit.md:155`): phases 0 and 1 take the top
+/// six mantissa bits with the implicit bit, phases 2 and 3 the next four.
+pub fn src_b_fidelity_bits(x: f32, phase: u32) -> f32 {
+    if phase & 2 == 0 {
+        f32::from_bits(x.to_bits() & 0xfffe_0000)
+    } else {
+        x - f32::from_bits(x.to_bits() & 0xfffe_1fff)
+    }
+}
+
+/// Denormals read out of `Src` are flushed (`MVMUL.md`: "Denormals will be flushed
+/// to zero"), keeping the sign.
+fn flush(x: f32) -> f32 {
+    if x.to_bits() & 0x7f80_0000 == 0 {
+        f32::from_bits(x.to_bits() & 0x8000_0000)
+    } else {
+        x
+    }
+}
+
+/// `MVMUL` into FP32 `Dst`: `dst += src_b @ src_a`, once per fidelity phase in
+/// `phases`, for the floating-point styles (TF32/BF16 `Src`, FP32 `Dst`).
+///
+/// `src_b` is 8x16 and `src_a` 16x16, both already in `Src` precision -- truncate
+/// with `tile::fp32_to_tf32` first.
+///
+/// # This is only a model where the arithmetic is exact
+///
+/// `MVMUL.md` says its float model is "a rough guide": the summation order,
+/// fusion and intermediate precision are unspecified. So this returns `None`
+/// unless every partial product and every sum it forms is exact in FP32 --
+/// checked by recomputing in `f64` and comparing -- in which case any order gives
+/// the same bits and the answer does not depend on what the document leaves open.
+/// A gate built on it therefore needs operands chosen to stay in that regime, and
+/// fails loudly (rather than asserting a guess) when they do not.
+pub fn mvmul_reference(
+    dst: &[[f32; 16]; 8],
+    src_b: &[[f32; 16]; 8],
+    src_a: &[[f32; 16]; 16],
+    phases: &[u32],
+) -> Option<[[f32; 16]; 8]> {
+    let mut out = *dst;
+    for &phase in phases {
+        for i in 0..8 {
+            for j in 0..16 {
+                let mut x = 0f32;
+                let mut wide = 0f64;
+                for k in 0..16 {
+                    let b = src_b_fidelity_bits(flush(src_b[i][k]), phase);
+                    let a = src_a_fidelity_bits(flush(src_a[k][j]), phase);
+                    let p = b * a;
+                    if f64::from(p) != f64::from(b) * f64::from(a) {
+                        return None;
+                    }
+                    x += p;
+                    wide += f64::from(p);
+                }
+                if f64::from(x) != wide {
+                    return None;
+                }
+                let sum = out[i][j] + x;
+                if f64::from(sum) != f64::from(out[i][j]) + f64::from(x) {
+                    return None;
+                }
+                out[i][j] = sum;
+            }
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fidelity_phases_split_each_operand_exactly() {
+        // The pair `step9_matmul.rs` watched ttsim split, one phase at a time.
+        let a = 1.0f32 + 2f32.powi(-5) + 2f32.powi(-9);
+        let b = 1.0f32 + 2f32.powi(-7) + 2f32.powi(-9);
+        assert_eq!(src_a_fidelity_bits(a, 0), 1.0);
+        assert_eq!(src_a_fidelity_bits(a, 1), 2f32.powi(-5) + 2f32.powi(-9));
+        assert_eq!(src_b_fidelity_bits(b, 0), 1.0);
+        assert_eq!(src_b_fidelity_bits(b, 2), 2f32.powi(-7) + 2f32.powi(-9));
+        // Phases 0 and 2 share the `SrcA` half, 0 and 1 the `SrcB` half.
+        assert_eq!(src_a_fidelity_bits(a, 2), src_a_fidelity_bits(a, 0));
+        assert_eq!(src_b_fidelity_bits(b, 1), src_b_fidelity_bits(b, 0));
+        // All four phases recover the product.
+        let sum: f32 = (0..4)
+            .map(|p| src_b_fidelity_bits(b, p) * src_a_fidelity_bits(a, p))
+            .sum();
+        assert_eq!(sum, a * b);
+    }
+
+    #[test]
+    fn the_last_tf32_bit_of_src_a_is_consumed_by_no_phase() {
+        let a = 1.0f32 + 2f32.powi(-10);
+        let consumed = src_a_fidelity_bits(a, 0) + src_a_fidelity_bits(a, 1);
+        assert_eq!(consumed, 1.0);
+    }
+
+    #[test]
+    fn the_reference_refuses_to_guess_where_order_matters() {
+        let dst = [[0f32; 16]; 8];
+        let mut a = [[0f32; 16]; 16];
+        let mut b = [[0f32; 16]; 8];
+        // 2^24 + 1 + 1 is 2^24 + 2 in one order and 2^24 in the other.
+        a[0][0] = 1.0;
+        a[1][0] = 1.0;
+        a[2][0] = 1.0;
+        b[0][0] = 16_777_216.0;
+        b[0][1] = 1.0;
+        b[0][2] = 1.0;
+        assert_eq!(mvmul_reference(&dst, &b, &a, &[0]), None);
+        // Small integers are exact, so it answers.
+        b[0][0] = 3.0;
+        let out = mvmul_reference(&dst, &b, &a, &[0]).unwrap();
+        assert_eq!(out[0][0], 5.0);
+    }
+}

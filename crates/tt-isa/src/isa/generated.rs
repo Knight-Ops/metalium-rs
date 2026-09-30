@@ -4,13 +4,14 @@
 //! file matches the specification revision pinned in `PINS.toml`.
 //!
 //! Source: tt-isa-documentation `f848eb668c2aeae742a88a49a86157e24a0a20c6`,
-//! 148 instruction encodings and 19 datum layouts, each
+//! 149 instruction encodings and 19 datum layouts, each
 //! cross-checked against the `TT_*(…)` syntax block on the page that embeds
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 11 superseded on Blackhole, 79 Wormhole-only and therefore
-//! **`UNVERIFIED`**.
+//! to be identical, 12 superseded on Blackhole, 78 Wormhole-only and therefore
+//! **`UNVERIFIED`**, and 1 **`MEASURED`** against ttsim where the specification
+//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`).
 //!
 //! Names are the `Bits32.lua` diagram keys, so a name in the specification can
 //! be found here without translation — except that a Blackhole-specific form
@@ -983,24 +984,6 @@ pub mod defs {
         0x00ffffff,
         Provenance::WormholeOnly,
         "WormholeB0/TensixTile/TensixCoprocessor/CLREXPHIST.md",
-    );
-
-    /// `MVMUL`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static MVMUL: InstructionDef = InstructionDef::new(
-        "MVMUL",
-        "MVMUL",
-        0x26,
-        &[
-            Field::new("FlipSrcB", 23, 1, false, None),
-            Field::new("FlipSrcA", 22, 1, false, None),
-            Field::new("BroadcastSrcBRow", 19, 1, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("DstRow", 0, 10, false, None),
-        ],
-        &[],
-        0x00367c00,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md",
     );
 
     /// `DOTPV`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
@@ -2332,6 +2315,18 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md",
     );
 
+    /// `MVMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static MVMUL: InstructionDef = InstructionDef::new(
+        "MVMUL_BH",
+        "MVMUL",
+        0x26,
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 19, 1, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[],
+        0x00373c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"] },
+        "WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md",
+    );
+
     /// Encodings Blackhole replaces. Present so that the difference is
     /// visible and testable, not so that they can be used here.
     pub mod wormhole {
@@ -2387,6 +2382,24 @@ pub mod defs {
                 by: "SFPLUTFP32_BH",
             },
             "WormholeB0/TensixTile/TensixCoprocessor/SFPLUTFP32.md",
+        );
+
+        /// `MVMUL`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`. Blackhole replaces it with `MVMUL_BH`; use that instead.
+        pub static MVMUL: InstructionDef = InstructionDef::new(
+            "MVMUL",
+            "MVMUL",
+            0x26,
+            &[
+                Field::new("FlipSrcB", 23, 1, false, None),
+                Field::new("FlipSrcA", 22, 1, false, None),
+                Field::new("BroadcastSrcBRow", 19, 1, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("DstRow", 0, 10, false, None),
+            ],
+            &[],
+            0x00367c00,
+            Provenance::SupersededOnBlackhole { by: "MVMUL_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md",
         );
 
         /// `SFPLOAD`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/SFPLOAD.md`. Blackhole replaces it with `SFPLOAD_BH`; use that instead.
@@ -2589,7 +2602,7 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::SHIFTXA,
     &defs::SHIFTXB,
     &defs::CLREXPHIST,
-    &defs::MVMUL,
+    &defs::wormhole::MVMUL,
     &defs::DOTPV,
     &defs::GAPOOL,
     &defs::CLEARDVALID,
@@ -2679,6 +2692,7 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::UNPACR_NOP_Nop,
     &defs::UNPACR_NOP_SETREG,
     &defs::UNPACR_NOP_SETDVALID,
+    &defs::MVMUL,
 ];
 
 /// The documented bit layout of each datum type in `Src` and `Dst`.
@@ -7363,111 +7377,6 @@ pub mod encode {
         Ok(Instruction::new(word, def))
     }
 
-    /// `MVMUL`, built field by field.
-    ///
-    /// 5 operands is too many to pass positionally without inviting a
-    /// transposition, so each is named: `Mvmul::ZERO.flip_src_b(1).encode()`.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub struct Mvmul {
-        flip_src_b: u32,
-        flip_src_a: u32,
-        broadcast_src_b_row: u32,
-        addr_mod: u32,
-        dst_row: u32,
-    }
-
-    impl Mvmul {
-        /// Every operand zero. Fixed bits are added by [`Self::encode`].
-        pub const ZERO: Self = Mvmul {
-            flip_src_b: 0,
-            flip_src_a: 0,
-            broadcast_src_b_row: 0,
-            addr_mod: 0,
-            dst_row: 0,
-        };
-
-        pub const fn flip_src_b(mut self, value: u32) -> Self {
-            self.flip_src_b = value;
-            self
-        }
-
-        pub const fn flip_src_a(mut self, value: u32) -> Self {
-            self.flip_src_a = value;
-            self
-        }
-
-        pub const fn broadcast_src_b_row(mut self, value: u32) -> Self {
-            self.broadcast_src_b_row = value;
-            self
-        }
-
-        pub const fn addr_mod(mut self, value: u32) -> Self {
-            self.addr_mod = value;
-            self
-        }
-
-        pub const fn dst_row(mut self, value: u32) -> Self {
-            self.dst_row = value;
-            self
-        }
-
-        pub const fn encode(self) -> Result<Instruction, EncodeError> {
-            let def = &defs::MVMUL;
-            let mut word = def.skeleton();
-            let f = def.fields()[0];
-            if !f.fits(self.flip_src_b) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.flip_src_b,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.flip_src_b);
-            let f = def.fields()[1];
-            if !f.fits(self.flip_src_a) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.flip_src_a,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.flip_src_a);
-            let f = def.fields()[2];
-            if !f.fits(self.broadcast_src_b_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.broadcast_src_b_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.broadcast_src_b_row);
-            let f = def.fields()[3];
-            if !f.fits(self.addr_mod) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.addr_mod,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.addr_mod);
-            let f = def.fields()[4];
-            if !f.fits(self.dst_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.dst_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.dst_row);
-            Ok(Instruction::new(word, def))
-        }
-    }
-
     /// `DOTPV`.
     pub const fn dotpv(
         flip_src_b: u32,
@@ -11870,6 +11779,111 @@ pub mod encode {
         Ok(Instruction::new(word, def))
     }
 
+    /// `MVMUL_BH`, built field by field.
+    ///
+    /// 5 operands is too many to pass positionally without inviting a
+    /// transposition, so each is named: `Mvmul::ZERO.flip_src_b(1).encode()`.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Mvmul {
+        flip_src_b: u32,
+        flip_src_a: u32,
+        broadcast_src_b_row: u32,
+        addr_mod: u32,
+        dst_row: u32,
+    }
+
+    impl Mvmul {
+        /// Every operand zero. Fixed bits are added by [`Self::encode`].
+        pub const ZERO: Self = Mvmul {
+            flip_src_b: 0,
+            flip_src_a: 0,
+            broadcast_src_b_row: 0,
+            addr_mod: 0,
+            dst_row: 0,
+        };
+
+        pub const fn flip_src_b(mut self, value: u32) -> Self {
+            self.flip_src_b = value;
+            self
+        }
+
+        pub const fn flip_src_a(mut self, value: u32) -> Self {
+            self.flip_src_a = value;
+            self
+        }
+
+        pub const fn broadcast_src_b_row(mut self, value: u32) -> Self {
+            self.broadcast_src_b_row = value;
+            self
+        }
+
+        pub const fn addr_mod(mut self, value: u32) -> Self {
+            self.addr_mod = value;
+            self
+        }
+
+        pub const fn dst_row(mut self, value: u32) -> Self {
+            self.dst_row = value;
+            self
+        }
+
+        pub const fn encode(self) -> Result<Instruction, EncodeError> {
+            let def = &defs::MVMUL;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(self.flip_src_b) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.flip_src_b,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.flip_src_b);
+            let f = def.fields()[1];
+            if !f.fits(self.flip_src_a) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.flip_src_a,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.flip_src_a);
+            let f = def.fields()[2];
+            if !f.fits(self.broadcast_src_b_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.broadcast_src_b_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.broadcast_src_b_row);
+            let f = def.fields()[3];
+            if !f.fits(self.addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.addr_mod);
+            let f = def.fields()[4];
+            if !f.fits(self.dst_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.dst_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.dst_row);
+            Ok(Instruction::new(word, def))
+        }
+    }
+
     /// Encoders for the forms Blackhole replaces. Reaching one has to be
     /// deliberate.
     pub mod wormhole {
@@ -12069,6 +12083,111 @@ pub mod encode {
             }
             word |= f.place(mod1);
             Ok(Instruction::new(word, def))
+        }
+
+        /// `MVMUL`, built field by field.
+        ///
+        /// 5 operands is too many to pass positionally without inviting a
+        /// transposition, so each is named: `Mvmul::ZERO.flip_src_b(1).encode()`.
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        pub struct Mvmul {
+            flip_src_b: u32,
+            flip_src_a: u32,
+            broadcast_src_b_row: u32,
+            addr_mod: u32,
+            dst_row: u32,
+        }
+
+        impl Mvmul {
+            /// Every operand zero. Fixed bits are added by [`Self::encode`].
+            pub const ZERO: Self = Mvmul {
+                flip_src_b: 0,
+                flip_src_a: 0,
+                broadcast_src_b_row: 0,
+                addr_mod: 0,
+                dst_row: 0,
+            };
+
+            pub const fn flip_src_b(mut self, value: u32) -> Self {
+                self.flip_src_b = value;
+                self
+            }
+
+            pub const fn flip_src_a(mut self, value: u32) -> Self {
+                self.flip_src_a = value;
+                self
+            }
+
+            pub const fn broadcast_src_b_row(mut self, value: u32) -> Self {
+                self.broadcast_src_b_row = value;
+                self
+            }
+
+            pub const fn addr_mod(mut self, value: u32) -> Self {
+                self.addr_mod = value;
+                self
+            }
+
+            pub const fn dst_row(mut self, value: u32) -> Self {
+                self.dst_row = value;
+                self
+            }
+
+            pub const fn encode(self) -> Result<Instruction, EncodeError> {
+                let def = &defs::wormhole::MVMUL;
+                let mut word = def.skeleton();
+                let f = def.fields()[0];
+                if !f.fits(self.flip_src_b) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.flip_src_b,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.flip_src_b);
+                let f = def.fields()[1];
+                if !f.fits(self.flip_src_a) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.flip_src_a,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.flip_src_a);
+                let f = def.fields()[2];
+                if !f.fits(self.broadcast_src_b_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.broadcast_src_b_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.broadcast_src_b_row);
+                let f = def.fields()[3];
+                if !f.fits(self.addr_mod) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.addr_mod,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.addr_mod);
+                let f = def.fields()[4];
+                if !f.fits(self.dst_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.dst_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.dst_row);
+                Ok(Instruction::new(word, def))
+            }
         }
 
         /// `SFPLOAD`.

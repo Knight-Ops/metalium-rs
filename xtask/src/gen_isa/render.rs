@@ -243,7 +243,8 @@ fn header(out: &mut String, input: &Input<'_>, instructions: usize, layouts: usi
          //!\n\
          //! Provenance: {} documented for Blackhole, {} shared with Wormhole and stated\n\
          //! to be identical, {} superseded on Blackhole, {} Wormhole-only and therefore\n\
-         //! **`UNVERIFIED`**.\n\
+         //! **`UNVERIFIED`**, and {} **`MEASURED`** against ttsim where the specification\n\
+         //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`).\n\
          //!\n\
          //! Names are the `Bits32.lua` diagram keys, so a name in the specification can\n\
          //! be found here without translation — except that a Blackhole-specific form\n\
@@ -259,6 +260,7 @@ fn header(out: &mut String, input: &Input<'_>, instructions: usize, layouts: usi
         counts.get("SharedWithWormhole").copied().unwrap_or(0),
         counts.get("SupersededOnBlackhole").copied().unwrap_or(0),
         counts.get("WormholeOnly").copied().unwrap_or(0),
+        counts.get("Measured").copied().unwrap_or(0),
     )
     .unwrap();
 }
@@ -322,6 +324,13 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
         Provenance::SupersededOnBlackhole { by } => {
             format!("Provenance::SupersededOnBlackhole {{ by: \"{by}\" }}")
         }
+        Provenance::Measured { evidence, moved } => {
+            let moved: Vec<String> = moved.iter().map(|m| format!("\"{m}\"")).collect();
+            format!(
+                "Provenance::Measured {{ evidence: \"{evidence}\", moved: &[{}] }}",
+                moved.join(", ")
+            )
+        }
         other => format!("Provenance::{}", other.variant_name()),
     };
     let mnemonic = &e.mnemonic;
@@ -338,6 +347,18 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
         Provenance::WormholeOnly => format!(
             "**`UNVERIFIED`.** `{page}` is a Wormhole page and Blackhole has none, so this \
              layout is a hypothesis until silicon or the simulator confirms it."
+        ),
+        Provenance::Measured { evidence, moved } => format!(
+            "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
+             diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere. \
+             Every other field is carried from that diagram and is as unverified as it \
+             was. Re-derive on silicon.",
+            moved
+                .iter()
+                .map(|m| format!("`{m}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if moved.len() == 1 { "s" } else { "" }
         ),
     };
 
