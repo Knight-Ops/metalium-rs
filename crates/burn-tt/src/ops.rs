@@ -30,12 +30,23 @@ fn retag(tensor: TtTensor, device: &TtDevice) -> TtTensor {
 }
 
 /// A device result as a tensor.
-fn device_result(device: TtDevice, id: crate::server::BufferId, [m, n]: [usize; 2]) -> TtTensor {
+fn device_result(device: TtDevice, id: crate::server::BufferId, dims: [usize; 2]) -> TtTensor {
+    device_view(device, id, dims, None)
+}
+
+/// A device result that reads `parent`'s slots, keeping it alive.
+fn device_view(
+    device: TtDevice,
+    id: crate::server::BufferId,
+    [m, n]: [usize; 2],
+    parent: Option<std::sync::Arc<crate::tensor::Buffer>>,
+) -> TtTensor {
     let buffer = std::sync::Arc::new(crate::tensor::Buffer {
         id,
         device,
         rows: m,
         cols: n,
+        parent,
     });
     TtTensor::on_device(
         crate::tensor::DramRef {
@@ -264,15 +275,85 @@ pub mod float {
         float_swap_dims(tensor, n - 2, n - 1)
     }
 
+    /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
+    /// Flex's order (`tt_isa::dm::kind::COL_SUM`). Anything else is Flex's.
+    pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let device = tensor.device;
+        if dim == 0 && tensor.is_matrix_f32() {
+            if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
+                if crate::server::supports_dram(device) {
+                    let (id, dims) = crate::server::sum_rows(device, d.buffer.id);
+                    return device_result(device, id, dims);
+                }
+            }
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_sum_dim(tensor.into_host(), dim),
+            device,
+        )
+    }
+
+    /// Whole tile rows, all columns, of a matrix on the device: a view of the
+    /// same slots, nothing copied -- how a batch is taken from a dataset
+    /// uploaded once. Anything else is Flex's.
+    pub fn float_slice(
+        tensor: FloatTensor<TtBackend>,
+        slices: &[burn_backend::Slice],
+    ) -> FloatTensor<TtBackend> {
+        let device = tensor.device;
+        if let Some(view) = row_view(&tensor, slices) {
+            return view;
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_slice(tensor.into_host(), slices),
+            device,
+        )
+    }
+
+    fn row_view(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
+        if !tensor.is_matrix_f32() || slices.is_empty() || slices.len() > 2 {
+            return None;
+        }
+        let d = tensor.dram().filter(|d| !d.transposed)?;
+        let [rows, cols] = [d.buffer.rows, d.buffer.cols];
+        let r = &slices[0];
+        let end = r.end.unwrap_or(rows as isize);
+        if r.step != 1 || r.start < 0 || end < r.start || end as usize > rows {
+            return None;
+        }
+        if let Some(c) = slices.get(1) {
+            let cend = c.end.unwrap_or(cols as isize);
+            if c.step != 1 || c.start != 0 || cend != cols as isize {
+                return None;
+            }
+        }
+        let (first, n) = (r.start as usize, (end - r.start) as usize);
+        if first % 32 != 0 || (end as usize % 32 != 0 && end as usize != rows) || n == 0 {
+            return None;
+        }
+        if !crate::server::supports_dram(tensor.device) {
+            return None;
+        }
+        let (id, dims) = crate::server::slice_rows(tensor.device, d.buffer.id, first, n);
+        Some(device_view(tensor.device, id, dims, Some(d.buffer.clone())))
+    }
+
     pub fn float_device(tensor: &FloatTensor<TtBackend>) -> Device<TtBackend> {
         tensor.device
     }
 
+    /// On `device`, and for an F32 matrix on an engine that keeps tensors,
+    /// resident there: `Tensor::to_device` is how a caller says "this lives on
+    /// the card" (a dataset, say, uploaded once).
     pub fn float_to_device(
         tensor: FloatTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        retag(tensor, device)
+        let t = retag(tensor, device);
+        if t.is_matrix_f32() && crate::server::supports_dram(*device) {
+            let _ = t.to_dram();
+        }
+        t
     }
 
     pub fn float_into_data(

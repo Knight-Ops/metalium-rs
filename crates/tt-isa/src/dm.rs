@@ -103,7 +103,13 @@ pub mod kind {
     pub const RELU_BACKWARD: u32 = 6;
     /// `a[r, c] + b[0, c]`: `b`'s first row broadcast down the tile.
     pub const ADD_ROW: u32 = 7;
-    pub const LAST: u32 = ADD_ROW;
+    /// `dst[0, c] = acc + a[0, c] + a[1, c] + ... + a[31, c]`, added in row
+    /// order, where `acc` is `dst[0, c]`, or `+0.0` when the scalar is
+    /// non-zero (the first tile of a column). Only `dst`'s row 0 is written.
+    /// Over a column of tiles in order, this is `burn-flex`'s `sum_dim(0)`
+    /// order exactly (`ops/reduce.rs:959-989`: from `0.0`, rows in order).
+    pub const COL_SUM: u32 = 8;
+    pub const LAST: u32 = COL_SUM;
 }
 
 /// Where a descriptor list lives, and how many entries it may hold.

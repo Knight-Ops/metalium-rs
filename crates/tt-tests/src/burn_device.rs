@@ -189,6 +189,20 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
         }
+        fn sum_rows(
+            &mut self,
+            a: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.sum_rows(&mut self.session, a)
+        }
+        fn slice_rows(
+            &mut self,
+            a: burn_tt::BufferId,
+            first: usize,
+            rows: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.slice_rows(a, first, rows)
+        }
         fn matmul(
             &mut self,
             a: &[f32],

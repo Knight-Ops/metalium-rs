@@ -79,12 +79,18 @@ pub struct Placement {
     base: Vec<u64>,
     slots: u64,
     tiles: usize,
+    /// A view's first tile within the allocation it borrows from.
+    first: usize,
+    /// Did this placement allocate its slots? A view ([`DramTensor::rows_view`])
+    /// did not, and freeing it gives nothing back.
+    owned: bool,
 }
 
 impl Placement {
     /// Tile `t`'s slot.
     pub fn slot(&self, t: usize) -> DramRange {
         assert!(t < self.tiles, "tile {t} of {}", self.tiles);
+        let t = t + self.first;
         let n = self.channels.len();
         let (c, i) = (t % n, (t / n) as u64);
         self.channels[c]
@@ -145,10 +151,16 @@ impl DramAlloc {
             base,
             slots,
             tiles,
+            first: 0,
+            owned: true,
         })
     }
 
+    /// Give `p`'s slots back; nothing, for a view.
     pub fn free(&mut self, p: &Placement) {
+        if !p.owned {
+            return;
+        }
         for (i, &b) in p.base.iter().enumerate() {
             release(&mut self.free[i], b, p.slots * TILE_SLOT);
         }
@@ -236,7 +248,15 @@ impl DramTensor {
             let at = i * TILE_SLOT as usize;
             regions[c][at..at + img].copy_from_slice(image);
         }
+        // Only the slots tiles occupy: a one-tile tensor has one slot's worth
+        // on one channel, not a slot on every channel.
+        let tiles = images.len() / img;
         for (c, bytes) in regions.iter().enumerate() {
+            let used = tiles / per + usize::from(c < tiles % per);
+            if used == 0 {
+                continue;
+            }
+            let bytes = &bytes[..used * TILE_SLOT as usize];
             let r = t.placement.channels[c]
                 .range(t.placement.base[c], bytes.len() as u64)
                 .expect("allocated");
@@ -245,8 +265,67 @@ impl DramTensor {
         Ok(t)
     }
 
-    /// Download to row-major values: one bulk read per channel.
+    /// Rows `[first_row, first_row + rows)` of this tensor, all columns, as a
+    /// view of the same slots: nothing is copied. `first_row` must start a tile
+    /// row, and the view must end at one or at this tensor's last row. Freeing
+    /// the view frees nothing; the caller keeps this tensor alive meanwhile.
+    pub fn rows_view(&self, first_row: usize, rows: usize) -> Result<Self> {
+        let [_, ct] = self.grid();
+        let end = first_row + rows;
+        if first_row % 32 != 0
+            || (end % 32 != 0 && end != self.rows)
+            || end > self.rows
+            || rows == 0
+        {
+            return Err(TensorError::Shape(format!(
+                "rows {first_row}..{end} of {} are not whole tile rows",
+                self.rows
+            )));
+        }
+        Ok(DramTensor {
+            rows,
+            cols: self.cols,
+            placement: Placement {
+                tiles: rows.div_ceil(32) * ct,
+                first: self.placement.first + first_row / 32 * ct,
+                owned: false,
+                ..self.placement.clone()
+            },
+        })
+    }
+
+    /// Download to row-major values: one bulk read per channel, or, for a
+    /// view or a small tensor, only what its data occupies.
     pub fn download<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<f32>> {
+        // A small tensor, or a view: tile by tile, and of each tile only the
+        // faces and face rows its data reaches -- a `[1, n]` row is 64 bytes
+        // from each of two faces, not 4 KiB per tile.
+        if self.placement.first != 0 || self.placement.tiles < 2 * self.placement.channels.len() {
+            let [rt, ct] = self.grid();
+            let mut packed = vec![0u8; self.placement.tiles * 4096];
+            for i in 0..rt {
+                let rows = (self.rows - 32 * i).min(32);
+                for j in 0..ct {
+                    let cols = (self.cols - 32 * j).min(32);
+                    let s = self.tile(i, j);
+                    let tile = &mut packed[(i * ct + j) * 4096..][..4096];
+                    for (fr, fc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                        if 16 * fr >= rows || 16 * fc >= cols {
+                            continue;
+                        }
+                        let face_rows = (rows - 16 * fr).min(16);
+                        let at = ((fr * 2 + fc) * 256 * 4) as u64;
+                        let len = face_rows * 16 * 4;
+                        let r = s
+                            .channel()
+                            .range(s.offset() + TILE_DATA + at, len as u64)
+                            .expect("in the slot");
+                        dev.dram_read(w, r, &mut tile[at as usize..at as usize + len])?;
+                    }
+                }
+            }
+            return Ok(matmul::detilize_packed(&packed, self.rows, self.cols));
+        }
         let per = self.placement.channels.len();
         let mut regions = Vec::with_capacity(per);
         for c in 0..per {
@@ -498,6 +577,96 @@ pub fn eltwise<T: Transport, N: NocId>(
         }
         stats::timed("eltwise list", || mover.run_list(dev, w, &list))?;
     }
+    Ok(out)
+}
+
+/// The sum over rows of `a`, as a `[1, cols]` tensor, in `burn-flex`'s order:
+/// from `+0.0`, adding rows in order (`tt_isa::dm::kind::COL_SUM`).
+pub fn sum_rows<T: Transport, N: NocId>(
+    dev: &mut Device<T>,
+    w: &Window,
+    mover: &mut DataMover<N>,
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+) -> Result<DramTensor> {
+    let out = DramTensor::alloc(alloc, 1, a.cols)?;
+    let [rt, ct] = a.grid();
+    let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
+    // Slots in the staging area; each column takes one accumulator and one
+    // per tile. Whole columns are packed into one mover list while they fit;
+    // a column taller than that spans several lists, accumulating in place.
+    const SLOTS: usize = 200;
+    let read = |from: DramRange, to: u64, i: usize| {
+        [
+            dm::op::READ,
+            from.channel().index() as u32,
+            (i % tt_isa::dram::PORTS as usize) as u32,
+            from.offset() as u32,
+            to as u32,
+            TILE_SLOT as u32,
+            0,
+            0,
+        ]
+    };
+    let sum = |acc: u64, tile: u64, first: bool| {
+        [
+            dm::op::COMPUTE,
+            dm::kind::COL_SUM,
+            u32::from(first),
+            0,
+            acc as u32,
+            tile as u32,
+            acc as u32,
+            0,
+        ]
+    };
+    let write = |j: usize, acc: u64| {
+        let o = out.tile(0, j);
+        let data = o
+            .channel()
+            .range(o.offset() + TILE_DATA, 4096)
+            .expect("in the slot");
+        [
+            dm::op::WRITE,
+            data.channel().index() as u32,
+            0,
+            data.offset() as u32,
+            (acc + TILE_DATA) as u32,
+            4096,
+            0,
+            0,
+        ]
+    };
+    let mut list = Vec::new();
+    let mut used = 0;
+    for j in 0..ct {
+        if used + 1 + rt.min(SLOTS - 1) > SLOTS {
+            stats::timed("sum list", || mover.run_list(dev, w, &list))?;
+            list.clear();
+            used = 0;
+        }
+        let acc = slot(used);
+        used += 1;
+        for i0 in (0..rt).step_by(SLOTS - 1) {
+            let rows = (rt - i0).min(SLOTS - 1);
+            if used + rows > SLOTS {
+                // Only a column taller than a list reaches here: run what
+                // is queued, keeping the accumulator slot where it is.
+                stats::timed("sum list", || mover.run_list(dev, w, &list))?;
+                list.clear();
+                used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
+            }
+            for i in i0..i0 + rows {
+                list.push(read(a.tile(i, j), slot(used + i - i0), i));
+            }
+            for i in i0..i0 + rows {
+                list.push(sum(acc, slot(used + i - i0), i == 0));
+            }
+            used += rows;
+        }
+        list.push(write(j, acc));
+    }
+    stats::timed("sum list", || mover.run_list(dev, w, &list))?;
     Ok(out)
 }
 

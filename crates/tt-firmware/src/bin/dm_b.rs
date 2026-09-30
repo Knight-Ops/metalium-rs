@@ -95,11 +95,25 @@ fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
             dm::kind::SUB => float::sub_n(pd, pa, pb, 1024),
             dm::kind::MUL => float::mul_n(pd, pa, pb, 1024),
             dm::kind::MUL_SCALAR => float::mul_scalar_n(pd, pa, s, 1024),
+            dm::kind::COL_SUM => col_sum(s != 0, dst, a),
             _ => per_datum(kind, dst, a, b),
         }
     }
     // The stores must reach L1 before the mover's next NoC write reads it.
     publish();
+}
+
+/// `dm::kind::COL_SUM`: row 0 of `dst` accumulates each column of `a`, rows
+/// in order. The addresses are the datums' (past the header).
+fn col_sum(first: bool, dst: u64, a: u64) {
+    for c in 0..32usize {
+        let at = dst + dm::face_index(0, c) as u64 * 4;
+        let mut acc = if first { 0 } else { rd(at) };
+        for r in 0..32usize {
+            acc = float::add(acc, rd(a + dm::face_index(r, c) as u64 * 4));
+        }
+        wr(at, acc);
+    }
 }
 
 /// The kinds that need a datum's position, or integer tests: one at a time.

@@ -60,6 +60,20 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// The sum over rows of `a`, `[1, cols]`, left on the device.
+    fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
+    /// keeps `a` alive while the view is.
+    fn slice_rows(
+        &mut self,
+        _a: BufferId,
+        _first: usize,
+        _rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_isa::dm::kind`),
     /// result left on the device.
     fn eltwise(
@@ -168,6 +182,37 @@ impl DramBuffers {
         self.next += 1;
         self.live.insert(self.next, c);
         Ok((self.next, dims))
+    }
+
+    pub fn sum_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let c = s.sum_rows(&ta).map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    /// A view: freeing it frees nothing (`DramTensor::rows_view`).
+    pub fn slice_rows(
+        &mut self,
+        a: BufferId,
+        first: usize,
+        rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let v = self
+            .get(a)?
+            .rows_view(first, rows)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(v))
+    }
+
+    fn insert(&mut self, t: tt_kernels::tensor::DramTensor) -> (BufferId, [usize; 2]) {
+        let dims = [t.rows, t.cols];
+        self.next += 1;
+        self.live.insert(self.next, t);
+        (self.next, dims)
     }
 
     /// How many are live.
@@ -418,6 +463,25 @@ pub(crate) fn eltwise(
     .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
 }
 
+/// Sum over rows on the device, panicking on a device error.
+pub(crate) fn sum_rows(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]) {
+    timed_run("sum_rows", device, move |engine| engine.sum_rows(a))
+        .unwrap_or_else(|e| panic!("sum over rows on {device}: {e}"))
+}
+
+/// A row view on the device, panicking on a device error.
+pub(crate) fn slice_rows(
+    device: TtDevice,
+    a: BufferId,
+    first: usize,
+    rows: usize,
+) -> (BufferId, [usize; 2]) {
+    timed_run("slice_rows", device, move |engine| {
+        engine.slice_rows(a, first, rows)
+    })
+    .unwrap_or_else(|e| panic!("row view on {device}: {e}"))
+}
+
 /// `op(A) @ op(B)` on the device, panicking on a device error.
 pub(crate) fn matmul_dram(
     device: TtDevice,
@@ -496,6 +560,19 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise(&mut self.session, kind, scalar, a, b)
+    }
+    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.sum_rows(&mut self.session, a)
+    }
+    fn slice_rows(
+        &mut self,
+        a: BufferId,
+        first: usize,
+        rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.slice_rows(a, first, rows)
     }
 }
 

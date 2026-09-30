@@ -435,11 +435,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_slice(tensor: FloatTensor<TtBackend>, slices: &[Slice]) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_slice(tensor.into_flex(), slices),
-            device,
-        )
+        crate::ops::float::float_slice(tensor, slices)
     }
     fn float_slice_assign(
         tensor: FloatTensor<TtBackend>,
@@ -661,11 +657,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sum_dim(tensor.into_flex(), dim),
-            device,
-        )
+        crate::ops::float::float_sum_dim(tensor, dim)
     }
     fn float_prod(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);

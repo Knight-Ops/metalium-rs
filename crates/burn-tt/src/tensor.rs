@@ -52,6 +52,10 @@ pub(crate) struct Buffer {
     pub(crate) device: TtDevice,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    /// For a view: the buffer whose slots it reads. Held, never read: the
+    /// parent's slots are freed only once every view of them has gone.
+    #[allow(dead_code)]
+    pub(crate) parent: Option<Arc<Buffer>>,
 }
 
 impl Drop for Buffer {
@@ -168,6 +172,7 @@ impl TtTensor {
                     device: self.device,
                     rows,
                     cols,
+                    parent: None,
                 }),
                 transposed: false,
             }

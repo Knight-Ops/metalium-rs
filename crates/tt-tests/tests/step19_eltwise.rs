@@ -204,3 +204,82 @@ fn a_denormal_result_is_flushed() {
         assert_eq!(got.to_bits(), 0, "the device flushes it to +0");
     });
 }
+
+/// The sum over rows, against Flex's `sum_dim(0)` bit for bit: the order of
+/// the additions is the point (`tt_isa::dm::kind::COL_SUM`). A column taller
+/// than one mover list (MNIST's 60 000 rows are 1875 tiles) is included.
+#[test]
+fn the_sum_over_rows_matches_flex_bit_for_bit() {
+    with_session(|s| {
+        for [r, c] in [[37, 70], [64, 128], [7000, 40]] {
+            let v = edgy(r as u64 * 3, r * c);
+            let want = bits(flex(&v, r, c).sum_dim(0));
+            let a = s.upload(&v, r, c).unwrap();
+            let out = s.sum_rows(&a).unwrap();
+            assert_eq!((out.rows, out.cols), (1, c));
+            assert_same(
+                &s.download(&out).unwrap(),
+                &want,
+                &format!("[{r}, {c}] sum"),
+            );
+            s.free(out).unwrap();
+            s.free(a).unwrap();
+        }
+    });
+}
+
+/// A row view reads exactly the rows it names, ragged last tile row included,
+/// and works as a matmul operand.
+#[test]
+fn a_row_view_is_the_rows_it_names() {
+    with_session(|s| {
+        let [r, c] = [200, 70];
+        let v = floats(77, r * c);
+        let a = s.upload(&v, r, c).unwrap();
+        for (first, n) in [(0, 64), (64, 64), (192, 8), (32, 168)] {
+            let view = a.rows_view(first, n).unwrap();
+            assert_eq!(
+                s.download(&view).unwrap(),
+                v[first * c..(first + n) * c],
+                "rows {first}..{}",
+                first + n
+            );
+            s.free(view).unwrap();
+        }
+        assert!(a.rows_view(16, 32).is_err(), "not a tile row");
+        assert!(a.rows_view(0, 40).is_err(), "ends inside a tile row");
+        // As a matmul operand: rows 64..128 against the host product.
+        let w = floats(78, c * 32);
+        let bw = s.upload(&w, c, 32).unwrap();
+        let view = a.rows_view(64, 64).unwrap();
+        let got = s
+            .matmul_dram(
+                &view,
+                false,
+                &bw,
+                false,
+                tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                tt_kernels::matmul::Fidelity::HiFi4,
+                tt_tests::harness::BUDGET,
+            )
+            .unwrap();
+        let want = s
+            .matmul(
+                &v[64 * c..128 * c],
+                &w,
+                [64, c, 32],
+                tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                tt_kernels::matmul::Fidelity::HiFi4,
+                tt_tests::harness::BUDGET,
+            )
+            .unwrap();
+        let got = s.download(&got).unwrap();
+        assert!(got
+            .iter()
+            .zip(&want)
+            .all(|(g, w)| g.to_bits() == w.to_bits()));
+        // Freeing the view gave nothing back; the parent is intact.
+        s.free(view).unwrap();
+        assert_eq!(s.download(&a).unwrap(), v);
+    });
+}

@@ -356,6 +356,25 @@ impl<T: Transport> Session<T> {
         out
     }
 
+    /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
+    /// ([`tensor::sum_rows`]).
+    pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
+        let tile = self.tile;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if d.mover.is_none() {
+            d.mover = Some(DataMover::start(dev, &d.w, tile, &d.dram, d.image)?);
+        }
+        let mover = d.mover.as_mut().expect("started above");
+        let out = tensor::sum_rows(dev, &d.w, mover, &mut d.alloc, a);
+        if out.is_err() {
+            d.mover = None;
+        }
+        out
+    }
+
     /// `op(A) @ op(B)` with every operand and the result in GDDR
     /// ([`tensor::matmul_dram`]), on the resident roles.
     #[allow(clippy::too_many_arguments)]

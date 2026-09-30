@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 9.9 ms/step on one card (Flex: 0.5), weights and activations resident in GDDR |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR |
 
 ---
 
@@ -1220,9 +1220,27 @@ tensors in `burn-tt`, 9.5 gates.
       steps diverges on the mesh. Phase 8 code; not yet investigated.
 - [ ] **The mesh is not device-resident**: GDDR tensors, per-chip resident
       roles, and chips concurrent rather than in turn.
-- [ ] **Left per step:** the batch `x` (200 KB up: preload the dataset, a batch
-      is a row-slice view), `g1` for the bias gradient's row sum (32 KB down),
-      logits and `g2` (2.5 KB each, the loss stays on the host).
+- [x] **The dataset is preloaded; a batch is a view.** `float_to_device` makes
+      an F32 matrix resident (`Tensor::to_device` is the caller saying so), and
+      `float_slice` of whole tile rows of a resident matrix is a view of the
+      same slots (`DramTensor::rows_view`), keeping its parent alive. The MNIST
+      gates now upload the images once and slice each batch.
+- [x] **The bias gradient's sum is on the device.** `float_sum_dim(·, 0)` of a
+      resident matrix is `tensor::sum_rows`: `COL_SUM` adds each column's rows
+      in order from `+0.0`, which is `burn-flex`'s `sum_dim(0)` order exactly
+      (`ops/reduce.rs:959-989`) -- bit for bit on edge values and a
+      7000-row column spanning several mover lists, ttsim and both cards;
+      watched failing with the rows summed in reverse.
+- [x] **Small tensors move only what they occupy**: an upload writes only the
+      slots its tiles fill, and a small download reads only the faces and face
+      rows its data reaches (a `[1, n]` row: 128 bytes a tile, not 33 KB of
+      whole regions).
+- [x] **Result: full MNIST 9.9 -> 5.8 ms/step** steady state on both cards
+      (the one-time preload of the model and 59 968 images: 2.7 s, most of it
+      host tilizing), accuracy unchanged, 50/50 Phase 9 and training gates.
+      Per step: element-wise 2.4, matmul 2.4, column sums 0.3, downloads 0.3
+      (logits, two bias gradients), uploads 0.2 (`g2`, two biases), host
+      0.2 ms. Tensor traffic per step: about 13 KB up, 3 KB down.
 - [ ] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
       allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum / SGD on
       device, with fallback counted by `Device::traffic`.
