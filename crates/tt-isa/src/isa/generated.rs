@@ -4,13 +4,13 @@
 //! file matches the specification revision pinned in `PINS.toml`.
 //!
 //! Source: tt-isa-documentation `f848eb668c2aeae742a88a49a86157e24a0a20c6`,
-//! 151 instruction encodings and 19 datum layouts, each
+//! 154 instruction encodings and 19 datum layouts, each
 //! cross-checked against the `TT_*(…)` syntax block on the page that embeds
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 14 superseded on Blackhole, 76 Wormhole-only and therefore
-//! **`UNVERIFIED`**, and 3 **`MEASURED`** against ttsim where the specification
+//! to be identical, 17 superseded on Blackhole, 73 Wormhole-only and therefore
+//! **`UNVERIFIED`**, and 6 **`MEASURED`** against ttsim where the specification
 //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`).
 //!
 //! Names are the `Bits32.lua` diagram keys, so a name in the specification can
@@ -710,59 +710,6 @@ pub mod defs {
         0x00fffffd,
         Provenance::WormholeOnly,
         "WormholeB0/TensixTile/TensixCoprocessor/GATESRCRST.md",
-    );
-
-    /// `MOVD2A`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static MOVD2A: InstructionDef = InstructionDef::new(
-        "MOVD2A",
-        "MOVD2A",
-        0x08,
-        &[
-            Field::new("UseDst32bLo", 23, 1, false, None),
-            Field::new("SrcRow", 17, 6, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("Move4Rows", 13, 1, false, None),
-            Field::new("DstRow", 0, 10, false, None),
-        ],
-        &[],
-        0x00005c00,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md",
-    );
-
-    /// `MOVD2B`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static MOVD2B: InstructionDef = InstructionDef::new(
-        "MOVD2B",
-        "MOVD2B",
-        0x0a,
-        &[
-            Field::new("UseDst32bLo", 23, 1, false, None),
-            Field::new("SrcRow", 17, 6, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("Move4Rows", 13, 1, false, None),
-            Field::new("DstRow", 0, 10, false, None),
-        ],
-        &[],
-        0x00005c00,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md",
-    );
-
-    /// `MOVB2A`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static MOVB2A: InstructionDef = InstructionDef::new(
-        "MOVB2A",
-        "MOVB2A",
-        0x0b,
-        &[
-            Field::new("SrcARow", 17, 6, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("Move4Rows", 13, 1, false, None),
-            Field::new("SrcBRow", 0, 6, false, None),
-        ],
-        &[],
-        0x00805fc0,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
     );
 
     /// `MOVDBGA2D`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
@@ -2313,6 +2260,42 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md",
     );
 
+    /// `MOVD2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static MOVD2A: InstructionDef = InstructionDef::new(
+        "MOVD2A_BH",
+        "MOVD2A",
+        0x08,
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[],
+        0x00011c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"] },
+        "WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md",
+    );
+
+    /// `MOVD2B_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static MOVD2B: InstructionDef = InstructionDef::new(
+        "MOVD2B_BH",
+        "MOVD2B",
+        0x0a,
+        &[Field::new("UseDst32bLo", 23, 1, false, None), Field::new("SrcRow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[],
+        0x00011c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"] },
+        "WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md",
+    );
+
+    /// `MOVB2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`), and on Blackhole `AddrMod` sits elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static MOVB2A: InstructionDef = InstructionDef::new(
+        "MOVB2A_BH",
+        "MOVB2A",
+        0x0b,
+        &[Field::new("SrcARow", 17, 6, false, None), Field::new("AddrMod", 14, 2, false, None), Field::new("Move4Rows", 13, 1, false, None), Field::new("SrcBRow", 0, 6, false, None)],
+        &[],
+        0x00811fc0,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"] },
+        "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
+    );
+
     /// Encodings Blackhole replaces. Present so that the difference is
     /// visible and testable, not so that they can be used here.
     pub mod wormhole {
@@ -2368,6 +2351,59 @@ pub mod defs {
                 by: "SFPLUTFP32_BH",
             },
             "WormholeB0/TensixTile/TensixCoprocessor/SFPLUTFP32.md",
+        );
+
+        /// `MOVD2A`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`. Blackhole replaces it with `MOVD2A_BH`; use that instead.
+        pub static MOVD2A: InstructionDef = InstructionDef::new(
+            "MOVD2A",
+            "MOVD2A",
+            0x08,
+            &[
+                Field::new("UseDst32bLo", 23, 1, false, None),
+                Field::new("SrcRow", 17, 6, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("Move4Rows", 13, 1, false, None),
+                Field::new("DstRow", 0, 10, false, None),
+            ],
+            &[],
+            0x00005c00,
+            Provenance::SupersededOnBlackhole { by: "MOVD2A_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md",
+        );
+
+        /// `MOVD2B`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`. Blackhole replaces it with `MOVD2B_BH`; use that instead.
+        pub static MOVD2B: InstructionDef = InstructionDef::new(
+            "MOVD2B",
+            "MOVD2B",
+            0x0a,
+            &[
+                Field::new("UseDst32bLo", 23, 1, false, None),
+                Field::new("SrcRow", 17, 6, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("Move4Rows", 13, 1, false, None),
+                Field::new("DstRow", 0, 10, false, None),
+            ],
+            &[],
+            0x00005c00,
+            Provenance::SupersededOnBlackhole { by: "MOVD2B_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md",
+        );
+
+        /// `MOVB2A`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`. Blackhole replaces it with `MOVB2A_BH`; use that instead.
+        pub static MOVB2A: InstructionDef = InstructionDef::new(
+            "MOVB2A",
+            "MOVB2A",
+            0x0b,
+            &[
+                Field::new("SrcARow", 17, 6, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("Move4Rows", 13, 1, false, None),
+                Field::new("SrcBRow", 0, 6, false, None),
+            ],
+            &[],
+            0x00805fc0,
+            Provenance::SupersededOnBlackhole { by: "MOVB2A_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
         );
 
         /// `MOVA2D`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md`. Blackhole replaces it with `MOVA2D_BH`; use that instead.
@@ -2610,9 +2646,9 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::SEMGET,
     &defs::SETDVALID,
     &defs::GATESRCRST,
-    &defs::MOVD2A,
-    &defs::MOVD2B,
-    &defs::MOVB2A,
+    &defs::wormhole::MOVD2A,
+    &defs::wormhole::MOVD2B,
+    &defs::wormhole::MOVB2A,
     &defs::MOVDBGA2D,
     &defs::ZEROSRC,
     &defs::wormhole::MOVA2D,
@@ -2719,6 +2755,9 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::MVMUL,
     &defs::MOVA2D,
     &defs::MOVB2D,
+    &defs::MOVD2A,
+    &defs::MOVD2B,
+    &defs::MOVB2A,
 ];
 
 /// The documented bit layout of each datum type in `Src` and `Dst`.
@@ -6002,268 +6041,6 @@ pub mod encode {
             });
         }
         word |= f.place(invalidate_src_b_cache);
-        Ok(Instruction::new(word, def))
-    }
-
-    /// `MOVD2A`, built field by field.
-    ///
-    /// 5 operands is too many to pass positionally without inviting a
-    /// transposition, so each is named: `Movd2A::ZERO.use_dst32b_lo(1).encode()`.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub struct Movd2A {
-        use_dst32b_lo: u32,
-        src_row: u32,
-        addr_mod: u32,
-        move4_rows: u32,
-        dst_row: u32,
-    }
-
-    impl Movd2A {
-        /// Every operand zero. Fixed bits are added by [`Self::encode`].
-        pub const ZERO: Self = Movd2A {
-            use_dst32b_lo: 0,
-            src_row: 0,
-            addr_mod: 0,
-            move4_rows: 0,
-            dst_row: 0,
-        };
-
-        pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
-            self.use_dst32b_lo = value;
-            self
-        }
-
-        pub const fn src_row(mut self, value: u32) -> Self {
-            self.src_row = value;
-            self
-        }
-
-        pub const fn addr_mod(mut self, value: u32) -> Self {
-            self.addr_mod = value;
-            self
-        }
-
-        pub const fn move4_rows(mut self, value: u32) -> Self {
-            self.move4_rows = value;
-            self
-        }
-
-        pub const fn dst_row(mut self, value: u32) -> Self {
-            self.dst_row = value;
-            self
-        }
-
-        pub const fn encode(self) -> Result<Instruction, EncodeError> {
-            let def = &defs::MOVD2A;
-            let mut word = def.skeleton();
-            let f = def.fields()[0];
-            if !f.fits(self.use_dst32b_lo) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.use_dst32b_lo,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.use_dst32b_lo);
-            let f = def.fields()[1];
-            if !f.fits(self.src_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.src_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.src_row);
-            let f = def.fields()[2];
-            if !f.fits(self.addr_mod) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.addr_mod,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.addr_mod);
-            let f = def.fields()[3];
-            if !f.fits(self.move4_rows) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.move4_rows,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.move4_rows);
-            let f = def.fields()[4];
-            if !f.fits(self.dst_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.dst_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.dst_row);
-            Ok(Instruction::new(word, def))
-        }
-    }
-
-    /// `MOVD2B`, built field by field.
-    ///
-    /// 5 operands is too many to pass positionally without inviting a
-    /// transposition, so each is named: `Movd2B::ZERO.use_dst32b_lo(1).encode()`.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub struct Movd2B {
-        use_dst32b_lo: u32,
-        src_row: u32,
-        addr_mod: u32,
-        move4_rows: u32,
-        dst_row: u32,
-    }
-
-    impl Movd2B {
-        /// Every operand zero. Fixed bits are added by [`Self::encode`].
-        pub const ZERO: Self = Movd2B {
-            use_dst32b_lo: 0,
-            src_row: 0,
-            addr_mod: 0,
-            move4_rows: 0,
-            dst_row: 0,
-        };
-
-        pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
-            self.use_dst32b_lo = value;
-            self
-        }
-
-        pub const fn src_row(mut self, value: u32) -> Self {
-            self.src_row = value;
-            self
-        }
-
-        pub const fn addr_mod(mut self, value: u32) -> Self {
-            self.addr_mod = value;
-            self
-        }
-
-        pub const fn move4_rows(mut self, value: u32) -> Self {
-            self.move4_rows = value;
-            self
-        }
-
-        pub const fn dst_row(mut self, value: u32) -> Self {
-            self.dst_row = value;
-            self
-        }
-
-        pub const fn encode(self) -> Result<Instruction, EncodeError> {
-            let def = &defs::MOVD2B;
-            let mut word = def.skeleton();
-            let f = def.fields()[0];
-            if !f.fits(self.use_dst32b_lo) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.use_dst32b_lo,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.use_dst32b_lo);
-            let f = def.fields()[1];
-            if !f.fits(self.src_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.src_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.src_row);
-            let f = def.fields()[2];
-            if !f.fits(self.addr_mod) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.addr_mod,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.addr_mod);
-            let f = def.fields()[3];
-            if !f.fits(self.move4_rows) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.move4_rows,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.move4_rows);
-            let f = def.fields()[4];
-            if !f.fits(self.dst_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.dst_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.dst_row);
-            Ok(Instruction::new(word, def))
-        }
-    }
-
-    /// `MOVB2A`.
-    pub const fn movb2_a(
-        src_a_row: u32,
-        addr_mod: u32,
-        move4_rows: u32,
-        src_b_row: u32,
-    ) -> Result<Instruction, EncodeError> {
-        let def = &defs::MOVB2A;
-        let mut word = def.skeleton();
-        let f = def.fields()[0];
-        if !f.fits(src_a_row) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: src_a_row,
-                width: f.width(),
-            });
-        }
-        word |= f.place(src_a_row);
-        let f = def.fields()[1];
-        if !f.fits(addr_mod) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: addr_mod,
-                width: f.width(),
-            });
-        }
-        word |= f.place(addr_mod);
-        let f = def.fields()[2];
-        if !f.fits(move4_rows) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: move4_rows,
-                width: f.width(),
-            });
-        }
-        word |= f.place(move4_rows);
-        let f = def.fields()[3];
-        if !f.fits(src_b_row) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: src_b_row,
-                width: f.width(),
-            });
-        }
-        word |= f.place(src_b_row);
         Ok(Instruction::new(word, def))
     }
 
@@ -11910,6 +11687,268 @@ pub mod encode {
         }
     }
 
+    /// `MOVD2A_BH`, built field by field.
+    ///
+    /// 5 operands is too many to pass positionally without inviting a
+    /// transposition, so each is named: `Movd2A::ZERO.use_dst32b_lo(1).encode()`.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Movd2A {
+        use_dst32b_lo: u32,
+        src_row: u32,
+        addr_mod: u32,
+        move4_rows: u32,
+        dst_row: u32,
+    }
+
+    impl Movd2A {
+        /// Every operand zero. Fixed bits are added by [`Self::encode`].
+        pub const ZERO: Self = Movd2A {
+            use_dst32b_lo: 0,
+            src_row: 0,
+            addr_mod: 0,
+            move4_rows: 0,
+            dst_row: 0,
+        };
+
+        pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
+            self.use_dst32b_lo = value;
+            self
+        }
+
+        pub const fn src_row(mut self, value: u32) -> Self {
+            self.src_row = value;
+            self
+        }
+
+        pub const fn addr_mod(mut self, value: u32) -> Self {
+            self.addr_mod = value;
+            self
+        }
+
+        pub const fn move4_rows(mut self, value: u32) -> Self {
+            self.move4_rows = value;
+            self
+        }
+
+        pub const fn dst_row(mut self, value: u32) -> Self {
+            self.dst_row = value;
+            self
+        }
+
+        pub const fn encode(self) -> Result<Instruction, EncodeError> {
+            let def = &defs::MOVD2A;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(self.use_dst32b_lo) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.use_dst32b_lo,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.use_dst32b_lo);
+            let f = def.fields()[1];
+            if !f.fits(self.src_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.src_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.src_row);
+            let f = def.fields()[2];
+            if !f.fits(self.addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.addr_mod);
+            let f = def.fields()[3];
+            if !f.fits(self.move4_rows) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.move4_rows,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.move4_rows);
+            let f = def.fields()[4];
+            if !f.fits(self.dst_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.dst_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.dst_row);
+            Ok(Instruction::new(word, def))
+        }
+    }
+
+    /// `MOVD2B_BH`, built field by field.
+    ///
+    /// 5 operands is too many to pass positionally without inviting a
+    /// transposition, so each is named: `Movd2B::ZERO.use_dst32b_lo(1).encode()`.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Movd2B {
+        use_dst32b_lo: u32,
+        src_row: u32,
+        addr_mod: u32,
+        move4_rows: u32,
+        dst_row: u32,
+    }
+
+    impl Movd2B {
+        /// Every operand zero. Fixed bits are added by [`Self::encode`].
+        pub const ZERO: Self = Movd2B {
+            use_dst32b_lo: 0,
+            src_row: 0,
+            addr_mod: 0,
+            move4_rows: 0,
+            dst_row: 0,
+        };
+
+        pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
+            self.use_dst32b_lo = value;
+            self
+        }
+
+        pub const fn src_row(mut self, value: u32) -> Self {
+            self.src_row = value;
+            self
+        }
+
+        pub const fn addr_mod(mut self, value: u32) -> Self {
+            self.addr_mod = value;
+            self
+        }
+
+        pub const fn move4_rows(mut self, value: u32) -> Self {
+            self.move4_rows = value;
+            self
+        }
+
+        pub const fn dst_row(mut self, value: u32) -> Self {
+            self.dst_row = value;
+            self
+        }
+
+        pub const fn encode(self) -> Result<Instruction, EncodeError> {
+            let def = &defs::MOVD2B;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(self.use_dst32b_lo) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.use_dst32b_lo,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.use_dst32b_lo);
+            let f = def.fields()[1];
+            if !f.fits(self.src_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.src_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.src_row);
+            let f = def.fields()[2];
+            if !f.fits(self.addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.addr_mod);
+            let f = def.fields()[3];
+            if !f.fits(self.move4_rows) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.move4_rows,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.move4_rows);
+            let f = def.fields()[4];
+            if !f.fits(self.dst_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.dst_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.dst_row);
+            Ok(Instruction::new(word, def))
+        }
+    }
+
+    /// `MOVB2A_BH`.
+    pub const fn movb2_a(
+        src_a_row: u32,
+        addr_mod: u32,
+        move4_rows: u32,
+        src_b_row: u32,
+    ) -> Result<Instruction, EncodeError> {
+        let def = &defs::MOVB2A;
+        let mut word = def.skeleton();
+        let f = def.fields()[0];
+        if !f.fits(src_a_row) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: src_a_row,
+                width: f.width(),
+            });
+        }
+        word |= f.place(src_a_row);
+        let f = def.fields()[1];
+        if !f.fits(addr_mod) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: addr_mod,
+                width: f.width(),
+            });
+        }
+        word |= f.place(addr_mod);
+        let f = def.fields()[2];
+        if !f.fits(move4_rows) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: move4_rows,
+                width: f.width(),
+            });
+        }
+        word |= f.place(move4_rows);
+        let f = def.fields()[3];
+        if !f.fits(src_b_row) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: src_b_row,
+                width: f.width(),
+            });
+        }
+        word |= f.place(src_b_row);
+        Ok(Instruction::new(word, def))
+    }
+
     /// Encoders for the forms Blackhole replaces. Reaching one has to be
     /// deliberate.
     pub mod wormhole {
@@ -12108,6 +12147,268 @@ pub mod encode {
                 });
             }
             word |= f.place(mod1);
+            Ok(Instruction::new(word, def))
+        }
+
+        /// `MOVD2A`, built field by field.
+        ///
+        /// 5 operands is too many to pass positionally without inviting a
+        /// transposition, so each is named: `Movd2A::ZERO.use_dst32b_lo(1).encode()`.
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        pub struct Movd2A {
+            use_dst32b_lo: u32,
+            src_row: u32,
+            addr_mod: u32,
+            move4_rows: u32,
+            dst_row: u32,
+        }
+
+        impl Movd2A {
+            /// Every operand zero. Fixed bits are added by [`Self::encode`].
+            pub const ZERO: Self = Movd2A {
+                use_dst32b_lo: 0,
+                src_row: 0,
+                addr_mod: 0,
+                move4_rows: 0,
+                dst_row: 0,
+            };
+
+            pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
+                self.use_dst32b_lo = value;
+                self
+            }
+
+            pub const fn src_row(mut self, value: u32) -> Self {
+                self.src_row = value;
+                self
+            }
+
+            pub const fn addr_mod(mut self, value: u32) -> Self {
+                self.addr_mod = value;
+                self
+            }
+
+            pub const fn move4_rows(mut self, value: u32) -> Self {
+                self.move4_rows = value;
+                self
+            }
+
+            pub const fn dst_row(mut self, value: u32) -> Self {
+                self.dst_row = value;
+                self
+            }
+
+            pub const fn encode(self) -> Result<Instruction, EncodeError> {
+                let def = &defs::wormhole::MOVD2A;
+                let mut word = def.skeleton();
+                let f = def.fields()[0];
+                if !f.fits(self.use_dst32b_lo) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.use_dst32b_lo,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.use_dst32b_lo);
+                let f = def.fields()[1];
+                if !f.fits(self.src_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.src_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.src_row);
+                let f = def.fields()[2];
+                if !f.fits(self.addr_mod) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.addr_mod,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.addr_mod);
+                let f = def.fields()[3];
+                if !f.fits(self.move4_rows) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.move4_rows,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.move4_rows);
+                let f = def.fields()[4];
+                if !f.fits(self.dst_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.dst_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.dst_row);
+                Ok(Instruction::new(word, def))
+            }
+        }
+
+        /// `MOVD2B`, built field by field.
+        ///
+        /// 5 operands is too many to pass positionally without inviting a
+        /// transposition, so each is named: `Movd2B::ZERO.use_dst32b_lo(1).encode()`.
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        pub struct Movd2B {
+            use_dst32b_lo: u32,
+            src_row: u32,
+            addr_mod: u32,
+            move4_rows: u32,
+            dst_row: u32,
+        }
+
+        impl Movd2B {
+            /// Every operand zero. Fixed bits are added by [`Self::encode`].
+            pub const ZERO: Self = Movd2B {
+                use_dst32b_lo: 0,
+                src_row: 0,
+                addr_mod: 0,
+                move4_rows: 0,
+                dst_row: 0,
+            };
+
+            pub const fn use_dst32b_lo(mut self, value: u32) -> Self {
+                self.use_dst32b_lo = value;
+                self
+            }
+
+            pub const fn src_row(mut self, value: u32) -> Self {
+                self.src_row = value;
+                self
+            }
+
+            pub const fn addr_mod(mut self, value: u32) -> Self {
+                self.addr_mod = value;
+                self
+            }
+
+            pub const fn move4_rows(mut self, value: u32) -> Self {
+                self.move4_rows = value;
+                self
+            }
+
+            pub const fn dst_row(mut self, value: u32) -> Self {
+                self.dst_row = value;
+                self
+            }
+
+            pub const fn encode(self) -> Result<Instruction, EncodeError> {
+                let def = &defs::wormhole::MOVD2B;
+                let mut word = def.skeleton();
+                let f = def.fields()[0];
+                if !f.fits(self.use_dst32b_lo) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.use_dst32b_lo,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.use_dst32b_lo);
+                let f = def.fields()[1];
+                if !f.fits(self.src_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.src_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.src_row);
+                let f = def.fields()[2];
+                if !f.fits(self.addr_mod) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.addr_mod,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.addr_mod);
+                let f = def.fields()[3];
+                if !f.fits(self.move4_rows) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.move4_rows,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.move4_rows);
+                let f = def.fields()[4];
+                if !f.fits(self.dst_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.dst_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.dst_row);
+                Ok(Instruction::new(word, def))
+            }
+        }
+
+        /// `MOVB2A`.
+        pub const fn movb2_a(
+            src_a_row: u32,
+            addr_mod: u32,
+            move4_rows: u32,
+            src_b_row: u32,
+        ) -> Result<Instruction, EncodeError> {
+            let def = &defs::wormhole::MOVB2A;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(src_a_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: src_a_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(src_a_row);
+            let f = def.fields()[1];
+            if !f.fits(addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(addr_mod);
+            let f = def.fields()[2];
+            if !f.fits(move4_rows) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: move4_rows,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(move4_rows);
+            let f = def.fields()[3];
+            if !f.fits(src_b_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: src_b_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(src_b_row);
             Ok(Instruction::new(word, def))
         }
 

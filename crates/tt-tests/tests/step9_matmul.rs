@@ -485,3 +485,208 @@ fn dump_the_identity_block() {
         println!("row {r} want {}", want.join(" "));
     }
 }
+
+/// `MOVD2A`'s, `MOVD2B`'s and `MOVB2A`'s `AddrMod` sit at bits 14..15 on
+/// Blackhole, one bit lower than the Wormhole diagrams draw them -- as `MVMUL`'s,
+/// `MOVA2D`'s and `MOVB2D`'s do (row 42), and as LLK's `addr_mode << 14` has them.
+///
+/// Each case moves four rows into `Src` twice, both moves carrying `addr_mod(1)`,
+/// where entry 1 advances the counter of the rows being *read* by four and entry
+/// 2 advances nothing. So the second move reads the next four rows with the
+/// measured encoding and the same four again with the Wormhole one (modifier 2).
+/// The written `Src` rows are then copied into `Dst` with `MOVA2D`/`MOVB2D`.
+/// Four-row moves because ttsim implements no other form of these (as for
+/// `MOVA2D`, row 37: `tensix_movd2a: instr_mod=0` is `UnsupportedFunctionality`).
+///
+/// At the body's start the RWCs are `SrcA` 16, `SrcB` 8, `Dst` 0 (`program`), so
+/// `Src` row arguments here are offsets from the staged operands.
+#[test]
+fn mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole() {
+    let words = [
+        (
+            "MOVD2A",
+            encode::Movd2A::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Movd2A::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+        (
+            "MOVD2B",
+            encode::Movd2B::ZERO.addr_mod(1).encode().unwrap().word(),
+            encode::wormhole::Movd2B::ZERO
+                .addr_mod(1)
+                .encode()
+                .unwrap()
+                .word(),
+        ),
+        (
+            "MOVB2A",
+            // (src_a_row, addr_mod, move4_rows, src_b_row)
+            encode::movb2_a(0, 1, 0, 0).unwrap().word(),
+            encode::wormhole::movb2_a(0, 1, 0, 0).unwrap().word(),
+        ),
+    ];
+    for (name, bh, wh) in words {
+        assert_eq!(bh & 0x00ff_ffff, 1 << 14, "{name}: the measured layout");
+        assert_eq!(wh & 0x00ff_ffff, 1 << 15, "{name}: the Wormhole diagram");
+    }
+
+    // Every datum distinct and exact in TF32, so a row names where it came from.
+    let mut a = [[0f32; 16]; 16];
+    for (k, v) in a.iter_mut().flatten().enumerate() {
+        *v = 1.0 + k as f32;
+    }
+    let mut b = [[0f32; 16]; 8];
+    for (k, v) in b.iter_mut().flatten().enumerate() {
+        *v = 1000.0 + k as f32;
+    }
+    let row_bits = |r: &[f32; 16]| -> Vec<u32> { r.iter().map(|v| v.to_bits()).collect() };
+    let dst_row = |dst: &[u32], r: usize| dst[r * ROW..(r + 1) * ROW].to_vec();
+
+    // Entry 1 advances `SrcB` by `b_incr` and `Dst` by `d_incr`; entry 2, nothing.
+    let modifiers = |p: &mut Vec<Instruction>, b_incr: u16, d_incr: u16| {
+        p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcBIncr, b_incr));
+        p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, d_incr));
+        p.push(thread_entry(thread::ADDR_MOD_AB_SEC2_SrcBIncr, 0));
+        p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
+    };
+    let raw = |i: Instruction, bits: u32| Instruction::new(i.word() | bits, i.def());
+    let dst_rwc_zero = || encode::Setrwc::ZERO.dst(1).dst_val(0).encode().unwrap();
+
+    for (addr_mod, encoding) in [(words[0].1, "measured"), (words[0].2, "Wormhole")] {
+        let bits = addr_mod & 0x00ff_ffff;
+        let second = if encoding == "measured" { 4 } else { 0 };
+
+        // MOVD2A: B rows 0..8 into `Dst` 0..8; `Dst` 0..4, then `Dst` RWC..+4,
+        // into `SrcA` 24..28 and 28..32; `SrcA` 24..32 back into `Dst` 8..16.
+        let dst = run(
+            &a,
+            &b,
+            Box::new(move |_banks, p| {
+                modifiers(p, 0, 4);
+                for row in [0, 4] {
+                    p.push(
+                        encode::Movb2D::ZERO
+                            .move4_rows(1)
+                            .src_row(row)
+                            .dst_row(row)
+                            .encode()
+                            .unwrap(),
+                    );
+                }
+                for src_row in [8, 12] {
+                    let i = encode::Movd2A::ZERO
+                        .move4_rows(1)
+                        .src_row(src_row)
+                        .encode()
+                        .unwrap();
+                    p.push(raw(i, bits));
+                }
+                p.push(dst_rwc_zero());
+                p.push(
+                    encode::Mova2D::ZERO
+                        .move8_rows(1)
+                        .src_row(8)
+                        .dst_row(8)
+                        .encode()
+                        .unwrap(),
+                );
+            }),
+        );
+        assert_eq!(
+            dst_row(&dst, 8),
+            row_bits(&b[0]),
+            "MOVD2A {encoding}: first"
+        );
+        assert_eq!(
+            dst_row(&dst, 12),
+            row_bits(&b[second]),
+            "MOVD2A {encoding}: second"
+        );
+    }
+
+    for (addr_mod, encoding) in [(words[1].1, "measured"), (words[1].2, "Wormhole")] {
+        let bits = addr_mod & 0x00ff_ffff;
+        let second = if encoding == "measured" { 4 } else { 0 };
+
+        // MOVD2B: A rows 0..8 into `Dst` 0..8; `Dst` 0..4, then `Dst` RWC..+4,
+        // into `SrcB` 16..20 and 20..24; those back into `Dst` 8..16.
+        let dst = run(
+            &a,
+            &b,
+            Box::new(move |_banks, p| {
+                modifiers(p, 0, 4);
+                p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+                for src_row in [8, 12] {
+                    let i = encode::Movd2B::ZERO
+                        .move4_rows(1)
+                        .src_row(src_row)
+                        .encode()
+                        .unwrap();
+                    p.push(raw(i, bits));
+                }
+                p.push(dst_rwc_zero());
+                for row in [8, 12] {
+                    p.push(
+                        encode::Movb2D::ZERO
+                            .move4_rows(1)
+                            .src_row(row)
+                            .dst_row(row)
+                            .encode()
+                            .unwrap(),
+                    );
+                }
+            }),
+        );
+        assert_eq!(
+            dst_row(&dst, 8),
+            row_bits(&a[0]),
+            "MOVD2B {encoding}: first"
+        );
+        assert_eq!(
+            dst_row(&dst, 12),
+            row_bits(&a[second]),
+            "MOVD2B {encoding}: second"
+        );
+    }
+
+    for (addr_mod, encoding) in [(words[2].1, "measured"), (words[2].2, "Wormhole")] {
+        let bits = addr_mod & 0x00ff_ffff;
+        let second = if encoding == "measured" { 4 } else { 0 };
+
+        // MOVB2A: `SrcB` 8..12, then `SrcB` RWC..+4 (B rows 0..4, then 4..8 or
+        // 0..4 again), into `SrcA` 24..28 and 28..32; `SrcA` 24..32 back into
+        // `Dst` 0..8.
+        let dst = run(
+            &a,
+            &b,
+            Box::new(move |_banks, p| {
+                modifiers(p, 4, 0);
+                for src_a_row in [8, 12] {
+                    // (src_a_row, addr_mod, move4_rows, src_b_row)
+                    let i = encode::movb2_a(src_a_row, 0, 1, 0).unwrap();
+                    p.push(raw(i, bits));
+                }
+                p.push(
+                    encode::Mova2D::ZERO
+                        .move8_rows(1)
+                        .src_row(8)
+                        .encode()
+                        .unwrap(),
+                );
+            }),
+        );
+        assert_eq!(
+            dst_row(&dst, 0),
+            row_bits(&b[0]),
+            "MOVB2A {encoding}: first"
+        );
+        assert_eq!(
+            dst_row(&dst, 4),
+            row_bits(&b[second]),
+            "MOVB2A {encoding}: second"
+        );
+    }
+}

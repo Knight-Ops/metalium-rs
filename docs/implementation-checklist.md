@@ -68,9 +68,10 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       Two Wormhole layouts were wrong on Blackhole: `MOVB2D`'s `instr_mod` (the
       whole of row 38) and `MOVA2D`/`MOVB2D`'s `AddrMod` (one bit lower, as
       `MVMUL`). Both are now measured `Bits32_BH.lua` layouts, each licensed by a
-      `probe_src` gate that passes on ttsim and both cards. Still Wormhole-drawn and
-      contradicted by LLK: `MOVD2A`/`MOVD2B`/`MOVB2A`'s `AddrMod` (not on any gate's
-      path yet).
+      `probe_src` gate that passes on ttsim and both cards. `MOVD2A`/`MOVD2B`/`MOVB2A`
+      had the same `AddrMod` shift and are measured layouts too, licensed by
+      `step9_matmul::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`. No
+      datapath encoding now disagrees with LLK.
 - [x] **`Src` -> `Dst` losses: root-caused -- the chip was never raised to busy.**
       UMD sends the ARC `AICLK_GO_BUSY` whenever it opens a chip; this stack never
       did, so every run computed at the idle operating point (800 MHz, ~0.72 V), where
@@ -90,7 +91,7 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       tile (row 49).
 - [x] **Silicon regression: 146/148 on both cards**, the two failures being the
       `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
-      replaced by two gates that run on both targets. Unfiltered run since: 110/110 on
+      replaced by two gates that run on both targets. Unfiltered run since: 111/111 on
       each card, `silicon_measure` and `fma_oracle` included.
 - [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
       "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.

@@ -6,8 +6,9 @@
 //! (`Provenance::WormholeOnly`). Twice now a field has sat one bit lower on
 //! Blackhole and applied the wrong operand silently: `MVMUL`'s `AddrMod`
 //! (divergence row 42), and `MOVB2D`'s `Move4Rows`, found here -- the whole of
-//! what row 38 recorded as ttsim "moving one row" -- along with `MOVA2D`'s and
-//! `MOVB2D`'s `AddrMod`. All are now measured layouts (`Bits32_BH.lua`). The
+//! what row 38 recorded as ttsim "moving one row" -- along with the `AddrMod` of
+//! every `MOV*` between `Src` and `Dst`. All are now measured layouts
+//! (`Bits32_BH.lua`). The
 //! LLK macros are a second, independent source that runs on these chips, so every
 //! encoding the datapath emits is checked against one.
 //!
@@ -97,6 +98,44 @@ fn the_datapath_encodings_agree_with_llk() {
                 .unwrap()
                 .word(),
             op(0x08, (1 << 17) | 1),
+        ),
+        // p_movd2a::MOV_4_ROWS = 2 at instr_mod<<12
+        (
+            "MOVD2A Move4Rows",
+            encode::Movd2A::ZERO.move4_rows(1).encode().unwrap().word(),
+            op(0x08, 2 << 12),
+        ),
+        (
+            "MOVD2A AddrMod",
+            encode::Movd2A::ZERO.addr_mod(1).encode().unwrap().word(),
+            op(0x08, 1 << 14),
+        ),
+        // TT_OP_MOVD2B: as MOVD2A, opcode 0x0a; p_movd2b::MOV_4_ROWS = 2
+        (
+            "MOVD2B Move4Rows",
+            encode::Movd2B::ZERO.move4_rows(1).encode().unwrap().word(),
+            op(0x0a, 2 << 12),
+        ),
+        (
+            "MOVD2B AddrMod",
+            encode::Movd2B::ZERO.addr_mod(1).encode().unwrap().word(),
+            op(0x0a, 1 << 14),
+        ),
+        // TT_OP_MOVB2A(srca<<17, addr_mode<<14, instr_mod<<12, srcb); p_movb2a::MOV_4_ROWS = 2
+        (
+            "MOVB2A rows",
+            encode::movb2_a(5, 0, 0, 3).unwrap().word(),
+            op(0x0b, (5 << 17) | 3),
+        ),
+        (
+            "MOVB2A Move4Rows",
+            encode::movb2_a(0, 0, 1, 0).unwrap().word(),
+            op(0x0b, 2 << 12),
+        ),
+        (
+            "MOVB2A AddrMod",
+            encode::movb2_a(0, 1, 0, 0).unwrap().word(),
+            op(0x0b, 1 << 14),
         ),
         // TT_OP_ZEROACC(clear_mode<<19, use_32_bit_mode<<18, clear_zero_flags<<17, addr_mode<<14, where); CLR_ALL = 3
         (

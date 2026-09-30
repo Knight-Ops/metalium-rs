@@ -89,6 +89,33 @@ pub const MEASURED: &[Measured] = &[
             ),
         ],
     },
+    Measured {
+        key: "MOVD2A_BH",
+        supersedes: "MOVD2A",
+        moved: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVD2B_BH",
+        supersedes: "MOVD2B",
+        moved: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
+    Measured {
+        key: "MOVB2A_BH",
+        supersedes: "MOVB2A",
+        moved: &["AddrMod"],
+        evidence: &[(
+            "crates/tt-tests/tests/step9_matmul.rs",
+            "mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole",
+        )],
+    },
 ];
 
 /// Does `file` (relative to the workspace root) define `fn name(`?
