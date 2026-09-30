@@ -819,6 +819,29 @@ rather than taken from the paragraphs above, two of which it corrects.
   offers. Training needs the four-phase product available (`MatrixUnit.md:143-165`);
   the phases are gated per block in `step9_matmul` and not yet at tile level.
 
+#### As built (2026-09-30)
+
+* **Delegation is generated, and defaults are left alone.** `cargo xtask
+  gen-burn-delegate` forwards every op method *Flex implements* to Flex and leaves
+  every default Flex does not override to its default, which then composes
+  `burn-tt`'s own ops. The distinction is load-bearing: `ModuleOps::linear` is a
+  default over `float_matmul`, `nn::Linear` calls it, and forwarding it kept every
+  layer on the host. Type knowledge is three conversion traits in `burn-tt`, which
+  rustc checks; the generator itself is syntactic and refuses what it cannot read.
+* **Hardware lives on a server thread per device** (`burn_tt::attach`), created by a
+  factory that runs on that thread. That is what lets the simulator, a `!Send`
+  process-wide singleton, back a `Send + Sync` backend; the silicon engine is
+  `burn_tt::kmd_engine` over `tt_kernels::session::Session`.
+* **Precision.** HiFi4 from TF32 `Src` by default. Agreement with Flex is asserted
+  bit-exact where the operands allow and otherwise against a bound derived from
+  TF32 truncation and truncating accumulation (`step11_burn`), never an epsilon.
+  Training is claimed to *work* (a stated loss factor, met by the host run of the
+  same setup) and to be *deterministic and target-independent* (a pinned bit-exact
+  loss curve that ttsim wrote and both cards reproduce); it is deliberately not
+  claimed to stay within a bound of the host's trajectory.
+* **Only matmul runs on the device**, and tensors live on the host between ops.
+  The next ops, and device-resident data, are where Phase 7 hands over to Phase 9.
+
 **Gate (simulator):** an MNIST MLP trains through `burn-autodiff` — loss descends, final weights
 match the `burn-flex` backend within tolerance, optimizer step is correct. Use a reduced dataset;
 the simulator is "slower than silicon but still fast enough" and a full training run is not the

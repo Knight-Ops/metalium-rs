@@ -46,8 +46,20 @@ jobs:
           path: vendor/tt-isa-documentation
           key: tt-isa-docs-${{ hashFiles('PINS.toml') }}
 
+      # MNIST, for the Phase 7 training gate: pinned by the .gz digests and the
+      # decompressed files' own, and verified on every fetch, so a cache hit that
+      # does not match the pin is rejected by the same check.
+      - name: Cache the pinned MNIST files
+        uses: actions/cache@v4
+        with:
+          path: vendor/mnist
+          key: mnist-${{ hashFiles('PINS.toml') }}
+
       - name: Fetch simulator
         run: cargo xtask fetch-ttsim
+
+      - name: Fetch MNIST
+        run: cargo xtask fetch-mnist
 
       - name: Fetch specification
         run: cargo xtask fetch-spec
@@ -64,6 +76,12 @@ jobs:
       # descriptions of the instruction set still agree with each other.
       - name: Generated instruction table is current
         run: cargo xtask gen-isa --check
+
+      # burn-tt's forwarding of every op to burn-flex is generated from the
+      # pinned burn-backend's op traits and burn-flex's impls. This proves the
+      # committed forwarding still matches them.
+      - name: Generated Burn delegation is current
+        run: cargo xtask gen-burn-delegate --check
 
       - name: Format
         run: cargo fmt --all --check

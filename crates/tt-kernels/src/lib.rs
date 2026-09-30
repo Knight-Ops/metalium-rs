@@ -19,3 +19,4 @@
 pub mod datapath;
 pub mod matmul;
 pub mod runtime;
+pub mod session;

@@ -38,9 +38,12 @@ tt-isa.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
 tt-kernels.workspace = true
+tt-firmware-images.workspace = true
+burn-tt.workspace = true
 tt-ttsim.workspace = true
 tt-kmd.workspace = true
 
 [dev-dependencies]
-burn-flex = { version = "0.21", default-features = false, features = ["std"] }
-burn-tensor = { version = "0.21", default-features = false, features = ["std"] }
+burn-flex.workspace = true
+burn-tensor.workspace = true
+burn.workspace = true
