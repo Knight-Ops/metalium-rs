@@ -25,8 +25,8 @@ use tt_isa::numerics::mvmul_reference;
 use tt_isa::sfpu;
 use tt_isa::tile::{fp32_to_tf32, L1Format, TileImage};
 use tt_tests::datapath::{
-    flat_descriptor, set_adc_x, src_thread_config, thread_entry, unpack_src_config, Unpacker,
-    SCRATCH_GPR, STAGE,
+    self, config_program, flat_descriptor, pack_config, set_adc_x, src_thread_config, thread_entry,
+    unpack_src_config, Unpacker, OUT, SCRATCH_GPR, STAGE,
 };
 use tt_tests::harness::{self, Run};
 
@@ -166,9 +166,42 @@ fn once(dst_row: u32) -> Body {
 
 /// `Dst` rows 0..16 after running `body` over `a` and `b`.
 fn run(a: &MatA, b: &MatB, body: Body) -> Vec<u32> {
+    run_and_pack(a, b, body, 0).0
+}
+
+/// A sentinel pre-written over the packer's output, so a word it never wrote is
+/// distinguishable from one it wrote as zero.
+const L1_SENTINEL: u32 = 0xA5A5_5A5A;
+
+/// Datums of L1 read back after a pack: sixteen rows' worth, so a pack that
+/// runs past what it was asked for lands on sentinel the gate can see.
+const PACK_READBACK: usize = 16 * ROW;
+
+/// [`run`], then pack `pack_rows` rows of `Dst` from row 0 to [`OUT`] on the
+/// pack thread (`datapath::pack_rows`). Returns `(Dst rows 0..16, the
+/// PACK_READBACK words at OUT)`; with `pack_rows == 0` there is no pack role
+/// and the second is empty.
+fn run_and_pack(a: &MatA, b: &MatB, body: Body, pack_rows: u32) -> (Vec<u32>, Vec<u32>) {
     let (sa, na) = stage_operand(SRC_A_ROW, a);
     let (sb, nb) = stage_operand(SRC_B_ROW, b);
     let (unpack, math) = program(na, nb, body);
+    let pack = if pack_rows == 0 {
+        Vec::new()
+    } else {
+        let mut words = ConfigWords::new();
+        pack_config(&mut words, OUT);
+        let mut p = config_program(&words);
+        p.extend(datapath::pack_rows(pack_rows));
+        p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
+        p
+    };
+    let sentinel: Vec<u8> = L1_SENTINEL
+        .to_le_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(PACK_READBACK * 4)
+        .collect();
     // `fork_scope` gives the child no return channel.
     let path = std::env::temp_dir().join(format!(
         "ttmvmul-{}-{:?}.bin",
@@ -179,25 +212,32 @@ fn run(a: &MatA, b: &MatB, body: Body) -> Vec<u32> {
         let roles = harness::Roles {
             unpack: &unpack,
             math: &math,
-            pack: &[],
+            pack: &pack,
         };
+        let readback = [(OUT, PACK_READBACK * 4)];
         let out = harness::run(
             dev,
             &Run::roles(roles)
-                .stage(&[(STAGE_A, &sa), (STAGE_B, &sb)])
-                .dump_rows(16),
+                .stage(&[(STAGE_A, &sa), (STAGE_B, &sb), (OUT, &sentinel)])
+                .dump_rows(16)
+                .read_back(if pack_rows == 0 { &[] } else { &readback }),
         );
-        let bytes: Vec<u8> = (0..16 * ROW)
+        let mut bytes: Vec<u8> = (0..16 * ROW)
             .flat_map(|f| out.dst_at(f / ROW, f % ROW).to_le_bytes())
             .collect();
+        if let Some(l1) = out.l1.first() {
+            bytes.extend_from_slice(l1);
+        }
         std::fs::write(&path, bytes).unwrap();
     });
     let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    bytes
+    let words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+        .collect();
+    let (dst, l1) = words.split_at(16 * ROW);
+    (dst.to_vec(), l1.to_vec())
 }
 
 fn assert_block(dst: &[u32], first_row: usize, want: &MatB, what: &str) {
@@ -290,6 +330,58 @@ fn small_integer_products_match_the_model_and_burn() {
     // Control: the gate distinguishes `SrcB @ SrcA` from `SrcB @ SrcA^T`.
     let transposed: Vec<f32> = tb.matmul(ta.transpose()).into_data().to_vec().unwrap();
     assert!((0..128).any(|k| dst[k] != transposed[k].to_bits()));
+}
+
+/// The packer carries a Matrix Unit result out to L1: the 8x16 product of
+/// `MVMUL`, packed by the pack thread in two `PACR`s of four rows, lands in L1
+/// datum for datum as `Dst` holds it and as the model predicts, and nothing is
+/// written past it.
+///
+/// This is the first gate in which all three roles do work, and the path every
+/// later matmul result leaves by: the `Dst` dump holds one face at most, a tile
+/// is four.
+#[test]
+fn the_packer_writes_the_matmul_result_to_l1() {
+    let (a, b) = small_integer_operands(0xfeed);
+    let model = mvmul_reference(&ZERO_DST, &b, &a, &[0]).expect("small integers are exact");
+    let (dst, l1) = run_and_pack(&a, &b, once(0), 8);
+    assert_block(&dst, 0, &model, "Dst");
+    assert_block(&l1, 0, &model, "L1");
+    assert!(
+        l1[8 * ROW..].iter().all(|&w| w == L1_SENTINEL),
+        "the packer wrote past the eight rows it was asked for"
+    );
+    // Control: the result is the product, not either operand or zero.
+    assert!(l1[..8 * ROW].iter().any(|&w| w != 0));
+    assert!((0..8 * ROW).any(|k| l1[k] != b[k / ROW][k % ROW].to_bits()));
+}
+
+/// A final partial group of rows is packed with the mask `PACR.md` gives for
+/// it, `(1 << remaining) - 1`, and stops there: six rows are 96 datums, the
+/// seventh row's L1 is untouched.
+#[test]
+fn a_partial_final_group_packs_only_its_rows() {
+    let (a, b) = small_integer_operands(0xfeed);
+    let model = mvmul_reference(&ZERO_DST, &b, &a, &[0]).expect("small integers are exact");
+    let (_, l1) = run_and_pack(&a, &b, once(0), 6);
+    let mut six = ZERO_DST;
+    six[..6].copy_from_slice(&model[..6]);
+    for (k, &w) in l1.iter().enumerate().take(6 * ROW) {
+        assert_eq!(w, six[k / ROW][k % ROW].to_bits(), "L1 datum {k}");
+    }
+    assert!(
+        l1[6 * ROW..].iter().all(|&w| w == L1_SENTINEL),
+        "a six-row pack wrote past row 6"
+    );
+}
+
+fn small_integer_operands(seed: u64) -> (MatA, MatB) {
+    let mut rng = Lcg(seed);
+    let mut a = [[0f32; 16]; 16];
+    let mut b = [[0f32; 16]; 8];
+    a.iter_mut().flatten().for_each(|v| *v = rng.int(31));
+    b.iter_mut().flatten().for_each(|v| *v = rng.int(127));
+    (a, b)
 }
 
 /// `MVMUL` is `+=`: without a `ZEROACC` between them, two give twice the product.

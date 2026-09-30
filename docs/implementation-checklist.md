@@ -751,8 +751,19 @@ undocumented.
       **Open:** sweep every other Matrix Unit instruction with an `AddrMod` or a
       mode field — `ZEROACC` first, whose refused `UseDst32b` (row 40) is probably
       the same shift.
-- [ ] `PACR` out of a `MVMUL` result. The `Dst` dump suffices for one block; the
-      packer path exists from Phase 5 and needs only the `Dst` offsets.
+- [x] **`PACR` out of a `MVMUL` result**, on ttsim and both cards -- the first
+      gate in which all three roles work. `datapath::pack_rows` packs any number
+      of `Dst` rows as one `PACR` per aligned group of four: the packer's input
+      `Ystride` is one FP32 row (64 bytes), a pack `AddrMod` entry steps ADC Y by
+      four between `PACR`s, and only the last carries `Last`, so the output
+      address generator keeps appending rather than restarting at `L1_Dest_addr`.
+      A final partial group gets `(1 << remaining) - 1`. Gates:
+      `step9_matmul::the_packer_writes_the_matmul_result_to_l1` (L1 = `Dst` dump
+      = `mvmul_reference`, sentinel intact past row 8) and
+      `a_partial_final_group_packs_only_its_rows` (six rows, nothing past them).
+      Watched failing with the Y step removed (L1 row 4 repeats row 0) and with an
+      empty math body. `PCK0_ADDR_BASE_REG_0_Base` is left at reset zero: it is
+      register 16, which ttsim does not model (row 28).
 - [ ] Single 16×16 face → 32×32 tile → blocked → multi-tile. The tile step settles
       the Phase 4 "which `Z` plane is which face" convention.
 - [ ] Budget a standing percentage of the phase for empirical discovery rather

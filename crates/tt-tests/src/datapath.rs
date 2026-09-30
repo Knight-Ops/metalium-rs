@@ -339,8 +339,17 @@ pub fn pack_config(words: &mut ConfigWords, l1_dest: u64) {
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_1_Zstride, 0)
         .unwrap()
-        // The input (`Dst`) side's strides.
+        // The input (`Dst`) side's strides. `Ystride` is in bytes and divided
+        // by the datum size (`Packers/InputAddressGenerator.md`), so one FP32
+        // `Dst` row is 64: ADC Y then counts rows, which is how [`pack_rows`]
+        // walks `Dst` a group of four at a time. With Y at zero -- every single
+        // `PACR` here -- it contributes nothing. `PCK0_ADDR_BASE_REG_0_Base`
+        // is left at its reset zero rather than written: it is register 16,
+        // which ttsim does not model (`tensix_cfg_wr32: reg=16`, divergence
+        // row 28), and the silicon per-thread reset zeroes all of `Config`.
         .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Xstride, 0)
+        .unwrap()
+        .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride, DST_ROW_BYTES)
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_0_Zstride, 0)
         .unwrap()
@@ -408,6 +417,51 @@ pub fn unpack_instruction() -> Instruction {
         .encode()
         .unwrap();
     Instruction::new(base.word() | UNPACR_LAST, &defs::UNPACR_Regular)
+}
+
+/// Bytes in one row of FP32 `Dst`: the packer's input `Ystride` per row.
+pub const DST_ROW_BYTES: u32 = 16 * 4;
+
+/// The pack `AddrMod` entry [`pack_rows`] uses to step ADC Y by four rows.
+pub const PACK_ADDR_MOD_NEXT_GROUP: u32 = 1;
+
+/// Pack `rows` rows of FP32 `Dst`, from row 0, to the L1 run [`pack_config`]
+/// set up, contiguously.
+///
+/// One `PACR` reads one aligned group of four rows (`PACR.md`), so this issues
+/// one per group, with `AddrMod` stepping the input ADC's Y by four between
+/// them (`Packers/InputAddressGenerator.md`) and `Last` only on the final one:
+/// without `Last` the output address generator keeps appending to the same run
+/// rather than starting at `L1_Dest_addr` again (`OutputAddressGenerator.md`).
+/// A final partial group gets the mask `(1 << remaining) - 1`, as `PACR.md`
+/// recommends. Runs on the pack thread, whose `ThreadConfig` it sets.
+pub fn pack_rows(rows: u32) -> Vec<Instruction> {
+    assert!(rows > 0, "nothing to pack");
+    let groups = rows.div_ceil(4);
+    let mut p = vec![
+        state_id(),
+        thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0),
+        thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4),
+        set_adc_x_pack(0, 15),
+    ];
+    for g in 0..groups {
+        let last = g + 1 == groups;
+        let remaining = rows - 4 * g;
+        let mask = if remaining >= 4 {
+            0b1111
+        } else {
+            (1 << remaining) - 1
+        };
+        p.push(
+            encode::Pacr::ZERO
+                .read_intf_sel(mask)
+                .addr_mod(if last { 0 } else { PACK_ADDR_MOD_NEXT_GROUP })
+                .last(u32::from(last))
+                .encode()
+                .unwrap(),
+        );
+    }
+    p
 }
 
 /// One `PACR` enabling `read_intf_sel` read interfaces.
