@@ -30,6 +30,13 @@ pub enum Provenance {
     /// Only a Wormhole page embeds it, and Blackhole has no such page at all.
     /// A hypothesis: `UNVERIFIED` until silicon says otherwise.
     WormholeOnly,
+    /// Not from the specification: a Blackhole layout measured against ttsim,
+    /// replacing a `WormholeOnly` diagram whose `moved` fields were found
+    /// elsewhere. See `super::measured`.
+    Measured {
+        evidence: String,
+        moved: Vec<String>,
+    },
 }
 
 impl Provenance {
@@ -39,6 +46,7 @@ impl Provenance {
             Provenance::SharedWithWormhole => "SharedWithWormhole",
             Provenance::SupersededOnBlackhole { .. } => "SupersededOnBlackhole",
             Provenance::WormholeOnly => "WormholeOnly",
+            Provenance::Measured { .. } => "Measured",
         }
     }
 }

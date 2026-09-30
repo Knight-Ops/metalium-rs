@@ -21,6 +21,7 @@
 
 pub mod check;
 pub mod lua;
+pub mod measured;
 pub mod model;
 pub mod provenance;
 pub mod render;
@@ -80,7 +81,7 @@ pub fn load() -> Result<Sources, String> {
     }
 
     let diagrams = lua::parse(&bits32)?;
-    let diagrams = check::dedupe(diagrams)?;
+    let mut diagrams = check::dedupe(diagrams)?;
     check::structure(&diagrams)?;
 
     let mut pages = Vec::new();
@@ -156,7 +157,7 @@ pub fn load() -> Result<Sources, String> {
         ));
     }
 
-    let provenance = provenance::classify(&pages, &bare)?;
+    let mut provenance = provenance::classify(&pages, &bare)?;
     let mut mnemonics = BTreeMap::new();
     let mut variants: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for page in &pages {
@@ -174,6 +175,20 @@ pub fn load() -> Result<Sources, String> {
                 .or_insert_with(|| page.calls.iter().map(|c| c.name.clone()).collect());
         }
     }
+
+    // Measured Blackhole layouts join last, after the specification has been
+    // checked on its own terms: they are not part of it, and must not be able to
+    // mask a disagreement inside it. They then face the same structural checks.
+    let root = crate::util::workspace_root();
+    measured::apply(
+        measured::SOURCE,
+        measured::MEASURED,
+        &measured::gate_exists(&root),
+        &mut diagrams,
+        &mut provenance,
+        &mut mnemonics,
+    )?;
+    check::structure(&diagrams)?;
 
     let mut provenance_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (p, _) in provenance.values() {

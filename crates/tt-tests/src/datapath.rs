@@ -143,6 +143,134 @@ pub fn unpack_config(words: &mut ConfigWords, descriptor: TileDescriptor, l1_bas
     }
 }
 
+/// Which unpacker: 0 feeds `SrcA` (or `Dst`), 1 feeds `SrcB` only.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Unpacker {
+    SrcA = 0,
+    SrcB = 1,
+}
+
+/// The `ThreadConfig` the `Src` path needs, in place of [`thread_config`].
+///
+/// `SRCA_SET_SetOvrdWithAddr` is the reverse of the `Dst` path's setting: with it
+/// clear, a `Src` unpack is `UnsupportedFunctionality` (`UNPACR_Regular.md:316`),
+/// and ttsim says so by name (`!unpack_to_dst: SRCA_SET_SetOvrdWithAddr=0`). It
+/// shares entry 5 with `SRCA_SET_Base`, which stays zero.
+pub fn src_thread_config() -> Vec<Instruction> {
+    vec![
+        ThreadConfigEntry::zeroed(thread::CFG_STATE_ID_StateID.addr32())
+            .set(thread::CFG_STATE_ID_StateID, 0)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        ThreadConfigEntry::zeroed(thread::SRCA_SET_SetOvrdWithAddr.addr32())
+            .set(thread::SRCA_SET_SetOvrdWithAddr, 1)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        ThreadConfigEntry::zeroed(thread::UNPACK_MISC_CFG_CfgContextOffset_0.addr32())
+            .set(thread::UNPACK_MISC_CFG_CfgContextOffset_0, 0)
+            .unwrap()
+            .encode()
+            .unwrap(),
+    ]
+}
+
+/// Configure `unpacker` to move FP32 datums from `l1_base` into `SrcA`/`SrcB`,
+/// converting to `out` (`UNPACR_Regular.md:495-520`: FP32 in, TF32 or a 16-bit
+/// type out; FP32 *into* `Src` is `UndefinedBehavior`).
+///
+/// Unpacker 1 is configured through far fewer fields than unpacker 0, because ttsim
+/// refuses most of `THCON_SEC1_REG5`/`REG7` and `UNP1_ADDR_*` outright
+/// (`probe_src::map_the_src_path_configuration_surface`). None of the refused ones
+/// is read on this path: unpacker 1 takes `XDim` from the descriptor rather than
+/// from `Tile_x_dim_cntx` (`UNPACR_Regular.md:73`), has no `Dest_cntx` term, and a
+/// single flat row needs no `Ystride`. `REG7_Offset_address` *is* read and cannot
+/// be written, so this relies on its reset value being zero.
+pub fn unpack_src_config(
+    words: &mut ConfigWords,
+    unpacker: Unpacker,
+    descriptor: TileDescriptor,
+    l1_base: u64,
+    out: u32,
+) {
+    let base_units = (l1_base / (TileImage::ALIGNMENT as u64) - 1) as u32;
+    let descriptor_span = match unpacker {
+        Unpacker::SrcA => {
+            words
+                .set(thcon::THCON_SEC0_REG3_Base_address, base_units)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, descriptor.x_dim())
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG2_Out_data_format, out)
+                .unwrap()
+                // `Src`, not `Dst`.
+                .set(thcon::THCON_SEC0_REG2_Unpack_if_sel_cntx0, 0)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                // With `UnpackToDst` clear this *replaces* the output address rather
+                // than adding to it (`UNPACR_Regular.md:265-270`); `SrcA` row 0 is
+                // `OutAddr / 16 - 4`, so 64 is row 0.
+                .set(thcon::THCON_SEC0_REG5_Dest_cntx0_address, DST_BASE)
+                .unwrap()
+                .set(unpack1::UNP0_ADDR_CTRL_XY_REG_1_Ystride, 0)
+                .unwrap()
+                .set(unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride, 0)
+                .unwrap();
+            thcon::THCON_SEC0_REG0_TileDescriptor
+        }
+        Unpacker::SrcB => {
+            words
+                .set(thcon::THCON_SEC1_REG3_Base_address, base_units)
+                .unwrap()
+                .set(thcon::THCON_SEC1_REG2_Out_data_format, out)
+                .unwrap()
+                .set(thcon::THCON_SEC1_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                .set(unpack1::UNP1_ADDR_CTRL_ZW_REG_1_Zstride, 0)
+                .unwrap();
+            thcon::THCON_SEC1_REG0_TileDescriptor
+        }
+    };
+    // Every other field of the words touched above is zero by construction, which
+    // is what `Ovrd_data_format`, `Haloize_mode`, `Tileize_mode`, `Throttle_mode`,
+    // upsampling, `Shift_amount` and `Unpack_Src_Reg_Set_Upd` must be here.
+
+    // Only the non-zero descriptor words: row 29.
+    for (i, word) in descriptor.words().iter().enumerate() {
+        if *word != 0 {
+            words
+                .seed(descriptor_span.addr32() + i as u16, *word)
+                .unwrap();
+        }
+    }
+}
+
+/// `SETADCXX` for either unpacker's channels.
+pub fn set_adc_x(unpacker: Unpacker, first: u32, last: u32) -> Instruction {
+    let adc = encode::Setadcxx::ZERO.x0_val(first).x1_val(last);
+    match unpacker {
+        Unpacker::SrcA => adc.u0(1),
+        Unpacker::SrcB => adc.u1(1),
+    }
+    .encode()
+    .unwrap()
+}
+
+/// `UNPACR` into `SrcA`/`SrcB`, handing the bank to the Matrix Unit if `flip`.
+pub fn unpack_src_instruction(unpacker: Unpacker, flip: bool) -> Instruction {
+    let base = encode::UnpacrRegular::ZERO
+        .which_unpacker(unpacker as u32)
+        .multi_context_mode(1)
+        .flip_src(u32::from(flip))
+        .encode()
+        .unwrap();
+    Instruction::new(base.word() | UNPACR_LAST, &defs::UNPACR_Regular)
+}
+
 /// Packer configuration: read `Dst` as 32-bit data, write FP32 to `l1_dest`.
 pub fn pack_config(words: &mut ConfigWords, l1_dest: u64) {
     // `Packers/OutputAddressGenerator.md`: `Addr = L1_Dest_addr +

@@ -148,6 +148,16 @@ pub enum Provenance {
     /// Only a Wormhole page embeds it, and Blackhole has no such page at all.
     /// **`UNVERIFIED`**: a hypothesis until silicon or the simulator says otherwise.
     WormholeOnly,
+    /// **`MEASURED`, not documented.** The specification draws only Wormhole's
+    /// layout, and the `moved` fields were measured against ttsim to sit elsewhere
+    /// on Blackhole, by the gate(s) `evidence` names. Replaces that Wormhole layout,
+    /// which becomes `SupersededOnBlackhole`. Every field *not* in `moved` is
+    /// carried from the Wormhole diagram and is exactly as unverified as it was.
+    /// Enters the table only through `xtask/src/gen_isa/Bits32_BH.lua`.
+    Measured {
+        evidence: &'static str,
+        moved: &'static [&'static str],
+    },
 }
 
 impl Provenance {
@@ -464,8 +474,8 @@ mod tests {
     fn the_table_has_the_expected_shape() {
         assert_eq!(
             ALL.len(),
-            148,
-            "instruction encodings: 145 diagrams, of which RMWCIB is four"
+            149,
+            "instruction encodings: 145 diagrams, of which RMWCIB is four, plus MVMUL_BH"
         );
         assert_eq!(ALL_LAYOUTS.len(), 19, "Src/Dst/NoC datum layouts");
     }
@@ -481,16 +491,18 @@ mod tests {
                 Provenance::SharedWithWormhole => "SharedWithWormhole",
                 Provenance::SupersededOnBlackhole { .. } => "SupersededOnBlackhole",
                 Provenance::WormholeOnly => "WormholeOnly",
+                Provenance::Measured { .. } => "Measured",
             };
             *counts.entry(name).or_default() += 1;
         }
         assert_eq!(counts["Blackhole"], 39);
         assert_eq!(counts["SharedWithWormhole"], 24);
-        assert_eq!(counts["SupersededOnBlackhole"], 11);
+        assert_eq!(counts["SupersededOnBlackhole"], 12);
         assert_eq!(
-            counts["WormholeOnly"], 74,
+            counts["WormholeOnly"], 73,
             "half the instruction set is a hypothesis; that is the point of recording it"
         );
+        assert_eq!(counts["Measured"], 1, "MVMUL_BH");
     }
 
     #[test]

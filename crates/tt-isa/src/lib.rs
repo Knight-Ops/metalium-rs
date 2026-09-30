@@ -15,6 +15,7 @@ pub mod backend;
 pub mod cfg;
 pub mod isa;
 pub mod mailbox;
+pub mod matrix;
 pub mod noc;
 pub mod numerics;
 pub mod sfpu;
