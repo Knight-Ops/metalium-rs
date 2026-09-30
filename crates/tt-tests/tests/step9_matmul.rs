@@ -12,15 +12,11 @@
 //!
 //! # Where the operands sit, and why
 //!
-//! ttsim holds the unpackers' output base at 16 bytes and will not let it be
-//! written (`docs/ttsim-divergence.md` row 35), so the first row an unpack targets
-//! can never have its first four columns written. `MVMUL` reads whole aligned
-//! blocks, so each operand is staged one or more rows early, behind zero padding
-//! that absorbs the offset, and the RWCs point `MVMUL` past it. `SrcA` goes at row
-//! 16 rather than 8 because ttsim refuses `src_a_row=8` (row 41), which
-//! `MVMUL.md`'s `& 0x38` allows.
+//! Each operand is staged behind zero rows so that it lands at the row the RWCs
+//! point `MVMUL` at. `SrcA` goes at row 16 rather than 8 because ttsim refuses
+//! `src_a_row=8` (row 41), which `MVMUL.md`'s `& 0x38` allows.
 
-use tt_isa::backend::{self, ConfigWords, ThreadConfigEntry};
+use tt_isa::backend::{self, Before, ConfigWords, ThreadConfigEntry};
 use tt_isa::cfg::generated::{alu, thread};
 use tt_isa::cfg::ThreadConfigField;
 use tt_isa::isa::generated::encode;
@@ -37,8 +33,6 @@ use tt_tests::harness::{self, Run};
 const ROW: usize = 16;
 const SRC_A_ROW: usize = 16;
 const SRC_B_ROW: usize = 8;
-/// Leading `Src` positions the hidden base keeps from an FP32 input.
-const HIDDEN: usize = 4;
 const TF32_CODE: u32 = 4;
 
 const STAGE_A: u64 = STAGE;
@@ -52,10 +46,8 @@ const ZERO_DST: MatB = [[0f32; 16]; 8];
 
 /// Stage `rows` as a flat FP32 run that lands at `Src` row `src_row`, column 0.
 fn stage_operand(src_row: usize, rows: &[[f32; 16]]) -> (Vec<u8>, u32) {
-    let mut datums = vec![0u32; src_row * ROW - HIDDEN];
+    let mut datums = vec![0u32; src_row * ROW];
     datums.extend(rows.iter().flatten().map(|v| v.to_bits()));
-    // The unpacker stops `HIDDEN` short of the count it is given (row 35).
-    datums.extend([0u32; HIDDEN]);
     let n = datums.len() as u32;
     let image = TileImage::new(flat_descriptor(n), L1Format::Fp32).unwrap();
     let mut staged = vec![0u8; image.total_bytes()];
@@ -123,8 +115,10 @@ fn program(na: u32, nb: u32, body: Body) -> Vec<Instruction> {
     p.push(set_adc_x(Unpacker::SrcB, 0, nb - 1));
     let (i, banks) = banks.unpack_b(unpack).unwrap();
     p.push(i);
-    p.push(backend::wait_for_unpacker0().unwrap());
-    p.push(backend::wait_for_unpacker1().unwrap());
+    // `MVMUL` waits for bank ownership by itself, but `ZEROACC` and the RWC
+    // setup do not; hold the Matrix Unit until both unpacks land.
+    p.push(backend::wait_for_unpacker0(Before::MATRIX).unwrap());
+    p.push(backend::wait_for_unpacker1(Before::MATRIX).unwrap());
 
     // `SrcAVal` is four bits, so 16 takes two steps: set 8, then add the carried
     // 8 (`SETRWC.md`: `if (SrcACr) SrcAVal += RWC.SrcA_Cr`).
@@ -146,7 +140,7 @@ fn program(na: u32, nb: u32, body: Body) -> Vec<Instruction> {
     // is the one whose meaning does not depend on it.
     p.push(encode::Zeroacc::ZERO.mode(3).encode().unwrap());
     body(banks, &mut p);
-    p.push(backend::wait_for_matrix().unwrap());
+    p.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
     p
 }
 

@@ -199,8 +199,7 @@ mod silicon {
             let w = dev
                 .alloc_window(tt_device::tlb::WindowKind::TwoMib)
                 .unwrap_or_else(|e| panic!("no TLB window left to claim ({x},{y}): {e}"));
-            dev.write32(&w, coord, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
-                .unwrap_or_else(|e| panic!("could not hold ({x},{y})'s cores in reset: {e}"));
+            reset_tile(dev, &w, coord);
             dev.free_window(w);
         }
         coord
@@ -314,13 +313,40 @@ mod silicon {
         | Core::T2.soft_reset_mask()
         | Core::NC.soft_reset_mask();
 
-    /// Put the gate tile, and every tile claimed through [`tile`], back to a
-    /// known state.
+    /// Hold every core on `tile`, and put its Tensix backend through a reset
+    /// pulse, leaving the backend released and the cores held.
     ///
-    /// Only the cores, for now. `Dst` is the other piece of state that survives a
-    /// run, and scrubbing it needs a Tensix program rather than a register write;
-    /// the gates that read `Dst` pre-fill their dump area with a sentinel, which
-    /// catches a stale datum but does not remove it.
+    /// Holding the cores alone is not enough. On silicon a program that hangs
+    /// the coprocessor -- a `STALLWAIT` on an unpacker that never finishes --
+    /// leaves the backend stuck after its core is stopped, and every later gate
+    /// on the tile then times out: the first run of the Stage 2 probes wedged the
+    /// gate tile that way and took the rest of the suite down with it. The pulse
+    /// is `SoftReset.md`'s remedy: entering reset aborts in-flight
+    /// `UNPACR`/`PACR`, Matrix Unit and Vector Unit work, resets the `Src` bank
+    /// ownership and zeroes the THCON configuration; the cores being held
+    /// discards anything queued in their Tensix FIFOs. `Dst` survives it.
+    ///
+    /// Silicon only: ttsim accepts only the baby RISC-V bits of `SOFT_RESET_0`
+    /// (divergence row 16).
+    fn reset_tile(dev: &mut Dev<'_>, w: &tt_device::Window, tile: NocCoord<Noc0>) {
+        dev.write32(
+            w,
+            tile,
+            tensix::SOFT_RESET_0,
+            ALL_BABIES_HELD | tensix::BACKEND_RESET_MASK,
+        )
+        .unwrap_or_else(|e| panic!("could not reset {tile:?}'s backend: {e}"));
+        dev.write32(w, tile, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
+            .unwrap_or_else(|e| panic!("could not release {tile:?}'s backend: {e}"));
+    }
+
+    /// Put the gate tile, and every tile claimed through [`tile`], back to a
+    /// known state: cores held, backend reset and released ([`reset_tile`]).
+    ///
+    /// `Dst` is the piece of state that survives this, and scrubbing it needs a
+    /// Tensix program rather than a register write; the gates that read `Dst`
+    /// pre-fill their dump area with a sentinel, which catches a stale datum but
+    /// does not remove it.
     pub fn scrub(dev: &mut Dev<'_>) {
         let (x, y) = GATE_TILE;
         let mut tiles: Vec<NocCoord<Noc0>> = vec![NocCoord::new(x, y).unwrap()];
@@ -346,8 +372,7 @@ mod silicon {
                 )
             });
         for tile in tiles {
-            dev.write32(&w, tile, tensix::SOFT_RESET_0, ALL_BABIES_HELD)
-                .unwrap_or_else(|e| panic!("could not hold {tile:?}'s cores in reset: {e}"));
+            reset_tile(dev, &w, tile);
         }
         dev.free_window(w);
     }

@@ -125,15 +125,14 @@ fn unpack_config(
 ) -> ConfigWords {
     let mut w = ConfigWords::new();
 
-    // `InAddr = (REG3_Base_address + REG7_Offset_address + 1 + DigestSize) * 16`
-    // (`UNPACR_Regular.md:98-112`). With `DigestSize = 0` that is
-    // `(base + 1) * 16`, so the register holds the address in 16-byte units, less
-    // one for the tile header the unpacker skips.
-    let base_units = l1_base / (TileImage::ALIGNMENT as u64);
-    w.set(thcon::THCON_SEC0_REG3_Base_address, (base_units - 1) as u32)
-        .unwrap()
-        .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
-        .unwrap();
+    // The image's own start, header included: see `datapath::tile_base_units`.
+    w.set(
+        thcon::THCON_SEC0_REG3_Base_address,
+        tt_tests::datapath::tile_base_units(l1_base),
+    )
+    .unwrap()
+    .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
+    .unwrap();
 
     // `XDim` comes from `REG5_Tile_x_dim_cntx[WhichContext & 3]` rather than from
     // the descriptor, for unpacker 0 in context mode (`UNPACR_Regular.md:62-66`).
@@ -279,7 +278,7 @@ fn unpack_program_with_base(
     p.extend_from_slice(&staged[..n]);
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -316,7 +315,7 @@ fn unpack_program_with_ystride(
     );
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -329,7 +328,7 @@ fn unpack_program(descriptor: TileDescriptor, out_format: u32, datums: u32) -> V
     p.extend_from_slice(&staged[..n]);
     p.push(set_adc_x(0, datums - 1));
     p.push(unpack_instruction(true));
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -464,37 +463,24 @@ fn survey_the_data_format_codes() {
     }
 }
 
-/// Where the measured model says datum `i` lands, as a flat `row * 16 + col`.
+/// Where staged datum `i` lands: `OutAddr = dst_base + i`, split as
+/// `Row = OutAddr / 16 - 4`, `Col = OutAddr & 15` (`UNPACR_Regular.md:394-396`).
 ///
-/// `UNPACR_Regular.md:394-396` gives `Row = OutAddr / 16`, `Col = OutAddr & 15`,
-/// then `Row -= 4` for the `UnpackToDst` path. `OutAddr` is
-/// `UNP0_ADDR_BASE_REG_1_Base + ADC terms`, shifted right by two for a 32-bit
-/// output format, plus `REG5_Dest_cntx0_address`.
-///
-/// The `+ 4` is measured, not documented. With every stride zeroed the ADC terms
-/// vanish and the only term left is the base — which ttsim refuses to let us write
-/// (register 49 is not modelled; see `probe_config_coverage.rs`) and which it
-/// evidently holds at 16, since `16 >> 2 == 4`. That this is the base and not
-/// something else is pinned by `does_the_output_address_formula_respond_to_the_adc`:
-/// giving channel 1 a `Y` and a `Ystride` moves the landing position by exactly
-/// `Y * Ystride >> 2`, leaving 4 as the residual.
-const HIDDEN_BASE_DATUMS: u32 = 4;
-
+/// This once carried a measured `+ 4`, attributed to ttsim holding
+/// `UNP0_ADDR_BASE_REG_1_Base` at 16, with the last four datums dropped. Silicon
+/// showed the same shape with that register reading 0; the cause was our
+/// `REG3_Base_address` pointing one unit before the tile header, so the unpacker
+/// read the header as datums (`datapath::tile_base_units`).
 fn expected_flat(dst_base: u32, i: u32) -> usize {
-    let out_addr = dst_base + HIDDEN_BASE_DATUMS + i;
+    let out_addr = dst_base + i;
     let row = out_addr / 16 - 4;
     let col = out_addr % 16;
     (row * 16 + col) as usize
 }
 
-/// How many of `staged` datums actually reach `Dst`.
-///
-/// Measured: the write runs from `dst_base + 4` up to but not including
-/// `dst_base + N`, so the last four are dropped. Recorded as a named quantity
-/// rather than a magic subtraction so that a simulator bump changing it fails the
-/// gate loudly.
+/// How many of `staged` datums reach `Dst`: all of them.
 fn expected_datums(staged: u32) -> u32 {
-    staged - HIDDEN_BASE_DATUMS
+    staged
 }
 
 #[test]
@@ -609,7 +595,7 @@ fn unpacr_without_the_undocumented_last_bit_is_refused() {
             p.extend_from_slice(&buf[..n]);
             p.push(set_adc_x(0, count - 1));
             p.push(unpack_instruction(last));
-            p.push(backend::wait_for_unpacker0().unwrap());
+            p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
             let _ = run(dev, &staged, &p, 4);
         })
     }

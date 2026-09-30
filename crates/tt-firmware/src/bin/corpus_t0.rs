@@ -1,5 +1,7 @@
-//! A generic Tensix program runner: push what the host staged, dump what it asks
-//! for.
+//! The generic Tensix program runner on T0 / thread 0: the silicon image.
+//!
+//! See `corpus.rs` for what it does, and `tt_firmware::corpus` for why the
+//! thread differs by target.
 //!
 //! The step 4 firmware computes one thing. This computes whatever the host encoded,
 //! which is what turns "does this instruction execute correctly" from a firmware
@@ -15,11 +17,9 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::tensix::{RiscvT1, Thread1};
+use tt_isa::tensix::{RiscvT0, Thread0};
 
-/// T1 because ttsim models the RISC-V view of `Dst` only for it (divergence row
-/// 12). `corpus_t0` is the silicon image; see `tt_firmware::corpus`.
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
-    corpus::run::<RiscvT1, Thread1>()
+    corpus::run::<RiscvT0, Thread0>()
 }

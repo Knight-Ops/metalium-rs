@@ -32,11 +32,27 @@ pub use crate::backend::{
     advance, assert_on_silicon, in_device, survives, tensix_grid, tile, Dev, ON_SILICON,
 };
 
-/// T1, not T0: ttsim implements the RISC-V view of `Dst` only for `pipe == 1`
-/// (`docs/ttsim-divergence.md` row 12). A simulator constraint, not a hardware one.
+/// Which core pushes the program, and so which Tensix thread runs it.
+///
+/// **T0 on silicon, T1 on the simulator**, and the difference is load-bearing.
+/// `UNPACR` in multi-context mode -- the only mode the specification supports --
+/// takes its X counters from `ADCs[ContextADC]`, an instruction field that is 0,
+/// not from the issuing thread (`UNPACR_Regular.md:45-59`). The packer and the
+/// `SETADC*` instructions use the issuing thread. So an unpack issued from thread
+/// 1 is programmed through thread 1's ADCs and executed with thread 0's: on
+/// silicon it moved exactly one datum (m10 in `silicon_measure.rs`). ttsim uses
+/// the issuing thread's ADCs (divergence row 45), which hid it, and ttsim only
+/// lets T1 read `Dst` (row 12), which forced T1 there. tt-metal's LLK unpacks
+/// from TRISC0 for the same reason.
+#[cfg(feature = "silicon")]
+pub const CORE: Core = Core::T0;
+#[cfg(not(feature = "silicon"))]
 pub const CORE: Core = Core::T1;
 /// The Tensix thread `CORE` pushes to, and the value the firmware cross-checks
 /// against `mailbox::THREAD_INDEX`.
+#[cfg(feature = "silicon")]
+pub const CORE_THREAD: u32 = 0;
+#[cfg(not(feature = "silicon"))]
 pub const CORE_THREAD: u32 = 1;
 /// `RISC_DEST_ACCESS_CTRL_SEC*.fmt` 0 is `float Dst32b[512][16]`.
 pub const DST_FMT_FP32: u32 = 0;
@@ -124,15 +140,41 @@ impl Outcome {
     }
 }
 
+/// Zero the `Dst` rows a run will dump, before its program runs.
+///
+/// `Dst` has no reset value and survives everything the harness can do to a tile
+/// from outside -- the backend soft-reset pulse included (`SoftReset.md`) -- so on
+/// silicon a run reads whatever the last one left: the first silicon run of
+/// `probe_unpack` found an earlier probe's `-7.0` marker in rows it asserts are
+/// untouched. ttsim hands out a fresh, zeroed chip per run, which is what the
+/// gates were written against. Done through the SFPU, whose `Dst` writes read
+/// back correctly on silicon (`step5_corpus`), and identically on both targets so
+/// the programs stay the same; the wait keeps it ahead of anything the program
+/// then writes.
+fn dst_clear_prelude(dump_rows: u32) -> Vec<Instruction> {
+    use tt_isa::sfpu;
+    let mut p = Vec::new();
+    p.extend(sfpu::load_f32(0, 0).unwrap());
+    for group in 0..dump_rows.div_ceil(4) {
+        for cols in [0, sfpu::DST_ODD_COLUMNS] {
+            p.push(sfpu::store(0, sfpu::store_format::FP32, 0, (group * 4) | cols).unwrap());
+        }
+    }
+    p.push(tt_isa::backend::wait_for_sfpu(tt_isa::backend::Before::EVERYTHING).unwrap());
+    p
+}
+
 /// Stage, run, and read back.
 ///
 /// Panics rather than returning an error: every failure here is a broken gate, not
 /// a condition a caller could handle.
 pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
+    let mut program = dst_clear_prelude(spec.dump_rows);
+    program.extend_from_slice(spec.program);
     assert!(
-        spec.program.len() as u32 <= mailbox::PROGRAM_MAX,
-        "program is {} instructions; the mailbox holds {}",
-        spec.program.len(),
+        program.len() as u32 <= mailbox::PROGRAM_MAX,
+        "program is {} instructions with the Dst-clearing prelude; the mailbox holds {}",
+        program.len(),
         mailbox::PROGRAM_MAX
     );
     assert!(spec.dump_rows <= mailbox::DUMP_MAX_ROWS);
@@ -153,12 +195,12 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
         .unwrap();
     dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, spec.dst_fmt)
         .unwrap();
-    dev.write32(&w, tile, mailbox::PROGRAM_LEN, spec.program.len() as u32)
+    dev.write32(&w, tile, mailbox::PROGRAM_LEN, program.len() as u32)
         .unwrap();
     dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
     dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, spec.dump_rows)
         .unwrap();
-    for (i, insn) in spec.program.iter().enumerate() {
+    for (i, insn) in program.iter().enumerate() {
         dev.write32(&w, tile, mailbox::PROGRAM + (i as u64) * 4, insn.word())
             .unwrap();
     }

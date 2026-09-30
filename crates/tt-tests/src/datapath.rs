@@ -34,10 +34,6 @@ pub const SCRATCH_GPR: u32 = 8;
 /// See `probe_unpack.rs`: the smallest `REG5_Dest_cntx0_address` the unpacker
 /// accepts, which is `Dst` row 0.
 pub const DST_BASE: u32 = 64;
-/// ttsim holds `UNP0_ADDR_BASE_REG_1_Base` at 16 and will not let it be written, so
-/// the unpacker's first datum lands four columns into the row and the last four
-/// datums are dropped. Divergence row 30.
-pub const HIDDEN_BASE_DATUMS: u32 = 4;
 
 pub const UNPACR_LAST: u32 = 1;
 
@@ -87,11 +83,26 @@ pub fn thread_config() -> Vec<Instruction> {
     ]
 }
 
+/// `REG3_Base_address` for a tile image staged at `l1_base`.
+///
+/// `InAddr = (Base_address + 1 + DigestSize) * 16` (`UNPACR_Regular.md:112-115`):
+/// the `+ 1` is the unpacker stepping over the tile header, so `Base_address`
+/// names the *start of the image, header included* -- which is where
+/// [`TileImage`] puts the header. This was once `l1_base / 16 - 1`, subtracting
+/// the header a second time: the unpacker then read the header's 16 zero bytes
+/// as the first datums and dropped as many from the end. That is the whole of
+/// what divergence rows 30 and 35 recorded as a "hidden output base" scaling
+/// with the input width -- ttsim, silicon and the specification all agreed, and
+/// the error was here.
+pub fn tile_base_units(l1_base: u64) -> u32 {
+    (l1_base / TileImage::ALIGNMENT as u64) as u32
+}
+
 /// Unpacker configuration, as established by `probe_unpack.rs`.
 pub fn unpack_config(words: &mut ConfigWords, descriptor: TileDescriptor, l1_base: u64) {
-    let base_units = l1_base / (TileImage::ALIGNMENT as u64);
+    let base_units = tile_base_units(l1_base);
     words
-        .set(thcon::THCON_SEC0_REG3_Base_address, (base_units - 1) as u32)
+        .set(thcon::THCON_SEC0_REG3_Base_address, base_units)
         .unwrap()
         .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
         .unwrap()
@@ -194,7 +205,7 @@ pub fn unpack_src_config(
     l1_base: u64,
     out: u32,
 ) {
-    let base_units = (l1_base / (TileImage::ALIGNMENT as u64) - 1) as u32;
+    let base_units = tile_base_units(l1_base);
     let descriptor_span = match unpacker {
         Unpacker::SrcA => {
             words

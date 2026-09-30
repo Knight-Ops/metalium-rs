@@ -19,14 +19,14 @@
 //! pages are still written in terms of `Packers[i]`, so "packer 0's configuration"
 //! is `THCON_SEC0_REG1_*` and that is what this configures.
 
-use tt_isa::backend::{self, ConfigWords};
+use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::isa::Instruction;
 use tt_isa::mailbox;
 use tt_isa::sfpu;
 use tt_isa::tile::{L1Format, TileDescriptor, TileImage};
 use tt_tests::datapath::{
     flat_descriptor, pack_config, pack_instruction, set_adc_x_pack, set_adc_x_unpack, staged_image,
-    thread_config, unpack_config, unpack_instruction, HIDDEN_BASE_DATUMS, OUT, SCRATCH_GPR, STAGE,
+    thread_config, unpack_config, unpack_instruction, OUT, SCRATCH_GPR, STAGE,
 };
 use tt_tests::harness::{self, in_device, Run};
 
@@ -42,12 +42,12 @@ fn round_trip_program(descriptor: TileDescriptor, datums: u32, rows: u32) -> Vec
 
     p.push(set_adc_x_unpack(0, datums - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(Before::PACKER).unwrap());
 
     // The packer reads 16 datums per row per enabled interface.
     p.push(set_adc_x_pack(0, 15));
     p.push(pack_instruction(0b1111, true));
-    p.push(backend::wait_for_packer().unwrap());
+    p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
     let _ = rows;
     p
 }
@@ -110,13 +110,14 @@ fn round_trip_with_kernel(
 
     p.push(set_adc_x_unpack(0, datums - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    // Held back until the unpack lands: the kernel's SFPU reads, or else the pack.
+    p.push(backend::wait_for_unpacker0(Before::SFPU.and(Before::PACKER)).unwrap());
 
     if !kernel.is_empty() {
         p.extend_from_slice(kernel);
         // The packer must not start reading `Dst` before the SFPU has finished
-        // writing it. C11 with block bit B8 (`STALLWAIT.md`).
-        p.push(backend::wait_for_sfpu().unwrap());
+        // writing it: C11, holding the packer back.
+        p.push(backend::wait_for_sfpu(Before::PACKER).unwrap());
     }
 
     p.push(set_adc_x_pack(0, 15));
@@ -124,7 +125,7 @@ fn round_trip_with_kernel(
     // Without this the host can read L1 before the packer has drained. The thread
     // unblocks once the packer has *accepted* the work, not finished it
     // (`Packers/README.md`).
-    p.push(backend::wait_for_packer().unwrap());
+    p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
 
     let sentinel = sentinel_bytes(PACKED_DATUMS);
     let out = harness::run(
@@ -178,17 +179,11 @@ fn a_tile_survives_the_round_trip_through_dst() {
 
     in_device(|dev| {
         let (_, packed) = round_trip(dev, descriptor, &staged, datums, 0b1111);
-        // The unpacker lands datum `i` at `Dst` flat `HIDDEN_BASE_DATUMS + i` and
-        // drops the last four (divergence row 30), and the packer is a linear copy
-        // of `Dst`, so the staged values reappear at the same offset.
-        let landed = (datums - HIDDEN_BASE_DATUMS) as usize;
-        for i in 0..landed {
+        // The unpacker lands datum `i` at `Dst` flat `i`, and the packer is a
+        // linear copy of `Dst`, so every staged value reappears in order.
+        for (i, &got) in packed.iter().enumerate().take(datums as usize) {
             let want = (1.0f32 + i as f32).to_bits();
-            assert_eq!(
-                packed[HIDDEN_BASE_DATUMS as usize + i],
-                want,
-                "datum {i} did not survive the round trip"
-            );
+            assert_eq!(got, want, "datum {i} did not survive the round trip");
         }
     });
 }
@@ -212,16 +207,14 @@ fn a_single_corrupted_datum_changes_exactly_one_packed_word() {
 
     in_device(|dev| {
         let (_, packed) = round_trip(dev, descriptor, &dirty, datums, 0b1111);
-        let landed = (datums - HIDDEN_BASE_DATUMS) as usize;
-        for i in 0..landed {
-            let at = HIDDEN_BASE_DATUMS as usize + i;
+        for (i, &got) in packed.iter().enumerate().take(datums as usize) {
             let want = if i == CORRUPT_INDEX {
                 CORRUPT_VALUE.to_bits()
             } else {
                 (1.0f32 + i as f32).to_bits()
             };
             assert_eq!(
-                packed[at], want,
+                got, want,
                 "datum {i} is wrong; only datum {CORRUPT_INDEX} was corrupted"
             );
         }

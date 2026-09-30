@@ -24,7 +24,13 @@ pub mod firmware {
     ///
     /// Adding a case to the instruction corpus is a host-side change, not a
     /// firmware one.
+    ///
+    /// Built for the core [`crate::harness::CORE`] names: T1 on the simulator, T0
+    /// on silicon. See `tt_firmware::corpus`.
+    #[cfg(not(feature = "silicon"))]
     pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
+    #[cfg(feature = "silicon")]
+    pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
 
     /// Where a firmware image must be loaded in L1.
     ///

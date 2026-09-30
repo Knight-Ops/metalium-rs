@@ -3,7 +3,7 @@
 //! Split from the gates themselves so the assertions read as arithmetic rather than
 //! as address arithmetic.
 
-use tt_isa::backend::{self, ConfigWords};
+use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::isa::Instruction;
 use tt_isa::sfpu;
 use tt_isa::tile::TileDescriptor;
@@ -17,9 +17,8 @@ use tt_tests::harness::{self, Run};
 ///
 /// One unpack fills `Dst` rows 0..8: rows 0..4 are operand A and rows 4..8 are
 /// operand B, which is what lets the kernel address them as two row groups four
-/// apart. That is 128 datums, plus the four the unpacker drops off the end
-/// (`docs/ttsim-divergence.md` row 30).
-pub const DATUMS: u32 = 132;
+/// apart: 128 datums.
+pub const DATUMS: u32 = 128;
 
 /// `Dst` datums per aligned group of four rows -- the span one `SFPLOAD` pair
 /// covers, and the operand size.
@@ -27,19 +26,17 @@ pub const GROUP_DATUMS: usize = 64;
 
 /// Which staged datum a flat `Dst` position holds, if any.
 ///
-/// The unpacker places datum `i` at `OutAddr = dst_base + 4 + i` and the row/column
+/// The unpacker places datum `i` at `OutAddr = dst_base + i` and the row/column
 /// split is `Row = OutAddr/16 - 4`, `Col = OutAddr & 15`
-/// (`UNPACR_Regular.md:394-396`), so the flat position is just `4 + i`. The `4` is
-/// ttsim holding `UNP0_ADDR_BASE_REG_1_Base` at 16; see divergence row 30.
-///
-/// `None` for the first four positions, which no datum reaches. `Dst` has no
-/// power-on reset value (`Dst.md:15`), so those read `UnpredictableValue` and the
-/// gates exclude them rather than asserting the zero ttsim happens to give.
+/// (`UNPACR_Regular.md:394-396`), so the flat position is just `i`, for every
+/// position the operands cover. (It was once `4 + i` with four positions no datum
+/// reached: `REG3_Base_address` pointed one unit early and the unpacker read the
+/// tile header as datums. See `datapath::tile_base_units`.)
 pub const fn datum_at_dst_flat(flat: usize) -> Option<usize> {
-    if flat < 4 {
-        None
+    if flat < DATUMS as usize {
+        Some(flat)
     } else {
-        Some(flat - 4)
+        None
     }
 }
 
@@ -67,16 +64,18 @@ pub fn kernel_program(
     // two row groups four apart.
     p.push(set_adc_x_unpack(0, datums - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    // The kernel's `SFPLOAD`s read what the unpacker writes, so the wait holds the
+    // SFPU, not only the unpackers (`backend::Before`).
+    p.push(backend::wait_for_unpacker0(Before::SFPU).unwrap());
 
     p.extend_from_slice(kernel);
-    // The packer must not read `Dst` before the SFPU has written it: C11 with block
-    // bit B8 (`STALLWAIT.md`).
-    p.push(backend::wait_for_sfpu().unwrap());
+    // The packer must not read `Dst` before the SFPU has written it: C11, holding
+    // the packer back.
+    p.push(backend::wait_for_sfpu(Before::PACKER).unwrap());
 
     p.push(set_adc_x_pack(0, 15));
     p.push(pack_instruction(0b1111, true));
-    p.push(backend::wait_for_packer().unwrap());
+    p.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
     p
 }
 

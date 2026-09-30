@@ -542,32 +542,82 @@ pub const fn stallwait(block_mask: u32, condition_mask: u32) -> Result<Instructi
     }
 }
 
-/// Wait until this thread has drained unpacker 0 (C1, blocking B3).
-pub const fn wait_for_unpacker0() -> Result<Instruction, EncodeError> {
-    stallwait(block::UNPACKER, cond::UNPACKER0_BUSY)
+/// Which of this thread's *following* instructions a wait must hold back: the
+/// units that consume what the waited-on unit produces.
+///
+/// `STALLWAIT`'s block mask does not name what to wait *for* -- the condition mask
+/// does that -- it names which later instructions stall until the condition
+/// clears (`STALLWAIT.md`, "Block mask"). Everything else runs past it. So a wait
+/// for unpacker 0 that blocks only B3 (the unpackers) holds back the next
+/// `UNPACR` and lets the `SFPLOAD`s that read what it wrote go ahead. The first
+/// silicon run of the elementwise gate did exactly that and read `Dst` before the
+/// unpacker had written it; ttsim evaluates each unit synchronously and cannot
+/// show the race. Every wait helper therefore takes the consumer as an argument
+/// it cannot omit, and blocks the producer's own unit in addition.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Before(u32);
+
+impl Before {
+    pub const UNPACKER: Before = Before(block::UNPACKER);
+    pub const PACKER: Before = Before(block::PACKER);
+    pub const MATRIX: Before = Before(block::MATRIX);
+    pub const SFPU: Before = Before(block::SFPU);
+    pub const CONFIG: Before = Before(block::CONFIG);
+    /// Every unit: a full barrier on this thread. What the end of a program, or
+    /// anything a RISC-V core or the host will read afterwards, wants.
+    pub const EVERYTHING: Before = Before(
+        block::ANY_DMA
+            | block::SYNC
+            | block::PACKER
+            | block::UNPACKER
+            | block::MOVER
+            | block::SCALAR
+            | block::MATRIX
+            | block::CONFIG
+            | block::SFPU,
+    );
+
+    /// Both sets of consumers.
+    pub const fn and(self, other: Before) -> Before {
+        Before(self.0 | other.0)
+    }
+
+    pub const fn mask(self) -> u32 {
+        self.0
+    }
 }
 
-/// Wait until this thread has drained unpacker 1 (C2, blocking B3).
-pub const fn wait_for_unpacker1() -> Result<Instruction, EncodeError> {
-    stallwait(block::UNPACKER, cond::UNPACKER1_BUSY)
+/// Wait until this thread has drained unpacker 0 (C1), holding back its own
+/// unit (B3) and `before`.
+pub const fn wait_for_unpacker0(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::UNPACKER | before.0, cond::UNPACKER0_BUSY)
 }
 
-/// Wait until this thread has drained the packer (C3, blocking B2).
-pub const fn wait_for_packer() -> Result<Instruction, EncodeError> {
-    stallwait(block::PACKER, cond::PACKER_BUSY)
+/// Wait until this thread has drained unpacker 1 (C2), holding back B3 and
+/// `before`.
+pub const fn wait_for_unpacker1(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::UNPACKER | before.0, cond::UNPACKER1_BUSY)
 }
 
-/// Wait until this thread has drained the SFPU (C11, blocking B8).
-pub const fn wait_for_sfpu() -> Result<Instruction, EncodeError> {
-    stallwait(block::SFPU, cond::SFPU_BUSY)
+/// Wait until this thread has drained the packer (C3), holding back B2 and
+/// `before`.
+pub const fn wait_for_packer(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::PACKER | before.0, cond::PACKER_BUSY)
 }
 
-/// Wait until this thread has drained the Matrix Unit (C4, blocking B6).
+/// Wait until this thread has drained the SFPU (C11), holding back B8 and
+/// `before`.
+pub const fn wait_for_sfpu(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::SFPU | before.0, cond::SFPU_BUSY)
+}
+
+/// Wait until this thread has drained the Matrix Unit (C4), holding back B6 and
+/// `before`.
 ///
 /// `ZEROACC` runs on the Matrix Unit, not on the SFPU — easy to get wrong, since
 /// everything around it in a `Dst` scrub is SFPU work.
-pub const fn wait_for_matrix() -> Result<Instruction, EncodeError> {
-    stallwait(block::MATRIX, cond::MATRIX_BUSY)
+pub const fn wait_for_matrix(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::MATRIX | before.0, cond::MATRIX_BUSY)
 }
 
 #[cfg(test)]
@@ -749,21 +799,48 @@ mod tests {
         assert!(entry.set(thread::CFG_STATE_ID_StateID, 1).is_err());
     }
 
-    /// The paired helpers exist because a condition without its block bit waits
-    /// without stopping anything, which reads as a race rather than a missing bit.
+    /// Each helper waits on its own condition, always holds back its own unit --
+    /// a condition without its block bit waits without stopping anything -- and
+    /// also holds back the consumers it is given.
     #[test]
-    fn the_stall_helpers_pair_each_condition_with_the_block_bit_the_page_names() {
+    fn the_stall_helpers_block_their_own_unit_and_the_named_consumers() {
         for (insn, block, cond) in [
-            (wait_for_unpacker0(), block::UNPACKER, cond::UNPACKER0_BUSY),
-            (wait_for_packer(), block::PACKER, cond::PACKER_BUSY),
-            (wait_for_sfpu(), block::SFPU, cond::SFPU_BUSY),
-            (wait_for_matrix(), block::MATRIX, cond::MATRIX_BUSY),
+            (
+                wait_for_unpacker0(Before::SFPU),
+                block::UNPACKER | block::SFPU,
+                cond::UNPACKER0_BUSY,
+            ),
+            (
+                wait_for_packer(Before::EVERYTHING),
+                Before::EVERYTHING.mask(),
+                cond::PACKER_BUSY,
+            ),
+            (
+                wait_for_sfpu(Before::PACKER),
+                block::SFPU | block::PACKER,
+                cond::SFPU_BUSY,
+            ),
+            (
+                wait_for_matrix(Before::MATRIX),
+                block::MATRIX,
+                cond::MATRIX_BUSY,
+            ),
         ] {
             let insn = insn.unwrap();
             assert_eq!(insn.def().key(), "STALLWAIT_BH");
             assert_eq!(insn.operand("BlockMask"), Some(block));
             assert_eq!(insn.operand("ConditionMask"), Some(cond));
         }
+    }
+
+    /// The case that broke the elementwise gate on silicon: an unpack into `Dst`
+    /// followed by SFPU reads of it. The wait must hold the SFPU, not only the
+    /// unpackers.
+    #[test]
+    fn an_unpack_consumed_by_the_sfpu_holds_the_sfpu() {
+        let insn = wait_for_unpacker0(Before::SFPU).unwrap();
+        let mask = insn.operand("BlockMask").unwrap();
+        assert_ne!(mask & block::SFPU, 0, "the SFPU would run past the wait");
     }
 
     /// Blackhole renumbers the condition mask relative to Wormhole, so these

@@ -77,6 +77,19 @@ fn landing(dump: &[u32], expected: &[u32]) -> Option<(usize, usize)> {
 }
 
 fn report_landing(key: &str, dump: &[u32], expected: &[u32]) {
+    let rows: Vec<String> = dump
+        .chunks(ROW)
+        .take(4)
+        .map(|r| {
+            r.iter()
+                .map(|v| format!("{v:08x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    for (i, r) in rows.iter().enumerate() {
+        measure(&format!("{key}.row{i}"), r);
+    }
     match landing(dump, expected) {
         Some((first, run)) => {
             measure(&format!("{key}.first_flat"), first);
@@ -115,7 +128,7 @@ fn m01_unpack_to_dst_landing() {
     p.extend_from_slice(&buf[..n]);
     p.push(set_adc_x_unpack(0, N as u32 - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     in_device(|dev| {
         let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(4));
         report_landing("dst.fp32", &out.dst, &bits);
@@ -145,7 +158,7 @@ fn src_probe(
     p.push(unpack_src_instruction(unpacker, true));
     match unpacker {
         Unpacker::SrcA => {
-            p.push(backend::wait_for_unpacker0().unwrap());
+            p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
             if single_row_mova2d {
                 for r in 0..2 {
                     p.push(encode::Mova2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
@@ -162,13 +175,13 @@ fn src_probe(
             }
         }
         Unpacker::SrcB => {
-            p.push(backend::wait_for_unpacker1().unwrap());
+            p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
             for r in 0..8 {
                 p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
             }
         }
     }
-    p.push(backend::wait_for_matrix().unwrap());
+    p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
     let want: Vec<u32> = datums.iter().map(|&d| expected(d)).collect();
     in_device(|dev| {
         let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(8));
@@ -268,16 +281,16 @@ fn m05_fp16_into_srca_and_srcb() {
         p.push(unpack_src_instruction(u, true));
         match u {
             Unpacker::SrcA => {
-                p.push(backend::wait_for_unpacker0().unwrap());
+                p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
                 p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
             }
             Unpacker::SrcB => {
-                p.push(backend::wait_for_unpacker1().unwrap());
+                p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
                 p.push(encode::Movb2D::ZERO.encode().unwrap());
                 p.push(encode::Movb2D::ZERO.src_row(1).dst_row(1).encode().unwrap());
             }
         }
-        p.push(backend::wait_for_matrix().unwrap());
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
         in_device(|dev| {
             let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(2));
             let distinct: std::collections::BTreeSet<u32> =
@@ -311,10 +324,10 @@ fn m06_packer_output_offset() {
     p.extend_from_slice(&buf[..n]);
     p.push(set_adc_x_unpack(0, N as u32 - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     p.push(set_adc_x_pack(0, 15));
     p.push(pack_instruction(0b1111, true));
-    p.push(backend::wait_for_packer().unwrap());
+    p.push(backend::wait_for_packer(backend::Before::EVERYTHING).unwrap());
 
     let window = OUT - MARGIN as u64;
     let span = 2 * MARGIN + PACKED * 4;
@@ -417,7 +430,7 @@ fn m08_bf16_unpack_to_dst() {
     p.extend_from_slice(&buf[..n]);
     p.push(set_adc_x_unpack(0, N as u32 - 1));
     p.push(unpack_instruction());
-    p.push(backend::wait_for_unpacker0().unwrap());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
     let want: Vec<u32> = halves
         .iter()
         .map(|&h| tt_isa::tile::bf16_to_fp32(h as u16))
@@ -437,5 +450,402 @@ fn m08_bf16_unpack_to_dst() {
                 .collect();
             measure(&format!("dst.bf16.{label}.row0"), head.join(" "));
         });
+    }
+}
+
+/// Every non-zero `Config` field, as the chip holds it after a trivial run.
+///
+/// ttsim starts every run with all of `Config` zero, and the datapath programs
+/// write only the fields whose zero is wrong for them -- so on the simulator a
+/// field they never write *is* zero. On silicon it is whatever the last program,
+/// or the boot firmware, left, and the first Stage 2 run unpacked nothing
+/// visible. The backend pulse in the harness zeroes only the THCON block
+/// (`SoftReset.md`); this reads all 224 words through the `CFGREG` debug pair
+/// (row E, confirmed on silicon) to see what the rest holds.
+#[test]
+fn m09_non_zero_config_fields_on_silicon() {
+    assert_on_silicon();
+    let p = vec![backend::nop()];
+    in_device(|dev| {
+        let _ = harness::run(dev, &Run::new(&p));
+        let tile = harness::tensix_tile();
+        let w = dev
+            .alloc_window(tt_device::tlb::WindowKind::TwoMib)
+            .unwrap();
+        let mut words = Vec::new();
+        for addr32 in 0..tt_isa::cfg::CONFIG_WORDS_PER_BANK {
+            dev.write32(&w, tile, tensix::CFGREG_RD_CNTL, addr32)
+                .unwrap();
+            harness::advance(dev, 64);
+            words.push(dev.read32(&w, tile, tensix::CFGREG_RDDATA).unwrap());
+        }
+        dev.free_window(w);
+        let nonzero: Vec<String> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, v)| format!("{i}:{v:#x}"))
+            .collect();
+        measure("cfg.nonzero_words", nonzero.join(" "));
+        for (name, field) in tt_isa::cfg::generated::ALL_CONFIG_FIELDS {
+            let v = field.extract(words[field.addr32() as usize]);
+            if v != 0 {
+                measure(&format!("cfg.field.{name}"), format!("{v:#x}"));
+            }
+        }
+    });
+}
+
+/// Which `Dst` positions does an FP32 `UnpackToDst` write, on silicon?
+///
+/// m01 found none of the staged datums in the first four rows. This pre-fills
+/// rows 0..16 -- both column parities -- with a marker through the SFPU, whose
+/// `Dst` writes read back correctly on silicon (`step5_corpus`), then unpacks
+/// and reports every position that no longer holds the marker. Run with
+/// `ALU_ACC_CTRL_Fp32_enabled` both ways, since the unpack path never set it and
+/// m09 found it left at 1 by an earlier program.
+#[test]
+fn m10_where_unpack_to_dst_writes() {
+    assert_on_silicon();
+    const MARK: u32 = 0xC0E0_0000; // -7.0
+    let descriptor = flat_descriptor(N as u32);
+    let bits: Vec<u32> = (0..N).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, L1Format::Fp32.code().unwrap(), &bits);
+    for fp32_enabled in [1u32, 0] {
+        let mut p = Vec::new();
+        p.extend(sfpu::load_f32(0, MARK).unwrap());
+        for group in 0..4u32 {
+            for cols in [0, sfpu::DST_ODD_COLUMNS] {
+                p.push(sfpu::store(0, sfpu::store_format::FP32, 0, (group * 4) | cols).unwrap());
+            }
+        }
+        p.push(backend::wait_for_sfpu(backend::Before::EVERYTHING).unwrap());
+        p.extend(thread_config());
+        let mut words = ConfigWords::new();
+        unpack_config(&mut words, descriptor, STAGE);
+        words
+            .set(alu::ALU_ACC_CTRL_Fp32_enabled, fp32_enabled)
+            .unwrap();
+        let mut buf = [sfpu::nop(); 64];
+        let n = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        p.extend_from_slice(&buf[..n]);
+        p.push(set_adc_x_unpack(0, N as u32 - 1));
+        p.push(unpack_instruction());
+        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        in_device(|dev| {
+            let out = harness::run(
+                dev,
+                &Run::new(&p)
+                    .stage(&[(STAGE, &staged)])
+                    .dump_rows(tt_isa::mailbox::DUMP_MAX_ROWS),
+            );
+            let marked = out.dst.iter().filter(|&&v| v == MARK).count();
+            let changed: Vec<String> = out
+                .dst
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v != MARK)
+                .map(|(i, v)| format!("[{}][{}]={v:08x}", i / ROW, i % ROW))
+                .collect();
+            let key = format!("dst_writes.fp32_enabled_{fp32_enabled}");
+            measure(
+                &format!("{key}.still_marked"),
+                format!("{marked} of {}", out.dst.len()),
+            );
+            measure(&format!("{key}.changed"), changed.join(" "));
+        });
+    }
+}
+
+/// Rows 30 and 35, re-examined: is the four-datum shift an *output* base or an
+/// *input* that starts 16 bytes early?
+///
+/// m10 on silicon: 20 positions written from `[0][0]`, the first four zero, then
+/// the staged 1.0.. -- and m09: `UNP0_ADDR_BASE_REG_1_Base` reads 0 on silicon,
+/// not ttsim's 16, yet the landing is identical. A zeroed output prefix and a
+/// read of the 16 unstaged bytes before `STAGE` look the same. Staging four
+/// markers there tells them apart.
+#[test]
+fn m11_what_the_first_four_positions_hold() {
+    assert_on_silicon();
+    let descriptor = flat_descriptor(N as u32);
+    let bits: Vec<u32> = (0..N).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, L1Format::Fp32.code().unwrap(), &bits);
+    let prefix: Vec<u8> = [100.0f32, 101.0, 102.0, 103.0]
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .collect();
+    let mut p = thread_config();
+    let mut words = ConfigWords::new();
+    unpack_config(&mut words, descriptor, STAGE);
+    let mut buf = [sfpu::nop(); 64];
+    let n = words.program(SCRATCH_GPR, &mut buf).unwrap();
+    p.extend_from_slice(&buf[..n]);
+    p.push(set_adc_x_unpack(0, N as u32 - 1));
+    p.push(unpack_instruction());
+    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+    in_device(|dev| {
+        let out = harness::run(
+            dev,
+            &Run::new(&p)
+                .stage(&[(STAGE - 16, &prefix), (STAGE, &staged)])
+                .dump_rows(2),
+        );
+        let head: Vec<String> = out.dst[..24].iter().map(|v| format!("{v:08x}")).collect();
+        measure("dst.prefix_probe.first_24", head.join(" "));
+    });
+}
+
+/// Why does FP32 -> TF32 into `SrcA` corrupt scattered datums on silicon, when
+/// `SrcB` is clean and ttsim is clean?
+///
+/// m02: a few positions per run come back with mantissa bits cleared (6.0 as
+/// 4.0), and *which* positions changes run to run -- a race, which ttsim cannot
+/// exhibit. `UNPACR_Regular.md:325-346` models "SrcA burst drop cases" for
+/// exactly this shape -- unpacker 0, into `SrcA`, more than 16 datums, with
+/// Blackhole's default x4 throttle -- and says the model is "mildly simplified".
+/// Three variants, three runs each: 20 datums at the default throttle; 16
+/// datums, which the check exempts; 20 datums with the throttle forced to x1,
+/// which makes a burst one row.
+#[test]
+fn m12_srca_corruption_versus_burst_size() {
+    assert_on_silicon();
+    let run_case = |n: usize, force_x1: bool| -> Vec<usize> {
+        let datums: Vec<u32> = (0..n)
+            .map(|i| (1.0f32 + i as f32).to_bits() | 0x3FFF)
+            .collect();
+        let staged = stage(L1Format::Fp32, 0, &datums);
+        let mut p = src_thread_config();
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+        words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+        if force_x1 {
+            words
+                .set(thcon::THCON_SEC0_REG1_ovrd_default_throttle_mode, 1)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG2_Throttle_mode, 0)
+                .unwrap();
+        }
+        let mut buf = [sfpu::nop(); 64];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        p.extend_from_slice(&buf[..k]);
+        p.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        p.push(unpack_src_instruction(Unpacker::SrcA, true));
+        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+        let path = std::env::temp_dir().join(format!("m12-{}-{n}-{force_x1}", std::process::id()));
+        in_device(|dev| {
+            let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(2));
+            let bad: Vec<String> = (0..n)
+                .filter(|&i| out.dst[i] != tt_isa::tile::fp32_to_tf32(datums[i]))
+                .map(|i| i.to_string())
+                .collect();
+            std::fs::write(&path, bad.join(",")).unwrap();
+        });
+        let s = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        s.split(',')
+            .filter(|t| !t.is_empty())
+            .map(|t| t.parse().unwrap())
+            .collect()
+    };
+    for (n, force_x1) in [(20usize, false), (16, false), (20, true)] {
+        for attempt in 0..3 {
+            let bad = run_case(n, force_x1);
+            measure(
+                &format!("srca_race.n{n}.x1_{force_x1}.run{attempt}"),
+                format!("{} bad of {}: {bad:?}", bad.len(), n),
+            );
+        }
+    }
+}
+
+/// m12 follow-up: race, or cells?
+///
+/// Same 20-datum FP32 -> TF32 `SrcA` path. Variants: as m12; with 64 `NOP`s
+/// between the unpacker wait and `MOVA2D`; and with plain operands (no low
+/// mantissa bits), to see whether the loss depends on the data. Run on both
+/// cards to see whether the positions are the chip's or the design's.
+#[test]
+fn m13_srca_corruption_race_or_cells() {
+    assert_on_silicon();
+    let run_case = |plain: bool, pad: usize| -> Vec<(usize, u32, u32)> {
+        let n = 20usize;
+        let datums: Vec<u32> = (0..n)
+            .map(|i| (1.0f32 + i as f32).to_bits() | if plain { 0 } else { 0x3FFF })
+            .collect();
+        let staged = stage(L1Format::Fp32, 0, &datums);
+        let mut p = src_thread_config();
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, 4);
+        words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+        let mut buf = [sfpu::nop(); 64];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        p.extend_from_slice(&buf[..k]);
+        p.push(set_adc_x(Unpacker::SrcA, 0, n as u32 - 1));
+        p.push(unpack_src_instruction(Unpacker::SrcA, true));
+        p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+        p.extend(std::iter::repeat_n(backend::nop(), pad));
+        p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+        let path = std::env::temp_dir().join(format!("m13-{}-{plain}-{pad}", std::process::id()));
+        in_device(|dev| {
+            let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(2));
+            let bad: Vec<String> = (0..n)
+                .filter_map(|i| {
+                    let want = tt_isa::tile::fp32_to_tf32(datums[i]);
+                    let got = out.dst[i];
+                    (got != want).then(|| format!("{i}:{want:08x}:{got:08x}"))
+                })
+                .collect();
+            std::fs::write(&path, bad.join(",")).unwrap();
+        });
+        let s = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        s.split(',')
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                let f: Vec<&str> = t.split(':').collect();
+                (
+                    f[0].parse().unwrap(),
+                    u32::from_str_radix(f[1], 16).unwrap(),
+                    u32::from_str_radix(f[2], 16).unwrap(),
+                )
+            })
+            .collect()
+    };
+    for (plain, pad) in [(false, 0usize), (false, 64), (true, 0)] {
+        for attempt in 0..3 {
+            let bad = run_case(plain, pad);
+            let shown: Vec<String> = bad
+                .iter()
+                .map(|(i, w, g)| format!("d{i} want {w:08x} got {g:08x}"))
+                .collect();
+            measure(
+                &format!("srca_race2.plain_{plain}.pad{pad}.run{attempt}"),
+                format!("{} bad: {}", bad.len(), shown.join("; ")),
+            );
+        }
+    }
+}
+
+/// m13 follow-up: are the bad `SrcA` positions *unwritten*?
+///
+/// Deterministic per card, different between cards, unaffected by padding, and
+/// the wrong values look like `Dst` leftovers rather than damaged datums. So:
+/// mark `Dst` rows 0..8 through the SFPU first (as m10), then unpack FP32 -> TF32
+/// into `SrcA` and `MOVA2D` it out, and list every position that still holds the
+/// marker -- once for `SrcA`, once for the same path through `SrcB`/`MOVB2D`.
+#[test]
+fn m14_which_positions_the_src_path_leaves_unwritten() {
+    assert_on_silicon();
+    const MARK: u32 = 0xC0E0_0000;
+    let n = 20usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    for unpacker in [Unpacker::SrcA, Unpacker::SrcB] {
+        let mut p = Vec::new();
+        p.extend(sfpu::load_f32(0, MARK).unwrap());
+        for group in 0..2u32 {
+            for cols in [0, sfpu::DST_ODD_COLUMNS] {
+                p.push(sfpu::store(0, sfpu::store_format::FP32, 0, (group * 4) | cols).unwrap());
+            }
+        }
+        p.push(backend::wait_for_sfpu(backend::Before::EVERYTHING).unwrap());
+        p.extend(src_thread_config());
+        let mut words = ConfigWords::new();
+        let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+        unpack_src_config(&mut words, unpacker, descriptor, STAGE, 4);
+        words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+        let mut buf = [sfpu::nop(); 64];
+        let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+        p.extend_from_slice(&buf[..k]);
+        p.push(set_adc_x(unpacker, 0, n as u32 - 1));
+        p.push(unpack_src_instruction(unpacker, true));
+        match unpacker {
+            Unpacker::SrcA => {
+                p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+                p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+            }
+            Unpacker::SrcB => {
+                p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+                for r in 0..2 {
+                    p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                }
+            }
+        }
+        p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+        in_device(|dev| {
+            let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(2));
+            let marked: Vec<usize> = (0..2 * ROW).filter(|&f| out.dst[f] == MARK).collect();
+            let row0: Vec<String> = out.dst[..ROW].iter().map(|v| format!("{v:08x}")).collect();
+            let key = format!("{unpacker:?}").to_lowercase();
+            measure(
+                &format!("unwritten.{key}.still_marked_flat"),
+                format!("{marked:?}"),
+            );
+            measure(&format!("unwritten.{key}.row0"), row0.join(" "));
+        });
+    }
+}
+
+/// m14 follow-up: is it the RISC-V `Dst` read racing the Matrix Unit's write?
+///
+/// `Dst.md:101`: after an instruction writes `Dst`, its 8x16 block cannot be
+/// read for four cycles, and hardware stalls only Matrix Unit and `PACR`
+/// readers. The firmware reads `Dst` from RISC-V as soon as the coprocessor
+/// reports idle, which nothing makes wait for that write-back. Padding before
+/// `MOVA2D` changed nothing (m13); this pads *after* it.
+#[test]
+fn m15_dst_read_after_matrix_write() {
+    assert_on_silicon();
+    let n = 20usize;
+    let datums: Vec<u32> = (0..n).map(|i| (1.0f32 + i as f32).to_bits()).collect();
+    let staged = stage(L1Format::Fp32, 0, &datums);
+    for (unpacker, pad) in [
+        (Unpacker::SrcA, 0usize),
+        (Unpacker::SrcA, 16),
+        (Unpacker::SrcA, 64),
+        (Unpacker::SrcB, 0),
+        (Unpacker::SrcB, 64),
+    ] {
+        for attempt in 0..3 {
+            let mut p = src_thread_config();
+            let mut words = ConfigWords::new();
+            let descriptor = flat_descriptor(n as u32).with_in_data_format_raw(0);
+            unpack_src_config(&mut words, unpacker, descriptor, STAGE, 4);
+            words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+            let mut buf = [sfpu::nop(); 64];
+            let k = words.program(SCRATCH_GPR, &mut buf).unwrap();
+            p.extend_from_slice(&buf[..k]);
+            p.push(set_adc_x(unpacker, 0, n as u32 - 1));
+            p.push(unpack_src_instruction(unpacker, true));
+            match unpacker {
+                Unpacker::SrcA => {
+                    p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
+                    p.push(encode::Mova2D::ZERO.move8_rows(1).encode().unwrap());
+                }
+                Unpacker::SrcB => {
+                    p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
+                    for r in 0..2 {
+                        p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
+                    }
+                }
+            }
+            p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
+            p.extend(std::iter::repeat_n(backend::nop(), pad));
+            in_device(|dev| {
+                let out = harness::run(dev, &Run::new(&p).stage(&[(STAGE, &staged)]).dump_rows(2));
+                let bad: Vec<usize> = (0..n).filter(|&i| out.dst[i] != datums[i]).collect();
+                let key = format!("{unpacker:?}").to_lowercase();
+                measure(
+                    &format!("raw.{key}.pad{pad}.run{attempt}"),
+                    format!("bad {bad:?}"),
+                );
+            });
+        }
     }
 }

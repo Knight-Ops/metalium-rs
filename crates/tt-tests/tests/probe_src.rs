@@ -137,28 +137,6 @@ const ROW: usize = 16;
 /// Datums staged by the gates: two `Src` rows.
 const N: usize = 32;
 
-/// The `UNP[n]_ADDR_BASE_REG_1_Base` ttsim holds, **in bytes**, on both unpackers.
-///
-/// Divergence row 30 found this for unpacker 0 on the `Dst` path as "four datums".
-/// The `Src` path pins what it is: with a 32-bit `Src` format the first datum lands
-/// four columns in, and with a 16-bit one it lands **eight** in, which is exactly a
-/// 16-byte base after `OutAddr >>= 2` or `>>= 1` (`UNPACR_Regular.md:258-264`).
-///
-/// **The width is the *input* format's, not the output's.** FP32 staged in L1
-/// and converted to BF16 lands four in; BF16 staged as BF16 lands eight in. The
-/// specification shifts by `OutDataFormat`, so this is part of the same divergence.
-///
-/// On the `SrcA` path this should not appear at all: with `UnpackToDst` clear,
-/// `REG5_Dest_cntx0_address` *replaces* `OutAddr` rather than adding to it
-/// (`UNPACR_Regular.md:265-270`). ttsim adds it regardless; divergence row 35.
-const HIDDEN_BASE_BYTES: usize = 16;
-
-/// How many leading `Src` positions no datum reaches, for an L1 input format of
-/// `in_bytes` bytes per datum.
-const fn hidden_datums(in_bytes: usize) -> usize {
-    HIDDEN_BASE_BYTES / in_bytes
-}
-
 const FP32_CODE: u32 = 0;
 const TF32_CODE: u32 = 4;
 const BF16_CODE: u32 = 5;
@@ -198,7 +176,7 @@ fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<In
     p.push(unpack_src_instruction(unpacker, flip));
     match unpacker {
         Unpacker::SrcA => {
-            p.push(backend::wait_for_unpacker0().unwrap());
+            p.push(backend::wait_for_unpacker0(backend::Before::EVERYTHING).unwrap());
             // ttsim implements only the eight-row form (`tensix_mova2d:
             // instr_mod=0` is `UnsupportedFunctionality`).
             p.push(
@@ -211,13 +189,13 @@ fn src_program(unpacker: Unpacker, in_code: u32, out: u32, flip: bool) -> Vec<In
             );
         }
         Unpacker::SrcB => {
-            p.push(backend::wait_for_unpacker1().unwrap());
+            p.push(backend::wait_for_unpacker1(backend::Before::EVERYTHING).unwrap());
             for r in 0..8 {
                 p.push(encode::Movb2D::ZERO.src_row(r).dst_row(r).encode().unwrap());
             }
         }
     }
-    p.push(backend::wait_for_matrix().unwrap());
+    p.push(backend::wait_for_matrix(backend::Before::EVERYTHING).unwrap());
     p
 }
 
@@ -230,24 +208,21 @@ fn run_src(dev: &mut harness::Dev<'_>, staged: &[u8], program: &[Instruction]) -
     (0..8 * ROW).map(|f| out.dst_at(f / ROW, f % ROW)).collect()
 }
 
-/// Assert that staged datum `i` landed at flat `Src` position `hidden + i`, as
-/// `expect(i)`, for every datum that lands.
+/// Assert that every staged datum `i` landed at flat `Src` position `i`, as
+/// `expect(i)`.
 ///
-/// The last `hidden` staged datums do not land -- the write stops at `OutAddr = N`
-/// rather than running `N` datums, as row 30 found for `Dst` -- and the first
-/// `hidden` positions are reached by nothing, so hold `Src`'s undefined contents
-/// and are not asserted.
-fn assert_landed(dst: &[u32], in_bytes: usize, expect: impl Fn(usize) -> u32) {
-    let hidden = hidden_datums(in_bytes);
-    for i in 0..N - hidden {
-        let got = dst[hidden + i];
+/// There was once a leading offset here -- four datums for a 4-byte input, eight
+/// for a 2-byte one -- with as many dropped from the end, recorded as divergence
+/// row 35. It was the unpacker reading our tile header as datums, because
+/// `REG3_Base_address` pointed one unit early (`datapath::tile_base_units`).
+fn assert_landed(dst: &[u32], expect: impl Fn(usize) -> u32) {
+    for (i, &got) in dst.iter().enumerate().take(N) {
         assert_eq!(
             got,
             expect(i),
-            "staged datum {i} should be at Src flat {} (row {}, col {}); got {got:08x}",
-            hidden + i,
-            (hidden + i) / ROW,
-            (hidden + i) % ROW,
+            "staged datum {i} should be at Src flat {i} (row {}, col {}); got {got:08x}",
+            i / ROW,
+            i % ROW,
         );
     }
 }
@@ -259,9 +234,9 @@ fn fp32_unpacks_into_srca_as_truncated_tf32() {
     let program = src_program(Unpacker::SrcA, FP32_CODE, TF32_CODE, true);
     harness::in_device(|dev| {
         let dst = run_src(dev, &staged, &program);
-        assert_landed(&dst, 4, |i| fp32_to_tf32(bits[i]));
+        assert_landed(&dst, |i| fp32_to_tf32(bits[i]));
         // And the truncation is real: the staged bits differ from what landed.
-        assert_ne!(dst[hidden_datums(4)], bits[0]);
+        assert_ne!(dst[0], bits[0]);
     });
 }
 
@@ -272,7 +247,7 @@ fn fp32_unpacks_into_srcb_as_truncated_tf32() {
     let program = src_program(Unpacker::SrcB, FP32_CODE, TF32_CODE, true);
     harness::in_device(|dev| {
         let dst = run_src(dev, &staged, &program);
-        assert_landed(&dst, 4, |i| fp32_to_tf32(bits[i]));
+        assert_landed(&dst, |i| fp32_to_tf32(bits[i]));
     });
 }
 
@@ -286,7 +261,7 @@ fn fp32_unpacks_into_src_as_truncated_bf16() {
         let program = src_program(unpacker, FP32_CODE, BF16_CODE, true);
         harness::in_device(|dev| {
             let dst = run_src(dev, &staged, &program);
-            assert_landed(&dst, 4, |i| bf16_to_fp32(fp32_to_bf16_truncate(bits[i])));
+            assert_landed(&dst, |i| bf16_to_fp32(fp32_to_bf16_truncate(bits[i])));
         });
     }
 }
@@ -304,7 +279,7 @@ fn bf16_in_l1_unpacks_into_src_unchanged() {
         let program = src_program(unpacker, BF16_CODE, BF16_CODE, true);
         harness::in_device(|dev| {
             let dst = run_src(dev, &staged, &program);
-            assert_landed(&dst, 2, |i| bf16_to_fp32(halves[i] as u16));
+            assert_landed(&dst, |i| bf16_to_fp32(halves[i] as u16));
         });
     }
 }
@@ -365,26 +340,7 @@ fn a_corrupted_datum_moves_exactly_one_src_element() {
     let a = dump(&bits);
     let b = dump(&corrupted);
     let differ: Vec<usize> = (0..a.len()).filter(|&f| a[f] != b[f]).collect();
-    assert_eq!(differ, vec![hidden_datums(4) + 7]);
-}
-
-/// The specification's answer, which ttsim contradicts (row 35): with `UnpackToDst`
-/// clear, `Dest_cntx0` *replaces* `OutAddr`, so the first datum lands at column 0
-/// and all `N` land. A failure here says the hidden base is real hardware, not a
-/// simulator artefact -- a finding either way, and it decides whether the
-/// correction in `assert_landed` survives past the simulator.
-#[test]
-#[cfg(feature = "silicon")]
-fn on_silicon_srca_has_no_hidden_base() {
-    let bits = operand_bits();
-    let staged = stage(L1Format::Fp32, FP32_CODE, &bits);
-    let program = src_program(Unpacker::SrcA, FP32_CODE, TF32_CODE, true);
-    harness::in_device(|dev| {
-        let dst = run_src(dev, &staged, &program);
-        for (i, b) in bits.iter().enumerate() {
-            assert_eq!(dst[i], fp32_to_tf32(*b), "datum {i}");
-        }
-    });
+    assert_eq!(differ, vec![7]);
 }
 
 /// `MOVB2D.md` says `Move4Rows` moves four rows; ttsim moves one, silently (row
