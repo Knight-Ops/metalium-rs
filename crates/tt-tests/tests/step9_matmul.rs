@@ -12,9 +12,10 @@
 //!
 //! # Where the operands sit, and why
 //!
-//! Each operand is staged behind zero rows so that it lands at the row the RWCs
-//! point `MVMUL` at. `SrcA` goes at row 16 rather than 8 because ttsim refuses
-//! `src_a_row=8` (row 41), which `MVMUL.md`'s `& 0x38` allows.
+//! At row 0 of each `Src`, where the RWCs point `MVMUL` (`tt_tests::matmul`).
+//! They once sat at `SrcA` row 16 and `SrcB` row 8, behind staged zero rows --
+//! a leftover of the tile-header off-by-one (divergence rows 30 and 35) that
+//! row 0 on both targets retired.
 
 use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::cfg::generated::thread;

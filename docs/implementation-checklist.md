@@ -34,7 +34,7 @@ gate you have not seen reject something is not yet evidence.
 | 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
-| 6 — Matmul | `[~]` | One-block `MVMUL` gates pass on **silicon, both cards**, split across threads as LLK does; face, tile and multi-tile open |
+| 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores. Multi-phase fidelity at tile level not yet exercised |
 | 7 — Burn backend, training | `[ ]` | The milestone |
 | 8 — Multi-chip | `[ ]` | Spike first, then re-estimate |
 | 9 — Performance | `[ ]` | Silicon-only |
@@ -646,8 +646,11 @@ specification does not make.
 
 ### Open, and deliberately so
 
-- [ ] **Which `Z` plane is which face of a tile is a convention, not a
-      specification.** The address generator fixes the *order* datums are visited;
+- [x] **Which `Z` plane is which face of a tile is a convention, not a
+      specification.** *Settled by the tile matmul:* the unpacker takes face `z` as
+      the `z`-th `XDim * YDim` datums (its ADC `Z`), `tt_layout` puts face
+      `(z / 2, z % 2)` there, and the product is right on both targets and wrong
+      with the faces transposed. Row-major faces of row-major datums, as LLK. The address generator fixes the *order* datums are visited;
       nothing says which 2-D patch a `Z` plane corresponds to.
       `Layout::tt_metal_32x32` picks row-major faces of row-major datums, and
       `placement.rs` **pins** that choice with a test whose failure means the
@@ -780,20 +783,51 @@ undocumented.
       without the semaphore the pack races the math (0/128 right) on both targets
       -- which silicon showed only after the release was made simultaneous
       (divergence row 53).
-- [ ] Single 16×16 face → 32×32 tile → blocked → multi-tile. The tile step settles
-      the Phase 4 "which `Z` plane is which face" convention.
+- [x] **One 32×32 tile**, from `tt_layout` tile images to `tt_layout` de-tiling,
+      on ttsim and both cards (`step10_matmul_tile::a_32x32_tile_matmul_matches_the_model_and_burn`):
+      every datum equals `numerics::matmul_tile_reference` (face-composed
+      `mvmul_reference`) and `burn-flex`, which agree first; transpose control.
+      `matmul::tile_roles`: faces selected by the unpack thread's ADC `Z`
+      (`SETADCZW`, one of the eight backlog ADC instructions -- now exercised on
+      both targets) with `X` over all 256 datums; in0 -> `SrcB`, in1 -> `SrcA` as
+      LLK; 16 unpack pairs and 32 `MVMUL`s per tile, `SETRWC` choosing the `SrcB`
+      half; 64 `Dst` rows packed in 16 `PACR`s. Watched failing with `B`'s faces
+      transposed and with the `Z` select removed. Operands now sit at `Src` row 0:
+      the row-16/row-8 placement and its staged zero rows were a leftover of the
+      header off-by-one, and row 0 passes on both targets.
+- [x] **BF16 `Src`**, both routes (FP32 in L1 converted, BF16 in L1 as is), same
+      tile, both targets (`a_32x32_tile_matmul_through_bf16_src`). The operands are
+      exact in BF16, so this shows the routes work end to end, not that the
+      conversion truncates; the truncation itself is `probe_src`'s gate.
+- [x] **Multi-tile**, ttsim and both cards: `K` depth 2 and 4 (the unpacker
+      re-pointed at each pair's images with `WRCFG` of both `REG3_Base_address`
+      words between pairs, drained before and `CONFIG_BUSY`-waited after), `M`×`N`
+      output tiles (2×3), and padded shapes (`[13,47]@[47,29]`, `[1,64]@[64,96]`)
+      through `tt_layout`'s zero padding and cropping. `matmul::matmul_roles`:
+      one output tile in `Dst` at a time, `DST_FREE` (pack -> math, starts at 1)
+      guarding the `ZEROACC` and `DST_READY` (math -> pack) the `PACR`s; both
+      semaphores end where they started. `pack_rows` now resets the packer's ADC Y
+      first. Watched failing three ways: no re-pointing (K depth wrong), no
+      `DST_FREE` wait (output tile 0 packed as zeros), no Y reset (tile 1 packed
+      from the wrong rows).
 - [ ] Budget a standing percentage of the phase for empirical discovery rather
       than implementation. *(Borne out: six of the eight new divergence rows were
       found while building the first block.)*
 - [x] Do unpacker/packer bring-up **entirely in the simulator** — every refusal so
       far has been a specification question, answered and logged before moving on.
-- [ ] **Gate (sim):** matches **`burn-flex`** (not `burn-ndarray`, which is
-      deprecated) across shapes, dtypes, fidelity phases, accumulation depths. One
-      block, TF32, all phases, depth 2: done. Shapes, BF16 and depth: open.
-- [ ] **Gate (silicon):** same suite. Expect divergence here more than anywhere
-      else — this is where Wormhole-sourced assumptions will be wrong. Silicon twins
-      written for the two ttsim artefacts the gates corrected for (the hidden base,
-      `MOVB2D` `Move4Rows`); both turned out to be our bugs, not ttsim's.
+- [x] **Gate (sim):** `step10_matmul_tile::a_shape_format_and_depth_sweep` --
+      four shapes (depth one to three tiles, three of them padded) by three `Src`
+      routes (FP32->TF32, FP32->BF16, BF16->BF16), each bit-exact against the
+      integer product; `burn-flex` checks the pairing on the single tile. Fidelity
+      phases are gated per block (`step9_matmul`, all four through
+      `FIDELITY_BASE` and through the RWC); the tile path runs phase 0 on operands
+      phase 0 represents exactly, so multi-phase *tiles* are not yet exercised.
+      Noted rather than ticked separately: nothing a Burn backend needs first
+      depends on it.
+- [x] **Gate (silicon):** the same suite, unreduced, passes on both cards --
+      18/18 in `step10_matmul_tile` per card, with no divergence from ttsim. The
+      one silicon-only finding on the way was the harness's (row 53): cores
+      released one by one ran in sequence.
 
 ---
 

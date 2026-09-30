@@ -15,6 +15,7 @@ use tt_isa::isa::Instruction;
 use tt_isa::matrix::Banks;
 use tt_isa::numerics::mvmul_reference;
 use tt_isa::sync::{self, Semaphore, Unit};
+use tt_isa::tile::L1Format;
 use tt_tests::datapath::{self, config_program, pack_config, set_adc_x, Unpacker, OUT, STAGE};
 use tt_tests::harness::{self, Roles, Run, SemaphoreInit};
 use tt_tests::matmul::{self, stage_operand, ROW, SRC_A_ROW, SRC_B_ROW, TF32_CODE};
@@ -286,4 +287,243 @@ fn without_the_semaphore_the_pack_races_the_math() {
         right < 8 * ROW,
         "the pack must race the math without the semaphore, or the gate above proves nothing"
     );
+}
+
+// --- One 32x32 tile -----------------------------------------------------------
+
+type Tile = [[f32; 32]; 32];
+
+fn tile_operands(seed: u64) -> (Tile, Tile) {
+    // `A` becomes `SrcB` and keeps seven significant bits in phase 0, `B`
+    // becomes `SrcA` and keeps five: `|A| <= 127`, `|B| <= 31` lose nothing,
+    // and 32-term sums stay far under 2^24.
+    let mut rng = Lcg(seed);
+    let mut a = [[0f32; 32]; 32];
+    let mut b = [[0f32; 32]; 32];
+    a.iter_mut().flatten().for_each(|v| *v = rng.int(127));
+    b.iter_mut().flatten().for_each(|v| *v = rng.int(31));
+    (a, b)
+}
+
+fn flat(m: &Tile) -> Vec<f32> {
+    m.iter().flatten().copied().collect()
+}
+
+/// `C = A @ B` for 32x32 tiles staged by `tt_layout` in `in_fmt`, converted to
+/// `out_fmt` in `Src`, through [`matmul::tile_roles`], de-tiled on the host.
+fn run_tile(a: &Tile, b: &Tile, in_fmt: L1Format, out_fmt: u32) -> Vec<f32> {
+    let (ta, _) = matmul::tilize_f32(&flat(a), 32, 32, in_fmt);
+    let (tb, _) = matmul::tilize_f32(&flat(b), 32, 32, in_fmt);
+    const A_AT: u64 = STAGE;
+    const B_AT: u64 = STAGE + 0x2000;
+    let [unpack, math, pack] = matmul::tile_roles(&[(A_AT, B_AT)], in_fmt, out_fmt, OUT);
+    let path = std::env::temp_dir().join(format!(
+        "tttile-{}-{:?}.bin",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    harness::in_device(|dev| {
+        let out = harness::run(
+            dev,
+            &Run::roles(Roles {
+                unpack: &unpack,
+                math: &math,
+                pack: &pack,
+            })
+            .concurrent(&matmul::TILE_SEMAPHORES)
+            .stage(&[(A_AT, &ta), (B_AT, &tb)])
+            .dump_rows(0)
+            .read_back(&[(OUT, 1024 * 4)]),
+        );
+        std::fs::write(&path, &out.l1[0]).unwrap();
+    });
+    let packed = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    matmul::detilize_packed(&packed, 32, 32)
+}
+
+/// A whole 32x32 tile, from `tt_layout`'s tile images to `tt_layout`'s
+/// de-tiling: every datum matches the face-composed model and Burn, which must
+/// agree with each other first.
+///
+/// This is also where the `Z`-plane-to-face convention stops being a choice:
+/// the unpacker takes face `z` as the `z`-th 256 datums of the image (its `Z`
+/// ADC, `UNPACR_Regular.md:182`), and `tt_layout` puts face `(z / 2, z % 2)`
+/// there. If either were transposed the product would be `A @ B` with two of
+/// its quadrants exchanged, which the transpose control below and the
+/// quadrant-distinct operands both rule out.
+#[test]
+fn a_32x32_tile_matmul_matches_the_model_and_burn() {
+    use burn_tensor::{Tensor, TensorData};
+    type B = burn_flex::Flex;
+    let device = burn_flex::FlexDevice;
+
+    let (a, b) = tile_operands(0x7117);
+    let model = tt_isa::numerics::matmul_tile_reference(&[[0f32; 32]; 32], &a, &b, &[0])
+        .expect("small integers are exact");
+    let ta = Tensor::<B, 2>::from_data(TensorData::new(flat(&a), [32, 32]), &device);
+    let tb = Tensor::<B, 2>::from_data(TensorData::new(flat(&b), [32, 32]), &device);
+    let burn: Vec<f32> = ta.clone().matmul(tb.clone()).into_data().to_vec().unwrap();
+    assert_eq!(flat(&model), burn, "the model and Burn must agree first");
+
+    let got = run_tile(&a, &b, L1Format::Fp32, TF32_CODE);
+    for (k, (g, w)) in got.iter().zip(&burn).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "C[{}][{}] is {g}, want {w}",
+            k / 32,
+            k % 32
+        );
+    }
+    // Control: the gate distinguishes `A @ B` from `A @ B^T`.
+    let transposed: Vec<f32> = ta.matmul(tb.transpose()).into_data().to_vec().unwrap();
+    assert!(got.iter().zip(&transposed).any(|(g, t)| g != t));
+}
+
+/// The same tile through BF16 `Src`, by both routes into it (divergence row
+/// H): FP32 in L1 converted by the unpacker, and BF16 in L1 unconverted. The
+/// operands are small integers, exact in BF16, so the answer is the TF32
+/// one's, bit for bit; the Matrix Unit reads BF16 `Src` with the BF16 style
+/// (`MVMUL.md`), and phase 0 keeps as many bits of each as TF32 does.
+#[test]
+fn a_32x32_tile_matmul_through_bf16_src() {
+    let (a, b) = tile_operands(0xbf16);
+    let model = tt_isa::numerics::matmul_tile_reference(&[[0f32; 32]; 32], &a, &b, &[0])
+        .expect("small integers are exact");
+    for (what, in_fmt) in [
+        ("FP32 in L1", L1Format::Fp32),
+        ("BF16 in L1", L1Format::Bf16),
+    ] {
+        let got = run_tile(&a, &b, in_fmt, matmul::BF16_CODE);
+        for (k, (g, w)) in got.iter().zip(flat(&model).iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "{what}: C[{}][{}] is {g}, want {w}",
+                k / 32,
+                k % 32
+            );
+        }
+    }
+}
+
+// --- Multi-tile ----------------------------------------------------------------
+
+/// `C = A @ B` on the device for row-major `a` (`m` x `k`) and `b` (`k` x `n`),
+/// through `tt_layout`'s padding, [`matmul::matmul_roles`] and de-tiling.
+fn device_matmul(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    in_fmt: L1Format,
+    out_fmt: u32,
+) -> Vec<f32> {
+    let staged = matmul::stage_matmul(a, b, m, k, n, in_fmt);
+    let [unpack, math, pack] = matmul::matmul_roles(&staged.outputs, in_fmt, out_fmt);
+    let path = std::env::temp_dir().join(format!(
+        "ttmm-{}-{:?}.bin",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    harness::in_device(|dev| {
+        let out = harness::run(
+            dev,
+            &Run::roles(Roles {
+                unpack: &unpack,
+                math: &math,
+                pack: &pack,
+            })
+            .concurrent(&matmul::TILE_SEMAPHORES)
+            .stage(&[(matmul::MATMUL_STAGE, &staged.a), (staged.b_at, &staged.b)])
+            .dump_rows(0)
+            .read_back(&[(matmul::MATMUL_OUT, staged.out_bytes())]),
+        );
+        std::fs::write(&path, &out.l1[0]).unwrap();
+    });
+    let packed = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    matmul::detilize_packed(&packed, staged.m, staged.n)
+}
+
+/// Small integers, `|A| <= 127` and `|B| <= 31` as for one tile: every
+/// product and every sum up to `k = 128` is an exact FP32 integer, so the
+/// device must match the integer product bit for bit, in any order.
+fn int_matrix(rng: &mut Lcg, rows: usize, cols: usize, bound: i32) -> Vec<f32> {
+    (0..rows * cols).map(|_| rng.int(bound)).collect()
+}
+
+fn exact_product(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let s: i64 = (0..k)
+                .map(|kk| a[i * k + kk] as i64 * b[kk * n + j] as i64)
+                .sum();
+            assert!(s.unsigned_abs() < 1 << 24, "the product must stay exact");
+            c[i * n + j] = s as f32;
+        }
+    }
+    c
+}
+
+fn assert_matmul(m: usize, k: usize, n: usize, in_fmt: L1Format, out_fmt: u32, seed: u64) {
+    let mut rng = Lcg(seed);
+    let a = int_matrix(&mut rng, m, k, 127);
+    let b = int_matrix(&mut rng, k, n, 31);
+    let want = exact_product(&a, &b, m, k, n);
+    let got = device_matmul(&a, &b, m, k, n, in_fmt, out_fmt);
+    assert_eq!(got.len(), m * n);
+    for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "[{m}x{k}] @ [{k}x{n}] {in_fmt:?}: C[{}][{}] is {g}, want {w}",
+            idx / n,
+            idx % n
+        );
+    }
+}
+
+/// `K` depth: one output tile accumulating two and four tile pairs, the
+/// unpacker re-pointed at each pair's images between them and `Dst` never
+/// cleared in between.
+#[test]
+fn k_depth_accumulates_across_tiles() {
+    assert_matmul(32, 64, 32, L1Format::Fp32, TF32_CODE, 1);
+    assert_matmul(32, 128, 32, L1Format::Fp32, TF32_CODE, 2);
+}
+
+/// `M` x `N` output tiles, each cleared only once the packer has finished the
+/// last (`matmul::DST_FREE`) and packed to its own place.
+#[test]
+fn m_by_n_output_tiles() {
+    assert_matmul(64, 32, 96, L1Format::Fp32, TF32_CODE, 3);
+}
+
+/// Shapes that are not multiples of the tile, padded with zeros by `tt_layout`
+/// on the way in and cropped on the way out.
+#[test]
+fn awkward_shapes_are_padded_and_cropped() {
+    assert_matmul(13, 47, 29, L1Format::Fp32, TF32_CODE, 4);
+    assert_matmul(1, 64, 96, L1Format::Fp32, TF32_CODE, 5);
+}
+
+/// The sweep: shapes, both `Src` formats by both routes, depths one to three,
+/// against the exact product. Deterministic; the simulator gate.
+#[test]
+fn a_shape_format_and_depth_sweep() {
+    let shapes = [(32, 32, 32), (40, 70, 33), (64, 96, 32), (17, 32, 64)];
+    let formats = [
+        (L1Format::Fp32, TF32_CODE),
+        (L1Format::Fp32, matmul::BF16_CODE),
+        (L1Format::Bf16, matmul::BF16_CODE),
+    ];
+    for (s, &(m, k, n)) in shapes.iter().enumerate() {
+        for (f, &(in_fmt, out_fmt)) in formats.iter().enumerate() {
+            assert_matmul(m, k, n, in_fmt, out_fmt, 100 + (s * 3 + f) as u64);
+        }
+    }
 }

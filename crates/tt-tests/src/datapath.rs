@@ -443,6 +443,13 @@ pub fn pack_rows(rows: u32) -> Vec<Instruction> {
         thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0),
         thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4),
         set_adc_x_pack(0, 15),
+        // From row 0, whatever an earlier `pack_rows` on this thread left Y at.
+        encode::Setadcxy::ZERO
+            .pk(1)
+            .y0(1)
+            .y0_val(0)
+            .encode()
+            .unwrap(),
     ];
     for g in 0..groups {
         let last = g + 1 == groups;
