@@ -243,9 +243,10 @@ pub enum RunError {
         reason: tt_isa::frontend::mop::MopError,
     },
     /// The tile's reset never finished: these roles' threads take no
-    /// instruction even after the backend pulse and every semaphore released.
-    /// Nothing the host can do from software clears it; a board reset does
-    /// (`docs/hardware-coverage.md`, "Hazards and known bugs").
+    /// instruction even after the backend pulse, every semaphore released and
+    /// their `Src` banks fed (`session::unwedge_tile`). What else holds them is
+    /// unknown; a board reset clears it (`docs/hardware-coverage.md`, "Hazards
+    /// and known bugs").
     Wedged {
         tile: (u8, u8),
         roles: Vec<Core>,
@@ -289,8 +290,10 @@ impl std::fmt::Display for RunError {
                 write!(
                     f,
                     "tile ({x},{y}) is wedged: {} took no instruction after the reset \
-                     released every semaphore. Software cannot clear this; reset the \
-                     board (`tt-smi -r`, or a power cycle), or choose another tile",
+                     released every semaphore, nor after its `Src` banks were fed (on \
+                     silicon; ttsim cannot finish that recovery). Software could not \
+                     clear it; reset the board (`tt-smi -r`, or a power cycle), or \
+                     choose another tile",
                     names.join(", ")
                 )
             }

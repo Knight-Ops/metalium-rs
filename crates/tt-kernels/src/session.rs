@@ -228,20 +228,65 @@ pub fn reset_thread_state<T: Transport>(
     // The reset program is a few hundred instructions on an idle tile: a role
     // that does not finish it is blocked on state a failed run left behind,
     // and no host access gets it moving again (the hazard table).
-    match runtime::run(dev, tile, images, &kernel, RESET_BUDGET) {
-        Ok(_) => Ok(()),
-        Err(RunError::Roles(stuck))
+    runtime::run(dev, tile, images, &kernel, RESET_BUDGET)
+        .map(|_| ())
+        .map_err(|e| wedged_if_stuck(e, tile))
+}
+
+/// Roles that all timed out are a wedged tile ([`RunError::Wedged`]).
+fn wedged_if_stuck(e: RunError, tile: NocCoord<Noc0>) -> RunError {
+    match e {
+        RunError::Roles(stuck)
             if stuck
                 .iter()
                 .all(|(_, _, e)| matches!(e, WaitError::TimedOut { .. })) =>
         {
-            Err(RunError::Wedged {
+            RunError::Wedged {
                 tile: (tile.x(), tile.y()),
                 roles: stuck.into_iter().map(|(_, core, _)| core).collect(),
-            })
+            }
         }
-        Err(e) => Err(e),
+        e => e,
     }
+}
+
+/// The per-thread reset, then the roles started resident: what a tile needs
+/// after the backend pulse. A tile that does not come back is
+/// [`RunError::Wedged`].
+pub fn restart_roles<T: Transport>(
+    dev: &mut Device<T>,
+    tile: NocCoord<Noc0>,
+    images: &RoleImages<'_>,
+) -> Result<Resident<Noc0>, RunError> {
+    reset_thread_state(dev, tile, images)?;
+    Resident::start(dev, tile, images, RESET_BUDGET).map_err(|e| wedged_if_stuck(e, tile))
+}
+
+/// Release a thread stuck on a Matrix Unit instruction starved of `Src` (X5b):
+/// such an instruction waits for its banks by itself, and the backend pulse
+/// hands them all to the unpackers, so it outlives the pulse and its thread
+/// takes nothing more. Thread 0 runs [`datapath::src_feeder`] -- four plain
+/// `UNPACR`s, one into each bank of each `Src` -- which gives the instruction
+/// its banks; then the pulse again, which takes them back. Returns whether the
+/// feeding run finished: the stuck thread, if it was one, ran on.
+pub fn unwedge_tile<T: Transport>(
+    dev: &mut Device<T>,
+    tile: NocCoord<Noc0>,
+    images: &RoleImages<'_>,
+) -> Result<bool, RunError> {
+    reset_tile(dev, tile)?;
+    let feeder = datapath::src_feeder();
+    let nothing = Vec::new();
+    // In order: the feeding thread first, then the others with nothing to run
+    // -- each finishes only once the instruction ahead of it in its thread has.
+    let kernel = Kernel {
+        dump_rows: 0,
+        unwedge: true,
+        ..Kernel::new([&feeder, &nothing, &nothing], Schedule::InOrder)
+    };
+    let fed = runtime::run(dev, tile, images, &kernel, RESET_BUDGET).is_ok();
+    reset_tile(dev, tile)?;
+    Ok(fed)
 }
 
 /// `A[m,k] @ B[k,n]`, row-major, on `tile`, in as many runs as it takes
@@ -699,8 +744,29 @@ impl<T: Transport> Session<T> {
             r.stop(dev, images)?;
         }
         reset_tile(dev, unit.tile)?;
-        reset_thread_state(dev, unit.tile, images)?;
-        let mut r = Resident::start(dev, unit.tile, images, RESET_BUDGET)?;
+        let mut r = match restart_roles(dev, unit.tile, images) {
+            // ttsim has no backend pulse (divergence row 16), the half of the
+            // recovery that takes the fed banks back: there the tile would
+            // compute from them, wrongly. It stays an error.
+            Err(e @ RunError::Wedged { .. }) if dev.transport().is_simulated() => return Err(e),
+            Err(RunError::Wedged { .. }) => {
+                let (x, y) = (unit.tile.x(), unit.tile.y());
+                let fed = unwedge_tile(dev, unit.tile, images)?;
+                let again = restart_roles(dev, unit.tile, images);
+                eprintln!(
+                    "session: tile ({x},{y}) was wedged; fed its `Src` banks (the feeding run \
+                     {}): {}",
+                    if fed { "finished" } else { "did not finish" },
+                    if again.is_ok() {
+                        "recovered"
+                    } else {
+                        "still wedged"
+                    }
+                );
+                again?
+            }
+            other => other?,
+        };
         if self.profiling.is_some() {
             // What the stream held since the last drain belonged to the run
             // that failed; the profile goes on from an empty one.

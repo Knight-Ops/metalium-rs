@@ -18,7 +18,13 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01, after 10.0)
+## Where things stand (2026-10-01, after 10.1)
+
+10.1 added, on top of the table below: reciprocal, division, `exp` and `log` on the SFPU
+(S3, S4a), lane movement (S8), `sum` and `max` over either dim (R1a), softmax and
+log-softmax on the device (R2); the matmul's loops replayed and the MOP Expander gated
+(X1, X2); the movers' queues, barriers, batching and traces (X4); and wedged tiles
+detected and recovered (X5). The table is 10.0's.
 
 Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
 
@@ -47,7 +53,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X2, X4a-d, X5a; X5b, then the close |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -431,7 +437,7 @@ reverse index.
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
       after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes
       per step down to the descriptors.
-- [~] **X5 Wedged tiles: detect, then recover** (the hazard table's open wedge row).
+- [x] **X5 Wedged tiles: detect, then recover** (the hazard table's open wedge row).
   - [x] **X5a Detect at open, never fail opaquely.** A role that does not finish the
         tile reset (`session::reset_thread_state`, a few hundred instructions on an
         idle tile) is `RunError::Wedged { tile, roles }`, whose message names the tile
@@ -442,13 +448,33 @@ reverse index.
         listing the wedged tiles. Unit tests: the selection (a wedged tile passed over,
         the search stopping once enough are found) and both messages. The signature it
         keys on, every stuck role a timeout, is the one the wedged tile (1,2) gave on
-        both cards; no wedged tile exists to re-run it on since the boards were reset,
-        and none can be made safely on purpose.
-  - [ ] **X5b Recover in software.** Find what thread 1 is blocked on (the leading guess,
-        a math instruction waiting for `Src` banks, is unconfirmed) and release it --
-        only with encodings first confirmed on ttsim and in an isolated gate on a
-        healthy tile: the one attempt, an `UNVERIFIED` `UNPACR_NOP_SETDVALID` on the
-        wedged tile, took the host down.
+        both cards -- and the deliberate wedge of X5b gives again.
+  - [x] **X5b Recover in software.** The cause, from the specification and then
+        reproduced: a Matrix Unit instruction that reads `Src` waits by itself until its
+        bank's `AllowedClient` is the Matrix Unit (`STALLWAIT.md`, C7/C8), and the
+        backend pulse hands every bank to the unpackers (`SoftReset.md`, bits 15-16). One
+        caught waiting by the pulse waits for good, and its thread takes nothing more --
+        an unpacker caught waiting the other way is released by the same pulse, which is
+        why only thread 1 stayed stuck. The recovery (`session::unwedge_tile`): the
+        pulse, then `datapath::src_feeder` on thread 0 -- four plain `UNPACR`s, the
+        matmul's own encoding, one into each bank of each `Src`, none of which can wait
+        on a freshly pulsed tile -- which gives the stuck instruction its banks, then
+        the pulse again to take them back. `prepare_unit` tries it once when the
+        thread reset or the roles' restart comes back `Wedged`, logs the outcome, and
+        reports `Wedged` (message updated) if the tile is still stuck. No `UNVERIFIED`
+        encoding anywhere. Gate `step41_unwedge`: a math role of one `MVMUL` with
+        nothing to feed it (verified encodings only) wedges tile (2,3) through the pulse
+        and thread reset -- `Wedged` is asserted, so the gate is not vacuous -- the
+        feeding run finishes, the roles restart, and a matmul is bit for bit the one
+        before; the session does the same by itself after a failed kernel; and the
+        recovery on a healthy tile leaves it healthy, the isolated gate run first.
+        Watched failing with an empty feeder ("the feeding run did not finish"). ttsim:
+        the wedge and the release by the feeder; it has no pulse to take the banks back
+        (row 69), so there the session reports `Wedged` instead of computing from
+        them. Silicon: both cards, four runs each. The wedge that started this (tile
+        (1,2), from programs overwritten under a queued list) is gone with the boards'
+        reset and prevented since X4c; another cause the feeder does not release still
+        ends in `Wedged` and a board reset.
 
 ### Performance follow-ups (measured, not yet scheduled)
 
@@ -886,7 +912,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
 | A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
-| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevented (X4c), detected at open (X5a); recovery X5b |
+| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.

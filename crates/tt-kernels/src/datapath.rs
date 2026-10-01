@@ -517,6 +517,43 @@ pub fn release_semaphores() -> Vec<Instruction> {
         .collect()
 }
 
+/// Hand both banks of `SrcA` and of `SrcB` to the Matrix Unit, by four plain
+/// `UNPACR`s (the matmul's own encoding, `unpack_src_instruction`) of whatever
+/// is at [`STAGE`]: the wedged-tile recovery (`session::unwedge_tile`, X5b).
+///
+/// A Matrix Unit instruction that reads `Src` waits, by itself, until its bank's
+/// `AllowedClient` is the Matrix Unit (`STALLWAIT.md`, C7/C8), and the backend
+/// pulse hands every bank back to the unpackers (`SoftReset.md`, bits 15-16):
+/// one caught waiting by the pulse waits for good, and its thread takes nothing
+/// more. These unpacks give it its banks. Two per unpacker, one into each bank:
+/// the pulse leaves both banks the unpackers' and each unpacker on bank 0, so
+/// none of them waits, whatever the stuck thread does with what it is given.
+/// What lands in `Src` is not data anyone reads. The pulse after it gives the
+/// banks back.
+pub fn src_feeder() -> Vec<Instruction> {
+    const DATUMS: u32 = 16;
+    let descriptor = flat_descriptor(DATUMS);
+    let tf32 = L1Format::Tf32.code().expect("TF32 has a code");
+    let mut p = src_thread_config();
+    let mut words = ConfigWords::new();
+    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, STAGE, tf32);
+    unpack_src_config(&mut words, Unpacker::SrcB, descriptor, STAGE, tf32);
+    let mut buf = [Instruction::new(0, &defs::NOP); 96];
+    let n = words
+        .program(SCRATCH_GPR, &mut buf)
+        .expect("two unpackers' configuration fits");
+    p.extend_from_slice(&buf[..n]);
+    for u in [Unpacker::SrcA, Unpacker::SrcB] {
+        for _bank in 0..2 {
+            p.push(set_adc_x(u, 0, DATUMS - 1));
+            p.push(unpack_src_instruction(u, true));
+        }
+    }
+    p.push(tt_isa::backend::wait_for_unpacker0(tt_isa::backend::Before::EVERYTHING).unwrap());
+    p.push(tt_isa::backend::wait_for_unpacker1(tt_isa::backend::Before::EVERYTHING).unwrap());
+    p
+}
+
 /// Put the tile's configuration and the issuing thread's own Tensix state back to
 /// what ttsim starts with: `Config` below the global block zero, every
 /// `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.
