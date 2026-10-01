@@ -261,10 +261,35 @@ reverse index.
           the same counted sum, and the lowered is under a quarter of the words
           (watched failing: one `MOP` dropped, short by exactly its five
           iterations). ttsim and both cards: a `MOP` looping a `REPLAY` on silicon.
-    - [ ] **The matmul in loops**: every tile pair's block identical and short
-          enough to replay -- faces stepped by the unpacker's own Z increment in an
-          order that keeps each output face's accumulation, tiles by the ADC's W
-          instead of a base-address rewrite per pair.
+    - [~] **The matmul in loops** (`matmul::matmul_items`, lowered by
+          `loops::lower_with`):
+      - [x] Faces in the order `fi`, `k`, `fj`: each `Dst` face still takes its
+            `k = 0` product before its `k = 1` within a pair, so every datum
+            accumulates as before -- the MNIST golden is bit for bit -- and each `A`
+            face is unpacked once for the two `MVMUL` groups that read it
+            (`mvmul_release_a`, then `_both`). The unpackers' `X` range is set once.
+            A pair's face block is the same words for every pair: 24 on the unpack
+            role, 32 on the math role at LoFi.
+      - [x] Tiles stepped by GPR arithmetic where the pairs are evenly spaced (the
+            gather's layout): each operand's base and stride in GPRs 24-27, and per
+            pair the same eight words -- wait, `ADDDMAREG` base += stride, `WRCFG`
+            both -- so each output's K loop is one `Repeat` of the face block and the
+            step, 32 words, replayed (`gpr_step`; uneven pairs keep the explicit
+            retarget and share the face block). `ADDDMAREG` gated alone first
+            (`step38_gpr_add`, both forms on silicon, the register form on ttsim --
+            row 67 -- and now `CONFIRMED`). A body already in the buffer is replayed
+            by the next output without recording it again.
+      - [x] Measured (row AC): a 1x8x1 tile's unpack 514 -> 116 words, LoFi math
+            269 -> 53; MNIST inference 0.61 -> 0.53 ms a batch. Full suite 430/430.
+      - [ ] HiFi4 math: its 80-word block (eight `MVMUL` groups whose `Dst` rows
+            and flips differ) does not fit the buffer, so it is written out, and at
+            653 words for a 1x8x1 tile it is now every HiFi4 kernel's pace (MNIST
+            trains at HiFi4: 2.1 ms a step on one tile, unchanged). The `Dst` rows
+            stepped by address modifiers instead, so the groups are one body.
+      - [ ] The MOP carried to the roles: `Step::Kernel` and the session's lists
+            take each role's `MopConfig` (a list's kernels share one descriptor, so
+            a list splits where it changes); then the K loops run under the `MOP`,
+            two words for up to 32 pairs.
 - [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
       mover brackets each list and each top-level entry or record with timestamper events
       when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,

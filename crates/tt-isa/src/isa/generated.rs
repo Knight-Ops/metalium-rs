@@ -9,9 +9,9 @@
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 24 superseded on Blackhole, 64 Wormhole-only and therefore
+//! to be identical, 24 superseded on Blackhole, 63 Wormhole-only and therefore
 //! **`UNVERIFIED`**, 13 **`MEASURED`** against ttsim where the specification
-//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 2
+//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 3
 //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate
 //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).
 //!
@@ -996,7 +996,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/DMANOP.md",
     );
 
-    /// `ADDDMAREG`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `ADDDMAREG`. **`CONFIRMED`** on Blackhole, ttsim and silicon, by `crates/tt-tests/tests/step38_gpr_add.rs::adddmareg_adds_two_registers`: the layout of `WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md` (a Wormhole page; Blackhole has none), every field exercised.
     pub static ADDDMAREG: InstructionDef = InstructionDef::new(
         "ADDDMAREG",
         "ADDDMAREG",
@@ -1008,7 +1008,9 @@ pub mod defs {
         ],
         &[(Field::new("", 23, 1, false, None), 0)],
         0x007c0000,
-        Provenance::WormholeOnly,
+        Provenance::Confirmed {
+            evidence: "crates/tt-tests/tests/step38_gpr_add.rs::adddmareg_adds_two_registers",
+        },
         "WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md",
     );
 

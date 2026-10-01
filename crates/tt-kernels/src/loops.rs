@@ -16,8 +16,8 @@
 //! * a body of at most [`tt_isa::frontend::REPLAY_BUFFER`] instructions, none
 //!   of them a `REPLAY` or `MOP`, is recorded once (executing as it records)
 //!   and replayed: one word for each further iteration;
-//! * the loop that saves the most words beyond that takes the thread's one MOP
-//!   configuration ([`crate::runtime::Kernel::mop`]: one per thread per run):
+//! * the loop that saves the most words beyond that -- and every other loop
+//!   with the same body -- takes the thread's one MOP configuration ([`crate::runtime::Kernel::mop`]: one per thread per run):
 //!   template 0 with `A0` the body's `REPLAY`, the iteration count in the
 //!   `MOP` itself, so two words stand for up to 32 iterations (the mask's
 //!   width; `Count1` reaches 128, but past 32 the expander would read mask
@@ -47,6 +47,14 @@ pub enum Item {
         times: u32,
         body: Vec<Item>,
     },
+    /// A block that recurs, not necessarily back to back -- a matmul's face
+    /// block, once per tile pair, between the pairs' own retargeting: recorded
+    /// where `key` first appears, replayed wherever it appears again. Every
+    /// occurrence of a key must have the same body.
+    Shared {
+        key: u32,
+        body: Vec<Instruction>,
+    },
 }
 
 impl Item {
@@ -62,6 +70,7 @@ impl Item {
                         out.extend_from_slice(&b);
                     }
                 }
+                Item::Shared { body, .. } => out.extend_from_slice(body),
             }
         }
         out
@@ -76,6 +85,8 @@ pub enum LoopForm {
     Mop { times: u32, body: usize, mops: u32 },
     /// Recorded and replayed: one `REPLAY` per further iteration.
     Replayed { times: u32, body: usize },
+    /// A shared block: recorded once, replayed at each of its other `uses`.
+    Shared { key: u32, body: usize, uses: u32 },
     /// Written out.
     Unrolled {
         times: u32,
@@ -96,6 +107,11 @@ pub enum Unrolled {
     BufferInUse,
     /// One iteration or none: nothing to save.
     Once,
+    /// The replay buffer is full: the shared blocks before it, and a loop's
+    /// body beside them, do not fit its 32 slots together.
+    BufferFull,
+    /// A shared block whose body differs from its key's first occurrence.
+    Differs,
 }
 
 /// A lowered role program.
@@ -138,17 +154,44 @@ fn words_mop(times: u32, len: usize) -> usize {
 
 /// Lower `items`: see the module documentation.
 pub fn lower(items: &[Item]) -> Lowered {
+    lower_with(items, true)
+}
+
+/// [`lower`], with or without the MOP: a caller that cannot carry a MOP
+/// configuration to the role's mailbox lowers with `REPLAY` alone.
+pub fn lower_with(items: &[Item], allow_mop: bool) -> Lowered {
+    let has_own = |b: &[Instruction]| b.iter().any(is_expander_insn);
     let own_replay = items.iter().any(|i| match i {
         Item::I(x) => is_expander_insn(x),
-        Item::Repeat { body, .. } => Item::unrolled(body).iter().any(is_expander_insn),
+        Item::Repeat { body, .. } => has_own(&Item::unrolled(body)),
+        Item::Shared { body, .. } => has_own(body),
     });
+    // Shared blocks take slots from the top of the buffer, in order of first
+    // appearance, as long as they fit; loops record from slot 0 below them.
+    let mut shared: Vec<(u32, Vec<Instruction>, Option<u32>)> = Vec::new(); // key, body, slot
+    let mut top = REPLAY_BUFFER as usize;
+    if !own_replay {
+        for it in items {
+            if let Item::Shared { key, body } = it {
+                if shared.iter().any(|(k, ..)| k == key) {
+                    continue;
+                }
+                let slot = (!body.is_empty() && body.len() <= top).then(|| {
+                    top -= body.len();
+                    top as u32
+                });
+                shared.push((*key, body.clone(), slot));
+            }
+        }
+    }
+    let loop_room = top;
     // The loop the MOP configuration saves the most on, if any.
     let mut best: Option<(usize, usize)> = None; // (item index, words saved)
-    if !own_replay {
+    if !own_replay && allow_mop {
         for (k, it) in items.iter().enumerate() {
             if let Item::Repeat { times, body } = it {
                 if let Some(b) = flat_body(body) {
-                    if *times > 1 && b.len() <= REPLAY_BUFFER as usize {
+                    if *times > 1 && b.len() <= loop_room {
                         let saved = words_replayed(*times, b.len())
                             .saturating_sub(words_mop(*times, b.len()));
                         if saved > 0 && best.is_none_or(|(_, s)| saved > s) {
@@ -164,10 +207,52 @@ pub fn lower(items: &[Item]) -> Lowered {
         mop: None,
         loops: Vec::new(),
     };
-    for (k, it) in items.iter().enumerate() {
+    let mut recorded: Vec<u32> = Vec::new();
+    // What the loop region (from slot 0) holds now: a loop whose body is
+    // already there replays it rather than recording it again.
+    let mut slot0: Option<Vec<Instruction>> = None;
+    let mut uses: Vec<(u32, usize, u32)> = Vec::new(); // key, body, uses
+    for it in items {
         let (times, body) = match it {
             Item::I(x) => {
                 out.words.push(*x);
+                continue;
+            }
+            Item::Shared { key, body } => {
+                let entry = shared.iter().find(|(k2, ..)| k2 == key);
+                match entry {
+                    Some((_, first, Some(slot))) if first == body => {
+                        if recorded.contains(key) {
+                            out.words
+                                .push(frontend::replay(*slot, body.len()).expect("allocated"));
+                        } else {
+                            frontend::record(*slot, body, true, &mut out.words)
+                                .expect("allocated, no REPLAY");
+                            recorded.push(*key);
+                        }
+                        match uses.iter_mut().find(|(k2, ..)| k2 == key) {
+                            Some(u) => u.2 += 1,
+                            None => uses.push((*key, body.len(), 1)),
+                        }
+                    }
+                    _ => {
+                        let why = if own_replay {
+                            Unrolled::BufferInUse
+                        } else if entry.is_some_and(|(_, first, _)| first != body) {
+                            Unrolled::Differs
+                        } else if body.len() > REPLAY_BUFFER as usize {
+                            Unrolled::TooLong
+                        } else {
+                            Unrolled::BufferFull
+                        };
+                        out.words.extend_from_slice(body);
+                        out.loops.push(LoopForm::Unrolled {
+                            times: 1,
+                            body: body.len(),
+                            why,
+                        });
+                    }
+                }
                 continue;
             }
             Item::Repeat { times, body } => (*times, body),
@@ -200,10 +285,26 @@ pub fn lower(items: &[Item]) -> Lowered {
             write_out(&mut out, Unrolled::TooLong);
             continue;
         }
-        // The first iteration runs as it is recorded, from slot 0.
-        frontend::record(0, &b, true, &mut out.words).expect("checked: fits, no REPLAY");
+        if b.len() > loop_room {
+            write_out(&mut out, Unrolled::BufferFull);
+            continue;
+        }
+        // The first iteration runs as it is recorded, from slot 0 -- unless
+        // slot 0 holds this body already, when every iteration replays.
+        let resident = slot0.as_ref() == Some(&b);
+        if !resident {
+            frontend::record(0, &b, true, &mut out.words).expect("checked: fits, no REPLAY");
+            slot0 = Some(b.clone());
+        }
         let replay = frontend::replay(0, b.len()).expect("checked: fits");
-        if best.is_some_and(|(at, _)| at == k) {
+        let rest = if resident { times } else { times - 1 };
+        // The chosen loop, and every other loop with the same body: one MOP
+        // configuration serves them all.
+        let mop_body = best.and_then(|(at, _)| match &items[at] {
+            Item::Repeat { body, .. } => flat_body(body),
+            _ => None,
+        });
+        if mop_body.as_ref() == Some(&b) {
             out.mop = Some(MopConfig::Template0(Template0 {
                 a0: replay,
                 a123: None,
@@ -211,7 +312,7 @@ pub fn lower(items: &[Item]) -> Lowered {
                 skip_a0: replay,
                 skip_b: replay,
             }));
-            let mut left = times - 1;
+            let mut left = rest;
             let mut mops = 0;
             while left > 0 {
                 let n = left.min(MOP_ITERATIONS);
@@ -227,12 +328,15 @@ pub fn lower(items: &[Item]) -> Lowered {
             });
         } else {
             out.words
-                .extend(core::iter::repeat_n(replay, times as usize - 1));
+                .extend(core::iter::repeat_n(replay, rest as usize));
             out.loops.push(LoopForm::Replayed {
                 times,
                 body: b.len(),
             });
         }
+    }
+    for (key, body, n) in uses {
+        out.loops.push(LoopForm::Shared { key, body, uses: n });
     }
     out
 }
@@ -411,5 +515,118 @@ mod tests {
             None
         );
         assert_eq!(frontend_stream(&[mop::mop_template1()], None), None);
+    }
+
+    #[test]
+    fn a_shared_block_is_recorded_once_and_replayed_between_other_work() {
+        let block: Vec<Instruction> = (0..20).map(op).collect();
+        let mut items = Vec::new();
+        for pair in 0..6 {
+            items.push(Item::I(op(500 + pair))); // each pair's own retargeting
+            items.push(Item::Shared {
+                key: 1,
+                body: block.clone(),
+            });
+        }
+        // A loop beside it, in the twelve slots left.
+        items.push(Item::Repeat {
+            times: 9,
+            body: body(40..50),
+        });
+        let l = holds(&items);
+        // 6 + (1 + 20) + 5 replays, then the loop.
+        assert!(
+            l.loops.contains(&LoopForm::Shared {
+                key: 1,
+                body: 20,
+                uses: 6
+            }),
+            "{:?}",
+            l.loops
+        );
+        assert!(
+            matches!(
+                l.loops[0],
+                LoopForm::Mop {
+                    times: 9,
+                    body: 10,
+                    ..
+                }
+            ),
+            "{:?}",
+            l.loops
+        );
+        // A loop that would not fit beside the block is written out, and says so.
+        let mut tight = items.clone();
+        tight.pop();
+        tight.push(Item::Repeat {
+            times: 3,
+            body: body(60..75),
+        });
+        let l = holds(&tight);
+        assert!(l.loops.contains(&LoopForm::Unrolled {
+            times: 3,
+            body: 15,
+            why: Unrolled::BufferFull
+        }));
+        // A key whose body changes is written out where it differs.
+        let mut odd = items.clone();
+        odd.push(Item::Shared {
+            key: 1,
+            body: (100..120).map(op).collect(),
+        });
+        let l = holds(&odd);
+        assert!(l.loops.contains(&LoopForm::Unrolled {
+            times: 1,
+            body: 20,
+            why: Unrolled::Differs
+        }));
+    }
+
+    #[test]
+    fn loops_with_the_same_body_share_the_mop() {
+        // A matmul's K loop, once per output tile, between each output's setup.
+        let items: Vec<Item> = (0..3)
+            .flat_map(|out| {
+                [
+                    Item::I(op(900 + out)),
+                    Item::Repeat {
+                        times: 25,
+                        body: body(0..8),
+                    },
+                ]
+            })
+            .collect();
+        let l = holds(&items);
+        assert_eq!(
+            l.loops
+                .iter()
+                .filter(|f| matches!(f, LoopForm::Mop { .. }))
+                .count(),
+            3,
+            "{:?}",
+            l.loops
+        );
+    }
+
+    #[test]
+    fn a_body_already_recorded_is_replayed_not_recorded_again() {
+        let items: Vec<Item> = (0..3)
+            .flat_map(|out| {
+                [
+                    Item::I(op(900 + out)),
+                    Item::Repeat {
+                        times: 5,
+                        body: body(0..8),
+                    },
+                ]
+            })
+            .collect();
+        let l = lower_with(&items, false);
+        let got = frontend_stream(&l.words, None).unwrap();
+        assert_eq!(got, Item::unrolled(&items));
+        // 3 setup words, one recording (1 + 8), and 4 + 5 + 5 replays.
+        assert_eq!(l.words.len(), 3 + 9 + 14);
+        assert!(l.mop.is_none());
     }
 }

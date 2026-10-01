@@ -123,9 +123,10 @@ pub fn math_prelude() -> Vec<Instruction> {
 
 // --- Whole tiles --------------------------------------------------------------
 
+use crate::loops::Item;
 use tt_isa::backend::{self, Before};
 use tt_isa::cfg::generated::thcon;
-use tt_isa::matrix::Banks;
+use tt_isa::matrix::{Banks, Loaded};
 use tt_isa::sync::{self, Semaphore, Unit};
 use tt_isa::tile::TileDescriptor;
 
@@ -214,23 +215,85 @@ pub const FACE_DATUMS: u32 = 256;
 /// `Dst` rows one 32x32 FP32 output tile occupies: four faces of sixteen.
 pub const TILE_DST_ROWS: u32 = 64;
 
-/// Unpack face `face` of the tile `unpacker` is configured for: all 256 of its
-/// datums, from the `Z` plane the unpack thread's ADC names.
-///
-/// `FirstDatum = ((W * ZDim + Z) * YDim + Y) * XDim + X`, with `Z` from the
-/// *issuing* thread's ADCs and `X`/`Y` from `ContextADC`'s -- thread 0 for
-/// both, on the unpack role (`UNPACR_Regular.md:136-182`). `X` runs over the
-/// whole face, so one `UNPACR` moves 16 rows.
-fn select_face(unpacker: Unpacker, face: u32) -> [Instruction; 2] {
-    let z = encode::Setadczw::ZERO.z0(1).z0_val(face);
-    let z = match unpacker {
-        Unpacker::SrcA => z.u0(1),
-        Unpacker::SrcB => z.u1(1),
+/// GPRs the matmul's unpack role steps its tiles with: each operand's base
+/// address (in `tile_base_units`) and its stride from one pair to the next.
+/// Clear of `datapath::SCRATCH_GPR`, the only other GPR a kernel uses.
+const A_BASE_GPR: u32 = 24;
+const B_BASE_GPR: u32 = 25;
+const A_STRIDE_GPR: u32 = 26;
+const B_STRIDE_GPR: u32 = 27;
+
+/// The constant step from each tile pair to the next, in bytes, if there is
+/// one: `(da, db)`, both non-negative multiples of the tile alignment. One
+/// pair has none to need.
+fn even_strides(pairs: &[(u64, u64)]) -> Option<(u64, u64)> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let step = |i: usize| {
+        let (a0, b0) = pairs[i];
+        let (a1, b1) = pairs[i + 1];
+        Some((a1.checked_sub(a0)?, b1.checked_sub(b0)?))
     };
+    let first = step(0)?;
+    let align = TileImage::ALIGNMENT as u64;
+    if first.0 % align != 0 || first.1 % align != 0 {
+        return None;
+    }
+    (1..pairs.len() - 1)
+        .all(|i| step(i) == Some(first))
+        .then_some(first)
+}
+
+/// [`retarget`] to the pair `(a_tile, b_tile)`, with each base and its stride
+/// left in the GPRs [`gpr_step`] adds: `SETDMAREG`s, then the bases written
+/// to the unpackers.
+fn gpr_retarget(a_tile: u64, b_tile: u64, da: u64, db: u64) -> Vec<Instruction> {
+    let units = |x: u64| crate::datapath::tile_base_units(x);
+    let mut p = vec![
+        backend::wait_for_unpacker0(Before::CONFIG).unwrap(),
+        backend::wait_for_unpacker1(Before::CONFIG).unwrap(),
+    ];
+    for (gpr, v) in [
+        (A_BASE_GPR, units(a_tile)),
+        (B_BASE_GPR, units(b_tile)),
+        (A_STRIDE_GPR, units(da)),
+        (B_STRIDE_GPR, units(db)),
+    ] {
+        p.extend(backend::set_gpr(gpr, v).unwrap());
+    }
+    p.extend(write_bases());
+    p
+}
+
+/// Both bases from their GPRs into the unpackers' configuration, and the
+/// separation `WRCFG.md` asks for before an unpack reads it. `A` is in0 and
+/// goes to `SrcB` (unpacker 1, `THCON_SEC1`); `B` to `SrcA` (`THCON_SEC0`).
+fn write_bases() -> [Instruction; 4] {
     [
-        crate::datapath::set_adc_x(unpacker, 0, FACE_DATUMS - 1),
-        z.encode().unwrap(),
+        backend::write_word(A_BASE_GPR, thcon::THCON_SEC1_REG3_Base_address.addr32()).unwrap(),
+        backend::write_word(B_BASE_GPR, thcon::THCON_SEC0_REG3_Base_address.addr32()).unwrap(),
+        tt_isa::sfpu::nop(),
+        backend::stallwait(
+            backend::block::UNPACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
     ]
+}
+
+/// On to the next tile pair: once both unpackers have drained, each base
+/// plus its stride (`ADDDMAREG`, `step38_gpr_add`), written back. The same
+/// eight words every pair.
+fn gpr_step() -> Vec<Instruction> {
+    let mut p = vec![
+        backend::wait_for_unpacker0(Before::CONFIG).unwrap(),
+        backend::wait_for_unpacker1(Before::CONFIG).unwrap(),
+        encode::adddmareg(A_BASE_GPR, A_STRIDE_GPR, A_BASE_GPR).unwrap(),
+        encode::adddmareg(B_BASE_GPR, B_STRIDE_GPR, B_BASE_GPR).unwrap(),
+    ];
+    p.extend(write_bases());
+    p
 }
 
 /// Point both unpackers at a new pair of tile images, between `UNPACR`s.
@@ -349,12 +412,48 @@ pub fn matmul_roles(
     out_fmt: u32,
     fidelity: Fidelity,
 ) -> [Vec<Instruction>; 3] {
+    let [unpack, math, pack] = matmul_items(outputs, sems, in_fmt, out_fmt, fidelity);
+    // `REPLAY` alone for now: a kernel step does not carry a MOP
+    // configuration to the roles' mailboxes yet (X2b).
+    let lower = |items: &[Item]| crate::loops::lower_with(items, false).words;
+    [lower(&unpack), lower(&math), Item::unrolled(&pack)]
+}
+
+/// Keys of the matmul's shared blocks (`crate::loops::Item::Shared`): one
+/// tile pair's face block on each of the unpack and math roles.
+const UNPACK_FACES: u32 = 1;
+const MATH_FACES: u32 = 2;
+
+/// The three role programs of [`matmul_roles`] as loop items, before
+/// lowering: each tile pair's face block -- the same words for every pair --
+/// a shared block on the unpack and the math role, between the pairs' own
+/// retargeting (`crate::loops`).
+///
+/// The face loop runs `fi`, `k`, `fj`: `Dst` face `(fi, fj)` still takes its
+/// `k = 0` product before its `k = 1` one within each pair, and pairs in
+/// order, so every output datum accumulates exactly as before -- but each `A`
+/// face is unpacked once and read by the two `MVMUL` groups that need it,
+/// released by the second. Each face is picked by `SETADCZW` alone --
+/// `FirstDatum = ((W * ZDim + Z) * YDim + Y) * XDim + X`, `Z` from the issuing
+/// thread's ADCs and `X`/`Y` from `ContextADC`'s, thread 0 for both on the
+/// unpack role (`UNPACR_Regular.md:136-182`) -- and the `X` range is the whole
+/// face throughout, so it is set once at the start rather than before every
+/// unpack. A pair's block is 24 words on the
+/// unpack role, which the replay buffer holds; on the math role it is 32 words
+/// at LoFi, and longer, so written out, at higher fidelities.
+pub fn matmul_items(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    in_fmt: L1Format,
+    out_fmt: u32,
+    fidelity: Fidelity,
+) -> [Vec<Item>; 3] {
     assert!(
         outputs.iter().all(|o| !o.pairs.is_empty()),
         "every output tile needs at least one operand pair"
     );
     let (a0, b0) = outputs[0].pairs[0];
-    let mut unpack = src_thread_config();
+    let mut prelude = src_thread_config();
     let mut words = ConfigWords::new();
     let descriptor = tile_descriptor(in_fmt);
     unpack_src_config(&mut words, Unpacker::SrcA, descriptor, b0, out_fmt);
@@ -363,75 +462,139 @@ pub fn matmul_roles(
     words
         .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
         .unwrap();
-    unpack.extend(config_program(&words));
-
-    let mut math = math_prelude();
-    let mut pack = Vec::new();
+    prelude.extend(config_program(&words));
+    for u in [Unpacker::SrcA, Unpacker::SrcB] {
+        prelude.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
+    }
+    fn i(v: impl IntoIterator<Item = Instruction>) -> impl Iterator<Item = Item> {
+        v.into_iter().map(Item::I)
+    }
+    let mut unpack: Vec<Item> = i(prelude).collect();
+    let mut math: Vec<Item> = i(math_prelude()).collect();
+    let mut pack: Vec<Item> = Vec::new();
     let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
+    let phases = fidelity.phases();
+    // Lo keeps the encoding the gates established; with more phases, each
+    // MVMUL steps the phase (addr_mod 1).
+    let step = |row: u32| {
+        let m = encode::Mvmul::ZERO.dst_row(row);
+        if phases > 1 {
+            m.addr_mod(1)
+        } else {
+            m
+        }
+    };
+    // One `MVMUL` group into `Dst` rows `dst..dst + 16`: both `SrcB` halves,
+    // every phase, all but the group's last `MVMUL`.
+    let group = |out: &mut Vec<Instruction>, dst: u32, mut loaded: Banks<Loaded, Loaded>| {
+        for half in 0..2u32 {
+            out.push(set_src_b_row(8 * half, phases > 1));
+            for phase in 0..phases {
+                if half == 1 && phase + 1 == phases {
+                    break;
+                }
+                let (i, next) = loaded.mvmul(step(dst + 8 * half)).unwrap();
+                out.push(i);
+                loaded = next;
+            }
+        }
+        loaded
+    };
+    let zw = |u: Unpacker, face: u32| {
+        let z = encode::Setadczw::ZERO.z0(1).z0_val(face);
+        match u {
+            Unpacker::SrcA => z.u0(1),
+            Unpacker::SrcB => z.u1(1),
+        }
+        .encode()
+        .unwrap()
+    };
+    // One tile pair's face block on each role: the same words for every pair
+    // (the banks start and end empty), so built once.
+    let (mut ub, mut mb) = (Vec::new(), Vec::new());
     let mut banks = Banks::after_reset();
+    for fi in 0..2u32 {
+        for k in 0..2u32 {
+            // `A` is in0 and goes to `SrcB`: its face `(fi, k)`.
+            ub.push(zw(Unpacker::SrcB, 2 * fi + k));
+            let (u, with_b) = banks.unpack_b(base).unwrap();
+            ub.push(u);
+            // `B` is in1 and goes to `SrcA`: its faces `(k, fj)`.
+            ub.push(zw(Unpacker::SrcA, 2 * k));
+            let (u, both) = with_b.unpack_a(base).unwrap();
+            ub.push(u);
+            let loaded = group(&mut mb, 16 * (2 * fi), both);
+            let (m, only_b) = loaded.mvmul_release_a(step(16 * (2 * fi) + 8)).unwrap();
+            mb.push(m);
+            ub.push(zw(Unpacker::SrcA, 2 * k + 1));
+            let (u, both) = only_b.unpack_a(base).unwrap();
+            ub.push(u);
+            let loaded = group(&mut mb, 16 * (2 * fi + 1), both);
+            let (m, empty) = loaded
+                .mvmul_release_both(step(16 * (2 * fi + 1) + 8))
+                .unwrap();
+            mb.push(m);
+            banks = empty;
+        }
+    }
+    let _ = banks;
     let mut current = (a0, b0);
     for output in outputs {
-        math.extend(sync::take(sems.free, Before::MATRIX));
+        math.extend(i(sync::take(sems.free, Before::MATRIX)));
         // (mode, use_dst32b, addr_mod, imm10): all of `Dst`.
-        math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
-        for &(a, b) in &output.pairs {
-            if (a, b) != current {
-                unpack.extend(retarget(a, b));
-                current = (a, b);
+        math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
+        match even_strides(&output.pairs) {
+            // Pairs evenly spaced in L1 (how the gather stages them): the
+            // tiles are stepped by GPR arithmetic, so every pair is the same
+            // words -- one loop, which the replay buffer and the MOP take.
+            Some((da, db)) => {
+                let (a, b) = output.pairs[0];
+                unpack.extend(i(gpr_retarget(a, b, da, db)));
+                let body: Vec<Item> = i(ub.iter().copied()).chain(i(gpr_step())).collect();
+                let n = output.pairs.len() as u32;
+                unpack.push(Item::Repeat { times: n, body });
+                math.push(Item::Repeat {
+                    times: n,
+                    body: i(mb.iter().copied()).collect(),
+                });
+                // Where the last step left the bases: one stride past the last pair.
+                current = (u64::MAX, u64::MAX);
             }
-            for fi in 0..2u32 {
-                for fj in 0..2u32 {
-                    for k in 0..2u32 {
-                        unpack.extend(select_face(Unpacker::SrcA, 2 * k + fj));
-                        let (i, loaded_a) = banks.unpack_a(base).unwrap();
-                        unpack.push(i);
-                        unpack.extend(select_face(Unpacker::SrcB, 2 * fi + k));
-                        let (i, loaded) = loaded_a.unpack_b(base).unwrap();
-                        unpack.push(i);
-
-                        let dst = 16 * (2 * fi + fj);
-                        let phases = fidelity.phases();
-                        // Lo keeps the encoding the gates established; with more
-                        // phases, each MVMUL steps the phase (addr_mod 1).
-                        let step = |row: u32| {
-                            let m = encode::Mvmul::ZERO.dst_row(row);
-                            if phases > 1 {
-                                m.addr_mod(1)
-                            } else {
-                                m
-                            }
-                        };
-                        let mut loaded = loaded;
-                        for half in 0..2u32 {
-                            math.push(set_src_b_row(8 * half, phases > 1));
-                            for phase in 0..phases {
-                                if half == 1 && phase + 1 == phases {
-                                    break;
-                                }
-                                let (i, next) = loaded.mvmul(step(dst + 8 * half)).unwrap();
-                                math.push(i);
-                                loaded = next;
-                            }
-                        }
-                        let (i, empty) = loaded.mvmul_release_both(step(dst + 8)).unwrap();
-                        math.push(i);
-                        banks = empty;
+            None => {
+                for &(a, b) in &output.pairs {
+                    if (a, b) != current {
+                        unpack.extend(i(retarget(a, b)));
+                        current = (a, b);
                     }
+                    unpack.push(Item::Shared {
+                        key: UNPACK_FACES,
+                        body: ub.clone(),
+                    });
+                    math.push(Item::Shared {
+                        key: MATH_FACES,
+                        body: mb.clone(),
+                    });
                 }
             }
         }
-        math.extend(sync::post_after(Unit::Matrix, sems.ready));
+        math.extend(i(sync::post_after(Unit::Matrix, sems.ready)));
 
         let mut pw = ConfigWords::new();
         crate::datapath::pack_config(&mut pw, output.out);
-        pack.extend(config_program(&pw));
-        pack.extend(sync::take(sems.ready, Before::PACKER));
-        pack.extend(crate::datapath::pack_rows(TILE_DST_ROWS));
-        pack.extend(sync::post_after(Unit::Packer, sems.free));
+        pack.extend(i(config_program(&pw)));
+        pack.extend(i(sync::take(sems.ready, Before::PACKER)));
+        pack.extend(i(crate::datapath::pack_rows(TILE_DST_ROWS)));
+        pack.extend(i(sync::post_after(Unit::Packer, sems.free)));
     }
-    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
-    unpack.push(backend::wait_for_unpacker1(Before::EVERYTHING).unwrap());
-    pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
+    unpack.push(Item::I(
+        backend::wait_for_unpacker0(Before::EVERYTHING).unwrap(),
+    ));
+    unpack.push(Item::I(
+        backend::wait_for_unpacker1(Before::EVERYTHING).unwrap(),
+    ));
+    pack.push(Item::I(
+        backend::wait_for_packer(Before::EVERYTHING).unwrap(),
+    ));
     [unpack, math, pack]
 }
 
@@ -1199,5 +1362,40 @@ mod tests {
         .unwrap();
         assert!(runs > 1, "the shape must need more than one run");
         assert_eq!(c, host(&a, &b, [m, k, n]));
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    /// The lowered roles are the unrolled ones, as the frontend expands them
+    /// (`crate::loops::frontend_stream`), at every fidelity and over block
+    /// shapes with several outputs and tile pairs; and the face blocks are
+    /// shared: a pair costs one `REPLAY` on the math role at LoFi.
+    #[test]
+    fn the_lowered_roles_are_the_unrolled_ones() {
+        for tiles in [[1usize, 1, 1], [2, 16, 3], [1, 25, 4]] {
+            let layout = plan_layout_in(tiles, L1Format::Fp32, Staging::Slots).unwrap();
+            for f in [Fidelity::Lo, Fidelity::HiFi2, Fidelity::HiFi4] {
+                let items = matmul_items(&layout.outputs, layout.sems, L1Format::Fp32, 0, f);
+                for (r, it) in items.iter().enumerate() {
+                    let l = crate::loops::lower_with(it, false);
+                    let got = crate::loops::frontend_stream(&l.words, l.mop.as_ref()).unwrap();
+                    assert!(got == Item::unrolled(it), "{tiles:?} {f:?} role {r}");
+                }
+                if f == Fidelity::Lo && tiles[1] > 1 {
+                    // A pair costs about one word on the math role at LoFi:
+                    // the body recorded once, every other pair a REPLAY.
+                    let math = crate::loops::lower_with(&items[1], false);
+                    let pairs = tiles[0] * tiles[1] * tiles[2];
+                    assert!(
+                        math.words.len() < pairs + 80,
+                        "{tiles:?}: {} words for {pairs} pairs",
+                        math.words.len()
+                    );
+                }
+            }
+        }
     }
 }

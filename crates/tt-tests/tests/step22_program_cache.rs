@@ -169,14 +169,19 @@ fn a_matmul_of_two_block_shapes_is_one_list_and_then_no_uploads() {
 #[test]
 fn evicted_programs_run_correctly_when_they_return() {
     with_session(|s| {
-        // About 92 + 49 + 102 + 57 KB of programs on one tile (the cache's
-        // own counts, on ttsim): more than the 240 KB region, so the fourth
-        // evicts and the second round finds the first three gone.
+        // The cache cut to 128 KB (`Session::limit_program_cache`), so the
+        // kernels below -- about 230 KB of programs together, each role's
+        // well under half the cut -- evict whatever shrinks the programs next
+        // (X2b's loops took them from ~300 KB to this): the gate no longer
+        // depends on how big a matmul's programs happen to be.
+        s.limit_program_cache(128 * 1024).unwrap();
         let ops = [
             ([512, 512, 512], Fidelity::HiFi4),
             ([512, 512, 512], Fidelity::Lo),
             ([784, 64, 128], Fidelity::Lo),
             ([64, 784, 128], Fidelity::HiFi4),
+            ([256, 1024, 128], Fidelity::HiFi4),
+            ([128, 640, 320], Fidelity::HiFi4),
         ];
         let mut evictions = 0;
         for round in 0..2 {

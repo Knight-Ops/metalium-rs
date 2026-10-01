@@ -239,6 +239,17 @@ pub struct Confirmed {
 
 pub const CONFIRMED: &[Confirmed] = &[
     Confirmed {
+        // The register form; the six-bit immediate form (`ADDDMAREGi`) runs
+        // on silicon (`adddmareg_adds_an_immediate`) but not on ttsim
+        // (divergence row 67), so it is not confirmed here.
+        key: "ADDDMAREG",
+        exercised: &["ResultReg", "RightReg", "LeftReg"],
+        evidence: &[(
+            "crates/tt-tests/tests/step38_gpr_add.rs",
+            "adddmareg_adds_two_registers",
+        )],
+    },
+    Confirmed {
         key: "MOP",
         exercised: &["Template", "Count1", "MaskLo"],
         evidence: &[(
