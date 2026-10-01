@@ -15,7 +15,7 @@
 //! card's GDDR6. The cross-entropy loss is computed on the host.
 //!
 //! ```text
-//! tt-mnist [--card N | --cards 0,1] [--epochs E] [--steps S] [--host]
+//! tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
 //! ```
 
 use std::time::{Duration, Instant};

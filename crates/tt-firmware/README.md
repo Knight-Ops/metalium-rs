@@ -11,9 +11,15 @@ by hand.
 | Binary | Core | Link script | Purpose |
 |---|---|---|---|
 | `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link.x`, `link_t1.x`, `link_t2.x` | The unpack / math / pack role runners. Each at its core's default reset PC, so all three sit in one tile's L1. Resident in a `Session`. |
-| `dm_b` | B | `link_b.x` | The data mover (`tt_isa::dm`): GDDR to and from L1, list entries, op records expanded on the tile, `COMPUTE` on its FP32 unit, `KERNEL` entries that run the resident roles. |
+| `dm_b` | B | `link_b.x` | The data mover (`tt_isa::dm`): GDDR to and from L1, list entries, op records expanded on the tile, `COMPUTE` on its FP32 unit, `KERNEL` entries that point the resident roles at their programs and run them. |
 | `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::eth::mover`). |
 | `corpus` / `corpus_t0` | T1 / T0 | `link.x` | Generic single-thread program runner (T1 for ttsim, T0 for silicon). |
+
+The program runners push from their fixed program slot, or, when
+`mailbox::PROGRAM_ADDR` is non-zero, from that address, which must lie in the
+program cache region. The host writes a runner's whole descriptor
+(`tt_isa::mailbox::Descriptor`) before every run: L1 survives between processes on
+silicon, so a field left unwritten is the previous process's.
 | `heartbeat`, `sfpu_mul` | T0, or the corpus core | `link.x` | The step 3 and step 4 bring-up gates. |
 
 `src/lib.rs` is the runtime (entry, `.bss`, status/heartbeat/panic words in the L1

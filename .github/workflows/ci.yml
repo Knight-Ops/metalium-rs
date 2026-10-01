@@ -17,7 +17,8 @@ jobs:
 
       # riscv32im-unknown-none-elf is a built-in target, so the firmware needs no
       # custom target JSON. llvm-tools supplies the objcopy and objdump that
-      # crates/tt-tests/build.rs uses to produce and check the firmware image.
+      # crates/tt-firmware-images/build.rs uses to produce and check the
+      # firmware images.
       - name: Install toolchain
         run: |
           rustup show active-toolchain

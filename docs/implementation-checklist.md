@@ -541,7 +541,8 @@ misattribution.
       default, which is the first real use of the generated table — and a test
       proves changing it changes the readback, so the path is not inert.
 - [x] **Broad instruction corpus, encoded bit-exact.** `cargo xtask gen-isa`
-      parses `Diagrams/Src/Bits32.lua` into 148 instruction encodings and 19 datum
+      parses `Diagrams/Src/Bits32.lua` into 148 instruction encodings (161 since the
+      measured Blackhole layouts, `isa/generated.rs`'s header) and 19 datum
       layouts, each cross-checked against the hand-written `TT_*(…)` syntax block
       on the page that embeds its diagram. The two sources agree on names, widths,
       signedness **and slot bit positions** across 167 pairs, with ten documented

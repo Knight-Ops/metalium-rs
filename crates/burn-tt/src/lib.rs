@@ -1,9 +1,12 @@
 //! A Burn backend for Tenstorrent Blackhole.
 //!
 //! **What runs where.** Every op runs on the host through `burn-flex` except
-//! the ones listed in `xtask/src/gen_burn.rs`'s `OVERRIDDEN` as device ops --
-//! today, `float_matmul` on F32 tensors, which runs on a Tensix tile through
-//! [`tt_kernels::session::matmul_on`]. The forwarding is generated from the
+//! the ones listed in `xtask/src/gen_burn.rs`'s `OVERRIDDEN`: matmul, add, sub,
+//! mul, mul by a scalar, the sum over rows, row slices and transposes, and the
+//! ReLU pair, each on the device when its F32 matrix operands are already there
+//! (tensors live in GDDR once uploaded, `tensor::TtTensor`), and on the host
+//! otherwise -- counted by [`tensor_traffic`] and named with
+//! `TT_TRACE_FALLBACK=1`. The forwarding is generated from the
 //! pinned `burn-backend`'s op traits (`cargo xtask gen-burn-delegate`), so
 //! `burn-tt` behaves exactly as Flex does wherever it has not been told
 //! otherwise, and each op moved to the device is a change behind an unchanged
