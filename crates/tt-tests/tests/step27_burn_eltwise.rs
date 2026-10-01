@@ -1,0 +1,154 @@
+//! Phase 10 gate (S1, Burn routing): every element-wise method `burn-tt`
+//! overrides, on a device-resident tensor, against `burn-flex` bit for bit,
+//! and downloading nothing.
+//!
+//! The ops run where the session puts them -- the SFPU or the data mover,
+//! whichever is cheaper for the size (`tt_kernels::tensor::sfpu_is_cheaper`),
+//! both bit-identical (`step19_eltwise`) -- so the claim here is the routing:
+//! a resident operand stays resident through the op, the result is the
+//! device's, and the scalar is converted as Flex converts it.
+
+use burn::tensor::{activation, Tensor, TensorData};
+use burn_flex::{Flex, FlexDevice};
+use burn_tt::{tensor_traffic, TtBackend};
+use tt_tests::burn_device::{with_device, Config};
+
+fn values(seed: u64, n: usize) -> Vec<f32> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|i| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            match i % 17 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::INFINITY,
+                _ => ((s >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 4.0,
+            }
+        })
+        .collect()
+}
+
+fn bits<const D: usize, B: burn::tensor::backend::Backend>(t: Tensor<B, D>) -> Vec<u32> {
+    t.into_data()
+        .to_vec::<f32>()
+        .unwrap()
+        .iter()
+        .map(|x| x.to_bits())
+        .collect()
+}
+
+#[test]
+fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
+    with_device(Config::default(), |d| {
+        // Ragged, and big enough that the SFPU takes some of them.
+        for [r, c] in [[37, 70], [512, 128]] {
+            let (av, bv, rowv) = (values(1, r * c), values(2, r * c), values(3, c));
+            let ta = |v: &[f32], s: [usize; 2]| {
+                Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), s), &d).to_device(&d)
+            };
+            let fl = |v: &[f32], s: [usize; 2]| {
+                Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), s), &FlexDevice)
+            };
+            let (a, b, row) = (ta(&av, [r, c]), ta(&bv, [r, c]), ta(&rowv, [1, c]));
+            let (fa, fb, frow) = (fl(&av, [r, c]), fl(&bv, [r, c]), fl(&rowv, [1, c]));
+            type Case = (
+                &'static str,
+                Box<dyn Fn() -> Tensor<TtBackend, 2>>,
+                Vec<u32>,
+            );
+            let cases: Vec<Case> = vec![
+                (
+                    "add",
+                    Box::new({
+                        let (a, b) = (a.clone(), b.clone());
+                        move || a.clone() + b.clone()
+                    }),
+                    bits(fa.clone() + fb.clone()),
+                ),
+                (
+                    "sub",
+                    Box::new({
+                        let (a, b) = (a.clone(), b.clone());
+                        move || a.clone() - b.clone()
+                    }),
+                    bits(fa.clone() - fb.clone()),
+                ),
+                (
+                    "mul",
+                    Box::new({
+                        let (a, b) = (a.clone(), b.clone());
+                        move || a.clone() * b.clone()
+                    }),
+                    bits(fa.clone() * fb.clone()),
+                ),
+                (
+                    "add a row",
+                    Box::new({
+                        let (a, row) = (a.clone(), row.clone());
+                        move || a.clone() + row.clone()
+                    }),
+                    bits(fa.clone() + frow.clone()),
+                ),
+                (
+                    "mul_scalar",
+                    Box::new({
+                        let a = a.clone();
+                        move || a.clone() * 0.37
+                    }),
+                    bits(fa.clone() * 0.37),
+                ),
+                (
+                    "add_scalar",
+                    Box::new({
+                        let a = a.clone();
+                        move || a.clone() + 1.5
+                    }),
+                    bits(fa.clone() + 1.5),
+                ),
+                (
+                    "sub_scalar",
+                    Box::new({
+                        let a = a.clone();
+                        move || a.clone() - 0.25
+                    }),
+                    bits(fa.clone() - 0.25),
+                ),
+                (
+                    "relu",
+                    Box::new({
+                        let a = a.clone();
+                        move || activation::relu(a.clone())
+                    }),
+                    bits(activation::relu(fa.clone())),
+                ),
+            ];
+            for (name, op, want) in cases {
+                let before = tensor_traffic();
+                let out = op();
+                let during = tensor_traffic() - before;
+                assert_eq!(
+                    during.downloads, 0,
+                    "[{r}, {c}] {name}: downloaded {during:?}"
+                );
+                assert_eq!(during.uploads, 0, "[{r}, {c}] {name}: uploaded {during:?}");
+                let got = bits(out);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    let wf = f32::from_bits(*w);
+                    if wf.is_nan() {
+                        assert!(
+                            f32::from_bits(*g).is_nan(),
+                            "[{r}, {c}] {name}: element {i}"
+                        );
+                    } else {
+                        assert_eq!(
+                            g, w,
+                            "[{r}, {c}] {name}: element {i}: {g:#010x} vs {w:#010x}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}

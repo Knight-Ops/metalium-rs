@@ -191,11 +191,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_add(lhs, rhs)
     }
     fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_add_scalar(lhs.into_flex(), rhs),
-            device,
-        )
+        crate::ops::float::float_add_scalar(lhs, rhs)
     }
     fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -229,11 +225,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_sub(lhs, rhs)
     }
     fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sub_scalar(lhs.into_flex(), rhs),
-            device,
-        )
+        crate::ops::float::float_sub_scalar(lhs, rhs)
     }
     fn float_mul(
         lhs: FloatTensor<TtBackend>,

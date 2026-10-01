@@ -145,10 +145,14 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
             assert_eq!(roles, 3 * ks, "every role run belongs to a KERNEL entry");
         }
         assert!(kernels > 0, "the matmul ran kernels");
+        // On the mover (an `ELTWISE` record) or the SFPU (a `READ_RUN`, its
+        // kernel, a `WRITE_RUN`), whichever the session found cheaper.
         assert!(
-            p.units
+            p.units.iter().all(|u| u
+                .spans()
+                .unwrap()
                 .iter()
-                .all(|u| u.spans().unwrap().iter().any(|s| s.name == "eltwise")),
+                .any(|s| s.name == "eltwise" || s.name == "read run")),
             "the add was dealt to both units"
         );
         let json = p.to_chrome_trace().unwrap();

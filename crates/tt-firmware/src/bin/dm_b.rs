@@ -99,6 +99,11 @@ fn compute(kind: u32, s: u32, param: u32, dst: u64, a: u64, b: u64) {
             dm::kind::MUL_SCALAR => float::mul_scalar_n(pd, pa, s, 1024),
             dm::kind::COL_SUM => col_sum(s != 0, dm::kind::extent(param) as usize, dst, a),
             dm::kind::FILL_PAD => fill_pad(s, param, dst),
+            dm::kind::ADD_SCALAR => {
+                for i in 0..1024 {
+                    *pd.add(i) = float::add(*pa.add(i), s);
+                }
+            }
             dm::kind::COPY => {
                 for i in 0..1024 {
                     *pd.add(i) = *pa.add(i);

@@ -18,15 +18,15 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01)
+## Where things stand (2026-10-01, after 10.0)
 
 Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
 
 | Unit | What runs there today | Where |
 |---|---|---|
 | **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
-| **B core FP32 unit** | every element-wise op and the column sum: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`, `COL_SUM` -- one datum at a time, `fadd.s`/`fsub.s`/`fmul.s` | `tt_isa::dm::kind` (`dm.rs:108-135`), `dm_b.rs::{compute, col_sum, per_datum}` |
-| **SFPU** | nothing a tensor op uses. Gates only (`step4_tensix`, `step5_corpus`, `step8_eltwise` at 128 datums), and `Dst` zeroing in `runtime.rs` | `tt_isa::sfpu` |
+| **B core FP32 unit** | the column sum, small element-wise ops spread over many units, and the reference for every element-wise op; padding fills | `tt_isa::dm::kind`, `dm_b.rs::{compute, col_sum, per_datum, fill_pad}` |
+| **SFPU** | every element-wise op where it is cheaper (`Auto`): `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` | `tt_kernels::sfpu::{ops, kernel}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
 The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
@@ -46,7 +46,7 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0, F1, X1; F2, F5 partial |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
@@ -115,13 +115,13 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 
 | Group | Instructions | Enc | Helper | Kernel | Sim | Si | Item |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | | x | x | F3 |
-| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | | x | x | S1 |
+| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
+| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
 | Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
-| Move / abs | `SFPMOV`, `SFPABS` | x | x | | x | x | S2 |
+| Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
 | Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | `~` `SFPSETSGN` | | `~` `SFPSETSGN` | `~` `SFPSETSGN` | S2, S4, S6 |
-| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC` | | `~` `SFPSETCC` | `~` `SFPSETCC` | S2 |
-| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | | x | x | -- |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
+| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
@@ -154,7 +154,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 
 | Feature | State | Item |
 |---|---|---|
-| Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums | `[x]` | -- |
+| Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums, a datum sub-run of a tile (base moved) | `[x]` | -- |
 | `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
@@ -170,7 +170,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 
 | Feature | Enc | Helper | Kernel | Sim | Si | Item |
 |---|:-:|:-:|:-:|:-:|:-:|---|
-| `REPLAY` (record and replay, 32 entries per thread) | x | x | | x | x | X1 |
+| `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
@@ -319,14 +319,33 @@ reverse index.
         `SFPMULI`, `SFPADDI`, `SFPMUL24`, `SFPLUT`, `SFPLUTFP32`) -- including across
         a replayed body's wrap-around; unit-tested to appear once, in the right
         place.
-- [ ] **F3 The SFPU tile kernel.** T0 unpacks to `Dst`, T1 runs the SFPU program over the
-      tile, T2 packs; the hand-offs by semaphores; buffers and semaphores declared through
-      `tt_kernels::l1::Requirements`, programs through the program cache. Unary, binary
-      (two operands in two `Dst` regions) and binary-with-scalar shapes.
-- [ ] **F4 Dispatch without new firmware.** A `record::SFPU` (op id, scalar parameters,
-      tensor refs) that expands, like `ELTWISE`, into gathers, one `KERNEL` entry and
-      scatters; a host-side registry from op id to program builder. Adding an op is then
-      a builder and a gate, not a new arm in `dm_b.rs`.
+- [x] **F3 The SFPU tile kernel** (`tt_kernels::sfpu::kernel`). T0 unpacks each tile's
+      `A` to `Dst` rows 0..64 and `B` to 64..128 -- or, for a row broadcast, `B`'s row 0
+      laid four times per face into rows 64..72 by sub-run unpacks
+      (`datapath::unpack_datums_to_dst`, the base moved because an uncompressed unpack
+      always starts at datum 0) -- T1 runs the op's program writing rows 128..192, T2
+      packs them; three semaphores (`unpacked`, `computed`, `free`), declared through
+      `crate::l1` in the order that numbers them as a matmul's are, so the two
+      alternate with no setup run; slots planned in the data arena. Unary, binary and
+      row-broadcast shapes; binary-with-scalar is a unary program with an immediate.
+      Every role carries the state it needs (G11): found on the way, a matmul leaves
+      unpacker 0's ADC Z at its last face and the next kernel read the wrong datums --
+      the unpack role now clears the ADCs, `unpack_config` always writes descriptor
+      words 0 and 1, and every SFPU program starts with address modifier 0 at no
+      increment and the `Dst` row counter cleared. Gated through S1 and `step19`.
+- [x] **F4 Dispatch without new firmware** for SFPU ops; two new mover records for the
+      operands. `tensor::sfpu_eltwise` makes each run of tiles a job: `READ_RUN`
+      (operands into consecutive slots, with a row-broadcast flag), `Step::Kernel`,
+      `WRITE_RUN` (outputs back) -- the matmul's gather/kernel/scatter shape, since the
+      session patches only top-level `KERNEL` entries. Programs memoised by op, scalar
+      and run length; the run length is measured from the programs, the longest whose
+      role programs fit a slot (`ADD_ROW`'s unrolled loop gets shorter runs -- found by
+      MNIST's evaluation batch on one tile, now `step19::the_longest_runs_fit_and_match_flex`,
+      watched failing with code 8 without it). Adding an op is a program in
+      `sfpu::ops` and a gate. `EltwiseUnit::{Auto, Sfpu, Mover}`: `Auto`, the default,
+      picks by `tensor::sfpu_is_cheaper`, a linear cost model per op from
+      `silicon_perf::eltwise_unit_sweep` (measurement Q); `TT_ELTWISE=auto|sfpu|mover`
+      for burn-tt.
 - [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
       register nothing has established is `None`, and reading it is refused), per-lane
       `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
@@ -354,11 +373,22 @@ reverse index.
 
 ### S — SFPU operations
 
-- [ ] **S1 Today's element-wise ops on the SFPU** (was checklist 9.9): `ADD`, `SUB`, `MUL`,
-      `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`. `fma_bh` says the results equal
-      the B core's for every normal case; the gate is `step19_eltwise` bit-identical and
-      the MNIST golden unchanged. The B-core path stays, as the reference and the fallback.
-      Burn: no new methods; `float_add_scalar`, `float_sub_scalar` come free.
+- [x] **S1 Today's element-wise ops on the SFPU** (was checklist 9.9): `ADD`, `SUB`,
+      `MUL`, `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`, and new `ADD_SCALAR`
+      (mover and SFPU) for `float_add_scalar`/`float_sub_scalar` (`x - s` as `x + -s`,
+      the same bits). `RELU`'s predicate is the mover's integer test, `+0 < x <= +inf`,
+      as two `SFPGT`s in the total order. Oracle: each program equals the mover's
+      arithmetic in the interpreter over every special (`sfpu::ops` unit test). Gates:
+      `step19_eltwise::every_kind_matches_flex_bit_for_bit` on both units, forced, over
+      both zeros, infinities, NaNs, denormal-adjacent values at `[37, 70]`, `[64, 128]`,
+      `[784, 128]`; the padding and long-run tests; `step27_burn_eltwise` (every
+      overridden element-wise method on resident tensors against Flex, no upload or
+      download during the op; in `SMOKE`; watched failing with `sub_scalar`'s sign
+      unflipped); the MNIST golden bit for bit at 1 and 4 tiles with the 9.5 budget;
+      ttsim and both cards. **Measured** (Q, R): per op the SFPU costs ~26 us + ~3 us a
+      tile against the mover's ~9 us + 8-22 us a tile, so small ops spread over many
+      units stay on the mover; full MNIST 5.1 -> 3.8 ms/step on one tile, 2.5 -> 2.4 on
+      eight, 2.3 on 32, accuracy 91.96%.
 - [ ] **S2 Compare, select, sign.** `SFPGT`/`SFPLE`/`SFPSETCC` writing 1.0/0.0, `SFPSWAP`'s
       min/max mode, `SFPABS`, `SFPSETSGN`. Burn: `float_{equal,not_equal,greater,
       greater_equal,lower,lower_equal}{,_elem}`, `float_mask_where`, `float_mask_fill`,
@@ -448,11 +478,11 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
-| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (B core) | S1 |
+| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (SFPU or mover by size) | S1 |
 | `float_sum_dim` | `~` dim 0 only (B core) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
-| `float_add_scalar`, `float_sub_scalar` | | S1 |
+| `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
 | `float_div{,_scalar}`, `float_recip`, `float_remainder{,_scalar}` | | S3 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
@@ -470,7 +500,7 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `relu`, `relu_backward` | x (B core) | S1 |
+| `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
 | `softmax`, `log_softmax`, `softmin` | | R2 |

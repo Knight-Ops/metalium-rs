@@ -29,6 +29,8 @@
 //! against ttsim and both cards (`step26_sfpu_isa`).
 
 pub mod interp;
+pub mod kernel;
+pub mod ops;
 
 use tt_isa::frontend;
 use tt_isa::isa::generated::{defs, encode};
@@ -80,6 +82,10 @@ pub enum Cond {
     Ne0(LReg),
     Gte0(LReg),
     Eq0(LReg),
+    /// `a < b`, the 32 bits of each read as sign-magnitude integers: for FP32
+    /// the total order `-NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN`
+    /// (Blackhole's `SFPGT`, `SFPGT_MOD1_SET_CC`).
+    Less(LReg, LReg),
 }
 
 impl Cond {
@@ -90,6 +96,7 @@ impl Cond {
             Cond::Ne0(r) => (r, 2),
             Cond::Gte0(r) => (r, 4),
             Cond::Eq0(r) => (r, 6),
+            Cond::Less(a, b) => return encode::sfpgt(a.index(), b.index(), 1).unwrap(),
         };
         encode::sfpsetcc(0, vc.index(), 0, mod1).unwrap()
     }
@@ -155,6 +162,12 @@ impl Program {
         };
         // `SFPENCC_MOD1_EI | SFPENCC_MOD1_RI`, both immediate bits set.
         p.push(encode::sfpencc(3, 0, 2 | 8).unwrap());
+        // The thread's address modifier 0 steps nothing and its `Dst` row
+        // counter is zero, so an `SFPLOAD`/`SFPSTORE` address is absolute --
+        // whatever the kernel before left (a matmul steps the counter).
+        p.ins
+            .push(thread_entry(crate::datapath::addr_mod_entry(0).dst_incr, 0));
+        p.ins.push(clear_dst_rwc());
         p
     }
 
@@ -526,14 +539,18 @@ mod tests {
             }
         });
         assert_eq!(p.loops(), &[LoopForm::Unrolled { body: 40 }]);
-        assert_eq!(p.finish().len(), 1 + 32 * 40);
+        assert_eq!(
+            p.finish().len(),
+            3 + 32 * 40,
+            "the prologue and every iteration"
+        );
 
         let mut p = Program::with_policy(LoopPolicy::Unrolled);
         p.for_each_row_group(4, |p, o| p.store(LReg::L0, Format::Fp32, o));
         let ins = p.finish();
         let addrs: Vec<_> = ins
             .iter()
-            .skip(1)
+            .skip(3)
             .map(|i| i.operand("Imm10").unwrap())
             .collect();
         assert_eq!(addrs, [0, 2], "group 0, both halves");

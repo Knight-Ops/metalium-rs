@@ -1220,6 +1220,14 @@ host; the reduced golden bit for bit on ttsim and both cards after every slice):
       is not a multiple of 32 should be wrong; the crop on download hides the
       rows themselves. MNIST's batches are whole tiles. `tt-metal-concepts-review.md`
       G1; the fix (a typed pad state per tensor) is `hardware-coverage.md` F0.
+- [ ] **`silicon_eth_link::host_driven_tt_link_*` are flaky** (found by Phase 10's
+      full-suite run, 2026-10-01): in the full suite and in their own group, one to
+      three of the four `host_driven_tt_link_card{0,1}_to_card{1,0}_x{3,13}` fail per
+      pass, each after ~2.6 s, a different set each time, and each passes run alone.
+      `main` (8800cdb) fails the same way, so it predates Phase 10; the Ethernet movers'
+      tests (`silicon_eth_link::mover::*`) and the sharded MNIST pass throughout.
+      Next: read what the 2.6 s failure is (the runner's log does not keep test
+      output), and fix the access rather than retrying it.
 - [ ] **A `BufferId` can outlive its engine** (found by review): `DramBuffers`
       numbers from 1 per attach (`burn-tt/src/server.rs`), so a tensor kept across
       a detach and re-attach reads another tensor's buffer, and dropping it frees
@@ -1428,7 +1436,7 @@ tiles, done in turn. The slices from there:
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait
       planner from the plan belong here).
-- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10 (S1, milestone 10.0).
+- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10, and done there (S1, milestone 10.0).
 - [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
       host tilizing: tilize in parallel, or upload row-major and let the movers
       tilize on the device.
@@ -1457,7 +1465,7 @@ every Tensix unit and what drives it, the work items (F foundation, S SFPU, M Ma
 R reductions, D formats and data movement), milestones 10.0–10.6, and the Burn op coverage
 table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
 
-- [ ] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9).
+- [x] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9). Branch `phase10-0-sfpu-foundation`; full silicon suite 381/386 on both cards, the five being two since-fixed `step23` assertions and the pre-existing Ethernet flake above.
 - [ ] **10.1** Softmax and cross-entropy on the device (was 9.12); `MOP`; op-list traces.
 - [ ] **10.2** Activation and math breadth.
 - [ ] **10.3** Reductions over any dim, pooling, device transpose, norms.

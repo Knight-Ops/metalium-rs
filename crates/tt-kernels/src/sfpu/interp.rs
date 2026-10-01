@@ -328,6 +328,27 @@ impl Vector {
                     };
                 }
             }
+            "SFPGT" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                if mod1 & 2 != 0 {
+                    return unmodelled("SFPGT mutating the flag stack".into());
+                }
+                // `SignMagIsSmaller(C, D)`.
+                let key = |x: u32| (x ^ (((x as i32) >> 30) as u32 >> 1)) as i32;
+                let (c, d) = (self.read(at, vc)?, self.read(at, vd)?);
+                let smaller: [bool; 32] = std::array::from_fn(|l| key(c[l]) < key(d[l]));
+                if mod1 & 8 != 0 {
+                    let v = smaller.map(|s| if s { u32::MAX } else { 0 });
+                    self.write(vd, v, false);
+                }
+                if mod1 & 1 != 0 {
+                    for (l, &smaller) in smaller.iter().enumerate() {
+                        if self.lane_enabled(l) {
+                            self.lane_flags[l] = smaller;
+                        }
+                    }
+                }
+            }
             "SFPENCC" => {
                 let (mod1, imm2) = (op("Mod1"), op("Imm2"));
                 for l in 0..32 {

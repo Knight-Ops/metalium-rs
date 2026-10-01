@@ -109,6 +109,9 @@ pub fn op_name(op: u32) -> &'static str {
         record::SCATTER => "scatter",
         record::ELTWISE => "eltwise",
         record::SUM => "sum",
+        record::FILL_PAD => "fill pad",
+        record::READ_RUN => "read run",
+        record::WRITE_RUN => "write run",
         _ => "entry",
     }
 }

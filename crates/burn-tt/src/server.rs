@@ -609,6 +609,19 @@ pub fn kmd_engine(
         session
             .enable_dram(tt_firmware_images::DM_B.1)
             .map_err(|e| EngineError(e.to_string()))?;
+        // `TT_ELTWISE=mover|sfpu`: element-wise ops always on one unit rather
+        // than on whichever is cheaper for their size -- bit-identical, for
+        // comparison (`tt_kernels::tensor::EltwiseUnit`).
+        match std::env::var("TT_ELTWISE").as_deref() {
+            Ok("mover") => session.set_eltwise_unit(tt_kernels::tensor::EltwiseUnit::Mover),
+            Ok("sfpu") => session.set_eltwise_unit(tt_kernels::tensor::EltwiseUnit::Sfpu),
+            Ok("auto") | Err(_) => {}
+            Ok(other) => {
+                return Err(EngineError(format!(
+                    "TT_ELTWISE={other}: expected `auto`, `sfpu` or `mover`"
+                )))
+            }
+        }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.

@@ -145,7 +145,9 @@ pub mod kind {
     /// payloads included (the FP32 unit would flush the one and canonicalise
     /// the other).
     pub const COPY: u32 = 10;
-    pub const LAST: u32 = COPY;
+    /// `a + s`. `a - s` is this with `-s`, bit for bit in IEEE arithmetic.
+    pub const ADD_SCALAR: u32 = 11;
+    pub const LAST: u32 = ADD_SCALAR;
 
     /// The valid rows (or columns) a parameter field names: `0` is 32.
     pub const fn extent(field: u32) -> u32 {

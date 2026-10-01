@@ -219,6 +219,8 @@ pub struct Session<T: Transport> {
     /// Each unit's timestamper stream so far, between
     /// [`Session::profile_start`] and [`Session::profile_stop`].
     profiling: Option<Vec<crate::profile::UnitProfile>>,
+    /// Which unit element-wise ops run on ([`Session::set_eltwise_unit`]).
+    eltwise_unit: tensor::EltwiseUnit,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -513,6 +515,7 @@ impl<T: Transport> Session<T> {
             profile: runtime::Profile::default(),
             dram: None,
             profiling: None,
+            eltwise_unit: tensor::EltwiseUnit::default(),
             _cleanup: cleanup,
         };
         session.prepare().map_err(SessionError::Reset)?;
@@ -737,8 +740,9 @@ impl<T: Transport> Session<T> {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
     }
 
-    /// Element-wise `a (op) b` in GDDR ([`tensor::eltwise`]), on the data
-    /// movers' FP32 units. No Tensix run, so the resident roles are untouched.
+    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`])
+    /// or the data movers' FP32 units ([`tensor::eltwise`]), as
+    /// [`Session::set_eltwise_unit`] says.
     pub fn eltwise(
         &mut self,
         op: tensor::Eltwise,
@@ -747,10 +751,39 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let work = tensor::eltwise(&mut self.dram_state()?.alloc, op, a, b, units)?;
+        let unit = self.eltwise_unit;
+        let alloc = &mut self.dram_state()?.alloc;
+        let [rt, ct] = a.grid();
+        let sfpu = match unit {
+            tensor::EltwiseUnit::Sfpu => true,
+            tensor::EltwiseUnit::Mover => false,
+            tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(op.kind, rt * ct, units),
+        };
+        let work = if sfpu {
+            tensor::sfpu_eltwise(alloc, op, a, b, units)?
+        } else {
+            None
+        };
+        let work = match work {
+            Some(w) => w,
+            None => tensor::eltwise(alloc, op, a, b, units)?,
+        };
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(op.produces(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>()));
         Ok(out)
+    }
+
+    /// Run element-wise ops on `unit` from now on: by default whichever is
+    /// cheaper for the op's size (`tensor::sfpu_is_cheaper`), or always the
+    /// SFPU (where the op has a program), or always the data mover's FP32
+    /// unit, which stays as the reference and the fallback. Bit-identical
+    /// whichever (`step19_eltwise`).
+    pub fn set_eltwise_unit(&mut self, unit: tensor::EltwiseUnit) {
+        self.eltwise_unit = unit;
+    }
+
+    pub fn eltwise_unit(&self) -> tensor::EltwiseUnit {
+        self.eltwise_unit
     }
 
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order

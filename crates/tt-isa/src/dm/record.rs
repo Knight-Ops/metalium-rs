@@ -51,6 +51,16 @@ pub const SUM: u32 = 0x13;
 /// into slot `n` of the staging area at `stage`, filled with `value` outside
 /// the valid region ([`super::kind::FILL_PAD`]) and written back in place.
 pub const FILL_PAD: u32 = 0x14;
+/// A run of whole tiles, GDDR -> L1: `[READ_RUN, first, count, at, flags, 0,
+/// 0, 0]` + `X`. Tiles `first..first + count` of `X` in row-major order, each
+/// into the next tile slot from `at`. `flags` bit 0: `X` is one tile row
+/// broadcast down the run -- tile `(0, j)` read for every tile `(i, j)` --
+/// which is how a `[1, n]` bias meets a `[m, n]` tensor.
+pub const READ_RUN: u32 = 0x15;
+/// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
+/// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
+/// tile `first + n` of `X`, row-major. What a kernel's packer wrote goes back.
+pub const WRITE_RUN: u32 = 0x16;
 
 /// Slots of the staging area a column sum uses at once, accumulator included.
 pub const SUM_SLOTS: usize = 200;
@@ -64,7 +74,7 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 pub const fn len(op: u32) -> usize {
     match op {
         GATHER | SUM => 5,
-        SCATTER | FILL_PAD => 3,
+        SCATTER | FILL_PAD | READ_RUN | WRITE_RUN => 3,
         ELTWISE => 7,
         _ => 1,
     }
@@ -317,6 +327,40 @@ pub fn expand(
                 last_rows,
                 &mut emit,
             )?;
+        }
+        READ_RUN | WRITE_RUN => {
+            let [_, first, count, at, flags, ..] = h;
+            let count = extent(count)?;
+            let x = tensor(rec, 1)?;
+            if x.ct == 0 {
+                return Err(super::error::LENGTH);
+            }
+            let row = h[0] == READ_RUN && flags & 1 != 0;
+            let (mut i, mut j) = div_rem(first, x.ct);
+            for n in 0..count {
+                if n > 0 {
+                    j += 1;
+                    if j == x.ct {
+                        (i, j) = (i + 1, 0);
+                    }
+                }
+                let slot = at + n * TILE_SLOT as u32;
+                let (ch, off) = x.tile(if row { 0 } else { i }, j)?;
+                emit(if h[0] == READ_RUN {
+                    [op::READ, ch, n % PORTS, off, slot, TILE_SLOT as u32, 0, 0]
+                } else {
+                    [
+                        op::WRITE,
+                        ch,
+                        n % PORTS,
+                        off + TILE_DATA as u32,
+                        slot + TILE_DATA as u32,
+                        4096,
+                        0,
+                        0,
+                    ]
+                })?;
+            }
         }
         FILL_PAD => {
             let [_, value, first, count, rows, cols, stage, rt] = h;

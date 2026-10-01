@@ -679,6 +679,30 @@ pub struct Eltwise {
     pub scalar: f32,
 }
 
+/// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
+/// shape or, for `ADD_ROW`, one row as wide.
+fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
+    use tt_isa::dm::kind;
+    let binary = !matches!(
+        op.kind,
+        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+    );
+    let row = op.kind == kind::ADD_ROW;
+    match (binary, b) {
+        (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),
+        (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => Err(TensorError::Shape(
+            format!("[{}, {}] + row [{}, {}]", a.rows, a.cols, b.rows, b.cols),
+        )),
+        (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
+            Err(TensorError::Shape(format!(
+                "[{}, {}] and [{}, {}] differ",
+                a.rows, a.cols, b.rows, b.cols
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Element-wise `a (op) b` -- or `a (op) scalar` -- with everything in GDDR,
 /// computed tile by tile by the data mover's FP32 unit in L1
 /// (`tt_isa::dm::kind`). For `ADD_ROW`, `b` is `[1, cols]` and its row is
@@ -696,7 +720,11 @@ pub fn eltwise(
     units: usize,
 ) -> Result<Work> {
     use tt_isa::dm::kind;
-    let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU | kind::COPY);
+    check_eltwise(op, a, b)?;
+    let binary = !matches!(
+        op.kind,
+        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+    );
     let row = op.kind == kind::ADD_ROW;
     match (binary, b) {
         (false, _) => {}
@@ -751,6 +779,202 @@ pub fn eltwise(
         }]);
     }
     Ok(Work { out, jobs })
+}
+
+/// Which unit computes an element-wise op. Both give the same bits
+/// (`step19_eltwise`); they differ in cost.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EltwiseUnit {
+    /// The data mover's FP32 unit, datum by datum (`tt_isa::dm::kind`).
+    Mover,
+    /// The SFPU, through `crate::sfpu::kernel` -- where the op has a program
+    /// (`crate::sfpu::ops`); the mover otherwise.
+    Sfpu,
+    /// Whichever [`sfpu_is_cheaper`] predicts is faster for the op's size.
+    #[default]
+    Auto,
+}
+
+/// Does the SFPU finish `kind` over `tiles` tiles on `units` units sooner than
+/// the mover? A linear model of each, per op: a fixed cost growing with the
+/// units (the host's per-unit submission; the SFPU's kernel reservation costs
+/// more than a list), plus a cost per tile of the largest share. The
+/// constants are `silicon_perf::eltwise_unit_sweep`'s, on card 0 (divergence
+/// measurement Q): the mover takes ~8 us a tile for the `fadd.s`-shaped kinds
+/// and ~22 us for the per-datum ones (`RELU`, `RELU_BACKWARD`, `ADD_ROW`), the
+/// SFPU ~2-4 us; a list costs ~9 us plus ~2 us a unit, a kernel ~26 us plus
+/// ~4.4 us a unit. So a small op spread thin stays on the mover and anything
+/// with a few tiles a unit goes to the SFPU.
+pub fn sfpu_is_cheaper(kind: u32, tiles: usize, units: usize) -> bool {
+    use tt_isa::dm::kind as k;
+    let per_unit = tiles.div_ceil(units.max(1)).max(1) as f64;
+    let u = units.max(1) as f64 - 1.0;
+    let (mover_tile, sfpu_tile) = match kind {
+        k::RELU | k::RELU_BACKWARD | k::ADD_ROW => (22.4, 2.4),
+        k::MUL_SCALAR | k::ADD_SCALAR => (7.9, 2.4),
+        _ => (7.9, 3.0),
+    };
+    let mover = 9.5 + 2.0 * u + per_unit * mover_tile;
+    let sfpu = 26.0 + 4.4 * u + per_unit * sfpu_tile;
+    sfpu < mover
+}
+
+/// [`eltwise`] on the SFPU: each run of tiles a job of three steps -- the
+/// mover gathers the run's operands into L1 (`record::READ_RUN`), the
+/// resident roles run the SFPU kernel over them (`crate::sfpu::kernel`), the
+/// mover scatters the outputs (`record::WRITE_RUN`). `None` when the op has no
+/// SFPU program.
+///
+/// The roles' programs are memoised by op, scalar and run length, so a
+/// model's repeated ops reuse them, and so does the program cache.
+pub fn sfpu_eltwise(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+    units: usize,
+) -> Result<Option<Work>> {
+    use crate::sfpu::kernel::Operands;
+    let Some((operands, _)) = crate::sfpu::ops::program(op.kind, op.scalar) else {
+        return Ok(None);
+    };
+    check_eltwise(op, a, b)?;
+    let group = sfpu_group(op, operands);
+    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let [rt, ct] = a.grid();
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let rb = b.map(DramTensor::tensor_ref);
+    let mut jobs = Vec::new();
+    for run in runs(rt * ct, units, group) {
+        let len = run.len();
+        let (layout, roles) = match sfpu_programs(op, operands, len) {
+            Ok(p) => p,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(e);
+            }
+        };
+        let read = |x: &TensorRef, at: u64, flags: u32| {
+            [
+                [
+                    record::READ_RUN,
+                    run.start as u32,
+                    len as u32,
+                    at as u32,
+                    flags,
+                    0,
+                    0,
+                    0,
+                ],
+                x.encode()[0],
+                x.encode()[1],
+            ]
+        };
+        let mut gather = read(&ra, layout.a_at, 0).to_vec();
+        if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
+            gather.extend(read(
+                rb,
+                b_at,
+                u32::from(operands == Operands::RowBroadcast),
+            ));
+        }
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![
+            Step::List {
+                what: "sfpu gather",
+                entries: gather,
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+            },
+            Step::List {
+                what: "sfpu scatter",
+                entries: scatter.to_vec(),
+            },
+        ]);
+    }
+    Ok(Some(Work { out, jobs }))
+}
+
+type SfpuPrograms = (crate::sfpu::kernel::Layout, Arc<[Vec<Instruction>; 3]>);
+
+/// Most tiles one SFPU run of `op` may take: 64, or fewer if the data arena
+/// cannot hold their slots or a role's program -- which grows by a fixed
+/// amount per tile -- would outgrow a program slot (`mailbox::PROGRAM_MAX`).
+/// Measured from the programs themselves, at one tile and at two, so an op
+/// with a long program (`ADD_ROW`'s unrolled loop) gets shorter runs rather
+/// than a refusal.
+#[cfg(test)]
+pub(crate) fn sfpu_group_for_tests(
+    kind: u32,
+    scalar: f32,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
+    sfpu_group(Eltwise { kind, scalar }, operands)
+}
+
+fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
+    const GROUP: usize = 64;
+    let lens = |n: usize| -> [usize; 3] {
+        let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
+        let (_, math) =
+            crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+        crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
+    };
+    let (one, two) = (lens(1), lens(2));
+    let max = tt_isa::mailbox::PROGRAM_MAX as usize;
+    let by_program = (0..3)
+        .map(|r| {
+            let per = two[r] - one[r];
+            let fixed = one[r] - per;
+            (max - fixed) / per.max(1)
+        })
+        .min()
+        .unwrap();
+    GROUP
+        .min(crate::sfpu::kernel::max_tiles(operands))
+        .min(by_program)
+        .max(1)
+}
+
+/// One run's layout and role programs, memoised by op, scalar and length.
+fn sfpu_programs(
+    op: Eltwise,
+    operands: crate::sfpu::kernel::Operands,
+    len: usize,
+) -> Result<SfpuPrograms> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Memo = Mutex<HashMap<(u32, u32, usize), SfpuPrograms>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op.kind, op.scalar.to_bits(), len);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Ok(p.clone());
+    }
+    let layout = crate::sfpu::kernel::plan_layout(len, operands)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (_, math) = crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+    let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
+    let p = (layout, roles);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, p.clone());
+    Ok(p)
 }
 
 /// The sum over rows of `a`, as a `[1, cols]` tensor, in `burn-flex`'s order:
@@ -838,6 +1062,8 @@ impl OpPadding for Eltwise {
             kind::ADD | kind::SUB | kind::MUL => zero(0) && zero(1),
             // `0 * s` is a zero unless `s` is infinite or NaN.
             kind::MUL_SCALAR => zero(0) && self.scalar.is_finite(),
+            // `0 + s` is a zero only if `s` is.
+            kind::ADD_SCALAR => zero(0) && self.scalar == 0.0,
             kind::RELU => zero(0),
             kind::COPY => zero(0),
             // `a > 0 ? g : 0`: zero where either is.
@@ -1401,7 +1627,10 @@ mod reference {
         units: usize,
     ) -> Result<Work> {
         use tt_isa::dm::kind;
-        let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU | kind::COPY);
+        let binary = !matches!(
+            op.kind,
+            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+        );
         let row = op.kind == kind::ADD_ROW;
         match (binary, b) {
             (false, _) => {}
