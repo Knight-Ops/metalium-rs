@@ -23,6 +23,7 @@ use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, SessionError, TileChoice};
 
 use crate::TtDevice;
+pub use tt_kernels::tensor::Elem;
 
 /// What a device can do for the backend, on its server thread.
 pub trait Engine {
@@ -45,6 +46,22 @@ pub trait Engine {
     }
     /// Read one back, row-major.
     fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, EngineError> {
+        Err(unsupported())
+    }
+    /// Put a row-major `[rows, cols]` matrix of `elem` datums on the device, as
+    /// their bits (`hardware-coverage.md` D3): an `I32`'s two's complement, a
+    /// `Bool`'s `0` or `1`.
+    fn upload_bits(
+        &mut self,
+        _bits: &[u32],
+        _rows: usize,
+        _cols: usize,
+        _elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        Err(unsupported())
+    }
+    /// Read any buffer back as its datums' bits, row-major.
+    fn download_bits(&mut self, _id: BufferId) -> Result<Vec<u32>, EngineError> {
         Err(unsupported())
     }
     /// Forget one.
@@ -210,6 +227,31 @@ impl DramBuffers {
     ) -> Result<Vec<f32>, EngineError> {
         let t = self.get(id)?;
         s.download(t).map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn upload_bits<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        bits: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        let t = s
+            .upload_bits(bits, rows, cols, elem)
+            .map_err(|e| EngineError(e.to_string()))?;
+        self.next += 1;
+        self.live.insert(self.next, t);
+        Ok(self.next)
+    }
+
+    pub fn download_bits<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+    ) -> Result<Vec<u32>, EngineError> {
+        let t = self.get(id)?;
+        s.download_bits(t).map_err(|e| EngineError(e.to_string()))
     }
 
     pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
@@ -539,6 +581,30 @@ pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usiz
     .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
 }
 
+/// Upload datums as bits, panicking on a device error.
+pub(crate) fn upload_bits(
+    device: TtDevice,
+    bits: Vec<u32>,
+    rows: usize,
+    cols: usize,
+    elem: Elem,
+) -> BufferId {
+    crate::traffic::uploaded(rows, cols);
+    timed_run("upload", device, move |engine| {
+        engine.upload_bits(&bits, rows, cols, elem)
+    })
+    .unwrap_or_else(|e| panic!("upload {elem:?} [{rows}, {cols}] to {device}: {e}"))
+}
+
+/// Download any buffer's datums as bits, panicking on a device error.
+pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u32> {
+    let v = timed_run("download", device, move |engine| engine.download_bits(id))
+        .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
+    debug_assert_eq!(v.len(), rows * cols);
+    crate::traffic::downloaded(rows, cols);
+    v
+}
+
 /// Download, panicking on a device error.
 /// `rows` and `cols` are the buffer's, for the traffic count.
 pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<f32> {
@@ -638,6 +704,20 @@ impl Engine for KmdEngine {
     fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.download(&mut self.session, id)
+    }
+    fn upload_bits(
+        &mut self,
+        v: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.upload_bits(&mut self.session, v, rows, cols, elem)
+    }
+    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.download_bits(&mut self.session, id)
     }
     fn free(&mut self, id: BufferId) {
         if let Some(b) = self.buffers.as_mut() {

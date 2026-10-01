@@ -933,6 +933,33 @@ impl<T: Transport> Session<T> {
         DramTensor::upload(dev, &d.w4, &mut d.alloc, values, rows, cols)
     }
 
+    /// Upload a row-major `[rows, cols]` matrix of `elem` datums, as their
+    /// bits (`DramTensor::upload_bits`).
+    pub fn upload_bits(
+        &mut self,
+        values: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: crate::tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        DramTensor::upload_bits(dev, &d.w4, &mut d.alloc, values, rows, cols, elem)
+    }
+
+    /// Download a tensor of any element type to row-major datums' bits.
+    pub fn download_bits(&mut self, t: &DramTensor) -> Result<Vec<u32>, TensorError> {
+        self.refuse_while_capturing("download")?;
+        self.sync()?;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        t.download_bits(dev, &d.w4)
+    }
+
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
         self.refuse_while_capturing("download")?;
@@ -1897,6 +1924,9 @@ impl<T: Transport> Session<T> {
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
+        // Before any padding fill: an integer tensor is refused untouched.
+        a.expect("a matmul", tensor::Elem::F32)?;
+        b.expect("a matmul", tensor::Elem::F32)?;
         let need = tensor::MatmulPadding;
         let ca = self.meet(a, need.requires(0))?;
         let cb = match self.meet(b, need.requires(1)) {

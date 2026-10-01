@@ -93,7 +93,15 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     ),
     (
         "IntTensorOps",
-        &["int_device", "int_to_device", "int_into_data"],
+        &[
+            "int_device",
+            "int_to_device",
+            "int_into_data",
+            "int_reshape",
+            "int_slice",
+            "int_swap_dims",
+            "int_transpose",
+        ],
     ),
     (
         "BoolTensorOps",
@@ -102,6 +110,14 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "bool_to_device",
             "bool_into_data",
             "bool_argwhere",
+            "bool_reshape",
+            "bool_slice",
+            "bool_swap_dims",
+            "bool_transpose",
+            "bool_not",
+            "bool_and",
+            "bool_or",
+            "bool_xor",
         ],
     ),
     (

@@ -166,6 +166,18 @@ fn attach_engine(
         fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
             self.buffers.download(&mut self.session, id)
         }
+        fn upload_bits(
+            &mut self,
+            v: &[u32],
+            r: usize,
+            c: usize,
+            elem: burn_tt::Elem,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers.upload_bits(&mut self.session, v, r, c, elem)
+        }
+        fn download_bits(&mut self, id: burn_tt::BufferId) -> Result<Vec<u32>, EngineError> {
+            self.buffers.download_bits(&mut self.session, id)
+        }
         fn free(&mut self, id: burn_tt::BufferId) {
             self.buffers.free(&mut self.session, id)
         }

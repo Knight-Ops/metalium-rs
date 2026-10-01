@@ -14,6 +14,7 @@ use tt_isa::isa::Instruction;
 
 use super::kernel::{bias_row, Operands, A_ROW, B_ROW, OUT_ROW};
 use super::{Cond, Format, LReg, Program};
+use crate::tensor::Elem;
 
 /// `+inf`'s bits plus one: the first positive NaN.
 const FIRST_NAN: u32 = 0x7f80_0001;
@@ -33,6 +34,51 @@ pub mod kind_sfpu {
     pub const EXP: u32 = 0x103;
     /// `ln a` (`log_program`).
     pub const LOG: u32 = 0x104;
+    /// `!a` of a `Bool` tensor (`hardware-coverage.md` D3).
+    pub const BOOL_NOT: u32 = 0x105;
+    /// `a && b`, `Bool`.
+    pub const BOOL_AND: u32 = 0x106;
+    /// `a || b`, `Bool`.
+    pub const BOOL_OR: u32 = 0x107;
+    /// `a != b`, `Bool`.
+    pub const BOOL_XOR: u32 = 0x108;
+}
+
+/// What `kind` computes on and what it produces (`crate::tensor::Elem`); `None`
+/// for a kind that moves datums whatever they are (`COPY`), whose output is
+/// its input's. The session refuses any other operand
+/// (`TensorError::Elem`) before choosing a unit.
+pub fn elems(kind: u32) -> Option<(Elem, Elem)> {
+    match kind {
+        kind::COPY => None,
+        kind_sfpu::BOOL_NOT | kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => {
+            Some((Elem::Bool, Elem::Bool))
+        }
+        _ => Some((Elem::F32, Elem::F32)),
+    }
+}
+
+/// Whether `kind` gives the host's bits exactly or an approximation held to a
+/// derived bound -- which decides whether burn-tt's exact mode may run it on
+/// the device (`burn-backend-parity.md` 4.3a).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Accuracy {
+    /// Flex's bits, every input.
+    Exact,
+    /// Within a derived bound: `Program::recip`'s ulp, `EXP_BOUND`, ...
+    Approximate,
+}
+
+/// [`Accuracy`] of `kind`.
+pub fn accuracy(kind: u32) -> Accuracy {
+    match kind {
+        kind_sfpu::RECIP
+        | kind_sfpu::DIV
+        | kind_sfpu::DIV_SCALAR
+        | kind_sfpu::EXP
+        | kind_sfpu::LOG => Accuracy::Approximate,
+        _ => Accuracy::Exact,
+    }
 }
 
 /// `e^x` of `x` into `d`, every register but `x` and `d` scratch.
@@ -189,16 +235,22 @@ pub fn mover_has(kind: u32) -> bool {
 /// What operands `kind` takes, if the SFPU has it.
 pub fn operands(kind: u32) -> Option<Operands> {
     Some(match kind {
-        kind::ADD | kind::SUB | kind::MUL | kind::RELU_BACKWARD | kind_sfpu::DIV => {
-            Operands::Binary
-        }
+        kind::ADD
+        | kind::SUB
+        | kind::MUL
+        | kind::RELU_BACKWARD
+        | kind_sfpu::DIV
+        | kind_sfpu::BOOL_AND
+        | kind_sfpu::BOOL_OR
+        | kind_sfpu::BOOL_XOR => Operands::Binary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
         | kind::RELU
         | kind_sfpu::RECIP
         | kind_sfpu::DIV_SCALAR
         | kind_sfpu::EXP
-        | kind_sfpu::LOG => Operands::Unary,
+        | kind_sfpu::LOG
+        | kind_sfpu::BOOL_NOT => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -237,16 +289,44 @@ pub enum Broadcast {
 
 /// The kinds that take a broadcast second operand.
 pub fn broadcasts(kind: u32) -> bool {
-    matches!(kind, kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV)
+    matches!(
+        kind,
+        kind::ADD
+            | kind::SUB
+            | kind::MUL
+            | kind_sfpu::DIV
+            | kind_sfpu::BOOL_AND
+            | kind_sfpu::BOOL_OR
+            | kind_sfpu::BOOL_XOR
+    )
 }
 
 /// `out = a (kind) b` for one row group, `a` in `L0`, `b` from `Dst` at `b_at`,
 /// the result stored at `out_at`. `DIV` needs `f32::MAX` in `L6` and `+inf`
 /// in `L7` ([`binary_constants`]).
 fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
-    p.load(LReg::L0, Format::Fp32, a_at);
-    p.load(LReg::L1, Format::Fp32, b_at);
+    // A `Bool` is `0`/`1` as an integer -- a denormal to FP32's load and
+    // store, which would flush it -- so the logic ops move raw bits.
+    let fmt = match elems(kind) {
+        Some((Elem::F32, _)) => Format::Fp32,
+        _ => Format::Int32,
+    };
+    p.load(LReg::L0, fmt, a_at);
+    p.load(LReg::L1, fmt, b_at);
     let out = match kind {
+        kind_sfpu::BOOL_AND => {
+            p.and(LReg::L0, LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        kind_sfpu::BOOL_OR => {
+            p.or(LReg::L0, LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        kind_sfpu::BOOL_XOR => {
+            p.mov(LReg::L0, LReg::L2);
+            p.xor(LReg::L1, LReg::L2);
+            LReg::L2
+        }
         kind::ADD => {
             p.add(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
@@ -275,7 +355,7 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
         }
         _ => unreachable!("kind {kind:#x} is not a broadcastable binary op"),
     };
-    p.store(out, Format::Fp32, out_at);
+    p.store(out, fmt, out_at);
 }
 
 /// The constants [`binary_body`] needs for `kind`, loaded once.
@@ -318,7 +398,13 @@ pub fn program_for(
 pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
     let mut p = Program::new();
     let operands = match kind {
-        kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV => {
+        kind::ADD
+        | kind::SUB
+        | kind::MUL
+        | kind_sfpu::DIV
+        | kind_sfpu::BOOL_AND
+        | kind_sfpu::BOOL_OR
+        | kind_sfpu::BOOL_XOR => {
             binary_constants(&mut p, kind);
             p.for_each_row_group(64, |p, o| {
                 binary_body(p, kind, A_ROW + o, B_ROW + o, OUT_ROW + o)
@@ -404,6 +490,16 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
                     log_program(p, LReg::L0, LReg::L7);
                 }
                 p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        // `0`/`1` either way: `x ^ 1`, on raw bits.
+        kind_sfpu::BOOL_NOT => {
+            p.loadi_bits(LReg::L3, 1);
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L2, Format::Int32, A_ROW + o);
+                p.xor(LReg::L3, LReg::L2);
+                p.store(LReg::L2, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
         }

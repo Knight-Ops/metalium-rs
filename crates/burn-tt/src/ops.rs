@@ -18,7 +18,9 @@ use burn_backend::{DType, ExecutionError, IntDType, TensorData, TensorMetadata};
 use burn_flex::{Flex, FlexTensor};
 
 use crate::convert::IntoFlex;
+use crate::server::Elem;
 use crate::{TtBackend, TtDevice, TtQTensor, TtTensor};
+use tt_kernels::sfpu::ops::kind_sfpu;
 
 /// A tensor moved to `device`. The same device: unchanged. Another: its host
 /// copy, retagged -- a device copy belongs to the chip that holds it.
@@ -31,7 +33,7 @@ fn retag(tensor: TtTensor, device: &TtDevice) -> TtTensor {
 
 /// A device result as a tensor.
 fn device_result(device: TtDevice, id: crate::server::BufferId, dims: [usize; 2]) -> TtTensor {
-    device_view(device, id, dims, None)
+    device_view(device, id, dims, None, DType::F32)
 }
 
 /// [`device_result`] for a tensor of `shape`, stored as `dims`
@@ -41,10 +43,11 @@ fn device_result_shaped(
     id: crate::server::BufferId,
     dims: [usize; 2],
     shape: burn_backend::Shape,
+    dtype: DType,
 ) -> TtTensor {
-    let t = device_result(device, id, dims);
+    let t = device_view(device, id, dims, None, dtype);
     let dram = t.dram().expect("made on the device").clone();
-    TtTensor::on_device(dram, shape, device)
+    TtTensor::on_device(dram, shape, dtype, device)
 }
 
 /// A device result that reads `parent`'s slots, keeping it alive.
@@ -53,6 +56,7 @@ fn device_view(
     id: crate::server::BufferId,
     [m, n]: [usize; 2],
     parent: Option<std::sync::Arc<crate::tensor::Buffer>>,
+    dtype: DType,
 ) -> TtTensor {
     let buffer = std::sync::Arc::new(crate::tensor::Buffer {
         id,
@@ -67,6 +71,7 @@ fn device_view(
             transposed: false,
         },
         burn_backend::Shape::from(vec![m, n]),
+        dtype,
         device,
     )
 }
@@ -108,9 +113,10 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
 }
 
 fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) -> Option<TtTensor> {
-    // The SFPU-only ops are approximations: not in exact mode, and not on a
-    // tensor too small to pay their fixed cost (`APPROX_MIN_TILES`).
-    if !tt_kernels::sfpu::ops::mover_has(kind) && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
+    // An approximation: not in exact mode, and not on a tensor too small to
+    // pay its fixed cost (`APPROX_MIN_TILES`). An exact op follows the data.
+    use tt_kernels::sfpu::ops::{accuracy, Accuracy};
+    if accuracy(kind) == Accuracy::Approximate && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
         return None;
     }
     device_eltwise_ungated(kind, scalar, a, b)
@@ -129,8 +135,9 @@ fn device_eltwise_ungated(
     let device = a.device;
     let all = |f: &dyn Fn(&TtTensor) -> bool| f(a) && b.is_none_or(f);
     // Any rank: each operand as the matrix it is stored as
-    // (`crate::tensor::stored_dims`).
-    if !all(&|t: &TtTensor| t.is_stored_f32() && t.device == device) {
+    // (`crate::tensor::stored_dims`), of the element type the kind computes on.
+    let (input, output) = tt_kernels::sfpu::ops::elems(kind)?;
+    if !all(&|t: &TtTensor| t.is_storable() && t.elem() == Some(input) && t.device == device) {
         return None;
     }
     if a.dram().is_none() && b.is_none_or(|b| b.dram().is_none()) {
@@ -182,7 +189,76 @@ fn device_eltwise_ungated(
     }
     let (id, dims) =
         crate::server::eltwise(device, kind, scalar, da.buffer.id, db.map(|d| d.buffer.id));
-    Some(device_result_shaped(device, id, dims, a.shape()))
+    // The input's own dtype where the element type is kept (a bool's store
+    // among them), else the output's.
+    let dtype = if output == input {
+        a.dtype()
+    } else {
+        match output {
+            Elem::F32 => DType::F32,
+            Elem::I32 => DType::I32,
+            Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
+        }
+    };
+    Some(device_result_shaped(device, id, dims, a.shape(), dtype))
+}
+
+/// The two dimensions of a matrix already on the device swapped, as a view of
+/// the same buffer, whatever its element type -- the device matmul reads it
+/// transposed, and a host op downloads it transposed. `None` for anything else.
+fn swapped_view(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
+    if !(tensor.is_storable_matrix() && dim1 != dim2 && dim1 < 2 && dim2 < 2) {
+        return None;
+    }
+    let d = tensor.dram()?;
+    let d = crate::tensor::DramRef {
+        buffer: d.buffer.clone(),
+        transposed: !d.transposed,
+    };
+    let s = tensor.shape().to_vec();
+    Some(TtTensor::on_device(
+        d,
+        burn_backend::Shape::from(vec![s[1], s[0]]),
+        tensor.dtype(),
+        tensor.device,
+    ))
+}
+
+/// `tensor` reshaped, a view of the same slots when the new shape is stored as
+/// the same matrix (`crate::tensor::stored_dims`: `[1, n]` and `[n]`, `[2, 3,
+/// 4]` and `[6, 4]`), so a reshape of a device tensor costs nothing and keeps
+/// it there; else `host`'s, on the host copy -- sharing the source's
+/// device-copy slot where there is none yet, so a bias reshaped every forward
+/// pass is uploaded once.
+fn reshaped(
+    tensor: TtTensor,
+    shape: burn_backend::Shape,
+    host: impl Fn(burn_flex::FlexTensor, burn_backend::Shape) -> burn_flex::FlexTensor,
+) -> TtTensor {
+    let same =
+        tensor.stored().is_some() && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
+    if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
+        if same && tensor.is_storable() {
+            return TtTensor::on_device(d.clone(), shape, tensor.dtype(), tensor.device);
+        }
+    }
+    if same && tensor.is_storable() && tensor.dram().is_none() {
+        let h = host(tensor.host().clone(), shape.clone());
+        return tensor.reshaped_host(h, shape);
+    }
+    let device = tensor.device;
+    TtTensor::new(host(tensor.into_host(), shape), device)
+}
+
+/// On `device`, and for a tensor the device stores on an engine that keeps
+/// tensors, resident there: `Tensor::to_device` is how a caller says "this
+/// lives on the card" (a dataset, its labels, a mask).
+fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
+    let t = retag(tensor, device);
+    if t.is_storable() && crate::server::supports_dram(*device) {
+        let _ = t.to_dram();
+    }
+    t
 }
 
 pub mod float {
@@ -425,19 +501,8 @@ pub mod float {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
-        if tensor.is_matrix_f32() && dim1 != dim2 && dim1 < 2 && dim2 < 2 {
-            if let Some(d) = tensor.dram() {
-                let d = crate::tensor::DramRef {
-                    buffer: d.buffer.clone(),
-                    transposed: !d.transposed,
-                };
-                let s = tensor.shape().to_vec();
-                return TtTensor::on_device(
-                    d,
-                    burn_backend::Shape::from(vec![s[1], s[0]]),
-                    tensor.device,
-                );
-            }
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
         }
         let device = tensor.device;
         TtTensor::new(
@@ -463,25 +528,7 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
-        let same = tensor.stored().is_some()
-            && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
-        if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
-            if same && tensor.is_stored_f32() {
-                return TtTensor::on_device(d.clone(), shape, tensor.device);
-            }
-        }
-        // On the host, but sharing the source's device-copy slot: a bias
-        // reshaped every forward pass is uploaded once, not every pass.
-        if same && tensor.is_stored_f32() && tensor.dram().is_none() {
-            let host =
-                <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.host().clone(), shape.clone());
-            return tensor.reshaped_host(host, shape);
-        }
-        let device = tensor.device;
-        TtTensor::new(
-            <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_host(), shape),
-            device,
-        )
+        reshaped(tensor, shape, <Flex as FloatTensorOps<Flex>>::float_reshape)
     }
 
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
@@ -564,8 +611,8 @@ pub mod float {
         )
     }
 
-    fn row_view(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
-        if !tensor.is_matrix_f32() || slices.is_empty() || slices.len() > 2 {
+    pub(crate) fn row_view(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
+        if !tensor.is_storable_matrix() || slices.is_empty() || slices.len() > 2 {
             return None;
         }
         let d = tensor.dram().filter(|d| !d.transposed)?;
@@ -589,7 +636,13 @@ pub mod float {
             return None;
         }
         let (id, dims) = crate::server::slice_rows(tensor.device, d.buffer.id, first, n);
-        Some(device_view(tensor.device, id, dims, Some(d.buffer.clone())))
+        Some(device_view(
+            tensor.device,
+            id,
+            dims,
+            Some(d.buffer.clone()),
+            tensor.dtype(),
+        ))
     }
 
     pub fn float_device(tensor: &FloatTensor<TtBackend>) -> Device<TtBackend> {
@@ -603,11 +656,7 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let t = retag(tensor, device);
-        if t.is_stored_f32() && crate::server::supports_dram(*device) {
-            let _ = t.to_dram();
-        }
-        t
+        to_device_resident(tensor, device)
     }
 
     pub fn float_into_data(
@@ -733,11 +782,59 @@ pub mod int {
         tensor.device
     }
 
+    /// On `device`, and an `I32` tensor resident there (D3).
     pub fn int_to_device(
         tensor: IntTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> IntTensor<TtBackend> {
-        retag(tensor, device)
+        to_device_resident(tensor, device)
+    }
+
+    /// A view where the stored matrix is kept, as `float_reshape`.
+    pub fn int_reshape(
+        tensor: IntTensor<TtBackend>,
+        shape: burn_backend::Shape,
+    ) -> IntTensor<TtBackend> {
+        reshaped(tensor, shape, <Flex as IntTensorOps<Flex>>::int_reshape)
+    }
+
+    /// Whole tile rows of a device matrix, a view; as `float_slice`.
+    pub fn int_slice(
+        tensor: IntTensor<TtBackend>,
+        slices: &[burn_backend::Slice],
+    ) -> IntTensor<TtBackend> {
+        if let Some(v) = super::float::row_view(&tensor, slices) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_slice(tensor.into_host(), slices),
+            device,
+        )
+    }
+
+    /// A view of a device matrix transposed; as `float_swap_dims`.
+    pub fn int_swap_dims(
+        tensor: IntTensor<TtBackend>,
+        dim1: usize,
+        dim2: usize,
+    ) -> IntTensor<TtBackend> {
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_swap_dims(tensor.into_host(), dim1, dim2),
+            device,
+        )
+    }
+
+    pub fn int_transpose(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let n = tensor.shape().num_dims();
+        if n < 2 {
+            return tensor;
+        }
+        int_swap_dims(tensor, n - 2, n - 1)
     }
 
     pub fn int_into_data(
@@ -754,12 +851,92 @@ pub mod bool {
         tensor.device
     }
 
+    /// On `device`, and resident there as `0`/`1` (D3).
     pub fn bool_to_device(
         tensor: BoolTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> BoolTensor<TtBackend> {
-        retag(tensor, device)
+        to_device_resident(tensor, device)
     }
+
+    pub fn bool_reshape(
+        tensor: BoolTensor<TtBackend>,
+        shape: burn_backend::Shape,
+    ) -> BoolTensor<TtBackend> {
+        reshaped(tensor, shape, <Flex as BoolTensorOps<Flex>>::bool_reshape)
+    }
+
+    pub fn bool_slice(
+        tensor: BoolTensor<TtBackend>,
+        slices: &[burn_backend::Slice],
+    ) -> BoolTensor<TtBackend> {
+        if let Some(v) = super::float::row_view(&tensor, slices) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_slice(tensor.into_host(), slices),
+            device,
+        )
+    }
+
+    pub fn bool_swap_dims(
+        tensor: BoolTensor<TtBackend>,
+        dim1: usize,
+        dim2: usize,
+    ) -> BoolTensor<TtBackend> {
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_swap_dims(tensor.into_host(), dim1, dim2),
+            device,
+        )
+    }
+
+    pub fn bool_transpose(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let n = tensor.shape().num_dims();
+        if n < 2 {
+            return tensor;
+        }
+        bool_swap_dims(tensor, n - 2, n - 1)
+    }
+
+    /// `!x` on the device where the tensor is (`kind_sfpu::BOOL_NOT`).
+    pub fn bool_not(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        if let Some(t) = device_eltwise(kind_sfpu::BOOL_NOT, 0.0, &tensor, None) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_not(tensor.into_host()),
+            device,
+        )
+    }
+
+    macro_rules! logic {
+        ($name:ident, $kind:expr) => {
+            /// On the device where the operands are, with a row or column
+            /// broadcast; else Flex's.
+            pub fn $name(
+                lhs: BoolTensor<TtBackend>,
+                rhs: BoolTensor<TtBackend>,
+            ) -> BoolTensor<TtBackend> {
+                if let Some(t) = device_eltwise($kind, 0.0, &lhs, Some(&rhs)) {
+                    return t;
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as BoolTensorOps<Flex>>::$name(lhs.into_host(), rhs.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    logic!(bool_and, kind_sfpu::BOOL_AND);
+    logic!(bool_or, kind_sfpu::BOOL_OR);
+    logic!(bool_xor, kind_sfpu::BOOL_XOR);
 
     pub fn bool_into_data(
         tensor: BoolTensor<TtBackend>,

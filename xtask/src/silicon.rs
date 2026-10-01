@@ -99,6 +99,7 @@ pub const SMOKE: &[&str] = &[
     "step27_burn_eltwise::",
     "step32_burn_softmax::",
     "step35_burn_rank_n::",
+    "step47_burn_activations::",
     "step11_burn::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",

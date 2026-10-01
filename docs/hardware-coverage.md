@@ -23,7 +23,9 @@ reason given.
 10.2 (branch `phase10-2-activations`) has its instructions (10.2a): every SFPU
 instruction the rest of S2-S4 needs has a typed helper, an interpreter model and a
 device gate on ttsim and both cards, and the `SFPLUTFP32` hazard is closed. D3 (int
-and bool storage) moved into 10.2, so that comparisons and masks stay on the card.
+and bool storage) moved into 10.2, so that comparisons and masks stay on the card, and
+is done (10.2b): `I32` and `Bool` tensors are resident through Burn, with views and
+the logic ops on the card.
 `tt-mnist --activation` now trains with any of seven of Burn's activations; every one
 but ReLU still runs on the host, at 2.2-3.4x ReLU's step time (row AI) -- what the
 rest of 10.2 removes.
@@ -64,7 +66,7 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates) |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
@@ -175,7 +177,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
 | Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
-| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[ ]` | D3 |
+| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
 
@@ -851,8 +853,41 @@ Each names the measurement it must move. The Burn-side ones are in
       half the bytes for every op. `DramTensor` grows a format.
 - [ ] **D2 Block float (BFP8/BFP4).** Measure the codes as divergence rows G and H did,
       then exponent sharing and `CLREXPHIST`. Prerequisite for `QTensorOps` on the device.
-- [ ] **D3 Integer and bool storage** (INT32, INT8, bool as a format) for `IntTensorOps`,
-      `BoolTensorOps`, `QTensorOps`.
+- [x] **D3 Integer and bool storage** (10.2b; was INT32, INT8, bool as a format).
+      `tensor::Elem::{F32, I32, Bool}` on every `DramTensor`. The device moves
+      every 32-bit pattern unchanged -- the FP32-coded unpack to `Dst` and pack back
+      (`step26`'s `INT32` pass-through case) -- so no unpacker or packer is
+      reconfigured: the tag says what an op may compute on. `I32` is the host's
+      two's complement as bits (the unpacker's `INT32` is sign-magnitude, but
+      nothing converts between formats, `SFPIADD` is two's complement, and
+      `i32::MIN` survives); `Bool` is `0`/`1` as an integer, never `1.0`, and an
+      upload of anything else is refused. `Session::{upload_bits,
+      download_bits}`; an FP32 `download` or `write` of another type is refused.
+      Every op computing in FP32 refuses another type by `TensorError::Elem`
+      before choosing a unit or filling padding (`sfpu::ops::elems`, in
+      `broadcast_of`; the matmul, the sums, the reductions); `COPY` moves any.
+      `sfpu::ops::accuracy` (`Exact` / `Approximate`) replaces burn-tt's "not a
+      mover kind is an approximation". Logic ops pulled forward from S5:
+      `kind_sfpu::BOOL_{NOT, AND, OR, XOR}` on raw bits (`Format::Int32` loads and
+      stores, since an FP32 store flushes the denormal `1`), with row and column
+      broadcasts and padding rules (`false && b` is false). Gates:
+      `step42_int_bool_storage` -- round trips at ragged shapes and through a view
+      (every sign, the extremes, bits that are FP32 denormals and NaNs), every
+      refusal, the logic ops against the truth tables and their programs with
+      every broadcast, padding claims against raw tiles; watched failing with
+      `BOOL_NOT` storing as FP32. ttsim and both cards. Burn: `TtTensor`'s cell
+      carries its dtype onto the device (`tensor::device_elem`: `F32`, `I32` --
+      Burn's `IntElem` here -- and a bool of any store); `{int,bool}_{to_device,
+      reshape, slice, swap_dims, transpose}` keep a device copy as `float_`'s do
+      (shared helpers `reshaped`, `swapped_view`, `row_view`), `bool_{not, and,
+      or, xor}` run on it; other int dtypes stay on the host.
+      `step47_burn_activations::integers_and_booleans_stay_on_the_card` against
+      Flex, nothing downloaded, `computed_on_device` (watched failing with
+      `bool_and` routed to the host); in `SMOKE`. MNIST unchanged (labels stay
+      host values). Element-wise ops still do not read a transposed view (M3).
+  - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
+        format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
+        measured beside the block-float ones `QTensorOps` needs.
 - [ ] **D4 Indexing on the B mover.** General `slice` (not only whole tile rows),
       `slice_assign`, `cat`, `gather`, `scatter_add`, `select`, `select_add`, `repeat_dim`,
       `expand`, `flip`, `embedding` and its backward. The mover moves; the SFPU is not
@@ -922,11 +957,13 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| storage on the device | | D3 |
+| storage on the device | x `I32`, `Bool` (any store); other int dtypes host | D3 |
+| `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul,div,remainder}{,_scalar}`, `int_neg`, `int_abs`, comparisons, `bitwise_*` | | S5 |
 | `int_into_float`, `int_cast`, `bool_into_float`, `bool_into_int` | | S6 |
 | `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
-| `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_mask_*` | | S5 |
+| `bool_and`, `bool_or`, `bool_xor`, `bool_not` | x (SFPU, exact) | D3 |
+| `bool_mask_*` | | S5 |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
 | `QTensorOps` | | D2 (stays Flex's until then) |
 

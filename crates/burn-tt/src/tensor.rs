@@ -19,7 +19,19 @@ use burn_backend::quantization::QuantScheme;
 use burn_backend::{DType, QTensorPrimitive, Shape, TensorData, TensorMetadata};
 use burn_flex::{FlexQTensor, FlexTensor};
 
-use crate::server::{self, BufferId};
+use crate::server::{self, BufferId, Elem};
+
+/// The device element type a Burn dtype is stored as (`hardware-coverage.md`
+/// D3): `F32`; `I32` -- Burn's `IntElem` here -- as its bits; a bool of any
+/// store as `0`/`1`. Anything else stays on the host.
+pub(crate) fn device_elem(dtype: DType) -> Option<Elem> {
+    match dtype {
+        DType::F32 => Some(Elem::F32),
+        DType::I32 => Some(Elem::I32),
+        DType::Bool(_) => Some(Elem::Bool),
+        _ => None,
+    }
+}
 use crate::TtDevice;
 
 /// Float, int and bool tensors alike, as Flex uses one primitive for all three.
@@ -85,8 +97,13 @@ impl TtTensor {
         }
     }
 
-    /// A device tensor, of `shape` (the buffer's, or its transpose's).
-    pub(crate) fn on_device(dram: DramRef, shape: Shape, device: TtDevice) -> Self {
+    /// A device tensor, of `shape` (the buffer's, or its transpose's) and
+    /// `dtype` -- one [`device_elem`] stores.
+    pub(crate) fn on_device(dram: DramRef, shape: Shape, dtype: DType, device: TtDevice) -> Self {
+        debug_assert!(
+            device_elem(dtype).is_some(),
+            "{dtype:?} is not stored on the device"
+        );
         let cell = OnceLock::new();
         let _ = cell.set(dram);
         TtTensor {
@@ -94,7 +111,7 @@ impl TtTensor {
                 host: OnceLock::new(),
                 dram: Arc::new(cell),
                 shape,
-                dtype: DType::F32,
+                dtype,
             }),
             device,
         }
@@ -125,19 +142,37 @@ impl TtTensor {
                 );
             }
             let (r, c) = (d.buffer.rows, d.buffer.cols);
-            let v = server::download(self.device, d.buffer.id, r, c);
-            let v = if d.transposed {
-                let mut t = vec![0f32; v.len()];
+            fn transposed<T: Copy + Default>(v: Vec<T>, t: bool, r: usize, c: usize) -> Vec<T> {
+                if !t {
+                    return v;
+                }
+                let mut out = vec![T::default(); v.len()];
                 for i in 0..r {
                     for j in 0..c {
-                        t[j * r + i] = v[i * c + j];
+                        out[j * r + i] = v[i * c + j];
                     }
                 }
-                t
-            } else {
-                v
+                out
+            }
+            let shape = self.cell.shape.clone();
+            let data = match device_elem(self.cell.dtype) {
+                Some(Elem::F32) => {
+                    let v = server::download(self.device, d.buffer.id, r, c);
+                    TensorData::new(transposed(v, d.transposed, r, c), shape)
+                }
+                Some(elem) => {
+                    let v = server::download_bits(self.device, d.buffer.id, r, c);
+                    let v = transposed(v, d.transposed, r, c);
+                    if elem == Elem::I32 {
+                        TensorData::new(v.into_iter().map(|b| b as i32).collect::<Vec<_>>(), shape)
+                    } else {
+                        TensorData::new(v.into_iter().map(|b| b != 0).collect::<Vec<_>>(), shape)
+                            .convert_dtype(self.cell.dtype)
+                    }
+                }
+                None => unreachable!("only a stored dtype has a device copy"),
             };
-            FlexTensor::from_data(TensorData::new(v, self.cell.shape.clone()))
+            FlexTensor::from_data(data)
         })
     }
 
@@ -194,13 +229,34 @@ impl TtTensor {
         self.cell.dram.get_or_init(|| {
             let [rows, cols] =
                 stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
-            let values = self
-                .host()
-                .clone()
-                .into_data()
-                .to_vec::<f32>()
-                .expect("an F32 tensor reads back as f32");
-            let id = server::upload(self.device, values, rows, cols);
+            let data = self.host().clone().into_data();
+            let id = match device_elem(self.cell.dtype) {
+                Some(Elem::F32) => {
+                    let values = data
+                        .to_vec::<f32>()
+                        .expect("an F32 tensor reads back as f32");
+                    server::upload(self.device, values, rows, cols)
+                }
+                Some(Elem::I32) => {
+                    let v = data
+                        .to_vec::<i32>()
+                        .expect("an I32 tensor reads back as i32");
+                    let bits = v.into_iter().map(|x| x as u32).collect();
+                    server::upload_bits(self.device, bits, rows, cols, Elem::I32)
+                }
+                Some(Elem::Bool) => {
+                    let v = data
+                        .convert_dtype(DType::Bool(burn_backend::BoolStore::Native))
+                        .to_vec::<bool>()
+                        .expect("a bool tensor reads back as bool");
+                    let bits = v.into_iter().map(u32::from).collect();
+                    server::upload_bits(self.device, bits, rows, cols, Elem::Bool)
+                }
+                None => panic!(
+                    "callers check the dtype: {:?} is not stored",
+                    self.cell.dtype
+                ),
+            };
             DramRef {
                 buffer: Arc::new(Buffer {
                     id,
@@ -219,6 +275,23 @@ impl TtTensor {
     pub(crate) fn is_stored_f32(&self) -> bool {
         self.cell.dtype == DType::F32
             && stored_dims(&self.cell.shape.to_vec()).is_some_and(|[r, c]| r > 0 && c > 0)
+    }
+
+    /// A tensor of any dtype the device stores ([`device_elem`]), of any rank
+    /// but zero and not empty: what views and residency take.
+    pub(crate) fn is_storable(&self) -> bool {
+        device_elem(self.cell.dtype).is_some()
+            && stored_dims(&self.cell.shape.to_vec()).is_some_and(|[r, c]| r > 0 && c > 0)
+    }
+
+    /// A rank-2 tensor of a stored dtype.
+    pub(crate) fn is_storable_matrix(&self) -> bool {
+        device_elem(self.cell.dtype).is_some() && self.cell.shape.num_dims() == 2
+    }
+
+    /// The device element type this tensor is (or would be) stored as.
+    pub(crate) fn elem(&self) -> Option<Elem> {
+        device_elem(self.cell.dtype)
     }
 
     /// The matrix this tensor is (or would be) stored as on the device.

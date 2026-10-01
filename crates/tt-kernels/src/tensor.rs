@@ -49,6 +49,14 @@ pub enum TensorError {
     Shape(String),
     /// A trace refused (`crate::trace`).
     Trace(crate::trace::TraceError),
+    /// An op given a tensor of an element type it does not compute on: a
+    /// matmul of booleans, a sum of integers -- refused, never computed on
+    /// the bits as if they were FP32.
+    Elem {
+        op: String,
+        got: Elem,
+        wants: Elem,
+    },
 }
 
 impl From<crate::trace::TraceError> for TensorError {
@@ -84,6 +92,11 @@ impl std::fmt::Display for TensorError {
             }
             TensorError::Shape(s) => write!(f, "{s}"),
             TensorError::Trace(e) => write!(f, "{e}"),
+            TensorError::Elem { op, got, wants } => write!(
+                f,
+                "{op} takes {wants:?} tensors, not {got:?}: the device does not compute it on \
+                 these, and treating their bits as {wants:?} would be wrong"
+            ),
         }
     }
 }
@@ -329,11 +342,31 @@ pub trait OpPadding {
     fn produces(&self, inputs: &[&DramTensor]) -> Pad;
 }
 
-/// An FP32 `[rows, cols]` matrix in GDDR, tiled. See the module documentation.
+/// What a tensor's 32-bit datums are (`hardware-coverage.md` D3). The device
+/// moves all three alike -- the FP32-coded unpack to `Dst` and pack back carry
+/// every bit pattern unchanged (`step26_sfpu_isa`'s `INT32` pass-through
+/// case) -- so the tag says only what an op may compute on.
+///
+/// - `I32` is two's complement, as the host has it: the unpacker's and
+///   packer's `INT32` is sign-magnitude, but nothing converts between formats
+///   here, and the SFPU's integer arithmetic (`SFPIADD`) is two's complement,
+///   so the raw bits are the useful form -- and `i32::MIN` has one.
+/// - `Bool` is `0` or `1` as an `I32` (never `1.0`: an FP32 op sees `1` as a
+///   denormal and would flush it).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Elem {
+    F32,
+    I32,
+    Bool,
+}
+
+/// A `[rows, cols]` matrix of 32-bit datums in GDDR, tiled, FP32 unless
+/// [`DramTensor::elem`] says otherwise. See the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DramTensor {
     pub rows: usize,
     pub cols: usize,
+    pub elem: Elem,
     pub placement: Placement,
     /// What the padding holds. Behind a cell because filling it changes no
     /// element of the tensor: the session refreshes it through a shared
@@ -387,12 +420,18 @@ impl DramTensor {
         self.placement.slot(i * ct + j)
     }
 
-    /// Allocate a `[rows, cols]` tensor, contents undefined.
+    /// Allocate a `[rows, cols]` FP32 tensor, contents undefined.
     pub fn alloc(alloc: &mut DramAlloc, rows: usize, cols: usize) -> Result<Self> {
+        Self::alloc_elem(alloc, rows, cols, Elem::F32)
+    }
+
+    /// Allocate a `[rows, cols]` tensor of `elem`, contents undefined.
+    pub fn alloc_elem(alloc: &mut DramAlloc, rows: usize, cols: usize, elem: Elem) -> Result<Self> {
         let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
         let t = DramTensor {
             rows,
             cols,
+            elem,
             placement: alloc.alloc(tiles)?,
             pad: std::cell::Cell::new(Pad::Undefined),
         };
@@ -410,15 +449,44 @@ impl DramTensor {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
+        let bits: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+        Self::upload_bits(dev, w, alloc, &bits, rows, cols, Elem::F32)
+    }
+
+    /// Upload row-major datums of `elem`, as their bits: an `I32`'s two's
+    /// complement, a `Bool`'s `0` or `1` (anything else refused).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_bits<T: Transport>(
+        dev: &mut Device<T>,
+        w: &Window,
+        alloc: &mut DramAlloc,
+        values: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<Self> {
         if values.len() != rows * cols {
             return Err(TensorError::Shape(format!(
                 "{} values for a [{rows}, {cols}] tensor",
                 values.len()
             )));
         }
-        let t = Self::alloc(alloc, rows, cols)?;
-        t.write(dev, w, values)?;
+        let t = Self::alloc_elem(alloc, rows, cols, elem)?;
+        t.write_bits(dev, w, values)?;
         Ok(t)
+    }
+
+    /// Refuse anything but `want`, naming `op`.
+    pub fn expect(&self, op: &str, want: Elem) -> Result<()> {
+        if self.elem == want {
+            Ok(())
+        } else {
+            Err(TensorError::Elem {
+                op: op.into(),
+                got: self.elem,
+                wants: want,
+            })
+        }
     }
 
     /// Overwrite every datum of this tensor, in its own slots: a trace's input
@@ -431,6 +499,31 @@ impl DramTensor {
         w: &Window,
         values: &[f32],
     ) -> Result<()> {
+        self.expect("a write of FP32 values", Elem::F32)?;
+        let bits: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+        self.write_bits(dev, w, &bits)
+    }
+
+    /// [`DramTensor::write`] of datums as their bits, whatever the element
+    /// type; a `Bool` tensor takes only `0` and `1`.
+    pub fn write_bits<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+        values: &[u32],
+    ) -> Result<()> {
+        if self.elem == Elem::Bool {
+            if let Some(i) = values.iter().position(|&v| v > 1) {
+                return Err(TensorError::Shape(format!(
+                    "a Bool tensor's datum {i} is {:#x}, not 0 or 1",
+                    values[i]
+                )));
+            }
+        }
+        // The tilizer is FP32's, which moves bits: `from_bits` keeps every
+        // pattern, NaN payloads included.
+        let values: Vec<f32> = values.iter().map(|&b| f32::from_bits(b)).collect();
+        let values = &values[..];
         let (rows, cols) = (self.rows, self.cols);
         if values.len() != rows * cols {
             return Err(TensorError::Shape(format!(
@@ -492,6 +585,7 @@ impl DramTensor {
         let v = DramTensor {
             rows,
             cols: self.cols,
+            elem: self.elem,
             placement: Placement {
                 tiles: rows.div_ceil(32) * ct,
                 first: self.placement.first + first_row / 32 * ct,
@@ -509,6 +603,20 @@ impl DramTensor {
     /// Download to row-major values: one bulk read per channel, or, for a
     /// view or a small tensor, only what its data occupies.
     pub fn download<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<f32>> {
+        self.expect("a download as FP32 values", Elem::F32)?;
+        self.download_any(dev, w)
+    }
+
+    /// Download to row-major datums as their bits, whatever the element type.
+    pub fn download_bits<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<u32>> {
+        Ok(self
+            .download_any(dev, w)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    }
+
+    fn download_any<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<f32>> {
         // A small tensor, or a view: tile by tile, and of each tile only the
         // faces and face rows its data reaches -- a `[1, n]` row is 64 bytes
         // from each of two faces, not 4 KiB per tile.
@@ -673,6 +781,8 @@ pub fn matmul_dram(
     units: usize,
     allow_mop: bool,
 ) -> Result<Work> {
+    a.expect("a matmul", Elem::F32)?;
+    b.expect("a matmul", Elem::F32)?;
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
     } else {
@@ -823,6 +933,14 @@ pub fn broadcast_of(
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::{broadcasts, Broadcast};
     use tt_isa::dm::kind;
+    let name = || format!("element-wise op {:#x}", op.kind);
+    // `None`: a kind that moves datums, whatever they are.
+    if let Some((input, _)) = crate::sfpu::ops::elems(op.kind) {
+        a.expect(&name(), input)?;
+        if let Some(b) = b {
+            b.expect(&name(), input)?;
+        }
+    }
     let binary = match crate::sfpu::ops::operands(op.kind) {
         Some(o) => o != Operands::Unary,
         None if crate::sfpu::ops::mover_has(op.kind) => !matches!(
@@ -862,6 +980,11 @@ pub fn broadcast_of(
             a.rows, a.cols, b.rows, b.cols
         ))),
     }
+}
+
+/// The element type `kind`'s output has, given its first operand.
+fn output_elem(kind: u32, a: &DramTensor) -> Elem {
+    crate::sfpu::ops::elems(kind).map_or(a.elem, |(_, out)| out)
 }
 
 /// Element-wise `a (op) b` -- or `a (op) scalar` -- with everything in GDDR,
@@ -907,7 +1030,7 @@ pub fn eltwise(
     // Two slots per tile of a run in flight, as one buffer the mover owns.
     const GROUP: usize = 96;
     let stage = staging("eltwise slots", 2 * GROUP)?;
-    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind, a))?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b
@@ -1002,7 +1125,7 @@ pub fn sfpu_eltwise(
         return Ok(None);
     };
     let group = sfpu_group(op, bcast, operands);
-    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind, a))?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b.map(DramTensor::tensor_ref);
@@ -1193,6 +1316,7 @@ pub fn sfpu_reduce(
     axis: crate::sfpu::reduce::Axis,
     units: usize,
 ) -> Result<Work> {
+    a.expect("a reduction", Elem::F32)?;
     use crate::sfpu::reduce::Axis;
     let [rt, ct] = a.grid();
     let (outs, per, valid, out) = match axis {
@@ -1369,6 +1493,7 @@ fn reduce_programs(
 /// Columns are independent; each keeps its rows in order on one tile. They
 /// are dealt out in contiguous runs, one [`Job`] per run, as many as `units`.
 pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
+    a.expect("a column sum", Elem::F32)?;
     // The schedule -- an accumulator per column, slots for its rows, where a
     // list's worth of slots runs out -- is `tt_isa::dm::record::SUM`'s.
     let stage = staging("column-sum slots", record::SUM_SLOTS)?;
@@ -1453,10 +1578,19 @@ impl OpPadding for Eltwise {
                 } else {
                     a.cols % 32 == 0
                 };
-                let z = matches!(self.kind, kind::ADD | kind::SUB | kind::ADD_ROW)
-                    && zero(0)
-                    && zero(1)
-                    && along_clear;
+                use crate::sfpu::ops::kind_sfpu;
+                // `0 && b` is false wherever `a`'s padding is.
+                let z = (self.kind == kind_sfpu::BOOL_AND && zero(0))
+                    || (matches!(
+                        self.kind,
+                        kind::ADD
+                            | kind::SUB
+                            | kind::ADD_ROW
+                            | kind_sfpu::BOOL_OR
+                            | kind_sfpu::BOOL_XOR
+                    ) && zero(0)
+                        && zero(1)
+                        && along_clear);
                 return if z { Pad::Zero } else { Pad::Undefined };
             }
         }
@@ -1474,6 +1608,12 @@ impl OpPadding for Eltwise {
             // The row goes into every row, padding rows included; a tensor
             // with none keeps only padding columns, `0 + 0`.
             kind::ADD_ROW => zero(0) && zero(1) && inputs[0].rows % 32 == 0,
+            // `false && b`, and `false || false`, `false != false`; `!false`
+            // is true.
+            crate::sfpu::ops::kind_sfpu::BOOL_AND => zero(0) || zero(1),
+            crate::sfpu::ops::kind_sfpu::BOOL_OR | crate::sfpu::ops::kind_sfpu::BOOL_XOR => {
+                zero(0) && zero(1)
+            }
             _ => false,
         };
         if z {

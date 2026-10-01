@@ -1179,18 +1179,10 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_to_device(tensor, device)
     }
     fn int_reshape(tensor: IntTensor<TtBackend>, shape: Shape) -> IntTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as IntTensorOps<Flex>>::int_reshape(tensor.into_flex(), shape),
-            device,
-        )
+        crate::ops::int::int_reshape(tensor, shape)
     }
     fn int_slice(tensor: IntTensor<TtBackend>, slices: &[Slice]) -> IntTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as IntTensorOps<Flex>>::int_slice(tensor.into_flex(), slices),
-            device,
-        )
+        crate::ops::int::int_slice(tensor, slices)
     }
     fn int_slice_assign(
         tensor: IntTensor<TtBackend>,
@@ -1809,22 +1801,14 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_transpose(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as IntTensorOps<Flex>>::int_transpose(tensor.into_flex()),
-            device,
-        )
+        crate::ops::int::int_transpose(tensor)
     }
     fn int_swap_dims(
         tensor: IntTensor<TtBackend>,
         dim1: usize,
         dim2: usize,
     ) -> IntTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as IntTensorOps<Flex>>::int_swap_dims(tensor.into_flex(), dim1, dim2),
-            device,
-        )
+        crate::ops::int::int_swap_dims(tensor, dim1, dim2)
     }
     fn int_permute(tensor: IntTensor<TtBackend>, axes: &[usize]) -> IntTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -2144,18 +2128,10 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         crate::ops::bool::bool_to_device(tensor, device)
     }
     fn bool_reshape(tensor: BoolTensor<TtBackend>, shape: Shape) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_reshape(tensor.into_flex(), shape),
-            device,
-        )
+        crate::ops::bool::bool_reshape(tensor, shape)
     }
     fn bool_slice(tensor: BoolTensor<TtBackend>, slices: &[Slice]) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_slice(tensor.into_flex(), slices),
-            device,
-        )
+        crate::ops::bool::bool_slice(tensor, slices)
     }
     fn bool_slice_assign(
         tensor: BoolTensor<TtBackend>,
@@ -2316,50 +2292,26 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_not(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_not(tensor.into_flex()),
-            device,
-        )
+        crate::ops::bool::bool_not(tensor)
     }
     fn bool_and(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_and(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::bool::bool_and(lhs, rhs)
     }
     fn bool_or(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_or(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::bool::bool_or(lhs, rhs)
     }
     fn bool_xor(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_xor(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::bool::bool_xor(lhs, rhs)
     }
     fn bool_transpose(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_transpose(tensor.into_flex()),
-            device,
-        )
+        crate::ops::bool::bool_transpose(tensor)
     }
     fn bool_swap_dims(
         tensor: BoolTensor<TtBackend>,
         dim1: usize,
         dim2: usize,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as BoolTensorOps<Flex>>::bool_swap_dims(tensor.into_flex(), dim1, dim2),
-            device,
-        )
+        crate::ops::bool::bool_swap_dims(tensor, dim1, dim2)
     }
     fn bool_permute(tensor: BoolTensor<TtBackend>, axes: &[usize]) -> BoolTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
