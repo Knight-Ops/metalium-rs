@@ -61,6 +61,8 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
             };
             let (a, b, row) = (ta(&av, [r, c]), ta(&bv, [r, c]), ta(&rowv, [1, c]));
             let (fa, fb, frow) = (fl(&av, [r, c]), fl(&bv, [r, c]), fl(&rowv, [1, c]));
+            let colv = values(6, r);
+            let (col, fcol) = (ta(&colv, [r, 1]), fl(&colv, [r, 1]));
             type Case = (
                 &'static str,
                 Box<dyn Fn() -> Tensor<TtBackend, 2>>,
@@ -98,6 +100,38 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
                         move || a.clone() + row.clone()
                     }),
                     bits(fa.clone() + frow.clone()),
+                ),
+                (
+                    "subtract a row",
+                    Box::new({
+                        let (a, row) = (a.clone(), row.clone());
+                        move || a.clone() - row.clone()
+                    }),
+                    bits(fa.clone() - frow.clone()),
+                ),
+                (
+                    "a row times (on the left)",
+                    Box::new({
+                        let (a, row) = (a.clone(), row.clone());
+                        move || row.clone() * a.clone()
+                    }),
+                    bits(frow.clone() * fa.clone()),
+                ),
+                (
+                    "subtract a column",
+                    Box::new({
+                        let (a, col) = (a.clone(), col.clone());
+                        move || a.clone() - col.clone()
+                    }),
+                    bits(fa.clone() - fcol.clone()),
+                ),
+                (
+                    "a column plus (on the left)",
+                    Box::new({
+                        let (a, col) = (a.clone(), col.clone());
+                        move || col.clone() + a.clone()
+                    }),
+                    bits(fcol.clone() + fa.clone()),
                 ),
                 (
                     "mul_scalar",

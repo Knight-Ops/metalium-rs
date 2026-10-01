@@ -102,6 +102,11 @@ pub mod op {
     /// were separate lists, whose entries may reuse each other's L1 slots.
     /// Only in a list entry.
     pub const WAIT: u32 = 7;
+    /// As [`READ_TRANSPOSED`], but the mover writes the tile with its column
+    /// 0 copied into every column: datum `(r, c)` from `(r, 0)`. A `[rows, 1]`
+    /// tensor so read is a whole tile to broadcast across a `[rows, cols]`
+    /// one, element for element. Only in a list entry.
+    pub const READ_BROADCAST_COL: u32 = 8;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -195,11 +200,22 @@ pub const fn face_index(row: usize, col: usize) -> usize {
 
 /// A decoded list entry: a move ([`Descriptor`], possibly a transposed tile
 /// read), or element-wise compute on tiles in L1.
+/// What the mover does to a tile it reads before anything else sees it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Transform {
+    /// Nothing: the bytes land where the descriptor says.
+    None,
+    /// [`op::READ_TRANSPOSED`].
+    Transpose,
+    /// [`op::READ_BROADCAST_COL`].
+    BroadcastCol0,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
     Move {
         descriptor: Descriptor,
-        transpose: bool,
+        transform: Transform,
     },
     Compute {
         kind: u32,
@@ -226,8 +242,12 @@ impl Entry {
     /// Decode entry words against the `usable` mask. A transposed read must be
     /// exactly one slot into a 16-aligned L1 slot inside L1.
     pub fn decode(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
-        let transpose = w[0] == op::READ_TRANSPOSED;
-        if transpose {
+        let transform = match w[0] {
+            op::READ_TRANSPOSED => Transform::Transpose,
+            op::READ_BROADCAST_COL => Transform::BroadcastCol0,
+            _ => Transform::None,
+        };
+        if transform != Transform::None {
             if w[5] as u64 != TILE_SLOT || w[4] % 16 != 0 {
                 return Err(error::LENGTH);
             }
@@ -238,7 +258,7 @@ impl Entry {
             }
             return Ok(Entry::Move {
                 descriptor: Descriptor { l1: w[4], ..d },
-                transpose,
+                transform,
             });
         }
         if w[0] == op::LIST {
@@ -303,7 +323,7 @@ impl Entry {
         Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(|descriptor| {
             Entry::Move {
                 descriptor,
-                transpose,
+                transform,
             }
         })
     }
@@ -426,12 +446,33 @@ mod tests {
         .unwrap();
         let Entry::Move {
             descriptor,
-            transpose,
+            transform,
         } = e
         else {
             panic!("{e:?}")
         };
-        assert!(transpose);
+        assert_eq!(transform, Transform::Transpose);
+        let b = Entry::decode(
+            ALL,
+            [
+                op::READ_BROADCAST_COL,
+                2,
+                0,
+                0x1040,
+                0x2_0010,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            b,
+            Entry::Move {
+                transform: Transform::BroadcastCol0,
+                ..
+            }
+        ));
         assert_eq!(
             (descriptor.l1, descriptor.range.offset()),
             (0x2_0010, 0x1040)
@@ -465,7 +506,7 @@ mod tests {
         assert!(matches!(
             w,
             Entry::Move {
-                transpose: false,
+                transform: Transform::None,
                 ..
             }
         ));

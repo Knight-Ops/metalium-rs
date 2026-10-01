@@ -469,6 +469,18 @@ reverse index.
       `prod`, full and per dim (today only `sum_dim(0)`, on the B core). Within a tile by
       S8/M2, across tiles by the mover (or NoC atomics). Sum order stated against Flex's,
       as `COL_SUM`'s is.
+- [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
+      `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
+      laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
+      (`tt_isa::dm::op::READ_BROADCAST_COL`, `READ_RUN` flag bit 1, `Transform` on
+      the decoded entry). The session reads the broadcast from the shapes
+      (`tensor::broadcast_of`) and sends to the SFPU whatever the mover cannot do;
+      padding rules know a broadcast lands in the padding along its dimension.
+      Burn's element-wise ops take a broadcast operand on either side where the op
+      commutes. Gates: `step30_broadcast` (row and column, the four kinds, `[37, 70]`
+      and `[64, 96]`; Flex bit for bit, `DIV` within one ulp; device equal to the
+      program; padding claims checked against raw tiles) and `step27_burn_eltwise`'s
+      broadcast cases; ttsim and both cards.
 - [ ] **R2 Softmax, log-softmax, cross-entropy on the device** (was checklist 9.12): max,
       subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
       per-step logits download goes away as a consequence, not as the goal. Burn:

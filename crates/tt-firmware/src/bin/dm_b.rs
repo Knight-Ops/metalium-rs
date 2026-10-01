@@ -9,7 +9,7 @@
 #![no_main]
 
 use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, record, Descriptor, Entry};
+use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
@@ -79,6 +79,22 @@ fn transpose_from_scratch(dst: u64) {
                     unsafe { *out.add(to + i * 16 + j) = *src.add(from + j * 16 + i) };
                 }
             }
+        }
+    }
+}
+
+/// The tile in the scratch slot into the slot at `dst`, its column 0 copied
+/// into every column (`dm::op::READ_BROADCAST_COL`): header copied, datum
+/// `(r, c)` from `(r, 0)`.
+fn broadcast_col0_from_scratch(dst: u64) {
+    for w in 0..(dm::TILE_DATA / 4) {
+        wr(dst + w * 4, rd(dm::SCRATCH + w * 4));
+    }
+    let (src, out) = (dm::SCRATCH + dm::TILE_DATA, dst + dm::TILE_DATA);
+    for r in 0..32usize {
+        let v = rd(src + dm::face_index(r, 0) as u64 * 4);
+        for c in 0..32usize {
+            wr(out + dm::face_index(r, c) as u64 * 4, v);
         }
     }
 }
@@ -243,12 +259,19 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 /// first waits for everything before it.
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
-        Entry::Move { descriptor, transpose: true } => {
+        Entry::Move {
+            descriptor,
+            transform: transform @ (Transform::Transpose | Transform::BroadcastCol0),
+        } => {
             // Everything before it has landed, and the scratch is free.
             noc::wait(TXN);
             run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
             publish();
-            transpose_from_scratch(descriptor.l1 as u64);
+            if transform == Transform::Transpose {
+                transpose_from_scratch(descriptor.l1 as u64);
+            } else {
+                broadcast_col0_from_scratch(descriptor.l1 as u64);
+            }
             // Visible in L1 before anything else reads the slot.
             publish();
         }

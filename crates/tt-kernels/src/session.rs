@@ -754,21 +754,37 @@ impl<T: Transport> Session<T> {
         let unit = self.eltwise_unit;
         let alloc = &mut self.dram_state()?.alloc;
         let [rt, ct] = a.grid();
-        // An op only the SFPU has goes there whatever the setting.
-        let sfpu = !crate::sfpu::ops::mover_has(op.kind)
+        let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
+        use crate::sfpu::ops::Broadcast;
+        // What the mover can do: its own kinds, the same shape or `ADD_ROW`.
+        let mover_op = match (kind, bcast) {
+            (k, Broadcast::None) if crate::sfpu::ops::mover_has(k) => Some(op),
+            (tt_isa::dm::kind::ADD, Broadcast::Row) => Some(tensor::Eltwise {
+                kind: tt_isa::dm::kind::ADD_ROW,
+                ..op
+            }),
+            _ => None,
+        };
+        // Anything else goes to the SFPU whatever the setting.
+        let sfpu = mover_op.is_none()
             || match unit {
                 tensor::EltwiseUnit::Sfpu => true,
                 tensor::EltwiseUnit::Mover => false,
-                tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(op.kind, rt * ct, units),
+                tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(kind, rt * ct, units),
             };
         let work = if sfpu {
             tensor::sfpu_eltwise(alloc, op, a, b, units)?
         } else {
             None
         };
-        let work = match work {
-            Some(w) => w,
-            None => tensor::eltwise(alloc, op, a, b, units)?,
+        let work = match (work, mover_op) {
+            (Some(w), _) => w,
+            (None, Some(m)) => tensor::eltwise(alloc, m, a, b, units)?,
+            (None, None) => {
+                return Err(TensorError::Shape(format!(
+                    "element-wise {kind:#x} with {bcast:?}: no unit computes it"
+                )))
+            }
         };
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(op.produces(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>()));

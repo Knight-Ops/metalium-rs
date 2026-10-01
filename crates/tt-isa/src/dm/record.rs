@@ -51,11 +51,14 @@ pub const SUM: u32 = 0x13;
 /// into slot `n` of the staging area at `stage`, filled with `value` outside
 /// the valid region ([`super::kind::FILL_PAD`]) and written back in place.
 pub const FILL_PAD: u32 = 0x14;
-/// A run of whole tiles, GDDR -> L1: `[READ_RUN, first, count, at, flags, 0,
-/// 0, 0]` + `X`. Tiles `first..first + count` of `X` in row-major order, each
-/// into the next tile slot from `at`. `flags` bit 0: `X` is one tile row
-/// broadcast down the run -- tile `(0, j)` read for every tile `(i, j)` --
-/// which is how a `[1, n]` bias meets a `[m, n]` tensor.
+/// A run of whole tiles, GDDR -> L1: `[READ_RUN, first, count, at, flags, ct,
+/// 0, 0]` + `X`. Tiles `first..first + count`, row-major over a grid `ct`
+/// tiles wide (the output's; `X`'s own when it is not a broadcast), each into
+/// the next tile slot from `at`. `flags` bit 0: `X` is one tile row broadcast
+/// down -- tile `(0, j)` read for every `(i, j)` -- which is how a `[1, n]`
+/// bias meets a `[m, n]` tensor; bit 1: `X` is one tile column broadcast
+/// across -- tile `(i, 0)` read, its column 0 copied into every column
+/// ([`op::READ_BROADCAST_COL`]) -- how a `[m, 1]` tensor meets one.
 pub const READ_RUN: u32 = 0x15;
 /// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
 /// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
@@ -329,25 +332,35 @@ pub fn expand(
             )?;
         }
         READ_RUN | WRITE_RUN => {
-            let [_, first, count, at, flags, ..] = h;
+            let [_, first, count, at, flags, grid_ct, ..] = h;
             let count = extent(count)?;
             let x = tensor(rec, 1)?;
-            if x.ct == 0 {
+            let read = h[0] == READ_RUN;
+            let (row, col) = (read && flags & 1 != 0, read && flags & 2 != 0);
+            // The grid the run counts over: the output's for a broadcast, the
+            // tensor's own otherwise (and for every older record, whose word
+            // 5 is zero).
+            let ct = if grid_ct != 0 { grid_ct } else { x.ct };
+            if ct == 0 || x.ct == 0 || (row && col) {
                 return Err(super::error::LENGTH);
             }
-            let row = h[0] == READ_RUN && flags & 1 != 0;
-            let (mut i, mut j) = div_rem(first, x.ct);
+            let (mut i, mut j) = div_rem(first, ct);
             for n in 0..count {
                 if n > 0 {
                     j += 1;
-                    if j == x.ct {
+                    if j == ct {
                         (i, j) = (i + 1, 0);
                     }
                 }
                 let slot = at + n * TILE_SLOT as u32;
-                let (ch, off) = x.tile(if row { 0 } else { i }, j)?;
-                emit(if h[0] == READ_RUN {
-                    [op::READ, ch, n % PORTS, off, slot, TILE_SLOT as u32, 0, 0]
+                let (ch, off) = x.tile(if row { 0 } else { i }, if col { 0 } else { j })?;
+                let op = if col {
+                    op::READ_BROADCAST_COL
+                } else {
+                    op::READ
+                };
+                emit(if read {
+                    [op, ch, n % PORTS, off, slot, TILE_SLOT as u32, 0, 0]
                 } else {
                     [
                         op::WRITE,

@@ -677,9 +677,9 @@ mod tests {
     #[test]
     fn what_has_no_model_is_refused_by_name() {
         let mut v = Vector::new();
-        let p = [tt_isa::isa::generated::encode::sfparecip(0, 1, 2, 0).unwrap()];
+        let p = [tt_isa::isa::generated::encode::sfpcast(1, 2, 0).unwrap()];
         let e = v.run(&p).unwrap_err();
-        assert!(e.to_string().contains("SFPARECIP"), "{e}");
+        assert!(e.to_string().contains("SFPCAST"), "{e}");
         let read8 = [tt_isa::isa::generated::encode::sfpmov(8, 0, 0).unwrap()];
         assert_eq!(
             Vector::new().run(&read8),

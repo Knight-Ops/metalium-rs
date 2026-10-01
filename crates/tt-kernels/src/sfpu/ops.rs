@@ -224,21 +224,104 @@ fn divide(p: &mut Program, a: LReg, b: LReg, y: LReg, q: LReg, r: LReg, t: LReg,
     });
 }
 
+/// How a binary op's second operand meets the first.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Broadcast {
+    /// The same shape.
+    None,
+    /// `[1, cols]`: its one row added (or subtracted, ...) to every row.
+    Row,
+    /// `[rows, 1]`: its one column to every column.
+    Col,
+}
+
+/// The kinds that take a broadcast second operand.
+pub fn broadcasts(kind: u32) -> bool {
+    matches!(kind, kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV)
+}
+
+/// `out = a (kind) b` for one row group, `a` in `L0`, `b` from `Dst` at `b_at`,
+/// the result stored at `out_at`. `DIV` needs `f32::MAX` in `L6` and `+inf`
+/// in `L7` ([`binary_constants`]).
+fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
+    p.load(LReg::L0, Format::Fp32, a_at);
+    p.load(LReg::L1, Format::Fp32, b_at);
+    let out = match kind {
+        kind::ADD => {
+            p.add(LReg::L0, LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        kind::SUB => {
+            p.sub(LReg::L0, LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        kind::MUL => {
+            p.mul(LReg::L0, LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        kind_sfpu::DIV => {
+            p.recip(LReg::L1, LReg::L2, LReg::L3, LReg::L4, LReg::L6);
+            divide(
+                p,
+                LReg::L0,
+                LReg::L1,
+                LReg::L2,
+                LReg::L5,
+                LReg::L3,
+                LReg::L4,
+                LReg::L7,
+            );
+            LReg::L5
+        }
+        _ => unreachable!("kind {kind:#x} is not a broadcastable binary op"),
+    };
+    p.store(out, Format::Fp32, out_at);
+}
+
+/// The constants [`binary_body`] needs for `kind`, loaded once.
+fn binary_constants(p: &mut Program, kind: u32) {
+    if kind == kind_sfpu::DIV {
+        p.loadi_bits(LReg::L6, f32::MAX.to_bits());
+        p.loadi_bits(LReg::L7, 0x7f80_0000);
+    }
+}
+
+/// The program for `kind` with its second operand broadcast as `bcast`, and
+/// what operands it takes; `None` where there is none. A row broadcast reads
+/// the row's two faces from where the kernel lays them, which depends on the
+/// row group, so its loop is unrolled; a column broadcast reads a whole tile
+/// the mover has made of the column (`READ_BROADCAST_COL`), so its program is
+/// the plain binary one.
+pub fn program_for(
+    kind: u32,
+    scalar: f32,
+    bcast: Broadcast,
+) -> Option<(Operands, Vec<Instruction>)> {
+    match bcast {
+        Broadcast::None => program(kind, scalar),
+        _ if !broadcasts(kind) => None,
+        Broadcast::Col => program(kind, scalar).map(|(_, p)| (Operands::ColBroadcast, p)),
+        Broadcast::Row => {
+            let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
+            binary_constants(&mut p, kind);
+            p.for_each_row_group(64, |p, o| {
+                binary_body(p, kind, A_ROW + o, bias_row(o / 4) + (o & 2), OUT_ROW + o)
+            });
+            Some((Operands::RowBroadcast, p.finish()))
+        }
+    }
+}
+
 /// The program for `kind` (with its scalar), and what operands it takes, or
-/// `None` for a kind with no SFPU program.
+/// `None` for a kind with no SFPU program. `ADD_ROW` is `ADD` with a row
+/// broadcast ([`program_for`]).
 pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
     let mut p = Program::new();
     let operands = match kind {
-        kind::ADD | kind::SUB | kind::MUL => {
+        kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV => {
+            binary_constants(&mut p, kind);
             p.for_each_row_group(64, |p, o| {
-                p.load(LReg::L0, Format::Fp32, A_ROW + o);
-                p.load(LReg::L1, Format::Fp32, B_ROW + o);
-                match kind {
-                    kind::ADD => p.add(LReg::L0, LReg::L1, LReg::L2),
-                    kind::SUB => p.sub(LReg::L0, LReg::L1, LReg::L2),
-                    _ => p.mul(LReg::L0, LReg::L1, LReg::L2),
-                }
-                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+                binary_body(p, kind, A_ROW + o, B_ROW + o, OUT_ROW + o)
             });
             Operands::Binary
         }
@@ -291,18 +374,12 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
             });
             Operands::Unary
         }
-        kind_sfpu::DIV | kind_sfpu::DIV_SCALAR => {
-            let scalar_b = kind == kind_sfpu::DIV_SCALAR;
+        kind_sfpu::DIV_SCALAR => {
             p.loadi_bits(LReg::L6, f32::MAX.to_bits());
             p.loadi_bits(LReg::L7, 0x7f80_0000);
-            if scalar_b {
-                p.loadi(LReg::L1, scalar);
-            }
+            p.loadi(LReg::L1, scalar);
             p.for_each_row_group(64, |p, o| {
                 p.load(LReg::L0, Format::Fp32, A_ROW + o);
-                if !scalar_b {
-                    p.load(LReg::L1, Format::Fp32, B_ROW + o);
-                }
                 p.recip(LReg::L1, LReg::L2, LReg::L3, LReg::L4, LReg::L6);
                 divide(
                     p,
@@ -316,11 +393,7 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
                 );
                 p.store(LReg::L5, Format::Fp32, OUT_ROW + o);
             });
-            if scalar_b {
-                Operands::Unary
-            } else {
-                Operands::Binary
-            }
+            Operands::Unary
         }
         kind_sfpu::EXP | kind_sfpu::LOG => {
             p.for_each_row_group(64, |p, o| {
@@ -334,16 +407,7 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
             });
             Operands::Unary
         }
-        kind::ADD_ROW => {
-            let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
-            p.for_each_row_group(64, |p, o| {
-                p.load(LReg::L0, Format::Fp32, A_ROW + o);
-                p.load(LReg::L1, Format::Fp32, bias_row(o / 4) + (o & 2));
-                p.add(LReg::L0, LReg::L1, LReg::L2);
-                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
-            });
-            return Some((Operands::RowBroadcast, p.finish()));
-        }
+        kind::ADD_ROW => return program_for(kind::ADD, scalar, Broadcast::Row),
         _ => return None,
     };
     Some((operands, p.finish()))
@@ -363,9 +427,33 @@ pub fn reference(
     rows: usize,
     cols: usize,
 ) -> Vec<f32> {
+    let bcast = match (kind, b.map(<[f32]>::len)) {
+        (kind::ADD_ROW, _) => Broadcast::Row,
+        (_, Some(n)) if n == cols && rows > 1 && broadcasts(kind) => Broadcast::Row,
+        (_, Some(n)) if n == rows && cols > 1 && broadcasts(kind) => Broadcast::Col,
+        _ => Broadcast::None,
+    };
+    let kind = if kind == kind::ADD_ROW {
+        kind::ADD
+    } else {
+        kind
+    };
+    reference_for(kind, scalar, bcast, a, b, rows, cols)
+}
+
+/// [`reference`] with the broadcast said rather than read from `b`'s length.
+pub fn reference_for(
+    kind: u32,
+    scalar: f32,
+    bcast: Broadcast,
+    a: &[f32],
+    b: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
     use super::interp::Vector;
     use tt_isa::dm::face_index;
-    let (operands, math) = program(kind, scalar).expect("an SFPU op");
+    let (operands, math) = program_for(kind, scalar, bcast).expect("an SFPU op");
     let (rt, ct) = (rows.div_ceil(32), cols.div_ceil(32));
     let mut out = vec![0.0f32; rows * cols];
     let tile = |x: &[f32], xr: usize, i: usize, j: usize| -> Vec<u32> {
@@ -392,6 +480,19 @@ pub fn reference(
                         v.dst[(B_ROW + r) as usize] = std::array::from_fn(|c| t[c]);
                         v.dst[(B_ROW + 4 + r) as usize] = std::array::from_fn(|c| t[256 + c]);
                     }
+                }
+                (Operands::ColBroadcast, Some(b)) => {
+                    // As `READ_BROADCAST_COL` makes it: row `r`'s value in
+                    // every column.
+                    let mut t = vec![0u32; 1024];
+                    for r in 0..32 {
+                        let gr = 32 * i + r;
+                        let v = if gr < rows { b[gr].to_bits() } else { 0 };
+                        for c in 0..32 {
+                            t[face_index(r, c)] = v;
+                        }
+                    }
+                    v.put_tile(B_ROW as usize, &t);
                 }
                 (Operands::Unary, _) => {}
                 _ => panic!("kind {kind:#x} takes a second operand"),

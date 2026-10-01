@@ -77,12 +77,17 @@ fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) ->
         return None;
     }
     let (sa, sb) = (a.shape().to_vec(), b.map(|b| b.shape().to_vec()));
-    let (kind, a, b) = match (kind, &sb) {
-        (_, None) => (kind, a, b),
-        (_, Some(s)) if *s == sa => (kind, a, b),
-        (k::ADD, Some(s)) if s[0] == 1 && s[1] == sa[1] => (k::ADD_ROW, a, b),
-        // Addition commutes bit for bit, so a row on the left is a row too.
-        (k::ADD, Some(s)) if sa[0] == 1 && sa[1] == s[1] => (k::ADD_ROW, b?, Some(a)),
+    let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
+    // `b` the same shape, or one row or one column of `a` to broadcast; for an
+    // op that commutes bit for bit (addition, multiplication) the broadcast
+    // operand may be on the left. The session reads which from the shapes.
+    let broadcast_of =
+        |x: &[usize], y: &[usize]| (y[0] == 1 && y[1] == x[1]) || (y[1] == 1 && y[0] == x[0]);
+    let (a, b) = match &sb {
+        None => (a, b),
+        Some(s) if *s == sa => (a, b),
+        Some(s) if broadcasts && broadcast_of(&sa, s) => (a, b),
+        Some(s) if matches!(kind, k::ADD | k::MUL) && broadcast_of(s, &sa) => (b?, Some(a)),
         _ => return None,
     };
     let (da, db) = (a.to_dram(), b.map(|b| b.to_dram()));

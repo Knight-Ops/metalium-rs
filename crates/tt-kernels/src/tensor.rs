@@ -682,7 +682,21 @@ pub struct Eltwise {
 /// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
 /// shape or, for `ADD_ROW`, one row as wide.
 fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
+    broadcast_of(op, a, b).map(|_| ())
+}
+
+/// What an element-wise op is once its operands' shapes are read: its kind
+/// (`ADD_ROW` is `ADD` with a row broadcast) and how `b` meets `a` -- the same
+/// shape, one row (`[1, cols]`) or one column (`[rows, 1]`), the last two only
+/// for the kinds that take one (`sfpu::ops::broadcasts`). Refuses anything
+/// else.
+pub fn broadcast_of(
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+) -> Result<(u32, crate::sfpu::ops::Broadcast)> {
     use crate::sfpu::kernel::Operands;
+    use crate::sfpu::ops::{broadcasts, Broadcast};
     use tt_isa::dm::kind;
     let binary = match crate::sfpu::ops::operands(op.kind) {
         Some(o) => o != Operands::Unary,
@@ -697,19 +711,31 @@ fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<
             )))
         }
     };
-    let row = op.kind == kind::ADD_ROW;
+    let shape = |t: &DramTensor| (t.rows, t.cols);
     match (binary, b) {
+        (false, _) => Ok((op.kind, Broadcast::None)),
         (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),
-        (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => Err(TensorError::Shape(
-            format!("[{}, {}] + row [{}, {}]", a.rows, a.cols, b.rows, b.cols),
-        )),
-        (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
-            Err(TensorError::Shape(format!(
-                "[{}, {}] and [{}, {}] differ",
-                a.rows, a.cols, b.rows, b.cols
-            )))
+        (true, Some(b)) if op.kind == kind::ADD_ROW => {
+            if shape(b) == (1, a.cols) {
+                Ok((kind::ADD, Broadcast::Row))
+            } else {
+                Err(TensorError::Shape(format!(
+                    "[{}, {}] + row [{}, {}]",
+                    a.rows, a.cols, b.rows, b.cols
+                )))
+            }
         }
-        _ => Ok(()),
+        (true, Some(b)) if shape(b) == shape(a) => Ok((op.kind, Broadcast::None)),
+        (true, Some(b)) if broadcasts(op.kind) && shape(b) == (1, a.cols) => {
+            Ok((op.kind, Broadcast::Row))
+        }
+        (true, Some(b)) if broadcasts(op.kind) && shape(b) == (a.rows, 1) => {
+            Ok((op.kind, Broadcast::Col))
+        }
+        (true, Some(b)) => Err(TensorError::Shape(format!(
+            "[{}, {}] and [{}, {}]: neither the same shape nor a row or column to broadcast",
+            a.rows, a.cols, b.rows, b.cols
+        ))),
     }
 }
 
@@ -844,12 +870,13 @@ pub fn sfpu_eltwise(
     b: Option<&DramTensor>,
     units: usize,
 ) -> Result<Option<Work>> {
-    use crate::sfpu::kernel::Operands;
-    let Some((operands, _)) = crate::sfpu::ops::program(op.kind, op.scalar) else {
+    use crate::sfpu::ops::Broadcast;
+    let (kind, bcast) = broadcast_of(op, a, b)?;
+    let op = Eltwise { kind, ..op };
+    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, op.scalar, bcast) else {
         return Ok(None);
     };
-    check_eltwise(op, a, b)?;
-    let group = sfpu_group(op, operands);
+    let group = sfpu_group(op, bcast, operands);
     let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
@@ -857,7 +884,7 @@ pub fn sfpu_eltwise(
     let mut jobs = Vec::new();
     for run in runs(rt * ct, units, group) {
         let len = run.len();
-        let (layout, roles) = match sfpu_programs(op, operands, len) {
+        let (layout, roles) = match sfpu_programs(op, bcast, operands, len) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -872,7 +899,7 @@ pub fn sfpu_eltwise(
                     len as u32,
                     at as u32,
                     flags,
-                    0,
+                    ct as u32,
                     0,
                     0,
                 ],
@@ -882,11 +909,12 @@ pub fn sfpu_eltwise(
         };
         let mut gather = read(&ra, layout.a_at, 0).to_vec();
         if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
-            gather.extend(read(
-                rb,
-                b_at,
-                u32::from(operands == Operands::RowBroadcast),
-            ));
+            let flags = match bcast {
+                Broadcast::None => 0,
+                Broadcast::Row => 1,
+                Broadcast::Col => 2,
+            };
+            gather.extend(read(rb, b_at, flags));
         }
         let scatter = [
             [
@@ -934,15 +962,29 @@ pub(crate) fn sfpu_group_for_tests(
     scalar: f32,
     operands: crate::sfpu::kernel::Operands,
 ) -> usize {
-    sfpu_group(Eltwise { kind, scalar }, operands)
+    let bcast = if kind == tt_isa::dm::kind::ADD_ROW {
+        crate::sfpu::ops::Broadcast::Row
+    } else {
+        crate::sfpu::ops::Broadcast::None
+    };
+    let kind = if kind == tt_isa::dm::kind::ADD_ROW {
+        tt_isa::dm::kind::ADD
+    } else {
+        kind
+    };
+    sfpu_group(Eltwise { kind, scalar }, bcast, operands)
 }
 
-fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
+fn sfpu_group(
+    op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
         let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
-        let (_, math) =
-            crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+        let (_, math) = crate::sfpu::ops::program_for(op.kind, op.scalar, bcast)
+            .expect("checked by the caller");
         crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
     };
     let (one, two) = (lens(1), lens(2));
@@ -964,21 +1006,24 @@ fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
 /// One run's layout and role programs, memoised by op, scalar and length.
 fn sfpu_programs(
     op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     len: usize,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(u32, u32, usize), SfpuPrograms>>;
+    type Key = (u32, u32, crate::sfpu::ops::Broadcast, usize);
+    type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), len);
+    let key = (op.kind, op.scalar.to_bits(), bcast, len);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
     let layout = crate::sfpu::kernel::plan_layout(len, operands)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) = crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+    let (_, math) =
+        crate::sfpu::ops::program_for(op.kind, op.scalar, bcast).expect("checked by the caller");
     let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
     let p = (layout, roles);
     memo.lock()
@@ -1067,6 +1112,23 @@ impl OpPadding for Eltwise {
     fn produces(&self, inputs: &[&DramTensor]) -> Pad {
         use tt_isa::dm::kind;
         let zero = |i: usize| inputs.get(i).is_some_and(|t| t.pad() == Pad::Zero);
+        // A broadcast operand goes into the padding of the dimension it is
+        // broadcast along: `0 + b` there is `b`. With no padding along it, the
+        // other dimension's padding is `0 (op) 0`, zero for `ADD` and `SUB`.
+        if let (Some(a), Some(b)) = (inputs.first(), inputs.get(1)) {
+            if (b.rows, b.cols) != (a.rows, a.cols) || self.kind == kind::ADD_ROW {
+                let along_clear = if b.rows == 1 {
+                    a.rows % 32 == 0
+                } else {
+                    a.cols % 32 == 0
+                };
+                let z = matches!(self.kind, kind::ADD | kind::SUB | kind::ADD_ROW)
+                    && zero(0)
+                    && zero(1)
+                    && along_clear;
+                return if z { Pad::Zero } else { Pad::Undefined };
+            }
+        }
         let z = match self.kind {
             // `0 (op) 0` is a zero.
             kind::ADD | kind::SUB | kind::MUL => zero(0) && zero(1),
