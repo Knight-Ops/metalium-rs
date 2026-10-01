@@ -503,9 +503,19 @@ fn mvmul_addr_mod_sits_one_bit_lower_on_blackhole() {
     // The first `MVMUL` carries `addr_mod_bits` on top of the typestate's word.
     let body = |addr_mod_bits: u32| -> Body {
         Box::new(move |banks, p| {
+            // Every entry this measures, whole: the matmul's prelude leaves
+            // its own modifiers in them (`matmul::math_prelude`), and
+            // modifiers persist between programs.
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_DestIncr, 8));
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC2_DestIncr, 0));
             p.push(thread_entry(thread::ADDR_MOD_DST_SEC4_DestIncr, 8));
+            for f in [
+                thread::ADDR_MOD_AB_SEC1_SrcBIncr,
+                thread::ADDR_MOD_AB_SEC2_SrcBIncr,
+                thread::ADDR_MOD_AB_SEC4_SrcBIncr,
+            ] {
+                p.push(thread_entry(f, 0));
+            }
             let (i, banks) = banks.mvmul(encode::Mvmul::ZERO).unwrap();
             p.push(Instruction::new(i.word() | addr_mod_bits, i.def()));
             let (i, _) = banks.mvmul_release_both(encode::Mvmul::ZERO).unwrap();

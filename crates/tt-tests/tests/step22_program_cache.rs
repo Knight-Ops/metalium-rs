@@ -141,16 +141,18 @@ impl<T: tt_device::Transport> SessionLike for Session<T> {
     }
 }
 
-/// `[512, 512] @ [512, 512]` on one tile plans blocks of two shapes
-/// (`[2, 16, 3]` and a ragged `[2, 16, 1]`): with one program slot per role
-/// that was two lists at least, and every change of shape a program upload.
+/// `[512, 512] @ [512, 512]` on one tile plans blocks of four shapes -- `[5,
+/// 16, 6]` and its ragged edges `[5, 16, 4]`, `[1, 16, 6]`, `[1, 16, 4]`
+/// (since X2b's loops made the programs short enough for blocks that big;
+/// it was `[2, 16, 3]` and `[2, 16, 1]`): with one program slot per role that
+/// was a list per shape at least, and every change of shape a program upload.
 #[test]
 fn a_matmul_of_two_block_shapes_is_one_list_and_then_no_uploads() {
     with_session(|s| {
         let mkn = [512, 512, 512];
         let (lists, first) = checked_matmul(s, mkn, Fidelity::HiFi4, 1);
         assert_eq!(lists, 1, "one list for every block, of both shapes");
-        assert_eq!(first.misses, 2 * 3, "two shapes, three roles each");
+        assert_eq!(first.misses, 4 * 3, "four shapes, three roles each");
         assert!(first.bytes_uploaded > 0);
         let (lists, again) = checked_matmul(s, mkn, Fidelity::HiFi4, 1);
         assert_eq!(lists, 1);
@@ -169,12 +171,6 @@ fn a_matmul_of_two_block_shapes_is_one_list_and_then_no_uploads() {
 #[test]
 fn evicted_programs_run_correctly_when_they_return() {
     with_session(|s| {
-        // The cache cut to 128 KB (`Session::limit_program_cache`), so the
-        // kernels below -- about 230 KB of programs together, each role's
-        // well under half the cut -- evict whatever shrinks the programs next
-        // (X2b's loops took them from ~300 KB to this): the gate no longer
-        // depends on how big a matmul's programs happen to be.
-        s.limit_program_cache(128 * 1024).unwrap();
         let ops = [
             ([512, 512, 512], Fidelity::HiFi4),
             ([512, 512, 512], Fidelity::Lo),
@@ -183,6 +179,23 @@ fn evicted_programs_run_correctly_when_they_return() {
             ([256, 1024, 128], Fidelity::HiFi4),
             ([128, 640, 320], Fidelity::HiFi4),
         ];
+        // Each kernel's programs measured with the whole cache, then the
+        // cache cut to twice the largest (`Session::limit_program_cache`):
+        // every program still admitted (at most half the cache), the six
+        // together more than it holds -- however short the programs get
+        // (X2b's loops took them from ~300 KB to a fraction of that).
+        let mut biggest = 0;
+        let mut total = 0;
+        for (i, (mkn, f)) in ops.iter().enumerate() {
+            let (_, c) = checked_matmul(s, *mkn, *f, 10 + i as u64);
+            biggest = biggest.max(c.bytes_uploaded);
+            total += c.bytes_uploaded;
+        }
+        assert!(
+            total > 2 * biggest,
+            "{total} bytes in all, {biggest} the largest kernel's"
+        );
+        s.limit_program_cache(2 * biggest).unwrap();
         let mut evictions = 0;
         for round in 0..2 {
             for (i, (mkn, f)) in ops.iter().enumerate() {

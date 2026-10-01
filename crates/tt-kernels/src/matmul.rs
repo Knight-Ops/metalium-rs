@@ -99,6 +99,7 @@ pub fn math_prelude() -> Vec<Instruction> {
     p.push(thread_entry(thread::ADDR_MOD_DST_SEC0_DestIncr, 0));
     p.push(thread_entry(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0));
     p.push(thread_entry(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1));
+    p.extend(math_addr_mods());
     p.push(thread_entry(thread::FIDELITY_BASE_Phase, 0));
     // `SrcAVal` is four bits; a row of 16 or more would take a second
     // `SETRWC` with `SrcACr` (`SETRWC.md`: `if (SrcACr) SrcAVal += RWC.SrcA_Cr`).
@@ -119,6 +120,113 @@ pub fn math_prelude() -> Vec<Instruction> {
     // (mode, use_dst32b, addr_mod, imm10)
     p.push(encode::zeroacc(3, 0, 0, 0).unwrap());
     p
+}
+
+/// The math role's address modifiers for the matmul's `MVMUL`s (`RWCs.md`,
+/// `ApplyAddrMod`; Blackhole's `MVMUL` takes a three-bit `AddrMod`,
+/// divergence row 42). Each `MVMUL` names its `Dst` row within an `fi`, and
+/// only plain increments move the counters:
+///
+/// * [`MATH_AM_PHASE`] (1): the next fidelity phase;
+/// * [`MATH_AM_HALF`] (2): the end of a group's first `SrcB` half -- phase
+///   back to 0, `SrcB` on eight rows;
+/// * [`MATH_AM_GROUP`] (3): the end of a group, but an `fi`'s last -- phase
+///   and `SrcB` back to 0;
+/// * [`MATH_AM_FI`] (4): the end of an `fi` -- phase and `SrcB` back to 0,
+///   `Dst` on 32 rows (two faces), the next `fi`'s base.
+///
+/// 0 moves nothing, as before.
+pub const MATH_AM_PHASE: u32 = 1;
+pub const MATH_AM_HALF: u32 = 2;
+pub const MATH_AM_GROUP: u32 = 3;
+pub const MATH_AM_FI: u32 = 4;
+
+fn math_addr_mods() -> Vec<Instruction> {
+    use tt_isa::backend::ThreadConfigEntry as E;
+    let ab = |srcb_incr: u16,
+              srcb_clear: u16,
+              fields: (
+        tt_isa::cfg::ThreadConfigField,
+        tt_isa::cfg::ThreadConfigField,
+    )| {
+        E::zeroed(fields.0.addr32())
+            .set(fields.0, srcb_incr)
+            .unwrap()
+            .set(fields.1, srcb_clear)
+            .unwrap()
+            .encode()
+            .unwrap()
+    };
+    // (DestIncr, DestCR, FidelityClear)
+    let dst = |incr: u16,
+               cr: u16,
+               fclear: u16,
+               f: (
+        tt_isa::cfg::ThreadConfigField,
+        tt_isa::cfg::ThreadConfigField,
+        tt_isa::cfg::ThreadConfigField,
+    )| {
+        E::zeroed(f.0.addr32())
+            .set(f.0, incr)
+            .unwrap()
+            .set(f.1, cr)
+            .unwrap()
+            .set(f.2, fclear)
+            .unwrap()
+            .encode()
+            .unwrap()
+    };
+    use thread::*;
+    vec![
+        // 2: end of a first half.
+        ab(
+            8,
+            0,
+            (ADDR_MOD_AB_SEC2_SrcBIncr, ADDR_MOD_AB_SEC2_SrcBClear),
+        ),
+        dst(
+            0,
+            0,
+            1,
+            (
+                ADDR_MOD_DST_SEC2_DestIncr,
+                ADDR_MOD_DST_SEC2_DestCR,
+                ADDR_MOD_DST_SEC2_FidelityClear,
+            ),
+        ),
+        // 3: end of a group.
+        ab(
+            0,
+            1,
+            (ADDR_MOD_AB_SEC3_SrcBIncr, ADDR_MOD_AB_SEC3_SrcBClear),
+        ),
+        dst(
+            0,
+            0,
+            1,
+            (
+                ADDR_MOD_DST_SEC3_DestIncr,
+                ADDR_MOD_DST_SEC3_DestCR,
+                ADDR_MOD_DST_SEC3_FidelityClear,
+            ),
+        ),
+        // 4: end of an `fi`, the base on two faces.
+        ab(
+            0,
+            1,
+            (ADDR_MOD_AB_SEC4_SrcBIncr, ADDR_MOD_AB_SEC4_SrcBClear),
+        ),
+        dst(
+            32,
+            0,
+            1,
+            (
+                ADDR_MOD_DST_SEC4_DestIncr,
+                ADDR_MOD_DST_SEC4_DestCR,
+                ADDR_MOD_DST_SEC4_FidelityClear,
+            ),
+        ),
+    ]
 }
 
 // --- Whole tiles --------------------------------------------------------------
@@ -419,10 +527,10 @@ pub fn matmul_roles(
     [lower(&unpack), lower(&math), Item::unrolled(&pack)]
 }
 
-/// Keys of the matmul's shared blocks (`crate::loops::Item::Shared`): one
-/// tile pair's face block on each of the unpack and math roles.
+/// Key of the matmul's shared block (`crate::loops::Item::Shared`): one tile
+/// pair's face block on the unpack role, where the pairs are not evenly
+/// spaced.
 const UNPACK_FACES: u32 = 1;
-const MATH_FACES: u32 = 2;
 
 /// The three role programs of [`matmul_roles`] as loop items, before
 /// lowering: each tile pair's face block -- the same words for every pair --
@@ -474,26 +582,23 @@ pub fn matmul_items(
     let mut pack: Vec<Item> = Vec::new();
     let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let phases = fidelity.phases();
-    // Lo keeps the encoding the gates established; with more phases, each
-    // MVMUL steps the phase (addr_mod 1).
-    let step = |row: u32| {
-        let m = encode::Mvmul::ZERO.dst_row(row);
-        if phases > 1 {
-            m.addr_mod(1)
-        } else {
-            m
-        }
-    };
-    // One `MVMUL` group into `Dst` rows `dst..dst + 16`: both `SrcB` halves,
-    // every phase, all but the group's last `MVMUL`.
+    // Each `MVMUL` names its `Dst` row within its `fi` -- the same for both --
+    // and the RWCs' `Dst` holds the `fi`'s base, which only the last `MVMUL`
+    // of an `fi` moves ([`math_prelude`], `MATH_AM_*`).
+    let mv = |row: u32, am: u32| encode::Mvmul::ZERO.dst_row(row).addr_mod(am);
+    // One `MVMUL` group into rows `dst..dst + 16` of the `fi` -- both `SrcB`
+    // halves, every phase -- all but its last `MVMUL`, which the caller issues
+    // with the group's flips and its end.
     let group = |out: &mut Vec<Instruction>, dst: u32, mut loaded: Banks<Loaded, Loaded>| {
         for half in 0..2u32 {
-            out.push(set_src_b_row(8 * half, phases > 1));
-            for phase in 0..phases {
-                if half == 1 && phase + 1 == phases {
-                    break;
-                }
-                let (i, next) = loaded.mvmul(step(dst + 8 * half)).unwrap();
+            let last = if half == 0 { phases } else { phases - 1 };
+            for phase in 0..last {
+                let am = if half == 0 && phase + 1 == phases {
+                    MATH_AM_HALF
+                } else {
+                    MATH_AM_PHASE
+                };
+                let (i, next) = loaded.mvmul(mv(dst + 8 * half, am)).unwrap();
                 out.push(i);
                 loaded = next;
             }
@@ -509,11 +614,15 @@ pub fn matmul_items(
         .encode()
         .unwrap()
     };
-    // One tile pair's face block on each role: the same words for every pair
-    // (the banks start and end empty), so built once.
-    let (mut ub, mut mb) = (Vec::new(), Vec::new());
+    // One tile pair's face block on the unpack role, and on the math role one
+    // `fi` unit -- its two `k` halves, the second ending by moving the `Dst`
+    // base on two faces: the same words for every pair and, on the math role,
+    // for both `fi` (the banks start and end empty), so built once.
+    let mut ub = Vec::new();
+    let mut unit: Option<Vec<Instruction>> = None;
     let mut banks = Banks::after_reset();
     for fi in 0..2u32 {
+        let mut mb = Vec::new();
         for k in 0..2u32 {
             // `A` is in0 and goes to `SrcB`: its face `(fi, k)`.
             ub.push(zw(Unpacker::SrcB, 2 * fi + k));
@@ -523,21 +632,44 @@ pub fn matmul_items(
             ub.push(zw(Unpacker::SrcA, 2 * k));
             let (u, both) = with_b.unpack_a(base).unwrap();
             ub.push(u);
-            let loaded = group(&mut mb, 16 * (2 * fi), both);
-            let (m, only_b) = loaded.mvmul_release_a(step(16 * (2 * fi) + 8)).unwrap();
+            let loaded = group(&mut mb, 0, both);
+            let (m, only_b) = loaded.mvmul_release_a(mv(8, MATH_AM_GROUP)).unwrap();
             mb.push(m);
             ub.push(zw(Unpacker::SrcA, 2 * k + 1));
             let (u, both) = only_b.unpack_a(base).unwrap();
             ub.push(u);
-            let loaded = group(&mut mb, 16 * (2 * fi + 1), both);
-            let (m, empty) = loaded
-                .mvmul_release_both(step(16 * (2 * fi + 1) + 8))
-                .unwrap();
+            let loaded = group(&mut mb, 16, both);
+            let end = if k == 0 { MATH_AM_GROUP } else { MATH_AM_FI };
+            let (m, empty) = loaded.mvmul_release_both(mv(24, end)).unwrap();
             mb.push(m);
             banks = empty;
         }
+        match &unit {
+            None => unit = Some(mb),
+            Some(u) => debug_assert_eq!(u, &mb, "both `fi` units are the same words"),
+        }
     }
     let _ = banks;
+    let unit = unit.expect("two units");
+    // A pair on the math role: `Dst`, its base, `SrcB` and the phase back to
+    // zero, then the unit for each `fi`.
+    let pair_math: Vec<Item> = {
+        let reset = encode::Setrwc::ZERO
+            .src_b(1)
+            .src_b_val(0)
+            .dst(1)
+            .dst_val(0)
+            .fidelity(1)
+            .encode()
+            .unwrap();
+        vec![
+            Item::I(reset),
+            Item::Repeat {
+                times: 2,
+                body: i(unit.iter().copied()).collect(),
+            },
+        ]
+    };
     let mut current = (a0, b0);
     for output in outputs {
         math.extend(i(sync::take(sems.free, Before::MATRIX)));
@@ -555,7 +687,7 @@ pub fn matmul_items(
                 unpack.push(Item::Repeat { times: n, body });
                 math.push(Item::Repeat {
                     times: n,
-                    body: i(mb.iter().copied()).collect(),
+                    body: pair_math.clone(),
                 });
                 // Where the last step left the bases: one stride past the last pair.
                 current = (u64::MAX, u64::MAX);
@@ -570,10 +702,7 @@ pub fn matmul_items(
                         key: UNPACK_FACES,
                         body: ub.clone(),
                     });
-                    math.push(Item::Shared {
-                        key: MATH_FACES,
-                        body: mb.clone(),
-                    });
+                    math.extend(pair_math.iter().cloned());
                 }
             }
         }
@@ -596,18 +725,6 @@ pub fn matmul_items(
         backend::wait_for_packer(Before::EVERYTHING).unwrap(),
     ));
     [unpack, math, pack]
-}
-
-/// `SETRWC` of the `SrcB` counter: which eight-row half of `SrcB` the next
-/// `MVMUL` reads (`SETRWC.md`; `MVMUL.md` takes `RWCs.SrcB & 0x38`), and, with
-/// `reset_phase`, the fidelity phase back to zero.
-fn set_src_b_row(row: u32, reset_phase: bool) -> Instruction {
-    encode::Setrwc::ZERO
-        .src_b(1)
-        .src_b_val(row)
-        .fidelity(u32::from(reset_phase))
-        .encode()
-        .unwrap()
 }
 
 /// A row-major `[rows, cols]` matrix as `tt_metal_32x32` tile images in
@@ -1235,12 +1352,12 @@ mod tests {
 
     #[test]
     fn lo_fidelity_is_the_established_encoding() {
-        // Two MVMULs per face pair, neither with an address modifier, and a
-        // SETRWC without a fidelity reset before each: what every gate before
-        // fidelity was a parameter ran.
+        // Two MVMULs per face pair at LoFi, as the backend receives them.
         let l = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
         let [_, math, _] =
             matmul_roles(&l.outputs, l.sems, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+        // As the backend receives them: the replays expanded.
+        let math = crate::loops::frontend_stream(&math, None).unwrap();
         let mvmuls = math
             .iter()
             .filter(|i| i.word() >> 24 == encode::Mvmul::ZERO.encode().unwrap().word() >> 24)
@@ -1286,6 +1403,7 @@ mod tests {
             Fidelity::HiFi4,
         ] {
             let [_, math, _] = matmul_roles(&l.outputs, l.sems, L1Format::Fp32, TF32_CODE, f);
+            let math = crate::loops::frontend_stream(&math, None).unwrap();
             let n = math.iter().filter(|i| i.word() >> 24 == opcode).count();
             assert_eq!(n as u32, 16 * f.phases(), "{f:?}");
         }

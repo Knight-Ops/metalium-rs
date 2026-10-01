@@ -281,11 +281,20 @@ reverse index.
             by the next output without recording it again.
       - [x] Measured (row AC): a 1x8x1 tile's unpack 514 -> 116 words, LoFi math
             269 -> 53; MNIST inference 0.61 -> 0.53 ms a batch. Full suite 430/430.
-      - [ ] HiFi4 math: its 80-word block (eight `MVMUL` groups whose `Dst` rows
-            and flips differ) does not fit the buffer, so it is written out, and at
-            653 words for a 1x8x1 tile it is now every HiFi4 kernel's pace (MNIST
-            trains at HiFi4: 2.1 ms a step on one tile, unchanged). The `Dst` rows
-            stepped by address modifiers instead, so the groups are one body.
+      - [x] Math at every fidelity in one replayed unit per `fi`: each `MVMUL`
+            names its `Dst` row within the `fi` (the same for both), the RWCs' `Dst`
+            holds the `fi`'s base, and address modifiers do the rest
+            (`matmul::MATH_AM_*`): 1 the phase, 2 a half's end (`SrcB` on 8), 3 a
+            group's end (`SrcB` back), 4 an `fi`'s end (`Dst` on 32). A unit is 32
+            `MVMUL`s at HiFi4, so a pair's math is a reset and two `REPLAY`s; the
+            planner now writes out a loop too long to record as items, so the loops
+            inside it still replay. MNIST golden bit for bit; HiFi4 math for a
+            1x8x1 tile 653 -> 75 words, the kernel now held by the backend, not by
+            pushing (row AD). A first version moved the base by `Dst`'s carriage
+            return (`DestCR`) and left output face (1, 0) wrong on ttsim, though each
+            modifier behaved in isolation (`step9`-style probe): unexplained, so the
+            design uses plain increments only. Modifiers persist between programs:
+            `step9`'s measurement now sets every entry it relies on.
       - [ ] The MOP carried to the roles: `Step::Kernel` and the session's lists
             take each role's `MopConfig` (a list's kernels share one descriptor, so
             a list splits where it changes); then the K loops run under the `MOP`,

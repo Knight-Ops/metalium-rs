@@ -160,6 +160,52 @@ pub fn lower(items: &[Item]) -> Lowered {
 /// [`lower`], with or without the MOP: a caller that cannot carry a MOP
 /// configuration to the role's mailbox lowers with `REPLAY` alone.
 pub fn lower_with(items: &[Item], allow_mop: bool) -> Lowered {
+    let mut notes = Vec::new();
+    let inlined = inline_long(items, &mut notes, true);
+    let mut l = lower_flat(&inlined, allow_mop);
+    // The loops written out iteration by iteration, first: what each became.
+    notes.extend(l.loops);
+    l.loops = notes;
+    l
+}
+
+/// A loop whose body is too long to record is written out iteration by
+/// iteration -- but as items, so the loops *inside* it are still lowered: a
+/// body recorded on its first iteration is replayed on the others
+/// (`a_loop_too_long_to_record_still_replays_the_loops_inside_it`). Each
+/// top-level loop so written out is noted as `Unrolled { why: TooLong }`.
+fn inline_long(items: &[Item], notes: &mut Vec<LoopForm>, top: bool) -> Vec<Item> {
+    let mut out = Vec::new();
+    for it in items {
+        match it {
+            Item::Repeat { times, body } => {
+                let body = inline_long(body, notes, false);
+                let len = Item::unrolled(&body).len();
+                if len > REPLAY_BUFFER as usize {
+                    if top {
+                        notes.push(LoopForm::Unrolled {
+                            times: *times,
+                            body: len,
+                            why: Unrolled::TooLong,
+                        });
+                    }
+                    for _ in 0..*times {
+                        out.extend(body.iter().cloned());
+                    }
+                } else {
+                    out.push(Item::Repeat {
+                        times: *times,
+                        body,
+                    });
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+fn lower_flat(items: &[Item], allow_mop: bool) -> Lowered {
     let has_own = |b: &[Instruction]| b.iter().any(is_expander_insn);
     let own_replay = items.iter().any(|i| match i {
         Item::I(x) => is_expander_insn(x),
@@ -628,5 +674,37 @@ mod tests {
         // 3 setup words, one recording (1 + 8), and 4 + 5 + 5 replays.
         assert_eq!(l.words.len(), 3 + 9 + 14);
         assert!(l.mop.is_none());
+    }
+
+    #[test]
+    fn a_loop_too_long_to_record_still_replays_the_loops_inside_it() {
+        // A HiFi4 matmul's pair: a reset, then twice (a unit twice, a step).
+        let unit = body(0..17);
+        let pair = vec![
+            Item::I(op(100)),
+            Item::Repeat {
+                times: 2,
+                body: unit.clone(),
+            },
+            Item::I(op(101)),
+            Item::Repeat {
+                times: 2,
+                body: unit,
+            },
+            Item::I(op(101)),
+        ];
+        let items = vec![Item::Repeat {
+            times: 8,
+            body: pair,
+        }];
+        let l = lower_with(&items, false);
+        assert_eq!(
+            frontend_stream(&l.words, None).unwrap(),
+            Item::unrolled(&items)
+        );
+        // The first pair: its reset, the unit recorded (1 + 17) and replayed
+        // once, a step, two replays, a step -- 24 words. Every other pair: a
+        // reset, four REPLAYs, two steps -- 7.
+        assert_eq!(l.words.len(), 24 + 7 * 7);
     }
 }
