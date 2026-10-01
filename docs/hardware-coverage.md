@@ -306,9 +306,24 @@ reverse index.
 
 ### P — Prerequisites pulled in when they block
 
-- [ ] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
+- [~] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
       `prod(leading)` stacked tile grids, a batch stride in `TensorRef` (0 = broadcast),
       last-dim-preserving reshapes as views. Blocks R1 over leading dims, R3, D6, R4.
+  - [x] **P1a Storage and element-wise.** `burn-tt` stores an F32 tensor of any rank
+        as `[product of the leading dims, last dim]` (`tensor::stored_dims`, rank 1 as
+        one row); `float_reshape` keeping that matrix is a view; element-wise ops of
+        one shape, and broadcasts that are a row or column of the stored matrix and
+        give the larger operand's shape by NumPy's rule, run on the device;
+        `to_device` uploads any rank. Pulled in because it blocked batching: a
+        linear layer's rank-1 bias put four transfers -- and so four syncs -- in
+        every MNIST step; the steady step now moves only the logits and their
+        gradient (the 9.5 budget, `step12_mnist`). Gate `step35_burn_rank_n`:
+        rank 1 and 3, row and column broadcasts, reshape views, against Flex bit
+        for bit (a NaN by class) and downloading nothing; `[6, 1, 4] + [1, 6, 1]`,
+        a column by the matrices but `[6, 6, 4]` by the rule, still right (watched
+        failing without the rule's check). ttsim and both cards.
+  - [ ] **P1b Batch stride.** `TensorRef` batch stride (0 = broadcast) for batched
+        matmul and reductions over leading dims.
 - [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
       a matmul's K is not capped by L1. Blocks D6's im2col.
 
@@ -612,7 +627,7 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
-| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (SFPU or mover by size) | S1 |
+| `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU or mover by size) | S1, P1a |
 | `float_sum_dim` | x (dim 0 the mover's, exact; dim 1 the SFPU's, order bound) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
@@ -691,6 +706,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
 | Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
+| The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevented (X4c), detected at open (X5a); recovery X5b |
 
 New ttsim refusals or disagreements found while doing any of this go in

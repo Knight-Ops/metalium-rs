@@ -34,6 +34,19 @@ fn device_result(device: TtDevice, id: crate::server::BufferId, dims: [usize; 2]
     device_view(device, id, dims, None)
 }
 
+/// [`device_result`] for a tensor of `shape`, stored as `dims`
+/// (`crate::tensor::stored_dims`).
+fn device_result_shaped(
+    device: TtDevice,
+    id: crate::server::BufferId,
+    dims: [usize; 2],
+    shape: burn_backend::Shape,
+) -> TtTensor {
+    let t = device_result(device, id, dims);
+    let dram = t.dram().expect("made on the device").clone();
+    TtTensor::on_device(dram, shape, device)
+}
+
 /// A device result that reads `parent`'s slots, keeping it alive.
 fn device_view(
     device: TtDevice,
@@ -74,10 +87,24 @@ fn device_view(
 /// asynchronous or a lookahead exists (`burn-backend-parity.md` B8, B13, B16).
 const APPROX_MIN_TILES: usize = 8;
 
-/// Tiles in a matrix's tile grid.
+/// Tiles in the tile grid of the matrix a tensor is stored as.
 fn tiles(t: &TtTensor) -> usize {
-    let d = t.shape().to_vec();
-    d.first().map_or(0, |r| r.div_ceil(32)) * d.get(1).map_or(1, |c| c.div_ceil(32))
+    t.stored()
+        .map_or(0, |[r, c]| r.div_ceil(32) * c.div_ceil(32))
+}
+
+/// The shape `a` and `b` broadcast to (NumPy's rule, which Burn's binary ops
+/// follow), or `None` if they do not.
+fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let n = a.len().max(b.len());
+    let at = |s: &[usize], i: usize| (i + s.len()).checked_sub(n).map_or(1, |j| s[j]);
+    (0..n)
+        .map(|i| match (at(a, i), at(b, i)) {
+            (x, y) if x == y || y == 1 => Some(x),
+            (1, y) => Some(y),
+            _ => None,
+        })
+        .collect()
 }
 
 fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) -> Option<TtTensor> {
@@ -101,7 +128,9 @@ fn device_eltwise_ungated(
     use tt_isa::dm::kind as k;
     let device = a.device;
     let all = |f: &dyn Fn(&TtTensor) -> bool| f(a) && b.is_none_or(f);
-    if !all(&|t: &TtTensor| t.is_matrix_f32() && t.device == device) {
+    // Any rank: each operand as the matrix it is stored as
+    // (`crate::tensor::stored_dims`).
+    if !all(&|t: &TtTensor| t.is_stored_f32() && t.device == device) {
         return None;
     }
     if a.dram().is_none() && b.is_none_or(|b| b.dram().is_none()) {
@@ -112,11 +141,22 @@ fn device_eltwise_ungated(
     }
     let (sa, sb) = (a.shape().to_vec(), b.map(|b| b.shape().to_vec()));
     let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
-    // `b` the same shape, or one row or one column of `a` to broadcast; for an
-    // op that commutes bit for bit (addition, multiplication) the broadcast
-    // operand may be on the left. The session reads which from the shapes.
-    let broadcast_of =
-        |x: &[usize], y: &[usize]| (y[0] == 1 && y[1] == x[1]) || (y[1] == 1 && y[0] == x[0]);
+    // `b` the same shape, or one that broadcasts to `a` as one row or one
+    // column of `a`'s matrix: a row is `b` with every leading dimension 1, a
+    // column `b` with `a`'s leading dimensions and a last of 1. Read on the
+    // matrices, then held to the broadcast's own shape -- `[6, 1, 4] + [6, 1]`
+    // is a column of `[6, 4]` by the matrices, but `[6, 6, 4]` by the rule.
+    // For an op that commutes bit for bit (addition, multiplication) the
+    // broadcast operand may be on the left. The session reads which from the
+    // matrices.
+    let broadcast_of = |x: &[usize], y: &[usize]| {
+        let ([xr, xc], [yr, yc]) = (
+            crate::tensor::stored_dims(x).expect("checked"),
+            crate::tensor::stored_dims(y).expect("checked"),
+        );
+        ((yr == 1 && yc == xc) || (yc == 1 && yr == xr))
+            && broadcast_shape(x, y).is_some_and(|s| s == x)
+    };
     let (a, b) = match &sb {
         None => (a, b),
         Some(s) if *s == sa => (a, b),
@@ -131,8 +171,8 @@ fn device_eltwise_ungated(
     // does exactly that). It goes to the device only if it is there already
     // -- except a row added to every row, a bias, which a host optimiser
     // step leaves on the host and the next forward pass wants on the device.
-    let bias = kind == k::ADD
-        && b.is_some_and(|b| b.shape().to_vec() == [1, a.shape()[1]] && a.shape()[0] != 1);
+    let [ar, ac] = a.stored().expect("checked");
+    let bias = kind == k::ADD && b.is_some_and(|b| b.stored() == Some([1, ac]) && ar != 1);
     if !bias && b.is_some_and(|b| b.shape() != a.shape() && b.dram().is_none()) {
         return None;
     }
@@ -142,7 +182,7 @@ fn device_eltwise_ungated(
     }
     let (id, dims) =
         crate::server::eltwise(device, kind, scalar, da.buffer.id, db.map(|d| d.buffer.id));
-    Some(device_result(device, id, dims))
+    Some(device_result_shaped(device, id, dims, a.shape()))
 }
 
 pub mod float {
@@ -415,6 +455,28 @@ pub mod float {
         float_swap_dims(tensor, n - 2, n - 1)
     }
 
+    /// A view of the same slots when the new shape is stored as the same
+    /// matrix (`crate::tensor::stored_dims`: `[1, n]` and `[n]`, `[2, 3, 4]` and
+    /// `[6, 4]`), so a reshape of a device tensor costs nothing and keeps it
+    /// there; else Flex's, on the host copy.
+    pub fn float_reshape(
+        tensor: FloatTensor<TtBackend>,
+        shape: burn_backend::Shape,
+    ) -> FloatTensor<TtBackend> {
+        let same = tensor.stored().is_some()
+            && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
+        if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
+            if same && tensor.is_stored_f32() {
+                return TtTensor::on_device(d.clone(), shape, tensor.device);
+            }
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_host(), shape),
+            device,
+        )
+    }
+
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
     /// Flex's order (`tt_isa::dm::kind::COL_SUM`). Anything else is Flex's.
     pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
@@ -535,7 +597,7 @@ pub mod float {
         device: &Device<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let t = retag(tensor, device);
-        if t.is_matrix_f32() && crate::server::supports_dram(*device) {
+        if t.is_stored_f32() && crate::server::supports_dram(*device) {
             let _ = t.to_dram();
         }
         t

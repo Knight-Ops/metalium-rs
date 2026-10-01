@@ -82,6 +82,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_log",
             "float_sum_dim",
             "float_max_dim",
+            "float_reshape",
             "float_slice",
             "float_swap_dims",
             "float_transpose",

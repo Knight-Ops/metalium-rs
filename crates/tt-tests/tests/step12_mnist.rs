@@ -281,11 +281,6 @@ fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)
     let t = |direction, shape| Transfer { direction, shape };
     vec![
         (
-            t(Up, [1, HIDDEN]),
-            "b1, after the host's SGD step (rank-1 ops stay on the host)",
-        ),
-        (t(Up, [1, CLASSES]), "b2, likewise"),
-        (
             t(Down, [batch, CLASSES]),
             "the logits, for the loss on the host",
         ),
@@ -293,8 +288,6 @@ fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)
             t(Up, [batch, CLASSES]),
             "dL/dlogits, from the host's loss backward",
         ),
-        (t(Down, [1, CLASSES]), "dL/db2, for the host's SGD step"),
-        (t(Down, [1, HIDDEN]), "dL/db1, likewise"),
     ]
 }
 

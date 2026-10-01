@@ -314,11 +314,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_reshape(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_flex(), shape),
-            device,
-        )
+        crate::ops::float::float_reshape(tensor, shape)
     }
     fn float_gather(
         dim: usize,

@@ -161,12 +161,14 @@ impl TtTensor {
         self.cell.dram.get()
     }
 
-    /// The device copy, uploaded the first time it is needed. Only for an F32
-    /// matrix: callers check [`TtTensor::is_matrix_f32`].
+    /// The device copy, uploaded the first time it is needed, as the matrix
+    /// [`stored_dims`] gives. Only for an F32 tensor of rank one or more:
+    /// callers check [`TtTensor::is_stored_f32`] (or the stricter
+    /// [`TtTensor::is_matrix_f32`]).
     pub(crate) fn to_dram(&self) -> &DramRef {
         self.cell.dram.get_or_init(|| {
-            let dims = self.cell.shape.to_vec();
-            let (rows, cols) = (dims[0], dims[1]);
+            let [rows, cols] =
+                stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
             let values = self
                 .host()
                 .clone()
@@ -185,6 +187,18 @@ impl TtTensor {
                 transposed: false,
             }
         })
+    }
+
+    /// An F32 tensor the device can hold: any rank but zero, not empty, as the
+    /// matrix [`stored_dims`] gives. What the element-wise path takes.
+    pub(crate) fn is_stored_f32(&self) -> bool {
+        self.cell.dtype == DType::F32
+            && stored_dims(&self.cell.shape.to_vec()).is_some_and(|[r, c]| r > 0 && c > 0)
+    }
+
+    /// The matrix this tensor is (or would be) stored as on the device.
+    pub(crate) fn stored(&self) -> Option<[usize; 2]> {
+        stored_dims(&self.cell.shape.to_vec())
     }
 
     /// A rank-2 F32 tensor: what the device path takes.
@@ -230,5 +244,29 @@ impl QTensorPrimitive for TtQTensor {
     }
     fn default_scheme() -> QuantScheme {
         FlexQTensor::default_scheme()
+    }
+}
+
+/// How a tensor of `shape` is laid out on the device: the matrix
+/// `[product of the leading dimensions, last dimension]`, rank 1 as one row.
+/// Row-major order is the same either way, so a reshape that keeps this
+/// matrix is a view, and an element-wise op between two tensors of one
+/// shape is the op on their matrices. `None` for a scalar (rank 0).
+pub(crate) fn stored_dims(shape: &[usize]) -> Option<[usize; 2]> {
+    let (&last, leading) = shape.split_last()?;
+    Some([leading.iter().product(), last])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_dims;
+
+    #[test]
+    fn a_tensor_is_stored_as_its_leading_dimensions_by_its_last() {
+        assert_eq!(stored_dims(&[]), None);
+        assert_eq!(stored_dims(&[128]), Some([1, 128]));
+        assert_eq!(stored_dims(&[64, 10]), Some([64, 10]));
+        assert_eq!(stored_dims(&[2, 3, 4]), Some([6, 4]));
+        assert_eq!(stored_dims(&[2, 0, 4]), Some([0, 4]));
     }
 }
