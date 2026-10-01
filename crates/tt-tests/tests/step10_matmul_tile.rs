@@ -321,7 +321,11 @@ fn run_tile_at(a: &Tile, b: &Tile, in_fmt: L1Format, out_fmt: u32, fidelity: Fid
     let (tb, _) = matmul::tilize_f32(&flat(b), 32, 32, in_fmt);
     const A_AT: u64 = STAGE;
     const B_AT: u64 = STAGE + 0x2000;
-    let [unpack, math, pack] = matmul::tile_roles(&[(A_AT, B_AT)], in_fmt, out_fmt, fidelity, OUT);
+    // A matmul alone on the tile: its two semaphores, as a plan of nothing
+    // else assigns them, and the setup that initialises them.
+    let (sems, init) = matmul::MatmulSemaphores::alone();
+    let [unpack, math, pack] =
+        matmul::tile_roles(&[(A_AT, B_AT)], sems, in_fmt, out_fmt, fidelity, OUT);
     let path = std::env::temp_dir().join(format!(
         "tttile-{}-{:?}.bin",
         std::process::id(),
@@ -335,7 +339,7 @@ fn run_tile_at(a: &Tile, b: &Tile, in_fmt: L1Format, out_fmt: u32, fidelity: Fid
                 math: &math,
                 pack: &pack,
             })
-            .concurrent(&matmul::TILE_SEMAPHORES)
+            .concurrent(&init)
             .stage(&[(A_AT, &ta), (B_AT, &tb)])
             .dump_rows(0)
             .read_back(&[(OUT, 1024 * 4)]),
@@ -686,7 +690,7 @@ fn a_matmul_larger_than_one_run_is_chunked() {
 }
 
 /// `M` x `N` output tiles, each cleared only once the packer has finished the
-/// last (`matmul::DST_FREE`) and packed to its own place.
+/// last (`MatmulSemaphores::free`) and packed to its own place.
 #[test]
 fn m_by_n_output_tiles() {
     assert_matmul(64, 32, 96, matmul::SrcRoute::Tf32FromFp32, 3);

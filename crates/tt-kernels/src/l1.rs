@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tt_isa::l1::Region;
 use tt_isa::sync::Semaphore;
 
+use crate::runtime::SemaphoreInit;
+
 /// Who reads or writes a circular buffer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Endpoint {
@@ -73,10 +75,19 @@ pub struct BufferSpec {
     pub kind: Kind,
 }
 
-/// One semaphore a kernel needs, and the stages it is in use.
+/// One semaphore a kernel needs: the value it starts each run at, and the
+/// stages it is in use.
+///
+/// The starting value is part of the semaphore, not of the kernel that sets
+/// it: a concurrent run's setup initialises every semaphore of its plan
+/// ([`Plan::semaphore_init`]), and a kernel that restores its semaphores
+/// leaves each at its starting value. So two semaphores of different stages
+/// may share one of the tile's eight only if they start at the same value --
+/// otherwise the second would inherit what the first left.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemSpec {
     pub name: &'static str,
+    pub initial: u8,
     pub live: Range<u32>,
 }
 
@@ -211,9 +222,13 @@ impl Requirements {
         })
     }
 
-    /// Declare a semaphore in use in `live`.
-    pub fn semaphore(&mut self, name: &'static str, live: Range<u32>) -> Sem {
-        self.sems.push(SemSpec { name, live });
+    /// Declare a semaphore starting at `initial`, in use in `live`.
+    pub fn semaphore(&mut self, name: &'static str, initial: u8, live: Range<u32>) -> Sem {
+        self.sems.push(SemSpec {
+            name,
+            initial,
+            live,
+        });
         Sem {
             set: self.id,
             index: self.sems.len() as u32 - 1,
@@ -305,12 +320,12 @@ impl Requirements {
         let sems_first = first
             .sems
             .iter()
-            .map(|s| req.semaphore(s.name, s.live.clone()))
+            .map(|s| req.semaphore(s.name, s.initial, s.live.clone()))
             .collect();
         let sems_second = second
             .sems
             .iter()
-            .map(|s| req.semaphore(s.name, shift(&s.live)))
+            .map(|s| req.semaphore(s.name, s.initial, shift(&s.live)))
             .collect();
         Ok(Fused {
             first: (first.id, map_first, sems_first),
@@ -354,6 +369,12 @@ impl Requirements {
         for s in &self.sems {
             if s.live.start >= s.live.end || s.live.end > self.stages {
                 return bad(format!("{}: live {:?} outside the kernel", s.name, s.live));
+            }
+            if s.initial > tt_isa::sync::MAX_VALUE {
+                return bad(format!(
+                    "{}: starts at {}, past the maximum",
+                    s.name, s.initial
+                ));
             }
         }
         Ok(())
@@ -400,7 +421,9 @@ impl Requirements {
             let taken: Vec<u32> = self.sems[..i]
                 .iter()
                 .zip(&sems)
-                .filter(|(p, _)| overlaps(&p.live, &s.live))
+                // Taken by anything live with it, or by anything that starts
+                // at another value (see `SemSpec`).
+                .filter(|(p, _)| overlaps(&p.live, &s.live) || p.initial != s.initial)
                 .map(|(_, &n)| n)
                 .collect();
             let n = (0..8)
@@ -408,8 +431,17 @@ impl Requirements {
                 .ok_or(PlanError::TooManySemaphores { name: s.name })?;
             sems.push(n);
         }
+        let mut init: Vec<SemaphoreInit> = Vec::new();
+        for (s, &n) in self.sems.iter().zip(&sems) {
+            if !init.iter().any(|(sem, ..)| sem.index() as u32 == n) {
+                let sem = Semaphore::new(n as u8).expect("one of eight");
+                init.push((sem, s.initial, tt_isa::sync::MAX_VALUE));
+            }
+        }
+        init.sort_by_key(|(sem, ..)| sem.index());
         Ok(Plan {
             set: self.id,
+            init,
             addr,
             sems: sems
                 .into_iter()
@@ -462,6 +494,7 @@ pub struct Plan {
     set: u64,
     addr: Vec<u64>,
     sems: Vec<Semaphore>,
+    init: Vec<SemaphoreInit>,
 }
 
 impl Plan {
@@ -486,6 +519,12 @@ impl Plan {
             "a semaphore handle used against another kernel's plan"
         );
         self.sems[s.index as usize]
+    }
+
+    /// Every semaphore the plan uses, once, with the value a concurrent run's
+    /// setup starts it at (`runtime::Schedule::Concurrent`), in semaphore order.
+    pub fn semaphore_init(&self) -> Vec<SemaphoreInit> {
+        self.init.clone()
     }
 }
 
@@ -522,6 +561,12 @@ pub fn check(req: &Requirements, plan: &Plan, arena: Region) -> Result<(), Strin
                 return Err(format!(
                     "{} and {} share a semaphore while live",
                     s.name, t.name
+                ));
+            }
+            if n == m && s.initial != t.initial {
+                return Err(format!(
+                    "{} and {} share a semaphore but start at {} and {}",
+                    s.name, t.name, s.initial, t.initial
                 ));
             }
         }
@@ -575,7 +620,7 @@ mod tests {
         assert!(matches!(r.plan(DATA), Err(PlanError::Invalid(_))));
         let mut r = Requirements::new(1);
         for _ in 0..9 {
-            r.semaphore("s", 0..1);
+            r.semaphore("s", 0, 0..1);
         }
         assert!(matches!(
             r.plan(DATA),
@@ -587,14 +632,36 @@ mod tests {
     fn semaphores_are_shared_only_across_stages() {
         let mut r = Requirements::new(2);
         let s = (0..8)
-            .map(|_| r.semaphore("first", 0..1))
+            .map(|_| r.semaphore("first", 0, 0..1))
             .collect::<Vec<_>>();
-        let t = r.semaphore("second", 1..2);
+        let t = r.semaphore("second", 0, 1..2);
         let p = r.plan(DATA).unwrap();
         let n: std::collections::BTreeSet<_> = s.iter().map(|&s| p.semaphore(s).index()).collect();
         assert_eq!(n.len(), 8);
         assert_eq!(p.semaphore(t).index(), 0);
+        assert_eq!(p.semaphore_init().len(), 8);
         check(&r, &p, DATA).unwrap();
+    }
+
+    /// Never live together, but starting at different values: they may not
+    /// share, or the second would start at whatever the first left.
+    #[test]
+    fn semaphores_share_only_with_the_same_starting_value() {
+        let mut r = Requirements::new(2);
+        let a = r.semaphore("a", 0, 0..1);
+        let b = r.semaphore("b", 1, 1..2);
+        let c = r.semaphore("c", 0, 1..2);
+        let p = r.plan(DATA).unwrap();
+        assert_ne!(p.semaphore(a), p.semaphore(b));
+        assert_eq!(p.semaphore(a), p.semaphore(c));
+        let init = p.semaphore_init();
+        assert_eq!(init.len(), 2);
+        assert!(init.contains(&(p.semaphore(b), 1, tt_isa::sync::MAX_VALUE)));
+        check(&r, &p, DATA).unwrap();
+        // And the checker refuses a plan that shares them anyway.
+        let mut bad = p.clone();
+        bad.sems[1] = bad.sems[0];
+        assert!(check(&r, &bad, DATA).unwrap_err().contains("start at"));
     }
 
     #[test]
@@ -630,7 +697,7 @@ mod tests {
             Endpoint::Mover,
             0..1,
         );
-        let a_sem = a.semaphore("a ready", 0..1);
+        let a_sem = a.semaphore("a ready", 0, 0..1);
         let mut b = Requirements::new(1);
         let b_in = b.cb(
             "b in",
@@ -650,7 +717,7 @@ mod tests {
             Endpoint::Mover,
             0..1,
         );
-        let b_sem = b.semaphore("b ready", 0..1);
+        let b_sem = b.semaphore("b ready", 0, 0..1);
         let f = Requirements::fuse(&a, &b, &[(a_out, b_in)]).unwrap();
         assert_eq!(f.req.stages(), 2);
         assert_eq!(f.buf(a_out), f.buf(b_in), "one ring");
@@ -739,7 +806,7 @@ mod tests {
             }
             for _ in 0..next(6) {
                 let s = next(stages as u64) as u32;
-                r.semaphore("m", s..s + 1);
+                r.semaphore("m", next(3) as u8, s..s + 1);
             }
             (r, cbs)
         };

@@ -1383,9 +1383,26 @@ cards for time):
       layout (A and B as rings from the mover to the unpacker, the outputs as
       a ring from the packer to the mover) and the element-wise and column-sum
       staging. Golden bit for bit; ttsim and both cards 84/84 with the smoke
-      tier. **Not yet:** the matmul's two semaphores (`DST_READY`, `DST_FREE`)
-      are still constants; moving them onto the planner threads them through
-      about twenty call sites. The host-staged path keeps its fixed layout.
+      tier. The host-staged path keeps its fixed layout.
+- [x] **Semaphores are planned, not named.** Every semaphore is a
+      `Requirements::semaphore(name, initial, live)` declaration, and a plan's
+      `semaphore_init()` is the whole of what a concurrent run initialises, so
+      `runtime`, `session` and the mover-driven `Step::Kernel` carry a generic
+      init list and know nothing of a matmul. The matmul's `DST_READY`,
+      `DST_FREE` and `TILE_SEMAPHORES` constants are gone; `MatmulSemaphores`
+      is only the matmul's names for its two (`ready` from 0, `free` from 1),
+      and the programs memo is keyed by them. Found on the way: two semaphores
+      of different stages may share a number only if they start at the same
+      value, or the second inherits the first's -- now a planner rule and a
+      `check` refusal, both tested. Gates: the roles' programs differ exactly
+      at the semaphore instructions when the pair is swapped; golden bit for
+      bit; ttsim and both cards 78/78 with the smoke tier; the two-card
+      sharded MNIST reproduces the golden.
+  - **Hardware, 2026-10-01:** the X 3 cable link reports "not Up on both
+    ends" on every run (`silicon_eth_link`'s host-driven X 3 tests and every
+    mover test, which takes the first two links); X 13 is Up and the
+    host-driven X 13 tests pass. Ethernet code is unchanged since Phase 8, so
+    this is link state, not a regression; not yet investigated.
 - [x] **Forking while another test thread is inside Burn could hang a child.**
       A forked child keeps every lock as it stood; one held by a thread
       computing a `burn-flex` reference in the parent is held forever. Seen

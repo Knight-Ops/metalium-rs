@@ -86,7 +86,7 @@ pub struct Kernel<'a> {
     /// A completed run leaves every semaphore of its [`Schedule::Concurrent`]
     /// set as the set initialises it: every post is matched by a take. A
     /// [`Resident`] then skips the setup run of the next kernel with the same
-    /// set (`matmul::TILE_SEMAPHORES` says why a matmul qualifies).
+    /// set (`matmul::MatmulSemaphores` says why a matmul qualifies).
     pub restores_semaphores: bool,
 }
 

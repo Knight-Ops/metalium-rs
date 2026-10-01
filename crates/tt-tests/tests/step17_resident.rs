@@ -161,13 +161,12 @@ fn a_failed_kernel_leaves_the_session_usable() {
         let mkn = [32, 64, 32];
         let (a, b) = (floats(9, 32 * 64), floats(10, 64 * 32));
         let want = reference(s, &a, &b, mkn, Fidelity::HiFi4);
-        let stuck = tt_isa::sync::take(
-            tt_kernels::matmul::DST_READY,
-            tt_isa::backend::Before::EVERYTHING,
-        )
-        .to_vec();
+        // Any semaphore will do: math waits on one that starts at zero and
+        // that nothing posts.
+        let never = tt_isa::sync::Semaphore::new(0).unwrap();
+        let stuck = tt_isa::sync::take(never, tt_isa::backend::Before::EVERYTHING).to_vec();
         let nothing: Vec<tt_isa::isa::Instruction> = Vec::new();
-        let sems = [(tt_kernels::matmul::DST_READY, 0, 1)];
+        let sems = [(never, 0, 1)];
         let k = Kernel {
             dump_rows: 0,
             ..Kernel::new([&nothing, &stuck, &nothing], Schedule::Concurrent(&sems))

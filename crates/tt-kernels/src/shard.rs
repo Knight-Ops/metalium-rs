@@ -21,7 +21,7 @@ use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::noc::{Noc0, NocCoord};
 
 use crate::link::{Dest, Dir, Link, LinkError, Mover, Source};
-use crate::matmul::{self, Fidelity, SrcRoute, MATMUL_OUT, MATMUL_STAGE, TILE_SEMAPHORES};
+use crate::matmul::{self, Fidelity, SrcRoute, MATMUL_OUT, MATMUL_STAGE};
 use crate::runtime::{self, Kernel, RoleImages, RunError, Schedule};
 use crate::session::{reset_thread_state, reset_tile};
 
@@ -299,11 +299,9 @@ impl<T: Transport> Fabric<T> {
         let staged = matmul::stage_matmul(a, b, m, k, n, in_fmt)?;
         self.deliver(chip, MATMUL_STAGE as u32, &staged.a)?;
         self.deliver(chip, staged.b_at as u32, &staged.b)?;
-        let [unpack, math, pack] = matmul::matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity);
-        let kernel = Kernel::new(
-            [&unpack, &math, &pack],
-            Schedule::Concurrent(&TILE_SEMAPHORES),
-        );
+        let [unpack, math, pack] =
+            matmul::matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity);
+        let kernel = Kernel::new([&unpack, &math, &pack], Schedule::Concurrent(&staged.init));
         runtime::run(&mut self.chips[chip].dev, tile, &images, &kernel, budget)?;
         let packed = self.collect(chip, MATMUL_OUT as u32, staged.out_bytes())?;
         Ok(matmul::detilize_packed(&packed, m, n))

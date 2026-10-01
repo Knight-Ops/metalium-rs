@@ -258,6 +258,9 @@ struct Segment {
     /// Indices into `entries` of the `KERNEL` entries.
     kernels: Vec<usize>,
     roles: Option<Arc<[Vec<Instruction>; 3]>>,
+    /// The semaphores those programs use, initialised as their kernel's setup
+    /// would (`matmul::MatmulSemaphores::init`).
+    init: Vec<runtime::SemaphoreInit>,
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
 }
@@ -312,13 +315,16 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 cur.steps += 1;
                 after_list = true;
             }
-            Step::Matmul(roles) => {
-                let same = cur.roles.as_ref().is_none_or(|r| {
-                    Arc::ptr_eq(r, &roles)
-                        || r.iter().zip(roles.iter()).all(|(a, b)| {
-                            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
-                        })
-                });
+            Step::Kernel { roles, init } => {
+                let same = cur.init.is_empty() || cur.init == init;
+                let same = same
+                    && cur.roles.as_ref().is_none_or(|r| {
+                        Arc::ptr_eq(r, &roles)
+                            || r.iter().zip(roles.iter()).all(|(a, b)| {
+                                a.len() == b.len()
+                                    && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
+                            })
+                    });
                 if !same || cur.entries.len() == LIST_MAX as usize {
                     close(&mut cur, &mut out);
                 }
@@ -326,6 +332,7 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                     cur.what = "matmul";
                 }
                 cur.roles = Some(roles);
+                cur.init = init;
                 cur.kernels.push(cur.entries.len());
                 cur.entries.push([op::KERNEL, 0, 0, 0, 0, 0, 0, 0]);
                 cur.steps += 1;
@@ -657,13 +664,11 @@ impl<T: Transport> Session<T> {
             Some(roles) => {
                 let [unpack, math, pack] = &**roles;
                 let kernel = Kernel {
-                    // `TILE_SEMAPHORES`: every run leaves them as it found them,
-                    // which is what lets the mover run them back to back.
+                    // `MatmulSemaphores::init`: every run leaves them as it
+                    // found them, which is what lets the mover run them back
+                    // to back.
                     restores_semaphores: true,
-                    ..Kernel::new(
-                        [unpack, math, pack],
-                        Schedule::Concurrent(&matmul::TILE_SEMAPHORES),
-                    )
+                    ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
                 };
                 let generations =
                     r.reserve(dev, images, &kernel, budget, seg.kernels.len() as u32)?;
@@ -861,7 +866,17 @@ mod tests {
     #[test]
     fn a_kernel_needs_no_wait_on_either_side_and_blocks_reuse_its_programs() {
         let roles = Arc::new([Vec::new(), Vec::new(), Vec::new()]);
-        let block = || vec![list(2, 1), Step::Matmul(roles.clone()), list(1, 2)];
+        let (_, init) = crate::matmul::MatmulSemaphores::alone();
+        let block = || {
+            vec![
+                list(2, 1),
+                Step::Kernel {
+                    roles: roles.clone(),
+                    init: init.clone(),
+                },
+                list(1, 2),
+            ]
+        };
         let segs = segments([block(), block()].concat());
         assert_eq!(segs.len(), 1, "same programs: one list");
         assert_eq!(
@@ -885,9 +900,35 @@ mod tests {
     fn different_programs_start_a_new_list() {
         let a = Arc::new([Vec::new(), Vec::new(), Vec::new()]);
         let b = Arc::new([vec![tt_isa::sfpu::nop()], Vec::new(), Vec::new()]);
-        let segs = segments(vec![Step::Matmul(a), list(1, 1), Step::Matmul(b)]);
+        let (_, init) = crate::matmul::MatmulSemaphores::alone();
+        let segs = segments(vec![
+            Step::Kernel {
+                roles: a.clone(),
+                init: init.clone(),
+            },
+            list(1, 1),
+            Step::Kernel {
+                roles: b,
+                init: init.clone(),
+            },
+        ]);
         assert_eq!(segs.len(), 2);
         assert_eq!(ops(&segs[1]), [op::KERNEL]);
+        // The same programs with other semaphore starting values are another
+        // kernel too: the setup a list's kernels share must suit all of them.
+        let mut other = init.clone();
+        other[0].1 = 1;
+        let segs = segments(vec![
+            Step::Kernel {
+                roles: a.clone(),
+                init,
+            },
+            Step::Kernel {
+                roles: a,
+                init: other,
+            },
+        ]);
+        assert_eq!(segs.len(), 2);
     }
 
     #[test]

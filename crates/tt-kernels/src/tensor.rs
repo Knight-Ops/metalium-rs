@@ -378,10 +378,15 @@ pub enum Step {
         what: &'static str,
         entries: Vec<[u32; 8]>,
     },
-    /// The three role programs of a matmul chunk, run concurrently on the
-    /// tile's resident roles with [`matmul::TILE_SEMAPHORES`], which they
-    /// restore.
-    Matmul(Arc<[Vec<Instruction>; 3]>),
+    /// A kernel on the tile's resident roles: its three role programs, run
+    /// concurrently, and the semaphores its plan gave it as a run initialises
+    /// them (`crate::l1::Plan::semaphore_init`). It must leave every one where
+    /// it started (`Kernel::restores_semaphores`), since the mover runs it
+    /// back to back with no setup between runs.
+    Kernel {
+        roles: Arc<[Vec<Instruction>; 3]>,
+        init: Vec<crate::runtime::SemaphoreInit>,
+    },
 }
 
 /// Steps that must run in order on one tile, from one L1 staging area. The
@@ -485,7 +490,12 @@ pub fn matmul_dram(
         for j0 in (0..nt).step_by(nc) {
             let cols = nc.min(nt - j0);
             let tiles = [rows, kt, cols];
-            let (b_at, outputs) = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+            let matmul::Layout {
+                b_at,
+                outputs,
+                sems,
+                init,
+            } = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
                 Ok(l) => l,
                 Err(e) => {
                     alloc.free(&c.placement);
@@ -509,8 +519,8 @@ pub fn matmul_dram(
                 rb.encode()[0],
                 rb.encode()[1],
             ];
-            let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
-                matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
+            let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
+                matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
             });
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
@@ -539,7 +549,7 @@ pub fn matmul_dram(
                     what: "matmul gather",
                     entries: gather.to_vec(),
                 },
-                Step::Matmul(roles),
+                Step::Kernel { roles, init },
                 Step::List {
                     what: "matmul scatter",
                     entries: scatter.to_vec(),
@@ -746,8 +756,13 @@ mod tests {
                     }
                     after_list = true;
                 }
-                Step::Matmul(roles) => {
-                    out.push(Err(roles.iter().map(|p| p.len() as u32).collect()));
+                Step::Kernel { roles, init } => {
+                    let mut k: Vec<u32> = roles.iter().map(|p| p.len() as u32).collect();
+                    k.extend(
+                        init.iter()
+                            .flat_map(|(s, v, m)| [s.index() as u32, *v as u32, *m as u32]),
+                    );
+                    out.push(Err(k));
                     after_list = false;
                 }
             }
@@ -1012,7 +1027,12 @@ mod reference {
             for j0 in (0..nt).step_by(nc) {
                 let cols = nc.min(nt - j0);
                 let tiles = [rows, kt, cols];
-                let (b_at, outputs) = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+                let matmul::Layout {
+                    b_at,
+                    outputs,
+                    sems,
+                    init,
+                } = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
                     Ok(l) => l,
                     Err(e) => {
                         alloc.free(&c.placement);
@@ -1032,9 +1052,10 @@ mod reference {
                         list.push(fetch(b, b_transposed, kk, j0 + j, to));
                     }
                 }
-                let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
-                    matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
-                });
+                let roles =
+                    matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
+                        matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
+                    });
 
                 // Only the datums go back: the packer writes nothing else, and the
                 // unpacker skips the header whatever it holds (`step18_dram_matmul`).
@@ -1064,7 +1085,7 @@ mod reference {
                         what: "matmul gather",
                         entries: list,
                     },
-                    Step::Matmul(roles),
+                    Step::Kernel { roles, init },
                     Step::List {
                         what: "matmul scatter",
                         entries: back,
