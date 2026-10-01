@@ -1730,17 +1730,27 @@ pub fn program_for(
     scalars: [f32; 2],
     bcast: Broadcast,
 ) -> Option<(Operands, Vec<Instruction>)> {
+    code_for(kind, scalars, bcast).map(|(o, c)| (o, c.expand()))
+}
+
+/// [`program_for`] as a role's slot holds it: its long row loops stored
+/// once, the runner's block repeats beside them (`crate::code`).
+pub fn code_for(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+) -> Option<(Operands, crate::code::Code)> {
     match bcast {
-        Broadcast::None => program2(kind, scalars),
+        Broadcast::None => code2(kind, scalars),
         _ if !broadcasts(kind) => None,
-        Broadcast::Col => program2(kind, scalars).map(|(_, p)| (Operands::ColBroadcast, p)),
+        Broadcast::Col => code2(kind, scalars).map(|(_, p)| (Operands::ColBroadcast, p)),
         Broadcast::Row => {
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
             binary_constants(&mut p, kind, scalars);
             p.for_each_row_group(64, |p, o| {
                 binary_body(p, kind, A_ROW + o, bias_row(o / 4) + (o & 2), OUT_ROW + o)
             });
-            Some((Operands::RowBroadcast, p.finish()))
+            Some((Operands::RowBroadcast, p.finish_code()))
         }
     }
 }
@@ -1755,10 +1765,15 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
 /// [`program`] for a kind with two scalars ([`kind_sfpu::CLAMP`],
 /// [`kind_sfpu::HARD_SIGMOID`]).
 pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instruction>)> {
+    code2(kind, scalars).map(|(o, c)| (o, c.expand()))
+}
+
+/// [`program2`] as a role's slot holds it ([`code_for`]).
+pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Code)> {
     let scalar = scalars[0];
     let mut p = Program::new();
     if let Some(o) = exact_program(&mut p, kind, scalars) {
-        return Some((o, p.finish()));
+        return Some((o, p.finish_code()));
     }
     let mut p = Program::new();
     let operands = match kind {
@@ -2008,10 +2023,10 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
             });
             Operands::Unary
         }
-        kind::ADD_ROW => return program_for(kind::ADD, scalars, Broadcast::Row),
+        kind::ADD_ROW => return code_for(kind::ADD, scalars, Broadcast::Row),
         _ => return None,
     };
-    Some((operands, p.finish()))
+    Some((operands, p.finish_code()))
 }
 
 /// What the device computes for `kind` over a whole `[rows, cols]` tensor:
@@ -2273,10 +2288,11 @@ mod tests {
 #[cfg(test)]
 mod fit {
     use super::*;
-    use crate::sfpu::kernel::{plan_layout, roles};
+    use crate::sfpu::kernel::{plan_layout, roles_code};
 
     /// Every op's longest run (`tensor::sfpu_eltwise`'s group) has role
-    /// programs that fit a program slot, and is no shorter than it must be.
+    /// programs that fit a program slot, as the slots hold them (block
+    /// repeats stored once), and is no shorter than it must be.
     #[test]
     fn every_op_s_longest_run_fits_a_program_slot() {
         for k in [
@@ -2289,11 +2305,18 @@ mod fit {
             kind::RELU_BACKWARD,
             kind::ADD_ROW,
         ] {
-            let (operands, math) = program(k, 0.5).unwrap();
+            let bcast = if k == kind::ADD_ROW {
+                Broadcast::Row
+            } else {
+                Broadcast::None
+            };
+            let kk = if k == kind::ADD_ROW { kind::ADD } else { k };
+            let (operands, math) = code_for(kk, [0.5, 0.0], bcast).unwrap();
             let n = crate::tensor::sfpu_group_for_tests(k, 0.5, operands);
             let fits = |n: usize| {
                 let layout = plan_layout(n, operands).unwrap();
-                roles(&layout, operands, &math)
+                roles_code(&layout, operands, &math)
+                    .0
                     .iter()
                     .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
             };

@@ -112,9 +112,11 @@ impl Cond {
 pub enum LoopForm {
     /// Recorded once and replayed: one `REPLAY` per further iteration.
     Replayed { body: usize },
-    /// Written out, every iteration: the body did not fit the buffer, or the
-    /// program asked for it.
+    /// Written out, every iteration: the program asked for it.
     Unrolled { body: usize },
+    /// Stored once and pushed once per iteration by the role runner
+    /// (`crate::code`): the body did not fit the replay buffer.
+    Repeated { body: usize },
 }
 
 /// Which form a row loop should take.
@@ -140,6 +142,8 @@ pub struct Program {
     in_loop: bool,
     loops: Vec<LoopForm>,
     policy: LoopPolicy,
+    /// The runner's block repeats over `ins` (`crate::code::Loop`).
+    repeats: Vec<crate::code::Loop>,
 }
 
 impl Default for Program {
@@ -164,6 +168,7 @@ impl Program {
             in_loop: false,
             loops: Vec::new(),
             policy,
+            repeats: Vec::new(),
         };
         // `SFPENCC_MOD1_EI | SFPENCC_MOD1_RI`, both immediate bits set.
         p.push(encode::sfpencc(3, 0, 2 | 8).unwrap());
@@ -668,6 +673,7 @@ impl Program {
             in_loop: true,
             loops: Vec::new(),
             policy: self.policy,
+            repeats: Vec::new(),
         };
         body(&mut b, 0);
         assert_eq!(
@@ -690,7 +696,7 @@ impl Program {
                 .first()
                 .is_some_and(|i| !i.stalls_automatically_after_mad());
         let fits = b.ins.len() + usize::from(wraps_nop) <= frontend::REPLAY_BUFFER as usize;
-        if self.policy == LoopPolicy::Unrolled || !fits {
+        if self.policy == LoopPolicy::Unrolled {
             for k in 0..iterations {
                 body(self, 2 * k);
             }
@@ -710,14 +716,27 @@ impl Program {
         self.ins.push(thread_entry(row.dst_incr, 0));
         self.ins.push(thread_entry(stepping.dst_incr, 2));
         self.ins.push(clear_dst_rwc());
-        frontend::record(0, &ins, true, &mut self.ins).expect("fits, and a body has no REPLAY");
-        let r = frontend::replay(0, ins.len()).unwrap();
-        for _ in 1..iterations {
-            self.ins.push(r);
+        if fits {
+            frontend::record(0, &ins, true, &mut self.ins).expect("fits, and a body has no REPLAY");
+            let r = frontend::replay(0, ins.len()).unwrap();
+            for _ in 1..iterations {
+                self.ins.push(r);
+            }
+            self.loops.push(LoopForm::Replayed { body: ins.len() });
+        } else {
+            // Too long to record: stored once, the runner pushes it once per
+            // iteration -- the same words the replayed form's expansion is,
+            // the row counter stepped the same way.
+            self.repeats.push(crate::code::Loop {
+                start: self.ins.len() as u32,
+                len: ins.len() as u32,
+                count: iterations,
+            });
+            self.ins.extend_from_slice(&ins);
+            self.loops.push(LoopForm::Repeated { body: ins.len() });
         }
         self.ins.push(clear_dst_rwc());
         self.after_mad = ins.last().is_some_and(is_mad_unit);
-        self.loops.push(LoopForm::Replayed { body: ins.len() });
     }
 
     /// The forms the program's row loops took, in order.
@@ -725,11 +744,21 @@ impl Program {
         &self.loops
     }
 
-    /// The instructions, for the math thread. Refuses a program that leaves
-    /// anything on the flag stack.
+    /// The instructions the math thread receives, block repeats expanded:
+    /// what the interpreter runs and the device is held to. Refuses a program
+    /// that leaves anything on the flag stack.
     pub fn finish(self) -> Vec<Instruction> {
+        self.finish_code().expand()
+    }
+
+    /// The program as a role's slot holds it, its block repeats beside it
+    /// (`crate::code::Code`).
+    pub fn finish_code(self) -> crate::code::Code {
         assert_eq!(self.depth, 0, "a program ends with the flag stack empty");
-        self.ins
+        crate::code::Code {
+            ins: self.ins,
+            loops: self.repeats,
+        }
     }
 }
 
@@ -914,11 +943,27 @@ mod tests {
                 p.load(LReg::L0, Format::Fp32, o + 4 * (k % 2));
             }
         });
-        assert_eq!(p.loops(), &[LoopForm::Unrolled { body: 40 }]);
+        // Too long for the replay buffer: stored once, one runner repeat of
+        // 32 over it (`crate::code`), which expands to every iteration.
+        assert_eq!(p.loops(), &[LoopForm::Repeated { body: 40 }]);
+        let code = p.clone().finish_code();
+        assert_eq!(
+            code.ins.len(),
+            3 + 3 + 40 + 1,
+            "the prologue, the setup, the body once, the clear"
+        );
+        assert_eq!(
+            code.loops,
+            [crate::code::Loop {
+                start: 6,
+                len: 40,
+                count: 32
+            }]
+        );
         assert_eq!(
             p.finish().len(),
-            3 + 32 * 40,
-            "the prologue and every iteration"
+            3 + 3 + 32 * 40 + 1,
+            "expanded: every iteration"
         );
 
         let mut p = Program::with_policy(LoopPolicy::Unrolled);

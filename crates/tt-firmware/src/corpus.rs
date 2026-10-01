@@ -162,7 +162,11 @@ where
     // left reset (or, resident, before it wrote the new generation).
     let thread = unsafe { l1_read32(mb.thread_index()) };
     let fmt = unsafe { l1_read32(mb.dst_access_fmt()) };
-    let program_len = unsafe { l1_read32(mb.program_len()) };
+    // A loop header leads the program where its length says so
+    // (`mailbox::loops::LOOPED`).
+    let program_len_word = unsafe { l1_read32(mb.program_len()) };
+    let looped = program_len_word & mailbox::loops::LOOPED != 0;
+    let program_len = program_len_word & !mailbox::loops::LOOPED;
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
@@ -232,46 +236,55 @@ where
         load_mop_config(&cfg);
     }
 
+    // The block repeats (`mailbox::loops`): each inside the code, and any two
+    // disjoint or one inside the other, at most two deep -- checked, since a
+    // bad table would push whatever L1 holds.
+    let (code, code_len, n) = if looped {
+        // SAFETY: the program's first word, inside its checked extent.
+        let n = if program_len == 0 { u32::MAX } else { unsafe { l1_read32(program) } };
+        if n as usize > mailbox::loops::MAX || n + 1 > program_len {
+            fail_in(mb, panic_code::EXPLICIT);
+        }
+        (program + 4 * (1 + n as u64), program_len - 1 - n, n as usize)
+    } else {
+        (program, program_len, 0)
+    };
+    let mut loops = [(0u32, 0u32, 0u32); mailbox::loops::MAX];
+    for (k, l) in loops.iter_mut().enumerate().take(n) {
+        // SAFETY: inside the header the bound above checked.
+        *l = mailbox::loops::decode(unsafe { l1_read32(program + 4 * (1 + k as u64)) });
+        if l.0 + l.1 > code_len {
+            fail_in(mb, panic_code::EXPLICIT);
+        }
+    }
+    for a in 0..n {
+        let mut depth = 0;
+        for b in 0..n {
+            let (x, y) = (loops[a], loops[b]);
+            let (xe, ye) = (x.0 + x.1, y.0 + y.1);
+            let disjoint = xe <= y.0 || ye <= x.0;
+            let inside = y.0 <= x.0 && xe <= ye && (x.0, x.1) != (y.0, y.1);
+            let around = x.0 <= y.0 && ye <= xe && (x.0, x.1) != (y.0, y.1);
+            if a != b && !(disjoint || inside || around) {
+                fail_in(mb, panic_code::EXPLICIT);
+            }
+            if a != b && inside {
+                depth += 1;
+            }
+        }
+        if depth > 1 {
+            fail_in(mb, panic_code::EXPLICIT);
+        }
+    }
+
     trace(tracing, Thread::INDEX, mailbox::trace::START);
-    let mut i = 0;
-    // A countdown rather than `i % push_window`: T2 has no remainder
-    // instruction, and the instruction-set gate refuses one.
-    let mut until_drain = push_window;
-    // Silicon (no push window): sixteen words read, then sixteen pushed, so
-    // the loads overlap rather than each push waiting on its own load. One
-    // word at a time took ~7.6 cycles a word, eight at a time 3.5, sixteen 2.8
-    // (`silicon_perf::role_push_rate`, card 0) -- and a matmul's unpack and
-    // math roles push as fast as their runner can. Sixteen is what fits the
-    // registers.
-    if push_window == 0 {
-        while i + 16 <= program_len {
-            let at = program + (i as u64) * 4;
-            // SAFETY: eight words inside the staged program, whose length was
-            // checked above.
-            let w: [u32; 16] = core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
-            for word in w {
-                // SAFETY: as the loop below.
-                unsafe { push_word::<Riscv, Thread>(word) }
-            }
-            i += 16;
-        }
-    }
-    while i < program_len {
-        // SAFETY: the word is inside the staged program, whose length was checked
-        // above; `Riscv` may push to `Thread`, which the type system checked; the
-        // backend is out of reset.
-        unsafe { push_word::<Riscv, Thread>(l1_read32(program + (i as u64) * 4)) }
-        i += 1;
-        // Flow control for the simulator (`mailbox::PUSH_WINDOW`): silicon
-        // stalls a push into a full FIFO, ttsim kills the process.
-        if push_window != 0 {
-            until_drain -= 1;
-            if until_drain == 0 {
-                wait_for_coprocessor();
-                until_drain = push_window;
-            }
-        }
-    }
+    let mut push = Pusher::<Riscv, Thread> {
+        program: code,
+        push_window,
+        until_drain: push_window,
+        _p: core::marker::PhantomData,
+    };
+    push.span(0, code_len, &loops[..n]);
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
 
@@ -296,4 +309,85 @@ where
     }
 
     program_len
+}
+
+/// Pushes ranges of a staged program, its block repeats expanded.
+struct Pusher<Riscv, Thread> {
+    program: u64,
+    push_window: u32,
+    /// A countdown rather than `i % push_window`: T2 has no remainder
+    /// instruction, and the instruction-set gate refuses one.
+    until_drain: u32,
+    _p: core::marker::PhantomData<(Riscv, Thread)>,
+}
+
+impl<Riscv, Thread> Pusher<Riscv, Thread>
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    /// Words `[lo, hi)`, each block repeat inside them its `count` times --
+    /// the next one being the first, not yet passed, that lies inside and is
+    /// not the span itself; the ones inside it its own call's.
+    fn span(&mut self, lo: u32, hi: u32, loops: &[(u32, u32, u32)]) {
+        let mut at = lo;
+        loop {
+            let mut next: Option<(u32, u32, u32)> = None;
+            for &l in loops {
+                let inside = l.0 >= at && l.0 + l.1 <= hi && (l.0, l.0 + l.1) != (lo, hi);
+                if inside && next.is_none_or(|n| l.0 < n.0 || (l.0 == n.0 && l.1 > n.1)) {
+                    next = Some(l);
+                }
+            }
+            let Some((start, len, count)) = next else {
+                self.linear(at, hi);
+                return;
+            };
+            self.linear(at, start);
+            for _ in 0..count {
+                self.span(start, start + len, loops);
+            }
+            at = start + len;
+        }
+    }
+
+    /// Words `[lo, hi)` as they are.
+    fn linear(&mut self, lo: u32, hi: u32) {
+        let mut i = lo;
+        // Silicon (no push window): sixteen words read, then sixteen pushed, so
+        // the loads overlap rather than each push waiting on its own load. One
+        // word at a time took ~7.6 cycles a word, eight at a time 3.5, sixteen
+        // 2.8 (`silicon_perf::role_push_rate`, card 0) -- and a matmul's unpack
+        // and math roles push as fast as their runner can. Sixteen is what fits
+        // the registers.
+        if self.push_window == 0 {
+            while i + 16 <= hi {
+                let at = self.program + (i as u64) * 4;
+                // SAFETY: sixteen words inside the staged program, whose length
+                // was checked by the caller.
+                let w: [u32; 16] = core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
+                for word in w {
+                    // SAFETY: as the loop below.
+                    unsafe { push_word::<Riscv, Thread>(word) }
+                }
+                i += 16;
+            }
+        }
+        while i < hi {
+            // SAFETY: the word is inside the staged program, whose length was
+            // checked; `Riscv` may push to `Thread`, which the type system
+            // checked; the backend is out of reset.
+            unsafe { push_word::<Riscv, Thread>(l1_read32(self.program + (i as u64) * 4)) }
+            i += 1;
+            // Flow control for the simulator (`mailbox::PUSH_WINDOW`): silicon
+            // stalls a push into a full FIFO, ttsim kills the process.
+            if self.push_window != 0 {
+                self.until_drain -= 1;
+                if self.until_drain == 0 {
+                    wait_for_coprocessor();
+                    self.until_drain = self.push_window;
+                }
+            }
+        }
+    }
 }

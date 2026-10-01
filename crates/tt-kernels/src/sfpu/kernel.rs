@@ -148,6 +148,26 @@ pub fn max_tiles(operands: Operands) -> usize {
 /// tile's SFPU program, reading `A_ROW` (and `B_ROW`) and writing `OUT_ROW`
 /// -- run once per tile.
 pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<Instruction>; 3] {
+    let (code, loops) = roles_code(layout, operands, &crate::code::Code::plain(math.to_vec()));
+    std::array::from_fn(|t| {
+        crate::code::Code {
+            ins: code[t].clone(),
+            loops: loops[t].clone(),
+        }
+        .expand()
+    })
+}
+
+/// [`roles`] as the role slots hold them, with each role's block repeats
+/// (`crate::code`): the math role's per-tile block -- the same for every tile
+/// -- stored once and repeated once per tile, and `math`'s own row loops
+/// inside it, so a run's math program is one tile's whatever its length.
+pub fn roles_code(
+    layout: &Layout,
+    operands: Operands,
+    math: &crate::code::Code,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    use crate::code::Loop;
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
 
@@ -161,6 +181,7 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
     tile_unpack_config(&mut words, layout.a_at);
     unpack.extend(config_program(&words));
     let mut m = vec![state_id()];
+    let mut math_loops = Vec::new();
     let mut pack = vec![state_id()];
     for n in 0..layout.tiles {
         unpack.extend(sync::take(s.free, Before::UNPACKER));
@@ -192,9 +213,24 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
         }
         unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
 
-        m.extend(sync::take(s.unpacked, Before::SFPU));
-        m.extend_from_slice(math);
-        m.extend(sync::post_after(Unit::Sfpu, s.computed));
+        if n == 0 {
+            let block = m.len() as u32;
+            m.extend(sync::take(s.unpacked, Before::SFPU));
+            let at = m.len() as u32;
+            m.extend_from_slice(&math.ins);
+            m.extend(sync::post_after(Unit::Sfpu, s.computed));
+            if layout.tiles > 1 {
+                math_loops.push(Loop {
+                    start: block,
+                    len: m.len() as u32 - block,
+                    count: layout.tiles as u32,
+                });
+            }
+            math_loops.extend(math.loops.iter().map(|l| Loop {
+                start: l.start + at,
+                ..*l
+            }));
+        }
 
         pack.extend(sync::take(s.computed, Before::PACKER));
         pack.extend(pack_tile_from_dst(
@@ -205,7 +241,7 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
     }
     unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
     pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
-    [unpack, m, pack]
+    ([unpack, m, pack], [Vec::new(), math_loops, Vec::new()])
 }
 
 #[cfg(test)]

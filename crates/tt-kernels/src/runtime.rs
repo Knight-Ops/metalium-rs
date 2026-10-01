@@ -95,6 +95,9 @@ pub struct Kernel<'a> {
     /// runner before the program is pushed (`tt_isa::frontend::mop`,
     /// `mailbox::MOP_CFG`). `None` leaves the expander as it is.
     pub mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    /// Each role's block repeats over its program (`crate::code`,
+    /// `mailbox::LOOPS`): the runner pushes each range `count` times.
+    pub loops: [&'a [crate::code::Loop]; 3],
 }
 
 impl<'a> Kernel<'a> {
@@ -112,7 +115,45 @@ impl<'a> Kernel<'a> {
             restores_semaphores: false,
             unwedge: false,
             mop: [None; 3],
+            loops: [&[]; 3],
         }
+    }
+
+    /// Role `thread`'s `program` -- its own program, or that with a prefix the
+    /// runtime put in front (`assemble`'s `Dst` clear) -- as its slot stores
+    /// it, its block repeats moved past the prefix and led by their header
+    /// (`crate::code::Code::stored`), and the length word that names it.
+    fn stored_program(
+        &self,
+        thread: usize,
+        program: &[Instruction],
+    ) -> Result<(Vec<u32>, u32), RunError> {
+        // A resident list's descriptor, staged without its programs (their
+        // `KERNEL` entries name them, length word and all).
+        if program.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let prefix = program.len().saturating_sub(self.roles[thread].len()) as u32;
+        let code = crate::code::Code {
+            ins: program.to_vec(),
+            loops: self.loops[thread]
+                .iter()
+                .map(|l| crate::code::Loop {
+                    start: l.start + prefix,
+                    ..*l
+                })
+                .collect(),
+        };
+        let (words, len) = code
+            .stored()
+            .map_err(|e| RunError::Loops { thread, reason: e })?;
+        if words.len() > mailbox::PROGRAM_MAX as usize {
+            return Err(RunError::ProgramTooLong {
+                thread,
+                len: words.len(),
+            });
+        }
+        Ok((words, len))
     }
 
     /// Role `thread`'s MOP words, checked: a configuration the expander cannot
@@ -242,6 +283,11 @@ pub enum RunError {
         thread: usize,
         reason: tt_isa::frontend::mop::MopError,
     },
+    /// Role `thread`'s block repeats were refused (`crate::code::check`).
+    Loops {
+        thread: usize,
+        reason: crate::code::LoopError,
+    },
     /// The tile's reset never finished: these roles' threads take no
     /// instruction even after the backend pulse, every semaphore released and
     /// their `Src` banks fed (`session::unwedge_tile`). What else holds them is
@@ -277,6 +323,9 @@ impl std::fmt::Display for RunError {
             RunError::Queued(e) => write!(f, "{e}"),
             RunError::Mop { thread, reason } => {
                 write!(f, "role {thread}'s MOP configuration: {reason}")
+            }
+            RunError::Loops { thread, reason } => {
+                write!(f, "role {thread}'s program: {reason}")
             }
             RunError::DoesNotFit { what, bytes, limit } => write!(
                 f,
@@ -327,11 +376,8 @@ fn dst_clear(rows: u32) -> Vec<Instruction> {
     p
 }
 
-fn program_bytes(program: &[Instruction]) -> Vec<u8> {
-    program
-        .iter()
-        .flat_map(|i| i.word().to_le_bytes())
-        .collect()
+fn word_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 /// The setup program (for a concurrent schedule) and thread 0's program, with
@@ -411,10 +457,11 @@ pub fn run<T: Transport, N: NocId>(
      -> Result<(), RunError> {
         let mb = Mailbox::of(thread as u32);
         dev.write32(&w, tile, mb.status(), 0)?;
+        let (words, len) = kernel.stored_program(thread, program)?;
         let d = mailbox::Descriptor {
             thread_index: thread as u32,
             dst_access_fmt: kernel.dst_fmt,
-            program_len: program.len() as u32,
+            program_len: len,
             dump_row_count: dump,
             trace: u32::from(traced),
             push_window,
@@ -425,7 +472,7 @@ pub fn run<T: Transport, N: NocId>(
         for (at, v) in d.writes(mb) {
             dev.write32(&w, tile, at, v)?;
         }
-        dev.write(&w, tile, mb.program(), &program_bytes(program))?;
+        dev.write(&w, tile, mb.program(), &word_bytes(&words))?;
         for row in 0..dump {
             for col in 0..mailbox::DUMP_ROW_WORDS {
                 dev.write32(&w, tile, mb.dump_offset(row, col), DUMP_SENTINEL)?;
@@ -608,7 +655,17 @@ impl<N: NocId> Resident<N> {
             reservations: Default::default(),
         };
         for thread in 0..3 {
-            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false, false, None)?;
+            r.stage(
+                dev,
+                thread,
+                0,
+                false,
+                DST_FMT_FP32,
+                false,
+                false,
+                None,
+                (Vec::new(), 0),
+            )?;
             dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
         }
         dev.load_and_start_together(&r.window, tile, images)?;
@@ -973,7 +1030,13 @@ impl<N: NocId> Resident<N> {
         if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
             self.last_setup = Some((self.generation, setup.clone()));
-            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true, false, None)?;
+            let stored = crate::code::Code::plain(setup.to_vec())
+                .stored()
+                .map_err(|e| RunError::Loops {
+                    thread: 0,
+                    reason: e,
+                })?;
+            self.stage(dev, 0, 0, false, kernel.dst_fmt, true, false, None, stored)?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {
                 self.poisoned = true;
@@ -1004,13 +1067,13 @@ impl<N: NocId> Resident<N> {
             self.stage(
                 dev,
                 thread,
-                program,
                 dump,
                 kernel.trace || self.profiling,
                 kernel.dst_fmt,
                 false,
                 resident_programs,
                 kernel.mop_words(thread)?,
+                kernel.stored_program(thread, program)?,
             )?;
         }
         clock.lap(dev, Phase::Programs);
@@ -1099,22 +1162,17 @@ impl<N: NocId> Resident<N> {
         &self,
         dev: &mut Device<T>,
         thread: usize,
-        program: &[Instruction],
         dump: u32,
         traced: bool,
         dst_fmt: u32,
         go: bool,
         resident_programs: bool,
         mop_cfg: Option<[u32; 9]>,
+        stored: (Vec<u32>, u32),
     ) -> Result<(), RunError> {
         let (w, tile) = (&self.window, self.tile);
         let mb = Mailbox::of(thread as u32);
-        if program.len() > mailbox::PROGRAM_MAX as usize {
-            return Err(RunError::ProgramTooLong {
-                thread,
-                len: program.len(),
-            });
-        }
+        let (words, len) = stored;
         let push_window = if dev.transport().is_simulated() {
             mailbox::SIM_PUSH_WINDOW
         } else {
@@ -1125,7 +1183,7 @@ impl<N: NocId> Resident<N> {
         let d = mailbox::Descriptor {
             thread_index: thread as u32,
             dst_access_fmt: dst_fmt,
-            program_len: program.len() as u32,
+            program_len: len,
             dump_row_count: dump,
             trace: u32::from(traced),
             push_window,
@@ -1152,12 +1210,11 @@ impl<N: NocId> Resident<N> {
         descs[thread] = Some(writes.map(|(_, v)| v));
         drop(descs);
         let mut slots = self.slots.borrow_mut();
-        let words = program.iter().map(|i| i.word());
-        if !program.is_empty() && !slots[thread].iter().copied().eq(words.clone()) {
+        if !words.is_empty() && slots[thread] != words {
             // Forget the slot first: if the write fails, it holds neither.
             slots[thread].clear();
-            dev.l1_write(w, tile, mb.program(), &program_bytes(program))?;
-            slots[thread] = words.collect();
+            dev.l1_write(w, tile, mb.program(), &word_bytes(&words))?;
+            slots[thread] = words;
         }
         drop(slots);
         for row in 0..dump {

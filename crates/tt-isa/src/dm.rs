@@ -361,9 +361,13 @@ impl Entry {
                 if at == 0 && len == 0 {
                     continue;
                 }
-                let bytes = len as u64 * 4;
+                // The length word may carry `mailbox::loops::LOOPED` (a loop
+                // header leads the program), which the runner reads; the
+                // bounds are the words'.
+                let words = len & !crate::mailbox::loops::LOOPED;
+                let bytes = words as u64 * 4;
                 if at % 16 != 0
-                    || len > crate::mailbox::PROGRAM_MAX
+                    || words > crate::mailbox::PROGRAM_MAX
                     || !cache.contains(at as u64, bytes)
                 {
                     return Err(error::PROGRAM);
@@ -702,6 +706,15 @@ mod tests {
             Ok(Entry::Kernel {
                 generation: 7,
                 programs: [(at, 10), (0, 0), (at + 64, 3)]
+            })
+        );
+        // A looped program's length word passes through, flag and all.
+        let looped = 10 | crate::mailbox::loops::LOOPED;
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 7, at, looped, 0, 0, 0, 0]),
+            Ok(Entry::Kernel {
+                generation: 7,
+                programs: [(at, looped), (0, 0), (0, 0)]
             })
         );
         for bad in [

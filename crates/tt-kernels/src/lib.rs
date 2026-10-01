@@ -16,6 +16,7 @@
 //! this crate, not a condition a caller could handle. The runner, which talks
 //! to a device, returns [`runtime::RunError`] instead.
 
+pub mod code;
 pub mod datapath;
 pub mod dm;
 pub mod l1;

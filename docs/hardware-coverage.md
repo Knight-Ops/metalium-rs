@@ -492,6 +492,33 @@ reverse index.
         reset and prevented since X4c; another cause the feeder does not release still
         ends in `Wedged` and a board reset.
 
+- [x] **X8 Block repeats in the role runner** (10.2, asked for when `pow` and `gelu`
+      had to split into several ops). An SFPU row loop longer than the 32-entry replay
+      buffer was unrolled 32 times into the 8192-word program slot -- `pow` and `gelu`
+      came to ~9200 words, so they ran as chains of 4 and 2 ops. MOP and `REPLAY`
+      cannot help: both are bounded by the replay buffer. Now a program may carry a
+      loop header (`mailbox::loops`: `LOOPED` set in its length word, then the entry
+      count, up to four `(start, len, count)` entries, then the code): metadata stored
+      with the program, not instructions and not descriptor words, so it travels
+      through the program cache and a `KERNEL` entry and kernels with different loops
+      queue back to back under one descriptor. The runner (`tt_firmware::corpus::
+      Pusher`) checks the table -- inside the code, any two disjoint or nested, at most
+      two deep -- and pushes each span with the same sixteen-word fast path, a program
+      without a header exactly as before; the mover's `KERNEL` check masks the flag.
+      Host: `crate::code::{Code, Loop}` (`Code::stored` writes the header,
+      `Code::expand` the stream every model runs); `Program::for_each_row_group`
+      stores a body too long to replay once (`LoopForm::Repeated`, the same
+      row-counter stepping as the replayed form), and the SFPU kernel's math role
+      stores its per-tile block once and repeats it per tile (`kernel::roles_code`):
+      LOG's math program for a run is 124 words whatever its length, from ~3500 a
+      tile, and every SFPU op's run reaches 64 tiles (`ops::fit`). Found on the way,
+      and fixed: a drain the descriptors needed came after a list's programs were
+      placed, and unpinned them (hazard table). Gates: `crate::code` unit tests (nested
+      expansion, every refusal), every SFPU device gate now running nested repeats
+      against the interpreter's expansion bit for bit; watched failing with the
+      runner's repeat count off by one (`step29`). ttsim (31 gates) and the full
+      silicon suite, 482/482 on both cards.
+
 ### Performance follow-ups (measured, not yet scheduled)
 
 From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` rows V-Z;
@@ -849,6 +876,24 @@ Each names the measurement it must move. The Burn-side ones are in
       for lane masks; interpreter models of all four held to silicon in
       `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
       transpose then add). First user: R1's in-tile folds.
+- [ ] **S10 A fast, approximate mode for the transcendentals** (asked for during 10.2e;
+      concepts review G10's `math_approx_mode`). Today every S3/S4 op is built for a
+      derived bound of a few ulps (`EXP_BOUND`, `ERF_BOUND`, ...), and that costs
+      instructions on the device -- degree-16 Chebyshev fits evaluated by Clenshaw,
+      two Newton steps, exactness fix-ups, every special-value scope (`pow`'s seven).
+      (The fits' coefficients are computed once per process and baked in as
+      immediates, so the cost is device time, not host time.) Most training does not
+      need that. Add `MathMode::{Precise, Approx}` -- named apart from exact mode
+      (`burn_tt::set_exact`, Flex's bits), which is a different question -- carried
+      in `Eltwise` and the program memo keys, chosen per op or per session
+      (`TT_MATH=approx`), `Precise` the default. `Approx` programs: hard-coded
+      low-degree minimax polynomials or `SFPLUT`/`SFPLUTFP32` tables (10.2a gated
+      them), one Newton step or none (`SFPARECIP`'s seed is 0.56%), a coarser range
+      reduction, special values only where an ML input meets them (NaN, ±inf, ±0).
+      Each still gets a derived bound (looser, stated: e.g. `exp` to 2^-11
+      relative), a sweep and a device gate, and `silicon_perf` measures what each
+      saves per tile against `Precise`. Burn: the mode on `TtDevice`/config;
+      `accuracy()` gains the mode so exact mode still refuses both.
 - [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
       else here works without it.
 
@@ -1074,6 +1119,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
 | A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
+| A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
 
 New ttsim refusals or disagreements found while doing any of this go in

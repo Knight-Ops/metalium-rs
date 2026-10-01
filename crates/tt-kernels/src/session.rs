@@ -401,6 +401,9 @@ struct Segment {
     kernels: Vec<usize>,
     /// The programs of each `KERNEL` entry, in order.
     kernel_roles: Vec<Arc<[Vec<Instruction>; 3]>>,
+    /// Each kernel's block repeats, beside its roles: stored with its
+    /// programs (`crate::code::Code::stored`).
+    kernel_loops: Vec<Arc<[Vec<crate::code::Loop>; 3]>>,
     /// Do its kernels run resident programs (`crate::program_cache`), each
     /// entry naming its own? Otherwise they all run the one program set the
     /// host stages in the fixed slots, `roles`.
@@ -414,6 +417,9 @@ struct Segment {
     /// Its kernels' MOP configurations: one descriptor serves the list, so
     /// every kernel in it has the same (`tensor::Step::Kernel::mop`).
     mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    /// The block repeats of the programs a list of fixed-slot kernels shares
+    /// (resident lists' kernels each carry their own, `kernel_loops`).
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
 }
@@ -449,7 +455,13 @@ fn place_programs<T: Transport>(
                 if program.is_empty() {
                     continue;
                 }
-                let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
+                let code = crate::code::Code {
+                    ins: program.clone(),
+                    loops: seg.kernel_loops[k][t].clone(),
+                };
+                let (words, len_word) = code
+                    .stored()
+                    .map_err(|e| PlaceError::Failed(TensorError::Shape(e.to_string())))?;
                 let at = match cache.place(&words) {
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
@@ -468,7 +480,7 @@ fn place_programs<T: Transport>(
                         break 'kernels;
                     }
                 };
-                p[t] = (at as u32, words.len() as u32);
+                p[t] = (at as u32, len_word);
             }
             placed.push(p);
         }
@@ -564,7 +576,12 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 cur.steps += 1;
                 after_list = true;
             }
-            Step::Kernel { roles, init, mop } => {
+            Step::Kernel {
+                roles,
+                init,
+                mop,
+                loops,
+            } => {
                 let resident = roles
                     .iter()
                     .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
@@ -585,15 +602,25 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                         })
                 };
                 let same_mop = cur.kernels.is_empty() || cur.mop == *mop;
-                if !same_init || !same_mop || !fits || cur.entries.len() == LIST_MAX as usize {
+                // Resident programs carry their loops; fixed-slot kernels
+                // share one program, so one table.
+                let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
+                if !same_init
+                    || !same_mop
+                    || !same_loops
+                    || !fits
+                    || cur.entries.len() == LIST_MAX as usize
+                {
                     close(&mut cur, &mut out);
                 }
                 cur.mop = *mop;
+                cur.loops = loops.clone();
                 cur.resident = resident;
                 if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
                     cur.resident_bytes += bytes;
                 }
                 cur.kernel_roles.push(roles.clone());
+                cur.kernel_loops.push(loops.clone());
                 if cur.what.is_empty() {
                     cur.what = "matmul";
                 }
@@ -1248,6 +1275,29 @@ impl<T: Transport> Session<T> {
             return Err(TraceError::NotResident.into());
         }
         self.ensure_unit(u)?;
+        // A drain the descriptors need comes before the programs are placed:
+        // a drain unpins every program, and those placed for this list must
+        // stay pinned until it has run -- the next placement would otherwise
+        // be free to evict them under it.
+        let kernel = seg.kernel_roles.first().map(|roles| {
+            let [unpack, math, pack] = &**roles;
+            Kernel {
+                restores_semaphores: true,
+                mop: seg.mop,
+                loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
+                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
+            }
+        });
+        if let Some(kernel) = &kernel {
+            let idle = {
+                let Session { dev, units, .. } = self;
+                let r = units[u].resident.as_ref().unwrap();
+                r.needs_idle(dev, kernel, seg.resident)
+            };
+            if idle {
+                self.drain_unit(u)?;
+            }
+        }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
             let placed = {
@@ -1278,21 +1328,7 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
-        if let Some(roles) = seg.kernel_roles.first() {
-            let [unpack, math, pack] = &**roles;
-            let kernel = Kernel {
-                restores_semaphores: true,
-                mop: seg.mop,
-                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
-            };
-            let idle = {
-                let Session { dev, units, .. } = self;
-                let r = units[u].resident.as_ref().unwrap();
-                r.needs_idle(dev, &kernel, seg.resident)
-            };
-            if idle {
-                self.drain_unit(u)?;
-            }
+        if let Some(kernel) = &kernel {
             let Session {
                 dev, units, images, ..
             } = self;
@@ -1301,7 +1337,7 @@ impl<T: Transport> Session<T> {
             let generations = r.reserve(
                 dev,
                 images,
-                &kernel,
+                kernel,
                 budget,
                 seg.kernels.len() as u32,
                 seg.resident,
@@ -1363,6 +1399,7 @@ impl<T: Transport> Session<T> {
             let kernel = Kernel {
                 restores_semaphores: true,
                 mop: seg.mop,
+                loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
                 ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
             };
             let Session { dev, units, .. } = self;
@@ -2224,6 +2261,7 @@ impl<T: Transport> Session<T> {
                     // to back.
                     restores_semaphores: true,
                     mop: seg.mop,
+                    loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
                     ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
                 };
                 let generations = r.reserve(
@@ -2473,6 +2511,7 @@ mod tests {
                     roles: roles.clone(),
                     init: init.clone(),
                     mop: Box::new([None; 3]),
+                    loops: Default::default(),
                 },
                 list(1, 2),
             ]
@@ -2506,6 +2545,7 @@ mod tests {
                 roles: roles.clone(),
                 init: init.clone(),
                 mop: Box::new([None; 3]),
+                loops: Default::default(),
             };
         let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
         assert_eq!(segs.len(), 1, "every program is resident: one list");
@@ -2529,6 +2569,7 @@ mod tests {
             roles: roles.clone(),
             init: init.clone(),
             mop: Box::new([None; 3]),
+            loops: Default::default(),
         };
         let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
@@ -2549,6 +2590,7 @@ mod tests {
                 roles: p(n),
                 init: init.clone(),
                 mop: Box::new([None; 3]),
+                loops: Default::default(),
             })
             .collect();
         let segs = segments(steps);

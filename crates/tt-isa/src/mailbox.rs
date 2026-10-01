@@ -121,6 +121,51 @@ pub const MOP_CFG: u64 = MAILBOX_BASE + 0x4C;
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x70;
 
+/// A program's block repeats: with [`loops::LOOPED`] set in its length
+/// ([`PROGRAM_LEN`], a `KERNEL` entry's), the program's first word is how
+/// many entries follow ([`loops::entry`], at most [`loops::MAX`]), and the
+/// code after them; the runner pushes each `[start, start + len)` of the code
+/// `count` times where it is stored once -- how an SFPU row loop too long for
+/// the replay buffer (`frontend::REPLAY_BUFFER`) runs without being unrolled
+/// into the program slot. Metadata stored with the program, not instructions,
+/// and not a descriptor word: it travels with the program through the
+/// program cache and a `KERNEL` entry, so kernels with different loops queue
+/// back to back under one descriptor.
+pub mod loops {
+    /// Set in a program length: a loop header leads the program.
+    pub const LOOPED: u32 = 1 << 31;
+    /// Entries a program may have.
+    pub const MAX: usize = 4;
+    /// Bits of each field: `start` in 0..13, `len` in 13..25, `count - 1` in
+    /// 25..32.
+    pub const START_BITS: u32 = 13;
+    pub const LEN_BITS: u32 = 12;
+    pub const COUNT_BITS: u32 = 7;
+
+    /// `[start, start + len)` pushed `count` times: `None` if a field does not
+    /// fit (`start < 8192`, `1 <= len < 4096`, `1 <= count <= 128`).
+    pub const fn entry(start: u32, len: u32, count: u32) -> Option<u32> {
+        if start >= 1 << START_BITS
+            || len == 0
+            || len >= 1 << LEN_BITS
+            || count == 0
+            || count > 1 << COUNT_BITS
+        {
+            return None;
+        }
+        Some(start | (len << START_BITS) | ((count - 1) << (START_BITS + LEN_BITS)))
+    }
+
+    /// `(start, len, count)` of an [`entry`].
+    pub const fn decode(e: u32) -> (u32, u32, u32) {
+        (
+            e & ((1 << START_BITS) - 1),
+            (e >> START_BITS) & ((1 << LEN_BITS) - 1),
+            (e >> (START_BITS + LEN_BITS)) + 1,
+        )
+    }
+}
+
 /// Where the host points the timestamper's event buffer: after the program
 /// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
 /// two events per list entry or record, never per expanded move, and each
@@ -520,6 +565,22 @@ mod tests {
         ];
         want.sort_unstable();
         assert_eq!(at, want);
+    }
+
+    #[test]
+    fn loop_entries_round_trip_and_refuse_what_does_not_fit() {
+        for (s, l, c) in [(0, 1, 1), (8191, 4095, 128), (17, 295, 32), (3, 300, 64)] {
+            assert_eq!(loops::decode(loops::entry(s, l, c).unwrap()), (s, l, c));
+        }
+        for (s, l, c) in [
+            (8192, 1, 1),
+            (0, 0, 1),
+            (0, 4096, 1),
+            (0, 1, 0),
+            (0, 1, 129),
+        ] {
+            assert_eq!(loops::entry(s, l, c), None, "{s} {l} {c}");
+        }
     }
 
     #[test]

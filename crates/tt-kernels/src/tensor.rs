@@ -712,6 +712,9 @@ pub enum Step {
         /// Each role's MOP Expander configuration (`runtime::Kernel::mop`):
         /// the kernels of one list share it, so a list ends where it changes.
         mop: Box<[Option<tt_isa::frontend::mop::MopConfig>; 3]>,
+        /// Each role's block repeats (`runtime::Kernel::loops`): shared by a
+        /// list's kernels as `mop` is, since the table is a descriptor word.
+        loops: Arc<[Vec<crate::code::Loop>; 3]>,
     },
 }
 
@@ -883,6 +886,7 @@ pub fn matmul_dram(
                     roles,
                     init,
                     mop: Box::new(mop),
+                    loops: Default::default(),
                 },
                 Step::List {
                     what: "matmul scatter",
@@ -1165,7 +1169,7 @@ pub fn sfpu_eltwise(
     let mut jobs = Vec::new();
     for run in runs(rt * ct, units, group) {
         let len = run.len();
-        let (layout, roles) = match sfpu_programs(op, bcast, operands, len) {
+        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -1223,6 +1227,7 @@ pub fn sfpu_eltwise(
                 roles,
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
+                loops,
             },
             Step::List {
                 what: "sfpu scatter",
@@ -1233,7 +1238,11 @@ pub fn sfpu_eltwise(
     Ok(Some(Work { out, jobs }))
 }
 
-type SfpuPrograms = (crate::sfpu::kernel::Layout, Arc<[Vec<Instruction>; 3]>);
+type SfpuPrograms = (
+    crate::sfpu::kernel::Layout,
+    Arc<[Vec<Instruction>; 3]>,
+    Arc<[Vec<crate::code::Loop>; 3]>,
+);
 
 /// Most tiles one SFPU run of `op` may take: 64, or fewer if the data arena
 /// cannot hold their slots or a role's program -- which grows by a fixed
@@ -1299,9 +1308,11 @@ fn measure_sfpu_group(
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
         let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
-        let (_, math) = crate::sfpu::ops::program_for(op.kind, [op.scalar, op.scalar2], bcast)
+        let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
             .expect("checked by the caller");
-        crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
+        crate::sfpu::kernel::roles_code(&layout, operands, &math)
+            .0
+            .map(|p| p.len())
     };
     let (one, two) = (lens(1), lens(2));
     let max = tt_isa::mailbox::PROGRAM_MAX as usize;
@@ -1344,10 +1355,10 @@ fn sfpu_programs(
     }
     let layout = crate::sfpu::kernel::plan_layout(len, operands)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) = crate::sfpu::ops::program_for(op.kind, [op.scalar, op.scalar2], bcast)
+    let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
         .expect("checked by the caller");
-    let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
-    let p = (layout, roles);
+    let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
+    let p = (layout, Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, p.clone());
@@ -1435,6 +1446,7 @@ pub fn sfpu_reduce(
                 roles,
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
+                loops: Default::default(),
             },
             Step::List {
                 what: "reduce scatter",
@@ -2245,6 +2257,7 @@ mod reference {
                         roles,
                         init,
                         mop: Box::new([None; 3]),
+                        loops: Default::default(),
                     },
                     Step::List {
                         what: "matmul scatter",
