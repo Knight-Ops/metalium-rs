@@ -357,13 +357,18 @@ pub fn run<T: Transport, N: NocId>(
      -> Result<(), RunError> {
         let mb = Mailbox::of(thread as u32);
         dev.write32(&w, tile, mb.status(), 0)?;
-        dev.write32(&w, tile, mb.thread_index(), thread as u32)?;
-        dev.write32(&w, tile, mb.dst_access_fmt(), kernel.dst_fmt)?;
-        dev.write32(&w, tile, mb.program_len(), program.len() as u32)?;
-        dev.write32(&w, tile, mb.dump_row_first(), 0)?;
-        dev.write32(&w, tile, mb.dump_row_count(), dump)?;
-        dev.write32(&w, tile, mb.trace(), u32::from(traced))?;
-        dev.write32(&w, tile, mb.push_window(), push_window)?;
+        let d = mailbox::Descriptor {
+            thread_index: thread as u32,
+            dst_access_fmt: kernel.dst_fmt,
+            program_len: program.len() as u32,
+            dump_row_count: dump,
+            trace: u32::from(traced),
+            push_window,
+            ..Default::default()
+        };
+        for (at, v) in d.writes(mb) {
+            dev.write32(&w, tile, at, v)?;
+        }
         dev.write(&w, tile, mb.program(), &program_bytes(program))?;
         for row in 0..dump {
             for col in 0..mailbox::DUMP_ROW_WORDS {
@@ -638,6 +643,11 @@ impl<N: NocId> Resident<N> {
     /// kernel back to back with no setup between runs, which is right only if
     /// every run leaves them as the next expects (`Kernel::restores_semaphores`).
     /// Its setup, if the tile does not already hold them, runs here first.
+    ///
+    /// With `resident_programs`, `kernel`'s programs are not written to the
+    /// fixed slots: every `KERNEL` entry names resident ones itself
+    /// (`crate::program_cache`), and the kernels it runs may differ, as long as
+    /// they share their semaphores.
     pub fn reserve<T: Transport>(
         &mut self,
         dev: &mut Device<T>,
@@ -645,6 +655,7 @@ impl<N: NocId> Resident<N> {
         kernel: &Kernel<'_>,
         budget: u64,
         count: u32,
+        resident_programs: bool,
     ) -> Result<std::ops::Range<u32>, RunError> {
         if count == 0 || !kernel.restores_semaphores || kernel.dump_rows != 0 || kernel.trace {
             return Err(RunError::Transport(TransportError::Hazard {
@@ -653,7 +664,16 @@ impl<N: NocId> Resident<N> {
                          the data mover",
             }));
         }
-        let clock = self.begin(dev, images, kernel, budget)?;
+        let descriptors_only = Kernel {
+            roles: [&[], &[], &[]],
+            ..*kernel
+        };
+        let staged = if resident_programs {
+            &descriptors_only
+        } else {
+            kernel
+        };
+        let clock = self.begin(dev, images, staged, budget)?;
         let first = self.generation;
         self.generation += count - 1;
         self.pending = Some(clock);
@@ -863,13 +883,20 @@ impl<N: NocId> Resident<N> {
         } else {
             0
         };
-        dev.write32(w, tile, mb.thread_index(), thread as u32)?;
-        dev.write32(w, tile, mb.dst_access_fmt(), dst_fmt)?;
-        dev.write32(w, tile, mb.program_len(), program.len() as u32)?;
-        dev.write32(w, tile, mb.dump_row_first(), 0)?;
-        dev.write32(w, tile, mb.dump_row_count(), dump)?;
-        dev.write32(w, tile, mb.trace(), u32::from(traced))?;
-        dev.write32(w, tile, mb.push_window(), push_window)?;
+        // From the role's fixed slot (`program_addr` zero), unless a `KERNEL`
+        // entry points it at a resident program (`mailbox::PROGRAM_ADDR`).
+        let d = mailbox::Descriptor {
+            thread_index: thread as u32,
+            dst_access_fmt: dst_fmt,
+            program_len: program.len() as u32,
+            dump_row_count: dump,
+            trace: u32::from(traced),
+            push_window,
+            ..Default::default()
+        };
+        for (at, v) in d.writes(mb) {
+            dev.write32(w, tile, at, v)?;
+        }
         let mut slots = self.slots.borrow_mut();
         let words = program.iter().map(|i| i.word());
         if !program.is_empty() && !slots[thread].iter().copied().eq(words.clone()) {

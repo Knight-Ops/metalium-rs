@@ -43,6 +43,7 @@ use tt_isa::tensix::{self, Core};
 use crate::datapath;
 use crate::dm::DataMover;
 use crate::matmul::{self, Fidelity, SrcRoute};
+use crate::program_cache::ProgramCache;
 use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
 use crate::tensor::{self, DramAlloc, DramTensor, Step, TensorError};
 
@@ -236,6 +237,9 @@ struct Unit {
     steps: u64,
     /// Mover lists submitted to this tile: one host round trip each.
     lists: u64,
+    /// The host's mirror of this tile's resident programs
+    /// (`tt_isa::l1::PROGRAM_CACHE`).
+    programs: ProgramCache,
 }
 
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
@@ -257,6 +261,14 @@ struct Segment {
     entries: Vec<[u32; 8]>,
     /// Indices into `entries` of the `KERNEL` entries.
     kernels: Vec<usize>,
+    /// The programs of each `KERNEL` entry, in order.
+    kernel_roles: Vec<Arc<[Vec<Instruction>; 3]>>,
+    /// Do its kernels run resident programs (`crate::program_cache`), each
+    /// entry naming its own? Otherwise they all run the one program set the
+    /// host stages in the fixed slots, `roles`.
+    resident: bool,
+    /// Bytes of the distinct programs its kernels name, resident.
+    resident_bytes: u64,
     roles: Option<Arc<[Vec<Instruction>; 3]>>,
     /// The semaphores those programs use, initialised as their kernel's setup
     /// would (`matmul::MatmulSemaphores::init`).
@@ -265,9 +277,77 @@ struct Segment {
     steps: u64,
 }
 
+/// Make every program `seg`'s kernels name resident on the tile, uploading
+/// what is missing, and return each kernel's `(address, words)` per role
+/// (`(0, 0)` for an empty one). Everything placed stays pinned until the list
+/// has finished. If fragmentation leaves no room beside what is pinned, the
+/// cache starts again from empty: `segments` keeps a list's programs within
+/// the region, so they always fit a fresh one.
+fn place_programs<T: Transport>(
+    dev: &mut Device<T>,
+    window: &tt_device::Window,
+    tile: NocCoord<Noc0>,
+    cache: &mut ProgramCache,
+    seg: &Segment,
+) -> Result<Vec<[(u32, u32); 3]>, TensorError> {
+    use crate::program_cache::{CacheError, Placed};
+    for attempt in 0..2 {
+        let mut placed: Vec<[(u32, u32); 3]> = Vec::with_capacity(seg.kernel_roles.len());
+        let mut full = false;
+        'kernels: for (k, roles) in seg.kernel_roles.iter().enumerate() {
+            if let Some(j) = seg.kernel_roles[..k]
+                .iter()
+                .position(|r| Arc::ptr_eq(r, roles))
+            {
+                placed.push(placed[j]);
+                continue;
+            }
+            let mut p = [(0, 0); 3];
+            for (t, program) in roles.iter().enumerate() {
+                if program.is_empty() {
+                    continue;
+                }
+                let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
+                let at = match cache.place(&words) {
+                    Ok(Placed::Hit(at)) => at,
+                    Ok(Placed::Upload(at)) => {
+                        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        dev.l1_write(window, tile, at, &bytes)?;
+                        at
+                    }
+                    Ok(Placed::Bypass) => {
+                        return Err(TensorError::Shape(
+                            "a resident list names a program too large to cache".into(),
+                        ))
+                    }
+                    Err(CacheError::Full { .. }) => {
+                        full = true;
+                        break 'kernels;
+                    }
+                };
+                p[t] = (at as u32, words.len() as u32);
+            }
+            placed.push(p);
+        }
+        if !full {
+            return Ok(placed);
+        }
+        cache.unpin_all();
+        if attempt == 0 {
+            cache.clear();
+        }
+    }
+    Err(TensorError::Shape(
+        "a list's programs do not fit an empty program cache".into(),
+    ))
+}
+
 /// One unit's steps as mover lists, in order. Consecutive steps share a list
-/// until it is full (`tt_isa::dm::LIST_MAX`) or a kernel's programs differ from
-/// the list's: a tile's role program slots hold one kernel at a time. What
+/// until it is full (`tt_isa::dm::LIST_MAX`), or until a kernel cannot join it:
+/// one whose semaphores start differently (a list's kernels share one setup),
+/// and -- since the fixed slots hold one kernel at a time -- one whose programs
+/// differ from the list's, unless every program involved is resident
+/// (`crate::program_cache`) and together they fit the cache. What
 /// were separate lists are separated by a `WAIT` entry, since their entries
 /// may reuse each other's L1 slots; a `KERNEL` entry waits by itself.
 fn segments(steps: Vec<Step>) -> Vec<Segment> {
@@ -316,18 +396,33 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 after_list = true;
             }
             Step::Kernel { roles, init } => {
-                let same = cur.init.is_empty() || cur.init == init;
-                let same = same
-                    && cur.roles.as_ref().is_none_or(|r| {
-                        Arc::ptr_eq(r, &roles)
-                            || r.iter().zip(roles.iter()).all(|(a, b)| {
-                                a.len() == b.len()
-                                    && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
-                            })
-                    });
-                if !same || cur.entries.len() == LIST_MAX as usize {
+                let resident = roles
+                    .iter()
+                    .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
+                let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
+                let seen = cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles));
+                let same_init = cur.init.is_empty() || cur.init == init;
+                let fits = if resident {
+                    (cur.kernels.is_empty() || cur.resident)
+                        && (seen || cur.resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+                } else {
+                    (cur.kernels.is_empty() || !cur.resident)
+                        && cur.roles.as_ref().is_none_or(|r| {
+                            Arc::ptr_eq(r, &roles)
+                                || r.iter().zip(roles.iter()).all(|(a, b)| {
+                                    a.len() == b.len()
+                                        && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
+                                })
+                        })
+                };
+                if !same_init || !fits || cur.entries.len() == LIST_MAX as usize {
                     close(&mut cur, &mut out);
                 }
+                cur.resident = resident;
+                if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
+                    cur.resident_bytes += bytes;
+                }
+                cur.kernel_roles.push(roles.clone());
                 if cur.what.is_empty() {
                     cur.what = "matmul";
                 }
@@ -404,6 +499,7 @@ impl<T: Transport> Session<T> {
                 mover: None,
                 steps: 0,
                 lists: 0,
+                programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
             });
         }
         let mut session = Session {
@@ -434,8 +530,9 @@ impl<T: Transport> Session<T> {
         } = self;
         let unit = &mut units[u];
         // The reset holds RISCV B too; GDDR contents survive, the mover does
-        // not.
+        // not, and what L1 holds is no longer the host's to vouch for.
         unit.mover = None;
+        unit.programs.clear();
         if let Some(r) = unit.resident.take() {
             r.stop(dev, images)?;
         }
@@ -659,7 +756,17 @@ impl<T: Transport> Session<T> {
             )?);
         }
         let mut entries = seg.entries.clone();
-        let kernel = match &seg.roles {
+        if seg.resident {
+            let window = r.window();
+            let placed = place_programs(dev, window, unit.tile, &mut unit.programs, seg)?;
+            for (&at, p) in seg.kernels.iter().zip(placed) {
+                for (t, (addr, len)) in p.into_iter().enumerate() {
+                    entries[at][2 + 2 * t] = addr;
+                    entries[at][3 + 2 * t] = len;
+                }
+            }
+        }
+        let kernel = match seg.kernel_roles.first() {
             None => None,
             Some(roles) => {
                 let [unpack, math, pack] = &**roles;
@@ -670,8 +777,14 @@ impl<T: Transport> Session<T> {
                     restores_semaphores: true,
                     ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
                 };
-                let generations =
-                    r.reserve(dev, images, &kernel, budget, seg.kernels.len() as u32)?;
+                let generations = r.reserve(
+                    dev,
+                    images,
+                    &kernel,
+                    budget,
+                    seg.kernels.len() as u32,
+                    seg.resident,
+                )?;
                 for (&at, g) in seg.kernels.iter().zip(generations) {
                     entries[at][1] = g;
                 }
@@ -695,6 +808,8 @@ impl<T: Transport> Session<T> {
         let r = unit.resident.as_mut().expect("a list was started on it");
         let mover = unit.mover.as_ref().expect("a list was started on it");
         let out = mover.wait(dev, r.window());
+        // Nothing in flight names a program any more.
+        unit.programs.unpin_all();
         if let Some(k) = &kernel {
             r.reserved_done(dev, k, out.is_ok())?;
         }
@@ -781,6 +896,11 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.steps).collect()
     }
 
+    /// Each unit's program cache counters, in unit order.
+    pub fn program_cache_stats(&self) -> Vec<crate::program_cache::CacheStats> {
+        self.units.iter().map(|u| u.programs.stats()).collect()
+    }
+
     /// Mover lists submitted to each unit so far, in unit order: the host's
     /// round trips for GDDR ops.
     pub fn lists_per_tile(&self) -> Vec<u64> {
@@ -840,7 +960,7 @@ impl Session<tt_kmd::Kmd> {
 
 #[cfg(test)]
 mod tests {
-    use super::{segments, Step};
+    use super::{runtime, segments, Instruction, Step};
     use std::sync::Arc;
     use tt_isa::dm::{op, LIST_MAX};
 
@@ -897,38 +1017,65 @@ mod tests {
     }
 
     #[test]
-    fn different_programs_start_a_new_list() {
-        let a = Arc::new([Vec::new(), Vec::new(), Vec::new()]);
-        let b = Arc::new([vec![tt_isa::sfpu::nop()], Vec::new(), Vec::new()]);
+    fn kernels_of_different_programs_share_a_list_when_resident() {
+        let a = Arc::new([vec![tt_isa::sfpu::nop()], Vec::new(), Vec::new()]);
+        let b = Arc::new([vec![tt_isa::sfpu::nop(); 2], Vec::new(), Vec::new()]);
         let (_, init) = crate::matmul::MatmulSemaphores::alone();
-        let segs = segments(vec![
-            Step::Kernel {
-                roles: a.clone(),
+        let k =
+            |roles: &Arc<[Vec<Instruction>; 3]>, init: &Vec<runtime::SemaphoreInit>| Step::Kernel {
+                roles: roles.clone(),
                 init: init.clone(),
-            },
-            list(1, 1),
-            Step::Kernel {
-                roles: b,
-                init: init.clone(),
-            },
-        ]);
-        assert_eq!(segs.len(), 2);
-        assert_eq!(ops(&segs[1]), [op::KERNEL]);
-        // The same programs with other semaphore starting values are another
-        // kernel too: the setup a list's kernels share must suit all of them.
+            };
+        let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
+        assert_eq!(segs.len(), 1, "every program is resident: one list");
+        assert!(segs[0].resident);
+        assert_eq!(segs[0].kernel_roles.len(), 3);
+        // Two distinct program sets, counted once each.
+        assert_eq!(segs[0].resident_bytes, 4 + 8);
+        // Other semaphore starting values: another setup, so another list.
         let mut other = init.clone();
         other[0].1 = 1;
-        let segs = segments(vec![
-            Step::Kernel {
-                roles: a.clone(),
-                init,
-            },
-            Step::Kernel {
-                roles: a,
-                init: other,
-            },
-        ]);
+        assert_eq!(segments(vec![k(&a, &init), k(&a, &other)]).len(), 2);
+    }
+
+    #[test]
+    fn programs_too_large_to_cache_take_the_fixed_slots_one_set_per_list() {
+        let words = (tt_isa::l1::PROGRAM_CACHE.len() / 2 / 4 + 1) as usize;
+        let big = |n| Arc::new([vec![tt_isa::sfpu::nop(); n], Vec::new(), Vec::new()]);
+        let (a, b) = (big(words), big(words + 1));
+        let (_, init) = crate::matmul::MatmulSemaphores::alone();
+        let k = |roles: &Arc<[Vec<Instruction>; 3]>| Step::Kernel {
+            roles: roles.clone(),
+            init: init.clone(),
+        };
+        let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
+        assert!(!segs[0].resident && segs[0].kernels.len() == 2);
+        // A resident kernel does not join a fixed-slot list either.
+        let small = Arc::new([vec![tt_isa::sfpu::nop()], Vec::new(), Vec::new()]);
+        assert_eq!(segments(vec![k(&a), k(&small)]).len(), 2);
+    }
+
+    #[test]
+    fn a_list_holds_no_more_resident_programs_than_the_cache() {
+        // Each just under the admission bound: two fit the region, three do not.
+        let words = (tt_isa::l1::PROGRAM_CACHE.len() / 2 / 4) as usize - 16;
+        let p = |n: usize| Arc::new([vec![tt_isa::sfpu::nop(); words - n], Vec::new(), Vec::new()]);
+        let (_, init) = crate::matmul::MatmulSemaphores::alone();
+        let steps = (0..3)
+            .map(|n| Step::Kernel {
+                roles: p(n),
+                init: init.clone(),
+            })
+            .collect();
+        let segs = segments(steps);
+        assert_eq!(
+            segs.iter().map(|s| s.kernels.len()).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(segs
+            .iter()
+            .all(|s| s.resident_bytes <= tt_isa::l1::PROGRAM_CACHE.len()));
     }
 
     #[test]

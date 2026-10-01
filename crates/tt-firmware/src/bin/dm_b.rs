@@ -158,7 +158,17 @@ fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
 /// The roles' acknowledgements are stores by other cores, which do not
 /// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
 /// goes through a fence.
-fn kernel(generation: u32) -> Result<(), u32> {
+fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
+    // Each role's resident program first, if named (checked by
+    // `Entry::decode`), so the generation that starts the run finds it.
+    for (t, (at, len)) in programs.into_iter().enumerate() {
+        if at != 0 {
+            let mb = Mailbox::of(t as u32);
+            wr(mb.program_addr(), at);
+            wr(mb.program_len(), len);
+        }
+    }
+    publish();
     for t in 0..3 {
         wr(Mailbox::of(t).generation(), generation);
     }
@@ -200,11 +210,11 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             publish();
         }
         Entry::Move { descriptor, .. } => issue(me, descriptor)?,
-        Entry::Kernel { generation } => {
+        Entry::Kernel { generation, programs } => {
             // The operands it computes on must have landed.
             noc::wait(TXN);
             publish();
-            kernel(generation)?;
+            kernel(generation, programs)?;
         }
         Entry::Wait => {
             noc::wait(TXN);

@@ -21,6 +21,7 @@ pub mod dm;
 pub mod l1;
 pub mod link;
 pub mod matmul;
+pub mod program_cache;
 pub mod runtime;
 pub mod session;
 pub mod shard;

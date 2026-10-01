@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile (3.7 ms/step on 8 tiles). Next: 9.7c resident programs |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles). Next: 9.8 overlap, with the circular-buffer runtime |
 
 ---
 
@@ -1416,15 +1416,40 @@ cards for time):
       which shares it (step9, step11, step12). Watched: with the gate removed,
       `a_lock_held_by_parent_work_is_not_inherited_by_the_child` hangs until
       its alarm.
-- [ ] **9.7c Resident programs.** Keep the kernels a session uses in
-      `tt_isa::l1::PROGRAM_CACHE` (252 KB), in slots the `KERNEL` entry names,
-      so a block of a new shape costs no program write and no new list. Policy
-      (measured: an MNIST step's kernels are 117 KB on one tile, 34 KB on
-      eight): host-mirrored LRU with pinning for anything a list in flight
-      names, an admission bound, invalidation on tile reset, and hit/miss/
-      byte counters. Then plan even blocks, so an op has one shape; looped
-      (MOP/`REPLAY`) programs, one per route and fidelity, are the long-term
-      fix.
+- [x] **9.7c Resident programs.** Each tile keeps the kernels it runs in
+      `tt_isa::l1::PROGRAM_CACHE` (252 KB), mirrored on the host by
+      `tt_kernels::program_cache::ProgramCache`: keyed by the program's words,
+      first fit with coalescing, least recently used evicted first, anything a
+      list in flight names pinned, programs over half the region bypassed to
+      the fixed slots, everything forgotten on a tile reset, and hit, miss,
+      upload, eviction and bypass counters (`Session::program_cache_stats`).
+      A role runner pushes from `mailbox::PROGRAM_ADDR` when it is non-zero
+      (refused outside the region), and a `KERNEL` entry names each role's
+      `(address, words)`, written by B before the generation -- so a list may
+      run kernels of any number of shapes, and `segments` splits only on a
+      change of semaphore setup or past the cache's capacity. Gates:
+      `step22_program_cache` (a two-shape `[512,512]@[512,512]` is one list,
+      and its second run uploads nothing; 300 KB of kernels through the 252 KB
+      region evicts, and every evicted kernel is right when it returns), cache
+      and `segments` unit tests including a random placement soak, the golden
+      at one and four tiles. Watched failing with B ignoring the addresses
+      (wrong products). ttsim and both cards 134/134 with the smoke tier.
+  - **Found on silicon only:** a stale `PROGRAM_ADDR` from the previous
+    process pointed a tile reset's runner into the cache, and the reset hung
+    -- L1 survives between processes, and the plain `runtime::run` path wrote
+    the descriptor field by field and had no reason to know the new word.
+    `probe_cfgreg` had the same gap (no `TRACE`, `PUSH_WINDOW`). Every runner
+    descriptor is now a `mailbox::Descriptor`, written whole, with a test
+    that it covers every word the runner reads.
+  - **Measured** (card 0): full MNIST **2.5 ms/step on 8 tiles** (from 3.7),
+    5.1 on one (from 5.8), accuracy 91.96%; its matmuls 2.08 -> 0.89 ms per
+    step on 8 tiles. `[512,512]@[512,512]` 9.65 -> 6.89 ms on one tile (605
+    KB -> 15 KB written) and 4.46 -> 1.32 ms on eight. Steady MNIST step on
+    one tile 155 -> 35 KB written. Past 8 tiles the matmul slows again (2.0 ms
+    on 120, 3600 PCIe calls): what is left is per-tile submission, a
+    descriptor write and a list per tile, which is the next floor.
+  - The validation tier grew from 36 to 59 s, about 20 of it
+    `step22_program_cache`.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait
