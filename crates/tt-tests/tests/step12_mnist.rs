@@ -24,6 +24,10 @@
 //!   Two runs whose first steps differ by rounding diverge along chaotic
 //!   trajectories, and a bound that honestly covered that would say nothing.
 //!   The curves are printed side by side instead.
+//!
+//! The training runs are the end-to-end tier (`tt-tests`'s `e2e` feature): on
+//! ttsim they run only with it, on silicon always. The first-forward-pass
+//! bound is cheap and stays in the default tier.
 
 use burn::backend::Autodiff;
 use burn::module::{Module, Param};
@@ -340,6 +344,10 @@ fn assert_steady_state_traffic(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "e2e"),
+    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+)]
 fn the_mlp_trains_on_a_reduced_dataset() {
     reduced_run_matches_the_golden(Config::default());
 }
@@ -349,6 +357,10 @@ fn the_mlp_trains_on_a_reduced_dataset() {
 /// tile and column sums by column changes no accumulation, so the claim is
 /// the single-tile golden bit for bit, and the same steady-state traffic.
 #[test]
+#[cfg_attr(
+    not(feature = "e2e"),
+    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+)]
 fn the_mlp_trains_on_four_tiles_matching_the_golden() {
     reduced_run_matches_the_golden(Config {
         tiles: Some(burn_tt::TileChoice::Count(4)),
@@ -608,12 +620,20 @@ fn sharded_training_matches_the_golden(chips: usize) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "e2e"),
+    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+)]
 fn the_mlp_trains_sharded_over_two_chips_matching_the_golden() {
     sharded_training_matches_the_golden(2);
 }
 
 #[cfg(not(feature = "silicon"))]
 #[test]
+#[cfg_attr(
+    not(feature = "e2e"),
+    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+)]
 fn the_mlp_trains_sharded_round_a_four_chip_ring_matching_the_golden() {
     sharded_training_matches_the_golden(4);
 }

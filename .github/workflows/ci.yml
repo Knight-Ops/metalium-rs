@@ -96,6 +96,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The end-to-end tier: whole training runs through Burn on the simulator,
+      # held to the golden loss curve that ttsim writes and silicon reproduces.
+      # Most of the simulator suite's time, so not in the default `cargo test`
+      # (see `e2e` in crates/tt-tests/Cargo.toml); here on every commit, so the
+      # golden cannot drift unseen.
+      - name: Test (end-to-end)
+        run: cargo test -p tt-tests --features e2e --test step12_mnist
+
       # The silicon-gated tests cannot run here, but they must keep compiling or
       # they rot between now and the first hardware run.
       - name: Type-check the silicon-only suite

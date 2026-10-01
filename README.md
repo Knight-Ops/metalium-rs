@@ -21,7 +21,7 @@ host ──libttsim──> chip
   └ host reads       → 0x40C0_0000   (3.0 × 2.0 = 6.0, bit-exact)
 ```
 
-`cargo test` runs all of it, deterministically, with no hardware.
+`cargo test` runs all of it, deterministically, with no hardware (see [Test tiers](#test-tiers)).
 
 ## Getting started
 
@@ -30,6 +30,15 @@ cargo xtask fetch-ttsim   # downloads the pinned libttsim builds into vendor/
 cargo xtask fetch-spec    # downloads the pinned ISA specification into vendor/
 cargo test                # builds the riscv32im firmware and runs every gate
 ```
+
+### Test tiers
+
+| Tier | Command | What it is |
+|---|---|---|
+| Validation | `cargo test` | Host tests and every simulator gate: ISA, kernels, data mover, residency, many tiles. Bit-exact against ttsim; about 35 s. |
+| End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole training runs through Burn on ttsim, held to the golden loss curve. Needed when the arithmetic changes; CI runs it on every commit. |
+| Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs; about 40 s for both cards. |
+| Silicon | `cargo xtask silicon --release` | Every gate on hardware. `--features silicon` turns on every tier. |
 
 The firmware is built automatically by `crates/tt-tests/build.rs`; there is no
 separate step. `rustup` needs the `riscv32im-unknown-none-elf` target and the

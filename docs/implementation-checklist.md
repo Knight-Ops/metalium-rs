@@ -136,6 +136,16 @@ Set up early; retrofitting is expensive.
 - [x] **Version control**, so the pinning discipline above is enforceable.
 - [x] **CI: simulator suite on every commit.** Deterministic, so no flakes.
       Also fmt, clippy under `-D warnings`, and a type-check of the silicon suite.
+- [x] **Test tiers** (2026-10-01). The simulator is for validation; whole Burn
+      training runs are the `e2e` feature of `tt-tests` (ignored without it,
+      on by default with `silicon`), and the everyday smoke test is
+      `cargo xtask silicon --smoke`: burn-tt against burn-flex on the cards.
+      Measured: all 59 test binaries ran in 53 s, 80% of it the four training
+      runs in `step12_mnist`. Default `cargo test` 54 -> 36 s; the e2e tier
+      28 s (CI runs both); smoke 42 s for both cards, where the reduced
+      training run takes 1.2 s against ttsim's 25. `xtask silicon` now refuses
+      a filter that matches nothing, so a stale smoke entry cannot shrink the
+      run unseen. See the README's test tiers.
 - [x] **CI: `cargo xtask check-no-sim-in-ship`** wired in.
 - [x] **CI: `cargo xtask gen-cfg --check`**, so the committed configuration table
       cannot drift from the pinned header.

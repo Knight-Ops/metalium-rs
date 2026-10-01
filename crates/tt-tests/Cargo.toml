@@ -27,7 +27,22 @@ path = "src/lib.rs"
 # Tests that assert something *about the simulator* -- that it refuses an access,
 # that its decode map has a particular shape -- are `#[cfg(not(feature =
 # "silicon"))]` for the same reason.
-silicon = []
+#
+# Silicon runs every tier, so it implies `e2e`.
+silicon = ["e2e"]
+
+# The test tiers. The simulator is for *validation*: the ISA, kernel, mover and
+# residency gates, where ttsim's bit-exactness and its refusal of undefined
+# behaviour are the point, run by plain `cargo test` in well under a minute.
+# Whole training runs through Burn -- the gates that write and guard
+# `tests/golden/mnist_reduced.txt` -- are the end-to-end tier: they take most of
+# the simulator suite's time and prove nothing per kernel that the validation
+# gates do not, so on ttsim they run only with this feature, when the arithmetic
+# changes (and in CI). Day to day, burn-tt is smoke-tested against burn-flex on
+# the cards (`cargo xtask silicon --smoke`). An end-to-end gate is
+# `#[cfg_attr(not(feature = "e2e"), ignore = ...)]`: it still compiles and
+# shows as ignored, rather than quietly passing.
+e2e = []
 
 # Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
 # is classified DEV_ONLY in `xtask/src/ship.rs`, so the simulator binding still
