@@ -609,6 +609,17 @@ pub fn kmd_engine(
         session
             .enable_dram(tt_firmware_images::DM_B.1)
             .map_err(|e| EngineError(e.to_string()))?;
+        // `TT_PROFILE=<path>`: a device-side profile of everything this
+        // attachment runs, written as Chrome trace JSON when it detaches
+        // (`tt_kernels::profile`). `{chip}` in the path becomes the card.
+        let profile_to = std::env::var("TT_PROFILE")
+            .ok()
+            .map(|p| p.replace("{chip}", &device.chip.to_string()));
+        if profile_to.is_some() {
+            session
+                .profile_start()
+                .map_err(|e| EngineError(format!("TT_PROFILE: {e}")))?;
+        }
         let mut engine = KmdEngine {
             session,
             route,
@@ -617,6 +628,18 @@ pub fn kmd_engine(
             buffers: Some(DramBuffers::default()),
         };
         serve.serve(&mut engine);
+        if let Some(path) = profile_to {
+            let written = engine
+                .session
+                .profile_stop()
+                .map_err(|e| e.to_string())
+                .and_then(|p| p.to_chrome_trace().map_err(|e| e.to_string()))
+                .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
+            match written {
+                Ok(()) => eprintln!("burn-tt: device profile written to {path}"),
+                Err(e) => eprintln!("burn-tt: TT_PROFILE: {e}"),
+            }
+        }
         Ok(())
     }
 }

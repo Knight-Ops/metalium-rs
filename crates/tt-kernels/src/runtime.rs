@@ -504,6 +504,9 @@ pub struct Resident<N: NocId> {
     /// A [`Resident::submit`]ted kernel's phases so far, until it is
     /// [`Resident::complete`]d.
     pending: Option<Stopwatch>,
+    /// Every run's roles record their progress through the timestamper, into
+    /// a stream the host configured and drains itself (`crate::profile`).
+    profiling: bool,
 }
 
 impl<N: NocId> Resident<N> {
@@ -525,6 +528,7 @@ impl<N: NocId> Resident<N> {
             slots: Default::default(),
             semaphores: None,
             pending: None,
+            profiling: false,
         };
         for thread in 0..3 {
             r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
@@ -541,6 +545,14 @@ impl<N: NocId> Resident<N> {
 
     pub fn tile(&self) -> NocCoord<N> {
         self.tile
+    }
+
+    /// Have every later run's roles record their progress through the tile's
+    /// timestamper, whose stream the caller has configured and will read
+    /// (`crate::profile`). A kernel that asks for its own trace
+    /// (`Kernel::trace`) reconfigures the stream, so it is refused meanwhile.
+    pub fn set_profiling(&mut self, on: bool) {
+        self.profiling = on;
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on
@@ -757,6 +769,12 @@ impl<N: NocId> Resident<N> {
             }
             clock.lap(dev, Phase::Setup);
         }
+        if kernel.trace && self.profiling {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: mailbox::TRACE_BUFFER,
+                reason: "a traced kernel would reset a profile's timestamper stream",
+            }));
+        }
         if kernel.trace {
             dev.configure_trace(
                 &self.window,
@@ -776,7 +794,7 @@ impl<N: NocId> Resident<N> {
                 thread,
                 program,
                 dump,
-                kernel.trace,
+                kernel.trace || self.profiling,
                 kernel.dst_fmt,
                 false,
             )?;

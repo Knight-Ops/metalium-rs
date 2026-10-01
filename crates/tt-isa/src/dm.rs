@@ -63,6 +63,12 @@ pub const MY_Y: u64 = MAILBOX_BASE + 0x48;
 /// ([`Dram::usable_mask`]). Written once, before start: the mover can only
 /// name channels the chip said it has.
 pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
+/// Host -> mover: non-zero, record each list's entries and records through
+/// the tile's timestamper (`crate::mailbox::trace`), which the host has
+/// configured. Read at the start of every list, so the host may turn it on or
+/// off between lists. Zero on the simulator, which does not model the event
+/// stream (divergence row 54).
+pub const TRACE: u64 = MAILBOX_BASE + 0x50;
 
 pub mod op {
     /// DRAM -> L1.

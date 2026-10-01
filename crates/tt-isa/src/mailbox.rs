@@ -104,13 +104,17 @@ pub const SIM_PUSH_WINDOW: u32 = 16;
 pub const MAILBOX_SIZE: u64 = 0x44;
 
 /// Where the host points the timestamper's event buffer: after the program
-/// slots, 256 events.
+/// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
+/// two events per list entry or record, never per expanded move, and each
+/// role three per run, so a full list of records with a kernel apiece fits.
 pub const TRACE_BUFFER: u64 = PROGRAM_REGION_END;
 /// Bytes in [`TRACE_BUFFER`].
-pub const TRACE_BUFFER_BYTES: u64 = 256 * crate::tensix::timestamper::EVENT_BYTES;
+pub const TRACE_BUFFER_BYTES: u64 = 1024 * crate::tensix::timestamper::EVENT_BYTES;
 
-/// What the firmware traces: the event, in the low bits of a token whose bits
-/// 8.. carry the Tensix thread.
+/// What the firmware traces. A token is 29 bits: the event in bits 0..8, its
+/// source in bits 8..12 (a Tensix thread's role runner, or the data mover),
+/// and a detail in bits 12..29 (for the mover, the entry's op or record
+/// kind). A role's tokens have no detail, so `token >> 8` is still its thread.
 pub mod trace {
     /// The firmware has read its mailbox and is about to push.
     pub const START: u32 = 1;
@@ -119,14 +123,60 @@ pub mod trace {
     /// The coprocessor has retired the program.
     pub const RETIRED: u32 = 3;
 
+    /// The data mover (`crate::dm`) began a list.
+    pub const LIST_BEGIN: u32 = 16;
+    /// The data mover finished a list, every move in it landed.
+    pub const LIST_END: u32 = 17;
+    /// The mover began a list entry or op record; the detail is its op
+    /// (`crate::dm::op`) or record kind (`crate::dm::record`).
+    pub const ENTRY_BEGIN: u32 = 18;
+    /// The mover finished the entry or record it last began. Moves it issued
+    /// may still be in flight: only a `KERNEL`, `WAIT` or `COMPUTE` entry, and
+    /// the list's end, wait for them.
+    pub const ENTRY_END: u32 = 19;
+
+    /// The source of the data mover's events. Role runners use their Tensix
+    /// thread, 0..3.
+    pub const MOVER: u32 = 3;
+
+    /// Bits a detail may use.
+    pub const DETAIL_MAX: u32 = (1 << 17) - 1;
+
     /// The token for `event` on `thread`.
     pub const fn token(thread: u32, event: u32) -> u32 {
         (thread << 8) | event
     }
 
-    /// `(thread, event)` from a token.
+    /// The token for `event` from `source` with `detail` (masked to
+    /// [`DETAIL_MAX`]).
+    pub const fn token_with(source: u32, event: u32, detail: u32) -> u32 {
+        ((detail & DETAIL_MAX) << 12) | ((source & 0xf) << 8) | (event & 0xff)
+    }
+
+    /// `(source, event)` from a token.
     pub const fn split(token: u32) -> (u32, u32) {
-        (token >> 8, token & 0xff)
+        ((token >> 8) & 0xf, token & 0xff)
+    }
+
+    /// The detail of a token.
+    pub const fn detail(token: u32) -> u32 {
+        token >> 12
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tokens_round_trip_and_fit_29_bits() {
+            let t = token_with(MOVER, ENTRY_BEGIN, 0x12);
+            assert_eq!(split(t), (MOVER, ENTRY_BEGIN));
+            assert_eq!(detail(t), 0x12);
+            assert!(token_with(0xf, 0xff, DETAIL_MAX) < 1 << 29);
+            // A role's token is what it always was.
+            assert_eq!(token(2, RETIRED), token_with(2, RETIRED, 0));
+            assert_eq!(split(token(2, RETIRED)), (2, RETIRED));
+        }
     }
 }
 

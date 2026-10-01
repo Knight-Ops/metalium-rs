@@ -216,6 +216,9 @@ pub struct Session<T: Transport> {
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
+    /// Each unit's timestamper stream so far, between
+    /// [`Session::profile_start`] and [`Session::profile_stop`].
+    profiling: Option<Vec<crate::profile::UnitProfile>>,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -509,6 +512,7 @@ impl<T: Transport> Session<T> {
             images,
             profile: runtime::Profile::default(),
             dram: None,
+            profiling: None,
             _cleanup: cleanup,
         };
         session.prepare().map_err(SessionError::Reset)?;
@@ -538,8 +542,128 @@ impl<T: Transport> Session<T> {
         }
         reset_tile(dev, unit.tile)?;
         reset_thread_state(dev, unit.tile, images)?;
-        unit.resident = Some(Resident::start(dev, unit.tile, images, RESET_BUDGET)?);
+        let mut r = Resident::start(dev, unit.tile, images, RESET_BUDGET)?;
+        if self.profiling.is_some() {
+            // What the stream held since the last drain belonged to the run
+            // that failed; the profile goes on from an empty one.
+            r.set_profiling(true);
+            dev.configure_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+                tt_isa::mailbox::TRACE_BUFFER_BYTES,
+            )?;
+        }
+        unit.resident = Some(r);
         Ok(())
+    }
+
+    /// Record what every unit's data mover and role runners do from now on,
+    /// through each tile's debug timestamper (`crate::profile`), until
+    /// [`Session::profile_stop`]. Each unit's stream is drained after every
+    /// wave, so a profile may span any number of ops.
+    ///
+    /// Refused on the simulator, which does not model the event stream
+    /// (divergence row 54).
+    pub fn profile_start(&mut self) -> Result<(), RunError> {
+        if self.dev.transport().is_simulated() {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: tt_isa::tensix::timestamper::TIMESTAMP,
+                reason: "ttsim does not model the timestamper's event stream (divergence row 54)",
+            }));
+        }
+        if self.profiling.is_some() {
+            return Ok(());
+        }
+        self.profiling = Some(Vec::new());
+        let mut units = Vec::with_capacity(self.units.len());
+        for u in 0..self.units.len() {
+            if self.units[u].resident.is_none() {
+                self.prepare_unit(u)?;
+            }
+            let Session { dev, units: us, .. } = self;
+            let unit = &mut us[u];
+            let r = unit.resident.as_mut().expect("prepared above");
+            dev.configure_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+                tt_isa::mailbox::TRACE_BUFFER_BYTES,
+            )?;
+            r.set_profiling(true);
+            if unit.mover.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
+            let counter_at_start = dev.wall_clock(r.window(), unit.tile)?;
+            units.push(crate::profile::UnitProfile {
+                tile: unit.tile,
+                events: Vec::new(),
+                counter_at_start,
+                host_at_start: std::time::Instant::now(),
+            });
+        }
+        self.profiling = Some(units);
+        Ok(())
+    }
+
+    /// Stop profiling and return what was recorded since
+    /// [`Session::profile_start`], with the tiles' clock measured over it.
+    pub fn profile_stop(&mut self) -> Result<crate::profile::DeviceProfile, RunError> {
+        let Some(mut units) = self.profiling.take() else {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "profile_stop without profile_start",
+            }));
+        };
+        let mut ticks_per_us = 0.0;
+        for (u, p) in units.iter_mut().enumerate() {
+            let Session { dev, units: us, .. } = self;
+            let unit = &mut us[u];
+            let Some(r) = unit.resident.as_mut() else {
+                continue;
+            };
+            p.events.extend(dev.read_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+            )?);
+            r.set_profiling(false);
+            if unit.mover.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 0)?;
+            }
+            if u == 0 {
+                let now = dev.wall_clock(r.window(), unit.tile)?;
+                let us_elapsed = p.host_at_start.elapsed().as_secs_f64() * 1e6;
+                ticks_per_us = (now - p.counter_at_start) as f64 / us_elapsed;
+            }
+        }
+        Ok(crate::profile::DeviceProfile {
+            units,
+            ticks_per_us,
+        })
+    }
+
+    /// Move unit `u`'s events into the profile and start its stream empty
+    /// again, so the 1024-event buffer bounds one wave, not a whole profile.
+    fn drain(&mut self, u: usize) -> Result<(), TransportError> {
+        let Session {
+            dev,
+            units,
+            profiling,
+            ..
+        } = self;
+        let (Some(p), Some(r)) = (profiling.as_mut(), units[u].resident.as_ref()) else {
+            return Ok(());
+        };
+        let tile = units[u].tile;
+        let events = dev.read_trace(r.window(), tile, tt_isa::mailbox::TRACE_BUFFER)?;
+        p[u].events.extend(events);
+        dev.configure_trace(
+            r.window(),
+            tile,
+            tt_isa::mailbox::TRACE_BUFFER,
+            tt_isa::mailbox::TRACE_BUFFER_BYTES,
+        )
     }
 
     /// Keep tensors in GDDR from now on: read the chip's channels and set up an
@@ -712,7 +836,7 @@ impl<T: Transport> Session<T> {
             }
         }
         for (u, seg, s) in started {
-            match self.finish(u, s) {
+            match self.finish(u, s).and_then(|()| Ok(self.drain(u)?)) {
                 Ok(()) => self.units[u].steps += seg.steps,
                 Err(e) => {
                     failed.push((u, seg.roles.is_some()));
@@ -739,6 +863,7 @@ impl<T: Transport> Session<T> {
             units,
             images,
             dram,
+            profiling,
             ..
         } = self;
         let unit = &mut units[u];
@@ -754,6 +879,9 @@ impl<T: Transport> Session<T> {
                 &d.dram,
                 d.image,
             )?);
+            if profiling.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
         }
         let mut entries = seg.entries.clone();
         if seg.resident {
@@ -839,9 +967,12 @@ impl<T: Transport> Session<T> {
             self.prepare_unit(0)?;
         }
         let r = self.units[0].resident.as_mut().expect("prepared above");
-        let out = r.run(&mut self.dev, &self.images, kernel, budget);
+        let mut out = r.run(&mut self.dev, &self.images, kernel, budget);
         if let Ok(o) = &out {
             self.profile.phases.extend_from_slice(&o.profile.phases);
+            if let Err(e) = self.drain(0) {
+                out = Err(e.into());
+            }
         }
         if out.is_err() {
             self.units[0].resident = None;

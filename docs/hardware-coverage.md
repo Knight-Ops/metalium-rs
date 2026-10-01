@@ -46,7 +46,7 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[ ]` |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3 |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
@@ -172,7 +172,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 |---|:-:|:-:|:-:|:-:|:-:|---|
 | `REPLAY` (record and replay, 32 entries per thread) | x | | | | | X1 |
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
-| Debug timestamper event stream | -- | `~` (`tt_device::trace`) | `~` role events | `-` row 54 | `~` | X3 |
+| Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
 | Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
@@ -222,11 +222,23 @@ reverse index.
       resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
       unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
       down; silicon time measured.
-- [ ] **X3 The debug timestamper as a device profiler** (concepts review G13). Begin/end
-      tokens per list entry and record kind from the B mover and per program from the
-      roles; `Session::profile()` gathers every unit's stream, exported as Chrome-trace
-      JSON (`TT_PROFILE=<path>`); overflow is a typed error. Silicon only (row 54). The
-      source of every later "Measured" entry.
+- [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
+      mover brackets each list and each top-level entry or record with timestamper events
+      when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,
+      the op or record kind as detail); role runners record start/pushed/retired per run
+      under `Resident::set_profiling`. `Session::profile_start`/`profile_stop` arm every
+      unit, drain each stream after every wave (so the 1024-event buffer bounds a wave,
+      not a profile), and return a `DeviceProfile`: spans per unit, checked to nest,
+      Chrome trace JSON on the host's time line, the clock measured (row N).
+      `TT_PROFILE=<path>` profiles a whole burn-tt attachment. Helper/oracle: unit tests
+      of the token layout, pairing, refusal of a non-nesting stream and the export.
+      Gates (`step23_profile`): on ttsim, profiling refused with its reason and the
+      session usable after; on silicon (both cards), two tiles running an add and a
+      ragged matmul -- every entry inside a list, exactly one run of each role inside
+      each `KERNEL` entry, no role run outside one -- and 300 lists on one tile, more
+      than the buffer holds, none lost. Watched failing with the drain disabled (the
+      overflow refusal). Sim `[-]`: row 54. First use: row O, the reduced-MNIST
+      breakdown. Burn: not applicable (no op).
 - [ ] **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay

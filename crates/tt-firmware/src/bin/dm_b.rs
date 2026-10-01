@@ -27,7 +27,8 @@ fn rd(addr: u64) -> u32 {
 }
 
 fn wr(addr: u64, v: u32) {
-    // SAFETY: as `rd`.
+    // SAFETY: as `rd`, or the timestamper's `TIMESTAMP` register, where a
+    // store only appends an event.
     unsafe { l1_write32(addr, v) }
 }
 
@@ -188,6 +189,17 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
     Ok(())
 }
 
+/// Record `event` through the tile's timestamper, if this list is traced
+/// (`dm::TRACE`). One 128-bit event per store, so the mover's events and the
+/// role runners' share one stream without interleaving.
+fn trace(on: bool, event: u32, detail: u32) {
+    use tt_isa::mailbox::trace as ev;
+    use tt_isa::tensix::timestamper as ts;
+    if on {
+        wr(ts::TIMESTAMP, ts::event_128(ev::token_with(ev::MOVER, event, detail)));
+    }
+}
+
 /// Run one descriptor to completion.
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
@@ -244,14 +256,22 @@ fn entry(i: u64) -> [u32; 8] {
 /// (`dm::record`) is expanded here, on the tile, into the entries the host
 /// would otherwise have sent, and each runs exactly as a sent one would --
 /// through `Entry::decode` and every refusal in it.
+///
+/// With `dm::TRACE` set, the list, and each entry or record in it, is
+/// bracketed by timestamper events (`tt_isa::mailbox::trace`); a record's
+/// expanded moves are not, so the events per list stay bounded by its length.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
+    use tt_isa::mailbox::trace as ev;
     if count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
+    let traced = rd(dm::TRACE) != 0;
+    trace(traced, ev::LIST_BEGIN, count);
     let mut i = 0u64;
     while i < count as u64 {
         let head = entry(i);
         let n = record::len(head[0]) as u64;
+        trace(traced, ev::ENTRY_BEGIN, head[0]);
         if n == 1 {
             exec(me, usable, head)?;
         } else {
@@ -264,9 +284,11 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
             }
             record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
         }
+        trace(traced, ev::ENTRY_END, head[0]);
         i += n;
     }
     noc::wait(TXN);
+    trace(traced, ev::LIST_END, count);
     Ok(())
 }
 

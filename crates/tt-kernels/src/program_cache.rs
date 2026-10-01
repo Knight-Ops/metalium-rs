@@ -11,7 +11,7 @@
 //! The host wrote every byte of the region, so it knows exactly what is there;
 //! the device keeps no bookkeeping. The policy, chosen against the working
 //! sets measured in the checklist (an MNIST step's kernels: 117 KB on one
-//! tile, 34 KB on eight, in a 252 KB region):
+//! tile, 34 KB on eight, in a 252 KB region (240 KB since the trace buffer grew, X3)):
 //!
 //! * **Keyed by the program's words**, compared exactly, as the fixed slots
 //!   already were.
