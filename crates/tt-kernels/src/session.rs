@@ -970,8 +970,10 @@ impl<T: Transport> Session<T> {
             units,
             dram,
             profiling,
+            barriers,
             ..
         } = self;
+        let idle = units.iter().all(|u| u.queued.is_empty());
         let unit = &mut units[u];
         let r = unit.resident.as_ref().expect("prepared above");
         let d = dram
@@ -987,6 +989,17 @@ impl<T: Transport> Session<T> {
             )?);
             if profiling.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
+            // Unit 0's tile holds the barrier counter, and L1 keeps whatever
+            // an earlier session left there: a count already past every
+            // target lets each barrier through at once, and multi-unit ops
+            // overlap (silicon: a batched four-tile MNIST diverged). The count
+            // and the session's barrier number start again together, with
+            // nothing queued anywhere that still waits on the old count.
+            if u == 0 {
+                debug_assert!(idle, "the coordinator restarted under queued barriers");
+                dev.write32(r.window(), unit.tile, tt_isa::dm::BARRIER_COUNTER, 0)?;
+                *barriers = 0;
             }
         }
         Ok(())

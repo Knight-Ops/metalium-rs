@@ -267,3 +267,49 @@ fn an_upload_lands_before_the_queued_op_that_reads_it() {
         s.free(w).unwrap();
     });
 }
+
+/// The barrier counter starts from zero in every session. It lives in unit
+/// 0's L1, which keeps what an earlier process left: a stale count past every
+/// target lets each barrier through at once (silicon: a batched four-tile
+/// MNIST diverged). A count left behind here, then one multi-unit op: the
+/// counter holds exactly that op's arrivals.
+#[test]
+fn barriers_count_from_zero_whatever_an_earlier_session_left() {
+    use tt_device::tlb::WindowKind;
+    use tt_isa::dm::kind;
+    with_tiles(TileChoice::Count(4), |s| {
+        s.set_batching(true).unwrap();
+        let coordinator = s.tile();
+        let stale = 0x00DE_AD00;
+        {
+            let d = s.device();
+            let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+            d.write32(&w, coordinator, tt_isa::dm::BARRIER_COUNTER, stale)
+                .unwrap();
+        }
+        let v: Vec<f32> = (0..256 * 128).map(|i| i as f32).collect();
+        let a = s.upload(&v, 256, 128).unwrap();
+        let y = s
+            .eltwise(
+                Eltwise {
+                    kind: kind::RELU,
+                    scalar: 0.0,
+                },
+                &a,
+                None,
+            )
+            .unwrap();
+        s.sync().unwrap();
+        let d = s.device();
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let count = d
+            .read32(&w, coordinator, tt_isa::dm::BARRIER_COUNTER)
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "one barrier, four arrivals, from zero (stale {stale:#x})"
+        );
+        s.free(y).unwrap();
+        s.free(a).unwrap();
+    });
+}
