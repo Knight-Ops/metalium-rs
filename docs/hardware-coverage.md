@@ -1,0 +1,416 @@
+# Hardware coverage — Phase 10 tracker
+
+The working tick-list for Phase 10 of `RUST_IMPL_PLAN.md` ("Phase 10 — Hardware
+coverage"). The plan says *why*; this file says *which parts of a Blackhole Tensix tile
+this stack can drive, which it cannot yet, and in what order the rest arrives*. It is the
+progress record: an item is ticked here or nowhere.
+
+Companion guides: [`tt-metal-concepts-review.md`](tt-metal-concepts-review.md) (the
+Tenstorrent concepts this stack lacks, G1–G16, and the hardware sharp edges to handle in
+code) and [`burn-backend-parity.md`](burn-backend-parity.md) (the `burn-tt` surface and
+ergonomics roadmap, B0–B16). Item ids here are cited from both.
+
+Same legend as `implementation-checklist.md`: `[x]` done and gated by a test · `[~]`
+partially done, see note · `[ ]` not started · `[-]` deliberately not done, with the
+reason given.
+
+---
+
+## Where things stand (2026-10-01)
+
+Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
+
+| Unit | What runs there today | Where |
+|---|---|---|
+| **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
+| **B core FP32 unit** | every element-wise op and the column sum: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`, `COL_SUM` -- one datum at a time, `fadd.s`/`fsub.s`/`fmul.s` | `tt_isa::dm::kind` (`dm.rs:108-135`), `dm_b.rs::{compute, col_sum, per_datum}` |
+| **SFPU** | nothing a tensor op uses. Gates only (`step4_tensix`, `step5_corpus`, `step8_eltwise` at 128 datums), and `Dst` zeroing in `runtime.rs` | `tt_isa::sfpu` |
+| **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
+
+The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
+instructions, every SFPU instruction among them, and `ELW*`, `GMPOOL`/`GAPOOL`, `MOP`,
+`REPLAY`, `TRNSPSRCB` and the ThCon set besides. The hand-written `tt_isa::sfpu` layer on
+top has `loadi`, `load`, `store`, `mad`, `mul`, `add`, `sub`, `load_f32` and `nop` -- no
+conditional execution, LUT, reciprocal, exponent or mantissa ops, casts, integer ops,
+swaps, transposes or PRNG.
+
+On the Burn side, 12 compute methods have a device path (`burn-tt/src/ops.rs`, listed in
+`OVERRIDDEN`, `xtask/src/gen_burn.rs`); no `ModuleOps`, `IntTensorOps` or
+`BoolTensorOps` method does. Under device residency every other op is a download, a
+Flex op on the host and an upload, which is why breadth is a performance problem and not
+only a feature list.
+
+**Milestones** (detail in "Work items"):
+
+| # | Milestone | Items | State |
+|--:|---|---|---|
+| 10.0 | SFPU foundation; today's element-wise ops move from the B core to the SFPU | F1–F5, S1 | `[ ]` |
+| 10.1 | Softmax and cross-entropy on the device | S3, S4 (`exp`, `log`), R1 (`max`, `sum`), R2 | `[ ]` |
+| 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
+| 10.3 | Reductions over any dim, pooling, device transpose, norms | M2, M3, R1, R3 | `[ ]` |
+| 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
+| 10.5 | Indexing and convolution | D4, D6 | `[ ]` |
+| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
+
+Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
+here, as S1 and R2.
+
+---
+
+## Definition of done
+
+The two-gate rule, applied per op. An item is `[x]` only when every line below holds for
+it, and a line that does not apply says why in the item.
+
+1. **A `tt-isa` helper**, typed so that the hazards are in the API (cross-cutting rule),
+   with unit tests of its encoding.
+2. **An oracle that is not an epsilon** (the Tolerance policy):
+   - *bit-exact* wherever the hardware's arithmetic is documented: `numerics::fma_bh` for
+     anything `SFPMAD`-shaped, and a port of the page's functional model for `SFPLUT`,
+     `SFPLUTFP32`, `SFPARECIP`, `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, `SFPSTOCHRND`,
+     `SFPCAST` -- each port checked against the page's pseudocode the way `fma_oracle`
+     checks `fma_bh` against `fma.c`;
+   - for an *approximation* (a polynomial, a Newton step, a range reduction), the device
+     result is still predicted bit for bit by running the same instruction sequence through
+     the ported models, **and** its distance from the true function is held to a bound
+     *derived* in a comment next to the gate (polynomial remainder, Newton's quadratic
+     convergence, the reduction's error), never a guessed number.
+3. **A ttsim gate** in `crates/tt-tests/tests/stepNN_*.rs`, inside `fork_scope`,
+   watched failing at least once (an empty kernel, a wrong constant, a swapped operand).
+4. **A silicon gate**, the same test on both cards through `cargo xtask silicon`.
+5. **Burn routing**: the method overridden in `burn-tt/src/ops.rs` and listed in
+   `OVERRIDDEN` (then `cargo xtask gen-burn-delegate`), agreeing with `burn-flex` bit for
+   bit or within the item's derived bound; a residency check that the op downloads
+   nothing (`tensor_traffic`, `TT_TRACE_FALLBACK=1` silent); and an entry in the silicon
+   smoke tier (`xtask/src/silicon.rs`, `SMOKE`), where burn-tt is compared with
+   burn-flex on the card.
+6. **Findings logged**: every ttsim refusal or ttsim/silicon disagreement met on the way
+   is a row in `ttsim-divergence.md`, and every measured fact a "Measured, not quoted"
+   entry.
+
+An op that works only on silicon (ttsim refuses an instruction it needs) can be ticked
+with the simulator line `[-]` and the divergence row cited, as `DOTPV` is today.
+
+---
+
+## Hardware inventory
+
+One row per feature of the Tensix tile and its surroundings. Columns: **Enc** -- in the
+generated table · **Helper** -- a typed `tt-isa` layer · **Kernel** -- used by a
+`tt-kernels` kernel · **Sim** / **Si** -- gated on ttsim / both cards · **Item** -- the
+work item below that takes it the rest of the way. **Spec** gives the page and its trust
+kind (BH = real Blackhole page, WH = Wormhole only, so every fact is unverified until
+measured).
+
+### SFPU (Vector Unit) -- 48 Blackhole pages
+
+Reference: BH `VectorUnit.md` (32 lanes × 32 bits, five sub-units, lane predication, PRNG),
+`LReg.md` → WH `LReg.md` (17 `LReg`s: 0–7 general, 8–10 and 15 constants, 11–14 written
+through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
+
+| Group | Instructions | Enc | Helper | Kernel | Sim | Si | Item |
+|---|---|:-:|:-:|:-:|:-:|:-:|---|
+| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x | | x | x | F2, F3 |
+| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x | | x | x | S1 |
+| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
+| Move / abs | `SFPMOV`, `SFPABS` | x | | | x | x | S2 |
+| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | | | | | S2, S4, S6 |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | | | | | S2 |
+| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | | | | | F2 |
+| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
+| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
+| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
+| Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
+| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | | | | | S2, S8 |
+| Configuration | `SFPCONFIG` | x | | | | | F2 |
+| Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
+| Misc | `SFPNOP` | x | x | x | x | x | -- |
+| PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | | | | | S7 |
+
+### Matrix Unit (FPU)
+
+Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWCs.md`, BH `Dst.md`.
+
+| Feature | Enc | Helper | Kernel | Sim | Si | Item |
+|---|:-:|:-:|:-:|:-:|:-:|---|
+| `MVMUL`, fidelity phases `Lo`..`HiFi4` | x (measured) | x | x | x | x | done (Phases 6–7) |
+| `ZEROACC`, `ZEROSRC` | x (`ZEROACC` measured) | | x | x | x | -- |
+| `MOVA2D`, `MOVB2D`, `MOVD2A`, `MOVD2B`, `MOVB2A` | x (measured) | `~` (`mova2d`, `movb2d`) | | x | x | F1 |
+| `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured) | | | `~` encoding only | `~` | M1 |
+| `GMPOOL`, `GAPOOL` | x | | | | | M2 |
+| `TRNSPSRCB` | x (WH) | | | | | M3 |
+| `DOTPV`, `SHIFTXA`, `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 |
+
+### Unpackers and packer
+
+Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpackers/*`, BH
+`PACR.md` ("basic"), WH `Packers/*` -- the thinnest part of the Blackhole tree.
+
+| Feature | State | Item |
+|---|---|---|
+| Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums | `[x]` | -- |
+| `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[ ]` | F1 |
+| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | F1, D1 |
+| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
+| Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
+| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[ ]` | D3 |
+| Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
+| Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
+
+### Frontend and scheduling
+
+These are Phase 9 items, listed so the inventory is whole; they are tracked in the
+checklist, not here.
+
+| Feature | Where tracked |
+|---|---|
+| `MOP` / `MOP_CFG` expansion, `REPLAY` | checklist Phase 9 |
+| `.ttinsn` fusion (four pushes per cycle) | checklist Phase 9 |
+| Hazards as data, the wait planner | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
+| Three-thread pipelining, double buffering | checklist 9.8 |
+
+### Scalar unit, mover, atomics, NoC
+
+Pulled in only when a kernel needs them; each says which.
+
+| Feature | Spec | State | Wanted by |
+|---|---|---|---|
+| ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` used for config staging; rest `[ ]` | F3 (per-tile parameters without reprogramming) |
+| Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[ ]` | 9.8 page FIFO, if counters move into Tensix |
+| `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[ ]` | D4 (copies without the B core) |
+| NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[ ]` | weight broadcast to many tiles (9.6 follow-up) |
+| NoC atomics | BH `NoC/Atomics.md` | `[ ]` | R1 across tiles |
+| NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; interrupts `[ ]` | -- |
+| `L1CacheTagSearchAccel` | BH | `[ ]` | checklist Phase 9 |
+| Debug timestamper | BH (STUB-C) | `[x]` silicon; ttsim row 54 | -- |
+
+### Out of scope, and why
+
+- `[-]` **L2CPU tiles.** Harts leave reset only once per power cycle (`L2CPUTile/README.md:30`);
+  nothing a Burn backend needs runs better there than on the host.
+- `[-]` **PCIe DMA engines.** No register-level documentation (open question 5);
+  residency makes bulk transfer a startup cost.
+- `[-]` **A GDB stub over the debug interface.** No Blackhole bit layouts (open question 2).
+
+---
+
+## Work items
+
+In dependency order. Each names the Burn methods it unlocks; the Burn table below is the
+reverse index.
+
+### F — SFPU foundation (blocks every S item)
+
+- [ ] **F0 Padding is a property of the tensor, not an assumption.** Today a ragged
+      edge tile's padding is zero only until an op writes it: `ADD_ROW` puts the bias
+      there and `COL_SUM` sums it (checklist Phase 9, open bug). Every SFPU op makes
+      this worse (`exp(0) = 1`). Each `DramTensor` carries its pad state; each op
+      declares the pad it needs and the pad it leaves, and the runtime refills edge
+      tiles only when they differ. Design in `tt-metal-concepts-review.md` G1. First
+      gate: a 50-row `add` then `sum_dim(0)` against `burn-flex`, which should fail
+      before the fix.
+- [ ] **F1 Whole-tile `Dst` round trip.** One 32×32 FP32 tile from GDDR into `Dst` by
+      `UnpackToDst` and packed back, every datum checked, on the three roles. Phase 5
+      did 128 datums; the step 8 lane map (`SFPLOAD`/`SFPSTORE` reach the even or the odd
+      columns of a four-row group) decides how the SFPU walks it. BF16: on silicon by
+      `UnpackToDst` (`silicon_measure::m08`), on ttsim through `Src` and `MOVA2D`
+      (row 31), whichever the kernel then uses on both.
+- [ ] **F2 An SFPU program builder in `tt_isa::sfpu`.**
+  - [ ] An `LReg` newtype: 0–7 writable; 8–10 and 15 read-only constants; 11–14 only
+        through `SFPCONFIG`; 16 refused. Replaces the `u32` register arguments.
+  - [ ] Tile iteration: a program body written once over "a row group of lanes" and
+        expanded over the tile's row groups and both column halves.
+  - [ ] Conditional execution as a scope: `SFPSETCC`/`SFPPUSHC`/`SFPCOMPC`/`SFPPOPC`/
+        `SFPENCC` emitted balanced by construction (`if`/`else` closures), the stack depth
+        tracked so `SFPPOPC`'s complex modes are refused on a full stack (Tier 2 bug).
+  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as named, loaded-once program prologue.
+  - [ ] `stalls_automatically_after_mad` applied by the builder, so an `SFPNOP` is
+        inserted exactly where the documentation says automatic stalling misses.
+- [ ] **F3 The SFPU tile kernel.** T0 unpacks to `Dst`, T1 runs the SFPU program over the
+      tile, T2 packs; the hand-offs by semaphores; buffers and semaphores declared through
+      `tt_kernels::l1::Requirements`, programs through the program cache. Unary, binary
+      (two operands in two `Dst` regions) and binary-with-scalar shapes.
+- [ ] **F4 Dispatch without new firmware.** A `record::SFPU` (op id, scalar parameters,
+      tensor refs) that expands, like `ELTWISE`, into gathers, one `KERNEL` entry and
+      scatters; a host-side registry from op id to program builder. Adding an op is then
+      a builder and a gate, not a new arm in `dm_b.rs`.
+- [ ] **F5 Oracles.** `tt_isa::numerics` grows ports of the functional models named in
+      "Definition of done", each with a test against the page's pseudocode; a host
+      interpreter that runs an SFPU program over a tile through them, so any kernel's
+      expected output is computed, not hand-derived.
+- [ ] **F6 (optional) A Burn coverage generator.** `cargo xtask burn-coverage --check`,
+      reading `OVERRIDDEN` and the pinned traits, so the table below cannot rot.
+
+### S — SFPU operations
+
+- [ ] **S1 Today's element-wise ops on the SFPU** (was checklist 9.9): `ADD`, `SUB`, `MUL`,
+      `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`. `fma_bh` says the results equal
+      the B core's for every normal case; the gate is `step19_eltwise` bit-identical and
+      the MNIST golden unchanged. The B-core path stays, as the reference and the fallback.
+      Burn: no new methods; `float_add_scalar`, `float_sub_scalar` come free.
+- [ ] **S2 Compare, select, sign.** `SFPGT`/`SFPLE`/`SFPSETCC` writing 1.0/0.0, `SFPSWAP`'s
+      min/max mode, `SFPABS`, `SFPSETSGN`. Burn: `float_{equal,not_equal,greater,
+      greater_equal,lower,lower_equal}{,_elem}`, `float_mask_where`, `float_mask_fill`,
+      `float_clamp{,_min,_max}`, `float_abs`, `float_neg`, `float_sign`, `leaky_relu`,
+      `hard_sigmoid`, `prelu`. Needs bool tensors on the device (`BoolTensorOps` storage,
+      D3).
+- [ ] **S3 Reciprocal and division.** `SFPARECIP` (Blackhole-only) for the seed, Newton
+      steps by `SFPMAD` to full precision, the bound derived from the seed's documented
+      accuracy. Burn: `float_recip`, `float_div`, `float_div_scalar`, `float_remainder{,_scalar}`.
+- [ ] **S4 Transcendentals.** Range reduction by `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, then
+      `SFPMAD` polynomials or `SFPLUTFP32` (its `LReg[LReg[7] & 15]` destination bug
+      handled inside the helper, Tier 2). In order: `exp`, `log`, `sqrt`/`rsqrt`, then
+      `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos`. Burn: `float_exp`, `float_log`,
+      `float_log1p`, `float_sqrt`, `float_powf{,_scalar}`, `float_powi*`, `float_tanh`,
+      `float_erf`, `float_sin`, `float_cos`, then the rest of the trig family;
+      `sigmoid`, `gelu`, `log_sigmoid` and their backwards.
+- [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
+      `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
+      the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
+- [ ] **S6 Casts and rounding.** `SFPCAST` int ↔ float (never `SFPCAST_IntAbs`: Tier 2,
+      use `SFPABS`); `SFPSTOCHRND` FP32 → BF16/FP16 in round-to-nearest and stochastic
+      modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
+      `float_cast`, `float_into_int`, `int_into_float`, `float_round`, `float_floor`,
+      `float_ceil`, `float_trunc`.
+- [ ] **S7 The PRNG.** Seeded per tile from `Backend::seed`. The claim is distributional
+      (a stated statistical test), not bit-exact against Flex, whose generator is
+      different. Burn: `float_random`, dropout.
+- [ ] **S8 Lane movement.** `SFPTRANSP`, `SFPSHFT2` for reductions inside a tile (feeds R1).
+- [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
+      else here works without it.
+
+### M — Matrix Unit beyond `MVMUL`
+
+- [ ] **M1 `ELWADD`/`ELWSUB`/`ELWMUL`** with `Src` row, column and scalar broadcast: binary
+      element-wise at matrix-unit throughput, at TF32/BF16 `Src` precision. Opt-in, like
+      `Fidelity`; never a silent replacement for the FP32 SFPU path.
+- [ ] **M2 `GMPOOL`/`GAPOOL`.** Max and average over rows. Burn: `float_max_dim`,
+      `float_mean_dim`, `max_pool2d`, `avg_pool2d`, `adaptive_avg_pool2d` (with D6's
+      windowing).
+- [ ] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
+      place of the B core's face transpose (`READ_TRANSPOSED`). Burn: `float_permute`,
+      materialised transposes.
+- [ ] **M4 `DOTPV`, `SHIFTXA`/`SHIFTXB`.** Silicon-only (row 50). Only when a kernel
+      wants them.
+
+### R — Reductions and composites
+
+- [ ] **R1 Reductions over any dim.** `sum`, `mean`, `max`, `min`, `argmax`, `argmin`,
+      `prod`, full and per dim (today only `sum_dim(0)`, on the B core). Within a tile by
+      S8/M2, across tiles by the mover (or NoC atomics). Sum order stated against Flex's,
+      as `COL_SUM`'s is.
+- [ ] **R2 Softmax, log-softmax, cross-entropy on the device** (was checklist 9.12): max,
+      subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
+      per-step logits download goes away as a consequence, not as the goal. Burn:
+      `softmax`, `log_softmax`, `softmin`.
+- [ ] **R3 Norms.** `ModuleOps::layer_norm`, RMS norm as a composite, and their backwards.
+- [ ] **R4 `ModuleOps::attention`.** Matmul, scale, mask, softmax, matmul -- after R2 and
+      the fusion work in Phase 9.
+
+### D — Formats and data movement
+
+- [ ] **D1 BF16 tensors in GDDR.** Packer FP32 → BF16, unpacker BF16 → `Src` and `Dst`;
+      half the bytes for every op. `DramTensor` grows a format.
+- [ ] **D2 Block float (BFP8/BFP4).** Measure the codes as divergence rows G and H did,
+      then exponent sharing and `CLREXPHIST`. Prerequisite for `QTensorOps` on the device.
+- [ ] **D3 Integer and bool storage** (INT32, INT8, bool as a format) for `IntTensorOps`,
+      `BoolTensorOps`, `QTensorOps`.
+- [ ] **D4 Indexing on the B mover.** General `slice` (not only whole tile rows),
+      `slice_assign`, `cat`, `gather`, `scatter_add`, `select`, `select_add`, `repeat_dim`,
+      `expand`, `flip`, `embedding` and its backward. The mover moves; the SFPU is not
+      needed.
+- [ ] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
+- [ ] **D6 Convolution.** `conv2d` as im2col on the mover plus the existing matmul, then
+      its three backwards, `conv1d`, `conv_transpose2d`, `unfold4d`.
+
+---
+
+## Burn op coverage
+
+The compute methods of the pinned Burn 0.21 op traits, with the item that brings each to
+the device. Bookkeeping methods (`*_device`, `*_to_device`, `*_into_data`, `*_from_data`,
+`*_reshape`, autodiff flags) are left out. **Device** is `x` when the method has a device
+path today, `~` when only some shapes do.
+
+### `FloatTensorOps`
+
+| Methods | Device | Item |
+|---|:-:|---|
+| `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
+| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (B core) | S1 |
+| `float_sum_dim` | `~` dim 0 only (B core) | R1 |
+| `float_slice` | `~` whole tile rows | D4 |
+| `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
+| `float_add_scalar`, `float_sub_scalar` | | S1 |
+| `float_div{,_scalar}`, `float_recip`, `float_remainder{,_scalar}` | | S3 |
+| `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
+| comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
+| `float_exp`, `float_log`, `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
+| `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
+| `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
+| `float_random` | | S7 |
+| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max*`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
+| `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
+| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
+| `float_gather`, `float_scatter_add`, `float_select{,_add}`, `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
+| `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
+
+### `ActivationOps`
+
+| Methods | Device | Item |
+|---|:-:|---|
+| `relu`, `relu_backward` | x (B core) | S1 |
+| `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
+| `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
+| `softmax`, `log_softmax`, `softmin` | | R2 |
+
+### `ModuleOps`
+
+| Methods | Device | Item |
+|---|:-:|---|
+| `linear` and its three backwards | `~` default over `float_matmul` | -- |
+| `embedding{,_backward}` | | D4 |
+| `conv1d`, `conv2d`, `conv_transpose*`, their backwards, `unfold4d` | | D6 |
+| `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | | M2 + D6 |
+| `layer_norm` | | R3 |
+| `attention` | | R4 |
+| `conv3d`, `deform_conv2d`, `interpolate`, `ctc_loss`, `rfft`/`irfft` | | not planned until a model needs them |
+
+### `IntTensorOps`, `BoolTensorOps`, `QTensorOps`
+
+| Methods | Device | Item |
+|---|:-:|---|
+| storage on the device | | D3 |
+| `int_{add,sub,mul,div,remainder}{,_scalar}`, `int_neg`, `int_abs`, comparisons, `bitwise_*` | | S5 |
+| `int_into_float`, `int_cast`, `bool_into_float`, `bool_into_int` | | S6 |
+| `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
+| `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_mask_*` | | S5 |
+| indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
+| `QTensorOps` | | D2 (stays Flex's until then) |
+
+---
+
+## Hazards and known bugs this phase meets
+
+From the Tier 2 register (`implementation-checklist.md`) and the divergence log, mapped to
+the item that must handle each. An item is not done while its hazard here is open.
+
+| Hazard | Source | Item |
+|---|---|---|
+| `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 |
+| `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 |
+| `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 |
+| `SFPSTOCHRND` biased; round-toward-zero sometimes rounds away | Tier 2 | S6 |
+| `SFPCAST_IntAbs` computes absolute value | Tier 2 | S5, S6 |
+| `SFPMUL` with `Mod1 > 1` refused by ttsim; `SFPMAD` spelling used | divergence row 17 | S1 |
+| `-1.0 * 0.0` gives `+0.0` unless the addend is `-0` | numerics row C | S1 |
+| Denormals flush, NaNs canonicalise to `0x7FC0_0000` | numerics row D | every oracle |
+| `SFPLOADMACRO` unsupported on ttsim | divergence row 7 | S9 |
+| `UnpackToDst` refused for 16-bit and block-float inputs on ttsim | divergence row 31 | F1, D1 |
+| `DOTPV`, `SHIFTXB`, `MOVDBGA2D` unimplemented on ttsim | divergence row 50 | M4 |
+| `STALLWAIT` must block the *consumer*; units run concurrently on silicon | divergence row 46 | F3 |
+| `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
+
+New ttsim refusals or disagreements found while doing any of this go in
+`ttsim-divergence.md`, numbered after the last row, and are cited from the item.

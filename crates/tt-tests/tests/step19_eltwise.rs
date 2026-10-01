@@ -283,3 +283,74 @@ fn a_row_view_is_the_rows_it_names() {
         assert_eq!(s.download(&a).unwrap(), v);
     });
 }
+
+/// Small integers: every sum and product here is exact in FP32, so the
+/// summation order cannot matter and Flex is the answer.
+fn ints(seed: usize, n: usize) -> Vec<f32> {
+    (0..n).map(|i| ((i * 7 + seed) % 9) as f32 - 4.0).collect()
+}
+
+/// A ragged edge tile's padding rows must not reach a later accumulation.
+///
+/// `DramTensor` says its padding is zero, "the identity for every
+/// accumulation" (`tt_kernels::tensor`), but an op that writes a whole tile
+/// writes the padding too: `ADD_ROW` adds the bias into every one of a tile's
+/// 32 rows, so after `x + b` on a 50-row `x` the 14 padding rows hold `b`.
+/// The crop on download hides them; a reduction over rows does not. Two
+/// accumulations read them: the column sum (a bias gradient's shape) and a
+/// matmul whose `K` is the row dimension (a weight gradient's, `h^T @ g`).
+/// A whole number of tile rows is the control: it has no padding to leak.
+#[test]
+#[ignore = "known bug: ADD_ROW writes padding rows (hardware-coverage F0); un-ignore with the fix"]
+fn padding_rows_stay_out_of_a_later_accumulation() {
+    with_session(|s| {
+        let c = 40;
+        for r in [64, 50] {
+            let (xv, bv) = (ints(1, r * c), ints(2, c));
+            let (yv, dv) = (ints(3, r * c), ints(4, c));
+            let x = s.upload(&xv, r, c).unwrap();
+            let b = s.upload(&bv, 1, c).unwrap();
+            let y = s.upload(&yv, r, c).unwrap();
+            let d = s.upload(&dv, 1, c).unwrap();
+            let add_row = Eltwise {
+                kind: kind::ADD_ROW,
+                scalar: 0.0,
+            };
+            let xb = s.eltwise(add_row, &x, Some(&b)).unwrap();
+            let yd = s.eltwise(add_row, &y, Some(&d)).unwrap();
+
+            // The element-wise result itself is right: the crop hides the
+            // padding, which is why nothing else noticed.
+            let fxb = flex(&xv, r, c) + flex(&bv, 1, c);
+            assert_same(&s.download(&xb).unwrap(), &bits(fxb.clone()), "x + b");
+
+            let sum = s.sum_rows(&xb).unwrap();
+            assert_same(
+                &s.download(&sum).unwrap(),
+                &bits(fxb.clone().sum_dim(0)),
+                &format!("[{r}, {c}]: (x + b).sum_dim(0)"),
+            );
+
+            let fyd = flex(&yv, r, c) + flex(&dv, 1, c);
+            let prod = s
+                .matmul_dram(
+                    &xb,
+                    true,
+                    &yd,
+                    false,
+                    tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                    tt_kernels::matmul::Fidelity::HiFi4,
+                    tt_tests::harness::BUDGET,
+                )
+                .unwrap();
+            assert_same(
+                &s.download(&prod).unwrap(),
+                &bits(fxb.transpose().matmul(fyd)),
+                &format!("[{r}, {c}]: (x + b)^T @ (y + d)"),
+            );
+            for t in [x, b, y, d, xb, yd, sum, prod] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}

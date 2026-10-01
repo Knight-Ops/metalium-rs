@@ -3,13 +3,17 @@
 The working tick-list for `RUST_IMPL_PLAN.md`. The plan says *why*; this says *what
 is done, what is next, and what must not be forgotten*.
 
+Related: [`hardware-coverage.md`](hardware-coverage.md) (Phase 10 tracker),
+[`tt-metal-concepts-review.md`](tt-metal-concepts-review.md) (gaps against tt-metal, G1–G16),
+[`burn-backend-parity.md`](burn-backend-parity.md) (Burn backend roadmap, B0–B16).
+
 **Status legend:** `[x]` done and gated by a test · `[~]` partially done, see note ·
 `[ ]` not started · `[-]` deliberately not applicable here, with the reason given.
 
 **The two-gate rule.** No item is complete until it passes on the simulator *and* on
 silicon. **Silicon now exists here:** two Tenstorrent p150a cards (Blackhole), PCIe-passed
-through to this VM, driver `tenstorrent` 2.11.0, firmware bundle 19.14.0.0. Phase 1's
-silicon gate is closed; every later phase's is still open.
+through to this VM, driver `tenstorrent` 2.11.0, firmware bundle 19.14.0.0. Phases 1-8
+have passed their silicon gates; the "Where things stand" table says what each still owes.
 
 The first silicon run vindicated the rule in the least comfortable way available. Phase 1
 had passed on the simulator for weeks while containing an assumption — 140 Tensix tiles —
@@ -28,16 +32,17 @@ gate you have not seen reject something is not yet evidence.
 
 | Phase | State | Note |
 |--:|---|---|
-| 0 — Simulator harness | `[~]` | `libttsim` path done; `ttsim-qemu` not started |
+| 0 — Simulator harness | `[x]` | `libttsim` path done; `ttsim-qemu` not needed -- the `tt-kmd` path is gated on real cards |
 | 1 — Host addresses the chip | `[x]` | **Gated on simulator and on silicon** (both p150a cards, 7/7). `tt-kmd` done; harvesting read from ARC telemetry |
 | 2 — Rust on a baby RISC-V | `[~]` | **Silicon gate passed on both cards** (heartbeat, reset, `pc` snapshot, local RAM + zeroing); I-cache and hot-reload paths open |
-| 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates and corpus pass on both cards**, `SFPLOADMACRO` load half pinned on silicon; tracing open |
+| 3 — Encoder + first Tensix round-trip | `[~]` | **SFPU gates, corpus and tracing pass on both cards**; `SFPLOADMACRO` load half pinned on silicon; open question 7 open |
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
-| 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 now possible on silicon, not yet written |
+| 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 silicon-only gate not written. Real element-wise ops are Phase 10 (S1) |
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
 | 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles). Next: 9.8 overlap, with the circular-buffer runtime |
+| 10 — Hardware coverage | `[ ]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** Only `MVMUL` runs on the Tensix today; element-wise is on the B core, the SFPU runs no tensor op. Next: 10.0, the SFPU foundation, with today's element-wise ops moved onto it |
 
 ---
 
@@ -102,12 +107,9 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
       per-thread reset now starts with `backend::reset_config` (the deliberate
       `STATE_RESET_EN` write), and runs on every tile a gate claims, not just the gate
       tile (row 49).
-- [x] **Silicon regression: 146/148 on both cards**, the two failures being the
-      `MOVB2D` `Move4Rows` twin. That encoding is now fixed (row 38) and the twin is
-      replaced by two gates that run on both targets. Unfiltered run since: 116/116 on
-      each card, `silicon_measure` and `fma_oracle` included. After the Phase 6 close-out (window pool,
-      program slots, concurrent roles, tiles, tracing, `tt-kernels`): **129/129 on
-      each card** (258 run, 0 failed), unfiltered.
+- [x] **Silicon regression clean.** The campaign's last two failures were the
+      `MOVB2D` `Move4Rows` twin (row 38, fixed); after the Phase 6 close-out the
+      unfiltered run was 129/129 on each card. Later phases record their own counts.
 - [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
       "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
 
@@ -129,8 +131,8 @@ Set up early; retrofitting is expensive.
       `Translated`, plus `ChipId` from day one. `ChipId` is now load-bearing rather
       than merely present: it is the bdf device field *and* the stride multiplier
       for a chip's BAR windows, so the day-one decision cost nothing to collect on.
-- [x] **Divergence log** — `docs/ttsim-divergence.md`, 42 numbered rows plus eight
-      measurements, and counting.
+- [x] **Divergence log** — `docs/ttsim-divergence.md`: numbered rows, lettered
+      measurements, and numerics notes.
 - [x] **Silicon-only suite exists** — `--features silicon`, compiled always so it
       cannot rot.
 - [x] **Version control**, so the pinning discipline above is enforceable.
@@ -159,14 +161,20 @@ Set up early; retrofitting is expensive.
       and the generated-table check — the same things CI runs, so a push does not
       fail on something a commit could have caught.
 - [ ] **CI: silicon suite nightly, and as a merge gate to main.**
+- [x] **Forking while another test thread is inside Burn could hang a child.**
+      A forked child keeps every lock as it stood; one held by a thread
+      computing a `burn-flex` reference in the parent is held forever. Seen
+      once (a training gate's child on a futex for ten minutes; every test
+      passed alone). `tt_ttsim::fork_scope` now takes a gate exclusively for
+      the fork, and parent-side library work goes through `outside_fork`,
+      which shares it (step9, step11, step12). Watched: with the gate removed,
+      `a_lock_held_by_parent_work_is_not_inherited_by_the_child` hangs until
+      its alarm.
 - [x] **`burn-flex` as the second differential oracle.** ttsim is the ISA-level
       oracle; this is the tensor-level one. Needed from Phase 5. **Not
       `burn-ndarray`**, which crates.io now marks `[Deprecated] … use burn-flex,
       burn-cuda, burn-rocm`; `burn-flex 0.21.0` is the supported CPU backend and is
       what `PINS.toml` should pin. Taken as a `tt-tests` dev-dependency at 0.21.
-      Note for Phase 7: in 0.21 the associated `Device` lives on `BackendTypes`, not
-      on `Backend`, so the supertrait list in `RUST_IMPL_PLAN.md` is already stale —
-      the item that says to re-verify it against the pinned version is load-bearing.
 
 ### Hazards to encode in the API, not in comments
 
@@ -286,12 +294,9 @@ no answer.
       advances, a bad access is rejected before reaching the library.
 - [-] **Gate (silicon):** none — this phase is simulator infrastructure by definition.
 
-### Deferred to step 5 of the baseline plan
-
-- [ ] Build `ttsim-qemu` (a single-patch QEMU fork) from source.
-- [ ] Provision a Linux guest image; build and `insmod` `tt-kmd` inside it.
-- [ ] Launch with the Blackhole-specific `bar4-size=32G`.
-- [ ] Run the Phase 1 and 2 gates through `/dev/tenstorrent/0` in the guest.
+- [-] **`ttsim-qemu`** (a QEMU fork exposing ttsim as `/dev/tenstorrent/0`, to
+      exercise the real ioctl and mmap paths): not needed. Two p150a cards exist and
+      the `tt-kmd` path is gated on them directly.
 
 ---
 
@@ -395,16 +400,11 @@ tile survives on this ASIC, *then* register `SET_NOC_CLEANUP`, *then* scrub. The
 write is a NoC write to a Tensix tile; registered against a fused-off one it would fire on
 every close from then on, including the close that follows the hang.
 
-**Run silicon gates with `--test-threads=1`.** All tests share one physical card. Window
-allocation is global card state, so `window_exhaustion_is_an_error_not_a_panic`'s
-`assert_eq!(held.len(), 201)` is only true if nothing else holds a window. The simulator
-hides this by handing out a fresh chip per call.
-
-**`Window` had no `Drop` that reached the free list** (fixed; see Hazards to encode
-in the API). This surfaced only on silicon, because silicon's `in_device` scrubs the
-gate tile *after* the body and needs a window to do it, while the simulator's never
-scrubs at all. The one gate whose job is to exhaust windows was the one that starved
-the cleanup path.
+**Run silicon gates through `cargo xtask silicon`**, which runs one test per process
+with an fsync'd log. All tests share one physical card and window allocation is global
+card state, so `window_exhaustion_is_an_error_not_a_panic`'s `assert_eq!(held.len(), 201)`
+is only true if nothing else holds a window. The simulator hides this by handing out a
+fresh chip per call.
 
 **When a run can take the node down, buy forensics first.** A hard kill loses the
 journal's last minutes *and* unflushed file data — a linked test binary came back as 9.2 MB
@@ -439,6 +439,11 @@ and the reset check was watched failing with the check removed.
 structurally simulator-only and *cannot* reach a card — which is fortunate, because
 finding "the highest addressable byte at each coordinate" is precisely the sweep that
 hangs on a fused-off tile. Its 140 is where the bad constant came from.
+
+**An Ethernet link reporting "not Up on both ends" wants a card reset, not a code
+change.** Seen 2026-10-01 on the X 3 cable link (X 13 stayed Up) with Ethernet code
+unchanged since Phase 8; after a device reset `silicon_eth_link` was 10/10 and the
+two-card sharded golden and the smoke tier passed again.
 
 **Host infrastructure, for whoever inherits this VM.** The cards are passed through with
 `viommu=virtio`. Switching to the Intel vIOMMU broke the passed-through NVMe — admin queue
@@ -546,9 +551,10 @@ misattribution.
       layouts, each cross-checked against the hand-written `TT_*(…)` syntax block
       on the page that embeds its diagram. The two sources agree on names, widths,
       signedness **and slot bit positions** across 167 pairs, with ten documented
-      exceptions. Provenance is derived from which tree embeds the diagram: 39
-      Blackhole, 24 shared, 11 superseded, 74 Wormhole-only and marked
-      `UNVERIFIED`.
+      exceptions. Provenance is derived from which tree embeds the diagram, plus
+      the measured Blackhole overrides; `isa/mod.rs` asserts the split (39
+      Blackhole, 24 shared, 24 superseded, 61 Wormhole-only and `UNVERIFIED`, 13
+      measured).
 - [~] **Broad instruction corpus, *executed* against ttsim.** Split from the
       above deliberately: encoding is host-side and covers everything, executing
       needs surrounding state most instructions do not have yet. The generic
@@ -590,8 +596,8 @@ misattribution.
 - [ ] **Probe whether ttsim models the documented hardware bugs** (open question 7)
       or the intended behaviour. Either answer is workable but changes what the
       simulator gate proves.
-- [ ] **Gate (silicon):** the corpus diffed against the simulator run. Any mismatch
-      is a real finding, since ttsim targets bit-exactness.
+- [x] **Gate (silicon):** the corpus and SFPU gates pass on both cards; the one
+      silicon-only behaviour, `SFPLOADMACRO`'s load half, is pinned (`step5_corpus`).
 
 ---
 
@@ -644,8 +650,8 @@ specification does not make.
       signature change, and `TileImage` sizes and places the shared-exponent section
       for BFP8 — tested — though no BFP encoder exists. The packer's encode direction
       is Wormhole-only and cannot be checked against anything until Phase 6.
-- [ ] **Gate (silicon):** written and `#[cfg(feature = "silicon")]`, two tests.
-      **The alignment scope is narrower than this plan assumed.**
+- [x] **Gate (silicon):** passed on both cards (two tests).
+      **The alignment scope is narrower than the plan first assumed.**
       `WormholeB0/NoC/Alignment.md:19,23` says data travelling *from the host via
       PCIe to an L1 address* has **no alignment restrictions at all**, so the host
       staging path cannot violate anything. The C16 congruence applies when an L1
@@ -654,29 +660,12 @@ specification does not make.
       deliberately misaligned tile bases; a failure is a finding against a
       Wormhole-sourced page Blackhole does not carry.
 
-### Two corrections to `RUST_IMPL_PLAN.md`
-
-1. **The conversion reference.** The plan says Phase 4 converts "using the documented
-   `Dst`/`Src` bit layouts". Those describe the **register files** — 19-bit `Src`
-   datums, swizzled 16/32-bit `Dst` ones — and are already generated into
-   `tt_isa::isa::generated::datum`. Host↔**L1** conversion is governed by
-   `FloatBitPatterns.md` and `Packers/FormatConversion.md:85-104`. Both matter, for
-   different directions: the `Dst` layouts are what the corpus firmware's readback
-   path uses. Implementing against the register layout here would have been wrong.
-2. **The alignment gate**, as above: the host→L1 path is documented as unrestricted.
-
-### Open, and deliberately so
-
 - [x] **Which `Z` plane is which face of a tile is a convention, not a
-      specification.** *Settled by the tile matmul:* the unpacker takes face `z` as
+      specification**, settled by the tile matmul: the unpacker takes face `z` as
       the `z`-th `XDim * YDim` datums (its ADC `Z`), `tt_layout` puts face
-      `(z / 2, z % 2)` there, and the product is right on both targets and wrong
-      with the faces transposed. Row-major faces of row-major datums, as LLK. The address generator fixes the *order* datums are visited;
-      nothing says which 2-D patch a `Z` plane corresponds to.
-      `Layout::tt_metal_32x32` picks row-major faces of row-major datums, and
-      `placement.rs` **pins** that choice with a test whose failure means the
-      convention changed — it does not claim the choice is correct. Settle it in
-      Phase 6 against what the unpacker's ADC walk wants; it is a one-line change.
+      `(z / 2, z % 2)` there -- row-major faces of row-major datums, as LLK -- and
+      the product is right on both targets and wrong with the faces transposed.
+      `placement.rs` pins the choice.
 
 ---
 
@@ -715,8 +704,8 @@ Eltwise before matmul deliberately: it exercises unpack → SFPU → pack with n
       **Controls watched failing:** expecting the host's `f32` multiply instead of
       the model; an empty kernel; swapped operand row groups; a reversed Burn
       operand.
-- [ ] **Gate (silicon):** same suite. A mismatch here is a high-value bug report —
-      it means the golden reference and the hardware disagree.
+- [x] **Gate (silicon):** the FP32 suite passes on both cards, after the three
+      datapath fixes in the Silicon campaign.
 
 ---
 
@@ -760,7 +749,7 @@ undocumented.
       **returns `None` unless every product and sum is exact**, because `MVMUL.md`
       calls its float model "a rough guide" to order; the gates choose operands in
       that regime, and the reference caught one set that was not.
-- [~] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..16, not
+- [x] **Blackhole Matrix Unit encodings.** `MVMUL`'s `AddrMod` is bits 14..16, not
       the Wormhole diagram's 15..16 (row 42), so the generated encoder applied the
       wrong modifier for every non-zero value, silently. **Now fixed through the
       generator, not beside it:** `xtask/src/gen_isa/Bits32_BH.lua` holds measured
@@ -772,9 +761,8 @@ undocumented.
       documenting the instruction for Blackhole. Each refusal has a mutation test,
       and the missing-gate one was watched end to end. The result is
       `Provenance::Measured`, a third status beside documented and `UNVERIFIED`.
-      **Open:** sweep every other Matrix Unit instruction with an `AddrMod` or a
-      mode field — `ZEROACC` first, whose refused `UseDst32b` (row 40) is probably
-      the same shift.
+      The sweep of every other Matrix Unit instruction is done: 13 measured
+      layouts, `ZEROACC` included (Silicon campaign; rows 40, 42).
 - [x] **`PACR` out of a `MVMUL` result**, on ttsim and both cards -- the first
       gate in which all three roles work. `datapath::pack_rows` packs any number
       of `Dst` rows as one `PACR` per aligned group of four: the packer's input
@@ -831,9 +819,6 @@ undocumented.
       first. Watched failing three ways: no re-pointing (K depth wrong), no
       `DST_FREE` wait (output tile 0 packed as zeros), no Y reset (tile 1 packed
       from the wrong rows).
-- [ ] Budget a standing percentage of the phase for empirical discovery rather
-      than implementation. *(Borne out: six of the eight new divergence rows were
-      found while building the first block.)*
 - [x] Do unpacker/packer bring-up **entirely in the simulator** — every refusal so
       far has been a specification question, answered and logged before moving on.
 - [x] **Gate (sim):** `step10_matmul_tile::a_shape_format_and_depth_sweep` --
@@ -960,20 +945,16 @@ reduced run's loss curve is the same 32 `f32`s on ttsim and on silicon.
       against ~49 ms/step for Flex on the host: every chunk re-stages its operands
       and re-runs the tile reset, and the data crosses PCIe for every matmul.
       That is the Phase 9 baseline, not a gate.
-- [ ] `QTensorOps` stays Flex's, on the host. Quantization is out of scope for the
-      milestone.
+- [-] `QTensorOps` stays Flex's, on the host: quantization was out of scope for the
+      milestone (Phase 10, D2).
 - [x] **Open question 3: `burn-fusion` does compose with a hand-written
       backend.** `Fusion<B: FusionBackend>`, where `FusionBackend` is `BackendIr` +
       a `FusionRuntime` supplying `OperationFuser`s over `OperationIr`. Fused
       unpack -> math -> pack chains are a `burn-tt` fuser (Phase 9), not a CubeCL
       question.
-- [ ] **Next ops for the device**, each gated against the delegate it replaces:
-      elementwise add/mul (Phase 5's kernel, tiled), then the ReLU and the
-      softmax reductions. Today everything but matmul is on the host, and the
-      data lives there between ops.
-- [ ] **Per-run cost.** Every chunk re-stages both operands and re-runs the tile
-      reset; device-resident tensors and one reset per session are Phase 9, and
-      the first silicon numbers are in the full-run item above.
+- [x] **Next ops and per-run cost**, carried forward: element-wise, ReLU and the
+      bias sum moved to the device and tensors became resident in Phase 9 (9.3-9.4);
+      everything else is Phase 10.
 
 ---
 
@@ -1086,13 +1067,9 @@ projects of this shape stall.
 
       `step12_mnist::the_mlp_trains_sharded_over_two_chips_matching_the_golden`
       passes on the two cards: **the loss curve is the golden, bit for bit.**
-- [x] **Throughput, measured** (`RUST_IMPL_PLAN.md`, Phase 8 "As built", for
-      the table). The mover moves 128 KiB Tensix -> Tensix across cards in
-      14 us, 9.4 GB/s; 11.4 GB/s from staging to landing. A ~9 us floor is the
-      host polling the ack. The host-driven TT-link reaches 9.1 GB/s with one
-      128 KiB command. **PCIe through the TLB windows manages 18 MB/s writing
-      and 5 MB/s reading**, so Ethernet is already about 500x faster for tensor
-      data. The PCIe path is Phase 9's first target. Integrity: 200 transfers of
+- [x] **Throughput, measured** -- the table is in `RUST_IMPL_PLAN.md`, Phase 8
+      "As built": 128 KiB Tensix -> Tensix across cards in 14 us (9.4 GB/s),
+      about 500x the PCIe TLB path. Integrity: 200 transfers of
       mixed size, each with fresh data and a fenced sentinel, all correct
       (`silicon_eth_bench::mover_integrity`). With the landing wait disabled, 400
       more were also all correct, so the record's in-order arrival suffices in
@@ -1104,8 +1081,6 @@ projects of this shape stall.
       commands fine). It exposed a real hazard: `Device::write` does not order
       against agents other than the host. `Mover::stage` now reads back, and
       the silicon gates fence what they stage.
-- [ ] **A `Device` write fence** as API, rather than read-backs at call sites
-      (carried into Phase 9).
 - [ ] Double-buffered `TX_STAGE`/`RX_LAND`, and both links at once.
 - [ ] **Data-parallel training** (a gradient all-reduce over the links) is not
       done. It reorders sums, so it needs a weaker claim than the golden, and
@@ -1119,9 +1094,26 @@ projects of this shape stall.
 GDDR6; the dataset and weights are loaded into it once at startup, and a
 steady-state training step should move almost nothing over PCIe. The headline
 metric is therefore **PCIe bytes per step** (`Device::traffic`), next to ms/step.
-The slice plan: 9.0 baseline, 9.1 DRAM discovery, 9.2 startup population,
-9.3 Tensix <-> DRAM data movement and session residency, 9.4 device-resident
-tensors in `burn-tt`, 9.5 gates.
+
+**Rules for every slice.** ttsim is the correctness gate (bit for bit against the
+golden and `burn-flex`), because pipelined kernels are where correctness is hardest;
+every performance number comes from silicon, since ttsim is not cycle-accurate; and
+the comparison is against the specification's peak figures, not a competitor.
+
+**Full MNIST, release, card 0** (accuracy 91.96% throughout, against 91.97% on the
+host; the reduced golden bit for bit on ttsim and both cards after every slice):
+
+| After | ms/step, 1 tile | ms/step, 8 tiles | Device written per step | What changed |
+|---|--:|--:|--:|---|
+| 9.0 | 224 | -- | -- | baseline; Flex on the host 0.5 |
+| 9.3b | 38.5 | -- | -- | resident role firmware, no per-run reset |
+| 9.4b | 16.8 | -- | -- | tensors in GDDR; tensor traffic 675/475 KB -> 216/35 KB up/down |
+| profiling | 9.9 | -- | -- | unrolled element-wise, face-wise transposes, program slots compared by word |
+| 9.4 views, sums | 5.8 | -- | 193 524 B | dataset preloaded (2.7 s, mostly host tilizing), batches as views, bias sum on device; ~13 KB up, 3 KB down |
+| 9.6 | 5.8 | 4.1 | 349 372 B (4 tiles) | many tiles, waves (5.0 on 120) |
+| 9.7a | 5.7 | 3.8 | 250 write calls | one launch per op per tile |
+| 9.7b | 5.8 | 3.7 | 155 KB | op records expanded on the tile |
+| 9.7c | 5.1 | **2.5** | 35 KB | resident program cache |
 
 - [x] **9.0 Release baseline.** `cargo xtask silicon --release` (and the log
       records the profile). Every earlier number was a dev build. Full MNIST,
@@ -1175,11 +1167,6 @@ tensors in `burn-tt`, 9.5 gates.
       recovers (silicon). Watched failing with the math program left stale.
       Recovery found row 65: a `SEMWAIT` survives the backend pulse, so the
       tile reset now releases every semaphore first.
-- [x] **Result: full MNIST 224 -> 38.5 ms/step** on both cards (release),
-      accuracy unchanged (91.96%), the reduced golden bit for bit on ttsim, both
-      cards and sharded over the two. Silicon regression before the resident
-      change: 316/316; the Phase 9 gates with matmul, burn, MNIST and multi-chip
-      after it: 82/82.
 - [x] **9.3c** Programs and chunk plans memoised per process
       (`matmul::programs`, `plan_in`); a resident program slot already holding
       the program is not rewritten.
@@ -1210,9 +1197,6 @@ tensors in `burn-tt`, 9.5 gates.
       `relu`, `relu_backward` -- whenever an operand is already there. Anything
       else downloads once, counted by `burn_tt::tensor_traffic`
       (`TT_TRACE_FALLBACK=1` says which op). Both engines keep tensors in GDDR.
-- [x] **Result: full MNIST 38.5 -> 16.8 ms/step** on both cards, accuracy
-      unchanged, the reduced golden bit for bit on ttsim and both cards. Tensor
-      traffic per step 675 KB up / 475 KB down -> 216 KB up / 35 KB down.
 - [x] **Profiled and cut, 16.8 -> 9.9 ms/step** (single card, both cards
       alike, golden unchanged): element-wise in unrolled `flw`/`f*`/`fsw` loops
       (7.4 -> 2.6 ms/step); the resident setup run skipped when a kernel
@@ -1226,6 +1210,20 @@ tensors in `burn-tt`, 9.5 gates.
       `attach_topology`, or `TT_TOPOLOGY=0` / `0,1` for the silicon harness, so a
       benchmark runs on one card or both unchanged. Two cards are Phase 8's
       mesh: host-staged, per-chunk resets, chips in turn -- 233 ms/step.
+- [ ] **Padding rows are not kept zero** (reproduced on ttsim:
+      `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`, ignored until
+      fixed; 50 rows give `-133` for Flex's `-105`, 14 padding rows times `b`, and the
+      `(x + b)^T @ (y + d)` weight-gradient shape is wrong too):
+      `ADD_ROW` adds the bias into a ragged tile's padding rows and `COL_SUM`
+      sums all 32 rows (`dm_b.rs`), so `(x + b).sum_dim(0)` on a row count that
+      is not a multiple of 32 should be wrong; the crop on download hides the
+      rows themselves. MNIST's batches are whole tiles. `tt-metal-concepts-review.md`
+      G1; the fix (a typed pad state per tensor) is `hardware-coverage.md` F0.
+- [ ] **A `BufferId` can outlive its engine** (found by review): `DramBuffers`
+      numbers from 1 per attach (`burn-tt/src/server.rs`), so a tensor kept across
+      a detach and re-attach reads another tensor's buffer, and dropping it frees
+      one. Reproduced: `burn-tt/tests/stale_buffer.rs`, both ignored until fixed.
+      `burn-backend-parity.md` sec. 4.1, roadmap B3.
 - [ ] **The two-card full run's accuracy is 0.9195, one card's 0.9196.** The
       reduced sharded run matches the golden bit for bit, so something past 32
       steps diverges on the mesh. Phase 8 code; not yet investigated.
@@ -1246,15 +1244,9 @@ tensors in `burn-tt`, 9.5 gates.
       slots its tiles fill, and a small download reads only the faces and face
       rows its data reaches (a `[1, n]` row: 128 bytes a tile, not 33 KB of
       whole regions).
-- [x] **Result: full MNIST 9.9 -> 5.8 ms/step** steady state on both cards
-      (the one-time preload of the model and 59 968 images: 2.7 s, most of it
-      host tilizing), accuracy unchanged, 50/50 Phase 9 and training gates.
-      Per step: element-wise 2.4, matmul 2.4, column sums 0.3, downloads 0.3
-      (logits, two bias gradients), uploads 0.2 (`g2`, two biases), host
-      0.2 ms. Tensor traffic per step: about 13 KB up, 3 KB down.
-- [x] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
-      allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum on
-      device. *Done as 9.4a and 9.4b above*; SGD on rank-1 biases stays on the
+- [x] **The 5.8 ms/step profile** (one tile): element-wise 2.4, matmul 2.4,
+      column sums 0.3, downloads 0.3 (logits, two bias gradients), uploads 0.2
+      (`g2`, two biases), host 0.2 ms. SGD on the rank-1 biases stays on the
       host (see 9.5).
 - [x] **9.5 The residency gate.** `step12_mnist::the_mlp_trains_on_a_reduced_dataset`
       samples `burn_tt::tensor_traffic`, the new `burn_tt::device_traffic` (the
@@ -1282,10 +1274,8 @@ tensors in `burn-tt`, 9.5 gates.
 
 ### Phase 9 -- next steps, in order
 
-At 5.8 ms/step nearly everything left is compute on **one** of 120 Tensix
-tiles, done in turn. The next slices, each gated as the ones above were
-(ttsim for correctness, bit for bit against the golden and `burn-flex`; both
-cards for time):
+At 5.8 ms/step nearly everything left was compute on **one** of 120 Tensix
+tiles, done in turn. The slices from there:
 
 - [x] **9.6 Many tiles.** `TileChoice::Count(n)` / `All` opens a `Session`
       over `n` tiles, each a unit with its own resident roles and B mover
@@ -1399,24 +1389,6 @@ cards for time):
       at the semaphore instructions when the pair is swapped; golden bit for
       bit; ttsim and both cards 78/78 with the smoke tier; the two-card
       sharded MNIST reproduces the golden.
-  - **Hardware, 2026-10-01:** the X 3 cable link reports "not Up on both
-    ends" on every run (`silicon_eth_link`'s host-driven X 3 tests and every
-    mover test, which takes the first two links); X 13 is Up and the
-    host-driven X 13 tests pass. Ethernet code is unchanged since Phase 8, so
-    this is link state, not a regression. **Cleared by a device reset:**
-    afterwards `silicon_eth_link` 10/10 (both X 3 directions, the mover and
-    the sharded matmul), the two-card sharded MNIST golden, and the smoke tier
-    26/26 on both cards. If it recurs, reset the cards before suspecting the
-    code.
-- [x] **Forking while another test thread is inside Burn could hang a child.**
-      A forked child keeps every lock as it stood; one held by a thread
-      computing a `burn-flex` reference in the parent is held forever. Seen
-      once (a training gate's child on a futex for ten minutes; every test
-      passed alone). `tt_ttsim::fork_scope` now takes a gate exclusively for
-      the fork, and parent-side library work goes through `outside_fork`,
-      which shares it (step9, step11, step12). Watched: with the gate removed,
-      `a_lock_held_by_parent_work_is_not_inherited_by_the_child` hangs until
-      its alarm.
 - [x] **9.7c Resident programs.** Each tile keeps the kernels it runs in
       `tt_isa::l1::PROGRAM_CACHE` (252 KB), mirrored on the host by
       `tt_kernels::program_cache::ProgramCache`: keyed by the program's words,
@@ -1455,10 +1427,7 @@ cards for time):
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait
       planner from the plan belong here).
-- [ ] **9.9 Element-wise on the SFPU.** Unpack to `Dst`, `SFPADD`/`SFPMUL`,
-      pack: the same IEEE results for normals (`fma_bh` measured it), at vector
-      width instead of one datum at a time on the B core. Needs whole-tile
-      `UnpackToDst`/pack, which Phase 5 did for 128 datums only.
+- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10 (S1, milestone 10.0).
 - [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
       host tilizing: tilize in parallel, or upload row-major and let the movers
       tilize on the device.
@@ -1467,22 +1436,33 @@ cards for time):
       tiles between GDDR rather than host-staged operands; data-parallel
       training over the two cards. First find why the full two-card run's
       accuracy is 0.9195 against one card's 0.9196.
-- [ ] **9.12 Loss on the device**: softmax and log on the SFPU, so the logits
-      stop crossing PCIe (the last per-step download bigger than a bias).
+- [-] **9.12 Loss on the device** -- moved to Phase 10 (R2, milestone 10.1).
 
-- [ ] A `Device` write fence as API (Phase 8's open item).
+- [ ] A `Device` write fence as API, rather than read-backs at call sites
+      (Phase 8: posted writes race other agents).
 - [ ] `MOP`/`REPLAY` expansion.
-- [ ] Three-thread pipelining: unpack on T0, math on T1, pack on T2.
-- [ ] Double buffering; multi-tile distribution with NoC multicast.
+- [ ] NoC multicast for operands many tiles share (matmul `in0`/`in1`).
 - [ ] `.ttinsn` fusion — up to four adjacent pushes per cycle. Deferred from the
       baseline because fused words disassemble as garbage and the instruction-set
       gate would have to stop rejecting undecodable instructions.
 - [ ] `L1CacheTagSearchAccel` — Blackhole-only, RISCV B only.
-- [ ] **Keep using the simulator as the correctness gate** for each optimization —
-      pipelined kernels are where correctness is hardest — then measure on silicon.
-- [ ] **Every performance number comes from hardware.** ttsim is not cycle-accurate
-      and makes no timing claim.
-- [ ] Measure against the theoretical peak figures in the spec, not a competitor.
+
+---
+
+## Phase 10 — Hardware coverage
+
+**Tracked in [`hardware-coverage.md`](hardware-coverage.md)**, not here: the inventory of
+every Tensix unit and what drives it, the work items (F foundation, S SFPU, M Matrix Unit,
+R reductions, D formats and data movement), milestones 10.0–10.6, and the Burn op coverage
+table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
+
+- [ ] **10.0** SFPU foundation; today's element-wise ops on the SFPU (was 9.9).
+- [ ] **10.1** Softmax and cross-entropy on the device (was 9.12).
+- [ ] **10.2** Activation and math breadth.
+- [ ] **10.3** Reductions over any dim, pooling, device transpose, norms.
+- [ ] **10.4** Formats and integers.
+- [ ] **10.5** Indexing and convolution.
+- [ ] **10.6** Block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV`.
 
 ---
 
@@ -1566,13 +1546,13 @@ Documented, not speculative. These bite in Phases 2–4.
       instruction's `Mod1`, which it can read because an `Instruction` carries its
       definition. Untested against silicon, and ttsim models no timing, so the
       answers are from the documentation.
-- [ ] `SFPLUTFP32` writes to `LReg[LReg[7] & 15]` instead of `LReg[VD]`.
-- [ ] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack.
+- [ ] `SFPLUTFP32` writes to `LReg[LReg[7] & 15]` instead of `LReg[VD]`. *(Phase 10: S4.)*
+- [ ] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack. *(Phase 10: F2.)*
 - [ ] `SFPSTOCHRND` — stochastic rounding is biased toward increasing magnitude,
       and the new-in-Blackhole round-toward-zero mode sometimes rounds *away* from
       zero. **The functional models in the docs faithfully reproduce the buggy
-      behaviour — match them, don't "fix" them.**
-- [ ] `SFPCAST_IntAbs` — the bug makes it compute absolute value; use `SFPABS`.
+      behaviour — match them, don't "fix" them.** *(Phase 10: S6.)*
+- [ ] `SFPCAST_IntAbs` — the bug makes it compute absolute value; use `SFPABS`. *(Phase 10: S5, S6.)*
 - [ ] `CLEARDVALID` — reset is unsafe and drops `SrcA`/`SrcB` banks
       ([tt-metal#22383](https://github.com/tenstorrent/tt-metal/issues/22383)).
 - [ ] `STREAMWRCFG` — later Configuration Unit instructions from the same thread
@@ -1594,9 +1574,11 @@ Documented, not speculative. These bite in Phases 2–4.
 - [ ] **5.** PCIe DMA engines have no register-level documentation anywhere in the
       repo. Plan on TLB-window MMIO for bulk transfer; revisit only if bandwidth
       demands it, and expect driver-source reverse engineering.
-- [ ] **6.** How faithfully does ttsim model reset sequencing, I-cache invalidation,
-      and the local-RAM zeroing window? All three land in Phase 2 and are the areas
-      most likely to be modelled loosely. Resolve at the Phase 2 silicon gate.
+- [~] **6.** How faithfully does ttsim model reset sequencing, I-cache invalidation,
+      and the local-RAM zeroing window? **Zeroing: not at all** (rows 25, 26), while
+      silicon behaves as documented (`silicon_local_ram`). Reset sequencing is closed
+      on silicon (Phase 2); ttsim models only the RISC-V reset bits (rows 16, 18).
+      I-cache invalidation is still avoided by construction (Phase 2).
 - [ ] **7.** Does ttsim model the documented hardware bugs, or the intended
       behaviour? Probe with targeted tests in Phase 3.
 - [x] **9.** *(Resolved for the formats this phase needs.)* **The 4-bit
@@ -1615,7 +1597,6 @@ Documented, not speculative. These bite in Phases 2–4.
       open:** the block-float and 8-bit codes. Divergence rows G and H; re-derive
       on silicon.
 
-- [ ] **8.** *(New.)* The Tensix grid topology in `tt_isa::noc::grid` was **measured
-      against ttsim**, not quoted — `NOC_ENDPOINT_ID` is unimplemented there, so the
-      documented discovery probe is unavailable. Three independent figures agree,
-      but re-derive it at the first silicon gate and treat a mismatch as a finding.
+- [x] **8.** The Tensix grid topology was measured against ttsim (140 tiles) and
+      was wrong for silicon (120, harvested; row 35). It now comes from the chip
+      (ARC tag 34, `grid::Tensix`), confirmed on both cards by Phase 1's gate.

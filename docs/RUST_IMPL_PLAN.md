@@ -1,10 +1,17 @@
 # Rust-Native Software Stack for Tenstorrent Blackhole → Burn Backend
 
-**Status:** Draft — implementation plan
+**Status:** Phases 0–8 closed on ttsim and silicon; Phase 9 (performance) and Phase 10
+(hardware coverage) in progress. Current state per item is in the checklist.
 **Target hardware:** Blackhole A0 (p100 / p150)
 **Spec source:** `tt-isa-documentation` @ `f848eb6` (2026-09-18)
-**Working checklist:** [`docs/implementation-checklist.md`](docs/implementation-checklist.md)
+**Working checklist:** [`docs/implementation-checklist.md`](implementation-checklist.md)
 — per-phase tick-list, current state, and the verification backlog as actual checkboxes.
+**Hardware coverage tracker:** [`docs/hardware-coverage.md`](hardware-coverage.md)
+— Phase 10: which Tensix units and Burn ops run on the device, and the order the rest arrives.
+**Implementation guides:** [`docs/tt-metal-concepts-review.md`](tt-metal-concepts-review.md)
+— Tenstorrent-system concepts we lack or do differently (G1–G16), and the hardware sharp
+edges to handle in code; [`docs/burn-backend-parity.md`](burn-backend-parity.md) — what
+`burn-tt` needs to be a CUDA-grade Burn backend (roadmap B0–B16).
 
 ---
 
@@ -72,12 +79,11 @@ Two integration paths, both usable:
    void     libttsim_clock(uint32_t n_clocks);
    void     libttsim_set_pci_dma_mem_callbacks(...);
    ```
-2. **`ttsim-qemu`**, which "exposes `libttsim.so` to a guest VM over PCIe, letting tt-kmd bind
-   to it and surface `/dev/tenstorrent/0` inside the guest." **The entire Rust stack, `tt-kmd`
-   crate included, runs unmodified.**
+2. **`ttsim-qemu`**, which exposes `libttsim.so` to a guest VM as `/dev/tenstorrent/0`.
+   **Not used:** two p150a cards arrived at Phase 1, and the real ioctl and mmap paths are
+   gated on them directly.
 
-Use path (1) for fast unit/differential tests in CI (deterministic, in-process, no VM), and
-path (2) for integration tests that must exercise the real ioctl and mmap paths.
+Path (1) is the validation tier: deterministic, in-process, run on every commit.
 
 **Why this is the right call here:**
 - ttsim's stated goal is **bit-exact numerical results relative to silicon** — so it is a valid
@@ -111,63 +117,49 @@ Rust.
 
 ---
 
-## Sizing reality check
+## Sizing and structure
 
-The requested combination — native-only, training-capable, multi-chip, one engineer — is a
-**12–16 month effort** at sustained focus. For calibration: Phases 0–3 (~7–9 weeks) get you a
-verified instruction encoder; Phase 6 (matmul) alone is 2–3 months and sits on the
-least-documented part of the spec; the training milestone (Phase 7) lands around month 8–10.
-
-Simulator-first development pulls the estimate down from the 12–18 months a hardware-first plan
-would need, for three reasons: the debug loop is faster and deterministic; multi-chip is
-developed against `bh_x2`/`bh_x4` rather than waiting on a second card; and the simulator's
-deliberate strictness converts a class of silent-corruption bugs into immediate failures. It
-does not change the fundamental shape of the work.
-
-This is not an argument against the plan. It *is* an argument for the structure below, which
-front-loads independently demoable milestones so that value lands continuously rather than
-arriving all at once at month 14:
-
-- **Multi-chip is sequenced late** (Phase 8), after single-chip training works. Building
-  inter-chip transport before single-chip compute is correct is the most common way projects
-  of this shape stall. The abstractions are chip-indexed from Phase 1 so this is an extension,
-  not a rewrite.
-- **Every phase passes two binary gates — simulator, then silicon.** No phase is "done" on the
-  strength of code review.
-- **The escape hatch is named but not taken.** If Phase 6 overruns badly, the fallback is to
-  narrow the dtype/shape surface, not to add FFI.
+The original estimate for native-only, training-capable, multi-chip, one engineer was 12–16
+months; simulator-first development ran Phases 0–8 far faster than that. What the estimate
+argued for still holds, and shapes everything below: independently demoable milestones;
+multi-chip sequenced after single-chip training, on chip-indexed abstractions from Phase 1;
+two binary gates per phase, simulator then silicon; and an escape hatch (narrow the
+dtype/shape surface) that is never FFI.
 
 ---
 
-## Workspace layout
+## Workspace layout (as built)
 
 ```
-tt-rs/
-  crates/
-    tt-isa/        # no_std — instruction encoders, config field defs, register maps
-    tt-isa-gen/    # build tool — cfg_defines.h → Rust consts
-    tt-ttsim/      # dev-only — libttsim.so bindings + deterministic test harness
-    tt-kmd/        # host — ioctls, BAR mmap, TLB window management
-    tt-device/     # host — chip/tile addressing, NoC ops, buffer alloc, core loading
-    tt-firmware/   # no_std bin crates, one per core role (B / T0 / T1 / T2 / NC / E0 / E1)
-    tt-layout/     # tilization, padding, dtype conversion
-    tt-kernels/    # host-side instruction-stream generation + device-side counterparts
-    burn-tt/       # Burn Backend implementation
-  xtask/           # build orchestration (firmware images, codegen)
-  tests/
-    differential/  # vs ttsim (ISA level), vs burn-ndarray (tensor level)
+crates/
+  tt-isa/              # no_std — generated instruction and config tables, typed helpers
+                       #   (sfpu, matrix, backend, sync, numerics, tile, dm, l1, noc, eth, arc)
+  tt-ttsim-sys/        # dev-only — raw dlopen bindings to libttsim
+  tt-ttsim/            # dev-only — singleton-safe Simulator, LibTtsim transport, fork_scope
+  tt-kmd/              # host — /dev/tenstorrent ioctls, BAR mmap, TLB windows
+  tt-device/           # host — Device over a Transport: tiles, NoC, DRAM, loading, telemetry
+  tt-layout/           # tilization, padding, dtype conversion
+  tt-firmware/         # no_std riscv32im bins (role_t0..2, dm_b, eth_e1, corpus, ...);
+                       #   its own workspace, built by xtask
+  tt-firmware-images/  # builds and checks the firmware, embeds the images
+  tt-kernels/          # kernels and the runtime: matmul, tensor, session, dm, l1 planner,
+                       #   program cache, shard, link
+  burn-tt/             # the Burn backend
+  tt-tests/            # ttsim and silicon gates (stepNN_*, probe_*, silicon_*)
+  tt-mnist/            # shippable binary: MNIST training on the card
+xtask/                 # gen-cfg, gen-isa, gen-burn-delegate, silicon, fetch-*, check-no-sim-in-ship
+vendor/                # pinned specification checkout (PINS.toml)
 ```
 
 `tt-isa` is the spine: `no_std`, zero host dependencies, compiled for **both** the host (to
 generate instruction streams) and the device (to push them). Everything else depends on it.
 
 `tt-ttsim` is a dev-dependency only and must never appear in the dependency graph of a shipped
-artifact. Enforce with a workspace lint or a CI check on `cargo tree`.
+artifact; `cargo xtask check-no-sim-in-ship` enforces it in CI.
 
-**A transport trait is the key abstraction.** `tt-device` must be generic over how it reaches
-the chip — `LibTtsim`, `Kmd` (real `/dev/tenstorrent/N`), and `Kmd`-in-QEMU are all
-implementations. Define it in Phase 0 and every later phase gets simulator and silicon
-execution for free, with no conditional compilation scattered through the codebase.
+**A transport trait is the key abstraction.** `tt-device` is generic over how it reaches the
+chip — `LibTtsim` and `Kmd` (real `/dev/tenstorrent/N`) — so every phase gets simulator and
+silicon execution from the same code, with no conditional compilation scattered through it.
 
 ## Documentation reference map
 
@@ -504,31 +496,20 @@ is the source these SVGs are generated from.
 
 ### Silicon-verification backlog
 
-Areas where Blackhole has **no documentation anywhere** and the Wormhole page is **not**
-`TTArchitecture`-conditionalized. Every item here needs empirical validation against ttsim and
-silicon before it can be trusted:
-
-> All 10 Packer sub-pages + `PACR_SETREG` + `CLREXPHIST`; Unpackers `README`/`FormatConversion`/
-> `FlushCache`/`IncrementContextCounter`/most `UNPACR_NOP_*`; **`RWCs`**; **`SrcASrcB` including
-> fidelity phases**; **`FloatBitPatterns`**; `ZEROACC`; `ZEROSRC`; `SHIFTXA`/`SHIFTXB`/
-> `TRNSPSRCB`; `SETRWC`/`INCRWC`/`GATESRCRST`; `GAPOOL`/`DOTPV`; all 8 ADC-manipulation
-> instructions; `WaitGate`; `REPLAY`; `MOP`/`MOP_CFG`; the entire Scalar Unit (ThCon) / Mover /
-> Miscellaneous Unit instruction set.
+Areas where Blackhole has no documentation and the Wormhole page is not
+`TTArchitecture`-conditionalized, so every fact needs validation against ttsim and silicon.
+The list, with what is closed, is the checklist's "Silicon-verification backlog".
 
 ### External resources
 
 | Resource | URL | Use |
 |---|---|---|
-| ttsim | https://github.com/tenstorrent/ttsim | **Golden reference simulator and primary development target.** Full-system (L1, NoC, PCIe), bit-exact by design, Blackhole single- and multi-chip. See `docs/libttsim_api.md` for the C API and the README for QEMU mode |
+| ttsim | https://github.com/tenstorrent/ttsim | **Golden reference simulator and primary development target.** Full-system (L1, NoC, PCIe), bit-exact by design, Blackhole single- and multi-chip. See `docs/libttsim_api.md` for the C API |
 | tt-kmd | https://github.com/tenstorrent/tt-kmd | Kernel driver; ioctl definitions |
-| tt-metal `cfg_defines.h` | https://github.com/tenstorrent/tt-metal/blob/81989dcdb8f9b340c932ae7a71a346f4f08703eb/tt_metal/hw/inc/blackhole/cfg_defines.h | `Field_ADDR32` / `_MASK` / `_SHAMT` for every config field — the input to `tt-isa-gen`. Cited directly by `BackendConfiguration.md` |
+| tt-metal `cfg_defines.h` | https://github.com/tenstorrent/tt-metal/blob/81989dcdb8f9b340c932ae7a71a346f4f08703eb/tt_metal/hw/inc/blackhole/cfg_defines.h | `Field_ADDR32` / `_MASK` / `_SHAMT` for every config field — the input to `cargo xtask gen-cfg`. Cited directly by `BackendConfiguration.md` |
 | TT-LLK | https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/tt-llk | C++ implementation of the layer being reimplemented — reference for *what works*, not for design |
 | tt-bh-linux | https://github.com/tenstorrent/tt-bh-linux | L2CPU bring-up, incl. `clock.py` PLL manipulation |
 | Burn | https://github.com/tracel-ai/burn | Target framework |
-
-**Pin the spec.** The docs are actively maintained — 357 commits since 2025-05-09, with recent
-commits filling in exactly the Blackhole UNPACR/PACR gaps this plan depends on. Pin a commit
-hash in the repo, and re-sync quarterly; gaps may close mid-project.
 
 ## Implementation phases
 
@@ -543,13 +524,11 @@ it means either the simulator, the docs, or your understanding is wrong.
 
 ### Phase 0 — Simulator harness (~1–2 weeks)
 
-**Deliverable:** `tt-ttsim` — Rust bindings over the eight `libttsim_*` entry points, wrapped in
+**Deliverable:** `tt-ttsim` — Rust bindings over the `libttsim_*` entry points, wrapped in
 a singleton-enforcing safe API; plus the `Transport` trait in `tt-device` with a `LibTtsim`
-implementation; plus a working `ttsim-qemu` VM image with `tt-kmd` loaded and
-`/dev/tenstorrent/0` present.
+implementation.
 
-**References:** ttsim `docs/libttsim_api.md`, ttsim `README.md` (build via `./make.py :build`,
-SOC descriptor YAML setup, QEMU device invocation).
+**References:** ttsim `docs/libttsim_api.md`, ttsim `README.md`.
 
 **Gate (simulator):** a Rust test calls `libttsim_init`, reads PCI config space, confirms the
 expected Blackhole device ID, and advances time with `libttsim_clock` without crashing.
@@ -570,7 +549,7 @@ otherwise corrupt state in ways that look like simulator bugs.
 `TENSTORRENT_IOCTL_ALLOCATE_TLB` / `CONFIGURE_TLB` / `FREE_TLB` ioctls, expose a `TlbWindow`
 RAII type bound to a NoC coordinate. Chip-indexed from the start (multi-chip is in scope).
 
-**Gate (simulator):** in the QEMU VM, write a pattern to a Tensix tile's L1 through one 2 MiB
+**Gate (simulator):** write a pattern to a Tensix tile's L1 through one 2 MiB
 window, read it back through a *different* window, bytes match. Repeat against a second tile to
 validate coordinate handling, and against `bh_x2` to validate chip indexing.
 
@@ -647,8 +626,9 @@ instructions, no `lr.w`/`sc.w`, no `fdiv.s`/`fsqrt.s`. Establish core identity a
 
 ### Phase 3 — Instruction encoder + first Tensix round-trip (~3 weeks)
 
-**Deliverable:** `tt-isa-gen` (parse tt-metal's `cfg_defines.h` into Rust consts — generate,
-never transcribe; there are thousands of fields) then `tt-isa` encoders. Differential harness
+**Deliverable:** `cargo xtask gen-cfg` (parse tt-metal's `cfg_defines.h` into Rust consts —
+generate, never transcribe; there are thousands of fields) and `gen-isa` (the instruction
+table from `Bits32.lua`), then `tt-isa` encoders. Differential harness
 against ttsim stood up **now**, not later.
 
 **Gate (simulator):** an SFPU program (`SFPLOADI` ×2 → `SFPMUL` → `SFPNOP` → `SFPSTORE`) runs
@@ -712,7 +692,7 @@ Eltwise before matmul, deliberately: it exercises unpack → SFPU → pack with 
 bank handshake, no fidelity phases, no RWC choreography. Smallest thing that is a genuine
 kernel.
 
-**Gate (simulator):** differential vs `burn-ndarray` on random inputs, with tolerances derived
+**Gate (simulator):** differential vs `burn-flex` on random inputs, with tolerances derived
 from the documented FMA divergence — not a guessed epsilon. Must include denormals (SFPU
 flushes them) and NaN (Blackhole canonicalization differs from IEEE *and* from Wormhole). Since
 ttsim targets bit-exactness *including NaN bit patterns*, assert exact equality against
@@ -747,7 +727,7 @@ deterministic failures instead of silent wrong data. Do the unpacker/packer brin
 the simulator; treat each `UndefinedBehavior` it raises as a specification question to answer
 from the Wormhole docs before moving on.
 
-**Gate (simulator):** differential vs `burn-ndarray` with tolerance derived from documented
+**Gate (simulator):** differential vs `burn-flex` with tolerance derived from documented
 numerics, across shapes, dtypes, fidelity phases, and accumulation depths.
 
 **Gate (silicon):** same suite. Expect divergence here more than anywhere else — this is where
@@ -757,31 +737,13 @@ Wormhole-sourced assumptions about packers, `SrcASrcB`, and `RWCs` will be wrong
 
 **Deliverable:** `burn-tt` implementing `Backend` and its supertraits.
 
-As of the current Burn release, `Backend` requires: `BackendTypes`, `FloatTensorOps<Self>`,
-`IntTensorOps<Self>`, `BoolTensorOps<Self>`, `ModuleOps<Self>`, `ActivationOps<Self>`,
-`QTensorOps<Self>`, `TransactionOps<Self>`, plus `Clone + Default + Send + Sync + Debug +
-'static`. Required methods: `name`, `seed`, `dtype_usage`, `device_count`. Provided methods
-(`sync`, `memory_cleanup`, `staging`, …) have defaults worth overriding later.
-
-**Verify this surface against the Burn version you pin** — it moves quickly, and
-`QTensorOps`/`TransactionOps`/`BackendTypes` are relatively recent additions.
-
-**Strategy** (*corrected below*, "The Burn surface, as pinned": 0.21 leaves about two hundred op methods without defaults, so `burn-tt` starts by delegating to `burn-flex`)**:** implement a narrow core (matmul, add/sub/mul, relu, reshape, transpose, reduce
-sum/mean, broadcast) and let Burn's default implementations compose the rest — slow but
-correct. Replace defaults by profiling, not by guess. `QTensorOps` can start as unsupported
-if quantization is out of scope for the milestone.
-
-**Important limitation** (*answered below: not one* -- `burn-fusion` is generic over any `FusionBackend`)**:** Burn's CubeCL-based backends compose with autodiff **and** fusion;
-external/hand-written backends compose with **autodiff only**. So `burn-autodiff` gives you
-backward passes largely for free, but `burn-fusion` likely will **not** apply. Since Tensix
-strongly wants fused unpack→math→pack chains, fusion must either be implemented inside
-`burn-tt` itself or revisited as a CubeCL-target question. Confirm against the pinned Burn
-version before designing the kernel dispatch layer — this decision shapes Phase 9.
+The original strategy -- implement a narrow core and let Burn's defaults compose the rest --
+and the assumption that `burn-fusion` applies only to CubeCL backends were both wrong for the
+pinned release; the corrected surface follows.
 
 #### The Burn surface, as pinned (0.21.0, read from source 2026-09-30)
 
-Verified against `burn-backend 0.21.0`, `burn-ir 0.21.0` and `burn-fusion 0.21.0`
-rather than taken from the paragraphs above, two of which it corrects.
+Verified against `burn-backend 0.21.0`, `burn-ir 0.21.0` and `burn-fusion 0.21.0`.
 
 * **`Backend: BackendTypes + FloatTensorOps<Self> + BoolTensorOps<Self> +
   IntTensorOps<Self> + ModuleOps<Self> + ActivationOps<Self> + QTensorOps<Self> +
@@ -814,10 +776,6 @@ rather than taken from the paragraphs above, two of which it corrects.
   activation in one pass through `Dst` -- is a `burn-tt` fuser, not a question of
   retargeting CubeCL. It is still Phase 9 work; Phase 7 needs only that the door
   is open, and it is.
-* **Precision.** `tt_kernels::matmul` runs fidelity phase 0 only, which is exact
-  for small integers and otherwise the lowest-fidelity product the Matrix Unit
-  offers. Training needs the four-phase product available (`MatrixUnit.md:143-165`);
-  the phases are gated per block in `step9_matmul` and not yet at tile level.
 
 #### As built (2026-09-30)
 
@@ -839,8 +797,9 @@ rather than taken from the paragraphs above, two of which it corrects.
   same setup) and to be *deterministic and target-independent* (a pinned bit-exact
   loss curve that ttsim wrote and both cards reproduce); it is deliberately not
   claimed to stay within a bound of the host's trajectory.
-* **Only matmul runs on the device**, and tensors live on the host between ops.
-  The next ops, and device-resident data, are where Phase 7 hands over to Phase 9.
+* **At Phase 7's close only matmul ran on the device**, with tensors on the host
+  between ops. Phase 9 made tensors resident and moved element-wise, ReLU and the
+  bias sum to the device; Phase 10 covers the rest.
 
 **Gate (simulator):** an MNIST MLP trains through `burn-autodiff` — loss descends, final weights
 match the `burn-flex` backend within tolerance, optimizer step is correct. Use a reduced dataset;
@@ -873,43 +832,22 @@ estimate above is lower than a hardware-first plan would justify. Two caveats: `
 x86_64-only, and ttsim's own README flags multichip testing as less mature than single-chip —
 so silicon divergence risk is higher here than elsewhere.
 
-**Still open a discovery spike before committing to a date.** Four compounding unknowns, now
-mostly investigable in the simulator:
-
-1. **Ethernet-tile reset sequencing is undocumented for Blackhole.** There is no
-   `BlackholeA0/EthernetTile/SoftReset.md` (Wormhole has one). How you bring an Ethernet
-   RISC-V out of reset is not in this repo.
-2. **RISCV E0 is cooperatively shared with Tenstorrent firmware** — it owns link training and
-   retraining and calls into customer code. You cannot simply take E0. `ethdump` works around
-   this by using E1 exclusively. The contract is documented only in
-   `WormholeB0/.../CallingIntoCustomerCode.md` (absent on Blackhole).
-3. **The Blackhole Ethernet PIC is effectively undocumented** — the memory map points at
-   `0xFFB1_4020`, but the link goes to the Tensix PIC page, which states the Ethernet PIC is a
-   different style.
-4. **The NoC Overlay is entirely absent from the Blackhole tree** — no directory, no stub,
-   five inbound dangling links. If multi-chip needs overlay streams (Wormhole's docs suggest
-   it is the natural mechanism), that is Wormhole-docs-plus-silicon work and this estimate
-   grows substantially.
-
-Ethernet tiles also lack the Tensix conveniences: local data RAM is **not NoC-accessible** and
-there are **no `pc` snapshots**, so host-side initialization and debugger inspection both work
-differently than in Phases 2–3.
+**Four unknowns were open going in:** (1) Ethernet-tile reset sequencing, undocumented for
+Blackhole; (2) RISCV E0's cooperative sharing with Tenstorrent firmware, whose contract exists
+only in WH `CallingIntoCustomerCode.md`; (3) the undocumented Ethernet PIC; (4) the NoC
+Overlay, absent from the Blackhole tree. A spike on `bh_x2` closed all four; see "Spike
+outcome". Ethernet tiles also lack the Tensix conveniences: local data RAM is **not
+NoC-accessible** and there are **no `pc` snapshots**.
 
 **Gate (simulator):** tensor transfers between two chips under `bh_x2`; a model shards across
 `bh_x4` and produces results matching the single-chip run.
 
 **Gate (silicon):** the same across two physical cards.
 
-**Recommendation:** run a 2-week timeboxed spike against `bh_x2` immediately after Phase 7 to
-resolve (1) and (2), then re-estimate. The spike is far cheaper than originally scoped because
-it needs no second card and no link training — but confirm on silicon before trusting simulator
-behaviour for Ethernet reset and the E0 firmware contract specifically, since those are exactly
-the areas a simulator is most likely to model loosely.
-
 #### Spike outcome (2026-09-30)
 
 The spike ran on `bh_x2` and on the two p150a cards, which are cabled through
-one QSFP-DD port. All four unknowns above are closed, and none of them grew the
+one QSFP-DD port. All four unknowns are closed, and none of them grew the
 estimate. Details are in the checklist's Phase 8 section and divergence rows
 56-60.
 
@@ -1019,33 +957,80 @@ two findings shape it: the GDDR is reachable and gated on both cards (divergence
 and under this VM the host's MMIO is uncached whatever the guest maps (measurement M), so bulk
 upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off the step.
 
-**Where it stands, and what is next (2026-09-30).** Full MNIST trains at **5.8 ms/step on one
-card** (from 224 at the start of the phase), bit for bit on the Phase 7 golden, with the dataset,
-weights, activations and gradients resident in GDDR. Per steady-state step exactly six tensors cross
-PCIe, 6224 B (`dL/dlogits`, the two biases and their gradients, and the logits), and the device is
-written 193 524 B in all, descriptors and programs included -- both asserted by the 9.5 gate. The
-loss stays on the host. Since 9.6 a session deals its GDDR ops over many Tensix tiles,
-bit-identically: 4.1 ms/step on eight tiles, and every op now floors at about 2 ms of host round
-trips per wave, which is what 9.7 removes. What is left is
-almost all compute on **a single Tensix tile**, sequenced by the host one round trip at a time. In
-order: spread matmul and element-wise work over many tiles (9.6); let each tile's B mover sequence
-gather, compute and scatter from an L1 work queue so an op is one host descriptor (9.7); double-
-buffer so data movement overlaps compute (9.8); move element-wise from the B core's FP32 unit to
-the SFPU (9.9); tilize on the device to cut the 2.7 s preload (9.10); make the two-card mesh
-device-resident and concurrent (9.11); and put the loss on the SFPU (9.12). The checklist's Phase 9
-section tracks each.
+**Where it stands (2026-10-01).** Full MNIST trains at **2.5 ms/step on eight Tensix tiles**
+(5.1 on one; 224 at the start of the phase), bit for bit on the Phase 7 golden, with the
+dataset, weights, activations and gradients resident in GDDR. Per steady-state step exactly six
+tensors cross PCIe, 6224 B (`dL/dlogits`, the two biases and their gradients, and the logits),
+asserted by the 9.5 gate; the loss stays on the host. Done: residency (9.3–9.5), many tiles
+(9.6), one launch per op, op records expanded on the tile, and a resident program cache (9.7a–c),
+which took the device writes per step from 193 KB to 35 KB. Next: overlap of data movement and
+compute with the circular-buffer runtime (9.8), on-device tilizing for the 2.7 s preload (9.10),
+and a device-resident, concurrent two-card mesh (9.11). Element-wise on the SFPU and the loss on
+the device moved to Phase 10. The checklist's Phase 9 section has the per-slice history and
+measurements.
 
 **ttsim does not model cycle-accurate timing.** It remains useful here for *correctness* of the
 more aggressive pipelined kernels — which is where correctness is hardest — but every
 performance number must come from hardware. Keep using the simulator as the correctness gate
 for each optimization, then measure on silicon.
 
+### Phase 10 — Hardware coverage (open-ended, **ttsim + silicon**)
+
+**Deliverable:** the rest of the Tensix tile, driven. Phases 0–9 proved the path to the card
+with one compute unit doing real work: the Matrix Unit, for `MVMUL`. Element-wise ops and the
+column sum run on the B core's scalar FP32 unit (`dm_b.rs`); the SFPU -- 32 lanes, 48
+Blackhole instruction pages, the unit built for exactly this -- runs no tensor op at all, and
+`ELW*`, `GMPOOL`/`GAPOOL`, `TRNSPSRCB`, block-float and integer formats are encoded and
+unused. On the Burn side, 12 compute methods have a device path; no `ModuleOps`,
+`IntTensorOps` or `BoolTensorOps` method does.
+
+**Why now.** `burn-tt` is a general Burn backend, and under device residency (Phase 9) every
+op without a device path is a download, a host op and an upload. Breadth is therefore a
+performance item as much as a feature list, and the next model -- anything with a softmax, a
+norm, a convolution -- falls back on its first unsupported op.
+
+**Tracking.** The inventory, the work items (F, S, M, R, D), the milestones 10.0–10.6 and a
+Burn op coverage table live in [`hardware-coverage.md`](hardware-coverage.md), which is the
+progress record. Checklist items 9.9 and 9.12 moved there.
+
+**Ordering: SFPU foundation first.** The foundation -- whole-tile `UnpackToDst` and pack, an
+SFPU program builder with typed `LReg`s and scoped conditional execution, one three-role SFPU
+tile kernel, a `record::SFPU` dispatched through the existing mover, and ported functional
+models as oracles -- is paid for once. After it, an SFPU op is a program builder and a gate,
+with no firmware change. The first use moves today's B-core ops onto the SFPU with the MNIST
+golden as the regression; the second is softmax/cross-entropy, which needs `exp`, reciprocal
+and reductions and so exercises most of the foundation.
+
+**References:** BH `VectorUnit.md`, the 48 BH `SFP*.md` pages (seven Blackhole-only:
+`SFPARECIP`, `SFPGT`, `SFPLE`, `SFPMUL24`, three `SFPCAST` modes), WH `LReg.md`, BH `Dst.md`,
+WH `GMPOOL.md`/`GAPOOL.md`/`ELWADD.md`/`TRNSPSRCB.md`, WH `Packers/*` and `Unpackers/*` for
+format conversion, `Miscellaneous/FMA/fma.c`.
+
+**Oracle policy for approximations.** Transcendentals on the SFPU are instruction sequences
+(range reduction, polynomial or LUT, Newton steps), so the Tolerance policy applies twice:
+the device result is predicted **bit for bit** by running the same sequence through the
+ported per-instruction models, and its distance from the true function is held to a bound
+**derived** next to the gate from the approximation's own error terms. Neither is an epsilon.
+
+**Gate (simulator):** per op, bit-exact against the ported models (or within the derived
+bound against the true function), and `burn-tt` against `burn-flex`; the op downloads
+nothing.
+
+**Gate (silicon):** the same on both cards, and a smoke-tier entry comparing `burn-tt` with
+`burn-flex` on the card.
+
+**Hazards:** the Tier 2 SFPU bugs (`SFPLUTFP32`'s destination, `SFPPOPC` on a full stack,
+`SFPSTOCHRND`'s bias, `SFPCAST_IntAbs`, `SFPMAD` stalling) all land here; the tracker maps
+each to the item that must handle it. ttsim declines `SFPLOADMACRO` (row 7), BF16
+`UnpackToDst` (row 31) and `DOTPV`/`SHIFTXB` (row 50), so those parts are silicon-only.
+
 ## Cross-cutting concerns
 
 Set these up in Phases 0–3. Retrofitting them later is expensive.
 
 **Differential testing is the backbone.** Two oracles: **ttsim** (the official golden reference,
-bit-exact by design, full-system) and **burn-ndarray** at the tensor level. Stand the harness up
+bit-exact by design, full-system) and **`burn-flex`** at the tensor level (`burn-ndarray` is
+deprecated). Stand the harness up
 in Phase 3, not Phase 6 — it is what makes every later phase debuggable.
 
 **CI runs on ttsim; silicon is a scheduled gate.** Hardware in CI is a reliability tax, and
@@ -1071,7 +1056,7 @@ not C++", and if it isn't done the answer is "no reason". Minimum set:
 - `NOC_CMD_WR_INLINE` may not target L1; `NOC_CMD_L1_ACC_AT_EN` must be false
 - Manual TTSync's load-adjacency constraint (must be one inline-asm block, never left to LLVM)
 
-**Generate, never transcribe.** `cfg_defines.h` has thousands of fields. `tt-isa-gen` parses it;
+**Generate, never transcribe.** `cfg_defines.h` has thousands of fields. `cargo xtask gen-cfg` parses it;
 hand-copying is a guaranteed bug source. Pin the same commit SHA the docs cite.
 
 **Pin the spec, re-sync quarterly.** The docs are actively maintained (357 commits since
@@ -1217,10 +1202,11 @@ run nightly and block merges to main.
 | 3 | SFPU program returns `0x40C0_0000`; instruction corpus is bit-exact | Corpus diffed against the simulator run; `SFPLOADMACRO` tested here only |
 | 4 | Property-tested tensor round-trip, all dtypes, awkward shapes | Representative sample + every alignment-boundary shape |
 | 5 | Eltwise bit-exact vs `fma_model_bh`; denormals and NaN included | Same suite; any mismatch is an upstream bug report |
-| 6 | Matmul matches `burn-ndarray` across shapes, dtypes, fidelity phases, accumulation depths | Same; expect the most divergence here |
+| 6 | Matmul matches `burn-flex` across shapes, dtypes, fidelity phases, accumulation depths | Same; expect the most divergence here |
 | 7 | MNIST MLP trains on a reduced dataset; loss descends | Full training run matching the simulator's loss curve |
 | 8 | Two-chip transfer under `bh_x2`; model shards across `bh_x4` | Same across two physical cards |
 | 9 | Correctness of pipelined kernels only | **All performance numbers** — ttsim is not cycle-accurate |
+| 10 | Each op bit-exact against the ported instruction models, or within a derived bound of the true function; `burn-tt` against `burn-flex`; no download | Same on both cards; `burn-tt` against `burn-flex` in the smoke tier |
 
 **Tolerance policy.** Never use a guessed epsilon. Derive expected values from the bit-exact
 models in `Miscellaneous/FMA/fma.c` (`fma_model_bh`) and the documented per-instruction
@@ -1234,23 +1220,9 @@ Wormhole-sourced behaviour.
 
 ---
 
-## Open questions to resolve during execution
+## Open questions
 
-1. **Blackhole I-cache capacities are undocumented.** Affects hot-loop sizing and whether T1 is
-   viable for large code. Measure in Phase 2.
-2. **Blackhole debug-interface parity is unverified.** The four `RISC_DBG_*` registers are named
-   at the same base as Wormhole's, but no Blackhole bit layouts exist. Prototype against silicon
-   before committing to a GDB-stub architecture.
-3. **Does `burn-fusion` compose with a hand-written backend?** Decide before designing kernel
-   dispatch (Phase 7); it shapes Phase 9.
-4. **Is the NoC Overlay required for multi-chip?** Resolve in the Phase 8 spike.
-5. **PCIe DMA engines have no register-level documentation anywhere in the repo.** Plan to use
-   TLB-window MMIO for bulk transfer; revisit DMA only if bandwidth demands it, and expect
-   driver-source reverse engineering.
-6. **How faithfully does ttsim model reset sequencing, I-cache invalidation, and the
-   local-data-RAM zeroing window?** These are the areas most likely to be modelled loosely and
-   they all land in Phase 2. Resolve at the Phase 2 silicon gate and record in the divergence
-   log.
-7. **Does ttsim model the documented hardware bugs** (Tier 1 register below), or does it
-   implement the intended behaviour? Either answer is workable but changes what the simulator
-   gate proves. Probe with targeted tests in Phase 3.
+Tracked, with what has been answered, in the checklist's "Open questions". Still open as of
+2026-10-01: Blackhole I-cache capacities (1), debug-interface parity (2), PCIe DMA (5), how
+faithfully ttsim models I-cache invalidation (6, in part), and whether ttsim models the
+documented hardware bugs (7).
