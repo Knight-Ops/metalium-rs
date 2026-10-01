@@ -454,11 +454,15 @@ pub fn detilize_packed(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Where [`stage_matmul`] puts things in L1: `A`'s tiles from here, then
-/// `B`'s, then the packed output tiles from [`MATMUL_OUT`].
-pub const MATMUL_STAGE: u64 = 0x2_0000;
-/// Where the packed output tiles go.
+/// Where [`stage_matmul`] puts things in L1 on the host-staged path: `A`'s
+/// tiles from here, then `B`'s, then the packed output tiles from
+/// [`MATMUL_OUT`]. The start of the data arena (`tt_isa::l1::DATA`); the
+/// GDDR path's layout is planned there instead ([`plan_layout_in`] with
+/// [`Staging::Slots`], through `crate::l1`).
+pub const MATMUL_STAGE: u64 = tt_isa::l1::DATA.base;
+/// Where the packed output tiles go on the host-staged path.
 pub const MATMUL_OUT: u64 = 0x8_0000;
+const _: () = assert!(MATMUL_OUT > MATMUL_STAGE && MATMUL_OUT < tt_isa::l1::DATA.end);
 
 /// A matmul `C[m, n] = A[m, k] @ B[k, n]` laid out for the device: both
 /// operands tiled and padded by `tt_layout`, and the output tiles planned.
@@ -518,17 +522,12 @@ pub fn plan_layout_in(
     staging: Staging,
 ) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
     use crate::runtime::RunError;
-    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    if staging == Staging::Slots {
+        return plan_slots([mt, kt, nt], in_fmt);
+    }
     let (img, align, out_stride, out_skip) = match staging {
         Staging::Host => (tile_image_bytes(in_fmt), 16, 1024 * 4, 0),
-        Staging::Slots => {
-            assert_eq!(
-                tile_image_bytes(in_fmt),
-                TILE_DATA + 4096,
-                "slot staging holds FP32 tiles"
-            );
-            (TILE_SLOT, TILE_SLOT, TILE_SLOT, TILE_DATA)
-        }
+        Staging::Slots => unreachable!("planned by plan_slots"),
     };
     let a_bytes = (mt * kt) as u64 * img;
     let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(align);
@@ -562,6 +561,101 @@ pub fn plan_layout_in(
             outputs.push(OutputTile {
                 pairs,
                 out: MATMUL_OUT + (i * nt + j) as u64 * out_stride + out_skip,
+            });
+        }
+    }
+    Ok((b_at, outputs))
+}
+
+/// The GDDR path's L1 layout ([`Staging::Slots`]): its kernel's needs as
+/// `crate::l1` requirements -- `A`'s and `B`'s tiles, rings from the mover to
+/// the unpacker, and the output tiles, a ring from the packer back to the
+/// mover -- planned in the data arena. One stage, so all three live at once.
+pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
+    use crate::l1::{Endpoint, Requirements};
+    use tt_isa::dm::TILE_SLOT;
+    let mut req = Requirements::new(1);
+    let ring = |req: &mut Requirements, name, pages: usize, from, to| {
+        // C64: a slot is read from GDDR under the 64-byte congruence rule
+        // (divergence row 64), and a slot is a whole number of 64-byte units.
+        req.cb(
+            name,
+            TILE_SLOT,
+            pages as u32,
+            tt_isa::dram::ALIGN,
+            from,
+            to,
+            0..1,
+        )
+    };
+    let a = ring(
+        &mut req,
+        "matmul A",
+        mt * kt,
+        Endpoint::Mover,
+        Endpoint::Unpack,
+    );
+    let b = ring(
+        &mut req,
+        "matmul B",
+        kt * nt,
+        Endpoint::Mover,
+        Endpoint::Unpack,
+    );
+    let out = ring(
+        &mut req,
+        "matmul out",
+        mt * nt,
+        Endpoint::Pack,
+        Endpoint::Mover,
+    );
+    MatmulBuffers { req, a, b, out }
+}
+
+/// A matmul's declared buffers ([`matmul_requirements`]).
+pub struct MatmulBuffers {
+    pub req: crate::l1::Requirements,
+    pub a: crate::l1::Buf,
+    pub b: crate::l1::Buf,
+    pub out: crate::l1::Buf,
+}
+
+fn plan_slots(
+    [mt, kt, nt]: [usize; 3],
+    in_fmt: L1Format,
+) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
+    use crate::l1::PlanError;
+    use crate::runtime::RunError;
+    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    assert_eq!(
+        tile_image_bytes(in_fmt),
+        TILE_DATA + 4096,
+        "slot staging holds FP32 tiles"
+    );
+    let m = matmul_requirements([mt, kt, nt]);
+    let plan = m.req.plan(tt_isa::l1::DATA).map_err(|e| match e {
+        PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
+            what: name,
+            bytes,
+            limit: arena,
+        },
+        e => panic!("the matmul's own requirements are invalid: {e}"),
+    })?;
+    let (a_at, b_at, out_at) = (plan.addr(m.a), plan.addr(m.b), plan.addr(m.out));
+    let mut outputs = Vec::with_capacity(mt * nt);
+    for i in 0..mt {
+        for j in 0..nt {
+            let pairs = (0..kt)
+                .map(|kk| {
+                    (
+                        a_at + (i * kt + kk) as u64 * TILE_SLOT,
+                        b_at + (kk * nt + j) as u64 * TILE_SLOT,
+                    )
+                })
+                .collect();
+            outputs.push(OutputTile {
+                pairs,
+                out: out_at + (i * nt + j) as u64 * TILE_SLOT + TILE_DATA,
             });
         }
     }

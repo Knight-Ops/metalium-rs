@@ -18,6 +18,7 @@
 
 pub mod datapath;
 pub mod dm;
+pub mod l1;
 pub mod link;
 pub mod matmul;
 pub mod runtime;

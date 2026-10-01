@@ -550,6 +550,18 @@ pub fn matmul_dram(
     Ok(Work { out: c, jobs })
 }
 
+/// `slots` tile slots of scratch for the mover's own use, planned in the data
+/// arena (`crate::l1`): where an element-wise run or a column sum stages its
+/// tiles.
+fn staging(name: &'static str, slots: usize) -> Result<u64> {
+    let mut req = crate::l1::Requirements::new(1);
+    let b = req.scratch(name, slots as u64 * TILE_SLOT, tt_isa::dram::ALIGN, 0..1);
+    let plan = req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    Ok(plan.addr(b))
+}
+
 /// What [`eltwise`] computes: a `tt_isa::dm::kind`, its scalar where it takes
 /// one, and whether `b` is a single row broadcast down `a`.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -594,13 +606,11 @@ pub fn eltwise(
         }
         _ => {}
     }
+    // Two slots per tile of a run in flight, as one buffer the mover owns.
+    const GROUP: usize = 96;
+    let stage = staging("eltwise slots", 2 * GROUP)?;
     let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
     let [rt, ct] = a.grid();
-    // Two slots per tile in flight, inside the matmul staging area.
-    const GROUP: usize = 96;
-    const _: () = assert!(
-        matmul::MATMUL_STAGE + 2 * GROUP as u64 * TILE_SLOT <= tt_isa::mailbox::MAILBOX_BASE
-    );
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b
         .filter(|_| binary)
@@ -616,7 +626,7 @@ pub fn eltwise(
                 run.start as u32,
                 run.len() as u32,
                 flags,
-                matmul::MATMUL_STAGE as u32,
+                stage as u32,
                 0,
             ],
             ra.encode()[0],
@@ -640,15 +650,11 @@ pub fn eltwise(
 /// Columns are independent; each keeps its rows in order on one tile. They
 /// are dealt out in contiguous runs, one [`Job`] per run, as many as `units`.
 pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
+    // The schedule -- an accumulator per column, slots for its rows, where a
+    // list's worth of slots runs out -- is `tt_isa::dm::record::SUM`'s.
+    let stage = staging("column-sum slots", record::SUM_SLOTS)?;
     let out = DramTensor::alloc(alloc, 1, a.cols)?;
     let [rt, ct] = a.grid();
-    // The schedule -- slots in the staging area, an accumulator per column,
-    // where a list's worth of slots runs out -- is `tt_isa::dm::record::SUM`'s.
-    // Its slots run into the matmul output area, which no column sum shares.
-    const _: () = assert!(
-        matmul::MATMUL_STAGE + record::SUM_SLOTS as u64 * TILE_SLOT
-            <= tt_isa::mailbox::MAILBOX_BASE
-    );
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let mut jobs = Vec::new();
     for columns in runs(ct, units, ct.max(1)) {
@@ -658,7 +664,7 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
                 columns.start as u32,
                 columns.len() as u32,
                 rt as u32,
-                matmul::MATMUL_STAGE as u32,
+                stage as u32,
                 0,
                 0,
                 0,

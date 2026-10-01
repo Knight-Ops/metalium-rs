@@ -248,9 +248,16 @@ fn small_integer_products_match_the_model_and_burn() {
 
     let model = mvmul_reference(&ZERO_DST, &b, &a, &[0]).expect("small integers are exact");
     let flat = |m: &[[f32; 16]]| m.iter().flatten().copied().collect::<Vec<f32>>();
-    let tb = Tensor::<B, 2>::from_data(TensorData::new(flat(&b), [8, 16]), &device);
-    let ta = Tensor::<B, 2>::from_data(TensorData::new(flat(&a), [16, 16]), &device);
-    let burn: Vec<f32> = tb.clone().matmul(ta.clone()).into_data().to_vec().unwrap();
+    // Burn in the parent goes through `outside_fork`, so no other test forks
+    // while it holds a lock (`tt_ttsim::fork`).
+    let (burn, transposed): (Vec<f32>, Vec<f32>) = tt_ttsim::outside_fork(|| {
+        let tb = Tensor::<B, 2>::from_data(TensorData::new(flat(&b), [8, 16]), &device);
+        let ta = Tensor::<B, 2>::from_data(TensorData::new(flat(&a), [16, 16]), &device);
+        (
+            tb.clone().matmul(ta.clone()).into_data().to_vec().unwrap(),
+            tb.matmul(ta.transpose()).into_data().to_vec().unwrap(),
+        )
+    });
     let mut burn_block = ZERO_DST;
     for (k, v) in burn.iter().enumerate() {
         burn_block[k / 16][k % 16] = *v;
@@ -264,7 +271,6 @@ fn small_integer_products_match_the_model_and_burn() {
     assert_block(&dst, 0, &burn_block, "SrcB @ SrcA");
 
     // Control: the gate distinguishes `SrcB @ SrcA` from `SrcB @ SrcA^T`.
-    let transposed: Vec<f32> = tb.matmul(ta.transpose()).into_data().to_vec().unwrap();
     assert!((0..128).any(|k| dst[k] != transposed[k].to_bits()));
 }
 

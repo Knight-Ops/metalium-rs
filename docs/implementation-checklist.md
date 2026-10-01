@@ -1369,10 +1369,41 @@ cards for time):
     still writes 605 KB on 1-8 tiles, rewriting each role's single program
     slot whenever consecutive blocks differ in shape, and a program change
     also ends a list (`xt@g1`, ragged at its edges, writes 74 KB).
-- [ ] **9.7c Resident programs.** Keep every kernel a session has used in
-      L1 (about 250 KB free above the trace buffer), in slots the `KERNEL`
-      entry names, so a block of a new shape costs no program write and no new
-      list.
+- [x] **L1 planning, step 1** (design: `RUST_IMPL_PLAN.md`, "L1 planning and
+      circular buffers"). `tt_isa::l1` maps every fixed region of a tile's L1,
+      ordered and disjoint at compile time, leaving the data arena.
+      `tt_kernels::l1` plans `Requirements` -- scratch and circular buffers
+      with producer and consumer endpoints, live ranges over a kernel's
+      stages, semaphores -- by liveness into the arena, with an independent
+      `check`, handles that refuse a foreign plan, and `Requirements::fuse`,
+      which joins one kernel's output ring to the next's input. Unit and
+      property tests (500 random kernel pairs and their fusions), and the
+      checker watched refusing an aliasing plan and the property test
+      catching a planner that ignores liveness. Ported: the GDDR matmul's
+      layout (A and B as rings from the mover to the unpacker, the outputs as
+      a ring from the packer to the mover) and the element-wise and column-sum
+      staging. Golden bit for bit; ttsim and both cards 84/84 with the smoke
+      tier. **Not yet:** the matmul's two semaphores (`DST_READY`, `DST_FREE`)
+      are still constants; moving them onto the planner threads them through
+      about twenty call sites. The host-staged path keeps its fixed layout.
+- [x] **Forking while another test thread is inside Burn could hang a child.**
+      A forked child keeps every lock as it stood; one held by a thread
+      computing a `burn-flex` reference in the parent is held forever. Seen
+      once (a training gate's child on a futex for ten minutes; every test
+      passed alone). `tt_ttsim::fork_scope` now takes a gate exclusively for
+      the fork, and parent-side library work goes through `outside_fork`,
+      which shares it (step9, step11, step12). Watched: with the gate removed,
+      `a_lock_held_by_parent_work_is_not_inherited_by_the_child` hangs until
+      its alarm.
+- [ ] **9.7c Resident programs.** Keep the kernels a session uses in
+      `tt_isa::l1::PROGRAM_CACHE` (252 KB), in slots the `KERNEL` entry names,
+      so a block of a new shape costs no program write and no new list. Policy
+      (measured: an MNIST step's kernels are 117 KB on one tile, 34 KB on
+      eight): host-mirrored LRU with pinning for anything a list in flight
+      names, an admission bound, invalidation on tile reset, and hit/miss/
+      byte counters. Then plan even blocks, so an op has one shape; looped
+      (MOP/`REPLAY`) programs, one per route and fidelity, are the long-term
+      fix.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait

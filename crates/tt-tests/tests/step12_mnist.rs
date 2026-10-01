@@ -40,6 +40,8 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tt::TtBackend;
 use tt_tests::burn_device::{with_device, Config};
 use tt_tests::mnist::{self, Split, PIXELS};
+// Host work in the parent goes through it, so no test forks mid-Burn.
+use tt_ttsim::outside_fork;
 
 const HIDDEN: usize = 128;
 const CLASSES: usize = 10;
@@ -374,7 +376,7 @@ fn the_mlp_trains_on_four_tiles_matching_the_golden() {
 fn reduced_run_matches_the_golden(config: Config) {
     let split = mnist::load(true);
     let init = init();
-    let (host, _) = train::<Autodiff<Flex>>(&split, &REDUCED, &init, &FlexDevice);
+    let (host, _) = outside_fork(|| train::<Autodiff<Flex>>(&split, &REDUCED, &init, &FlexDevice));
     let steps = REDUCED.samples / REDUCED.batch;
     assert!(
         mean(&host[host.len() - steps..]) <= DESCENT * host[0],
@@ -452,15 +454,18 @@ fn the_first_forward_pass_is_within_the_derived_bound() {
     let init = init();
     let n = 64;
     let x = split.images[..n * PIXELS].to_vec();
-    let host_model = Mlp::<Flex>::new(&init, &FlexDevice);
-    let (xt, _) = batch::<Flex>(&split, 0, n, &FlexDevice);
-    let h: Vec<f32> = host_model
-        .relu
-        .forward(host_model.l1.forward(xt.clone()))
-        .into_data()
-        .to_vec()
-        .unwrap();
-    let logits: Vec<f32> = host_model.forward(xt).into_data().to_vec().unwrap();
+    let (h, logits) = outside_fork(|| {
+        let host_model = Mlp::<Flex>::new(&init, &FlexDevice);
+        let (xt, _) = batch::<Flex>(&split, 0, n, &FlexDevice);
+        let h: Vec<f32> = host_model
+            .relu
+            .forward(host_model.l1.forward(xt.clone()))
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let logits: Vec<f32> = host_model.forward(xt).into_data().to_vec().unwrap();
+        (h, logits)
+    });
 
     let w1 = init.l1.0.to_vec::<f32>().unwrap();
     let b1 = init.l1.1.to_vec::<f32>().unwrap();
@@ -537,9 +542,10 @@ fn the_mlp_trains_on_full_mnist() {
         ..full
     };
     let steps = full.samples / full.batch;
-    let ((host, host_model), _, host_time, _) =
-        train_timed::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice, &mut |_| {});
-    let host_acc = accuracy(&host_model, &test_split, test_split.n, &FlexDevice);
+    let ((host, host_model), _, host_time, _) = outside_fork(|| {
+        train_timed::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice, &mut |_| {})
+    });
+    let host_acc = outside_fork(|| accuracy(&host_model, &test_split, test_split.n, &FlexDevice));
     with_device(Config::default(), |d| {
         let t0 = std::time::Instant::now();
         let ((tt, model), preload, tt_time, before) =

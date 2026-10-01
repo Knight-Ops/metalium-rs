@@ -1081,6 +1081,48 @@ silicon-discovery work that the docs may have obviated.
 
 ---
 
+### L1 planning and circular buffers (design, 2026-10-01)
+
+L1 was a set of fixed constants that overlapped by convention -- the matmul's
+staging and output areas, element-wise and column-sum slots reusing them, two
+hand-picked semaphores -- and kernel fusion cannot work that way: two kernels
+that each assume they own `0x2_0000` collide the moment they are one kernel.
+The design, of which step 1 is built:
+
+1. **One L1 map** (`tt_isa::l1`): every fixed region (images, the mover's
+   list, mailboxes, program slots, trace, and the program cache to come) in
+   one table, checked at compile time to be ordered and disjoint. What is left
+   is the data arena, `DATA`.
+2. **Kernels declare, never address** (`tt_kernels::l1::Requirements`): each
+   buffer's size, alignment (not necessarily a power of two: a tile slot is
+   4160 bytes), kind -- scratch, or a circular buffer of `pages` pages with one
+   producer and one consumer endpoint (mover, unpack, math, pack) -- and the
+   stages of the kernel it is live in; and its semaphores, likewise.
+3. **A planner places by liveness**: first fit in declaration order, sharing
+   bytes (and semaphores, of the tile's eight) between things never live in a
+   common stage. Deterministic, so programs built from a plan memoise by
+   shape. An independent `check` verifies any plan; a property test plans
+   500 random kernel pairs and their fusions through it.
+4. **Handles that cannot be misused.** A `Buf` or `Sem` carries its
+   requirements' identity in private fields, so it cannot be forged, and a
+   plan refuses another kernel's handle. A lifetime brand would catch that at
+   compile time but could not be stored with a memoised program or survive a
+   merge, so the check is at run time, one comparison. Device-time lifetime is
+   a property of the kernel's dataflow, not of a host scope, so RAII freeing
+   is not the model; planning is.
+5. **Fusion is a merge of requirements**: `Requirements::fuse` concatenates
+   two kernels' stages and unifies a circular buffer of the first (its
+   producer kept) with one of the second (its consumer kept), dropping the two
+   legs through GDDR, and the union plans as one. A fused kernel that does not
+   fit is a planning error at build time, never a silent overlap.
+6. **The runtime protocol is a page FIFO** (decided): tt-metal's
+   push/wait/pop over page counters in L1, polled through fences (the L0 cache
+   is not coherent), as mover list entries and role-side waits. It arrives with
+   9.8's double buffering, which is its first user.
+
+Order: map, planner and the GDDR kernels ported (done); 9.7c's program cache
+in its region of the map; the page-FIFO runtime with 9.8; fusion on the merge.
+
 ### Hazards as data (design item, from the silicon campaign)
 
 Every ordering requirement found on silicon -- a consumer must not start before a
