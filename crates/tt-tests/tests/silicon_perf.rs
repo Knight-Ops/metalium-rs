@@ -529,3 +529,134 @@ fn eltwise_unit_sweep() {
         }
     }
 }
+
+/// Softmax through Burn on a device-resident `[rows, cols]` tensor: the
+/// device composition (max, subtract, exp, sum, divide on the device) against
+/// the host's fused softmax after a download, by size, then the result read
+/// back either way. Decides when `burn-tt` composes on the device.
+#[test]
+#[ignore = "benchmark"]
+fn softmax_placement_sweep() {
+    use burn::tensor::{activation, Tensor, TensorData};
+    use burn_tt::TtBackend;
+    use tt_tests::burn_device::{with_device, Config};
+    let modes: &[bool] = if std::env::var_os("SOFTMAX_DEVICE_ONLY").is_some() {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    for &exact in modes {
+        with_device(
+            Config {
+                exact,
+                ..Config::default()
+            },
+            |d| {
+                let sizes: Vec<(usize, usize)> = match std::env::var("SOFTMAX_SIZE") {
+                    Ok(v) => {
+                        let (r, c) = v.split_once('x').expect("RxC");
+                        vec![(r.parse().unwrap(), c.parse().unwrap())]
+                    }
+                    Err(_) => vec![
+                        (64, 10),
+                        (256, 10),
+                        (64, 128),
+                        (512, 128),
+                        (1024, 256),
+                        (4096, 512),
+                    ],
+                };
+                for (r, c) in sizes {
+                    let v: Vec<f32> = (0..r * c).map(|i| (i % 97) as f32 * 0.01).collect();
+                    // Computed on the device, so neither path finds a host copy to
+                    // start from: the host path pays the download, as it would
+                    // after any device op.
+                    let t = Tensor::<TtBackend, 2>::from_data(TensorData::new(v, [r, c]), &d)
+                        .to_device(&d)
+                        * 1.0;
+                    let _ = activation::softmax(t.clone(), 1).into_data();
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        let t0 = Instant::now();
+                        let s = activation::softmax(t.clone(), 1);
+                        let _ = s.into_data();
+                        times.push(t0.elapsed());
+                    }
+                    println!(
+                        "softmax [{r}, {c}] ({} tiles) {}: {:.1} us",
+                        r.div_ceil(32) * c.div_ceil(32),
+                        if exact { "host" } else { "device" },
+                        median(times).as_secs_f64() * 1e6
+                    );
+                }
+            },
+        );
+    }
+}
+
+/// Each op of a device softmax on one `[512, 128]` tensor, alone, through the
+/// session: where a composition's time goes.
+#[test]
+#[ignore = "benchmark"]
+fn softmax_parts() {
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::sfpu::ops::kind_sfpu;
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    use tt_kernels::tensor::Eltwise;
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let mut s =
+            Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1)).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        let (r, c) = (512, 128);
+        let x = s.upload(&pattern_f32(r * c, 3), r, c).unwrap();
+        let col = s.upload(&pattern_f32(r, 4), r, 1).unwrap();
+        let time =
+            |label: &str,
+             s: &mut Session<tt_kmd::Kmd>,
+             f: &dyn Fn(&mut Session<tt_kmd::Kmd>) -> tt_kernels::tensor::DramTensor| {
+                let o = f(s);
+                s.free(o).unwrap();
+                let mut v = Vec::new();
+                for _ in 0..5 {
+                    let before = s.device().traffic();
+                    let t = Instant::now();
+                    let o = f(s);
+                    v.push((t.elapsed(), (s.device().traffic() - before).bytes_written));
+                    s.free(o).unwrap();
+                }
+                let w = v[0].1;
+                println!(
+                    "{label:>14}: {:>8.1} us, {w} B written",
+                    median(v.into_iter().map(|p| p.0).collect()).as_secs_f64() * 1e6
+                );
+            };
+        let e = |k| Eltwise {
+            kind: k,
+            scalar: 0.0,
+        };
+        time("max over cols", &mut s, &|s| {
+            s.reduce(&x, ReduceOp::Max, Axis::Cols).unwrap()
+        });
+        time("sub col", &mut s, &|s| {
+            s.eltwise(e(tt_isa::dm::kind::SUB), &x, Some(&col)).unwrap()
+        });
+        time("exp", &mut s, &|s| {
+            s.eltwise(e(kind_sfpu::EXP), &x, None).unwrap()
+        });
+        time("sum over cols", &mut s, &|s| {
+            s.reduce(&x, ReduceOp::Sum, Axis::Cols).unwrap()
+        });
+        time("div col", &mut s, &|s| {
+            s.eltwise(e(kind_sfpu::DIV), &x, Some(&col)).unwrap()
+        });
+        time("mul (ref)", &mut s, &|s| {
+            s.eltwise(e(tt_isa::dm::kind::MUL), &x, Some(&x)).unwrap()
+        });
+    }) {
+        panic!("{e}");
+    }
+}

@@ -58,7 +58,10 @@ pub const FILL_PAD: u32 = 0x14;
 /// down -- tile `(0, j)` read for every `(i, j)` -- which is how a `[1, n]`
 /// bias meets a `[m, n]` tensor; bit 1: `X` is one tile column broadcast
 /// across -- tile `(i, 0)` read, its column 0 copied into every column
-/// ([`op::READ_BROADCAST_COL`]) -- how a `[m, 1]` tensor meets one.
+/// ([`op::READ_BROADCAST_COL`]) -- how a `[m, 1]` tensor meets one; bit 2:
+/// the run counts column-major, down a grid `rt` tiles tall (word 6) -- tile
+/// `n` is `((first + n) % rt, (first + n) / rt)` -- which is the order a
+/// reduction over rows reads a column of tiles in.
 pub const READ_RUN: u32 = 0x15;
 /// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
 /// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
@@ -332,7 +335,7 @@ pub fn expand(
             )?;
         }
         READ_RUN | WRITE_RUN => {
-            let [_, first, count, at, flags, grid_ct, ..] = h;
+            let [_, first, count, at, flags, grid_ct, grid_rt, _] = h;
             let count = extent(count)?;
             let x = tensor(rec, 1)?;
             let read = h[0] == READ_RUN;
@@ -344,9 +347,23 @@ pub fn expand(
             if ct == 0 || x.ct == 0 || (row && col) {
                 return Err(super::error::LENGTH);
             }
-            let (mut i, mut j) = div_rem(first, ct);
+            let column_major = read && flags & 4 != 0;
+            if column_major && grid_rt == 0 {
+                return Err(super::error::LENGTH);
+            }
+            let (mut i, mut j) = if column_major {
+                let (q, r) = div_rem(first, grid_rt);
+                (r, q)
+            } else {
+                div_rem(first, ct)
+            };
             for n in 0..count {
-                if n > 0 {
+                if n > 0 && column_major {
+                    i += 1;
+                    if i == grid_rt {
+                        (i, j) = (0, j + 1);
+                    }
+                } else if n > 0 {
                     j += 1;
                     if j == ct {
                         (i, j) = (i + 1, 0);

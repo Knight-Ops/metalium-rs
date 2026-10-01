@@ -37,6 +37,34 @@ pub use server::{
     Engine, EngineError, KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
+
+/// Keep on the device only what gives `burn-flex`'s bits exactly.
+///
+/// By default the device runs every op it has, and some are approximations
+/// held to derived bounds rather than to Flex's bits: division and the
+/// reciprocal (one ulp), `exp` and `log`, sums over columns (a different
+/// order), and softmax built from them. A run that must reproduce a host
+/// golden bit for bit -- the MNIST golden is one -- sets this, and those ops
+/// run on the host instead; so does `TT_EXACT=1`. Per process.
+pub fn set_exact(on: bool) {
+    EXACT.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is exact mode on ([`set_exact`], or `TT_EXACT=1`)?
+pub fn exact() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match EXACT.load(Relaxed) {
+        0 => {
+            let on = std::env::var("TT_EXACT").is_ok_and(|v| v == "1");
+            EXACT.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// 0: not yet read from the environment; 1: off; 2: on.
+static EXACT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
 pub use traffic::{
     device_time, record_transfers, take_transfers, tensor_traffic, Direction, TensorTraffic,

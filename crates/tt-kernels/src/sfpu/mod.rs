@@ -31,6 +31,7 @@
 pub mod interp;
 pub mod kernel;
 pub mod ops;
+pub mod reduce;
 
 use tt_isa::frontend;
 use tt_isa::isa::generated::{defs, encode};
@@ -365,6 +366,31 @@ impl Program {
             "SFPDIVP2 by {k}: ttsim refuses an immediate from 128 (row 66)"
         );
         self.push(encode::sfpdivp2(k, s.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = a & b`, bitwise (`SFPAND` with `SFPAND_MOD1_USE_VB`).
+    pub fn and(&mut self, a: LReg, b: LReg, d: LReg) {
+        self.push(encode::sfpand(b.index(), a.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = a | b`, bitwise (`SFPOR` with `SFPOR_MOD1_USE_VB`).
+    pub fn or(&mut self, a: LReg, b: LReg, d: LReg) {
+        self.push(encode::sfpor(b.index(), a.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d[lane] = s[lane - 1]` within each group of eight lanes -- one row of
+    /// the 4x8 lane grid -- the first lane of each taking the last's
+    /// (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`). Eight of them are the identity, so
+    /// combining after each of seven reduces a row of eight into every lane.
+    pub fn rotate_row(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpshft2(0, s.index(), Self::dst(d), 3).unwrap());
+    }
+
+    /// Transpose each lane column's 4x4 block of `L0..L4` (and of `L4..L8`):
+    /// lane row `j` of `L[i]` swaps with lane row `i` of `L[j]` (`SFPTRANSP`).
+    /// So row `i` of a four-row group held in `L0` ends in row 0 of `L[i]`.
+    pub fn transpose4(&mut self) {
+        self.push(encode::sfptransp(0).unwrap());
     }
 
     /// `d = ApproxRecip(|x|)` with `x`'s sign (`SFPARECIP`, Blackhole only):

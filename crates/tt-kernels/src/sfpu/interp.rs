@@ -328,6 +328,58 @@ impl Vector {
                     };
                 }
             }
+            "SFPAND" | "SFPOR" => {
+                let (vb, vc, vd, mod1) = (op("VB"), op("VC"), op("VD"), op("Mod1"));
+                let b = self.read(at, if mod1 & 1 != 0 { vb } else { vd })?;
+                let c = self.read(at, vc)?;
+                let and = ins.def().mnemonic() == "SFPAND";
+                let v: [u32; 32] =
+                    std::array::from_fn(|l| if and { b[l] & c[l] } else { b[l] | c[l] });
+                self.write(vd, v, false);
+            }
+            "SFPSHFT2" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                // `SFPSHFT2_MOD1_SUBVEC_SHFLROR1`, and its zero-filling twin.
+                if mod1 != 3 && mod1 != 4 {
+                    return unmodelled(format!("SFPSHFT2 with Mod1 {mod1}"));
+                }
+                let c = self.read(at, vc)?;
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    if l & 7 != 0 {
+                        c[l - 1]
+                    } else if mod1 == 3 {
+                        c[l + 7]
+                    } else {
+                        0
+                    }
+                });
+                self.write(vd, v, false);
+            }
+            "SFPTRANSP" => {
+                for base in [0usize, 4] {
+                    let mut r: [[u32; 32]; 4] = [[0; 32]; 4];
+                    for (i, ri) in r.iter_mut().enumerate() {
+                        *ri = self.read(at, (base + i) as u32)?;
+                    }
+                    let old = r;
+                    for col in 0..8 {
+                        for i in 0..4 {
+                            for j in 0..i {
+                                let (ij, ji) = (old[i][j * 8 + col], old[j][i * 8 + col]);
+                                if self.lane_enabled(j * 8 + col) {
+                                    r[i][j * 8 + col] = ji;
+                                }
+                                if self.lane_enabled(i * 8 + col) {
+                                    r[j][i * 8 + col] = ij;
+                                }
+                            }
+                        }
+                    }
+                    for (i, ri) in r.iter().enumerate() {
+                        self.lreg[base + i] = Some(*ri);
+                    }
+                }
+            }
             "SFPIADD" => {
                 let (imm, vc, vd, mod1) = (op("Imm12"), op("VC"), op("VD"), op("Mod1"));
                 let c = self.read(at, vc)?;

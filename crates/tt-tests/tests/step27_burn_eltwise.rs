@@ -200,7 +200,9 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
 #[test]
 fn division_through_burn_is_within_one_ulp_and_stays_resident() {
     with_device(Config::default(), |d| {
-        let [r, c] = [40, 96];
+        // Eight tiles: the size from which these approximations run on the
+        // device (`burn-tt`'s `APPROX_MIN_TILES`).
+        let [r, c] = [64, 128];
         let (av, bv) = (values(4, r * c), values(5, r * c));
         let ta = |v: &[f32]| {
             Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)

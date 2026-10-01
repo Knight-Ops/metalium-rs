@@ -64,6 +64,16 @@ pub trait Engine {
     fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// `a` reduced over `axis` by `op`, left on the device
+    /// (`tt_kernels::session::Session::reduce`).
+    fn reduce(
+        &mut self,
+        _a: BufferId,
+        _op: tt_kernels::sfpu::reduce::ReduceOp,
+        _axis: tt_kernels::sfpu::reduce::Axis,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
     /// keeps `a` alive while the view is.
     fn slice_rows(
@@ -197,6 +207,20 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let ta = self.get(a)?.clone();
         let c = s.sum_rows(&ta).map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    pub fn reduce<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        axis: tt_kernels::sfpu::reduce::Axis,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let c = s
+            .reduce(&ta, op, axis)
+            .map_err(|e| EngineError(e.to_string()))?;
         Ok(self.insert(c))
     }
 
@@ -478,10 +502,15 @@ pub(crate) fn eltwise(
     .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
 }
 
-/// Sum over rows on the device, panicking on a device error.
-pub(crate) fn sum_rows(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]) {
-    timed_run("sum_rows", device, move |engine| engine.sum_rows(a))
-        .unwrap_or_else(|e| panic!("sum over rows on {device}: {e}"))
+/// A reduction on the device, panicking on a device error.
+pub(crate) fn reduce(
+    device: TtDevice,
+    a: BufferId,
+    op: tt_kernels::sfpu::reduce::ReduceOp,
+    axis: tt_kernels::sfpu::reduce::Axis,
+) -> (BufferId, [usize; 2]) {
+    timed_run("reduce", device, move |engine| engine.reduce(a, op, axis))
+        .unwrap_or_else(|e| panic!("{op:?} over {axis:?} on {device}: {e}"))
 }
 
 /// A row view on the device, panicking on a device error.
@@ -579,6 +608,15 @@ impl Engine for KmdEngine {
     fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.sum_rows(&mut self.session, a)
+    }
+    fn reduce(
+        &mut self,
+        a: BufferId,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        axis: tt_kernels::sfpu::reduce::Axis,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.reduce(&mut self.session, a, op, axis)
     }
     fn slice_rows(
         &mut self,

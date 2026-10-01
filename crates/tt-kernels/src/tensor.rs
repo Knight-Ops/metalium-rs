@@ -980,6 +980,29 @@ fn sfpu_group(
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
 ) -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Measuring builds the op's role programs twice over: once per op kind,
+    // scalar and broadcast, not once per op.
+    type Memo = Mutex<HashMap<(u32, u32, crate::sfpu::ops::Broadcast), usize>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op.kind, op.scalar.to_bits(), bcast);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return g;
+    }
+    let g = measure_sfpu_group(op, bcast, operands);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, g);
+    g
+}
+
+fn measure_sfpu_group(
+    op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
         let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
@@ -1026,6 +1049,187 @@ fn sfpu_programs(
         crate::sfpu::ops::program_for(op.kind, op.scalar, bcast).expect("checked by the caller");
     let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
     let p = (layout, roles);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, p.clone());
+    Ok(p)
+}
+
+/// `a` reduced over `axis` by `op` on the SFPU (`crate::sfpu::reduce`):
+/// `[rows, 1]` over columns, `[1, cols]` over rows. Each run of output tiles is
+/// a job: the mover gathers their lines of input tiles (column-major for a
+/// reduction over rows), the kernel accumulates and folds them, the mover
+/// writes the outputs.
+pub fn sfpu_reduce(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    units: usize,
+) -> Result<Work> {
+    use crate::sfpu::reduce::Axis;
+    let [rt, ct] = a.grid();
+    let (outs, per, valid, out) = match axis {
+        Axis::Cols => (rt, ct, a.cols % 32, DramTensor::alloc(alloc, a.rows, 1)?),
+        Axis::Rows => (ct, rt, a.rows % 32, DramTensor::alloc(alloc, 1, a.cols)?),
+    };
+    let valid = if valid == 0 { 32 } else { valid as u32 };
+    let group = match reduce_group(op, axis, per, valid) {
+        Some(g) => g,
+        None => {
+            alloc.free(&out.placement);
+            return Err(TensorError::Shape(format!(
+                "a reduction over {per} tiles does not fit one tile's L1 and program slots"
+            )));
+        }
+    };
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let mut jobs = Vec::new();
+    for run in runs(outs, units, group) {
+        let len = run.len();
+        let (layout, roles) = match reduce_programs(op, axis, len, per, valid) {
+            Ok(p) => p,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(e);
+            }
+        };
+        let (flags, grid_rt) = match axis {
+            Axis::Cols => (0, 0),
+            Axis::Rows => (4, rt as u32),
+        };
+        let gather = [
+            [
+                record::READ_RUN,
+                (run.start * per) as u32,
+                (len * per) as u32,
+                layout.in_at as u32,
+                flags,
+                ct as u32,
+                grid_rt,
+                0,
+            ],
+            ra.encode()[0],
+            ra.encode()[1],
+        ];
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![
+            Step::List {
+                what: "reduce gather",
+                entries: gather.to_vec(),
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+            },
+            Step::List {
+                what: "reduce scatter",
+                entries: scatter.to_vec(),
+            },
+        ]);
+    }
+    Ok(Work { out, jobs })
+}
+
+type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
+
+/// Most output tiles one reduce run may take, from the slots the data arena
+/// holds and the role programs' length per output tile; `None` if not even
+/// one fits.
+fn reduce_group(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    per: usize,
+    valid: u32,
+) -> Option<usize> {
+    use crate::sfpu::reduce::{Axis, ReduceOp};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32), Option<usize>>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op, axis, per, valid);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return g;
+    }
+    let g = measure_reduce_group(op, axis, per, valid);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, g);
+    g
+}
+
+fn measure_reduce_group(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    per: usize,
+    valid: u32,
+) -> Option<usize> {
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles};
+    const GROUP: usize = 64;
+    let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    let by_slots = slots / (per + 1);
+    if by_slots == 0 {
+        return None;
+    }
+    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let lens = |n: usize| -> Option<[usize; 3]> {
+        let layout = plan_layout(n, per).ok()?;
+        Some(roles(&layout, &inputs, &fin).map(|p| p.len()))
+    };
+    let max = tt_isa::mailbox::PROGRAM_MAX as usize;
+    let one = lens(1)?;
+    if one.iter().any(|&l| l > max) {
+        return None;
+    }
+    if by_slots == 1 {
+        return Some(1);
+    }
+    let two = lens(2)?;
+    let by_program = (0..3)
+        .map(|r| {
+            let per_out = (two[r] - one[r]).max(1);
+            (max - (one[r] - per_out)) / per_out
+        })
+        .min()
+        .unwrap();
+    Some(GROUP.min(by_slots).min(by_program).max(1))
+}
+
+fn reduce_programs(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    len: usize,
+    per: usize,
+    valid: u32,
+) -> Result<ReducePrograms> {
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles, Axis, ReduceOp};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (ReduceOp, Axis, usize, usize, u32);
+    type Memo = Mutex<HashMap<Key, ReducePrograms>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op, axis, len, per, valid);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Ok(p.clone());
+    }
+    let layout = plan_layout(len, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, p.clone());

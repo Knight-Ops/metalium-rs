@@ -351,7 +351,10 @@ fn assert_steady_state_traffic(
     ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
 )]
 fn the_mlp_trains_on_a_reduced_dataset() {
-    reduced_run_matches_the_golden(Config::default());
+    reduced_run_matches_the_golden(Config {
+        exact: true,
+        ..Config::default()
+    });
 }
 
 /// Phase 9.6: the same run with every GDDR op dealt over four Tensix tiles.
@@ -366,6 +369,7 @@ fn the_mlp_trains_on_a_reduced_dataset() {
 fn the_mlp_trains_on_four_tiles_matching_the_golden() {
     reduced_run_matches_the_golden(Config {
         tiles: Some(burn_tt::TileChoice::Count(4)),
+        exact: true,
         ..Config::default()
     });
 }

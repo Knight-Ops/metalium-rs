@@ -424,6 +424,16 @@ with teeth.
 * Hangs: per this repo's rule, a hang is fixed in the API that hung (budgets in
   `tt_kernels::runtime`), not by a watchdog around runs; `Timeout` carries which op and tile.
 
+### 4.3a Exact mode and approximate ops (Phase 10)
+
+Some device ops are approximations held to derived bounds rather than to Flex's bits
+(`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
+`log`, sums over columns (tree order), softmax. `burn_tt::set_exact(true)` or
+`TT_EXACT=1` keeps on the device only what gives Flex's bits exactly; a run that must
+reproduce a host golden sets it (the MNIST golden does). Below eight tiles the
+approximate ops run on the host whatever the mode (`APPROX_MIN_TILES`, measured: their
+fixed cost outweighs a download) -- a placement heuristic B16 should replace.
+
 ### 4.4 `sync`, async dispatch, determinism
 
 Today every job blocks the calling thread (`server.rs:378-394`), so `sync` is trivially

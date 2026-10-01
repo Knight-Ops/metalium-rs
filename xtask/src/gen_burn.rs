@@ -81,6 +81,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_exp",
             "float_log",
             "float_sum_dim",
+            "float_max_dim",
             "float_slice",
             "float_swap_dims",
             "float_transpose",
@@ -102,7 +103,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "bool_argwhere",
         ],
     ),
-    ("ActivationOps", &["relu", "relu_backward"]),
+    (
+        "ActivationOps",
+        &["relu", "relu_backward", "softmax", "log_softmax"],
+    ),
     ("QTensorOps", &["q_device", "q_to_device", "q_into_data"]),
     ("TransactionOps", &["tr_execute"]),
 ];

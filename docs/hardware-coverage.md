@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a (`exp`, `log`) |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a, S8, R1a, R2 (softmax); X2, X4 next |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -122,12 +122,12 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 | Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | x | `~` (`exp`, `log`, `recip`) | x | x | -- |
 | Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
-| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
-| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT` | `~` (`exp`, `log`) | `~` | `~` | S5, S8 |
+| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | `~` `AND`, `OR` | `~` (masks) | `~` | `~` | S5 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT`, `SFPSHFT2` (rotate) | `~` (`exp`, `log`, reductions) | `~` | `~` | S5 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
 | Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
-| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | | | | | S2, S8 |
+| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | `~` `SFPTRANSP` | `~` (reductions) | `~` | `~` | S2 |
 | Configuration | `SFPCONFIG` | x | | | | | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
@@ -445,7 +445,11 @@ reverse index.
 - [ ] **S7 The PRNG.** Seeded per tile from `Backend::seed`. The claim is distributional
       (a stated statistical test), not bit-exact against Flex, whose generator is
       different. Burn: `float_random`, dropout.
-- [ ] **S8 Lane movement.** `SFPTRANSP`, `SFPSHFT2` for reductions inside a tile (feeds R1).
+- [x] **S8 Lane movement.** `Program::rotate_row` (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`),
+      `Program::transpose4` (`SFPTRANSP`), with `Program::and`/`or` (`SFPAND`, `SFPOR`)
+      for lane masks; interpreter models of all four held to silicon in
+      `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
+      transpose then add). First user: R1's in-tile folds.
 - [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
       else here works without it.
 
@@ -465,10 +469,24 @@ reverse index.
 
 ### R — Reductions and composites
 
-- [ ] **R1 Reductions over any dim.** `sum`, `mean`, `max`, `min`, `argmax`, `argmin`,
-      `prod`, full and per dim (today only `sum_dim(0)`, on the B core). Within a tile by
-      S8/M2, across tiles by the mover (or NoC atomics). Sum order stated against Flex's,
-      as `COL_SUM`'s is.
+- [~] **R1 Reductions over any dim.** Done (R1a): `sum` and `max` over either dim of
+      a matrix (`Session::reduce`, `sfpu::reduce`): a reduce kernel -- many input tiles
+      into one output tile, four semaphores numbered compatibly with the matmul's and
+      the element-wise kernel's -- that accumulates lanewise in `Dst`, masks a ragged
+      edge's padding lanes to the identity by lane index (`LReg[15]`, `SFPAND`,
+      `SFPSHFT`), and folds within the tile by rotations (over columns, the result
+      replicated across the row: broadcast-ready) or `SFPTRANSP` (over rows); the
+      gather reads a tile column in column-major order (`READ_RUN` flag bit 2). Max is
+      exact (total order: a positive NaN propagates, a negative one is ordered below
+      `-inf`); a sum over columns is in tree order, within `2 (n-1) u sum|x|` of
+      Flex's; a sum over rows stays on the mover, in Flex's order. Oracle: the same
+      programs in the interpreter (`reduce::reference`), exact on integer data for
+      every shape. Gates: `step31_reduce` (device equal to the program bit for bit;
+      max equal to Flex's, sums within the bound; ragged shapes, lines of up to 32
+      tiles), `step32_burn_softmax`. Burn: `float_max_dim`, `float_sum_dim` (both
+      dims). Remaining (R1b, 10.3): `mean`, `min`, `prod`, `argmax`/`argmin`,
+      `any`/`all`, full reductions, `cum*`, more than ~200 tiles along the reduced
+      dimension (one pass's L1 limit; refused with a typed error today).
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
       laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
@@ -481,7 +499,26 @@ reverse index.
       and `[64, 96]`; Flex bit for bit, `DIV` within one ulp; device equal to the
       program; padding claims checked against raw tiles) and `step27_burn_eltwise`'s
       broadcast cases; ttsim and both cards.
-- [ ] **R2 Softmax, log-softmax, cross-entropy on the device** (was checklist 9.12): max,
+- [~] **R2 Softmax, log-softmax on the device**; cross-entropy waits on D4. `softmax`
+      and `log_softmax` (either dim of a resident matrix) run Burn's own composition
+      -- max, broadcast subtract, `exp`, sum, broadcast divide or `log` and subtract --
+      on the device end to end, decided once on the whole input. Against Flex's fused
+      softmax: a bound derived from the parts' (`EXP_BOUND` twice, the sum's order, the
+      division's ulp, Flex's own counterparts); measured worst `1.0e-6` relative.
+      Burn's `CrossEntropyLoss` gathers the target column with an integer index
+      tensor (`float_gather`, D4), so MNIST's loss -- and its logits download -- stays
+      on the host for now. **Placement** (measurement S): an SFPU kernel op costs
+      100-200 us whatever its size, a tile's download ~190 us, so the approximate ops
+      (division, `exp`, `log`, the SFPU's reductions) reached through Burn's methods run
+      on the host below eight tiles (`burn-tt`'s `APPROX_MIN_TILES`) -- autodiff's own
+      `log_softmax` on MNIST's two-tile logits took the step from 3.8 to 7.9 ms/step
+      on the device -- and softmax compositions decide on their input's size. Heuristic
+      until submission is asynchronous or a lookahead exists (X4, B8, B13, B16).
+      **Exact mode** (`burn_tt::set_exact`, `TT_EXACT=1`): only ops that give Flex's
+      bits run on the device; the MNIST golden runs so. Gates: `step32_burn_softmax`
+      (every step resident, both dims, three shapes; a two-tile tensor on the host and
+      bit-identical); the MNIST golden in exact mode. Was: **R2 Softmax, log-softmax,
+      cross-entropy on the device** (was checklist 9.12): max,
       subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
       per-step logits download goes away as a consequence, not as the goal. Burn:
       `softmax`, `log_softmax`, `softmin`.
@@ -520,7 +557,7 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
 | `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (SFPU or mover by size) | S1 |
-| `float_sum_dim` | `~` dim 0 only (B core) | R1 |
+| `float_sum_dim` | x (dim 0 the mover's, exact; dim 1 the SFPU's, order bound) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
@@ -533,7 +570,8 @@ path today, `~` when only some shapes do.
 | `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
-| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max*`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
+| `float_max_dim` | x (SFPU, exact value) | R1 |
+| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
 | `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add`, `float_select{,_add}`, `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
@@ -546,7 +584,8 @@ path today, `~` when only some shapes do.
 | `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
-| `softmax`, `log_softmax`, `softmin` | | R2 |
+| `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
+| `softmin` | | R2 |
 
 ### `ModuleOps`
 

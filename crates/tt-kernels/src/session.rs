@@ -815,6 +815,28 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `a` reduced over `axis` by `op`: `[rows, 1]` over columns, `[1, cols]`
+    /// over rows. On the SFPU ([`tensor::sfpu_reduce`]), except a sum over
+    /// rows, which the mover does in Flex's order ([`Session::sum_rows`]).
+    /// Padding is masked in the kernel, so `a`'s is never read; the output's
+    /// padding holds copies of the result (over columns) or is undefined.
+    pub fn reduce(
+        &mut self,
+        a: &DramTensor,
+        op: crate::sfpu::reduce::ReduceOp,
+        axis: crate::sfpu::reduce::Axis,
+    ) -> Result<DramTensor, TensorError> {
+        use crate::sfpu::reduce::{Axis, ReduceOp};
+        if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
+            return self.sum_rows(a);
+        }
+        let units = self.units.len();
+        let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
     /// Make `t`'s padding what an op needs (`tensor::PadNeed`): nothing when
     /// it already is, or when `t` has no ragged edge; otherwise its edge tiles
     /// refilled ([`tensor::fill_pad`]). In place when `t` owns its slots; a

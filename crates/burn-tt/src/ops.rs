@@ -63,7 +63,41 @@ fn device_view(
 /// on the device, none a transposed view, and the shapes ones the kernels take
 /// (`b` the same shape, or for `ADD_ROW` one row). `None` otherwise, and the
 /// caller runs Flex's op on the host copies.
+/// Tiles below which an SFPU-only op (an approximation: division, `exp`,
+/// `log`, the SFPU's reductions) runs on the host after a download instead.
+/// Each SFPU kernel op costs 100-200 us whatever its size -- most of it the
+/// host's submission (`silicon_perf::softmax_parts`, card 0) -- against ~190
+/// us to download a tile; and a small tensor's chain of such ops (autodiff's
+/// own `log_softmax` is five forward and more backward) usually ends on the
+/// host anyway. MNIST's two-tile logits trained at 7.9 ms/step on one tile
+/// with them on the device, 3.6 without. A heuristic until submission is
+/// asynchronous or a lookahead exists (`burn-backend-parity.md` B8, B13, B16).
+const APPROX_MIN_TILES: usize = 8;
+
+/// Tiles in a matrix's tile grid.
+fn tiles(t: &TtTensor) -> usize {
+    let d = t.shape().to_vec();
+    d.first().map_or(0, |r| r.div_ceil(32)) * d.get(1).map_or(1, |c| c.div_ceil(32))
+}
+
 fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) -> Option<TtTensor> {
+    // The SFPU-only ops are approximations: not in exact mode, and not on a
+    // tensor too small to pay their fixed cost (`APPROX_MIN_TILES`).
+    if !tt_kernels::sfpu::ops::mover_has(kind) && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
+        return None;
+    }
+    device_eltwise_ungated(kind, scalar, a, b)
+}
+
+/// [`device_eltwise`] without the size gate: for a composition that has
+/// already decided, on its whole input, to run on the device (a softmax's
+/// `log` of its small per-row sums, say).
+fn device_eltwise_ungated(
+    kind: u32,
+    scalar: f32,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+) -> Option<TtTensor> {
     use tt_isa::dm::kind as k;
     let device = a.device;
     let all = |f: &dyn Fn(&TtTensor) -> bool| f(a) && b.is_none_or(f);
@@ -90,6 +124,18 @@ fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) ->
         Some(s) if matches!(kind, k::ADD | k::MUL) && broadcast_of(s, &sa) => (b?, Some(a)),
         _ => return None,
     };
+    // A broadcast row or column made on the host usually belongs to a host
+    // chain -- a row max for a loss on the host, say: uploading it to meet a
+    // device tensor only to download the result for the chain's next host op
+    // is two crossings where there were none (MNIST's loss, in exact mode,
+    // does exactly that). It goes to the device only if it is there already
+    // -- except a row added to every row, a bias, which a host optimiser
+    // step leaves on the host and the next forward pass wants on the device.
+    let bias = kind == k::ADD
+        && b.is_some_and(|b| b.shape().to_vec() == [1, a.shape()[1]] && a.shape()[0] != 1);
+    if !bias && b.is_some_and(|b| b.shape() != a.shape() && b.dram().is_none()) {
+        return None;
+    }
     let (da, db) = (a.to_dram(), b.map(|b| b.to_dram()));
     if da.transposed || db.is_some_and(|d| d.transposed) {
         return None;
@@ -372,19 +418,64 @@ pub mod float {
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
     /// Flex's order (`tt_isa::dm::kind::COL_SUM`). Anything else is Flex's.
     pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = tensor.device;
-        if dim == 0 && tensor.is_matrix_f32() {
-            if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
-                if crate::server::supports_dram(device) {
-                    let (id, dims) = crate::server::sum_rows(device, d.buffer.id);
-                    return device_result(device, id, dims);
-                }
-            }
+        use tt_kernels::sfpu::reduce::ReduceOp;
+        if let Some(t) = device_reduce(&tensor, ReduceOp::Sum, dim) {
+            return t;
         }
+        let device = tensor.device;
         TtTensor::new(
             <Flex as FloatTensorOps<Flex>>::float_sum_dim(tensor.into_host(), dim),
             device,
         )
+    }
+
+    /// The maximum along `dim` of a device-resident matrix, on the SFPU
+    /// (exactly Flex's value; `step31_reduce`), else Flex's.
+    pub fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        use tt_kernels::sfpu::reduce::ReduceOp;
+        if let Some(t) = device_reduce(&tensor, ReduceOp::Max, dim) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_max_dim(tensor.into_host(), dim),
+            device,
+        )
+    }
+
+    /// `tensor` reduced along `dim` on the device, if it is a device-resident
+    /// F32 matrix (not a transposed view): a sum over rows by the mover in
+    /// Flex's order, everything else on the SFPU (`Session::reduce`).
+    pub(crate) fn device_reduce(
+        tensor: &TtTensor,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        dim: usize,
+    ) -> Option<TtTensor> {
+        use tt_kernels::sfpu::reduce::ReduceOp;
+        // Only the mover's sum over rows gives Flex's bits; the SFPU's sum is
+        // in another order, and its maximum prefers `+0` to `-0`. Those, not
+        // in exact mode, and not on a tensor too small to pay for themselves.
+        if (op, dim) != (ReduceOp::Sum, 0) && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
+            return None;
+        }
+        device_reduce_ungated(tensor, op, dim)
+    }
+
+    /// [`device_reduce`] without the size gate, for a composition.
+    pub(crate) fn device_reduce_ungated(
+        tensor: &TtTensor,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        dim: usize,
+    ) -> Option<TtTensor> {
+        use tt_kernels::sfpu::reduce::Axis;
+        let device = tensor.device;
+        if dim > 1 || !tensor.is_matrix_f32() || !crate::server::supports_dram(device) {
+            return None;
+        }
+        let d = tensor.dram().filter(|d| !d.transposed)?;
+        let axis = if dim == 0 { Axis::Rows } else { Axis::Cols };
+        let (id, dims) = crate::server::reduce(device, d.buffer.id, op, axis);
+        Some(device_result(device, id, dims))
     }
 
     /// Whole tile rows, all columns, of a matrix on the device: a view of the
@@ -472,6 +563,82 @@ pub mod activation {
             <Flex as ActivationOps<Flex>>::relu(tensor.into_host()),
             device,
         )
+    }
+
+    /// Burn's own composition (`ActivationOps::softmax`'s default) -- a max, a
+    /// broadcast subtract, `exp`, a sum and a broadcast divide -- through this
+    /// backend's ops, so on a device-resident matrix every step runs on the
+    /// device; anything else is Flex's fused softmax.
+    pub fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        match device_softmax(&tensor, dim, false) {
+            Some(t) => t,
+            None => {
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::softmax(tensor.into_host(), dim),
+                    device,
+                )
+            }
+        }
+    }
+
+    /// Burn's own composition (`ActivationOps::log_softmax`'s default: the
+    /// max-shifted log-sum-exp), on the device; else Flex's.
+    pub fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        match device_softmax(&tensor, dim, true) {
+            Some(t) => t,
+            None => {
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::log_softmax(tensor.into_host(), dim),
+                    device,
+                )
+            }
+        }
+    }
+
+    /// Softmax (or log-softmax) of a resident matrix along `dim`, every step on
+    /// the device: decided once, on the whole input, so the small per-row
+    /// statistics in the middle stay there too.
+    fn device_softmax(t: &TtTensor, dim: usize, log: bool) -> Option<TtTensor> {
+        use super::float::device_reduce_ungated as reduce;
+        use tt_kernels::sfpu::ops::kind_sfpu;
+        use tt_kernels::sfpu::reduce::ReduceOp;
+        if !resident_matrix(t) || dim > 1 {
+            return None;
+        }
+        let max = reduce(t, ReduceOp::Max, dim)?;
+        let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
+        let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
+        let sum = reduce(&exp, ReduceOp::Sum, dim)?;
+        if log {
+            let log_sum = device_eltwise_ungated(kind_sfpu::LOG, 0.0, &sum, None)?;
+            device_eltwise_ungated(kind::SUB, 0.0, &shifted, Some(&log_sum))
+        } else {
+            device_eltwise_ungated(kind_sfpu::DIV, 0.0, &exp, Some(&sum))
+        }
+    }
+
+    /// Tiles below which a softmax is Flex's after a download rather than
+    /// five device ops: each device op costs 100-200 us whatever its size, a
+    /// tile's download ~190 us and its share of the composition ~55 us
+    /// (`silicon_perf::softmax_parts`, card 0), so the composition pays from
+    /// about six tiles. A heuristic until a lookahead can see where the result
+    /// goes (Burn fusion, `burn-backend-parity.md` B13/B16): MNIST's
+    /// `[64, 10]` logits, two tiles bound for a loss on the host, stay there.
+    const SOFTMAX_DEVICE_MIN_TILES: usize = 8;
+
+    /// Is `t` an F32 matrix on a device that keeps tensors in GDDR, with a
+    /// device copy already, and big enough to compose a softmax over there?
+    fn resident_matrix(t: &TtTensor) -> bool {
+        let dims = t.shape().to_vec();
+        let tiles =
+            dims.first().map_or(0, |r| r.div_ceil(32)) * dims.get(1).map_or(0, |c| c.div_ceil(32));
+        !crate::exact()
+            && tiles >= SOFTMAX_DEVICE_MIN_TILES
+            && t.is_matrix_f32()
+            && t.dram().is_some_and(|d| !d.transposed)
+            && crate::server::supports_dram(t.device)
     }
 
     /// On the device where the data is, else Flex's.

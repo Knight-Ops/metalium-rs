@@ -97,6 +97,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 pub const SMOKE: &[&str] = &[
     "step19_eltwise::",
     "step27_burn_eltwise::",
+    "step32_burn_softmax::",
     "step11_burn::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",

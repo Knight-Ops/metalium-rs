@@ -951,11 +951,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_max_dim(tensor.into_flex(), dim),
-            device,
-        )
+        crate::ops::float::float_max_dim(tensor, dim)
     }
     fn float_max_dim_with_indices(
         tensor: FloatTensor<TtBackend>,
@@ -2923,11 +2919,10 @@ impl ActivationOps<TtBackend> for TtBackend {
         )
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::softmax(tensor.into_flex(), dim),
-            device,
-        )
+        crate::ops::activation::softmax(tensor, dim)
+    }
+    fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        crate::ops::activation::log_softmax(tensor, dim)
     }
     fn log_sigmoid_backward(
         x: FloatTensor<TtBackend>,
