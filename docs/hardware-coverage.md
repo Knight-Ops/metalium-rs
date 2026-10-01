@@ -244,8 +244,27 @@ reverse index.
         `MOP_CFG` were Wormhole-only drawings: the generator now marks them `CONFIRMED`
         with this gate as evidence (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`: only a
         `WormholeOnly` layout, the gate must exist, every field must be exercised).
-  - [ ] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
+  - [~] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
         MNIST golden bit for bit, program bytes and silicon time measured.
+    - [x] **Kernels are push-bound, measured** (`silicon_perf::role_push_rate`): a
+          matmul tile's unpack role pushes at the runner's ceiling and its backend
+          finishes the moment the last word lands, so fewer words is faster. The
+          runner itself now pushes in batches of sixteen (2.8 cycles a word, was
+          7.6): every kernel about 2.5x faster to issue (row AB). Full suite 424/424.
+    - [x] **The loop planner** (`tt_kernels::loops`): `Item::Repeat` lowered to a
+          `MOP` looping a `REPLAY` of the recorded body (the loop that saves the
+          most takes the one configuration), plain `REPLAY`, or unrolled, each
+          choice recorded with its reason; a program with `REPLAY`s of its own is
+          left unrolled. Unit tests: the modelled frontend's output
+          (`loops::frontend_stream`, MOP then Replay Expander) is the unrolled
+          program word for word. Gate `step37_loops`: lowered and unrolled store
+          the same counted sum, and the lowered is under a quarter of the words
+          (watched failing: one `MOP` dropped, short by exactly its five
+          iterations). ttsim and both cards: a `MOP` looping a `REPLAY` on silicon.
+    - [ ] **The matmul in loops**: every tile pair's block identical and short
+          enough to replay -- faces stepped by the unpacker's own Z increment in an
+          order that keeps each output face's accumulation, tiles by the ADC's W
+          instead of a base-address rewrite per pair.
 - [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
       mover brackets each list and each top-level entry or record with timestamper events
       when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,

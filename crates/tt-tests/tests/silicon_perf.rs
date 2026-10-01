@@ -764,3 +764,90 @@ fn mover_read_shapes() {
         m.stop(d, &w).unwrap();
     });
 }
+
+/// Is a kernel bound by its runners pushing instructions, or by the backend
+/// executing them? Each role's `START -> PUSHED` and `PUSHED -> RETIRED`, in
+/// cycles, for a program of NOPs (the runner's push rate: the backend takes a
+/// NOP a cycle) and for one matmul tile at LoFi and HiFi4. A role that pushes
+/// at the NOP rate and retires right after is push-bound, and fewer pushed
+/// words -- `REPLAY`, `MOP` -- make it faster; one that pushes slower than the
+/// NOP rate is held back by its FIFO, the backend's pace (X2b).
+#[test]
+#[ignore = "benchmark"]
+fn role_push_rate() {
+    use tt_isa::mailbox::trace as ev;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    let spans = |trace: &[tt_device::trace::TraceEvent]| {
+        let mut out = [[0u64; 3]; 3];
+        for e in trace {
+            let (src, what) = ev::split(e.token);
+            if src < 3 && (1..=3).contains(&what) {
+                out[src as usize][what as usize - 1] = e.cycles;
+            }
+        }
+        out.map(|[s, p, r]| (p.saturating_sub(s), r.saturating_sub(p)))
+    };
+    tt_tests::harness::in_device(|dev| {
+        let nops = vec![tt_isa::sfpu::nop(); 4000];
+        let out = tt_tests::harness::run(
+            dev,
+            &tt_tests::harness::Run::roles(tt_tests::harness::Roles {
+                unpack: &[],
+                math: &nops,
+                pack: &[],
+            })
+            .dump_rows(0)
+            .traced(),
+        );
+        let (push, retire) = spans(&out.trace)[1];
+        println!(
+            "MEASURE role_push nops: {} words, push {push} cycles ({:.2}/word), retire +{retire}",
+            nops.len(),
+            push as f64 / nops.len() as f64
+        );
+        let tile = tt_tests::harness::tensix_tile();
+        for (name, fidelity) in [("LoFi", Fidelity::Lo), ("HiFi4", Fidelity::HiFi4)] {
+            let kt = 8;
+            let (m, k, n) = (32, 32 * kt, 32);
+            let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32).collect();
+            let mut words = [0usize; 3];
+            let mut trace = Vec::new();
+            tt_kernels::matmul::matmul_with(
+                &a,
+                &b,
+                [m, k, n],
+                SrcRoute::Tf32FromFp32,
+                fidelity,
+                |kern| {
+                    for (t, r) in kern.roles.iter().enumerate() {
+                        words[t] = r.len();
+                    }
+                    let traced = tt_kernels::runtime::Kernel {
+                        trace: true,
+                        ..*kern
+                    };
+                    let o = tt_kernels::runtime::run(
+                        dev,
+                        tile,
+                        &tt_firmware_images::ROLES,
+                        &traced,
+                        1 << 30,
+                    )?;
+                    trace = o.trace.clone();
+                    Ok(o)
+                },
+            )
+            .unwrap();
+            let s = spans(&trace);
+            for (t, role) in ["unpack", "math", "pack"].iter().enumerate() {
+                let (push, retire) = s[t];
+                println!(
+                    "MEASURE role_push matmul {name} 1x{kt}x1 {role}: {} words, push {push} cycles ({:.2}/word), retire +{retire}",
+                    words[t],
+                    push as f64 / words[t].max(1) as f64
+                );
+            }
+        }
+    });
+}

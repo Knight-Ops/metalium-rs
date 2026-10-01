@@ -237,6 +237,25 @@ where
     // A countdown rather than `i % push_window`: T2 has no remainder
     // instruction, and the instruction-set gate refuses one.
     let mut until_drain = push_window;
+    // Silicon (no push window): sixteen words read, then sixteen pushed, so
+    // the loads overlap rather than each push waiting on its own load. One
+    // word at a time took ~7.6 cycles a word, eight at a time 3.5, sixteen 2.8
+    // (`silicon_perf::role_push_rate`, card 0) -- and a matmul's unpack and
+    // math roles push as fast as their runner can. Sixteen is what fits the
+    // registers.
+    if push_window == 0 {
+        while i + 16 <= program_len {
+            let at = program + (i as u64) * 4;
+            // SAFETY: eight words inside the staged program, whose length was
+            // checked above.
+            let w: [u32; 16] = core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
+            for word in w {
+                // SAFETY: as the loop below.
+                unsafe { push_word::<Riscv, Thread>(word) }
+            }
+            i += 16;
+        }
+    }
     while i < program_len {
         // SAFETY: the word is inside the staged program, whose length was checked
         // above; `Riscv` may push to `Thread`, which the type system checked; the
