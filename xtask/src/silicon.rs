@@ -34,6 +34,7 @@ struct Opts {
     include_ignored: bool,
     keep_going: bool,
     list_only: bool,
+    release: bool,
     timeout: Duration,
 }
 
@@ -44,6 +45,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         include_ignored: false,
         keep_going: false,
         list_only: false,
+        release: false,
         timeout: Duration::from_secs(120),
     };
     let mut args = args.peekable();
@@ -74,6 +76,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             "--include-ignored" => o.include_ignored = true,
             "--keep-going" => o.keep_going = true,
             "--list" => o.list_only = true,
+            "--release" => o.release = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
@@ -91,6 +94,8 @@ usage: cargo xtask silicon [options]
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
   --timeout-secs N      per-test wall-clock limit (default 120)
+  --release             build the suite optimised; every timing worth quoting
+                        comes from this, since the dev build is not a baseline
   --list                print the selection and exit without touching a card";
 
 /// Every card the driver has enumerated.
@@ -109,7 +114,7 @@ fn all_devices() -> Result<Vec<u16>, String> {
 pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let o = parse(args)?;
     let root = workspace_root();
-    let binaries = build(&root)?;
+    let binaries = build(&root, o.release)?;
 
     let mut selection = Vec::new();
     for (name, exe) in &binaries {
@@ -151,6 +156,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut log = Log::open(&log_path)?;
     let boot = boot_id();
     println!("logging to {}", log_path.display());
+    // A timing in the log is only comparable with one from the same profile.
+    let profile = if o.release { "release" } else { "dev" };
+    log.line(&format!("{} boot={boot} PROFILE {profile}", unix_secs()))?;
 
     let mut results = Vec::new();
     'cards: for &dev in &o.devices {
@@ -216,7 +224,7 @@ impl std::fmt::Display for Verdict {
 ///
 /// Parses cargo's JSON messages by hand, which is enough here: the two fields
 /// wanted are simple strings, and `xtask` stays dependency-free.
-fn build(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+fn build(root: &Path, release: bool) -> Result<Vec<(String, PathBuf)>, String> {
     let out = Command::new(env!("CARGO"))
         .args([
             "test",
@@ -227,6 +235,7 @@ fn build(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
             "--no-run",
             "--message-format=json",
         ])
+        .args(release.then_some("--release"))
         .current_dir(root)
         .stderr(Stdio::inherit())
         .output()

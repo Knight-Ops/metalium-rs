@@ -26,8 +26,10 @@ use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
 
 use crate::datapath;
+use crate::dm::DataMover;
 use crate::matmul::{self, Fidelity, SrcRoute};
-use crate::runtime::{self, Kernel, RoleImages, RunError, Schedule};
+use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
+use crate::tensor::{self, DramAlloc, DramTensor, TensorError};
 
 /// Every baby RISC-V held in reset: what the cleanup write leaves behind, and
 /// the resting state between runs.
@@ -140,9 +142,13 @@ pub fn reset_thread_state<T: Transport>(
         return Ok(());
     }
     let program = datapath::thread_state_reset();
+    // Thread 0 first releases anything a failed kernel left blocked on a
+    // semaphore, which the backend pulse does not (row 65); otherwise thread 1
+    // or 2's reset would queue behind it forever.
+    let first = [datapath::release_semaphores(), program.clone()].concat();
     let kernel = Kernel {
         dump_rows: 0,
-        ..Kernel::new([&program, &program, &program], Schedule::InOrder)
+        ..Kernel::new([&first, &program, &program], Schedule::InOrder)
     };
     runtime::run(dev, tile, images, &kernel, RESET_BUDGET).map(|_| ())
 }
@@ -176,6 +182,26 @@ pub struct Session<T: Transport> {
     tile: NocCoord<Noc0>,
     grid: Tensix,
     images: RoleImages<'static>,
+    /// The role images, resident since the last [`Session::prepare`]
+    /// (`runtime::Resident`): one reset and one load per session rather than per
+    /// run. `None` only between a failed run and the next `prepare`.
+    resident: Option<Resident<Noc0>>,
+    /// Every run's phases since the last [`Session::take_profile`].
+    profile: runtime::Profile,
+    /// GDDR, once [`Session::enable_dram`] has been called.
+    dram: Option<DramState>,
+}
+
+/// What a session needs to keep tensors in GDDR: the chip's channels, an
+/// allocator, the data mover on this session's tile, and a window for each
+/// size of access.
+struct DramState {
+    alloc: DramAlloc,
+    dram: tt_isa::dram::Dram,
+    image: &'static [u8],
+    mover: Option<DataMover<Noc0>>,
+    w: tt_device::Window,
+    w4: tt_device::Window,
 }
 
 impl<T: Transport> Session<T> {
@@ -216,18 +242,227 @@ impl<T: Transport> Session<T> {
             tile,
             grid,
             images,
+            resident: None,
+            profile: runtime::Profile::default(),
+            dram: None,
         };
         session.prepare().map_err(SessionError::Reset)?;
         Ok(session)
     }
 
-    /// Put the tile back to a known state before a run: step 4 again.
+    /// Put the tile back to a known state: step 4 again, then the role images
+    /// loaded and left resident.
     pub fn prepare(&mut self) -> Result<(), RunError> {
+        if let Some(r) = self.resident.take() {
+            r.stop(&mut self.dev, &self.images)?;
+        }
         reset_tile(&mut self.dev, self.tile)?;
-        reset_thread_state(&mut self.dev, self.tile, &self.images)
+        reset_thread_state(&mut self.dev, self.tile, &self.images)?;
+        self.resident = Some(Resident::start(
+            &mut self.dev,
+            self.tile,
+            &self.images,
+            RESET_BUDGET,
+        )?);
+        // The reset held RISCV B too; GDDR contents survive, the mover does not.
+        if let Some(d) = &mut self.dram {
+            d.mover = None;
+        }
+        Ok(())
     }
 
-    /// `A[m,k] @ B[k,n]`, row-major, on this session's tile ([`matmul_on`]).
+    /// Keep tensors in GDDR from now on: read the chip's channels and set up an
+    /// allocator. `dm_image` is `tt_firmware_images::DM_B`'s bytes, started on
+    /// this session's tile's RISCV B when first needed.
+    pub fn enable_dram(&mut self, dm_image: &'static [u8]) -> Result<(), TransportError> {
+        if self.dram.is_some() {
+            return Ok(());
+        }
+        let w = self.dev.alloc_window(WindowKind::TwoMib)?;
+        let w4 = self.dev.alloc_window(WindowKind::FourGib)?;
+        let dram = self.dev.dram_grid(&w)?;
+        self.dram = Some(DramState {
+            alloc: DramAlloc::new(&dram),
+            dram,
+            image: dm_image,
+            mover: None,
+            w,
+            w4,
+        });
+        Ok(())
+    }
+
+    fn dram_state(&mut self) -> Result<&mut DramState, TensorError> {
+        self.dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
+    }
+
+    /// Upload a row-major `[rows, cols]` matrix to GDDR.
+    pub fn upload(
+        &mut self,
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<DramTensor, TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        DramTensor::upload(dev, &d.w4, &mut d.alloc, values, rows, cols)
+    }
+
+    /// Download a tensor to row-major values.
+    pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        t.download(dev, &d.w4)
+    }
+
+    /// Give a tensor's slots back.
+    pub fn free(&mut self, t: DramTensor) -> Result<(), TensorError> {
+        self.dram_state()?.alloc.free(&t.placement);
+        Ok(())
+    }
+
+    /// Free GDDR bytes on the fullest channel.
+    pub fn dram_free_bytes(&self) -> u64 {
+        self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
+    }
+
+    /// Element-wise `a (op) b` in GDDR ([`tensor::eltwise`]), on the data
+    /// mover's FP32 unit. No Tensix run, so the resident roles are untouched.
+    pub fn eltwise(
+        &mut self,
+        op: tensor::Eltwise,
+        a: &DramTensor,
+        b: Option<&DramTensor>,
+    ) -> Result<DramTensor, TensorError> {
+        let tile = self.tile;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if d.mover.is_none() {
+            d.mover = Some(DataMover::start(dev, &d.w, tile, &d.dram, d.image)?);
+        }
+        let mover = d.mover.as_mut().expect("started above");
+        let out = tensor::eltwise(dev, &d.w, mover, &mut d.alloc, op, a, b);
+        if out.is_err() {
+            d.mover = None;
+        }
+        out
+    }
+
+    /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
+    /// ([`tensor::sum_rows`]).
+    pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
+        let tile = self.tile;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if d.mover.is_none() {
+            d.mover = Some(DataMover::start(dev, &d.w, tile, &d.dram, d.image)?);
+        }
+        let mover = d.mover.as_mut().expect("started above");
+        let out = tensor::sum_rows(dev, &d.w, mover, &mut d.alloc, a);
+        if out.is_err() {
+            d.mover = None;
+        }
+        out
+    }
+
+    /// `op(A) @ op(B)` with every operand and the result in GDDR
+    /// ([`tensor::matmul_dram`]), on the resident roles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dram(
+        &mut self,
+        a: &DramTensor,
+        a_transposed: bool,
+        b: &DramTensor,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<DramTensor, TensorError> {
+        if self.resident.is_none() {
+            self.prepare()?;
+        }
+        let tile = self.tile;
+        let Session {
+            dev,
+            dram,
+            resident,
+            images,
+            profile,
+            ..
+        } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if d.mover.is_none() {
+            d.mover = Some(DataMover::start(dev, &d.w, tile, &d.dram, d.image)?);
+        }
+        let mover = d.mover.as_mut().expect("started above");
+        let r = resident.as_mut().expect("prepared above");
+        let out = tensor::matmul_dram(
+            dev,
+            &d.w,
+            mover,
+            &mut d.alloc,
+            a,
+            a_transposed,
+            b,
+            b_transposed,
+            route,
+            fidelity,
+            |dev, k| {
+                let o = r.run(dev, images, k, budget)?;
+                profile.phases.extend_from_slice(&o.profile.phases);
+                Ok(o)
+            },
+        );
+        if out.is_err() {
+            // As `run`: leave the session usable.
+            self.resident = None;
+            if let Some(d) = &mut self.dram {
+                d.mover = None;
+            }
+            if let Err(e) = self.prepare() {
+                eprintln!("session: recovery after a failed kernel failed as well: {e}");
+            }
+        }
+        out
+    }
+
+    /// Run `kernel` on the resident roles. A failure resets the tile and
+    /// restarts them before it is returned, so the session stays usable.
+    pub fn run(&mut self, kernel: &Kernel<'_>, budget: u64) -> Result<runtime::Outcome, RunError> {
+        if self.resident.is_none() {
+            self.prepare()?;
+        }
+        let r = self.resident.as_mut().expect("prepared above");
+        let out = r.run(&mut self.dev, &self.images, kernel, budget);
+        if let Ok(o) = &out {
+            self.profile.phases.extend_from_slice(&o.profile.phases);
+        }
+        if out.is_err() {
+            self.resident = None;
+            // The kernel's error is the one to report; a recovery that fails
+            // too leaves `resident` empty, and the next run tries again.
+            if let Err(e) = self.prepare() {
+                eprintln!("session: recovery after a failed kernel failed as well: {e}");
+            }
+        }
+        out
+    }
+
+    /// `A[m,k] @ B[k,n]`, row-major, on this session's tile, chunked as
+    /// [`matmul_on`] chunks it but on the resident roles: no reset or image load
+    /// between chunks. Bit-identical to `matmul_on` (`step17_resident`).
     pub fn matmul(
         &mut self,
         a: &[f32],
@@ -237,17 +472,14 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<Vec<f32>, RunError> {
-        matmul_on(
-            &mut self.dev,
-            self.tile,
-            &self.images,
-            a,
-            b,
-            mkn,
-            route,
-            fidelity,
-            budget,
-        )
+        matmul::matmul_chunked(a, b, mkn, route, fidelity, |a, b, mkn| {
+            matmul::matmul_with(a, b, mkn, route, fidelity, |k| self.run(k, budget))
+        })
+    }
+
+    /// The phases of every run since the last call, and forget them.
+    pub fn take_profile(&mut self) -> runtime::Profile {
+        std::mem::take(&mut self.profile)
     }
 
     pub fn device(&mut self) -> &mut Device<T> {
@@ -266,7 +498,11 @@ impl<T: Transport> Session<T> {
         &self.images
     }
 
-    pub fn into_device(self) -> Device<T> {
+    /// The device, with the role cores held again.
+    pub fn into_device(mut self) -> Device<T> {
+        if let Some(r) = self.resident.take() {
+            let _ = r.stop(&mut self.dev, &self.images);
+        }
         self.dev
     }
 }

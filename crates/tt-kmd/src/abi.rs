@@ -43,8 +43,11 @@ pub const SET_NOC_CLEANUP: u64 = io(14);
 /// resource numbering is PCI BAR 0, 2, 4 rather than 0, 1, 2.
 pub mod mapping_id {
     pub const RESOURCE0_UC: u32 = 1;
+    pub const RESOURCE0_WC: u32 = 2;
     pub const RESOURCE1_UC: u32 = 3;
+    pub const RESOURCE1_WC: u32 = 4;
     pub const RESOURCE2_UC: u32 = 5;
+    pub const RESOURCE2_WC: u32 = 6;
 }
 
 /// `tenstorrent_lock_ctl_in.flags` (`ioctl.h:216-219`).

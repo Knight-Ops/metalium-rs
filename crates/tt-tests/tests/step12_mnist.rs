@@ -151,20 +151,56 @@ fn train<B: AutodiffBackend>(
     init: &Init,
     device: &B::Device,
 ) -> (Vec<f32>, Mlp<B>) {
+    train_timed(split, setup, init, device).0
+}
+
+/// What [`train_timed`] returns: the losses and model, the dataset's upload
+/// time, the steps' time without it, and `burn_tt::device_time` when the steps
+/// began.
+type Timed<B> = (
+    (Vec<f32>, Mlp<B>),
+    std::time::Duration,
+    std::time::Duration,
+    Vec<(&'static str, u64, std::time::Duration)>,
+);
+
+/// [`train`], and how long the steps took, without the dataset's upload.
+fn train_timed<B: AutodiffBackend>(
+    split: &Split,
+    setup: &Setup,
+    init: &Init,
+    device: &B::Device,
+) -> Timed<B> {
+    let t0 = std::time::Instant::now();
     let mut model = Mlp::<B>::new(init, device);
     let mut optim = SgdConfig::new().init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
     let mut losses = Vec::new();
+    // The images go to the device once; each batch is a row slice of them. On
+    // `burn-tt`, `to_device` makes the tensor resident in GDDR and a slice of
+    // whole tile rows is a view, so no image crosses PCIe after this.
+    let images: Tensor<B, 2> = Tensor::from_data(
+        TensorData::new(
+            split.images[..setup.samples * PIXELS].to_vec(),
+            [setup.samples, PIXELS],
+        ),
+        device,
+    )
+    .to_device(device);
+    let preload = t0.elapsed();
+    let device_before = burn_tt::device_time();
+    let t0 = std::time::Instant::now();
     for _ in 0..setup.epochs {
         for from in (0..setup.samples).step_by(setup.batch) {
-            let (x, y) = batch::<B>(split, from, setup.batch, device);
+            let (_, y) = batch::<B>(split, from, setup.batch, device);
+            let x = images.clone().slice([from..from + setup.batch, 0..PIXELS]);
             let loss = loss_fn.forward(model.forward(x), y);
             losses.push(loss.clone().into_scalar().elem::<f32>());
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(setup.lr, model, grads);
         }
     }
-    (losses, model)
+    ((losses, model), preload, t0.elapsed(), device_before)
 }
 
 use burn::tensor::ElementConversion;
@@ -230,7 +266,21 @@ fn the_mlp_trains_on_a_reduced_dataset() {
     let bless = std::env::var_os("TT_BLESS").is_some();
     let want = golden();
     with_device(Config::default(), |d| {
+        let before = burn_tt::tensor_traffic();
         let (tt, _) = train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d);
+        let moved = burn_tt::tensor_traffic() - before;
+        let n = tt.len() as u64;
+        println!(
+            "MEASURE tensor traffic per step: {} B up in {} uploads, {} B down in {} downloads",
+            moved.uploaded / n,
+            moved.uploads / n,
+            moved.downloaded / n,
+            moved.downloads / n
+        );
+        assert!(
+            moved.uploads > 0,
+            "the matmuls must have run on device-resident tensors"
+        );
         for (i, (t, h)) in tt.iter().zip(&host).enumerate() {
             eprintln!("step {i:2}: device {t:.6}  host {h:.6}");
         }
@@ -357,14 +407,35 @@ fn the_mlp_trains_on_full_mnist() {
         ..full
     };
     let steps = full.samples / full.batch;
-    let t0 = std::time::Instant::now();
-    let (host, host_model) = train::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice);
-    let host_time = t0.elapsed();
+    let ((host, host_model), _, host_time, _) =
+        train_timed::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice);
     let host_acc = accuracy(&host_model, &test_split, test_split.n, &FlexDevice);
     with_device(Config::default(), |d| {
         let t0 = std::time::Instant::now();
-        let (tt, model) = train::<Autodiff<TtBackend>>(&train_split, &full, &init, &d);
-        let tt_time = t0.elapsed();
+        let ((tt, model), preload, tt_time, before) =
+            train_timed::<Autodiff<TtBackend>>(&train_split, &full, &init, &d);
+        let before: std::collections::HashMap<_, _> =
+            before.into_iter().map(|(k, n, t)| (k, (n, t))).collect();
+        let _ = t0;
+        eprintln!(
+            "MEASURE preload (model and {} images to the device): {preload:.2?}",
+            full.samples
+        );
+        let mut device = std::time::Duration::ZERO;
+        for (k, n, t) in burn_tt::device_time() {
+            let (n0, t0) = before.get(k).copied().unwrap_or_default();
+            let (n, t) = (n - n0, t - t0);
+            device += t;
+            eprintln!(
+                "MEASURE per step {k:<12} {:>5.2} calls {:>7.3} ms",
+                n as f64 / steps as f64,
+                t.as_secs_f64() * 1e3 / steps as f64
+            );
+        }
+        eprintln!(
+            "MEASURE per step host (Burn, autodiff, loss) {:.3} ms",
+            (tt_time - device).as_secs_f64() * 1e3 / steps as f64
+        );
         let acc = accuracy(&model, &test_split, test_split.n, &d);
         for i in (0..steps).step_by(50) {
             eprintln!("step {i:4}: device {:.4}  host {:.4}", tt[i], host[i]);

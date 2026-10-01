@@ -136,21 +136,80 @@ fn attach_engine(
     use burn_tt::{Engine, EngineError};
     use tt_device::Device;
 
+    // The same `Session` the silicon engine uses (`burn_tt::kmd_engine`), so
+    // the reduced run's golden exercises the resident path on both targets.
     struct Sim<'a> {
-        dev: Device<tt_ttsim::LibTtsim<'a>>,
+        session: tt_kernels::session::Session<tt_ttsim::LibTtsim<'a>>,
         config: Config,
+        buffers: burn_tt::DramBuffers,
     }
     impl Engine for Sim<'_> {
+        fn supports_dram(&self) -> bool {
+            true
+        }
+        fn upload(
+            &mut self,
+            v: &[f32],
+            r: usize,
+            c: usize,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers.upload(&mut self.session, v, r, c)
+        }
+        fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
+            self.buffers.download(&mut self.session, id)
+        }
+        fn free(&mut self, id: burn_tt::BufferId) {
+            self.buffers.free(&mut self.session, id)
+        }
+        fn matmul_dram(
+            &mut self,
+            a: burn_tt::BufferId,
+            ta: bool,
+            b: burn_tt::BufferId,
+            tb: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            let c = &self.config;
+            self.buffers.matmul(
+                &mut self.session,
+                a,
+                ta,
+                b,
+                tb,
+                c.route,
+                c.fidelity,
+                c.budget,
+            )
+        }
+        fn eltwise(
+            &mut self,
+            kind: u32,
+            scalar: f32,
+            a: burn_tt::BufferId,
+            b: Option<burn_tt::BufferId>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
+        }
+        fn sum_rows(
+            &mut self,
+            a: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.sum_rows(&mut self.session, a)
+        }
+        fn slice_rows(
+            &mut self,
+            a: burn_tt::BufferId,
+            first: usize,
+            rows: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.slice_rows(a, first, rows)
+        }
         fn matmul(
             &mut self,
             a: &[f32],
             b: &[f32],
             mkn: [usize; 3],
         ) -> Result<Vec<f32>, EngineError> {
-            Ok(tt_kernels::session::matmul_on(
-                &mut self.dev,
-                crate::harness::tensix_tile(),
-                &tt_firmware_images::ROLES,
+            Ok(self.session.matmul(
                 a,
                 b,
                 mkn,
@@ -165,7 +224,23 @@ fn attach_engine(
         let mut sim = tt_ttsim::Simulator::open()
             .map_err(|e| EngineError(format!("could not open the simulator: {e}")))?;
         let dev = Device::open(sim.transport()).map_err(|e| EngineError(e.to_string()))?;
-        serve.serve(&mut Sim { dev, config });
+        let t = crate::harness::tensix_tile();
+        let session = tt_kernels::session::Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            tt_kernels::session::TileChoice::Exactly(t.x(), t.y()),
+            |_, _| Ok(()),
+        )
+        .map_err(|e| EngineError(e.to_string()))?;
+        let mut session = session;
+        session
+            .enable_dram(tt_firmware_images::DM_B.1)
+            .map_err(|e| EngineError(e.to_string()))?;
+        serve.serve(&mut Sim {
+            session,
+            config,
+            buffers: Default::default(),
+        });
         Ok(())
     })
 }
@@ -175,14 +250,19 @@ fn attach_engine(
     device: TtDevice,
     config: Config,
 ) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
-    let (x, y) = crate::backend::GATE_TILE;
-    attach(
-        device,
-        burn_tt::kmd_engine(
-            device,
-            burn_tt::TileChoice::Exactly(x, y),
-            config.route,
-            config.fidelity,
-        ),
-    )
+    // `TT_TOPOLOGY` ("0", "0,1") picks the cards, so one benchmark runs on one
+    // card or several unchanged (`burn_tt::Topology`); unset, the card this
+    // gate was pointed at, on the gate tile.
+    let topology = match burn_tt::Topology::from_env() {
+        Some(t) => t?,
+        None => {
+            let (x, y) = crate::backend::GATE_TILE;
+            burn_tt::Topology::Single {
+                card: device.chip,
+                tile: burn_tt::TileChoice::Exactly(x, y),
+            }
+        }
+    };
+    eprintln!("topology: {topology:?}");
+    burn_tt::attach_topology(device, topology, config.route, config.fidelity)
 }

@@ -28,6 +28,207 @@ use crate::TtDevice;
 pub trait Engine {
     /// `A[m, k] @ B[k, n]`, row-major.
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
+
+    /// Can this engine keep tensors on the device (Phase 9)? If not, every
+    /// tensor stays on the host and only `matmul` runs on the device.
+    fn supports_dram(&self) -> bool {
+        false
+    }
+    /// Put a row-major `[rows, cols]` matrix on the device.
+    fn upload(
+        &mut self,
+        _values: &[f32],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<BufferId, EngineError> {
+        Err(unsupported())
+    }
+    /// Read one back, row-major.
+    fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, EngineError> {
+        Err(unsupported())
+    }
+    /// Forget one.
+    fn free(&mut self, _id: BufferId) {}
+    /// `op(A) @ op(B)`, each operand transposed if asked, result left on the
+    /// device, as `(id, [rows, cols])`.
+    fn matmul_dram(
+        &mut self,
+        _a: BufferId,
+        _a_transposed: bool,
+        _b: BufferId,
+        _b_transposed: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// The sum over rows of `a`, `[1, cols]`, left on the device.
+    fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
+    /// keeps `a` alive while the view is.
+    fn slice_rows(
+        &mut self,
+        _a: BufferId,
+        _first: usize,
+        _rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_isa::dm::kind`),
+    /// result left on the device.
+    fn eltwise(
+        &mut self,
+        _kind: u32,
+        _scalar: f32,
+        _a: BufferId,
+        _b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+}
+
+fn unsupported() -> EngineError {
+    EngineError("this engine keeps no tensors on the device".into())
+}
+
+/// A tensor kept on the device, by the engine's own numbering.
+pub type BufferId = u64;
+
+/// The device-resident tensors of one engine: a [`Session`]'s `DramTensor`s by
+/// id. The engines built on a `Session` -- [`KmdEngine`], and the simulator's in
+/// `tt-tests` -- forward their DRAM methods here.
+#[derive(Default)]
+pub struct DramBuffers {
+    next: BufferId,
+    live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
+}
+
+impl DramBuffers {
+    pub fn upload<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<BufferId, EngineError> {
+        let t = s
+            .upload(values, rows, cols)
+            .map_err(|e| EngineError(e.to_string()))?;
+        self.next += 1;
+        self.live.insert(self.next, t);
+        Ok(self.next)
+    }
+
+    pub fn download<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+    ) -> Result<Vec<f32>, EngineError> {
+        let t = self.get(id)?;
+        s.download(t).map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
+        if let Some(t) = self.live.remove(&id) {
+            let _ = s.free(t);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let c = s
+            .matmul_dram(
+                &ta,
+                a_transposed,
+                &tb,
+                b_transposed,
+                route,
+                fidelity,
+                budget,
+            )
+            .map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
+    }
+
+    pub fn eltwise<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        kind: u32,
+        scalar: f32,
+        a: BufferId,
+        b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let tb = b.map(|b| self.get(b).cloned()).transpose()?;
+        let op = tt_kernels::tensor::Eltwise { kind, scalar };
+        let c = s
+            .eltwise(op, &ta, tb.as_ref())
+            .map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
+    }
+
+    pub fn sum_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let c = s.sum_rows(&ta).map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    /// A view: freeing it frees nothing (`DramTensor::rows_view`).
+    pub fn slice_rows(
+        &mut self,
+        a: BufferId,
+        first: usize,
+        rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let v = self
+            .get(a)?
+            .rows_view(first, rows)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(v))
+    }
+
+    fn insert(&mut self, t: tt_kernels::tensor::DramTensor) -> (BufferId, [usize; 2]) {
+        let dims = [t.rows, t.cols];
+        self.next += 1;
+        self.live.insert(self.next, t);
+        (self.next, dims)
+    }
+
+    /// How many are live.
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, EngineError> {
+        self.live
+            .get(&id)
+            .ok_or_else(|| EngineError(format!("no device buffer {id}")))
+    }
 }
 
 /// Why an engine could not start or finish a job.
@@ -186,11 +387,113 @@ pub(crate) fn run<R: Send + 'static>(
         .unwrap_or_else(|_| panic!("{device}'s server thread stopped during a job"))
 }
 
+/// [`run`], timed by `kind` (`crate::traffic::device_time`).
+fn timed_run<R: Send + 'static>(
+    kind: &'static str,
+    device: TtDevice,
+    job: impl FnOnce(&mut dyn Engine) -> R + Send + 'static,
+) -> R {
+    crate::traffic::timed(kind, || run(device, job))
+}
+
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
     let (a, b) = (a.to_vec(), b.to_vec());
-    run(device, move |engine| engine.matmul(&a, &b, mkn))
-        .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
+    timed_run("matmul_host", device, move |engine| {
+        engine.matmul(&a, &b, mkn)
+    })
+    .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
+}
+
+/// Does `device`'s engine keep tensors on the device? Asked once per device.
+pub(crate) fn supports_dram(device: TtDevice) -> bool {
+    static KNOWN: Mutex<Option<HashMap<TtDevice, bool>>> = Mutex::new(None);
+    if let Some(&k) = KNOWN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&device)
+    {
+        return k;
+    }
+    let k = run(device, |engine| engine.supports_dram());
+    KNOWN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(device, k);
+    k
+}
+
+/// Upload, panicking on a device error.
+pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
+    crate::traffic::uploaded(values.len() * 4);
+    timed_run("upload", device, move |engine| {
+        engine.upload(&values, rows, cols)
+    })
+    .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
+}
+
+/// Download, panicking on a device error.
+pub(crate) fn download(device: TtDevice, id: BufferId) -> Vec<f32> {
+    let v = timed_run("download", device, move |engine| engine.download(id))
+        .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
+    crate::traffic::downloaded(v.len() * 4);
+    v
+}
+
+/// Free, without waiting; nothing to do if the device has gone.
+pub(crate) fn free(device: TtDevice, id: BufferId) {
+    if let Some(sender) = with_attached(|a| a.get(&device).map(|d| d.jobs.clone())) {
+        let _ = sender.send(Box::new(move |engine| engine.free(id)));
+    }
+}
+
+/// Element-wise on the device, panicking on a device error.
+pub(crate) fn eltwise(
+    device: TtDevice,
+    kind: u32,
+    scalar: f32,
+    a: BufferId,
+    b: Option<BufferId>,
+) -> (BufferId, [usize; 2]) {
+    timed_run("eltwise", device, move |engine| {
+        engine.eltwise(kind, scalar, a, b)
+    })
+    .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
+}
+
+/// Sum over rows on the device, panicking on a device error.
+pub(crate) fn sum_rows(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]) {
+    timed_run("sum_rows", device, move |engine| engine.sum_rows(a))
+        .unwrap_or_else(|e| panic!("sum over rows on {device}: {e}"))
+}
+
+/// A row view on the device, panicking on a device error.
+pub(crate) fn slice_rows(
+    device: TtDevice,
+    a: BufferId,
+    first: usize,
+    rows: usize,
+) -> (BufferId, [usize; 2]) {
+    timed_run("slice_rows", device, move |engine| {
+        engine.slice_rows(a, first, rows)
+    })
+    .unwrap_or_else(|e| panic!("row view on {device}: {e}"))
+}
+
+/// `op(A) @ op(B)` on the device, panicking on a device error.
+pub(crate) fn matmul_dram(
+    device: TtDevice,
+    a: BufferId,
+    a_transposed: bool,
+    b: BufferId,
+    b_transposed: bool,
+) -> (BufferId, [usize; 2]) {
+    timed_run("matmul_dram", device, move |engine| {
+        engine.matmul_dram(a, a_transposed, b, b_transposed)
+    })
+    .unwrap_or_else(|e| panic!("matmul on {device}: {e}"))
 }
 
 // --- Silicon ------------------------------------------------------------------
@@ -203,6 +506,8 @@ pub struct KmdEngine {
     /// Per-role budget for each run; on silicon, a floor of one second applies
     /// (`tt_kernels::runtime::run`).
     pub budget: u64,
+    /// Tensors kept in GDDR, if the session has it enabled.
+    pub buffers: Option<DramBuffers>,
 }
 
 impl Engine for KmdEngine {
@@ -210,6 +515,64 @@ impl Engine for KmdEngine {
         Ok(self
             .session
             .matmul(a, b, mkn, self.route, self.fidelity, self.budget)?)
+    }
+    fn supports_dram(&self) -> bool {
+        self.buffers.is_some()
+    }
+    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.upload(&mut self.session, v, rows, cols)
+    }
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.download(&mut self.session, id)
+    }
+    fn free(&mut self, id: BufferId) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.free(&mut self.session, id);
+        }
+    }
+    fn matmul_dram(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul(
+            &mut self.session,
+            a,
+            ta,
+            b,
+            tb,
+            self.route,
+            self.fidelity,
+            self.budget,
+        )
+    }
+    fn eltwise(
+        &mut self,
+        kind: u32,
+        scalar: f32,
+        a: BufferId,
+        b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise(&mut self.session, kind, scalar, a, b)
+    }
+    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.sum_rows(&mut self.session, a)
+    }
+    fn slice_rows(
+        &mut self,
+        a: BufferId,
+        first: usize,
+        rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.slice_rows(a, first, rows)
     }
 }
 
@@ -222,12 +585,18 @@ pub fn kmd_engine(
     fidelity: Fidelity,
 ) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
     move |serve| {
-        let session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
+        let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
+        // Tensors live in GDDR (Phase 9). Bit-identical to the host-staged path
+        // (`step18_dram_matmul`), so on by default.
+        session
+            .enable_dram(tt_firmware_images::DM_B.1)
+            .map_err(|e| EngineError(e.to_string()))?;
         let mut engine = KmdEngine {
             session,
             route,
             fidelity,
             budget: 400_000,
+            buffers: Some(DramBuffers::default()),
         };
         serve.serve(&mut engine);
         Ok(())

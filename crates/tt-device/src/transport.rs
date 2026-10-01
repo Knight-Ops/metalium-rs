@@ -197,6 +197,23 @@ pub trait Transport {
     /// Required rather than defaulted: each transport has to say which it is.
     fn is_simulated(&self) -> bool;
 
+    /// Write device *memory* -- L1 or GDDR -- in bulk.
+    ///
+    /// A transport may use a faster, weaker path here (write-combining on
+    /// silicon), so only [`crate::Device`]'s memory accessors call it: never a
+    /// register, which may be dword-only and must see its stores in order. The
+    /// write is complete from the CPU's side when this returns (nothing buffered
+    /// may be overtaken by a later access), but, as with every PCIe write, not
+    /// necessarily landed; see `Device::fence`.
+    fn bar_write_bulk(&mut self, bar: Bar, offset: u64, src: &[u8]) -> Result<()> {
+        self.bar_write(bar, offset, src)
+    }
+
+    /// Read device memory in bulk. See [`Transport::bar_write_bulk`].
+    fn bar_read_bulk(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.bar_read(bar, offset, dst)
+    }
+
     /// Read a single dword from a BAR.
     fn bar_read32(&mut self, bar: Bar, offset: u64) -> Result<u32> {
         let mut buf = [0u8; 4];

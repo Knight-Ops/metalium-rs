@@ -480,6 +480,25 @@ pub fn pack_instruction(read_intf_sel: u32, last: bool) -> Instruction {
         .unwrap()
 }
 
+/// Release every Tensix semaphore: `SEMINIT` each to `Value` 1, `Max` 2.
+///
+/// A thread blocked in `SEMWAIT` survives the backend soft-reset pulse, and
+/// every later program on that thread queues behind it -- `MEASURED` on silicon,
+/// where a kernel whose math role waited on a semaphore nothing posted left the
+/// tile wedged across processes (divergence row 65). One `SEMWAIT` waits while a
+/// semaphore is zero, the other while it is at its max; 1 of 2 satisfies
+/// neither, so whatever is blocked runs on. Pushed from thread 0, which the
+/// reset runs first. Every kernel initialises the semaphores it uses in its own
+/// setup, so nothing depends on these values.
+pub fn release_semaphores() -> Vec<Instruction> {
+    (0..8)
+        .map(|i| {
+            let sem = tt_isa::sync::Semaphore::new(i).expect("eight semaphores");
+            tt_isa::sync::init(sem, 1, 2).expect("four-bit fields")
+        })
+        .collect()
+}
+
 /// Put the tile's configuration and the issuing thread's own Tensix state back to
 /// what ttsim starts with: `Config` below the global block zero, every
 /// `ThreadConfig` entry zero, every RWC zero, every ADC counter zero.

@@ -630,6 +630,7 @@ dependencies = [
  "burn-backend",
  "burn-flex",
  "burn-tensor",
+ "num-traits",
  "tt-device",
  "tt-firmware-images",
  "tt-isa",
@@ -4845,6 +4846,16 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "tt-isa",
+]
+
+[[package]]
+name = "tt-mnist"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-flex",
+ "burn-tt",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]

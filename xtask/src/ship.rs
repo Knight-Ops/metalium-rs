@@ -13,6 +13,7 @@ const SHIPPABLE: &[&str] = &[
     "tt-kernels",
     "tt-firmware-images",
     "burn-tt",
+    "tt-mnist",
 ];
 
 /// Crates that exist only for development, and so are exempt.

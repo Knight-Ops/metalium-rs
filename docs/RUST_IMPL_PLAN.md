@@ -1008,6 +1008,29 @@ taken.
 double buffering, multi-tile distribution with NoC multicast. Measure against the theoretical
 peak figures in the spec, not against a competitor.
 
+**Direction, decided 2026-09-30: device residency first.** The release baseline is 224 ms per
+MNIST step on the device against 0.5 ms for Flex on the host, and almost all of it is the host
+path: every matmul re-sends its operands over PCIe and repeats per-session work (a reset, seven
+firmware loads, program rebuilds). The answer is not a faster PCIe path but not using PCIe at all:
+a p150a carries 32 GiB of GDDR6, so the dataset and weights are loaded once at startup and stay
+there, and the metric is PCIe bytes per training step. The device-side items above follow once
+per-op cost is the device's. Progress and measurements are in the checklist's Phase 9 section;
+two findings shape it: the GDDR is reachable and gated on both cards (divergence measurement L),
+and under this VM the host's MMIO is uncached whatever the guest maps (measurement M), so bulk
+upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off the step.
+
+**Where it stands, and what is next (2026-09-30).** Full MNIST trains at **5.8 ms/step on one
+card** (from 224 at the start of the phase), bit for bit on the Phase 7 golden, with the dataset,
+weights, activations and gradients resident in GDDR. About 16 KB crosses PCIe per step (`g2`, the
+two biases and their gradients, and the logits); the loss stays on the host. What is left is
+almost all compute on **a single Tensix tile**, sequenced by the host one round trip at a time. In
+order: spread matmul and element-wise work over many tiles (9.6); let each tile's B mover sequence
+gather, compute and scatter from an L1 work queue so an op is one host descriptor (9.7); double-
+buffer so data movement overlaps compute (9.8); move element-wise from the B core's FP32 unit to
+the SFPU (9.9); tilize on the device to cut the 2.7 s preload (9.10); make the two-card mesh
+device-resident and concurrent (9.11); and put the loss on the SFPU (9.12). The checklist's Phase 9
+section tracks each.
+
 **ttsim does not model cycle-accurate timing.** It remains useful here for *correctness* of the
 more aggressive pipelined kernels — which is where correctness is hardest — but every
 performance number must come from hardware. Keep using the simulator as the correctness gate

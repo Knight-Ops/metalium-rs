@@ -317,6 +317,24 @@ pub mod niu {
         /// is unsafe on Blackhole (`MemoryMap.md`, `NOC_CTRL` bit 3), so the
         /// destination must be MMIO.
         MmioInline { to: Endpoint, data: u32 },
+        /// Read all of `from`, a range of a usable GDDR channel, into this
+        /// tile's L1 at `to_local`, through the channel's endpoint `port`.
+        ///
+        /// DRAM is an "other" address, so a read into L1 needs the two addresses
+        /// congruent mod [`crate::dram::ALIGN`] (64), not 16. The offset fits
+        /// the low address word: [`crate::dram::CHANNEL_BYTES`] is below 4 GiB.
+        ReadDram {
+            from: crate::dram::DramRange,
+            port: u8,
+            to_local: u32,
+        },
+        /// Write `len` bytes of this tile's L1 at `from_local` over all of `to`
+        /// (C16, WH `NoC/Alignment.md:32`).
+        WriteDram {
+            from_local: u32,
+            to: crate::dram::DramRange,
+            port: u8,
+        },
     }
 
     /// Why a [`Command`] was refused.
@@ -329,6 +347,8 @@ pub mod niu {
         Length,
         /// An inline write aimed at L1, or at an unaligned MMIO address.
         InlineToL1,
+        /// A DRAM endpoint port beyond the channel's three.
+        Port,
     }
 
     const CMD_WR: u32 = 2;
@@ -377,6 +397,24 @@ pub mod niu {
                     }
                     (to, local(0), CMD_WR | WR_INLINE | RESP_MARKED, 0, data)
                 }
+                Command::ReadDram {
+                    from,
+                    port,
+                    to_local,
+                } => {
+                    let (from, len) = dram_endpoint(from, port)?;
+                    check_dram(from.addr, to_local, len, crate::dram::ALIGN as u32)?;
+                    (from, local(to_local), CMD_RD | RESP_MARKED, len, 0)
+                }
+                Command::WriteDram {
+                    from_local,
+                    to,
+                    port,
+                } => {
+                    let (to, len) = dram_endpoint(to, port)?;
+                    check_dram(from_local, to.addr, len, 16)?;
+                    (local(from_local), to, CMD_WR | RESP_MARKED, len, 0)
+                }
             };
             Ok([
                 (TARG_ADDR_LO, targ.addr),
@@ -391,6 +429,31 @@ pub mod niu {
                 (AT_DATA, data),
             ])
         }
+    }
+
+    /// The endpoint `port` of a DRAM range's channel, and the range's length.
+    fn dram_endpoint(r: crate::dram::DramRange, port: u8) -> Result<(Endpoint, u32), RequestError> {
+        let at = r.channel().endpoint(port).ok_or(RequestError::Port)?;
+        let len = u32::try_from(r.len()).map_err(|_| RequestError::Length)?;
+        // `CHANNEL_BYTES` is below 4 GiB, so the offset fits the low word.
+        let e = Endpoint {
+            x: at.x(),
+            y: at.y(),
+            addr: r.offset() as u32,
+        };
+        Ok((e, len))
+    }
+
+    /// A GDDR <-> L1 copy: the L1 side must be L1, the two congruent mod
+    /// `modulus`, and the length one request.
+    fn check_dram(src: u32, dst: u32, len: u32, modulus: u32) -> Result<(), RequestError> {
+        if len == 0 || len > MAX_REQUEST_BYTES {
+            return Err(RequestError::Length);
+        }
+        if src % modulus != dst % modulus || src >= MMIO_START || dst >= MMIO_START {
+            return Err(RequestError::Alignment);
+        }
+        Ok(())
     }
 
     fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
@@ -447,6 +510,61 @@ pub mod niu {
             assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 4 | (5 << 6));
             assert_eq!(reg(&r, initiator::RET_ADDR_HI), 3 | (1 << 6));
             assert_eq!(reg(&r, initiator::CTRL), CMD_RD | RESP_MARKED);
+        }
+
+        #[test]
+        fn a_dram_read_targets_the_translated_endpoint_and_needs_c64() {
+            let ch = crate::dram::Dram::FULL.channel(5).unwrap();
+            let rd = |off: u64, to: u32| Command::ReadDram {
+                from: ch.range(off, 2048).unwrap(),
+                port: 1,
+                to_local: to,
+            };
+            let r = rd(0x10_0060, 0x3_0020).registers((3, 4), T).unwrap();
+            // Channel 5, port 1: translated (18, 12 + 3 + 1).
+            assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 18 | (16 << 6));
+            assert_eq!(reg(&r, initiator::TARG_ADDR_LO), 0x10_0060);
+            assert_eq!(reg(&r, initiator::TARG_ADDR_MID), 0);
+            assert_eq!(reg(&r, initiator::RET_ADDR_LO), 0x3_0020);
+            assert_eq!(reg(&r, initiator::AT_LEN_BE), 2048);
+            assert_eq!(reg(&r, initiator::CTRL), CMD_RD | RESP_MARKED);
+            // Congruent mod 16, or mod 32, but not mod 64: refused (row 64).
+            for off in [0x10_0010, 0x10_0040] {
+                assert_eq!(
+                    rd(off, 0x3_0020).registers((3, 4), T),
+                    Err(RequestError::Alignment)
+                );
+            }
+        }
+
+        #[test]
+        fn a_dram_write_needs_c16_a_port_and_one_request() {
+            let ch = crate::dram::Dram::FULL.channel(0).unwrap();
+            let wr = |len: u64, port: u8, from: u32| Command::WriteDram {
+                from_local: from,
+                to: ch.range(0x40, len).unwrap(),
+                port,
+            };
+            let r = wr(64, 0, 0x2_0000).registers((3, 4), T).unwrap();
+            assert_eq!(reg(&r, initiator::TARG_ADDR_LO), 0x2_0000);
+            assert_eq!(reg(&r, initiator::RET_ADDR_HI), 17 | (12 << 6));
+            assert_eq!(reg(&r, initiator::RET_ADDR_LO), 0x40);
+            assert_eq!(
+                wr(64, 0, 0x2_0008).registers((3, 4), T),
+                Err(RequestError::Alignment)
+            );
+            assert_eq!(
+                wr(64, 3, 0x2_0000).registers((3, 4), T),
+                Err(RequestError::Port)
+            );
+            assert_eq!(
+                wr(MAX_REQUEST_BYTES as u64 + 16, 0, 0x2_0000).registers((3, 4), T),
+                Err(RequestError::Length)
+            );
+            assert_eq!(
+                wr(0, 0, 0x2_0000).registers((3, 4), T),
+                Err(RequestError::Length)
+            );
         }
 
         #[test]

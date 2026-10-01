@@ -57,8 +57,15 @@ pub const CORPUS_T0: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS_T0"));
 /// The Ethernet-tile image, for RISCV E1, loaded at `tt_isa::eth::E1_IMAGE`.
 pub const ETH_E1: &[u8] = include_bytes!(env!("FIRMWARE_ETH_E1"));
 
+/// The RISCV B data mover (`tt_isa::dm`), loaded at L1 offset 0.
+pub const DM_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_DM_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 8] = [
+const ENTRIES: [(&str, &str); 9] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -67,6 +74,7 @@ const ENTRIES: [(&str, &str); 8] = [
     ("role_t1", env!("FIRMWARE_ROLE_T1_ENTRY")),
     ("role_t2", env!("FIRMWARE_ROLE_T2_ENTRY")),
     ("eth_e1", env!("FIRMWARE_ETH_E1_ENTRY")),
+    ("dm_b", env!("FIRMWARE_DM_B_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -112,5 +120,15 @@ mod tests {
         assert_eq!(entry("eth_e1").map(u64::from), Some(eth::E1_IMAGE));
         assert!(ETH_E1.len() as u64 <= eth::E1_IMAGE_MAX);
         assert!(eth::is_customer_l1(eth::E1_IMAGE, eth::E1_IMAGE_MAX));
+    }
+
+    /// B cannot be redirected, so its image must be linked at 0 and stay below
+    /// T0's entry point.
+    #[test]
+    fn the_data_mover_is_linked_where_b_starts() {
+        let (core, image, at) = DM_B;
+        assert_eq!(entry("dm_b").map(u64::from), Some(at));
+        assert_eq!(at, core.default_reset_pc() as u64);
+        assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);
     }
 }

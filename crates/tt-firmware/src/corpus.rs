@@ -75,8 +75,55 @@ where
     // SAFETY: fixed aligned mailbox locations inside L1.
     unsafe { l1_write32(mb.status(), status::RUNNING) };
     publish();
+    // SAFETY: as above; written by the host before this core left reset.
+    let mut generation = unsafe { l1_read32(mb.generation()) };
+    loop {
+        let program_len = run_once::<Riscv, Thread>(mb);
+        if generation == 0 {
+            // The dump is what carries the result; this only says it is complete.
+            if mb == Mailbox::single_core() {
+                finish(program_len);
+            } else {
+                // SAFETY: fixed aligned mailbox location inside L1.
+                unsafe { l1_write32(mb.status(), status::DONE) };
+                publish();
+            }
+            spin()
+        }
+        // Resident (`mailbox::GENERATION`): acknowledge, then wait for the next
+        // one. The host writes the whole descriptor and program before the new
+        // generation, and the poll goes through a fence, since nothing the NoC
+        // writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
+        // SAFETY: fixed aligned mailbox locations inside L1.
+        unsafe {
+            l1_write32(mb.status(), status::DONE);
+            l1_write32(mb.ack(), generation);
+        }
+        publish();
+        loop {
+            publish();
+            // SAFETY: as above.
+            let next = unsafe { l1_read32(mb.generation()) };
+            if next != 0 && next != generation {
+                generation = next;
+                break;
+            }
+        }
+        // SAFETY: as above.
+        unsafe { l1_write32(mb.status(), status::RUNNING) };
+        publish();
+    }
+}
+
+/// One run of the staged program: read the descriptor, push the program, wait
+/// for it to retire, dump `Dst`. Returns the program's length.
+fn run_once<Riscv, Thread>(mb: Mailbox) -> u32
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
     // SAFETY: fixed, aligned mailbox locations written by the host before this core
-    // left reset.
+    // left reset (or, resident, before it wrote the new generation).
     let thread = unsafe { l1_read32(mb.thread_index()) };
     let fmt = unsafe { l1_read32(mb.dst_access_fmt()) };
     let program_len = unsafe { l1_read32(mb.program_len()) };
@@ -163,13 +210,5 @@ where
         row += 1;
     }
 
-    // The dump is what carries the result; this only says it is complete.
-    if mb == Mailbox::single_core() {
-        finish(program_len);
-    } else {
-        // SAFETY: fixed aligned mailbox location inside L1.
-        unsafe { l1_write32(mb.status(), status::DONE) };
-        publish();
-    }
-    spin()
+    program_len
 }

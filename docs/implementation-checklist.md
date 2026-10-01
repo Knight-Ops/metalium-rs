@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[ ]` | Silicon-only |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR |
 
 ---
 
@@ -1093,7 +1093,8 @@ projects of this shape stall.
       commands fine). It exposed a real hazard: `Device::write` does not order
       against agents other than the host. `Mover::stage` now reads back, and
       the silicon gates fence what they stage.
-- [ ] **A `Device` write fence** as API, rather than read-backs at call sites.
+- [ ] **A `Device` write fence** as API, rather than read-backs at call sites
+      (carried into Phase 9).
 - [ ] Double-buffered `TX_STAGE`/`RX_LAND`, and both links at once.
 - [ ] **Data-parallel training** (a gradient all-reduce over the links) is not
       done. It reorders sums, so it needs a weaker claim than the golden, and
@@ -1103,6 +1104,197 @@ projects of this shape stall.
 
 ## Phase 9 — Performance (silicon-only)
 
+**Direction (2026-09-30):** keep everything on the card. A p150a has 32 GiB of
+GDDR6; the dataset and weights are loaded into it once at startup, and a
+steady-state training step should move almost nothing over PCIe. The headline
+metric is therefore **PCIe bytes per step** (`Device::traffic`), next to ms/step.
+The slice plan: 9.0 baseline, 9.1 DRAM discovery, 9.2 startup population,
+9.3 Tensix <-> DRAM data movement and session residency, 9.4 device-resident
+tensors in `burn-tt`, 9.5 gates.
+
+- [x] **9.0 Release baseline.** `cargo xtask silicon --release` (and the log
+      records the profile). Every earlier number was a dev build. Full MNIST,
+      release, both cards: **224 ms/step on the device, 0.5 ms/step for Flex on
+      the host**, test accuracy 91.96% against 91.97% as before. PCIe is bus-bound
+      and unchanged by the build: 19 MB/s write, 5 MB/s read.
+- [x] **`Device::traffic`**: bytes and calls in each direction, and TLB
+      retargets, counted at the three places a `Device` touches a BAR. Unit-tested
+      against the fake transport's own log, and watched failing with the read
+      counter removed.
+- [x] **`runtime::Profile`**: every `run` reports each phase (stage, setup,
+      programs, launch, wait, read-back) with its host time and traffic.
+- [x] **9.1 DRAM, from the chip.** `tt_isa::dram::Dram` is built from ARC tags
+      36 and 22 only (`Dram::FULL` on ttsim), and a `DramChannel` cannot be named
+      unless it is enabled, trained and BIST-clean; a fused-off channel is
+      refused outright, since it changes the translated numbering. Endpoints are
+      UMD's translated coordinates. `DramRange` stops at `0xFF00_0000` (row 63).
+      `Device::{dram_grid, dram_read, dram_write}`. Gate `step15_dram` (a single
+      read, patterns in every channel, the three-endpoint aliasing, refusals
+      before the transport) on ttsim and both cards; the round-trip gate was
+      watched failing. Measurement L.
+- [x] **The bulk path is memory-only by construction.** `Transport::bar_*_bulk`
+      is reached only from `Device::{l1_write, l1_read}` -- Tensix geometry and
+      inside L1, so no register -- and the DRAM accessors. Unit-tested refusals.
+      `tt-kmd` maps a second, WC view of BAR0/BAR4 for it (`RESOURCE*_WC`
+      transcribed and checked against the header, watched failing) and copies in
+      32-byte non-temporal stores and stream loads with an `sfence`.
+- [~] **Fast startup upload.** 226 MB/s into GDDR, 152 MB/s into L1, 38 MB/s
+      reading: 12x and 8x the dword path, but not WC -- under this KVM
+      passthrough the BAR is effectively uncached (measurement M). Enough to load
+      MNIST in under a second; real WC needs the host to map the BAR WC.
+- [x] **`niu::Command::{ReadDram, WriteDram}`**: take a `DramRange` and a port,
+      name the translated endpoint, and refuse a DRAM -> L1 read not congruent
+      mod 32 (L1 -> DRAM: mod 16), a fourth port, and more than one request.
+- [x] **9.3a The data mover on RISCV B** (`dm_b`, contract `tt_isa::dm`,
+      host `tt_kernels::dm::DataMover`): resident, one descriptor at a time,
+      DRAM -> L1 and L1 -> DRAM in 16 KiB NIU requests. Every refusal is in
+      `Descriptor::decode`, run by the host first and by the firmware again,
+      which answers rather than hangs. Gate `step16_dm` (every channel and port,
+      multi-request transfers, both refusal paths) on ttsim and both cards; per
+      move only the descriptor crosses PCIe, asserted with `Device::traffic`. It
+      found the DRAM read rule: **C64, not Wormhole's C32** (row 64).
+- [x] **9.3b Resident role firmware.** A non-zero `mailbox::GENERATION` makes
+      the runner acknowledge (`ACK`) and wait for the next generation instead of
+      stopping. `runtime::Resident` loads the three images once; `Session` resets
+      and starts it at open, and `Session::matmul` runs every chunk on it
+      (`matmul::matmul_with`). Both burn engines use `Session`, so the golden now
+      covers this path. Gate `step17_resident`: MNIST's shapes and fidelities,
+      twice round, bit-identical to reset-per-run `matmul_on`; a different kernel
+      in between changes nothing; a failed kernel is an error and the session
+      recovers (silicon). Watched failing with the math program left stale.
+      Recovery found row 65: a `SEMWAIT` survives the backend pulse, so the
+      tile reset now releases every semaphore first.
+- [x] **Result: full MNIST 224 -> 38.5 ms/step** on both cards (release),
+      accuracy unchanged (91.96%), the reduced golden bit for bit on ttsim, both
+      cards and sharded over the two. Silicon regression before the resident
+      change: 316/316; the Phase 9 gates with matmul, burn, MNIST and multi-chip
+      after it: 82/82.
+- [x] **9.3c** Programs and chunk plans memoised per process
+      (`matmul::programs`, `plan_in`); a resident program slot already holding
+      the program is not rewritten.
+- [x] **9.4a Tensors in GDDR** (`tt_kernels::tensor`). A `DramTensor` is
+      FP32 tiles in 4160-byte slots (zero header, datums, padding to 64, so any
+      slot copies to any other under C64), interleaved over the channels, by a
+      coalescing per-channel allocator. Upload and download are one bulk
+      transfer per channel. The mover takes descriptor **lists**, with a
+      transposed tile read (the B core transposes the tile in L1) and FP32
+      **compute** entries. Gates: `step18_dram_matmul` (round trips; MNIST's
+      forward and backward products, transposed operands included,
+      bit-identical to the host-staged matmul; a tile header's contents are
+      never read) and `step19_eltwise` (add/sub/mul/mul-scalar/relu/relu-backward/
+      broadcast row add against `burn-flex` bit for bit over +-0, +-inf, NaN,
+      huge and tiny values; the denormal flush recorded), ttsim and both cards.
+- [x] **Element-wise on the baby RISC-V's FP32 unit**, not the SFPU:
+      `fadd.s`/`fsub.s`/`fmul.s` round to nearest even with denormals flushed
+      (`InstructionSet.md:18-22`), IEEE for every normal case -- `fma_bh`
+      agreed with the host on 10^6 random `mul`, `add` and SGD updates each.
+      Reached through inline asm (the images stay `riscv32im`); the instruction
+      gate now decodes `F` and refuses `fmadd`/`fmsub`/`fnmadd`/`fnmsub` (watched
+      refusing a planted one). The SFPU path is the faster follow-up.
+- [x] **9.4b `burn-tt` keeps tensors on the device.** `TtTensor` is a shared
+      cell with lazily filled host and device copies (clones share both, so what
+      the forward pass uploads the backward pass finds); a 2-D transpose of a
+      device tensor is a view. On device: `float_matmul`, `float_add` (with the
+      `[1, n]` bias broadcast), `float_sub`, `float_mul`, `float_mul_scalar`,
+      `relu`, `relu_backward` -- whenever an operand is already there. Anything
+      else downloads once, counted by `burn_tt::tensor_traffic`
+      (`TT_TRACE_FALLBACK=1` says which op). Both engines keep tensors in GDDR.
+- [x] **Result: full MNIST 38.5 -> 16.8 ms/step** on both cards, accuracy
+      unchanged, the reduced golden bit for bit on ttsim and both cards. Tensor
+      traffic per step 675 KB up / 475 KB down -> 216 KB up / 35 KB down.
+- [x] **Profiled and cut, 16.8 -> 9.9 ms/step** (single card, both cards
+      alike, golden unchanged): element-wise in unrolled `flw`/`f*`/`fsw` loops
+      (7.4 -> 2.6 ms/step); the resident setup run skipped when a kernel
+      declares it restores its semaphores (`Kernel::restores_semaphores`, which
+      the matmul does by construction); face-wise transposes; and resident
+      program slots compared by encoded word -- comparing `Instruction`s
+      compared their definitions and cost 14 us per descriptor write on silicon,
+      more than the rewrite it saved (matmul 4.6 -> 2.7 ms/step). Per step now:
+      element-wise 2.6, matmul 2.7, upload 2.3, download 2.1, host 0.2 ms.
+- [x] **One switch for the topology**: `burn_tt::Topology` /
+      `attach_topology`, or `TT_TOPOLOGY=0` / `0,1` for the silicon harness, so a
+      benchmark runs on one card or both unchanged. Two cards are Phase 8's
+      mesh: host-staged, per-chunk resets, chips in turn -- 233 ms/step.
+- [ ] **The two-card full run's accuracy is 0.9195, one card's 0.9196.** The
+      reduced sharded run matches the golden bit for bit, so something past 32
+      steps diverges on the mesh. Phase 8 code; not yet investigated.
+- [ ] **The mesh is not device-resident**: GDDR tensors, per-chip resident
+      roles, and chips concurrent rather than in turn.
+- [x] **The dataset is preloaded; a batch is a view.** `float_to_device` makes
+      an F32 matrix resident (`Tensor::to_device` is the caller saying so), and
+      `float_slice` of whole tile rows of a resident matrix is a view of the
+      same slots (`DramTensor::rows_view`), keeping its parent alive. The MNIST
+      gates now upload the images once and slice each batch.
+- [x] **The bias gradient's sum is on the device.** `float_sum_dim(·, 0)` of a
+      resident matrix is `tensor::sum_rows`: `COL_SUM` adds each column's rows
+      in order from `+0.0`, which is `burn-flex`'s `sum_dim(0)` order exactly
+      (`ops/reduce.rs:959-989`) -- bit for bit on edge values and a
+      7000-row column spanning several mover lists, ttsim and both cards;
+      watched failing with the rows summed in reverse.
+- [x] **Small tensors move only what they occupy**: an upload writes only the
+      slots its tiles fill, and a small download reads only the faces and face
+      rows its data reaches (a `[1, n]` row: 128 bytes a tile, not 33 KB of
+      whole regions).
+- [x] **Result: full MNIST 9.9 -> 5.8 ms/step** steady state on both cards
+      (the one-time preload of the model and 59 968 images: 2.7 s, most of it
+      host tilizing), accuracy unchanged, 50/50 Phase 9 and training gates.
+      Per step: element-wise 2.4, matmul 2.4, column sums 0.3, downloads 0.3
+      (logits, two bias gradients), uploads 0.2 (`g2`, two biases), host
+      0.2 ms. Tensor traffic per step: about 13 KB up, 3 KB down.
+- [ ] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
+      allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum / SGD on
+      device, with fallback counted by `Device::traffic`.
+- [ ] **9.5** Reduced MNIST golden bit for bit with everything resident; PCIe
+      bytes per steady-state step asserted.
+- [x] **`tt-mnist`: the milestone as one binary.** A shippable crate whose
+      binary trains the MNIST MLP through Burn on the card, with MNIST
+      (deflated at build time, `miniz_oxide`) and the firmware embedded, and
+      optionally the same run on the host for comparison. Builds static for
+      `x86_64-unknown-linux-musl` (15 MB stripped; `tt-kmd`'s ioctl request type
+      follows the libc). Full epoch on one card: 91.96% test accuracy, 6.8
+      ms/step static, 5.8 with glibc. See `crates/tt-mnist/README.md`.
+
+### Phase 9 -- next steps, in order
+
+At 5.8 ms/step nearly everything left is compute on **one** of 120 Tensix
+tiles, done in turn. The next slices, each gated as the ones above were
+(ttsim for correctness, bit for bit against the golden and `burn-flex`; both
+cards for time):
+
+- [ ] **9.6 Many tiles.** A `Session` over a set of tiles, each with its
+      resident roles and its own B mover. Matmul split by output tile blocks
+      (`M` and `N`, `K` whole, so still bit-identical), element-wise and
+      column sums split by tile. The movers already read any channel, so the
+      interleaved placement feeds them all. Expected: matmul and element-wise
+      (4.8 ms of the 5.8) scale with tile count until the host's descriptor
+      round trips dominate -- which is the next item.
+- [ ] **9.7 One launch per op, not per chunk.** Today the host submits every
+      mover list and every kernel generation and polls for each: tens of
+      microseconds per round trip, several per op. Move the sequencing onto
+      the device: a per-tile work queue in L1 that the B mover drains (gather
+      -> signal the roles -> scatter), with the roles waiting on an L1 flag
+      rather than on the host. The host then writes one descriptor per op and
+      polls once.
+- [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
+      next chunk while the roles compute this one, and scatters the previous
+      one (the `Src`/`Dst` double buffering and the hazards-as-data wait
+      planner from the plan belong here).
+- [ ] **9.9 Element-wise on the SFPU.** Unpack to `Dst`, `SFPADD`/`SFPMUL`,
+      pack: the same IEEE results for normals (`fma_bh` measured it), at vector
+      width instead of one datum at a time on the B core. Needs whole-tile
+      `UnpackToDst`/pack, which Phase 5 did for 128 datums only.
+- [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
+      host tilizing: tilize in parallel, or upload row-major and let the movers
+      tilize on the device.
+- [ ] **9.11 The mesh, device-resident.** Per-chip `Session`s with GDDR and
+      resident roles, chips running concurrently, the Ethernet movers moving
+      tiles between GDDR rather than host-staged operands; data-parallel
+      training over the two cards. First find why the full two-card run's
+      accuracy is 0.9195 against one card's 0.9196.
+- [ ] **9.12 Loss on the device**: softmax and log on the SFPU, so the logits
+      stop crossing PCIe (the last per-step download bigger than a bias).
+
+- [ ] A `Device` write fence as API (Phase 8's open item).
 - [ ] `MOP`/`REPLAY` expansion.
 - [ ] Three-thread pipelining: unpack on T0, math on T1, pack on T2.
 - [ ] Double buffering; multi-tile distribution with NoC multicast.

@@ -76,6 +76,11 @@ pub struct Kmd {
     bar0: Mapping,
     bar2: Mapping,
     bar4: Mapping,
+    /// Write-combining views of the two BARs that carry TLB windows, used only
+    /// by the bulk path ([`Transport::bar_write_bulk`]), which `tt-device`
+    /// reserves for device memory. `None` if the driver offers no WC mapping.
+    bar0_wc: Option<Mapping>,
+    bar4_wc: Option<Mapping>,
 }
 
 /// A TLB window index reserved from the driver.
@@ -175,6 +180,19 @@ impl Kmd {
         let bar0 = find(abi::mapping_id::RESOURCE0_UC, Bar::Bar0)?;
         let bar2 = find(abi::mapping_id::RESOURCE1_UC, Bar::Bar2)?;
         let bar4 = find(abi::mapping_id::RESOURCE2_UC, Bar::Bar4)?;
+        // And a second, write-combining view of the window BARs, for bulk data
+        // into L1 and GDDR only. Registers never go through it: `tt-device`
+        // decides what is memory, and only its memory accessors reach
+        // `bar_write_bulk`. Optional, since a driver may not offer one.
+        let wc = |id, bar| {
+            mappings
+                .iter()
+                .any(|m| m.mapping_id == id)
+                .then(|| find(id, bar))
+                .transpose()
+        };
+        let bar0_wc = wc(abi::mapping_id::RESOURCE0_WC, Bar::Bar0)?;
+        let bar4_wc = wc(abi::mapping_id::RESOURCE2_WC, Bar::Bar4)?;
 
         Ok(Kmd {
             fd,
@@ -184,6 +202,8 @@ impl Kmd {
             bar0,
             bar2,
             bar4,
+            bar0_wc,
+            bar4_wc,
         })
     }
 
@@ -194,6 +214,21 @@ impl Kmd {
 
     fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// The mapping bulk memory copies use: WC where there is one.
+    fn bulk_bar(&self, bar: Bar) -> &Mapping {
+        let wc = match bar {
+            Bar::Bar0 => self.bar0_wc.as_ref(),
+            Bar::Bar4 => self.bar4_wc.as_ref(),
+            Bar::Bar2 => None,
+        };
+        wc.unwrap_or_else(|| self.bar(bar))
+    }
+
+    /// Is there a write-combining view of `bar`? For reporting.
+    pub fn has_wc(&self, bar: Bar) -> bool {
+        !std::ptr::eq(self.bulk_bar(bar), self.bar(bar))
     }
 
     fn bar(&self, bar: Bar) -> &Mapping {
@@ -295,6 +330,18 @@ impl Kmd {
     }
 }
 
+fn check_bounds(bar: Bar, offset: u64, len: usize) -> tt_device::Result<()> {
+    let oob = TransportError::OutOfBounds {
+        bar,
+        offset,
+        len: len as u64,
+    };
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= bar.size() => Ok(()),
+        _ => Err(oob),
+    }
+}
+
 impl Transport for Kmd {
     fn bar_read(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> tt_device::Result<()> {
         let end = offset
@@ -331,6 +378,18 @@ impl Transport for Kmd {
             });
         }
         self.bar(bar).write(offset as usize, src);
+        Ok(())
+    }
+
+    fn bar_write_bulk(&mut self, bar: Bar, offset: u64, src: &[u8]) -> tt_device::Result<()> {
+        check_bounds(bar, offset, src.len())?;
+        self.bulk_bar(bar).write_bulk(offset as usize, src);
+        Ok(())
+    }
+
+    fn bar_read_bulk(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> tt_device::Result<()> {
+        check_bounds(bar, offset, dst.len())?;
+        self.bulk_bar(bar).read_bulk(offset as usize, dst);
         Ok(())
     }
 

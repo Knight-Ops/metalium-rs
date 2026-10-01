@@ -10,6 +10,7 @@ members = [
     "crates/tt-kernels",
     "crates/tt-firmware-images",
     "crates/burn-tt",
+    "crates/tt-mnist",
     "crates/tt-tests",
     "xtask",
 ]
@@ -44,3 +45,10 @@ burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
 libloading = "0.8"
 libc = "0.2"
+
+# `tt-mnist`'s build script deflates 55 MB of MNIST; unoptimised, that is
+# most of a minute.
+[profile.dev.build-override]
+opt-level = 3
+[profile.release.build-override]
+opt-level = 3

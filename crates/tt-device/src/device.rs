@@ -116,10 +116,57 @@ pub struct Tile<N: NocId> {
     pub harvested: bool,
 }
 
+/// What a [`Device`] has sent across its transport: PCIe on silicon.
+///
+/// Counted at the three places a `Device` touches a BAR -- data writes, data
+/// reads, and TLB retargets -- so it covers everything above them, including
+/// the core-control and ARC paths. `*_calls` counts transport calls, not bus
+/// transactions: one call is one contiguous run of dword accesses.
+///
+/// The Phase 9 metric. Tensors are meant to live on the card, so a steady-state
+/// training step should move almost nothing here, and a gate can say so by
+/// subtracting two snapshots.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Traffic {
+    pub bytes_written: u64,
+    pub bytes_read: u64,
+    pub write_calls: u64,
+    pub read_calls: u64,
+    /// How many of the writes were TLB retargets (three config dwords each).
+    pub retargets: u64,
+}
+
+impl std::ops::Add for Traffic {
+    type Output = Traffic;
+    fn add(self, other: Traffic) -> Traffic {
+        Traffic {
+            bytes_written: self.bytes_written + other.bytes_written,
+            bytes_read: self.bytes_read + other.bytes_read,
+            write_calls: self.write_calls + other.write_calls,
+            read_calls: self.read_calls + other.read_calls,
+            retargets: self.retargets + other.retargets,
+        }
+    }
+}
+
+impl std::ops::Sub for Traffic {
+    type Output = Traffic;
+    fn sub(self, earlier: Traffic) -> Traffic {
+        Traffic {
+            bytes_written: self.bytes_written - earlier.bytes_written,
+            bytes_read: self.bytes_read - earlier.bytes_read,
+            write_calls: self.write_calls - earlier.write_calls,
+            read_calls: self.read_calls - earlier.read_calls,
+            retargets: self.retargets - earlier.retargets,
+        }
+    }
+}
+
 pub struct Device<T: Transport> {
     transport: T,
     chip: ChipId,
     pool: Arc<Mutex<Pool>>,
+    traffic: Traffic,
     /// When this `Device` last released each core from reset, keyed by
     /// `(NoC index, x, y, core)`. Read by the local-data-RAM accessors, which
     /// must not touch a core's RAM during the zeroing that follows a release.
@@ -184,6 +231,21 @@ impl<T: Transport> Drop for Device<T> {
 ///
 /// Ethernet tiles map different registers at these addresses; reaching them
 /// will need its own accessor when Phase 8 does.
+/// The bulk path is memory-only; see [`Device::l1_write`].
+fn refuse_non_l1<N: NocId>(coord: NocCoord<N>, address: u64, len: usize) -> Result<()> {
+    let in_l1 = address
+        .checked_add(len as u64)
+        .is_some_and(|end| end <= tensix::L1_SIZE);
+    if !tt_isa::noc::grid::is_tensix_geometry(coord.x(), coord.y()) || !in_l1 {
+        return Err(TransportError::Hazard {
+            address,
+            reason: "the bulk (write-combining) path is for Tensix L1 and GDDR only; \
+                     registers must go through Device::write",
+        });
+    }
+    Ok(())
+}
+
 fn refuse_local_ram_aperture(address: u64, len: usize) -> Result<()> {
     if touches_local_ram_aperture(address, len) {
         return Err(TransportError::Hazard {
@@ -242,6 +304,7 @@ impl<T: Transport> Device<T> {
             })),
             released: HashMap::new(),
             busy: false,
+            traffic: Traffic::default(),
         };
 
         // Compute needs the busy operating point; see `Device::set_busy`. Held
@@ -256,6 +319,11 @@ impl<T: Transport> Device<T> {
             dev.busy = true;
         }
         Ok(dev)
+    }
+
+    /// Everything this `Device` has moved across its transport so far.
+    pub fn traffic(&self) -> Traffic {
+        self.traffic
     }
 
     pub fn chip(&self) -> ChipId {
@@ -352,6 +420,9 @@ impl<T: Transport> Device<T> {
             return Ok(());
         }
         tlb::write_config(&mut self.transport, window.index, &config)?;
+        self.traffic.retargets += 1;
+        self.traffic.write_calls += 3;
+        self.traffic.bytes_written += 12;
         self.pool().shadow.insert(window.index, shadow);
         Ok(())
     }
@@ -387,8 +458,90 @@ impl<T: Transport> Device<T> {
             coord,
             address,
             data.len(),
-            |dev, bar, off, range| dev.transport.bar_write(bar, off, &data[range]),
+            |dev, bar, off, range| {
+                dev.traffic.write_calls += 1;
+                dev.traffic.bytes_written += range.len() as u64;
+                dev.transport.bar_write(bar, off, &data[range])
+            },
         )
+    }
+
+    /// Write `data` into a Tensix tile's L1, by the fast path.
+    ///
+    /// The bulk path ([`Transport::bar_write_bulk`]: write-combining on silicon)
+    /// is only for memory, and this is the one way to reach it at a Tensix tile:
+    /// the coordinate must have Tensix geometry and the range must lie inside
+    /// L1, so no register -- all of which sit at `0xFF..` addresses, or on the
+    /// ARC and PCIe tiles -- can be written this way. Use [`Device::write`] for
+    /// anything else.
+    pub fn l1_write<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        refuse_non_l1(coord, address, data.len())?;
+        self.write_memory(window, coord, address, data)
+    }
+
+    /// Read a Tensix tile's L1 by the fast path. See [`Device::l1_write`].
+    pub fn l1_read<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        refuse_non_l1(coord, address, out.len())?;
+        self.read_memory(window, coord, address, out)
+    }
+
+    /// The bulk write, for callers that have established `address` is memory.
+    pub(crate) fn write_memory<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.transfer(
+            window,
+            coord,
+            address,
+            data.len(),
+            |dev, bar, off, range| {
+                dev.traffic.write_calls += 1;
+                dev.traffic.bytes_written += range.len() as u64;
+                dev.transport.bar_write_bulk(bar, off, &data[range])
+            },
+        )
+    }
+
+    /// The bulk read. See [`Device::write_memory`].
+    pub(crate) fn read_memory<N: NocId>(
+        &mut self,
+        window: &Window,
+        coord: NocCoord<N>,
+        address: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let len = out.len();
+        let mut done = 0usize;
+        for chunk in self.plan(window, address, len)? {
+            self.retarget(window, coord, chunk.window_base)?;
+            let bar_offset = tlb::window_bar_offset(window.index).expect("allocated window")
+                + chunk.offset_in_window;
+            self.traffic.read_calls += 1;
+            self.traffic.bytes_read += chunk.len as u64;
+            self.transport.bar_read_bulk(
+                window.kind.bar(),
+                bar_offset,
+                &mut out[done..done + chunk.len],
+            )?;
+            done += chunk.len;
+        }
+        Ok(())
     }
 
     /// Read from `address` in the tile at `coord` into `out`, through `window`.
@@ -422,6 +575,8 @@ impl<T: Transport> Device<T> {
             self.retarget(window, coord, chunk.window_base)?;
             let bar_offset = tlb::window_bar_offset(window.index).expect("allocated window")
                 + chunk.offset_in_window;
+            self.traffic.read_calls += 1;
+            self.traffic.bytes_read += chunk.len as u64;
             self.transport.bar_read(
                 window.kind.bar(),
                 bar_offset,
@@ -678,6 +833,59 @@ mod tests {
             .iter()
             .filter(|(bar, off, _)| *bar == Bar::Bar0 && *off >= tlb::CONFIG_BASE)
             .count()
+    }
+
+    #[test]
+    fn the_bulk_path_refuses_anything_but_tensix_l1() {
+        let mut d = device();
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let before = d.traffic();
+        // The ARC tile, a DRAM column, a Tensix register, and L1's last byte + 1.
+        assert!(d.l1_write(&w, c(8, 0), 0x1000, &[0; 4]).is_err());
+        assert!(d.l1_write(&w, c(0, 5), 0x1000, &[0; 4]).is_err());
+        assert!(d.l1_write(&w, c(3, 4), 0xFFB1_21B0, &[0; 4]).is_err());
+        assert!(d
+            .l1_read(&w, c(3, 4), tensix::L1_SIZE - 2, &mut [0; 4])
+            .is_err());
+        assert_eq!(d.traffic(), before, "nothing may be sent");
+        d.l1_write(&w, c(3, 4), tensix::L1_SIZE - 4, &[1, 2, 3, 4])
+            .unwrap();
+        let mut back = [0u8; 4];
+        d.l1_read(&w, c(3, 4), tensix::L1_SIZE - 4, &mut back)
+            .unwrap();
+        assert_eq!(back, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn traffic_counts_every_bar_access() {
+        let mut d = device();
+        assert_eq!(d.traffic(), Traffic::default());
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+
+        // Across a window boundary: two data writes, two retargets.
+        let size = WindowKind::TwoMib.size();
+        d.write(&w, c(1, 2), size - 8, &[0xAA; 16]).unwrap();
+        let t = d.traffic();
+        assert_eq!(t.retargets, 2);
+        assert_eq!(t.bytes_written, 16 + 2 * 12);
+        assert_eq!(t.write_calls as usize, d.transport.writes.len());
+        assert_eq!(
+            t.bytes_written,
+            d.transport.writes.iter().map(|w| w.2 as u64).sum::<u64>()
+        );
+
+        // A read in the window it is already pointed at: no retarget.
+        let mut out = [0u8; 8];
+        d.read(&w, c(1, 2), size, &mut out).unwrap();
+        let delta = d.traffic() - t;
+        assert_eq!(
+            delta,
+            Traffic {
+                bytes_read: 8,
+                read_calls: 1,
+                ..Traffic::default()
+            }
+        );
     }
 
     #[test]
