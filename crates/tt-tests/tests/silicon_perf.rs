@@ -660,3 +660,107 @@ fn softmax_parts() {
         panic!("{e}");
     }
 }
+
+/// What one data mover's GDDR -> L1 reads cost, by request shape: the same
+/// 1 MiB as 4 KiB requests on one channel and port, rotating the channel's
+/// ports, rotating channels, and 16 KiB (the NIU's largest request) and
+/// 64 KiB entries. One list each, timed from the host around
+/// `submit_list`/`wait` and less an empty list's time; medians of nine. The
+/// question it answers: is a matmul gather's ~1 us a tile the NoC and GDDR,
+/// or the mover's per-request work?
+#[test]
+#[ignore = "benchmark"]
+fn mover_read_shapes() {
+    use tt_isa::dm::op;
+    use tt_kernels::dm::DataMover;
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+        const L1: u32 = 0x2_0000;
+        const L1_SPAN: u32 = 0x4_0000; // destinations cycle through 256 KiB
+        const TOTAL: u32 = 1 << 20;
+        let chans: Vec<_> = dram.channels().collect();
+        // Each channel's first 1 MiB at 64 MiB holds a known pattern.
+        let base = 64u64 << 20;
+        let data = pattern(TOTAL as usize, 7);
+        for ch in &chans {
+            d.dram_write(&w4, ch.range(base, TOTAL as u64).unwrap(), &data)
+                .unwrap();
+        }
+        let entry = |ch: usize, port: u32, off: u32, l1: u32, len: u32| {
+            [
+                op::READ,
+                chans[ch].index() as u32,
+                port,
+                (base as u32) + off,
+                l1,
+                len,
+                0,
+                0,
+            ]
+        };
+        let shape = |len: u32, ch_of: &dyn Fn(u32) -> usize, port_of: &dyn Fn(u32) -> u32| {
+            (0..TOTAL / len)
+                .map(|i| entry(ch_of(i), port_of(i), i * len, L1 + (i * len) % L1_SPAN, len))
+                .collect::<Vec<_>>()
+        };
+        let time = |d: &mut Dev<'_>, m: &mut DataMover<tt_isa::noc::Noc0>, list: &[[u32; 8]]| {
+            let mut v = Vec::new();
+            for _ in 0..REPS {
+                let t0 = Instant::now();
+                m.submit_list(d, &w, list).unwrap();
+                m.wait(d, &w).unwrap();
+                v.push(t0.elapsed());
+            }
+            median(v)
+        };
+        let empty = time(d, &mut m, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
+        println!("MEASURE mover_read empty list {empty:?}");
+        let n = chans.len();
+        let cases: Vec<(&str, Vec<[u32; 8]>)> = vec![
+            ("4K one port", shape(4096, &|_| 0, &|_| 0)),
+            ("4K 3 ports", shape(4096, &|_| 0, &|i| i % 3)),
+            ("4K all chans", shape(4096, &|i| i as usize % n, &|_| 0)),
+            ("16K one port", shape(16384, &|_| 0, &|_| 0)),
+            ("64K one port", shape(65536, &|_| 0, &|_| 0)),
+            ("64K all chans", shape(65536, &|i| i as usize % n, &|_| 0)),
+        ];
+        // The parts of an entry's cost: the loop and decode alone, then the
+        // whole path for a request with almost no data.
+        let waits = vec![[op::WAIT, 0, 0, 0, 0, 0, 0, 0]; 256];
+        let tiny: Vec<[u32; 8]> = (0..256u32)
+            .map(|i| entry(0, 0, i * 64, L1 + i * 64, 64))
+            .collect();
+        for (name, list) in [("256 waits", &waits), ("256 x 64 B", &tiny)] {
+            let dt = time(d, &mut m, list).saturating_sub(empty);
+            println!(
+                "MEASURE mover_read {name:<14} {:>4} entries {:>9.1?} {:>6.2} us/entry",
+                list.len(),
+                dt,
+                dt.as_secs_f64() * 1e6 / list.len() as f64
+            );
+        }
+        for (name, list) in &cases {
+            let dt = time(d, &mut m, list).saturating_sub(empty);
+            println!(
+                "MEASURE mover_read {name:<14} {:>4} entries {:>9.1?} {:>7.0} MB/s {:>6.2} us/4KiB",
+                list.len(),
+                dt,
+                mbps(TOTAL as usize, dt),
+                dt.as_secs_f64() * 1e6 / (TOTAL / 4096) as f64
+            );
+        }
+        // The bytes arrived: the last 256 KiB of the 4K-one-port case.
+        m.submit_list(d, &w, &cases[0].1).unwrap();
+        m.wait(d, &w).unwrap();
+        let mut back = vec![0u8; L1_SPAN as usize];
+        d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+        let tail = &data[(TOTAL - L1_SPAN) as usize..];
+        assert!(back == tail, "the reads did not land");
+        m.stop(d, &w).unwrap();
+    });
+}

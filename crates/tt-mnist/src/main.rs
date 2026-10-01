@@ -232,6 +232,98 @@ fn train<B: AutodiffBackend>(
     }
 }
 
+/// What an inference run measured.
+struct Infer {
+    /// The test images to the device, once.
+    preload: Duration,
+    /// The first batch alone: program caches and the session cold.
+    first: Duration,
+    /// Every batch after the first.
+    rest: Duration,
+    batches: usize,
+    accuracy: f64,
+}
+
+/// The forward pass alone, no autodiff: the test set uploaded once, then
+/// `passes` rounds over it in batches of `batch`, each batch's predictions
+/// downloaded (`argmax` on the host, as a caller would read them). Untrained
+/// weights unless the caller trains first; accuracy is printed only as a
+/// check that the right pictures went through.
+fn infer<B: Backend>(
+    test: &Split,
+    init: &Init,
+    batch: usize,
+    passes: usize,
+    device: &B::Device,
+) -> Infer {
+    let model = Mlp::<B>::new(init, device);
+    let t0 = Instant::now();
+    let n = test.n - test.n % batch;
+    let images: Tensor<B, 2> = Tensor::from_data(
+        TensorData::new(test.images[..n * PIXELS].to_vec(), [n, PIXELS]),
+        device,
+    )
+    .to_device(device);
+    let preload = t0.elapsed();
+    let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
+    let (mut batches, mut right) = (0, 0usize);
+    for _ in 0..passes {
+        for from in (0..n).step_by(batch) {
+            let t = Instant::now();
+            let x = images.clone().slice([from..from + batch, 0..PIXELS]);
+            let pred: Vec<i64> = model
+                .forward(x)
+                .argmax(1)
+                .reshape([batch])
+                .into_data()
+                .convert::<i64>()
+                .to_vec()
+                .expect("integer predictions");
+            if batches == 0 {
+                first = t.elapsed();
+            } else {
+                rest += t.elapsed();
+            }
+            batches += 1;
+            right += pred
+                .iter()
+                .zip(&test.labels[from..from + batch])
+                .filter(|(p, &l)| **p == i64::from(l))
+                .count();
+        }
+    }
+    Infer {
+        preload,
+        first,
+        rest,
+        batches,
+        accuracy: right as f64 / (batches * batch).max(1) as f64,
+    }
+}
+
+fn print_infer(r: &Infer, batch: usize) {
+    let steady = r.rest.as_secs_f64() / (r.batches.saturating_sub(1)).max(1) as f64;
+    println!(
+        "  test images uploaded once                  {:.2?}",
+        r.preload
+    );
+    println!(
+        "  first batch (cold)                         {:.2?}",
+        r.first
+    );
+    println!(
+        "  {} more batches of {batch}                   {:.2?}  ({:.3} ms/batch, {:.0} images/s)",
+        r.batches.saturating_sub(1),
+        r.rest,
+        steady * 1e3,
+        batch as f64 / steady
+    );
+    println!(
+        "  accuracy (untrained weights: a check, not a result)  {:.2}%",
+        r.accuracy * 100.0
+    );
+}
+
 // --- The command line ---------------------------------------------------------
 
 struct Args {
@@ -239,17 +331,27 @@ struct Args {
     epochs: usize,
     steps: usize,
     host: bool,
+    /// `--infer`: the forward pass alone, no training.
+    infer: bool,
+    batch: usize,
+    passes: usize,
 }
 
 const USAGE: &str = "\
 usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
+       tt-mnist --infer [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
   --tiles T     compute on T Tensix tiles of the card, or `all` (default 1)
   --epochs E    passes over the 60 000 training images (default 1)
   --steps S     stop after S steps
-  --host        also train on the host CPU (burn-flex), for comparison";
+  --host        also train on the host CPU (burn-flex), for comparison
+  --infer       benchmark inference alone: no training, the forward pass over
+                the test set (untrained weights), so it profiles on its own
+                (`TT_PROFILE`)
+  --batch B     inference batch size (default 64)
+  --passes P    rounds over the test set (default 3)";
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
@@ -257,6 +359,9 @@ fn args() -> Result<Args, String> {
         epochs: 1,
         steps: usize::MAX,
         host: false,
+        infer: false,
+        batch: BATCH,
+        passes: 3,
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -277,9 +382,17 @@ fn args() -> Result<Args, String> {
             "--epochs" => a.epochs = number(value()?)?,
             "--steps" => a.steps = number(value()?)?,
             "--host" => a.host = true,
+            "--infer" => a.infer = true,
+            "--batch" => a.batch = number(value()?)?,
+            "--passes" => a.passes = number(value()?)?,
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
+    }
+    if a.batch == 0 || a.batch > 10_000 || a.passes == 0 {
+        return Err(format!(
+            "--batch must be 1..=10000 and --passes at least 1\n\n{USAGE}"
+        ));
     }
     // After the loop, so `--tiles` applies whichever order it came in.
     if let Some(t) = tiles {
@@ -344,6 +457,31 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if a.infer {
+        println!(
+            "inference only, batch {}, {} passes over the test set:",
+            a.batch, a.passes
+        );
+        let before = burn_tt::tensor_traffic();
+        let r = infer::<TtBackend>(&test_split, &init, a.batch, a.passes, &device);
+        let moved = burn_tt::tensor_traffic() - before;
+        drop(guard);
+        println!("\non the card:");
+        print_infer(&r, a.batch);
+        println!(
+            "  tensor data over PCIe, whole run          {:.1} MB up (incl. the test set), {:.2} MB down",
+            moved.uploaded as f64 / 1e6,
+            moved.downloaded as f64 / 1e6
+        );
+        if a.host {
+            println!("\non the host CPU (burn-flex), same model:");
+            print_infer(
+                &infer::<Flex>(&test_split, &init, a.batch, a.passes, &FlexDevice),
+                a.batch,
+            );
+        }
+        return;
+    }
     let before = burn_tt::tensor_traffic();
     let card = train::<Autodiff<TtBackend>>(
         &train_split,
