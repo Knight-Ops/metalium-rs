@@ -143,6 +143,8 @@ impl<B: Backend> Mlp<B> {
 // --- Training -----------------------------------------------------------------
 
 struct Run {
+    /// burn-tt's per-call timers once the dataset is resident.
+    calls: Vec<(&'static str, u64, Duration)>,
     losses: Vec<(usize, f32)>,
     accuracy: f64,
     preload: Duration,
@@ -184,6 +186,7 @@ fn train<B: AutodiffBackend>(
     )
     .to_device(device);
     let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
 
     let t0 = Instant::now();
     let mut losses = Vec::new();
@@ -224,6 +227,7 @@ fn train<B: AutodiffBackend>(
         right += pred.equal(y).int().sum().into_scalar().elem::<i64>() as usize;
     }
     Run {
+        calls,
         losses,
         accuracy: right as f64 / test.n as f64,
         preload,
@@ -234,6 +238,8 @@ fn train<B: AutodiffBackend>(
 
 /// What an inference run measured.
 struct Infer {
+    /// burn-tt's per-call timers once the test set is resident.
+    calls: Vec<(&'static str, u64, Duration)>,
     /// The test images to the device, once.
     preload: Duration,
     /// The first batch alone: program caches and the session cold.
@@ -265,6 +271,7 @@ fn infer<B: Backend>(
     )
     .to_device(device);
     let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
     let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
     let (mut batches, mut right) = (0, 0usize);
     for _ in 0..passes {
@@ -293,6 +300,7 @@ fn infer<B: Backend>(
         }
     }
     Infer {
+        calls,
         preload,
         first,
         rest,
@@ -321,6 +329,38 @@ fn print_infer(r: &Infer, batch: usize) {
     println!(
         "  accuracy (untrained weights: a check, not a result)  {:.2}%",
         r.accuracy * 100.0
+    );
+}
+
+/// Where the host's time went: each kind of device call burn-tt made, timed
+/// on the caller's side (the server's queue, the session's work and the wait
+/// for the card included), per `per` units of work, and what was left outside
+/// every call -- Burn itself and the host's own ops.
+fn print_calls(before: &[(&'static str, u64, Duration)], wall: Duration, per: usize, unit: &str) {
+    let now = burn_tt::device_time();
+    let mut inside = Duration::ZERO;
+    println!("  where the time went, per {unit} (caller's side):");
+    for (k, n, d) in &now {
+        let (n0, d0) = before
+            .iter()
+            .find(|(b, ..)| b == k)
+            .map_or((0, Duration::ZERO), |(_, n, d)| (*n, *d));
+        let (n, d) = (n - n0, *d - d0);
+        if n == 0 {
+            continue;
+        }
+        inside += d;
+        println!(
+            "    {k:<14} {:>6.1} calls {:>8.1} us  ({:.1} us a call)",
+            n as f64 / per as f64,
+            d.as_secs_f64() * 1e6 / per as f64,
+            d.as_secs_f64() * 1e6 / n as f64
+        );
+    }
+    println!(
+        "    {:<14} {:>15.1} us",
+        "outside calls",
+        wall.saturating_sub(inside).as_secs_f64() * 1e6 / per as f64
     );
 }
 
@@ -468,6 +508,7 @@ fn main() {
         drop(guard);
         println!("\non the card:");
         print_infer(&r, a.batch);
+        print_calls(&r.calls, r.first + r.rest, r.batches, "batch");
         println!(
             "  tensor data over PCIe, whole run          {:.1} MB up (incl. the test set), {:.2} MB down",
             moved.uploaded as f64 / 1e6,
@@ -509,6 +550,7 @@ fn main() {
         card.train,
         per(card.train)
     );
+    print_calls(&card.calls, card.train, card.steps.max(1), "step");
     println!(
         "  loss                                      {:.4} -> {:.4}",
         card.losses.first().map_or(f32::NAN, |l| l.1),

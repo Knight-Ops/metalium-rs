@@ -470,6 +470,13 @@ pub mod float {
                 return TtTensor::on_device(d.clone(), shape, tensor.device);
             }
         }
+        // On the host, but sharing the source's device-copy slot: a bias
+        // reshaped every forward pass is uploaded once, not every pass.
+        if same && tensor.is_stored_f32() && tensor.dram().is_none() {
+            let host =
+                <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.host().clone(), shape.clone());
+            return tensor.reshaped_host(host, shape);
+        }
         let device = tensor.device;
         TtTensor::new(
             <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_host(), shape),

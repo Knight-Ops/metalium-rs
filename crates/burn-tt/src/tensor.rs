@@ -32,7 +32,11 @@ pub struct TtTensor {
 #[derive(Debug)]
 pub(crate) struct Cell {
     host: OnceLock<FlexTensor>,
-    dram: OnceLock<DramRef>,
+    /// The device copy, uploaded at most once -- shared by the cells of a
+    /// reshape that keeps the stored matrix ([`TtTensor::reshaped_host`]),
+    /// so a parameter reshaped on every forward pass (a bias) is uploaded
+    /// once, by whichever of them meets the device first.
+    dram: Arc<OnceLock<DramRef>>,
     shape: Shape,
     dtype: DType,
 }
@@ -73,7 +77,7 @@ impl TtTensor {
         TtTensor {
             cell: Arc::new(Cell {
                 host,
-                dram: OnceLock::new(),
+                dram: Arc::new(OnceLock::new()),
                 shape,
                 dtype,
             }),
@@ -88,7 +92,7 @@ impl TtTensor {
         TtTensor {
             cell: Arc::new(Cell {
                 host: OnceLock::new(),
-                dram: cell,
+                dram: Arc::new(cell),
                 shape,
                 dtype: DType::F32,
             }),
@@ -135,6 +139,27 @@ impl TtTensor {
             };
             FlexTensor::from_data(TensorData::new(v, self.cell.shape.clone()))
         })
+    }
+
+    /// `self` reshaped on the host to `shape`, which is stored as the same
+    /// matrix ([`stored_dims`]): the new tensor holds `host` (the host copy
+    /// reshaped) and shares `self`'s device-copy slot, so one upload serves
+    /// both. Only for a tensor with no device copy yet, or an untransposed
+    /// one -- a transposed view's buffer is not the reshape's.
+    pub(crate) fn reshaped_host(&self, host: FlexTensor, shape: Shape) -> TtTensor {
+        debug_assert_eq!(stored_dims(&shape.to_vec()), self.stored());
+        debug_assert!(self.dram().is_none_or(|d| !d.transposed));
+        let h = OnceLock::new();
+        let _ = h.set(host);
+        TtTensor {
+            cell: Arc::new(Cell {
+                host: h,
+                dram: self.cell.dram.clone(),
+                shape,
+                dtype: self.cell.dtype,
+            }),
+            device: self.device,
+        }
     }
 
     /// The host copy, owned: taken if this is the only reference to it.

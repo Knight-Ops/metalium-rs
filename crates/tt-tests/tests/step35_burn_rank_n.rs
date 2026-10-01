@@ -198,3 +198,32 @@ fn tensors_of_any_rank_stay_on_the_device() {
         );
     });
 }
+
+/// A host tensor reshaped on every pass -- a linear layer's bias, `[n]` to
+/// `[1, n]` -- and added to a device tensor is uploaded once, not once a
+/// pass: the reshape shares the source's device copy
+/// (`TtTensor::reshaped_host`). Before, inference re-uploaded both biases
+/// every batch (38% of a batch).
+#[test]
+fn a_bias_reshaped_every_pass_is_uploaded_once() {
+    with_device(Config::default(), |d| {
+        let (r, c) = (64, 128);
+        let xv = values(9, r * c);
+        let bv = values(10, c);
+        let x = Tensor::<TtBackend, 2>::from_data(TensorData::new(xv.clone(), [r, c]), &d)
+            .to_device(&d);
+        // On the host, as a module's parameter is until a device op needs it.
+        let bias = Tensor::<TtBackend, 1>::from_data(TensorData::new(bv.clone(), [c]), &d);
+        let fx = Tensor::<Flex, 2>::from_data(TensorData::new(xv, [r, c]), &FlexDevice);
+        let fb = Tensor::<Flex, 1>::from_data(TensorData::new(bv, [c]), &FlexDevice);
+        let want = bits(fx + fb.reshape([1, c]));
+        let before = tensor_traffic();
+        for pass in 0..10 {
+            let y = x.clone() + bias.clone().reshape([1, c]);
+            assert!(computed_on_device(&y), "pass {pass}: on the device");
+            assert!(same(bits(y), want.clone()), "pass {pass}: Flex's bits");
+        }
+        let during = tensor_traffic() - before;
+        assert_eq!(during.uploads, 1, "the bias, once: {during:?}");
+    });
+}
