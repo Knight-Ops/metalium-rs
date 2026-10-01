@@ -91,7 +91,16 @@ impl Layer {
             .unwrap()
         };
         let ew = |s: &mut Session<T>, kind, a, b| {
-            s.eltwise(Eltwise { kind, scalar: 0.0 }, a, b).unwrap()
+            s.eltwise(
+                Eltwise {
+                    scalar2: 0.0,
+                    kind,
+                    scalar: 0.0,
+                },
+                a,
+                b,
+            )
+            .unwrap()
         };
         let h = mm(s, x, &self.w1);
         let hb = ew(s, kind::ADD_ROW, &h, Some(&self.b1));
@@ -251,6 +260,7 @@ fn what_a_replay_could_not_repeat_is_refused() {
         let relu = |s: &mut Session<_>, a| {
             s.eltwise(
                 Eltwise {
+                    scalar2: 0.0,
                     kind: kind::RELU,
                     scalar: 0.0,
                 },

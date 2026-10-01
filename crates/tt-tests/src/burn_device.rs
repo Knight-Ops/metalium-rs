@@ -209,6 +209,15 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
         }
+        fn eltwise_op(
+            &mut self,
+            op: tt_kernels::tensor::Eltwise,
+            a: burn_tt::BufferId,
+            b: Option<burn_tt::BufferId>,
+            c: Option<burn_tt::BufferId>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.eltwise_op(&mut self.session, op, a, b, c)
+        }
         fn sum_rows(
             &mut self,
             a: burn_tt::BufferId,

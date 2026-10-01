@@ -124,18 +124,31 @@ fn ops_that_compute_in_fp32_refuse_integers_and_booleans() {
             Ok(_) => panic!("{what}: computed on integers"),
         };
         for kind in [tt_isa::dm::kind::ADD, tt_isa::dm::kind::MUL, kind_sfpu::DIV] {
-            let op = Eltwise { kind, scalar: 0.0 };
+            let op = Eltwise {
+                scalar2: 0.0,
+                kind,
+                scalar: 0.0,
+            };
             refused(s.eltwise(op, &i, Some(&i)).map(|_| ()), "an integer add");
             refused(s.eltwise(op, &f, Some(&b)).map(|_| ()), "FP32 with a Bool");
         }
         for kind in [tt_isa::dm::kind::RELU, kind_sfpu::EXP] {
             refused(
-                s.eltwise(Eltwise { kind, scalar: 0.0 }, &b, None)
-                    .map(|_| ()),
+                s.eltwise(
+                    Eltwise {
+                        scalar2: 0.0,
+                        kind,
+                        scalar: 0.0,
+                    },
+                    &b,
+                    None,
+                )
+                .map(|_| ()),
                 "a Bool's exp",
             );
         }
         let not = Eltwise {
+            scalar2: 0.0,
             kind: kind_sfpu::BOOL_NOT,
             scalar: 0.0,
         };
@@ -163,6 +176,7 @@ fn ops_that_compute_in_fp32_refuse_integers_and_booleans() {
         }
         // `COPY` moves datums: an integer comes through it whole.
         let copy = Eltwise {
+            scalar2: 0.0,
             kind: tt_isa::dm::kind::COPY,
             scalar: 0.0,
         };
@@ -190,7 +204,11 @@ fn the_logic_ops_are_the_truth_tables_with_broadcasts() {
             };
             let f = |v: &[u32]| v.iter().map(|&x| f32::from_bits(x)).collect::<Vec<f32>>();
             let check = |s: &mut Session<_>, kind: u32, b: Option<(&_, &[u32], usize)>| {
-                let op = Eltwise { kind, scalar: 0.0 };
+                let op = Eltwise {
+                    scalar2: 0.0,
+                    kind,
+                    scalar: 0.0,
+                };
                 let out = s.eltwise(op, &a, b.map(|(t, _, _)| t)).unwrap();
                 assert_eq!(out.elem, Elem::Bool);
                 let got = s.download_bits(&out).unwrap();

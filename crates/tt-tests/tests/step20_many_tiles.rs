@@ -263,7 +263,15 @@ fn eltwise_over_many_tiles_matches_flex_bit_for_bit() {
                     };
                     let before = s.steps_per_tile();
                     let out = s
-                        .eltwise(Eltwise { kind: k, scalar }, &a, other)
+                        .eltwise(
+                            Eltwise {
+                                scalar2: 0.0,
+                                kind: k,
+                                scalar,
+                            },
+                            &a,
+                            other,
+                        )
                         .unwrap_or_else(|e| panic!("{label} [{r}, {c}] on {n} tiles: {e}"));
                     let after = s.steps_per_tile();
                     let what = format!("{label} [{r}, {c}], {n} tiles");

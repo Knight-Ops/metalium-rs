@@ -140,6 +140,7 @@ fn eltwise_runs_share_a_list() {
             out = Some(
                 s.eltwise(
                     Eltwise {
+                        scalar2: 0.0,
                         kind: kind::ADD,
                         scalar: 0.0,
                     },

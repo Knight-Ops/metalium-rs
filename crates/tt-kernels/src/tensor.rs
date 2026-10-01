@@ -912,6 +912,10 @@ fn staging(name: &'static str, slots: usize) -> Result<u64> {
 pub struct Eltwise {
     pub kind: u32,
     pub scalar: f32,
+    /// A second immediate, for the kinds that take two (`CLAMP`'s bounds,
+    /// `HARD_SIGMOID`'s slope and offset); `0.0` for the rest. SFPU only: the
+    /// mover's record carries one.
+    pub scalar2: f32,
 }
 
 /// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
@@ -935,10 +939,10 @@ pub fn broadcast_of(
     use tt_isa::dm::kind;
     let name = || format!("element-wise op {:#x}", op.kind);
     // `None`: a kind that moves datums, whatever they are.
-    if let Some((input, _)) = crate::sfpu::ops::elems(op.kind) {
-        a.expect(&name(), input)?;
-        if let Some(b) = b {
-            b.expect(&name(), input)?;
+    if let Some(sig) = crate::sfpu::ops::elems(op.kind) {
+        a.expect(&name(), sig.inputs[0])?;
+        if let (Some(b), Some(&want)) = (b, sig.inputs.get(1)) {
+            b.expect(&name(), want)?;
         }
     }
     let binary = match crate::sfpu::ops::operands(op.kind) {
@@ -984,7 +988,7 @@ pub fn broadcast_of(
 
 /// The element type `kind`'s output has, given its first operand.
 fn output_elem(kind: u32, a: &DramTensor) -> Elem {
-    crate::sfpu::ops::elems(kind).map_or(a.elem, |(_, out)| out)
+    crate::sfpu::ops::elems(kind).map_or(a.elem, |sig| sig.out)
 }
 
 /// Element-wise `a (op) b` -- or `a (op) scalar` -- with everything in GDDR,
@@ -1116,13 +1120,42 @@ pub fn sfpu_eltwise(
     op: Eltwise,
     a: &DramTensor,
     b: Option<&DramTensor>,
+    c: Option<&DramTensor>,
     units: usize,
 ) -> Result<Option<Work>> {
+    use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
     let (kind, bcast) = broadcast_of(op, a, b)?;
     let op = Eltwise { kind, ..op };
-    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, op.scalar, bcast) else {
+    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, [op.scalar, op.scalar2], bcast)
+    else {
         return Ok(None);
+    };
+    // A ternary op's third operand: `A`'s shape, of the kind's type.
+    let rc = match (operands, c) {
+        (Operands::Ternary, Some(c)) => {
+            if (c.rows, c.cols) != (a.rows, a.cols) {
+                return Err(TensorError::Shape(format!(
+                    "a ternary op's third operand [{}, {}] for [{}, {}]",
+                    c.rows, c.cols, a.rows, a.cols
+                )));
+            }
+            if let Some(&want) = crate::sfpu::ops::elems(kind).and_then(|s| s.inputs.get(2)) {
+                c.expect(&format!("element-wise op {kind:#x}"), want)?;
+            }
+            Some(c.tensor_ref())
+        }
+        (Operands::Ternary, None) => {
+            return Err(TensorError::Shape(
+                "a ternary op needs three operands".into(),
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(TensorError::Shape(format!(
+                "{kind:#x} takes no third operand"
+            )))
+        }
+        _ => None,
     };
     let group = sfpu_group(op, bcast, operands);
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind, a))?;
@@ -1163,6 +1196,9 @@ pub fn sfpu_eltwise(
                 Broadcast::Col => 2,
             };
             gather.extend(read(rb, b_at, flags));
+        }
+        if let (Some(rc), Some(c_at)) = (&rc, layout.c_at) {
+            gather.extend(read(rc, c_at, 0));
         }
         let scatter = [
             [
@@ -1221,7 +1257,15 @@ pub(crate) fn sfpu_group_for_tests(
     } else {
         kind
     };
-    sfpu_group(Eltwise { kind, scalar }, bcast, operands)
+    sfpu_group(
+        Eltwise {
+            scalar2: 0.0,
+            kind,
+            scalar,
+        },
+        bcast,
+        operands,
+    )
 }
 
 fn sfpu_group(
@@ -1233,9 +1277,9 @@ fn sfpu_group(
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
     // scalar and broadcast, not once per op.
-    type Memo = Mutex<HashMap<(u32, u32, crate::sfpu::ops::Broadcast), usize>>;
+    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast), usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), bcast);
+    let key = (op.kind, op.scalar.to_bits(), op.scalar2.to_bits(), bcast);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
@@ -1255,7 +1299,7 @@ fn measure_sfpu_group(
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
         let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
-        let (_, math) = crate::sfpu::ops::program_for(op.kind, op.scalar, bcast)
+        let (_, math) = crate::sfpu::ops::program_for(op.kind, [op.scalar, op.scalar2], bcast)
             .expect("checked by the caller");
         crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
     };
@@ -1284,18 +1328,24 @@ fn sfpu_programs(
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (u32, u32, crate::sfpu::ops::Broadcast, usize);
+    type Key = (u32, u32, u32, crate::sfpu::ops::Broadcast, usize);
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), bcast, len);
+    let key = (
+        op.kind,
+        op.scalar.to_bits(),
+        op.scalar2.to_bits(),
+        bcast,
+        len,
+    );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
     let layout = crate::sfpu::kernel::plan_layout(len, operands)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) =
-        crate::sfpu::ops::program_for(op.kind, op.scalar, bcast).expect("checked by the caller");
+    let (_, math) = crate::sfpu::ops::program_for(op.kind, [op.scalar, op.scalar2], bcast)
+        .expect("checked by the caller");
     let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
     let p = (layout, roles);
     memo.lock()
@@ -1559,6 +1609,32 @@ impl OpPadding for MatmulPadding {
     }
 }
 
+impl Eltwise {
+    /// For the S2 kinds (10.2c): does a zero `a` -- with `b`, `c` zero where
+    /// `b_zero`, `c_zero` say -- give a zero (of either sign)? From each op's
+    /// algebra, its scalars known.
+    fn zero_at_zero(&self, kind: u32, b_zero: bool, c_zero: bool) -> bool {
+        use crate::sfpu::ops::{ieee_compare, kind_sfpu::*};
+        let (s, s2) = (self.scalar, self.scalar2);
+        let is_zero = |x: f32| x.to_bits() & 0x7fff_ffff == 0;
+        match kind {
+            NEG | ABS | SIGN | LEAKY_RELU | PRELU | IS_NAN | IS_INF => true,
+            // `f32::clamp`: `0` stays where `min <= 0 <= max`.
+            CLAMP => s <= 0.0 && 0.0 <= s2,
+            // The scalar where it is not below (above) zero, `x` for a NaN one.
+            CLAMP_MIN => s.is_nan() || s <= 0.0,
+            CLAMP_MAX => s.is_nan() || s >= 0.0,
+            // `alpha * 0 + beta`, clamped: `beta` (or zero) where `beta <= 0`.
+            HARD_SIGMOID => s.is_finite() && s2 <= 0.0,
+            EQ..=LE => b_zero && !ieee_compare(kind, 0.0, 0.0),
+            EQ_S..=LE_S => !ieee_compare(kind, 0.0, s),
+            MASK_FILL => b_zero || is_zero(s),
+            MASK_WHERE => b_zero || c_zero,
+            _ => false,
+        }
+    }
+}
+
 impl OpPadding for Eltwise {
     /// The data mover computes a tile's datums independently, so padding
     /// never reaches a real datum.
@@ -1579,8 +1655,12 @@ impl OpPadding for Eltwise {
                     a.cols % 32 == 0
                 };
                 use crate::sfpu::ops::kind_sfpu;
-                // `0 && b` is false wherever `a`'s padding is.
+                // `0 && b` is false wherever `a`'s padding is, and so is
+                // `mask ? 0 : 0`.
                 let z = (self.kind == kind_sfpu::BOOL_AND && zero(0))
+                    || (self.kind == kind_sfpu::MASK_FILL
+                        && zero(0)
+                        && self.scalar.to_bits() & 0x7fff_ffff == 0)
                     || (matches!(
                         self.kind,
                         kind::ADD
@@ -1614,7 +1694,7 @@ impl OpPadding for Eltwise {
             crate::sfpu::ops::kind_sfpu::BOOL_OR | crate::sfpu::ops::kind_sfpu::BOOL_XOR => {
                 zero(0) && zero(1)
             }
-            _ => false,
+            k => zero(0) && self.zero_at_zero(k, zero(1), zero(2)),
         };
         if z {
             Pad::Zero
@@ -1824,7 +1904,11 @@ mod tests {
                     for units in [1, 3, 8] {
                         let shapes = [[r, c], [if b == Some(true) { 1 } else { r }, c]];
                         let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &shapes);
-                        let op = Eltwise { kind: k, scalar };
+                        let op = Eltwise {
+                            scalar2: 0.0,
+                            kind: k,
+                            scalar,
+                        };
                         let got =
                             super::eltwise(&mut a1, op, &t1[0], b.map(|_| &t1[1]), units).unwrap();
                         let want =
@@ -1910,7 +1994,11 @@ mod tests {
             "no ragged edge, nothing to be wrong"
         );
         assert_eq!(undef.pad(), Pad::Undefined);
-        let e = |kind, scalar| Eltwise { kind, scalar };
+        let e = |kind, scalar| Eltwise {
+            scalar2: 0.0,
+            kind,
+            scalar,
+        };
         let p = |op: Eltwise, ins: &[&DramTensor]| op.produces(ins);
         assert_eq!(p(e(kind::ADD, 0.0), &[&zero, &zero]), Pad::Zero);
         assert_eq!(p(e(kind::ADD, 0.0), &[&zero, &undef]), Pad::Undefined);
@@ -1965,6 +2053,7 @@ mod tests {
             t2[1].rows_view(64, 128).unwrap(),
         );
         let op = Eltwise {
+            scalar2: 0.0,
             kind: kind::MUL,
             scalar: 0.0,
         };

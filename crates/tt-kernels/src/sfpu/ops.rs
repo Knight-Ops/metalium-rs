@@ -42,19 +42,105 @@ pub mod kind_sfpu {
     pub const BOOL_OR: u32 = 0x107;
     /// `a != b`, `Bool`.
     pub const BOOL_XOR: u32 = 0x108;
+    /// `-a`: the sign bit flipped, NaNs included (S2; 10.2c).
+    pub const NEG: u32 = 0x109;
+    /// `|a|`: the sign bit cleared, NaNs included.
+    pub const ABS: u32 = 0x10a;
+    /// `1`, `-1`, `+0` for `a > 0`, `a < 0`, `±0`; a NaN itself.
+    pub const SIGN: u32 = 0x10b;
+    /// `a.clamp(scalar, scalar2)`, as `f32::clamp`: bounds neither NaN nor
+    /// crossed (a program is refused otherwise, as `f32::clamp` panics).
+    pub const CLAMP: u32 = 0x10c;
+    /// `a.max(scalar)` as Flex's `float_clamp_min`: a NaN on either side gives
+    /// the other, and equal values (`±0`) give the scalar.
+    pub const CLAMP_MIN: u32 = 0x10d;
+    /// `a.min(scalar)`, as [`CLAMP_MIN`] mirrored.
+    pub const CLAMP_MAX: u32 = 0x10e;
+    /// `a >= 0 ? a : scalar * a`.
+    pub const LEAKY_RELU: u32 = 0x10f;
+    /// `(scalar * a + scalar2).clamp(0, 1)`, two roundings.
+    pub const HARD_SIGMOID: u32 = 0x110;
+    /// IEEE comparisons, `F32` with `F32` to `Bool`: `-0 == +0`, a NaN
+    /// unordered (every one false but `NE`).
+    pub const EQ: u32 = 0x111;
+    pub const NE: u32 = 0x112;
+    pub const GT: u32 = 0x113;
+    pub const GE: u32 = 0x114;
+    pub const LT: u32 = 0x115;
+    pub const LE: u32 = 0x116;
+    /// The same against `scalar`.
+    pub const EQ_S: u32 = 0x117;
+    pub const NE_S: u32 = 0x118;
+    pub const GT_S: u32 = 0x119;
+    pub const GE_S: u32 = 0x11a;
+    pub const LT_S: u32 = 0x11b;
+    pub const LE_S: u32 = 0x11c;
+    /// `F32` to `Bool`.
+    pub const IS_NAN: u32 = 0x11d;
+    pub const IS_INF: u32 = 0x11e;
+    /// `mask ? scalar : a`, `a` `F32`, `mask` `Bool` (as `B`, which may be a
+    /// row or a column).
+    pub const MASK_FILL: u32 = 0x11f;
+    /// `mask ? c : a`: `F32`, `Bool`, `F32`, all one shape (ternary).
+    pub const MASK_WHERE: u32 = 0x120;
+    /// `a >= 0 ? a : b * a`, Flex's `prelu`: `LEAKY_RELU` with the slope a
+    /// tensor -- a row of per-channel slopes, broadcast.
+    pub const PRELU: u32 = 0x121;
+}
+
+/// The IEEE comparisons, tensor with tensor, with their scalar forms.
+const COMPARES: [(u32, u32); 6] = [
+    (kind_sfpu::EQ, kind_sfpu::EQ_S),
+    (kind_sfpu::NE, kind_sfpu::NE_S),
+    (kind_sfpu::GT, kind_sfpu::GT_S),
+    (kind_sfpu::GE, kind_sfpu::GE_S),
+    (kind_sfpu::LT, kind_sfpu::LT_S),
+    (kind_sfpu::LE, kind_sfpu::LE_S),
+];
+
+/// `kind`'s tensor-with-tensor comparison, if it is one of either form.
+fn compare_of(kind: u32) -> Option<u32> {
+    COMPARES
+        .iter()
+        .find(|(t, s)| *t == kind || *s == kind)
+        .map(|(t, _)| *t)
+}
+
+/// What `x (cmp) y` is for two FP32 values by IEEE, as Flex compares.
+pub fn ieee_compare(cmp: u32, x: f32, y: f32) -> bool {
+    match compare_of(cmp).expect("a comparison") {
+        kind_sfpu::EQ => x == y,
+        kind_sfpu::NE => x != y,
+        kind_sfpu::GT => x > y,
+        kind_sfpu::GE => x >= y,
+        kind_sfpu::LT => x < y,
+        _ => x <= y,
+    }
+}
+
+/// An op's element types: one per operand, and its output's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Sig {
+    pub inputs: &'static [Elem],
+    pub out: Elem,
 }
 
 /// What `kind` computes on and what it produces (`crate::tensor::Elem`); `None`
 /// for a kind that moves datums whatever they are (`COPY`), whose output is
 /// its input's. The session refuses any other operand
 /// (`TensorError::Elem`) before choosing a unit.
-pub fn elems(kind: u32) -> Option<(Elem, Elem)> {
+pub fn elems(kind: u32) -> Option<Sig> {
+    use Elem::{Bool, F32};
+    let sig = |inputs, out| Some(Sig { inputs, out });
     match kind {
         kind::COPY => None,
-        kind_sfpu::BOOL_NOT | kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => {
-            Some((Elem::Bool, Elem::Bool))
-        }
-        _ => Some((Elem::F32, Elem::F32)),
+        kind_sfpu::BOOL_NOT => sig(&[Bool], Bool),
+        kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => sig(&[Bool, Bool], Bool),
+        kind_sfpu::EQ..=kind_sfpu::LE => sig(&[F32, F32], Bool),
+        kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
+        kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
+        kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
+        _ => sig(&[F32, F32], F32),
     }
 }
 
@@ -242,7 +328,11 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::DIV
         | kind_sfpu::BOOL_AND
         | kind_sfpu::BOOL_OR
-        | kind_sfpu::BOOL_XOR => Operands::Binary,
+        | kind_sfpu::BOOL_XOR
+        | kind_sfpu::EQ..=kind_sfpu::LE
+        | kind_sfpu::MASK_FILL
+        | kind_sfpu::PRELU => Operands::Binary,
+        kind_sfpu::MASK_WHERE => Operands::Ternary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
         | kind::RELU
@@ -250,7 +340,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::DIV_SCALAR
         | kind_sfpu::EXP
         | kind_sfpu::LOG
-        | kind_sfpu::BOOL_NOT => Operands::Unary,
+        | kind_sfpu::BOOL_NOT
+        | kind_sfpu::NEG..=kind_sfpu::HARD_SIGMOID
+        | kind_sfpu::EQ_S..=kind_sfpu::IS_INF => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -298,6 +390,7 @@ pub fn broadcasts(kind: u32) -> bool {
             | kind_sfpu::BOOL_AND
             | kind_sfpu::BOOL_OR
             | kind_sfpu::BOOL_XOR
+            | kind_sfpu::EQ..=kind_sfpu::LE | kind_sfpu::MASK_FILL | kind_sfpu::PRELU
     )
 }
 
@@ -307,8 +400,10 @@ pub fn broadcasts(kind: u32) -> bool {
 fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     // A `Bool` is `0`/`1` as an integer -- a denormal to FP32's load and
     // store, which would flush it -- so the logic ops move raw bits.
-    let fmt = match elems(kind) {
-        Some((Elem::F32, _)) => Format::Fp32,
+    // The exact ops of S2 move raw bits too: an FP32 store would flush a
+    // denormal Flex keeps.
+    let fmt = match kind {
+        kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV => Format::Fp32,
         _ => Format::Int32,
     };
     p.load(LReg::L0, fmt, a_at);
@@ -325,6 +420,28 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
         kind_sfpu::BOOL_XOR => {
             p.mov(LReg::L0, LReg::L2);
             p.xor(LReg::L1, LReg::L2);
+            LReg::L2
+        }
+        k if compare_of(k).is_some() => {
+            compare_body(p, k, true);
+            LReg::L2
+        }
+        // As `LEAKY_RELU`, the slope `b`'s lane.
+        kind_sfpu::PRELU => {
+            p.mul(LReg::L0, LReg::L1, LReg::L2);
+            p.and(LReg::L0, LReg::L4, LReg::L3);
+            p.if_(Cond::Gte0(LReg::L0), |p| {
+                p.if_(Cond::LessEq(LReg::L3, LReg::L5), |p| {
+                    p.mov(LReg::L0, LReg::L2)
+                })
+            });
+            p.if_(Cond::Eq0(LReg::L3), |p| p.mov(LReg::L0, LReg::L2));
+            LReg::L2
+        }
+        // `mask ? value : a`, the value in `L3` (`binary_constants`).
+        kind_sfpu::MASK_FILL => {
+            p.mov(LReg::L0, LReg::L2);
+            p.if_(Cond::Ne0(LReg::L1), |p| p.mov(LReg::L3, LReg::L2));
             LReg::L2
         }
         kind::ADD => {
@@ -359,11 +476,277 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
 }
 
 /// The constants [`binary_body`] needs for `kind`, loaded once.
-fn binary_constants(p: &mut Program, kind: u32) {
+fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
     if kind == kind_sfpu::DIV {
         p.loadi_bits(LReg::L6, f32::MAX.to_bits());
         p.loadi_bits(LReg::L7, 0x7f80_0000);
     }
+    if compare_of(kind).is_some() || kind == kind_sfpu::PRELU {
+        compare_constants(p);
+    }
+    if kind == kind_sfpu::MASK_FILL {
+        p.loadi_bits(LReg::L3, scalars[0].to_bits());
+    }
+}
+
+/// `L4 = 0x7fff_ffff` (the magnitude mask), `L5 = +inf`, `L6 = 1` (a `Bool`'s
+/// true): what the IEEE comparisons use.
+fn compare_constants(p: &mut Program) {
+    p.loadi_bits(LReg::L4, 0x7fff_ffff);
+    p.loadi_bits(LReg::L5, 0x7f80_0000);
+    p.loadi_bits(LReg::L6, 1);
+}
+
+/// `L2 = x (cmp) y` as a `Bool`, by IEEE, `x` in `L0` and `y` in `L1` as raw
+/// bits (clobbered), with [`compare_constants`] loaded. `SFPGT`/`SFPLE` order
+/// sign-magnitude (`-0 < +0`, NaNs ranked), so both are first made canonical
+/// -- a zero of either sign `+0` -- and a lane where either is a NaN takes the
+/// unordered answer (false; true for `NE`). `y_may_be_nan` is false where the
+/// caller has settled `y` (a scalar, on the host). Bit and flag operations
+/// only: no arithmetic, so a denormal compares as itself, as on the host.
+fn compare_body(p: &mut Program, kind: u32, y_may_be_nan: bool) {
+    let cmp = compare_of(kind).expect("a comparison");
+    let (x, y, out, ax, ay, one) = (LReg::L0, LReg::L1, LReg::L2, LReg::L3, LReg::L7, LReg::L6);
+    let (mask, inf) = (LReg::L4, LReg::L5);
+    p.and(x, mask, ax);
+    p.if_(Cond::Eq0(ax), |p| p.mov(LReg::ZERO, x));
+    p.and(y, mask, ay);
+    p.if_(Cond::Eq0(ay), |p| p.mov(LReg::ZERO, y));
+    let (unordered, holds) = if cmp == kind_sfpu::NE {
+        (one, LReg::ZERO)
+    } else {
+        (LReg::ZERO, one)
+    };
+    p.mov(unordered, out);
+    let ordered = move |p: &mut Program| match cmp {
+        kind_sfpu::EQ | kind_sfpu::NE => p.if_(Cond::LessEq(x, y), |p| {
+            p.if_(Cond::LessEq(y, x), |p| p.mov(holds, out))
+        }),
+        kind_sfpu::GT => p.if_(Cond::Less(y, x), |p| p.mov(holds, out)),
+        kind_sfpu::GE => p.if_(Cond::LessEq(y, x), |p| p.mov(holds, out)),
+        kind_sfpu::LT => p.if_(Cond::Less(x, y), |p| p.mov(holds, out)),
+        _ => p.if_(Cond::LessEq(x, y), |p| p.mov(holds, out)),
+    };
+    p.if_(Cond::LessEq(ax, inf), |p| {
+        if y_may_be_nan {
+            p.if_(Cond::LessEq(ay, inf), ordered);
+        } else {
+            ordered(p);
+        }
+    });
+}
+
+/// `bits` with a zero of either sign made `+0`: how a scalar meets the
+/// canonical lanes of [`compare_body`].
+fn canonical(bits: u32) -> u32 {
+    if bits & 0x7fff_ffff == 0 {
+        0
+    } else {
+        bits
+    }
+}
+
+/// The program for an exact S2 op (10.2c) over a tile, or `None` for a kind
+/// that is not one -- or a `CLAMP` whose bounds `f32::clamp` would refuse.
+fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operands> {
+    use kind_sfpu::*;
+    let (x, out, ax) = (LReg::L0, LReg::L2, LReg::L3);
+    let (mask, inf) = (LReg::L4, LReg::L5);
+    let (load, store) = (
+        move |p: &mut Program, o: u32| p.load(x, Format::Int32, A_ROW + o),
+        move |p: &mut Program, o: u32| p.store(out, Format::Int32, OUT_ROW + o),
+    );
+    match kind {
+        NEG | ABS => {
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                if kind == NEG {
+                    p.neg(x, out);
+                } else {
+                    p.and(x, mask, out);
+                }
+                store(p, o);
+            });
+        }
+        SIGN => {
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.loadi_bits(inf, 0x7f80_0000);
+            p.loadi(LReg::L6, 1.0);
+            p.loadi(LReg::L7, -1.0);
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                // A NaN is itself.
+                p.mov(x, out);
+                p.and(x, mask, ax);
+                p.if_(Cond::LessEq(ax, inf), |p| {
+                    p.if_else(
+                        Cond::Eq0(ax),
+                        |p| p.mov(LReg::ZERO, out),
+                        |p| {
+                            p.if_else(
+                                Cond::Lt0(x),
+                                |p| p.mov(LReg::L7, out),
+                                |p| p.mov(LReg::L6, out),
+                            )
+                        },
+                    )
+                });
+                store(p, o);
+            });
+        }
+        CLAMP_MIN | CLAMP_MAX => {
+            // A NaN scalar: the other side, `x`, everywhere.
+            if s.is_nan() {
+                p.for_each_row_group(64, |p, o| {
+                    load(p, o);
+                    p.mov(x, out);
+                    store(p, o);
+                });
+                return Some(Operands::Unary);
+            }
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.loadi_bits(inf, 0x7f80_0000);
+            p.loadi_bits(LReg::L1, s.to_bits());
+            p.loadi_bits(LReg::L7, canonical(s.to_bits()));
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                // The scalar, unless `x` is not NaN and beyond it.
+                p.mov(LReg::L1, out);
+                p.and(x, mask, ax);
+                p.mov(x, LReg::L6);
+                p.if_(Cond::Eq0(ax), |p| p.mov(LReg::ZERO, LReg::L6));
+                p.if_(Cond::LessEq(ax, inf), |p| {
+                    let beyond = if kind == CLAMP_MIN {
+                        Cond::Less(LReg::L7, LReg::L6)
+                    } else {
+                        Cond::Less(LReg::L6, LReg::L7)
+                    };
+                    p.if_(beyond, |p| p.mov(x, out));
+                });
+                store(p, o);
+            });
+        }
+        CLAMP => {
+            if s.is_nan() || s2.is_nan() || s > s2 {
+                return None;
+            }
+            use super::ConfigLReg;
+            // `f32::clamp`: below the low bound it, above the high one it,
+            // else `x` -- a NaN, and a zero equal to a bound, included.
+            p.constant(ConfigLReg::L11, s2.to_bits());
+            p.constant(ConfigLReg::L12, canonical(s2.to_bits()));
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.loadi_bits(inf, 0x7f80_0000);
+            p.loadi_bits(LReg::L1, s.to_bits());
+            p.loadi_bits(LReg::L7, canonical(s.to_bits()));
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                p.mov(x, out);
+                p.and(x, mask, ax);
+                p.mov(x, LReg::L6);
+                p.if_(Cond::Eq0(ax), |p| p.mov(LReg::ZERO, LReg::L6));
+                p.if_(Cond::LessEq(ax, inf), |p| {
+                    p.if_(Cond::Less(LReg::L6, LReg::L7), |p| p.mov(LReg::L1, out));
+                    p.if_(Cond::Less(ConfigLReg::L12.lreg(), LReg::L6), |p| {
+                        p.mov(ConfigLReg::L11.lreg(), out)
+                    });
+                });
+                store(p, o);
+            });
+        }
+        LEAKY_RELU => {
+            // `x >= 0` holds for `-0` and for every non-negative non-NaN; the
+            // rest -- negatives and NaNs -- take the product.
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.loadi_bits(inf, 0x7f80_0000);
+            p.loadi_bits(LReg::L6, s.to_bits());
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                p.mul(x, LReg::L6, out);
+                p.and(x, mask, ax);
+                p.if_(Cond::Gte0(x), |p| {
+                    p.if_(Cond::LessEq(ax, inf), |p| p.mov(x, out))
+                });
+                p.if_(Cond::Eq0(ax), |p| p.mov(x, out));
+                store(p, o);
+            });
+        }
+        HARD_SIGMOID => {
+            // Flex's `alpha * x + beta`: two roundings, as two instructions.
+            p.loadi_bits(mask, 0x7fff_ffff);
+            p.loadi_bits(inf, 0x7f80_0000);
+            p.loadi_bits(LReg::L6, s.to_bits());
+            p.loadi_bits(LReg::L7, s2.to_bits());
+            p.loadi(LReg::L1, 1.0);
+            p.for_each_row_group(64, |p, o| {
+                p.load(x, Format::Fp32, A_ROW + o);
+                p.mul(LReg::L6, x, out);
+                p.add(out, LReg::L7, out);
+                // `.clamp(0, 1)`: a NaN stays, `-0` stays.
+                p.and(out, mask, ax);
+                p.if_(Cond::LessEq(ax, inf), |p| {
+                    p.if_(Cond::Lt0(out), |p| {
+                        p.if_(Cond::Ne0(ax), |p| p.mov(LReg::ZERO, out))
+                    });
+                    p.if_(Cond::Less(LReg::L1, out), |p| p.mov(LReg::L1, out));
+                });
+                store(p, o);
+            });
+        }
+        k if (EQ_S..=LE_S).contains(&k) => {
+            // Against a scalar: its zero made `+0` and its NaN settled here,
+            // where every lane gets the unordered answer.
+            compare_constants(p);
+            if s.is_nan() {
+                let v = if compare_of(k) == Some(NE) {
+                    LReg::L6
+                } else {
+                    LReg::ZERO
+                };
+                p.for_each_row_group(64, |p, o| {
+                    p.mov(v, out);
+                    store(p, o);
+                });
+                return Some(Operands::Unary);
+            }
+            p.loadi_bits(LReg::L1, canonical(s.to_bits()));
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                compare_body(p, k, false);
+                store(p, o);
+            });
+        }
+        IS_NAN | IS_INF => {
+            compare_constants(p);
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                p.mov(LReg::ZERO, out);
+                p.and(x, mask, ax);
+                if kind == IS_NAN {
+                    p.if_(Cond::Less(inf, ax), |p| p.mov(LReg::L6, out));
+                } else {
+                    p.if_(Cond::LessEq(inf, ax), |p| {
+                        p.if_(Cond::LessEq(ax, inf), |p| p.mov(LReg::L6, out))
+                    });
+                }
+                store(p, o);
+            });
+        }
+        MASK_WHERE => {
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                p.load(LReg::L1, Format::Int32, super::kernel::B_ROW + o);
+                p.load(LReg::L3, Format::Int32, super::kernel::C_ROW + o);
+                p.mov(x, out);
+                p.if_(Cond::Ne0(LReg::L1), |p| p.mov(LReg::L3, out));
+                store(p, o);
+            });
+            return Some(Operands::Ternary);
+        }
+        _ => return None,
+    }
+    Some(Operands::Unary)
 }
 
 /// The program for `kind` with its second operand broadcast as `bcast`, and
@@ -374,16 +757,16 @@ fn binary_constants(p: &mut Program, kind: u32) {
 /// the plain binary one.
 pub fn program_for(
     kind: u32,
-    scalar: f32,
+    scalars: [f32; 2],
     bcast: Broadcast,
 ) -> Option<(Operands, Vec<Instruction>)> {
     match bcast {
-        Broadcast::None => program(kind, scalar),
+        Broadcast::None => program2(kind, scalars),
         _ if !broadcasts(kind) => None,
-        Broadcast::Col => program(kind, scalar).map(|(_, p)| (Operands::ColBroadcast, p)),
+        Broadcast::Col => program2(kind, scalars).map(|(_, p)| (Operands::ColBroadcast, p)),
         Broadcast::Row => {
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
-            binary_constants(&mut p, kind);
+            binary_constants(&mut p, kind, scalars);
             p.for_each_row_group(64, |p, o| {
                 binary_body(p, kind, A_ROW + o, bias_row(o / 4) + (o & 2), OUT_ROW + o)
             });
@@ -396,6 +779,17 @@ pub fn program_for(
 /// `None` for a kind with no SFPU program. `ADD_ROW` is `ADD` with a row
 /// broadcast ([`program_for`]).
 pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
+    program2(kind, [scalar, 0.0])
+}
+
+/// [`program`] for a kind with two scalars ([`kind_sfpu::CLAMP`],
+/// [`kind_sfpu::HARD_SIGMOID`]).
+pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instruction>)> {
+    let scalar = scalars[0];
+    let mut p = Program::new();
+    if let Some(o) = exact_program(&mut p, kind, scalars) {
+        return Some((o, p.finish()));
+    }
     let mut p = Program::new();
     let operands = match kind {
         kind::ADD
@@ -404,8 +798,11 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
         | kind_sfpu::DIV
         | kind_sfpu::BOOL_AND
         | kind_sfpu::BOOL_OR
-        | kind_sfpu::BOOL_XOR => {
-            binary_constants(&mut p, kind);
+        | kind_sfpu::BOOL_XOR
+        | kind_sfpu::EQ..=kind_sfpu::LE
+        | kind_sfpu::MASK_FILL
+        | kind_sfpu::PRELU => {
+            binary_constants(&mut p, kind, scalars);
             p.for_each_row_group(64, |p, o| {
                 binary_body(p, kind, A_ROW + o, B_ROW + o, OUT_ROW + o)
             });
@@ -503,7 +900,7 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
             });
             Operands::Unary
         }
-        kind::ADD_ROW => return program_for(kind::ADD, scalar, Broadcast::Row),
+        kind::ADD_ROW => return program_for(kind::ADD, scalars, Broadcast::Row),
         _ => return None,
     };
     Some((operands, p.finish()))
@@ -547,9 +944,24 @@ pub fn reference_for(
     rows: usize,
     cols: usize,
 ) -> Vec<f32> {
+    let inputs: Vec<&[f32]> = std::iter::once(a).chain(b).collect();
+    reference_op(kind, [scalar, 0.0], bcast, &inputs, rows, cols)
+}
+
+/// [`reference_for`] with both scalars and any number of operands: `B` as
+/// `bcast` says, a third (`Operands::Ternary`) the same shape as `A`.
+pub fn reference_op(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+    inputs: &[&[f32]],
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
     use super::interp::Vector;
     use tt_isa::dm::face_index;
-    let (operands, math) = program_for(kind, scalar, bcast).expect("an SFPU op");
+    let (a, b, c) = (inputs[0], inputs.get(1).copied(), inputs.get(2).copied());
+    let (operands, math) = program_for(kind, scalars, bcast).expect("an SFPU op");
     let (rt, ct) = (rows.div_ceil(32), cols.div_ceil(32));
     let mut out = vec![0.0f32; rows * cols];
     let tile = |x: &[f32], xr: usize, i: usize, j: usize| -> Vec<u32> {
@@ -570,6 +982,11 @@ pub fn reference_for(
             v.put_tile(A_ROW as usize, &tile(a, rows, i, j));
             match (operands, b) {
                 (Operands::Binary, Some(b)) => v.put_tile(B_ROW as usize, &tile(b, rows, i, j)),
+                (Operands::Ternary, Some(b)) => {
+                    v.put_tile(B_ROW as usize, &tile(b, rows, i, j));
+                    let c = c.expect("a ternary op's third operand");
+                    v.put_tile(super::kernel::C_ROW as usize, &tile(c, rows, i, j));
+                }
                 (Operands::RowBroadcast, Some(b)) => {
                     let t = tile(b, 1, 0, j);
                     for r in 0..4 {
@@ -988,7 +1405,185 @@ mod arity {
     #[test]
     fn operands_agrees_with_program() {
         for k in (1..=kind::LAST).chain(0x100..0x140) {
-            assert_eq!(operands(k), program(k, 0.5).map(|(o, _)| o), "kind {k:#x}");
+            // Scalars any kind takes: `CLAMP`'s bounds uncrossed.
+            let got = program2(k, [-0.5, 0.5]).map(|(o, _)| o);
+            assert_eq!(operands(k), got, "kind {k:#x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod s2 {
+    use super::kind_sfpu::*;
+    use super::*;
+
+    /// Both zeros, both infinities, NaNs of either sign with payloads,
+    /// denormals, the extremes, and ordinary values: every pairing of them
+    /// lands in one 32x32 tile.
+    const SPECIALS: [u32; 16] = [
+        0x0000_0000,
+        0x8000_0000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_1234,
+        0xffc0_0001,
+        0x0000_0001,
+        0x8040_0000,
+        0x7f7f_ffff,
+        0x0080_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x4000_0000,
+        0xbf00_0000,
+        0x3e4c_cccd,
+        0xc2c8_0000,
+    ];
+
+    fn pairs() -> (Vec<f32>, Vec<f32>) {
+        let a = (0..1024)
+            .map(|i| f32::from_bits(SPECIALS[i % 16]))
+            .collect();
+        let b = (0..1024)
+            .map(|i| f32::from_bits(SPECIALS[(i / 16) % 16]))
+            .collect();
+        (a, b)
+    }
+
+    fn b(x: bool) -> f32 {
+        f32::from_bits(u32::from(x))
+    }
+
+    /// The SFPU's arithmetic flushes a denormal operand to a signed zero
+    /// before it computes (numerics row D): the host's arithmetic, so.
+    fn ftz(x: f32) -> f32 {
+        if x != 0.0 && x.abs() < f32::MIN_POSITIVE {
+            f32::from_bits(x.to_bits() & 0x8000_0000)
+        } else {
+            x
+        }
+    }
+
+    /// The device's bits for the host's `want`: the same bits, or -- where
+    /// `products` says the op multiplies -- a flushed denormal's signed zero,
+    /// or any NaN for a NaN.
+    fn same(got: f32, want: f32, products: bool) -> bool {
+        let (g, w) = (got.to_bits(), want.to_bits());
+        g == w
+            || (products && want.is_nan() && got.is_nan())
+            || (products && want != 0.0 && want.abs() < f32::MIN_POSITIVE && g == w & 0x8000_0000)
+    }
+
+    fn check(kind: u32, scalars: [f32; 2], host: impl Fn(f32, f32) -> f32, products: bool) {
+        let (a, bv) = pairs();
+        let inputs: Vec<&[f32]> = match operands(kind).unwrap() {
+            Operands::Unary => vec![&a],
+            _ => vec![&a, &bv],
+        };
+        let got = reference_op(kind, scalars, Broadcast::None, &inputs, 32, 32);
+        for i in 0..1024 {
+            let want = host(a[i], bv[i]);
+            assert!(
+                same(got[i], want, products),
+                "kind {kind:#x} {scalars:?}: ({:#010x}, {:#010x}) gave {:#010x}, the host {:#010x}",
+                a[i].to_bits(),
+                bv[i].to_bits(),
+                got[i].to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn the_unary_ops_are_the_host_s_bit_for_bit() {
+        check(NEG, [0.0; 2], |x, _| -x, false);
+        check(ABS, [0.0; 2], |x, _| x.abs(), false);
+        let sign = |x: f32| {
+            if x.is_nan() {
+                x
+            } else if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        };
+        check(SIGN, [0.0; 2], move |x, _| sign(x), false);
+        for (lo, hi) in [(-1.0f32, 1.0f32), (0.0, 0.5), (-0.0, 0.0), (-2.0, -2.0)] {
+            check(CLAMP, [lo, hi], move |x, _| x.clamp(lo, hi), false);
+        }
+        // Flex's `x.max(s)`, measured: a NaN on either side gives the other,
+        // and equal values the scalar.
+        let max = |x: f32, s: f32| {
+            if s.is_nan() || x > s {
+                x
+            } else {
+                s
+            }
+        };
+        let min = |x: f32, s: f32| {
+            if s.is_nan() || x < s {
+                x
+            } else {
+                s
+            }
+        };
+        for s in [0.0f32, -0.0, 1.0, -0.5, f32::NAN, f32::INFINITY] {
+            check(CLAMP_MIN, [s, 0.0], move |x, _| max(x, s), false);
+            check(CLAMP_MAX, [s, 0.0], move |x, _| min(x, s), false);
+        }
+        for ns in [0.01f32, -3.0, 0.0] {
+            // The product of a flushed operand; the pass-through keeps `x`.
+            let leaky = move |x: f32, _| if x >= 0.0 { x } else { ns * ftz(x) };
+            check(LEAKY_RELU, [ns, 0.0], leaky, true);
+        }
+        for (al, be) in [(0.2f32, 0.5f32), (1.0 / 6.0, 0.5), (-1.0, 0.0)] {
+            check(
+                HARD_SIGMOID,
+                [al, be],
+                move |x, _| ftz(ftz(al * ftz(x)) + be).clamp(0.0, 1.0),
+                true,
+            );
+        }
+        let prelu = |x: f32, a: f32| if x >= 0.0 { x } else { ftz(a) * ftz(x) };
+        check(PRELU, [0.0; 2], prelu, true);
+        check(IS_NAN, [0.0; 2], |x, _| b(x.is_nan()), false);
+        check(IS_INF, [0.0; 2], |x, _| b(x.is_infinite()), false);
+    }
+
+    #[test]
+    fn the_comparisons_are_ieee_s() {
+        for (t, sk) in COMPARES {
+            check(t, [0.0; 2], move |x, y| b(ieee_compare(t, x, y)), false);
+            for s in [
+                0.0f32,
+                -0.0,
+                1.0,
+                -0.5,
+                f32::NAN,
+                f32::NEG_INFINITY,
+                f32::from_bits(1),
+            ] {
+                check(sk, [s, 0.0], move |x, _| b(ieee_compare(t, x, s)), false);
+            }
+        }
+    }
+
+    #[test]
+    fn the_masks_pass_bits_through() {
+        let (a, v) = pairs();
+        let m: Vec<f32> = (0..1024).map(|i| b((i * 7) % 3 == 0)).collect();
+        for value in [2.5f32, -0.0, f32::NAN] {
+            let got = reference_op(MASK_FILL, [value, 0.0], Broadcast::None, &[&a, &m], 32, 32);
+            for i in 0..1024 {
+                let want = if m[i].to_bits() != 0 { value } else { a[i] };
+                assert_eq!(got[i].to_bits(), want.to_bits(), "fill {i}");
+            }
+        }
+        let got = reference_op(MASK_WHERE, [0.0; 2], Broadcast::None, &[&a, &m, &v], 32, 32);
+        for i in 0..1024 {
+            let want = if m[i].to_bits() != 0 { v[i] } else { a[i] };
+            assert_eq!(got[i].to_bits(), want.to_bits(), "where {i}");
         }
     }
 }

@@ -190,7 +190,11 @@ fn every_kind_matches_flex_bit_for_bit() {
                     ),
                 ];
                 for (label, k, scalar, use_row, want) in cases {
-                    let op = Eltwise { kind: k, scalar };
+                    let op = Eltwise {
+                        scalar2: 0.0,
+                        kind: k,
+                        scalar,
+                    };
                     let other = if use_row { Some(&bias) } else { Some(&b) };
                     let out = s
                         .eltwise(op, &a, other)
@@ -215,6 +219,7 @@ fn a_denormal_result_is_flushed() {
         let tiny = f32::MIN_POSITIVE; // 2^-126, normal
         let a = s.upload(&[tiny], 1, 1).unwrap();
         let op = Eltwise {
+            scalar2: 0.0,
             kind: kind::MUL_SCALAR,
             scalar: 0.5,
         };
@@ -332,6 +337,7 @@ fn padding_rows_stay_out_of_a_later_accumulation() {
             let y = s.upload(&yv, r, c).unwrap();
             let d = s.upload(&dv, 1, c).unwrap();
             let add_row = Eltwise {
+                scalar2: 0.0,
                 kind: kind::ADD_ROW,
                 scalar: 0.0,
             };
@@ -391,6 +397,7 @@ fn the_longest_runs_fit_and_match_flex() {
             (
                 "add row",
                 Eltwise {
+                    scalar2: 0.0,
                     kind: kind::ADD_ROW,
                     scalar: 0.0,
                 },
@@ -400,6 +407,7 @@ fn the_longest_runs_fit_and_match_flex() {
             (
                 "add",
                 Eltwise {
+                    scalar2: 0.0,
                     kind: kind::ADD,
                     scalar: 0.0,
                 },

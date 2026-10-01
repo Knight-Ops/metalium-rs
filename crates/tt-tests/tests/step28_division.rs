@@ -140,7 +140,15 @@ fn reciprocal_and_division_are_the_program_and_within_one_ulp_of_flex() {
             ];
             for (name, kind, scalar, other, want) in cases {
                 let out = s
-                    .eltwise(Eltwise { kind, scalar }, &a, other)
+                    .eltwise(
+                        Eltwise {
+                            scalar2: 0.0,
+                            kind,
+                            scalar,
+                        },
+                        &a,
+                        other,
+                    )
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let got = s.download(&out).unwrap();
                 let model = reference(kind, scalar, &av, other.map(|_| bv.as_slice()), r, c);

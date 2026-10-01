@@ -194,29 +194,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_add_scalar(lhs, rhs)
     }
     fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_clamp_min(tensor.into_flex(), min),
-            device,
-        )
+        crate::ops::float::float_clamp_min(tensor, min)
     }
     fn float_clamp_max(tensor: FloatTensor<TtBackend>, max: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_clamp_max(tensor.into_flex(), max),
-            device,
-        )
+        crate::ops::float::float_clamp_max(tensor, max)
     }
     fn float_clamp(
         tensor: FloatTensor<TtBackend>,
         min: Scalar,
         max: Scalar,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_clamp(tensor.into_flex(), min, max),
-            device,
-        )
+        crate::ops::float::float_clamp(tensor, min, max)
     }
     fn float_sub(
         lhs: FloatTensor<TtBackend>,
@@ -280,11 +268,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_neg(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_neg(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_neg(tensor)
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_recip(tensor)
@@ -433,190 +417,98 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_mask_where(
-                tensor.into_flex(),
-                mask.into_flex(),
-                value.into_flex(),
-            ),
-            device,
-        )
+        crate::ops::float::float_mask_where(tensor, mask, value)
     }
     fn float_mask_fill(
         tensor: FloatTensor<TtBackend>,
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_mask_fill(
-                tensor.into_flex(),
-                mask.into_flex(),
-                value,
-            ),
-            device,
-        )
+        crate::ops::float::float_mask_fill(tensor, mask, value)
     }
     fn float_equal(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_equal(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_equal(lhs, rhs, out_dtype)
     }
     fn float_not_equal(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_not_equal(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_not_equal(lhs, rhs, out_dtype)
     }
     fn float_equal_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_equal_elem(lhs.into_flex(), rhs, out_dtype),
-            device,
-        )
+        crate::ops::float::float_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_not_equal_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_not_equal_elem(lhs.into_flex(), rhs, out_dtype),
-            device,
-        )
+        crate::ops::float::float_not_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_greater(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_greater(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_greater(lhs, rhs, out_dtype)
     }
     fn float_greater_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_greater_elem(lhs.into_flex(), rhs, out_dtype),
-            device,
-        )
+        crate::ops::float::float_greater_elem(lhs, rhs, out_dtype)
     }
     fn float_greater_equal(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_greater_equal(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_greater_equal(lhs, rhs, out_dtype)
     }
     fn float_greater_equal_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_greater_equal_elem(
-                lhs.into_flex(),
-                rhs,
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_greater_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_lower(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_lower(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_lower(lhs, rhs, out_dtype)
     }
     fn float_lower_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_lower_elem(lhs.into_flex(), rhs, out_dtype),
-            device,
-        )
+        crate::ops::float::float_lower_elem(lhs, rhs, out_dtype)
     }
     fn float_lower_equal(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_lower_equal(
-                lhs.into_flex(),
-                rhs.into_flex(),
-                out_dtype,
-            ),
-            device,
-        )
+        crate::ops::float::float_lower_equal(lhs, rhs, out_dtype)
     }
     fn float_lower_equal_elem(
         lhs: FloatTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_lower_equal_elem(lhs.into_flex(), rhs, out_dtype),
-            device,
-        )
+        crate::ops::float::float_lower_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_detach(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -692,11 +584,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cast(tensor: FloatTensor<TtBackend>, dtype: FloatDType) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_cast(tensor.into_flex(), dtype),
-            device,
-        )
+        crate::ops::float::float_cast(tensor, dtype)
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_exp(tensor)
@@ -763,11 +651,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_abs(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_abs(tensor)
     }
     fn float_cos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -1044,11 +928,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_sign(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sign(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_sign(tensor)
     }
     fn float_expand(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -1130,18 +1010,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_is_nan(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_is_nan(tensor.into_flex(), out_dtype),
-            device,
-        )
+        crate::ops::float::float_is_nan(tensor, out_dtype)
     }
     fn float_is_inf(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_is_inf(tensor.into_flex(), out_dtype),
-            device,
-        )
+        crate::ops::float::float_is_inf(tensor, out_dtype)
     }
 }
 
@@ -2789,11 +2661,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         negative_slope: Scalar,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::leaky_relu(tensor.into_flex(), negative_slope),
-            device,
-        )
+        crate::ops::activation::leaky_relu(tensor, negative_slope)
     }
     fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::activation::relu(tensor)
@@ -2815,11 +2683,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         alpha: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::prelu(tensor.into_flex(), alpha.into_flex()),
-            device,
-        )
+        crate::ops::activation::prelu(tensor, alpha)
     }
     fn gelu_backward(
         x: FloatTensor<TtBackend>,
@@ -2853,11 +2717,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         alpha: Scalar,
         beta: Scalar,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::hard_sigmoid(tensor.into_flex(), alpha, beta),
-            device,
-        )
+        crate::ops::activation::hard_sigmoid(tensor, alpha, beta)
     }
     fn log_sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);

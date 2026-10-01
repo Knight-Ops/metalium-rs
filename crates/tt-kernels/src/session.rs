@@ -1781,6 +1781,18 @@ impl<T: Transport> Session<T> {
         a: &DramTensor,
         b: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
+        self.eltwise3(op, a, b, None)
+    }
+
+    /// [`Session::eltwise`] with a ternary op's third operand
+    /// (`sfpu::ops::kind_sfpu::MASK_WHERE`): the SFPU's alone.
+    pub fn eltwise3(
+        &mut self,
+        op: tensor::Eltwise,
+        a: &DramTensor,
+        b: Option<&DramTensor>,
+        c: Option<&DramTensor>,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
         let unit = self.eltwise_unit;
@@ -1805,7 +1817,7 @@ impl<T: Transport> Session<T> {
                 tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(kind, rt * ct, units),
             };
         let work = if sfpu {
-            tensor::sfpu_eltwise(alloc, op, a, b, units)?
+            tensor::sfpu_eltwise(alloc, op, a, b, c, units)?
         } else {
             None
         };
@@ -1819,7 +1831,7 @@ impl<T: Transport> Session<T> {
             }
         };
         let out = self.execute(work, RESET_BUDGET)?;
-        out.set_pad(op.produces(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>()));
+        out.set_pad(op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()));
         Ok(out)
     }
 
@@ -1895,6 +1907,7 @@ impl<T: Transport> Session<T> {
         }
         let copy = self.eltwise(
             tensor::Eltwise {
+                scalar2: 0.0,
                 kind: tt_isa::dm::kind::COPY,
                 scalar: 0.0,
             },

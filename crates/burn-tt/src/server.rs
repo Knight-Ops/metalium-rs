@@ -112,6 +112,21 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// [`Engine::eltwise`] with the whole op -- both its scalars -- and a
+    /// ternary op's third operand. An engine without its own forwards what
+    /// the plain form carries.
+    fn eltwise_op(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if op.scalar2 != 0.0 || c.is_some() {
+            return Err(unsupported());
+        }
+        self.eltwise(op.kind, op.scalar, a, b)
+    }
     /// Everything the engine's device has moved across its transport so far
     /// (`tt_device::Device::traffic`): tensors, descriptors, programs and
     /// polls alike. `None` if the engine has no single device to ask.
@@ -298,11 +313,27 @@ impl DramBuffers {
         a: BufferId,
         b: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let op = tt_kernels::tensor::Eltwise {
+            scalar2: 0.0,
+            kind,
+            scalar,
+        };
+        self.eltwise_op(s, op, a, b, None)
+    }
+
+    pub fn eltwise_op<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let ta = self.get(a)?.clone();
         let tb = b.map(|b| self.get(b).cloned()).transpose()?;
-        let op = tt_kernels::tensor::Eltwise { kind, scalar };
+        let tc = c.map(|c| self.get(c).cloned()).transpose()?;
         let c = s
-            .eltwise(op, &ta, tb.as_ref())
+            .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
             .map_err(|e| EngineError(e.to_string()))?;
         let dims = [c.rows, c.cols];
         self.next += 1;
@@ -622,18 +653,19 @@ pub(crate) fn free(device: TtDevice, id: BufferId) {
     }
 }
 
-/// Element-wise on the device, panicking on a device error.
-pub(crate) fn eltwise(
+/// Element-wise on the device -- the whole op, both scalars, and a ternary
+/// op's third operand -- panicking on a device error.
+pub(crate) fn eltwise_op(
     device: TtDevice,
-    kind: u32,
-    scalar: f32,
+    op: tt_kernels::tensor::Eltwise,
     a: BufferId,
     b: Option<BufferId>,
+    c: Option<BufferId>,
 ) -> (BufferId, [usize; 2]) {
     timed_run("eltwise", device, move |engine| {
-        engine.eltwise(kind, scalar, a, b)
+        engine.eltwise_op(op, a, b, c)
     })
-    .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
+    .unwrap_or_else(|e| panic!("element-wise {:#x} on {device}: {e}", op.kind))
 }
 
 /// A reduction on the device, panicking on a device error.
@@ -752,6 +784,16 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise(&mut self.session, kind, scalar, a, b)
+    }
+    fn eltwise_op(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_op(&mut self.session, op, a, b, c)
     }
     fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;

@@ -51,6 +51,7 @@ fn profiling_is_refused_on_the_simulator_and_the_session_carries_on() {
         let v = floats(1, 64 * 64);
         let a = s.upload(&v, 64, 64).unwrap();
         let k = Eltwise {
+            scalar2: 0.0,
             kind: tt_isa::dm::kind::MUL_SCALAR,
             scalar: 2.0,
         };
@@ -89,6 +90,7 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
         let b = s.upload(&floats(2, k * n), k, n).unwrap();
         s.profile_start().unwrap();
         let add = Eltwise {
+            scalar2: 0.0,
             kind: tt_isa::dm::kind::ADD,
             scalar: 0.0,
         };
@@ -171,6 +173,7 @@ fn a_profile_outlives_the_event_buffer() {
     with_tiles(1, |s| {
         let a = s.upload(&floats(3, 64 * 64), 64, 64).unwrap();
         let relu = Eltwise {
+            scalar2: 0.0,
             kind: tt_isa::dm::kind::RELU,
             scalar: 0.0,
         };

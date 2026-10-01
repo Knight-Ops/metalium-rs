@@ -160,14 +160,17 @@ fn dirty_padding_never_reaches_an_accumulation() {
             }
 
             let add_row = Eltwise {
+                scalar2: 0.0,
                 kind: kind::ADD_ROW,
                 scalar: 0.0,
             };
             let inf = Eltwise {
+                scalar2: 0.0,
                 kind: kind::MUL_SCALAR,
                 scalar: f32::INFINITY,
             };
             let relu = Eltwise {
+                scalar2: 0.0,
                 kind: kind::RELU,
                 scalar: 0.0,
             };
@@ -282,6 +285,7 @@ fn a_view_is_filled_through_a_copy() {
         let y0 = s.upload(&yv, 18, 24).unwrap();
         let d = s.upload(&dv, 1, 24).unwrap();
         let add_row = Eltwise {
+            scalar2: 0.0,
             kind: kind::ADD_ROW,
             scalar: 0.0,
         };

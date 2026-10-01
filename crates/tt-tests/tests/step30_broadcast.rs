@@ -161,6 +161,7 @@ fn row_and_column_broadcasts_match_flex() {
                 let out = s
                     .eltwise(
                         Eltwise {
+                            scalar2: 0.0,
                             kind: k,
                             scalar: 0.0,
                         },

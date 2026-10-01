@@ -123,7 +123,15 @@ fn exp_and_log_are_the_program_and_within_the_bound_of_flex() {
             ];
             for (name, kind, want, bound) in cases {
                 let out = s
-                    .eltwise(Eltwise { kind, scalar: 0.0 }, &a, None)
+                    .eltwise(
+                        Eltwise {
+                            scalar2: 0.0,
+                            kind,
+                            scalar: 0.0,
+                        },
+                        &a,
+                        None,
+                    )
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let got = s.download(&out).unwrap();
                 let model = reference(kind, 0.0, &av, None, r, c);

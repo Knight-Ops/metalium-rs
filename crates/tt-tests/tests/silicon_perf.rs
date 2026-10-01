@@ -374,6 +374,7 @@ fn many_tiles_sweep() {
                 let o = s
                     .eltwise(
                         Eltwise {
+                            scalar2: 0.0,
                             kind: tt_isa::dm::kind::ADD,
                             scalar: 0.0,
                         },
@@ -497,6 +498,7 @@ fn eltwise_unit_sweep() {
                     s.set_eltwise_unit(unit);
                     for (name, k) in [("add", kind::ADD), ("relu", kind::RELU)] {
                         let op = Eltwise {
+                            scalar2: 0.0,
                             kind: k,
                             scalar: 0.0,
                         };
@@ -635,6 +637,7 @@ fn softmax_parts() {
                 );
             };
         let e = |k| Eltwise {
+            scalar2: 0.0,
             kind: k,
             scalar: 0.0,
         };
