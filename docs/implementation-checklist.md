@@ -1402,7 +1402,11 @@ cards for time):
     ends" on every run (`silicon_eth_link`'s host-driven X 3 tests and every
     mover test, which takes the first two links); X 13 is Up and the
     host-driven X 13 tests pass. Ethernet code is unchanged since Phase 8, so
-    this is link state, not a regression; not yet investigated.
+    this is link state, not a regression. **Cleared by a device reset:**
+    afterwards `silicon_eth_link` 10/10 (both X 3 directions, the mover and
+    the sharded matmul), the two-card sharded MNIST golden, and the smoke tier
+    26/26 on both cards. If it recurs, reset the cards before suspecting the
+    code.
 - [x] **Forking while another test thread is inside Burn could hang a child.**
       A forked child keeps every lock as it stood; one held by a thread
       computing a `burn-flex` reference in the parent is held forever. Seen
