@@ -5,6 +5,8 @@ coverage"). The plan says *why*; this file says *which parts of a Blackhole Tens
 this stack can drive, which it cannot yet, and in what order the rest arrives*. It is the
 progress record: an item is ticked here or nowhere.
 
+Execution order, branches and the per-item workflow: the "Execution" section at the end.
+
 Companion guides: [`tt-metal-concepts-review.md`](tt-metal-concepts-review.md) (the
 Tenstorrent concepts this stack lacks, G1–G16, and the hardware sharp edges to handle in
 code) and [`burn-backend-parity.md`](burn-backend-parity.md) (the `burn-tt` surface and
@@ -44,12 +46,12 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | SFPU foundation; today's element-wise ops move from the B core to the SFPU | F1–F5, S1 | `[ ]` |
-| 10.1 | Softmax and cross-entropy on the device | S3, S4 (`exp`, `log`), R1 (`max`, `sum`), R2 | `[ ]` |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[ ]` |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
-| 10.3 | Reductions over any dim, pooling, device transpose, norms | M2, M3, R1, R3 | `[ ]` |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
-| 10.5 | Indexing and convolution | D4, D6 | `[ ]` |
+| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
@@ -87,6 +89,9 @@ it, and a line that does not apply says why in the item.
 6. **Findings logged**: every ttsim refusal or ttsim/silicon disagreement met on the way
    is a row in `ttsim-divergence.md`, and every measured fact a "Measured, not quoted"
    entry.
+7. **Padding declared** (F0, from `tt-metal-concepts-review.md` G1): the op states the pad
+   it needs from each input and the pad it leaves (`OpPadding`), and a ragged-shape gate
+   chains it into an accumulation.
 
 An op that works only on silicon (ttsim refuses an instruction it needs) can be ticked
 with the simulator line `[-]` and the divergence row cited, as `DOTPV` is today.
@@ -158,17 +163,20 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
 
-### Frontend and scheduling
+### Frontend and tracing
 
-These are Phase 9 items, listed so the inventory is whole; they are tracked in the
-checklist, not here.
+Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
+`BabyRISCV/AutoTTSync.md` (the expanders and the Wait Gate), `DebugTimestamper.md`.
 
-| Feature | Where tracked |
-|---|---|
-| `MOP` / `MOP_CFG` expansion, `REPLAY` | checklist Phase 9 |
-| `.ttinsn` fusion (four pushes per cycle) | checklist Phase 9 |
-| Hazards as data, the wait planner | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
-| Three-thread pipelining, double buffering | checklist 9.8 |
+| Feature | Enc | Helper | Kernel | Sim | Si | Item |
+|---|:-:|:-:|:-:|:-:|:-:|---|
+| `REPLAY` (record and replay, 32 entries per thread) | x | | | | | X1 |
+| `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
+| Debug timestamper event stream | -- | `~` (`tt_device::trace`) | `~` role events | `-` row 54 | `~` | X3 |
+| Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
+| `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
+| Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
+| Three-thread pipelining, double buffering | -- | | | | | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
 
@@ -199,6 +207,39 @@ Pulled in only when a kernel needs them; each says which.
 
 In dependency order. Each names the Burn methods it unlocks; the Burn table below is the
 reverse index.
+
+### X — Frontend expanders and tracing
+
+- [ ] **X1 `REPLAY`.** `tt_isa::frontend::replay`: `record(slot, body, exec)` and
+      `replay(slot)`, over a per-thread `ReplaySlots` allocator of the 32-entry buffer that
+      refuses overlap, a body over 32 and a nested `REPLAY`. The buffer is per-thread state
+      that survives between programs (divergence rows 47, 49), so a program records before
+      it replays. F2's row-group loop records its body once and replays it where it fits,
+      unrolling (and saying so) where it does not. Gate: replayed programs bit-identical to
+      their unrolled form on ttsim and both cards.
+- [ ] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
+      after `MOPExpanderDoneCheck` (`ManualTTSync.md:57`); Auto TTSync takes the `MOP`'s
+      resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
+      unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
+      down; silicon time measured.
+- [ ] **X3 The debug timestamper as a device profiler** (concepts review G13). Begin/end
+      tokens per list entry and record kind from the B mover and per program from the
+      roles; `Session::profile()` gathers every unit's stream, exported as Chrome-trace
+      JSON (`TT_PROFILE=<path>`); overflow is a typed error. Silicon only (row 54). The
+      source of every later "Measured" entry.
+- [ ] **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
+      capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
+      B streaming the list from GDDR; a trace binds its tensors and refuses to replay
+      after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes
+      per step down to the descriptors.
+
+### P — Prerequisites pulled in when they block
+
+- [ ] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
+      `prod(leading)` stacked tile grids, a batch stride in `TensorRef` (0 = broadcast),
+      last-dim-preserving reshapes as views. Blocks R1 over leading dims, R3, D6, R4.
+- [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
+      a matmul's K is not capped by L1. Blocks D6's im2col.
 
 ### F — SFPU foundation (blocks every S item)
 
@@ -414,3 +455,29 @@ the item that must handle each. An item is not done while its hazard here is ope
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
+
+---
+
+## Execution
+
+**Branches.** One per milestone, stacked: `phase10-0-sfpu-foundation` off `main`, each
+later milestone off the previous one (`phase10-1-softmax`, `phase10-2-activations`,
+`phase10-3-reductions`, `phase10-4-formats`, `phase10-5-indexing-conv`, `phase10-6-rest`).
+A milestone's branch is green on ttsim and both cards before the next one starts.
+
+**Per item.** The `tt-isa` helper and its unit tests; the oracle; the ttsim gate, watched
+failing once; `cargo xtask silicon --release --device all --filter <gate>`; the Burn
+override with its Flex comparison, residency check and `SMOKE` entry; then the docs, in the
+same commit as the code:
+
+1. here: the item ticked, its inventory row's columns, its Burn table rows, its hazard row
+   closed, the milestone's state, the date in "Where things stand";
+2. `ttsim-divergence.md`: a numbered row per refusal or disagreement, a lettered row per
+   measurement, cited from the item;
+3. `implementation-checklist.md`: the Tier 2 bug entries and silicon-verification backlog
+   entries the item settles, and the milestone line `10.N` when it closes;
+4. at a milestone's close, `RUST_IMPL_PLAN.md`'s Phase 10 status and any
+   `burn-backend-parity.md` row that cites the item.
+
+**Order inside 10.0.** X3 (so S1's gain is measured on the device), F0, F1, F2 with X1, F5,
+F3, F4, S1, F6.

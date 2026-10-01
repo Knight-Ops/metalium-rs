@@ -1440,7 +1440,7 @@ tiles, done in turn. The slices from there:
 
 - [ ] A `Device` write fence as API, rather than read-backs at call sites
       (Phase 8: posted writes race other agents).
-- [ ] `MOP`/`REPLAY` expansion.
+- [-] `MOP`/`REPLAY` expansion -- moved to Phase 10 (`hardware-coverage.md` X1, X2).
 - [ ] NoC multicast for operands many tiles share (matmul `in0`/`in1`).
 - [ ] `.ttinsn` fusion — up to four adjacent pushes per cycle. Deferred from the
       baseline because fused words disassemble as garbage and the instruction-set
@@ -1456,8 +1456,8 @@ every Tensix unit and what drives it, the work items (F foundation, S SFPU, M Ma
 R reductions, D formats and data movement), milestones 10.0–10.6, and the Burn op coverage
 table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
 
-- [ ] **10.0** SFPU foundation; today's element-wise ops on the SFPU (was 9.9).
-- [ ] **10.1** Softmax and cross-entropy on the device (was 9.12).
+- [ ] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9).
+- [ ] **10.1** Softmax and cross-entropy on the device (was 9.12); `MOP`; op-list traces.
 - [ ] **10.2** Activation and math breadth.
 - [ ] **10.3** Reductions over any dim, pooling, device transpose, norms.
 - [ ] **10.4** Formats and integers.
