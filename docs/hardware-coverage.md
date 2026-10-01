@@ -46,7 +46,7 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3 |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0 |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
@@ -255,14 +255,32 @@ reverse index.
 
 ### F — SFPU foundation (blocks every S item)
 
-- [ ] **F0 Padding is a property of the tensor, not an assumption.** Today a ragged
-      edge tile's padding is zero only until an op writes it: `ADD_ROW` puts the bias
-      there and `COL_SUM` sums it (checklist Phase 9, open bug). Every SFPU op makes
-      this worse (`exp(0) = 1`). Each `DramTensor` carries its pad state; each op
-      declares the pad it needs and the pad it leaves, and the runtime refills edge
-      tiles only when they differ. Design in `tt-metal-concepts-review.md` G1. First
-      gate: a 50-row `add` then `sum_dim(0)` against `burn-flex`, which should fail
-      before the fix.
+- [x] **F0 Padding is a property of the tensor, not an assumption.** `DramTensor`
+      carries `pad: Pad` (`Zero` | `Undefined`; a tensor with no ragged edge is
+      always `Zero`), upload sets `Zero`, and every op implements `OpPadding`
+      (`requires(input) -> PadNeed`, `produces(inputs) -> Pad`, from the op's
+      algebra: `ADD_ROW` and `MUL_SCALAR` by a non-finite scalar leave
+      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). `COL_SUM` reads
+      only a ragged tensor's valid rows (`record::SUM`'s `last_rows`, the compute
+      entry's new parameter word) and zeroes its result's padding rows, so it
+      needs nothing; the matmul needs `Zero` on both operands, which the session
+      supplies by `record::FILL_PAD` over the edge tiles only, in place on a
+      tensor that owns its slots and through a bit-exact copy (`kind::COPY`) for a
+      view, so a parent's padding -- and its views' claims -- are never changed by
+      a view's fill. MNIST's tensors need no fill (its ragged ones are uploads and
+      matmul outputs), so the golden and the 9.5 budget are unchanged. Unit tests:
+      the fill touches each edge tile exactly once with the right valid region,
+      over three channel masks and 1/3/8 units; each op's declared pad; the
+      masked `SUM` record still expands to its reference builder's entries; the
+      compute entry's parameter is refused where a kind takes none or out of
+      range. Gates: `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`
+      (un-ignored) and `step24_padding` -- {`ADD_ROW`, `MUL_SCALAR(inf)`, `RELU`}
+      into the column sum and into matmuls with a ragged `K` in either operand and
+      orientation, dirty on both sides of `K`, at `[37, 70]` and `[50, 40]`,
+      against Flex bit for bit; every `pad()` claim checked against the raw tiles
+      (`Session::download_padded`); a view of a dirty tensor filled through a copy
+      with the parent's tiles untouched. Watched failing with the fills skipped
+      (both tests, and step19) and with the sum unmasked. ttsim and both cards.
 - [ ] **F1 Whole-tile `Dst` round trip.** One 32×32 FP32 tile from GDDR into `Dst` by
       `UnpackToDst` and packed back, every datum checked, on the three roles. Phase 5
       did 128 datums; the step 8 lane map (`SFPLOAD`/`SFPSTORE` reach the even or the odd

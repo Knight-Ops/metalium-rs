@@ -301,7 +301,6 @@ fn ints(seed: usize, n: usize) -> Vec<f32> {
 /// matmul whose `K` is the row dimension (a weight gradient's, `h^T @ g`).
 /// A whole number of tile rows is the control: it has no padding to leak.
 #[test]
-#[ignore = "known bug: ADD_ROW writes padding rows (hardware-coverage F0); un-ignore with the fix"]
 fn padding_rows_stay_out_of_a_later_accumulation() {
     with_session(|s| {
         let c = 40;

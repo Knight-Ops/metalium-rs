@@ -83,8 +83,9 @@ pub mod op {
     /// writes its transpose to the destination. Only in a list entry.
     pub const READ_TRANSPOSED: u32 = 4;
     /// Element-wise arithmetic on whole tiles already in L1, by the mover's
-    /// own FP32 unit: `[COMPUTE, kind, scalar, 0, dst, a, b, 0]`, each address a
-    /// tile slot. See [`super::kind`]. Only in a list entry.
+    /// own FP32 unit: `[COMPUTE, kind, scalar, param, dst, a, b, 0]`, each
+    /// address a tile slot, `param` kind-specific (zero for most). See
+    /// [`super::kind`]. Only in a list entry.
     pub const COMPUTE: u32 = 5;
     /// Run the tile's resident roles once: `[KERNEL, generation, a0, l0, a1,
     /// l1, a2, l2]`. The mover waits for every move before it; then, for each
@@ -126,13 +127,39 @@ pub mod kind {
     pub const RELU_BACKWARD: u32 = 6;
     /// `a[r, c] + b[0, c]`: `b`'s first row broadcast down the tile.
     pub const ADD_ROW: u32 = 7;
-    /// `dst[0, c] = acc + a[0, c] + a[1, c] + ... + a[31, c]`, added in row
-    /// order, where `acc` is `dst[0, c]`, or `+0.0` when the scalar is
-    /// non-zero (the first tile of a column). Only `dst`'s row 0 is written.
-    /// Over a column of tiles in order, this is `burn-flex`'s `sum_dim(0)`
-    /// order exactly (`ops/reduce.rs:959-989`: from `0.0`, rows in order).
+    /// `dst[0, c] = acc + a[0, c] + a[1, c] + ... + a[n - 1, c]`, added in
+    /// row order, where `n` is the entry's parameter (the tile's valid rows;
+    /// `0` means all 32) and `acc` is `dst[0, c]`, or `+0.0` when the scalar
+    /// is non-zero (the first tile of a column) -- in which case `dst`'s rows
+    /// 1..32 are zeroed too, so the result's padding is defined. Over a column
+    /// of tiles in order, this is `burn-flex`'s `sum_dim(0)` order exactly
+    /// (`ops/reduce.rs:959-989`: from `0.0`, rows in order), and rows past a
+    /// ragged tensor's last are never read, whatever they hold.
     pub const COL_SUM: u32 = 8;
-    pub const LAST: u32 = COL_SUM;
+    /// Write the scalar to every datum of `dst` outside the tile's valid
+    /// region: rows at or past the parameter's bits 0..8, or columns at or
+    /// past its bits 8..16 (each `0` meaning 32). The tile's padding, set
+    /// (`tt_kernels::tensor::Pad`); `a` must be `dst`.
+    pub const FILL_PAD: u32 = 9;
+    /// `a`, bit for bit: a tile copied through L1, denormals and NaN
+    /// payloads included (the FP32 unit would flush the one and canonicalise
+    /// the other).
+    pub const COPY: u32 = 10;
+    pub const LAST: u32 = COPY;
+
+    /// The valid rows (or columns) a parameter field names: `0` is 32.
+    pub const fn extent(field: u32) -> u32 {
+        if field == 0 {
+            32
+        } else {
+            field
+        }
+    }
+
+    /// A [`FILL_PAD`] parameter: `rows` and `cols` valid, each 1..=32.
+    pub const fn fill_param(rows: u32, cols: u32) -> u32 {
+        (rows % 32) | (cols % 32) << 8
+    }
 }
 
 /// Where a descriptor list lives, and how many entries it may hold.
@@ -174,6 +201,9 @@ pub enum Entry {
     },
     Compute {
         kind: u32,
+        /// Kind-specific: [`kind::COL_SUM`]'s valid rows, [`kind::FILL_PAD`]'s
+        /// valid region; zero for every other kind.
+        param: u32,
         scalar: u32,
         dst: u32,
         a: u32,
@@ -249,8 +279,19 @@ impl Entry {
             if !slot(w[4]) || !slot(w[5]) || !slot(w[6]) {
                 return Err(error::ALIGNMENT);
             }
+            // A parameter only where the kind reads one, and only in range: a
+            // valid-row count past 32 would walk past the tile.
+            let param_ok = match w[1] {
+                kind::COL_SUM => w[3] <= 32,
+                kind::FILL_PAD => w[3] & !0x1f1f == 0 && w[4] == w[5],
+                _ => w[3] == 0,
+            };
+            if !param_ok {
+                return Err(error::OP);
+            }
             return Ok(Entry::Compute {
                 kind: w[1],
+                param: w[3],
                 scalar: w[2],
                 dst: w[4],
                 a: w[5],
@@ -450,6 +491,31 @@ mod tests {
         let mut bad = c;
         bad[6] = crate::tensix::L1_SIZE as u32 - 64;
         assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
+        // A parameter only where the kind takes one, and only in range.
+        let mut bad = c;
+        bad[3] = 5;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::OP));
+        let mut sum = c;
+        (sum[1], sum[3]) = (kind::COL_SUM, 17);
+        assert!(matches!(
+            Entry::decode(ALL, sum),
+            Ok(Entry::Compute { param: 17, .. })
+        ));
+        sum[3] = 33;
+        assert_eq!(Entry::decode(ALL, sum), Err(error::OP));
+        let mut fill = c;
+        (fill[1], fill[3], fill[5]) = (kind::FILL_PAD, kind::fill_param(5, 32), c[4]);
+        assert!(Entry::decode(ALL, fill).is_ok());
+        fill[3] = 0x2000;
+        assert_eq!(Entry::decode(ALL, fill), Err(error::OP));
+        fill[3] = kind::fill_param(5, 7);
+        fill[5] = c[5];
+        assert_eq!(
+            Entry::decode(ALL, fill),
+            Err(error::OP),
+            "a fill is in place"
+        );
+        assert_eq!((kind::extent(0), kind::extent(7)), (32, 7));
         // A kernel entry names a non-zero generation; a wait takes nothing.
         assert_eq!(
             Entry::decode(ALL, [op::KERNEL, 7, 0, 0, 0, 0, 0, 0]),

@@ -1210,9 +1210,10 @@ host; the reduced golden bit for bit on ttsim and both cards after every slice):
       `attach_topology`, or `TT_TOPOLOGY=0` / `0,1` for the silicon harness, so a
       benchmark runs on one card or both unchanged. Two cards are Phase 8's
       mesh: host-staged, per-chunk resets, chips in turn -- 233 ms/step.
-- [ ] **Padding rows are not kept zero** (reproduced on ttsim:
-      `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`, ignored until
-      fixed; 50 rows give `-133` for Flex's `-105`, 14 padding rows times `b`, and the
+- [x] **Padding rows are not kept zero** -- fixed by `hardware-coverage.md` F0
+      (a typed pad state per tensor, a masked column sum, edge-tile refills
+      before a matmul); `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`
+      un-ignored and green on ttsim and both cards. Was (reproduced on ttsim, 50 rows give `-133` for Flex's `-105`, 14 padding rows times `b`, and the
       `(x + b)^T @ (y + d)` weight-gradient shape is wrong too):
       `ADD_ROW` adds the bias into a ragged tile's padding rows and `COL_SUM`
       sums all 32 rows (`dm_b.rs`), so `(x + b).sum_dim(0)` on a row count that
