@@ -121,6 +121,39 @@ pub mod float {
     binary!(float_add, kind::ADD);
     binary!(float_sub, kind::SUB);
     binary!(float_mul, kind::MUL);
+    // Within one ulp of Flex's correctly rounded quotient, not bit for bit:
+    // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
+    binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
+
+    /// `1/x` on the device where the data is, within one ulp of Flex's
+    /// (`kind_sfpu::RECIP`), else Flex's.
+    pub fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(tt_kernels::sfpu::ops::kind_sfpu::RECIP, 0.0, &tensor, None)
+        {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_recip(tensor.into_host()),
+            device,
+        )
+    }
+
+    /// `x / s` on the device where the data is, within one ulp of Flex's
+    /// (`kind_sfpu::DIV_SCALAR`), else Flex's.
+    pub fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let s = rhs.to_f64().expect("a float scalar") as f32;
+        if let Some(t) = device_eltwise(tt_kernels::sfpu::ops::kind_sfpu::DIV_SCALAR, s, &lhs, None)
+        {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_div_scalar(lhs.into_host(), rhs),
+            device,
+        )
+    }
 
     /// On the device where the data is, else Flex's. The scalar is converted
     /// exactly as Flex converts it (`to_f64() as f32`, `burn-flex`

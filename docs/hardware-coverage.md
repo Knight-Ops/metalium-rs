@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3 |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -124,7 +124,7 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
-| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
+| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
 | Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
 | Lane movement | `SFPSWAP`, `SFPTRANSP` | x | | | | | S2, S8 |
@@ -354,7 +354,7 @@ reverse index.
       anything without one refused by name. Modelled so far: `SFPLOAD`/`SFPSTORE`
       (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
       `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
-      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPNOP`, and the `SETRWC`/`SETC16`
+      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPGT` (flags, `VD`), `SFPARECIP`, `SFPNOP`, and the `SETRWC`/`SETC16`
       forms the builder emits. **Plan change:** each S item adds the models it
       needs, and where a page defines a self-contained C function (`ApproxRecip`,
       `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
@@ -395,9 +395,24 @@ reverse index.
       `float_clamp{,_min,_max}`, `float_abs`, `float_neg`, `float_sign`, `leaky_relu`,
       `hard_sigmoid`, `prelu`. Needs bool tensors on the device (`BoolTensorOps` storage,
       D3).
-- [ ] **S3 Reciprocal and division.** `SFPARECIP` (Blackhole-only) for the seed, Newton
-      steps by `SFPMAD` to full precision, the bound derived from the seed's documented
-      accuracy. Burn: `float_recip`, `float_div`, `float_div_scalar`, `float_remainder{,_scalar}`.
+- [x] **S3 Reciprocal and division** (`float_remainder{,_scalar}` moves to S6, which
+      brings `floor`). `tt_isa::numerics::sfpu::{approx_recip, approx_exp, arecip}` port
+      `SFPARECIP.md`'s functional model, the tables copied out of the page by script and
+      held to the page's own C -- extracted from the pinned tree and compiled by
+      `tt-tests/build.rs` (`sfpu_models_oracle`, every input reaching a table or
+      branch; watched failing with one table entry changed). `Program::recip`: the
+      `SFPARECIP` seed (`e0 < 0.0056`), two Newton steps in fma form, fix-ups for
+      `±0`/denormal (`±inf`) and `±inf` (`±0`) -- within one ulp of the correctly
+      rounded reciprocal, the bound derived on the method; division is the product and
+      one fma correction on finite non-zero lanes, within one ulp (`ops::divide`).
+      SFPU-only kinds (`kind_sfpu::{RECIP, DIV, DIV_SCALAR}`, above the mover's) go to
+      the SFPU whatever the unit setting. `sfpu::ops::reference` runs any op's program
+      over a whole tensor in the interpreter, the oracle for every later op. Gates:
+      unit tests (93% of 3072 results correctly rounded, the rest one ulp off; IEEE
+      special cases); `step28_division` -- device equal to the program bit for bit,
+      the program within one ulp of Flex, at `[37, 70]` and `[96, 128]` with every
+      special; `step27_burn_eltwise::division_through_burn_is_within_one_ulp_and_stays_resident`.
+      ttsim and both cards. Burn: `float_recip`, `float_div`, `float_div_scalar`.
 - [ ] **S4 Transcendentals.** Range reduction by `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, then
       `SFPMAD` polynomials or `SFPLUTFP32` (its `LReg[LReg[7] & 15]` destination bug
       handled inside the helper, Tier 2). In order: `exp`, `log`, `sqrt`/`rsqrt`, then
@@ -483,7 +498,8 @@ path today, `~` when only some shapes do.
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
-| `float_div{,_scalar}`, `float_recip`, `float_remainder{,_scalar}` | | S3 |
+| `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
+| `float_remainder{,_scalar}` | | S6 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
 | `float_exp`, `float_log`, `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |

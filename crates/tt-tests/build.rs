@@ -9,6 +9,71 @@ use std::process::Command;
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     build_fma_oracle(&out_dir);
+    build_sfpu_models(&out_dir);
+}
+
+/// The C functions of the Vector Unit's pages that `tt_isa::numerics::sfpu`
+/// ports, extracted from the pinned tree: `(page, a line the block holds)`.
+/// Each block is a page's "Supporting definitions", self-contained C.
+const SFPU_MODELS: &[(&str, &str)] = &[("SFPARECIP.md", "uint32_t ApproxRecip(")];
+
+/// Extract and compile [`SFPU_MODELS`] into `libsfpumodels.a`, for
+/// `sfpu_models_oracle`: the ports are held to the page's own C, as `fma_bh` is
+/// to `fma.c`, so a transcription slip in a lookup table cannot hide. Skipped,
+/// with a warning, without the tree or a C compiler.
+fn build_sfpu_models(out_dir: &Path) {
+    println!("cargo::rustc-check-cfg=cfg(have_sfpu_models)");
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let pages = manifest
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("vendor/tt-isa-documentation/BlackholeA0/TensixTile/TensixCoprocessor");
+    let mut c = String::from("#include <stdint.h>\n");
+    for (page, marker) in SFPU_MODELS {
+        let path = pages.join(page);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let block = text
+            .split("```c")
+            .skip(1)
+            .map(|b| b.split("```").next().unwrap_or(""))
+            .find(|b| b.contains(marker))
+            .unwrap_or_else(|| panic!("{page}: no C block holds `{marker}`"));
+        c += &format!("/* {page} */\n{block}\n");
+    }
+    let src = out_dir.join("sfpu_models.c");
+    std::fs::write(&src, c).unwrap();
+    let obj = out_dir.join("sfpu_models.o");
+    let lib = out_dir.join("libsfpumodels.a");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let Ok(status) = Command::new(&cc)
+        .args(["-c", "-O2", "-fPIC", "-o"])
+        .arg(&obj)
+        .arg(&src)
+        .status()
+    else {
+        println!(
+            "cargo:warning=no C compiler found; the SFPU model differential test will be skipped"
+        );
+        return;
+    };
+    assert!(
+        status.success(),
+        "compiling the pages' SFPU models failed: {}",
+        src.display()
+    );
+    let ar = std::env::var("AR").unwrap_or_else(|_| "ar".into());
+    let Ok(status) = Command::new(&ar).arg("crs").arg(&lib).arg(&obj).status() else {
+        println!("cargo:warning=no `ar` found; the SFPU model differential test will be skipped");
+        return;
+    };
+    assert!(status.success(), "archiving the SFPU models failed");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-cfg=have_sfpu_models");
 }
 
 /// Compile the specification's own FMA model and link it into the test binary.

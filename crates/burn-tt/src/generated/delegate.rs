@@ -240,18 +240,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_div(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::float::float_div(lhs, rhs)
     }
     fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_div_scalar(lhs.into_flex(), rhs),
-            device,
-        )
+        crate::ops::float::float_div_scalar(lhs, rhs)
     }
     fn float_remainder(
         lhs: FloatTensor<TtBackend>,
@@ -295,11 +287,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_recip(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_recip(tensor)
     }
     fn float_transpose(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_transpose(tensor)

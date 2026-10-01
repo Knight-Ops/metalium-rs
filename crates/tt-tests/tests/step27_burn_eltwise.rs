@@ -152,3 +152,83 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
         }
     });
 }
+
+/// The SFPU's approximations through Burn: within the one ulp their gates
+/// derive (`step28_division`), resident throughout.
+#[test]
+fn division_through_burn_is_within_one_ulp_and_stays_resident() {
+    with_device(Config::default(), |d| {
+        let [r, c] = [40, 96];
+        let (av, bv) = (values(4, r * c), values(5, r * c));
+        let ta = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (a, b, fa, fb) = (ta(&av), ta(&bv), fl(&av), fl(&bv));
+        type Case = (
+            &'static str,
+            Box<dyn Fn() -> Tensor<TtBackend, 2>>,
+            Vec<u32>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "div",
+                Box::new({
+                    let (a, b) = (a.clone(), b.clone());
+                    move || a.clone() / b.clone()
+                }),
+                bits(fa.clone() / fb.clone()),
+            ),
+            (
+                "recip",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone().recip()
+                }),
+                bits(fa.clone().recip()),
+            ),
+            (
+                "div_scalar",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone() / 0.3
+                }),
+                bits(fa.clone() / 0.3),
+            ),
+        ];
+        for (name, op, want) in cases {
+            let before = tensor_traffic();
+            let out = op();
+            let during = tensor_traffic() - before;
+            assert_eq!(
+                (during.downloads, during.uploads),
+                (0, 0),
+                "{name}: {during:?}"
+            );
+            for (i, (g, w)) in bits(out).iter().zip(&want).enumerate() {
+                let (gf, wf) = (f32::from_bits(*g), f32::from_bits(*w));
+                if wf.is_nan() {
+                    assert!(gf.is_nan(), "{name}: element {i}");
+                } else if wf.is_infinite() || wf == 0.0 || wf.abs() < f32::MIN_POSITIVE {
+                    assert_eq!(
+                        gf.abs(),
+                        if wf.abs() < f32::MIN_POSITIVE {
+                            0.0
+                        } else {
+                            wf.abs()
+                        },
+                        "{name}: element {i}"
+                    );
+                } else {
+                    let ulps = (*g as i64 - *w as i64).unsigned_abs();
+                    assert!(
+                        ulps <= 1,
+                        "{name}: element {i}: {gf:e} vs {wf:e}, {ulps} ulps"
+                    );
+                }
+            }
+        }
+    });
+}

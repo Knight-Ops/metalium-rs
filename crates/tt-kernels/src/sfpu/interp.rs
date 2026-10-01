@@ -328,6 +328,22 @@ impl Vector {
                     };
                 }
             }
+            "SFPARECIP" => {
+                let (vb, vc, vd, mod1) = (op("VB"), op("VC"), op("VD"), op("Mod1"));
+                if vd >= 8 {
+                    return unmodelled(format!("SFPARECIP into LReg[{vd}]"));
+                }
+                let c = self.read(at, vc)?;
+                let b = if mod1 == 1 {
+                    self.read(at, vb)?
+                } else {
+                    [0; 32]
+                };
+                let d = self.read(at, vd)?;
+                let v: [u32; 32] =
+                    std::array::from_fn(|l| tt_isa::numerics::sfpu::arecip(mod1, b[l], c[l], d[l]));
+                self.write(vd, v, false);
+            }
             "SFPGT" => {
                 let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
                 if mod1 & 2 != 0 {

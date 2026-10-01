@@ -754,11 +754,13 @@ impl<T: Transport> Session<T> {
         let unit = self.eltwise_unit;
         let alloc = &mut self.dram_state()?.alloc;
         let [rt, ct] = a.grid();
-        let sfpu = match unit {
-            tensor::EltwiseUnit::Sfpu => true,
-            tensor::EltwiseUnit::Mover => false,
-            tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(op.kind, rt * ct, units),
-        };
+        // An op only the SFPU has goes there whatever the setting.
+        let sfpu = !crate::sfpu::ops::mover_has(op.kind)
+            || match unit {
+                tensor::EltwiseUnit::Sfpu => true,
+                tensor::EltwiseUnit::Mover => false,
+                tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(op.kind, rt * ct, units),
+            };
         let work = if sfpu {
             tensor::sfpu_eltwise(alloc, op, a, b, units)?
         } else {

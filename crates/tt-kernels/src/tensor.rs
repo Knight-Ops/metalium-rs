@@ -682,11 +682,21 @@ pub struct Eltwise {
 /// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
 /// shape or, for `ADD_ROW`, one row as wide.
 fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
+    use crate::sfpu::kernel::Operands;
     use tt_isa::dm::kind;
-    let binary = !matches!(
-        op.kind,
-        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
-    );
+    let binary = match crate::sfpu::ops::operands(op.kind) {
+        Some(o) => o != Operands::Unary,
+        None if crate::sfpu::ops::mover_has(op.kind) => !matches!(
+            op.kind,
+            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+        ),
+        None => {
+            return Err(TensorError::Shape(format!(
+                "no element-wise op {:#x}",
+                op.kind
+            )))
+        }
+    };
     let row = op.kind == kind::ADD_ROW;
     match (binary, b) {
         (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),

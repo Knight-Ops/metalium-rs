@@ -286,6 +286,61 @@ impl Program {
         self.push(encode::sfpsetsgn(u32::from(negative), s.index(), Self::dst(d), 1).unwrap());
     }
 
+    /// `d = s` with the sign bit of `sign` (`SFPSETSGN` taking it from `VD`,
+    /// which is why `sign` is moved into `d` first).
+    pub fn copy_sign(&mut self, s: LReg, sign: LReg, d: LReg) {
+        if sign != d {
+            self.mov(sign, d);
+        }
+        self.push(encode::sfpsetsgn(0, s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = ApproxRecip(|x|)` with `x`'s sign (`SFPARECIP`, Blackhole only):
+    /// within 0.56% of `1/x` for `2^-126 <= |x| < 2^126`, infinite below and
+    /// zero above.
+    pub fn approx_recip(&mut self, x: LReg, d: LReg) {
+        let mod1 = tt_isa::numerics::sfpu::arecip_mod1::RECIP;
+        self.push(encode::sfparecip(0, x.index(), Self::dst(d), mod1).unwrap());
+    }
+
+    /// `d = 1/x`, within one ulp of the correctly rounded reciprocal for
+    /// every normal `x` whose reciprocal is normal; `1/±0 = ±inf`, `1/±inf =
+    /// ±0`, a NaN stays one; denormals in or out flush to zero, as all of the
+    /// SFPU's arithmetic does. Uses `t0`, `t1` as scratch, and needs `one`
+    /// holding `1.0` and `max` holding `f32::MAX` (loaded once, outside a
+    /// loop).
+    ///
+    /// The seed ([`Program::approx_recip`]) is within `e0 < 0.0056`; each
+    /// Newton step `y += y * (1 - x*y)` squares the error and adds at most
+    /// two roundings (`e1 <= e0^2 + 2^-23 < 3.2e-5`), and the last step's
+    /// result is `1/x * (1 - e1^2)` before its single rounding, `e1^2 < 1.1e-9`
+    /// -- so within half an ulp plus 0.02 of one of `1/x`, hence at most one
+    /// ulp from its correct rounding. (`step28_recip` holds the device to
+    /// this program bit for bit, and the program to the bound.)
+    pub fn recip(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
+        assert!(d != x && t0 != x && t1 != x && d != t0 && d != t1 && t0 != t1);
+        self.approx_recip(x, d);
+        for _ in 0..2 {
+            self.nmad(x, d, LReg::ONE, t0);
+            self.mad(t0, d, d, d);
+        }
+        // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
+        // seed's infinity met `0 * inf` in the steps.
+        self.abs(x, t1);
+        self.loadi_bits(t0, 0x0080_0000);
+        self.if_(Cond::Less(t1, t0), |p| {
+            p.loadi_bits(t0, 0x7f80_0000);
+            p.copy_sign(t0, x, d);
+        });
+        // `1/±inf`: the seed's zero met `inf * 0`.
+        self.if_(Cond::Less(max, t1), |p| {
+            p.loadi_bits(t0, 0x7f80_0001);
+            p.if_(Cond::Less(t1, t0), |p| {
+                p.copy_sign(LReg::ZERO, x, d);
+            });
+        });
+    }
+
     fn push_flags(&mut self) {
         assert!(
             self.depth < FLAG_STACK,
