@@ -119,6 +119,16 @@ fn batch<B: Backend>(
         split.images[from * PIXELS..(from + n) * PIXELS].to_vec(),
         [n, PIXELS],
     );
+    (Tensor::from_data(x, device), labels(split, from, n, device))
+}
+
+/// Labels `[from, from + n)` of `split`.
+fn labels<B: Backend>(
+    split: &Split,
+    from: usize,
+    n: usize,
+    device: &B::Device,
+) -> Tensor<B, 1, Int> {
     let y = TensorData::new(
         split.labels[from..from + n]
             .iter()
@@ -126,7 +136,7 @@ fn batch<B: Backend>(
             .collect::<Vec<i32>>(),
         [n],
     );
-    (Tensor::from_data(x, device), Tensor::from_data(y, device))
+    Tensor::from_data(y, device)
 }
 
 struct Setup {
@@ -151,7 +161,7 @@ fn train<B: AutodiffBackend>(
     init: &Init,
     device: &B::Device,
 ) -> (Vec<f32>, Mlp<B>) {
-    train_timed(split, setup, init, device).0
+    train_timed(split, setup, init, device, &mut |_| {}).0
 }
 
 /// What [`train_timed`] returns: the losses and model, the dataset's upload
@@ -165,11 +175,14 @@ type Timed<B> = (
 );
 
 /// [`train`], and how long the steps took, without the dataset's upload.
+/// `after_step` is called with each step's index once its optimizer step is
+/// done, so a gate can sample counters per step.
 fn train_timed<B: AutodiffBackend>(
     split: &Split,
     setup: &Setup,
     init: &Init,
     device: &B::Device,
+    after_step: &mut dyn FnMut(usize),
 ) -> Timed<B> {
     let t0 = std::time::Instant::now();
     let mut model = Mlp::<B>::new(init, device);
@@ -192,12 +205,13 @@ fn train_timed<B: AutodiffBackend>(
     let t0 = std::time::Instant::now();
     for _ in 0..setup.epochs {
         for from in (0..setup.samples).step_by(setup.batch) {
-            let (_, y) = batch::<B>(split, from, setup.batch, device);
+            let y = labels::<B>(split, from, setup.batch, device);
             let x = images.clone().slice([from..from + setup.batch, 0..PIXELS]);
             let loss = loss_fn.forward(model.forward(x), y);
             losses.push(loss.clone().into_scalar().elem::<f32>());
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(setup.lr, model, grads);
+            after_step(losses.len() - 1);
         }
     }
     ((losses, model), preload, t0.elapsed(), device_before)
@@ -253,6 +267,78 @@ fn golden() -> Option<Vec<u32>> {
     )
 }
 
+/// What one step may move between host and device once the dataset and
+/// weights are resident (Phase 9.5), each with why. Everything else stays in
+/// GDDR; a tensor that newly falls back to the host shows up here by shape.
+fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)> {
+    use burn_tt::{Direction::*, Transfer};
+    let t = |direction, shape| Transfer { direction, shape };
+    vec![
+        (
+            t(Up, [1, HIDDEN]),
+            "b1, after the host's SGD step (rank-1 ops stay on the host)",
+        ),
+        (t(Up, [1, CLASSES]), "b2, likewise"),
+        (
+            t(Down, [batch, CLASSES]),
+            "the logits, for the loss on the host",
+        ),
+        (
+            t(Up, [batch, CLASSES]),
+            "dL/dlogits, from the host's loss backward",
+        ),
+        (t(Down, [1, CLASSES]), "dL/db2, for the host's SGD step"),
+        (t(Down, [1, HIDDEN]), "dL/db1, likewise"),
+    ]
+}
+
+/// The Phase 9.5 claim, from counters sampled after every step: after the
+/// first step, each step moves exactly [`steady_state_transfers`] as tensor
+/// data, and writes the same number of bytes to the device -- descriptors,
+/// programs and tensors together. Reads are printed, not asserted: they are
+/// mostly completion polls, whose count depends on timing on silicon.
+fn assert_steady_state_traffic(
+    per_step: &[(
+        burn_tt::TensorTraffic,
+        tt_device::Traffic,
+        Vec<burn_tt::Transfer>,
+    )],
+) {
+    let want = steady_state_transfers(REDUCED.batch);
+    let named = |t: &burn_tt::Transfer| {
+        want.iter()
+            .find(|(w, _)| w == t)
+            .map_or("NOT EXPECTED", |(_, why)| *why)
+    };
+    let want_bytes: u64 = want
+        .iter()
+        .map(|(t, _)| (t.shape[0] * t.shape[1] * 4) as u64)
+        .sum();
+    let writes = per_step[1].1.bytes_written - per_step[0].1.bytes_written;
+    for (i, w) in per_step.windows(2).enumerate() {
+        let step = i + 1;
+        let got: Vec<_> = w[1].2.clone();
+        assert!(
+            got == want.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            "step {step} moved other tensors than the steady-state budget:\n  got  {:#?}\n  want {:#?}",
+            got.iter().map(|t| (t, named(t))).collect::<Vec<_>>(),
+            want,
+        );
+        let (t, dv) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+        assert_eq!(t.uploaded + t.downloaded, want_bytes, "step {step}");
+        assert_eq!(
+            dv.bytes_written, writes,
+            "step {step} wrote a different number of bytes to the device"
+        );
+    }
+    let last = per_step[per_step.len() - 1].1 - per_step[per_step.len() - 2].1;
+    println!(
+        "MEASURE steady-state step: {want_bytes} B of tensors; device {writes} B written in {} \
+         writes ({} retargets), {} B read in {} reads",
+        last.write_calls, last.retargets, last.bytes_read, last.read_calls
+    );
+}
+
 #[test]
 fn the_mlp_trains_on_a_reduced_dataset() {
     let split = mnist::load(true);
@@ -267,11 +353,24 @@ fn the_mlp_trains_on_a_reduced_dataset() {
     let want = golden();
     with_device(Config::default(), |d| {
         let before = burn_tt::tensor_traffic();
-        let (tt, _) = train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d);
+        // Counters after every step, so steady state can be told from the
+        // first step's uploads.
+        burn_tt::record_transfers(true);
+        let mut per_step = Vec::new();
+        let ((tt, _), ..) =
+            train_timed::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d, &mut |_| {
+                per_step.push((
+                    burn_tt::tensor_traffic(),
+                    burn_tt::device_traffic(d).expect("the engine reports its traffic"),
+                    burn_tt::take_transfers(),
+                ))
+            });
+        burn_tt::record_transfers(false);
         let moved = burn_tt::tensor_traffic() - before;
+        assert_steady_state_traffic(&per_step);
         let n = tt.len() as u64;
         println!(
-            "MEASURE tensor traffic per step: {} B up in {} uploads, {} B down in {} downloads",
+            "MEASURE tensor traffic per step, averaged over the run with the preload: {} B up in {} uploads, {} B down in {} downloads",
             moved.uploaded / n,
             moved.uploads / n,
             moved.downloaded / n,
@@ -408,12 +507,12 @@ fn the_mlp_trains_on_full_mnist() {
     };
     let steps = full.samples / full.batch;
     let ((host, host_model), _, host_time, _) =
-        train_timed::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice);
+        train_timed::<Autodiff<Flex>>(&train_split, &full, &init, &FlexDevice, &mut |_| {});
     let host_acc = accuracy(&host_model, &test_split, test_split.n, &FlexDevice);
     with_device(Config::default(), |d| {
         let t0 = std::time::Instant::now();
         let ((tt, model), preload, tt_time, before) =
-            train_timed::<Autodiff<TtBackend>>(&train_split, &full, &init, &d);
+            train_timed::<Autodiff<TtBackend>>(&train_split, &full, &init, &d, &mut |_| {});
         let before: std::collections::HashMap<_, _> =
             before.into_iter().map(|(k, n, t)| (k, (n, t))).collect();
         let _ = t0;

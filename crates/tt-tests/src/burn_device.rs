@@ -203,6 +203,9 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.slice_rows(a, first, rows)
         }
+        fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
+            Some(self.session.device().traffic())
+        }
         fn matmul(
             &mut self,
             a: &[f32],

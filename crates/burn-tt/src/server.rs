@@ -85,6 +85,12 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// Everything the engine's device has moved across its transport so far
+    /// (`tt_device::Device::traffic`): tensors, descriptors, programs and
+    /// polls alike. `None` if the engine has no single device to ask.
+    fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
+        None
+    }
 }
 
 fn unsupported() -> EngineError {
@@ -425,9 +431,16 @@ pub(crate) fn supports_dram(device: TtDevice) -> bool {
     k
 }
 
+/// Everything `device`'s engine has moved across its transport so far, if it
+/// can say ([`Engine::device_traffic`]). Queued behind every job already sent,
+/// frees included, so it counts all of them.
+pub fn device_traffic(device: TtDevice) -> Option<tt_device::Traffic> {
+    run(device, |engine| engine.device_traffic())
+}
+
 /// Upload, panicking on a device error.
 pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
-    crate::traffic::uploaded(values.len() * 4);
+    crate::traffic::uploaded(rows, cols);
     timed_run("upload", device, move |engine| {
         engine.upload(&values, rows, cols)
     })
@@ -435,10 +448,12 @@ pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usiz
 }
 
 /// Download, panicking on a device error.
-pub(crate) fn download(device: TtDevice, id: BufferId) -> Vec<f32> {
+/// `rows` and `cols` are the buffer's, for the traffic count.
+pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<f32> {
     let v = timed_run("download", device, move |engine| engine.download(id))
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
-    crate::traffic::downloaded(v.len() * 4);
+    debug_assert_eq!(v.len(), rows * cols);
+    crate::traffic::downloaded(rows, cols);
     v
 }
 
@@ -573,6 +588,9 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.slice_rows(a, first, rows)
+    }
+    fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
+        Some(self.session.device().traffic())
     }
 }
 

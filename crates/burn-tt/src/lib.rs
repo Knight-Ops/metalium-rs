@@ -30,12 +30,15 @@ mod topology;
 mod traffic;
 
 pub use server::{
-    attach, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Engine, EngineError,
-    KmdEngine, MeshEngine, Serve,
+    attach, device_traffic, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers,
+    Engine, EngineError, KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
 pub use topology::{attach_topology, Topology};
-pub use traffic::{device_time, tensor_traffic, TensorTraffic};
+pub use traffic::{
+    device_time, record_transfers, take_transfers, tensor_traffic, Direction, TensorTraffic,
+    Transfer,
+};
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 

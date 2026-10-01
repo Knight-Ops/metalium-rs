@@ -1021,8 +1021,10 @@ upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off 
 
 **Where it stands, and what is next (2026-09-30).** Full MNIST trains at **5.8 ms/step on one
 card** (from 224 at the start of the phase), bit for bit on the Phase 7 golden, with the dataset,
-weights, activations and gradients resident in GDDR. About 16 KB crosses PCIe per step (`g2`, the
-two biases and their gradients, and the logits); the loss stays on the host. What is left is
+weights, activations and gradients resident in GDDR. Per steady-state step exactly six tensors cross
+PCIe, 6224 B (`dL/dlogits`, the two biases and their gradients, and the logits), and the device is
+written 193 524 B in all, descriptors and programs included -- both asserted by the 9.5 gate. The
+loss stays on the host. What is left is
 almost all compute on **a single Tensix tile**, sequenced by the host one round trip at a time. In
 order: spread matmul and element-wise work over many tiles (9.6); let each tile's B mover sequence
 gather, compute and scatter from an L1 work queue so an op is one host descriptor (9.7); double-
