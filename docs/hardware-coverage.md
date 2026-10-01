@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3 |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a (`exp`, `log`) |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -117,13 +117,13 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
 | Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
-| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
+| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | `~` `SFPDIVP2` (0..128) | | `~` `SFPDIVP2` (row 66) | `~` `SFPDIVP2` | S2, S4 |
 | Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
-| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | `~` `SFPSETSGN` | | `~` `SFPSETSGN` | `~` `SFPSETSGN` | S2, S4, S6 |
+| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | x | `~` (`exp`, `log`, `recip`) | x | x | -- |
 | Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
-| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT` | `~` (`exp`, `log`) | `~` | `~` | S5, S8 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
 | Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
@@ -413,13 +413,27 @@ reverse index.
       the program within one ulp of Flex, at `[37, 70]` and `[96, 128]` with every
       special; `step27_burn_eltwise::division_through_burn_is_within_one_ulp_and_stays_resident`.
       ttsim and both cards. Burn: `float_recip`, `float_div`, `float_div_scalar`.
-- [ ] **S4 Transcendentals.** Range reduction by `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, then
-      `SFPMAD` polynomials or `SFPLUTFP32` (its `LReg[LReg[7] & 15]` destination bug
-      handled inside the helper, Tier 2). In order: `exp`, `log`, `sqrt`/`rsqrt`, then
-      `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos`. Burn: `float_exp`, `float_log`,
-      `float_log1p`, `float_sqrt`, `float_powf{,_scalar}`, `float_powi*`, `float_tanh`,
-      `float_erf`, `float_sin`, `float_cos`, then the rest of the trig family;
-      `sigmoid`, `gelu`, `log_sigmoid` and their backwards.
+- [~] **S4 Transcendentals.** Done: `exp`, `log` (10.1). Range reduction by
+      `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`, `SFPSHFT`),
+      polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding of `x log2
+      e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
+      bound `ops::EXP_BOUND = 1.3e-7` relative, derived on `exp_program`. `log`: `x =
+      2^e m`, `m` in `[sqrt(2)/2, sqrt(2))`, `2 atanh(f/(2+f))` through the corrected
+      division, `e ln2` in two parts; bound `ops::LOG_BOUND = 7.12 * 2^-24` relative,
+      derived on `log_program`. Oracle: interpreter models of `SFPIADD`, `SFPSHFT`,
+      `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN`, `SFPDIVP2`, each held to the
+      device in `step26_sfpu_isa`; sweeps of 64k (`exp`, worst 0.86 ulps) and 80k
+      (`log`, worst 1.91 ulps, near 1) inputs within the derived bounds; an arity test
+      keeping `ops::operands` and `ops::program` in step. Gates: `step29_exp_log`
+      (device equal to the program bit for bit; the program within the bound plus
+      Flex's ulp of Flex, every special); `step27_burn_eltwise` now also asserts each
+      result was *computed on the device* (`TtTensor::computed_on_device` -- a host
+      fallback on operands with host copies moves no bytes, so the traffic check
+      alone was vacuous; watched failing with `float_exp` forced to the host). ttsim
+      and both cards; ttsim refuses `SFPDIVP2` by 128 or more (row 66), so the
+      builder does not emit it. Burn: `float_exp`, `float_log`. Remaining: `sqrt`/
+      `rsqrt`, `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos` and the rest (10.2), with
+      F2's `SFPCONFIG` prologue for their constants.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -502,7 +516,8 @@ path today, `~` when only some shapes do.
 | `float_remainder{,_scalar}` | | S6 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
-| `float_exp`, `float_log`, `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
+| `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
+| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
 | `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |

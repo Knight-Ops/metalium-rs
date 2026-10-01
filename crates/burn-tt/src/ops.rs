@@ -139,6 +139,32 @@ pub mod float {
         )
     }
 
+    macro_rules! unary_sfpu {
+        ($name:ident, $kind:expr, $doc:literal) => {
+            #[doc = $doc]
+            pub fn $name(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+                if let Some(t) = device_eltwise($kind, 0.0, &tensor, None) {
+                    return t;
+                }
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::$name(tensor.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    unary_sfpu!(
+        float_exp,
+        tt_kernels::sfpu::ops::kind_sfpu::EXP,
+        "`e^x` on the device where the data is, within `ops::EXP_BOUND` of the exact value, else Flex's."
+    );
+    unary_sfpu!(
+        float_log,
+        tt_kernels::sfpu::ops::kind_sfpu::LOG,
+        "`ln x` on the device where the data is, within `ops::LOG_BOUND` of the exact value, else Flex's."
+    );
+
     /// `x / s` on the device where the data is, within one ulp of Flex's
     /// (`kind_sfpu::DIV_SCALAR`), else Flex's.
     pub fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {

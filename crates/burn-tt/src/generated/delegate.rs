@@ -703,18 +703,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_exp(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_exp(tensor)
     }
     fn float_log(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_log(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_log(tensor)
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);

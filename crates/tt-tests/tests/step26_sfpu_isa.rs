@@ -152,6 +152,42 @@ fn cases() -> Vec<(&'static str, Body)> {
                 |p| p.sub(LReg::L1, LReg::L0, LReg::L2),
             )
         }),
+        ("exponent and mantissa, added as integers", |p| {
+            p.exponent(LReg::L0, true, LReg::L3);
+            p.mantissa(LReg::L1, LReg::L2);
+            p.iadd(LReg::L3, LReg::L2);
+        }),
+        ("an undebiased exponent", |p| {
+            p.exponent(LReg::L1, false, LReg::L2)
+        }),
+        ("set the exponent", |p| {
+            p.set_exponent(LReg::L0, 127, LReg::L2)
+        }),
+        ("scale by 2^5 then 2^20", |p| {
+            p.scale_by_pow2(LReg::L0, 5, LReg::L3);
+            p.scale_by_pow2(LReg::L3, 20, LReg::L2);
+        }),
+        ("integer subtract, then shift left", |p| {
+            p.mov(LReg::L1, LReg::L2);
+            p.isub_from(LReg::L0, LReg::L2);
+            p.shl(LReg::L2, 3, LReg::L2);
+        }),
+        ("an integer add straight after a multiply", |p| {
+            p.mul(LReg::L0, LReg::L1, LReg::L3);
+            p.iadd(LReg::L3, LReg::L0);
+            p.mov(LReg::L0, LReg::L2);
+        }),
+        ("an immediate integer add", |p| {
+            p.iadd_imm(LReg::L0, -1000, LReg::L2)
+        }),
+        ("a logical right shift by a register", |p| {
+            p.loadi_bits(LReg::L3, (-7i32) as u32);
+            p.mov(LReg::L0, LReg::L2);
+            p.shr_by(LReg::L3, LReg::L2);
+        }),
+        ("an approximate reciprocal", |p| {
+            p.approx_recip(LReg::L0, LReg::L2)
+        }),
         ("nested scopes, every condition", |p| {
             p.mov(LReg::L1, LReg::L2);
             p.if_(Cond::Ne0(LReg::L0), |p| {
@@ -222,5 +258,40 @@ fn the_constant_register_holds_0_8373() {
         assert!(got.iter().all(|&x| x == got[0]), "every lane the same");
         println!("LReg[8] = {:#010x} = {}", got[0], f32::from_bits(got[0]));
         assert!((f32::from_bits(got[0]) - 0.8373).abs() < 1e-3);
+    });
+}
+
+/// `SFPDIVP2` adding an immediate from 128 up: the page has the exponent add
+/// wrap mod 256 (so 253 is `-3`); ttsim refuses it (divergence row 66). What
+/// silicon does, against the page's model.
+#[cfg(feature = "silicon")]
+#[test]
+fn sfpdivp2_wraps_on_silicon_as_the_page_says() {
+    let (a, b) = (operands(3), operands(5));
+    let mut p = Program::with_policy(LoopPolicy::Unrolled);
+    p.for_each_row_group(64, |p, o| {
+        p.load(LReg::L0, Format::Fp32, o);
+        p.raw(tt_isa::isa::generated::encode::sfpdivp2(253, 0, 2, 1).unwrap());
+        p.store(LReg::L2, Format::Fp32, 128 + o);
+    });
+    let math = p.finish();
+    harness::in_device(|dev| {
+        let got = on_device(dev, &math, &a, &b);
+        for (i, g) in got.iter().enumerate() {
+            let x = a[i];
+            let e = (x >> 23) & 0xff;
+            let want = if e == 255 {
+                x
+            } else {
+                (x & 0x807f_ffff) | (((e + 253) & 0xff) << 23)
+            };
+            // The store flushes what the wrap made denormal.
+            let want = if want & 0x7f80_0000 == 0 {
+                want & 0x8000_0000
+            } else {
+                want
+            };
+            assert_eq!(*g, want, "datum {i}: {x:#010x}");
+        }
     });
 }

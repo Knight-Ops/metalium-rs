@@ -96,6 +96,14 @@ impl TtTensor {
         }
     }
 
+    /// Was this tensor computed on the device: a device copy and, so far, no
+    /// host one? What a residency gate checks of an op's result -- a host
+    /// fallback on operands that still had host copies moves no bytes, so
+    /// the traffic counters alone cannot tell.
+    pub fn computed_on_device(&self) -> bool {
+        self.cell.dram.get().is_some() && self.cell.host.get().is_none()
+    }
+
     /// The host copy, downloaded the first time it is needed.
     pub(crate) fn host(&self) -> &FlexTensor {
         self.cell.host.get_or_init(|| {

@@ -29,6 +29,156 @@ pub mod kind_sfpu {
     pub const DIV: u32 = 0x101;
     /// `a / s`.
     pub const DIV_SCALAR: u32 = 0x102;
+    /// `e^a` (`exp_program`).
+    pub const EXP: u32 = 0x103;
+    /// `ln a` (`log_program`).
+    pub const LOG: u32 = 0x104;
+}
+
+/// `e^x` of `x` into `d`, every register but `x` and `d` scratch.
+///
+/// `n = round(x log2 e)` by the magic-number rounding (adding `1.5 * 2^23`
+/// leaves `n` in the low mantissa bits, round to nearest even), `r = x - n ln 2`
+/// by Cody and Waite's two-part `ln 2` (the high part has nine significant
+/// bits, so `n * ln2_hi` is exact for `|n| <= 128`), `|r| <= ln 2 / 2`; then
+/// `e^r` by its degree-7 Taylor polynomial in Horner form, and `2^n` added to
+/// the exponent field as an integer.
+///
+/// Error, as a fraction of `e^x`: the polynomial's remainder `r^8/8! * e^|r|`
+/// is below `7.4e-9`; Horner's seven roundings, with `|r| <= 0.347` damping
+/// all but the last two, contribute below `1.7 * 2^-24` (`1.0e-7`); the
+/// reduction's rounding of `r` (one rounding of the low product, `|n ln2_lo|
+/// < 2.8e-2`) moves `r` by under `2^-24 * |r| + 2^-30`, which `e^r` carries
+/// one for one (`2.3e-8`). In all under [`EXP_BOUND`] `= 1.3e-7` of `e^x`
+/// (about two ulps where the result's mantissa is near 2, one near 1).
+/// Outside `[-87.34, 88.72]` the result is `+0`
+/// (it would be denormal, which flushes) or `+inf`; a NaN stays one.
+pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
+    use LReg as R;
+    let regs: Vec<LReg> = [R::L0, R::L1, R::L2, R::L3, R::L4, R::L5, R::L6, R::L7]
+        .into_iter()
+        .filter(|r| *r != x && *r != d)
+        .collect();
+    let (k, magic, t, nf, r, c) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    p.loadi(k, std::f32::consts::LOG2_E);
+    p.loadi_bits(magic, 0x4b40_0000);
+    p.mad(x, k, magic, t);
+    p.sub(t, magic, nf);
+    p.loadi_bits(k, 0x3f31_8000); // ln2_hi = 0.693359375
+    p.nmad(nf, k, x, r);
+    p.loadi_bits(k, 0xb95e_8083); // ln2_lo = -2.12194440e-4
+    p.nmad(nf, k, r, r);
+    // e^r = 1 + r(1 + r(1/2 + r(1/6 + r(1/24 + r(1/120 + r(1/720 + r/5040))))))
+    p.loadi(d, 1.0 / 5040.0);
+    for coeff in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5] {
+        p.loadi(c, coeff);
+        p.mad(d, r, c, d);
+    }
+    p.mad(d, r, LReg::ONE, d);
+    p.mad(d, r, LReg::ONE, d);
+    // `n = bits(t) - bits(magic)`, into the exponent field.
+    p.isub_from(t, magic);
+    p.shl(magic, 23, magic);
+    p.iadd(magic, d);
+    // The range: below `ln 2^-126` a zero, above `ln f32::MAX` infinity
+    // (which a positive NaN also passes), and a NaN restored.
+    p.loadi_bits(k, 0xc2ae_ac50); // -87.336544
+    p.if_(Cond::Less(x, k), |p| p.mov(LReg::ZERO, d));
+    p.loadi_bits(k, 0x42b1_7218); // 88.72284
+    p.if_(Cond::Less(k, x), |p| p.loadi_bits(d, 0x7f80_0000));
+    p.abs(x, t);
+    p.loadi_bits(k, 0x7f80_0000);
+    p.if_(Cond::Less(k, t), |p| p.loadi_bits(d, 0x7fc0_0000));
+}
+
+/// [`exp_program`]'s derived bound, relative to `e^x`.
+pub const EXP_BOUND: f64 = 1.3e-7;
+
+/// [`log_program`]'s derived bound, relative to `ln x`.
+pub const LOG_BOUND: f64 = 7.12 / 16_777_216.0;
+
+/// `ln x` of `x` into `d`, every register but `x` and `d` scratch.
+///
+/// `x = 2^e m` with `m` in `[sqrt(2)/2, sqrt(2))` (`SFPEXEXP`, `SFPSETEXP`, and
+/// a halving where `m` comes out above `sqrt 2`); `f = m - 1` exactly
+/// (Sterbenz); `ln m = 2 atanh(s)`, `s = f / (2 + f)`, `|s| <= 0.1716`, by
+/// `2s(1 + s^2/3 + s^4/5 + s^6/7 + s^8/9)` -- the next term, `s^10/11`, is
+/// below `2.0e-9` of the sum -- and `ln x = e ln2_hi + (e ln2_lo + ln m)`.
+///
+/// Error, relative, in units of `u = 2^-24`: `fl(2 + f)` is within `u` of
+/// `2 + f`, and `s` within 1.5 ulps (`3u`) of `f / fl(2 + f)` (`divide`), so
+/// `4u` of `f/(2+f)`; `ln m` is `2s (1 + O(s^2))` and carries that one for one
+/// (`4.12u` with the `s^2 < 0.03` term), the series' own roundings damped by
+/// `s^2` to under `0.04u`, plus `u` for the fma that adds them; the two final
+/// fmas round once each, and `e ln 2` and `ln m` never cancel to less than
+/// `|ln m|` (they share a sign unless `|e| = 1`, where `|ln x| >= 0.34 >=
+/// |ln m|`). Under [`LOG_BOUND`] `= 7.12u` (`4.3e-7`) of `ln x` in all. `ln(±0)` (and
+/// a denormal, which flushes) is `-inf`, `ln` of a negative number NaN,
+/// `ln(+inf) = +inf`, a NaN stays one.
+pub fn log_program(p: &mut Program, x: LReg, d: LReg) {
+    use LReg as R;
+    let regs: Vec<LReg> = [R::L0, R::L1, R::L2, R::L3, R::L4, R::L5, R::L6, R::L7]
+        .into_iter()
+        .filter(|r| *r != x && *r != d)
+        .collect();
+    let (e, m, f, den, y, q) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    p.exponent(x, true, e);
+    p.set_exponent(x, 127, m);
+    // Positive: `SFPSETEXP` keeps the sign, and a negative `x` is a NaN below.
+    p.set_sign(m, false, m);
+    p.loadi_bits(f, 0x3fb5_04f3); // sqrt(2)
+    p.if_(Cond::Less(f, m), |p| {
+        p.set_exponent(m, 126, m);
+        p.iadd_imm(e, 1, e);
+    });
+    p.sub(m, LReg::ONE, f);
+    p.loadi(den, 2.0);
+    p.add(f, den, den);
+    // `s = f / (2 + f)`: `y = 1/den` uses `m` and `q` as scratch, `d` holds
+    // `f32::MAX`; then the quotient into `q`, `m` and `d` scratch, `inf` in
+    // `den` once it is spent.
+    p.loadi_bits(d, f32::MAX.to_bits());
+    p.recip(den, y, m, q, d);
+    p.mul(f, y, q);
+    p.abs(q, m);
+    p.if_(Cond::Less(LReg::ZERO, m), |p| {
+        p.nmad(den, q, f, m);
+        p.mad(m, y, q, q);
+    });
+    // `s` in `q`; `s^2` into `f`; the series into `d`.
+    p.mul(q, q, f);
+    p.loadi(d, 1.0 / 9.0);
+    for coeff in [1.0 / 7.0, 1.0 / 5.0, 1.0 / 3.0] {
+        p.loadi(m, coeff);
+        p.mad(d, f, m, d);
+    }
+    // ln m = 2(s + s * (s^2 * series)).
+    p.mul(d, f, d);
+    p.mad(q, d, q, d);
+    p.add(d, d, d);
+    // `e` as a float: `bits(1.5 * 2^23) + e` is `1.5 * 2^23 + e` exactly.
+    p.loadi_bits(m, 0x4b40_0000);
+    p.iadd(m, e);
+    p.sub(e, m, e);
+    p.loadi_bits(m, 0xb95e_8083); // ln2_lo
+    p.mad(e, m, d, d);
+    p.loadi_bits(m, 0x3f31_8000); // ln2_hi
+    p.mad(e, m, d, d);
+    // The special cases, each its own lanes (the total order of `SFPGT`).
+    p.abs(x, m);
+    // A zero or a denormal (which the arithmetic flushes): `-inf`.
+    p.loadi_bits(f, 0x0080_0000);
+    p.if_(Cond::Less(m, f), |p| p.loadi_bits(d, 0xff80_0000));
+    // Anything else negative -- below minus the largest denormal in the total
+    // order, `-inf` and negative NaNs included (whose `SFPABS` stays negative
+    // and so took the branch above first): NaN.
+    p.loadi_bits(f, 0x807f_ffff);
+    p.if_(Cond::Less(x, f), |p| p.loadi_bits(d, 0x7fc0_0000));
+    // `+inf`: `+inf`; a positive NaN: NaN.
+    p.loadi_bits(f, f32::MAX.to_bits());
+    p.if_(Cond::Less(f, x), |p| p.loadi_bits(d, 0x7f80_0000));
+    p.loadi_bits(f, 0x7f80_0000);
+    p.if_(Cond::Less(f, x), |p| p.loadi_bits(d, 0x7fc0_0000));
 }
 
 /// Does the data mover implement `kind`?
@@ -46,7 +196,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind::ADD_SCALAR
         | kind::RELU
         | kind_sfpu::RECIP
-        | kind_sfpu::DIV_SCALAR => Operands::Unary,
+        | kind_sfpu::DIV_SCALAR
+        | kind_sfpu::EXP
+        | kind_sfpu::LOG => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -169,6 +321,18 @@ pub fn program(kind: u32, scalar: f32) -> Option<(Operands, Vec<Instruction>)> {
             } else {
                 Operands::Binary
             }
+        }
+        kind_sfpu::EXP | kind_sfpu::LOG => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                if kind == kind_sfpu::EXP {
+                    exp_program(p, LReg::L0, LReg::L7);
+                } else {
+                    log_program(p, LReg::L0, LReg::L7);
+                }
+                p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Unary
         }
         kind::ADD_ROW => {
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
@@ -491,6 +655,143 @@ mod division {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcendental {
+    use super::*;
+
+    /// Ulps between `got` and the exact value `want` (an f64), in units of
+    /// `got`'s binade.
+    fn ulps(got: f32, want: f64) -> f64 {
+        let ulp = f32::from_bits((got.abs().to_bits() & 0x7f80_0000).max(0x0080_0000)) as f64
+            * f64::powi(2.0, -23);
+        (got as f64 - want).abs() / ulp
+    }
+
+    /// Every input's result within `bound` of the exact value, relative (the
+    /// bound derived on the program); the worst case is reported in ulps.
+    fn sweep(kind: u32, xs: impl Iterator<Item = f32>, exact: fn(f64) -> f64, bound: f64) {
+        let xs: Vec<f32> = xs.collect();
+        let mut worst = (0.0, 0.0f32);
+        for chunk in xs.chunks(1024) {
+            let mut a = chunk.to_vec();
+            a.resize(1024, 1.0);
+            let got = reference(kind, 0.0, &a, None, 32, 32);
+            for (x, g) in chunk.iter().zip(&got) {
+                let w = exact(*x as f64);
+                if w.is_nan() {
+                    assert!(g.is_nan(), "kind {kind:#x}({x}): {g}");
+                } else if w.is_infinite()
+                    || w.abs() < f32::MIN_POSITIVE as f64
+                    || w.abs() > f32::MAX as f64
+                {
+                    let want = if w.abs() < f32::MIN_POSITIVE as f64 {
+                        0.0
+                    } else {
+                        w.signum() * f64::INFINITY
+                    };
+                    assert_eq!(*g as f64, want, "kind {kind:#x}({x:e})");
+                } else {
+                    let u = ulps(*g, w);
+                    if u > worst.0 {
+                        worst = (u, *x);
+                    }
+                    let rel = (*g as f64 - w).abs() / w.abs();
+                    assert!(
+                        rel <= bound,
+                        "kind {kind:#x}({x:e}) = {g:e}, exact {w:e}: {rel:e} ({u:.2} ulps)"
+                    );
+                }
+            }
+        }
+        println!(
+            "kind {kind:#x}: worst {:.3} ulps at {:e} over {} inputs",
+            worst.0,
+            worst.1,
+            xs.len()
+        );
+    }
+
+    fn grid(lo: f32, hi: f32, n: usize) -> impl Iterator<Item = f32> {
+        (0..n).map(move |i| lo + (hi - lo) * (i as f32 / n as f32))
+    }
+
+    #[test]
+    fn exp_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            88.7,
+            88.73,
+            -87.3,
+            -87.4,
+            -100.0,
+            100.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        sweep(
+            kind_sfpu::EXP,
+            grid(-87.3, 88.7, 60_000)
+                .chain(grid(-0.01, 0.01, 4096))
+                .chain(specials),
+            f64::exp,
+            EXP_BOUND,
+        );
+    }
+
+    #[test]
+    fn log_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            2.0,
+            0.5,
+            1.0e-40,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ];
+        let ln = |x: f64| {
+            if x == 0.0 || x.abs() < f32::MIN_POSITIVE as f64 {
+                f64::NEG_INFINITY
+            } else {
+                x.ln()
+            }
+        };
+        sweep(
+            kind_sfpu::LOG,
+            grid(1.0e-6, 3.0, 40_000)
+                .chain(grid(0.7, 1.45, 20_000))
+                .chain((0..20_000).map(|i| f32::from_bits(0x0080_0000 + i * 106_000)))
+                .chain(specials),
+            ln,
+            LOG_BOUND,
+        );
+    }
+}
+
+#[cfg(test)]
+mod arity {
+    use super::*;
+
+    /// `operands` says what `program` builds, for every kind there is: the
+    /// shape check and the kernel cannot disagree.
+    #[test]
+    fn operands_agrees_with_program() {
+        for k in (1..=kind::LAST).chain(0x100..0x140) {
+            assert_eq!(operands(k), program(k, 0.5).map(|(o, _)| o), "kind {k:#x}");
         }
     }
 }

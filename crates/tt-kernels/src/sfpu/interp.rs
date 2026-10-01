@@ -328,6 +328,143 @@ impl Vector {
                     };
                 }
             }
+            "SFPIADD" => {
+                let (imm, vc, vd, mod1) = (op("Imm12"), op("VC"), op("VD"), op("Mod1"));
+                let c = self.read(at, vc)?;
+                let b = self.read(at, vd)?;
+                let sext = ((imm << 20) as i32 >> 20) as u32;
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    if mod1 & 1 != 0 {
+                        c[l].wrapping_add(sext)
+                    } else if mod1 & 2 != 0 {
+                        c[l].wrapping_sub(b[l])
+                    } else {
+                        c[l].wrapping_add(b[l])
+                    }
+                });
+                let en: [bool; 32] = std::array::from_fn(|l| self.lane_enabled(l));
+                self.write(vd, v, false);
+                if vd < 8 {
+                    for l in 0..32 {
+                        if !en[l] {
+                            continue;
+                        }
+                        if mod1 & 4 == 0 {
+                            self.lane_flags[l] = (v[l] as i32) < 0;
+                        }
+                        if mod1 & 8 != 0 {
+                            self.lane_flags[l] = !self.lane_flags[l];
+                        }
+                    }
+                }
+            }
+            "SFPSHFT" => {
+                let (imm, vc, vd, mod1) = (op("Imm12"), op("VC"), op("VD"), op("Mod1"));
+                if mod1 > 7 || mod1 == 4 || mod1 == 6 {
+                    return unmodelled(format!("SFPSHFT with reserved Mod1 {mod1}"));
+                }
+                let c = self.read(at, vc)?;
+                let b = self.read(at, vd)?;
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    let mut x = b[l];
+                    let mut amount = c[l] as i32;
+                    if mod1 & 1 != 0 {
+                        if mod1 & 4 != 0 {
+                            x = c[l];
+                        }
+                        amount = imm as i32;
+                    }
+                    if amount >= 0 {
+                        x << (amount & 31)
+                    } else if mod1 & 2 != 0 {
+                        ((x as i32) >> ((-amount) & 31)) as u32
+                    } else {
+                        x >> ((-amount) & 31)
+                    }
+                });
+                self.write(vd, v, false);
+            }
+            "SFPEXEXP" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                let bias = if mod1 & 1 != 0 { 0 } else { 127 };
+                let c = self.read(at, vc)?;
+                let v = c.map(|c| (((c >> 23) & 0xff) as i32 - bias) as u32);
+                let en: [bool; 32] = std::array::from_fn(|l| self.lane_enabled(l));
+                self.write(vd, v, false);
+                if vd < 8 && mod1 & 10 != 0 {
+                    for l in 0..32 {
+                        if en[l] {
+                            if mod1 & 2 != 0 {
+                                self.lane_flags[l] = (v[l] as i32) < 0;
+                            }
+                            if mod1 & 8 != 0 {
+                                self.lane_flags[l] = !self.lane_flags[l];
+                            }
+                        }
+                    }
+                }
+            }
+            "SFPEXMAN" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                let hidden = if mod1 & 1 != 0 { 0 } else { 1 << 23 };
+                let v = self.read(at, vc)?.map(|c| hidden + (c & 0x7f_ffff));
+                self.write(vd, v, false);
+            }
+            "SFPSETEXP" => {
+                let (imm, vc, vd, mod1) = (op("Imm8"), op("VC"), op("VD"), op("Mod1"));
+                let c = self.read(at, vc)?;
+                let b = if mod1 & 1 != 0 {
+                    [0; 32]
+                } else {
+                    self.read(at, vd)?
+                };
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    let e = if mod1 & 1 != 0 {
+                        imm
+                    } else if mod1 & 2 != 0 {
+                        (b[l] >> 23) & 0xff
+                    } else {
+                        b[l] & 0xff
+                    };
+                    (c[l] & 0x807f_ffff) | (e << 23)
+                });
+                self.write(vd, v, false);
+            }
+            "SFPSETMAN" => {
+                let (imm, vc, vd, mod1) = (op("Imm12"), op("VC"), op("VD"), op("Mod1"));
+                let c = self.read(at, vc)?;
+                let b = if mod1 & 1 != 0 {
+                    [0; 32]
+                } else {
+                    self.read(at, vd)?
+                };
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    let m = if mod1 & 1 != 0 {
+                        imm << 11
+                    } else {
+                        b[l] & 0x7f_ffff
+                    };
+                    (c[l] & 0xff80_0000) | m
+                });
+                self.write(vd, v, false);
+            }
+            "SFPDIVP2" => {
+                let (imm, vc, vd, mod1) = (op("Imm8"), op("VC"), op("VD"), op("Mod1"));
+                let v = self.read(at, vc)?.map(|c| {
+                    let e = (c >> 23) & 0xff;
+                    let e = if mod1 & 1 != 0 {
+                        if e == 255 {
+                            e
+                        } else {
+                            (e + imm) & 0xff
+                        }
+                    } else {
+                        imm
+                    };
+                    (c & 0x807f_ffff) | (e << 23)
+                });
+                self.write(vd, v, false);
+            }
             "SFPARECIP" => {
                 let (vb, vc, vd, mod1) = (op("VB"), op("VC"), op("VD"), op("Mod1"));
                 if vd >= 8 {

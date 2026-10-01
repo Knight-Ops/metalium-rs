@@ -11,6 +11,14 @@
 use burn::tensor::{activation, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, TtBackend};
+
+/// Was `t` computed on the device (`TtTensor::computed_on_device`)?
+fn computed_on_device(t: &Tensor<TtBackend, 2>) -> bool {
+    match t.clone().into_primitive() {
+        burn::tensor::TensorPrimitive::Float(p) => p.computed_on_device(),
+        _ => false,
+    }
+}
 use tt_tests::burn_device::{with_device, Config};
 
 fn values(seed: u64, n: usize) -> Vec<f32> {
@@ -167,6 +175,10 @@ fn division_through_burn_is_within_one_ulp_and_stays_resident() {
             Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
         };
         let (a, b, fa, fb) = (ta(&av), ta(&bv), fl(&av), fl(&bv));
+        // Positive operands for `log`, uploaded as they are: an `abs` first
+        // would run on the host copy, and `log` after it too.
+        let posv: Vec<f32> = av.iter().map(|x| x.abs()).collect();
+        let (pos, fpos) = (ta(&posv), fl(&posv));
         type Case = (
             &'static str,
             Box<dyn Fn() -> Tensor<TtBackend, 2>>,
@@ -197,11 +209,31 @@ fn division_through_burn_is_within_one_ulp_and_stays_resident() {
                 }),
                 bits(fa.clone() / 0.3),
             ),
+            (
+                "exp",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone().exp()
+                }),
+                bits(fa.clone().exp()),
+            ),
+            (
+                "log",
+                Box::new({
+                    let p = pos.clone();
+                    move || p.clone().log()
+                }),
+                bits(fpos.clone().log()),
+            ),
         ];
         for (name, op, want) in cases {
             let before = tensor_traffic();
             let out = op();
             let during = tensor_traffic() - before;
+            assert!(
+                computed_on_device(&out),
+                "{name}: the result was computed on the host"
+            );
             assert_eq!(
                 (during.downloads, during.uploads),
                 (0, 0),
@@ -220,6 +252,18 @@ fn division_through_burn_is_within_one_ulp_and_stays_resident() {
                             wf.abs()
                         },
                         "{name}: element {i}"
+                    );
+                } else if name == "exp" || name == "log" {
+                    // Their derived relative bounds, plus Flex's own ulp.
+                    let bound = if name == "exp" {
+                        tt_kernels::sfpu::ops::EXP_BOUND
+                    } else {
+                        tt_kernels::sfpu::ops::LOG_BOUND
+                    };
+                    let rel = (gf as f64 - wf as f64).abs() / (wf as f64).abs();
+                    assert!(
+                        rel <= bound + 1.2e-7,
+                        "{name}: element {i}: {gf:e} vs {wf:e}"
                     );
                 } else {
                     let ulps = (*g as i64 - *w as i64).unsigned_abs();

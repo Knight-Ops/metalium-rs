@@ -190,6 +190,13 @@ impl Program {
         self.ins.push(i);
     }
 
+    /// An instruction the builder has no method for -- a measurement of a
+    /// mode no op uses yet -- through the same `SFPNOP` bookkeeping. Nothing
+    /// is checked: the caller owns what it does.
+    pub fn raw(&mut self, i: Instruction) {
+        self.push(i);
+    }
+
     fn dst(d: LReg) -> u32 {
         assert!(
             d.writable(),
@@ -293,6 +300,71 @@ impl Program {
             self.mov(sign, d);
         }
         self.push(encode::sfpsetsgn(0, s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = c + d` as 32-bit two's-complement integers (`SFPIADD`), the lane
+    /// flags left alone.
+    pub fn iadd(&mut self, c: LReg, d: LReg) {
+        // `SFPIADD_MOD1_ARG_LREG_DST | SFPIADD_MOD1_CC_NONE`.
+        self.push(encode::sfpiadd(0, c.index(), Self::dst(d), 4).unwrap());
+    }
+
+    /// `d = c - d` as two's-complement integers (`SFPIADD_MOD1_ARG_2SCOMP_LREG_DST`).
+    pub fn isub_from(&mut self, c: LReg, d: LReg) {
+        self.push(encode::sfpiadd(0, c.index(), Self::dst(d), 2 | 4).unwrap());
+    }
+
+    /// `d = c + imm`, `imm` a signed twelve-bit integer (`SFPIADD_MOD1_ARG_IMM`).
+    pub fn iadd_imm(&mut self, c: LReg, imm: i32, d: LReg) {
+        assert!(
+            (-2048..2048).contains(&imm),
+            "{imm} is not a twelve-bit immediate"
+        );
+        self.push(encode::sfpiadd(imm as u32 & 0xfff, c.index(), Self::dst(d), 1 | 4).unwrap());
+    }
+
+    /// `d = s << amount` (`SFPSHFT` with an immediate, the value from `VC`).
+    pub fn shl(&mut self, s: LReg, amount: u32, d: LReg) {
+        assert!(amount < 32);
+        // `SFPSHFT_MOD1_ARG_IMM | SFPSHFT_MOD1_ARG_IMM_USE_VC`.
+        self.push(encode::sfpshft(amount, s.index(), Self::dst(d), 1 | 4).unwrap());
+    }
+
+    /// `d = s >> amount`, logical (`SFPSHFT` by `-amount` from a register
+    /// holding it: the immediate is unsigned). `amount_reg` must hold
+    /// `-amount`, `d` the value.
+    pub fn shr_by(&mut self, neg_amount: LReg, d: LReg) {
+        self.push(encode::sfpshft(0, neg_amount.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d` = the exponent field of `s` as a two's-complement integer, minus
+    /// 127 if `debias` (`SFPEXEXP`).
+    pub fn exponent(&mut self, s: LReg, debias: bool, d: LReg) {
+        self.push(encode::sfpexexp(s.index(), Self::dst(d), u32::from(!debias)).unwrap());
+    }
+
+    /// `d` = `s`'s mantissa bits with the hidden bit, `1 << 23` (`SFPEXMAN`).
+    pub fn mantissa(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpexman(s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = s` with its exponent field set to `exp` (`SFPSETEXP`, immediate).
+    pub fn set_exponent(&mut self, s: LReg, exp: u32, d: LReg) {
+        assert!(exp < 256);
+        self.push(encode::sfpsetexp(exp, s.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = s * 2^k` by adding `k` to the exponent field, an infinity or NaN
+    /// unchanged, no check of the result's range (`SFPDIVP2`). `k` in 0..128:
+    /// the page has the add wrap mod 256, so `-k` would be `256 - k`, but
+    /// ttsim refuses an immediate from 128 up (divergence row 66); scale down
+    /// with a multiply.
+    pub fn scale_by_pow2(&mut self, s: LReg, k: u32, d: LReg) {
+        assert!(
+            k < 128,
+            "SFPDIVP2 by {k}: ttsim refuses an immediate from 128 (row 66)"
+        );
+        self.push(encode::sfpdivp2(k, s.index(), Self::dst(d), 1).unwrap());
     }
 
     /// `d = ApproxRecip(|x|)` with `x`'s sign (`SFPARECIP`, Blackhole only):
