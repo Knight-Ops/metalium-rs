@@ -7,7 +7,8 @@
 //!
 //! What each gives today:
 //! * [`Topology::Single`]: one card, tensors resident in its GDDR (Phase 9),
-//!   every supported op on the device.
+//!   every supported op on the device, on one Tensix tile or many
+//!   ([`TileChoice`]; `TT_TILES` through [`tiles_from_env`]).
 //! * [`Topology::Cards`]: matmuls split along `N` across the cabled cards over
 //!   Ethernet (Phase 8), bit-identical to one card. Tensors are staged from the
 //!   host for each matmul: the mesh does not yet keep them in GDDR.
@@ -73,6 +74,22 @@ impl Topology {
         }
     }
 
+    /// This topology computing on `tile` on each card it has; only
+    /// [`Topology::Single`] can spread over several tiles yet.
+    pub fn on_tiles(self, tile: TileChoice) -> Result<Self, EngineError> {
+        match self {
+            Topology::Single { card, .. } => Ok(Topology::Single { card, tile }),
+            Topology::Cards { .. }
+                if tile == TileChoice::Exactly(Self::COMPUTE.0, Self::COMPUTE.1) =>
+            {
+                Ok(self)
+            }
+            Topology::Cards { .. } => Err(EngineError(format!(
+                "{tile:?}: several cards compute on one tile each, for now"
+            ))),
+        }
+    }
+
     /// How many cards.
     pub fn len(&self) -> usize {
         match self {
@@ -83,6 +100,26 @@ impl Topology {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// From `TT_TILES`: how many Tensix tiles one card computes on, a count or
+/// `"all"` ([`parse_tiles`]). `None` when unset.
+pub fn tiles_from_env() -> Option<Result<TileChoice, EngineError>> {
+    let v = std::env::var("TT_TILES").ok()?;
+    Some(parse_tiles(&v))
+}
+
+/// See [`tiles_from_env`].
+pub fn parse_tiles(s: &str) -> Result<TileChoice, EngineError> {
+    match s.trim() {
+        "all" => Ok(TileChoice::All),
+        n => match n.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(TileChoice::Count(n)),
+            _ => Err(EngineError(format!(
+                "TT_TILES={s:?}: expected a tile count, e.g. \"8\", or \"all\""
+            ))),
+        },
     }
 }
 
@@ -121,5 +158,24 @@ mod tests {
         );
         assert!(Topology::parse("").is_err());
         assert!(Topology::parse("zero").is_err());
+    }
+
+    #[test]
+    fn tiles_are_a_count_or_all() {
+        assert_eq!(parse_tiles("8").unwrap(), TileChoice::Count(8));
+        assert_eq!(parse_tiles(" all ").unwrap(), TileChoice::All);
+        assert!(parse_tiles("0").is_err());
+        assert!(parse_tiles("many").is_err());
+        let one = Topology::single(0);
+        assert_eq!(
+            one.on_tiles(TileChoice::All).unwrap(),
+            Topology::Single {
+                card: 0,
+                tile: TileChoice::All
+            }
+        );
+        assert!(Topology::cards(&[0, 1])
+            .on_tiles(TileChoice::Count(4))
+            .is_err());
     }
 }

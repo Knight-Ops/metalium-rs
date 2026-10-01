@@ -38,7 +38,7 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
             dev,
             tt_firmware_images::ROLES,
             TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
-            |_, _| Ok(()),
+            |_, _| Ok(None),
         )
         .unwrap();
         f(&mut s);

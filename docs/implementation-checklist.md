@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written). Next: 9.6 many tiles |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles (4.1 ms/step on 8). Next: 9.7 one launch per op |
 
 ---
 
@@ -1276,13 +1276,41 @@ tiles, done in turn. The next slices, each gated as the ones above were
 (ttsim for correctness, bit for bit against the golden and `burn-flex`; both
 cards for time):
 
-- [ ] **9.6 Many tiles.** A `Session` over a set of tiles, each with its
-      resident roles and its own B mover. Matmul split by output tile blocks
-      (`M` and `N`, `K` whole, so still bit-identical), element-wise and
-      column sums split by tile. The movers already read any channel, so the
-      interleaved placement feeds them all. Expected: matmul and element-wise
-      (4.8 ms of the 5.8) scale with tile count until the host's descriptor
-      round trips dominate -- which is the next item.
+- [x] **9.6 Many tiles.** `TileChoice::Count(n)` / `All` opens a `Session`
+      over `n` tiles, each a unit with its own resident roles and B mover
+      sharing one TLB window (so 120 tiles fit the 201-window pool). A GDDR op
+      is now a set of independent `tensor::Job`s -- matmul output blocks
+      (`tensor::blocks` shrinks the one-tile plan's block until every unit has
+      one, `K` whole), element-wise tile runs and column-sum column runs
+      (`tensor::runs`, balanced) -- dealt round-robin and run in **waves**:
+      one step started on every unit (`Resident::submit`,
+      `DataMover::submit_list`), then every unit waited for. On ttsim one wait
+      ticks every tile (row 23), on silicon they are separate tiles. Each extra
+      tile's crash-cleanup write is held by a `tt_kmd::CleanupWrite`, a driver
+      descriptor that maps no BAR: `Kmd::open` costs 247 ms on silicon and made
+      a 120-tile open take 29 s, `CleanupWrite::register` 0.74 ms (0.38 s).
+      `TT_TILES=n|all` (and `tt-mnist --tiles`) pick the count; the default
+      stays one tile. Gates: `step20_many_tiles` (MNIST's and larger
+      products, transposed and ragged, at 1, 2, 3 and 8 tiles bit-identical to
+      the host-staged path; element-wise and column sums against `burn-flex`;
+      every unit did a share; a stuck kernel on one tile recovers on silicon),
+      and `step12_mnist::the_mlp_trains_on_four_tiles_matching_the_golden`
+      (the golden bit for bit, and the 9.5 steady-state budget: 6224 B of
+      tensors, 349 372 B written per step against one tile's 193 524 --
+      per-tile descriptors and programs). Watched failing with the last job
+      dropped and with every unit but the first left unwaited (wrong data, not
+      just a missing count). ttsim and both cards: 38/38. `tensor::runs` and
+      `blocks` unit-tested.
+  - **Measured** (`silicon_perf::many_tiles_sweep`, card 0, release):
+    `[512,512]@[512,512]` HiFi4 9.99 -> 5.2 (8 tiles) -> 2.2 ms (64) -> 3.65
+    ms (120); an add over 2048 tiles 15.8 -> 3.6 -> 1.96 -> 2.06 ms; a column
+    sum over 32 columns 45.6 -> 6.4 -> 2.3 -> 2.3 ms. Everything floors at
+    about 2 ms, the host's per-wave round trips, and the matmul gets *slower*
+    past 64 tiles: smaller blocks, more of them, each with its own program
+    writes. **Full MNIST, one card: 5.8 -> 4.1 ms/step on 8 tiles** (5.0 on
+    all 120), accuracy 91.96% unchanged; the gain is element-wise (2.4 ->
+    0.8 ms), while MNIST's small matmuls stay at 2.4 ms -- bound by the host's
+    round trips per block, which is 9.7.
 - [ ] **9.7 One launch per op, not per chunk.** Today the host submits every
       mover list and every kernel generation and polls for each: tens of
       microseconds per round trip, several per op. Move the sequencing onto

@@ -13,15 +13,17 @@
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dm::{self, TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
-use tt_isa::noc::NocId;
+use tt_isa::isa::Instruction;
 use tt_isa::tile::L1Format;
 
-use crate::dm::{DataMover, DmError};
+use crate::dm::DmError;
 use crate::matmul::{self, Fidelity, SrcRoute, Staging};
-use crate::runtime::{Kernel, Outcome, RunError, Schedule};
+use crate::runtime::RunError;
 
 /// Why a DRAM tensor operation failed.
 #[derive(Debug)]
@@ -346,19 +348,78 @@ impl DramTensor {
     }
 }
 
+/// One step of a [`Job`], run on one tile.
+#[derive(Clone, Debug)]
+pub enum Step {
+    /// A data-mover list (`tt_isa::dm::Entry`s) on the tile's RISCV B. Any
+    /// length: the session splits it into lists the mover takes.
+    List {
+        /// What it is, for [`stats`].
+        what: &'static str,
+        entries: Vec<[u32; 8]>,
+    },
+    /// The three role programs of a matmul chunk, run concurrently on the
+    /// tile's resident roles with [`matmul::TILE_SEMAPHORES`], which they
+    /// restore.
+    Matmul(Arc<[Vec<Instruction>; 3]>),
+}
+
+/// Steps that must run in order on one tile, from one L1 staging area. The
+/// jobs of one op are independent of each other: each reads only GDDR and
+/// writes only its own output tiles, so they may run on different tiles, in
+/// any order, and give the same bits.
+pub type Job = Vec<Step>;
+
+/// What an op leaves to run: its output, already allocated, and its jobs.
+pub struct Work {
+    pub out: DramTensor,
+    pub jobs: Vec<Job>,
+}
+
+/// `0..len` in contiguous runs: one per unit while there is an item for each,
+/// more if a run would exceed `max` items, and as even as integer division
+/// allows (no two runs differ by more than one item).
+pub fn runs(len: usize, units: usize, max: usize) -> Vec<std::ops::Range<usize>> {
+    let parts = units.max(1).min(len).max(len.div_ceil(max.max(1)));
+    (0..parts)
+        .map(|p| p * len / parts..(p + 1) * len / parts)
+        .collect()
+}
+
+/// `[mc, nc]` output tiles per block, shrunk from the one-tile plan's until
+/// there are at least `units` blocks or no output tile is left to split.
+/// Shrinking only ever makes a block smaller, so it still fits wherever the
+/// plan's did, and `K` is never touched: each output tile is the same
+/// accumulation, in the same order, whichever block it falls in.
+pub fn blocks([mt, nt]: [usize; 2], [mc, nc]: [usize; 2], units: usize) -> [usize; 2] {
+    let (mut pm, mut pn) = (mt.div_ceil(mc), nt.div_ceil(nc));
+    let (mut mc, mut nc) = (mc, nc);
+    while mt.div_ceil(mc) * nt.div_ceil(nc) < units && (mc > 1 || nc > 1) {
+        // Split the wider side of the block, so blocks stay square-ish and
+        // each tile's gather reuses as much of its operands as it can.
+        if nc >= mc && nc > 1 {
+            pn += 1;
+            nc = nt.div_ceil(pn);
+        } else {
+            pm += 1;
+            mc = mt.div_ceil(pm);
+        }
+    }
+    [mc, nc]
+}
+
 /// `op(A) @ op(B)`, where `op` is a transpose when asked, all in GDDR: the
-/// data mover gathers each chunk's tiles into L1 (transposing where needed),
+/// data mover gathers each block's tiles into L1 (transposing where needed),
 /// the resident roles compute it, and the mover writes the output tiles back.
 /// Nothing but descriptors, programs and semaphores crosses PCIe.
 ///
 /// Chunked by [`matmul::plan_in`] with [`Staging::Slots`], and refused if the
 /// plan splits `K`: a split `K` means a partial-sum add, which the host path
 /// does on the host, and doing it anywhere else would change the rounding.
+/// The plan's blocks are then made small enough for `units` tiles to share
+/// ([`blocks`]); each block is one [`Job`].
 #[allow(clippy::too_many_arguments)]
-pub fn matmul_dram<T: Transport, N: NocId>(
-    dev: &mut Device<T>,
-    w: &Window,
-    mover: &mut DataMover<N>,
+pub fn matmul_dram(
     alloc: &mut DramAlloc,
     a: &DramTensor,
     a_transposed: bool,
@@ -366,8 +427,8 @@ pub fn matmul_dram<T: Transport, N: NocId>(
     b_transposed: bool,
     route: SrcRoute,
     fidelity: Fidelity,
-    mut run: impl FnMut(&mut Device<T>, &Kernel<'_>) -> std::result::Result<Outcome, RunError>,
-) -> Result<DramTensor> {
+    units: usize,
+) -> Result<Work> {
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
     } else {
@@ -394,6 +455,7 @@ pub fn matmul_dram<T: Transport, N: NocId>(
             "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
         )));
     }
+    let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     // Tile (i, j) of op(X), as a list entry into L1 slot `to`.
     let fetch = |x: &DramTensor, transposed: bool, i: usize, j: usize, to: u64| -> [u32; 8] {
         let (slot, op) = if transposed {
@@ -414,12 +476,19 @@ pub fn matmul_dram<T: Transport, N: NocId>(
         ]
     };
     let c = DramTensor::alloc(alloc, m, n)?;
+    let mut jobs = Vec::new();
     for i0 in (0..mt).step_by(mc) {
         let rows = mc.min(mt - i0);
         for j0 in (0..nt).step_by(nc) {
             let cols = nc.min(nt - j0);
             let tiles = [rows, kt, cols];
-            let (b_at, outputs) = matmul::plan_layout_in(tiles, in_fmt, Staging::Slots)?;
+            let (b_at, outputs) = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+                Ok(l) => l,
+                Err(e) => {
+                    alloc.free(&c.placement);
+                    return Err(e.into());
+                }
+            };
             let mut list = Vec::new();
             for i in 0..rows {
                 for kk in 0..kt {
@@ -433,21 +502,9 @@ pub fn matmul_dram<T: Transport, N: NocId>(
                     list.push(fetch(b, b_transposed, kk, j0 + j, to));
                 }
             }
-            stats::timed("matmul gather", || mover.run_list(dev, w, &list))?;
-
             let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
                 matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
             });
-            let [unpack, math, pack] = &*roles;
-            let kernel = Kernel {
-                // `TILE_SEMAPHORES`: every run leaves them as it found them.
-                restores_semaphores: true,
-                ..Kernel::new(
-                    [unpack, math, pack],
-                    Schedule::Concurrent(&matmul::TILE_SEMAPHORES),
-                )
-            };
-            stats::timed("matmul compute", || run(dev, &kernel))?;
 
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
@@ -472,10 +529,20 @@ pub fn matmul_dram<T: Transport, N: NocId>(
                     ]);
                 }
             }
-            stats::timed("matmul scatter", || mover.run_list(dev, w, &back))?;
+            jobs.push(vec![
+                Step::List {
+                    what: "matmul gather",
+                    entries: list,
+                },
+                Step::Matmul(roles),
+                Step::List {
+                    what: "matmul scatter",
+                    entries: back,
+                },
+            ]);
         }
     }
-    Ok(c)
+    Ok(Work { out: c, jobs })
 }
 
 /// What [`eltwise`] computes: a `tt_isa::dm::kind`, its scalar where it takes
@@ -491,15 +558,17 @@ pub struct Eltwise {
 /// (`tt_isa::dm::kind`). For `ADD_ROW`, `b` is `[1, cols]` and its row is
 /// added to every row of `a`; otherwise `b`, where the kind takes one, has
 /// `a`'s shape.
-pub fn eltwise<T: Transport, N: NocId>(
-    dev: &mut Device<T>,
-    w: &Window,
-    mover: &mut DataMover<N>,
+///
+/// Tiles are independent, so they are dealt out in contiguous runs, one
+/// [`Job`] each, as many runs as there are `units` (but never more tiles per
+/// list than the staging area holds).
+pub fn eltwise(
     alloc: &mut DramAlloc,
     op: Eltwise,
     a: &DramTensor,
     b: Option<&DramTensor>,
-) -> Result<DramTensor> {
+    units: usize,
+) -> Result<Work> {
     use tt_isa::dm::kind;
     let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU);
     let row = op.kind == kind::ADD_ROW;
@@ -541,7 +610,9 @@ pub fn eltwise<T: Transport, N: NocId>(
         ]
     };
     let tiles: Vec<(usize, usize)> = (0..rt).flat_map(|i| (0..ct).map(move |j| (i, j))).collect();
-    for group in tiles.chunks(GROUP) {
+    let mut jobs = Vec::new();
+    for run in runs(tiles.len(), units, GROUP) {
+        let group = &tiles[run];
         let mut list = Vec::new();
         for (n, &(i, j)) in group.iter().enumerate() {
             list.push(read(a.tile(i, j), slot(2 * n), n));
@@ -575,20 +646,20 @@ pub fn eltwise<T: Transport, N: NocId>(
                 0,
             ]);
         }
-        stats::timed("eltwise list", || mover.run_list(dev, w, &list))?;
+        jobs.push(vec![Step::List {
+            what: "eltwise list",
+            entries: list,
+        }]);
     }
-    Ok(out)
+    Ok(Work { out, jobs })
 }
 
 /// The sum over rows of `a`, as a `[1, cols]` tensor, in `burn-flex`'s order:
 /// from `+0.0`, adding rows in order (`tt_isa::dm::kind::COL_SUM`).
-pub fn sum_rows<T: Transport, N: NocId>(
-    dev: &mut Device<T>,
-    w: &Window,
-    mover: &mut DataMover<N>,
-    alloc: &mut DramAlloc,
-    a: &DramTensor,
-) -> Result<DramTensor> {
+///
+/// Columns are independent; each keeps its rows in order on one tile. They
+/// are dealt out in contiguous runs, one [`Job`] per run, as many as `units`.
+pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
     let out = DramTensor::alloc(alloc, 1, a.cols)?;
     let [rt, ct] = a.grid();
     let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
@@ -637,37 +708,46 @@ pub fn sum_rows<T: Transport, N: NocId>(
             0,
         ]
     };
-    let mut list = Vec::new();
-    let mut used = 0;
-    for j in 0..ct {
-        if used + 1 + rt.min(SLOTS - 1) > SLOTS {
-            stats::timed("sum list", || mover.run_list(dev, w, &list))?;
-            list.clear();
-            used = 0;
+    let mut jobs = Vec::new();
+    for columns in runs(ct, units, ct.max(1)) {
+        let mut job = Vec::new();
+        let mut list = Vec::new();
+        let mut flush = |list: &mut Vec<[u32; 8]>| {
+            job.push(Step::List {
+                what: "sum list",
+                entries: std::mem::take(list),
+            })
+        };
+        let mut used = 0;
+        for j in columns {
+            if used + 1 + rt.min(SLOTS - 1) > SLOTS {
+                flush(&mut list);
+                used = 0;
+            }
+            let acc = slot(used);
+            used += 1;
+            for i0 in (0..rt).step_by(SLOTS - 1) {
+                let rows = (rt - i0).min(SLOTS - 1);
+                if used + rows > SLOTS {
+                    // Only a column taller than a list reaches here: run what
+                    // is queued, keeping the accumulator slot where it is.
+                    flush(&mut list);
+                    used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
+                }
+                for i in i0..i0 + rows {
+                    list.push(read(a.tile(i, j), slot(used + i - i0), i));
+                }
+                for i in i0..i0 + rows {
+                    list.push(sum(acc, slot(used + i - i0), i == 0));
+                }
+                used += rows;
+            }
+            list.push(write(j, acc));
         }
-        let acc = slot(used);
-        used += 1;
-        for i0 in (0..rt).step_by(SLOTS - 1) {
-            let rows = (rt - i0).min(SLOTS - 1);
-            if used + rows > SLOTS {
-                // Only a column taller than a list reaches here: run what
-                // is queued, keeping the accumulator slot where it is.
-                stats::timed("sum list", || mover.run_list(dev, w, &list))?;
-                list.clear();
-                used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
-            }
-            for i in i0..i0 + rows {
-                list.push(read(a.tile(i, j), slot(used + i - i0), i));
-            }
-            for i in i0..i0 + rows {
-                list.push(sum(acc, slot(used + i - i0), i == 0));
-            }
-            used += rows;
-        }
-        list.push(write(j, acc));
+        flush(&mut list);
+        jobs.push(job);
     }
-    stats::timed("sum list", || mover.run_list(dev, w, &list))?;
-    Ok(out)
+    Ok(Work { out, jobs })
 }
 
 /// Host wall-clock time in each stage of the DRAM ops, process-wide: where a
@@ -697,5 +777,53 @@ pub mod stats {
             .into_iter()
             .map(|(k, (n, d))| (k, n, d))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blocks, runs};
+
+    #[test]
+    fn runs_cover_every_item_once_evenly_and_within_the_limit() {
+        for len in 0..60 {
+            for units in 1..12 {
+                for max in [1, 5, 96] {
+                    let r = runs(len, units, max);
+                    let items: Vec<usize> = r.iter().cloned().flatten().collect();
+                    assert_eq!(items, (0..len).collect::<Vec<_>>(), "{len} {units} {max}");
+                    let sizes: Vec<usize> = r.iter().map(|x| x.len()).collect();
+                    assert!(sizes.iter().all(|&n| n <= max), "{sizes:?}");
+                    let (lo, hi) = (sizes.iter().min(), sizes.iter().max());
+                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                        assert!(hi - lo <= 1, "{len} {units} {max}: {sizes:?}");
+                    }
+                    // One run per unit whenever there are items enough.
+                    if len >= units && len <= units * max {
+                        assert_eq!(r.len(), units, "{len} {units} {max}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_shrink_until_every_unit_has_one_and_never_grow() {
+        for (mt, nt) in [(1, 1), (2, 4), (2, 1), (3, 9), (8, 16), (25, 4)] {
+            for (mc, nc) in [(mt, nt), (1, nt), (mt.min(2), 1)] {
+                for units in [1, 2, 3, 8, 120] {
+                    let [bm, bn] = blocks([mt, nt], [mc, nc], units);
+                    assert!(bm >= 1 && bm <= mc && bn >= 1 && bn <= nc);
+                    let count = mt.div_ceil(bm) * nt.div_ceil(bn);
+                    assert!(
+                        count >= units.min(mt * nt) || (bm, bn) == (1, 1),
+                        "[{mt}, {nt}] from [{mc}, {nc}] for {units}: [{bm}, {bn}] -> {count}"
+                    );
+                    if units == 1 {
+                        assert_eq!([bm, bn], [mc, nc], "one unit keeps the plan's block");
+                    }
+                }
+            }
+        }
     }
 }

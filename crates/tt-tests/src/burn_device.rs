@@ -15,6 +15,9 @@ pub struct Config {
     pub fidelity: Fidelity,
     /// Simulated cycles per role per run (`tt_kernels::runtime::run`).
     pub budget: u64,
+    /// The Tensix tiles the device computes on; `None` is the gate tile
+    /// (`harness::tensix_tile`), or on silicon what `TT_TILES` says.
+    pub tiles: Option<burn_tt::TileChoice>,
 }
 
 impl Default for Config {
@@ -24,6 +27,7 @@ impl Default for Config {
             route: SrcRoute::Tf32FromFp32,
             fidelity: Fidelity::HiFi4,
             budget: 4_000_000,
+            tiles: None,
         }
     }
 }
@@ -231,8 +235,10 @@ fn attach_engine(
         let session = tt_kernels::session::Session::open(
             dev,
             tt_firmware_images::ROLES,
-            tt_kernels::session::TileChoice::Exactly(t.x(), t.y()),
-            |_, _| Ok(()),
+            config
+                .tiles
+                .unwrap_or(tt_kernels::session::TileChoice::Exactly(t.x(), t.y())),
+            |_, _| Ok(None),
         )
         .map_err(|e| EngineError(e.to_string()))?;
         let mut session = session;
@@ -255,7 +261,8 @@ fn attach_engine(
 ) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
     // `TT_TOPOLOGY` ("0", "0,1") picks the cards, so one benchmark runs on one
     // card or several unchanged (`burn_tt::Topology`); unset, the card this
-    // gate was pointed at, on the gate tile.
+    // gate was pointed at, on the gate tile. The gate's own `tiles`, else
+    // `TT_TILES` ("8", "all"), spreads one card's work over more tiles.
     let topology = match burn_tt::Topology::from_env() {
         Some(t) => t?,
         None => {
@@ -265,6 +272,10 @@ fn attach_engine(
                 tile: burn_tt::TileChoice::Exactly(x, y),
             }
         }
+    };
+    let topology = match config.tiles.map(Ok).or_else(burn_tt::tiles_from_env) {
+        Some(tiles) => topology.on_tiles(tiles?)?,
+        None => topology,
     };
     eprintln!("topology: {topology:?}");
     burn_tt::attach_topology(device, topology, config.route, config.fidelity)

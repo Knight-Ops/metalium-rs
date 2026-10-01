@@ -496,6 +496,9 @@ pub struct Resident<N: NocId> {
     /// The semaphore set the tile is known to hold, as initialised: set by a
     /// setup run, kept by kernels that restore it, dropped by anything else.
     semaphores: Option<Vec<SemaphoreInit>>,
+    /// A [`Resident::submit`]ted kernel's phases so far, until it is
+    /// [`Resident::complete`]d.
+    pending: Option<Stopwatch>,
 }
 
 impl<N: NocId> Resident<N> {
@@ -516,6 +519,7 @@ impl<N: NocId> Resident<N> {
             poisoned: false,
             slots: Default::default(),
             semaphores: None,
+            pending: None,
         };
         for thread in 0..3 {
             r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
@@ -534,6 +538,13 @@ impl<N: NocId> Resident<N> {
         self.tile
     }
 
+    /// The window this tile is reached through. A [`crate::dm::DataMover`] on
+    /// the same tile shares it, so a session over every tile of a chip needs
+    /// one window per tile, not two.
+    pub fn window(&self) -> &tt_device::Window {
+        &self.window
+    }
+
     /// Run `kernel` on the resident roles. The same contract as [`run`], less
     /// the image loads and core releases.
     pub fn run<T: Transport>(
@@ -543,10 +554,99 @@ impl<N: NocId> Resident<N> {
         kernel: &Kernel<'_>,
         budget: u64,
     ) -> Result<Outcome, RunError> {
+        if let Schedule::Concurrent(_) = kernel.schedule {
+            self.submit(dev, images, kernel, budget)?;
+            return self.complete(dev, images, kernel, budget);
+        }
+        let mut clock = self.begin(dev, images, kernel, budget)?;
+        // In order: each role runs to completion before the next moves,
+        // exactly as `run` sequences them.
+        let mut stuck = Vec::new();
+        for thread in 0..3 {
+            self.go(dev, thread)?;
+            stuck = self.wait(dev, &[thread], images, budget)?;
+            if !stuck.is_empty() {
+                break;
+            }
+        }
+        clock.lap(dev, Phase::Wait);
+        self.finish(dev, kernel, clock, stuck, None)
+    }
+
+    /// The first half of [`Resident::run`] for a [`Schedule::Concurrent`]
+    /// kernel: everything up to and including the three generation writes,
+    /// with no wait for the roles to finish. [`Resident::complete`] is the
+    /// other half, and must be called with the same kernel before anything
+    /// else runs here. Between the two, the host is free to start work on
+    /// other tiles, which is how a session computes on many at once.
+    ///
+    /// A setup run, when the kernel needs one, is still waited for here: it
+    /// runs only when the tile's semaphores are not already the kernel's.
+    pub fn submit<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+        kernel: &Kernel<'_>,
+        budget: u64,
+    ) -> Result<(), RunError> {
+        if !matches!(kernel.schedule, Schedule::Concurrent(_)) {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "only a concurrent kernel can be submitted without waiting",
+            }));
+        }
+        let mut clock = self.begin(dev, images, kernel, budget)?;
+        for thread in 0..3 {
+            self.go(dev, thread)?;
+        }
+        clock.lap(dev, Phase::Launch);
+        self.pending = Some(clock);
+        Ok(())
+    }
+
+    /// The second half of a [`Resident::submit`]: wait for the three roles,
+    /// then read back what `kernel` asks for.
+    pub fn complete<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+        kernel: &Kernel<'_>,
+        budget: u64,
+    ) -> Result<Outcome, RunError> {
+        let Some(mut clock) = self.pending.take() else {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "complete without a submitted kernel",
+            }));
+        };
+        let stuck = self.wait(dev, &[0, 1, 2], images, budget)?;
+        clock.lap(dev, Phase::Wait);
+        let init = match kernel.schedule {
+            Schedule::Concurrent(init) => Some(init.to_vec()),
+            Schedule::InOrder => None,
+        };
+        self.finish(dev, kernel, clock, stuck, init)
+    }
+
+    /// Stage `kernel` and its programs, running its setup first if it needs
+    /// one, and move to the next generation; nothing is released yet.
+    fn begin<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+        kernel: &Kernel<'_>,
+        budget: u64,
+    ) -> Result<Stopwatch, RunError> {
         if self.poisoned {
             return Err(RunError::Transport(TransportError::Hazard {
                 address: 0,
                 reason: "a resident kernel failed; reset the tile and start again",
+            }));
+        }
+        if self.pending.is_some() {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "a submitted kernel has not been completed",
             }));
         }
         let (setup, unpack) = assemble(kernel)?;
@@ -602,30 +702,26 @@ impl<N: NocId> Resident<N> {
             )?;
         }
         clock.lap(dev, Phase::Programs);
-        let go = |dev: &mut Device<T>, thread: usize| {
-            let mb = Mailbox::of(thread as u32);
-            dev.write32(&self.window, tile, mb.generation(), self.generation)
-        };
-        let stuck = if setup.is_some() {
-            for thread in 0..3 {
-                go(dev, thread)?;
-            }
-            clock.lap(dev, Phase::Launch);
-            self.wait(dev, &[0, 1, 2], images, budget)?
-        } else {
-            // In order: each role runs to completion before the next moves,
-            // exactly as `run` sequences them.
-            let mut stuck = Vec::new();
-            for thread in 0..3 {
-                go(dev, thread)?;
-                stuck = self.wait(dev, &[thread], images, budget)?;
-                if !stuck.is_empty() {
-                    break;
-                }
-            }
-            stuck
-        };
-        clock.lap(dev, Phase::Wait);
+        Ok(clock)
+    }
+
+    /// Move role `thread` to the current generation, so it runs.
+    fn go<T: Transport>(&self, dev: &mut Device<T>, thread: usize) -> Result<(), RunError> {
+        let mb = Mailbox::of(thread as u32);
+        dev.write32(&self.window, self.tile, mb.generation(), self.generation)?;
+        Ok(())
+    }
+
+    /// After the roles have finished (or `stuck` says which did not): record
+    /// the semaphores a restoring kernel left, and read back what it asks for.
+    fn finish<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        kernel: &Kernel<'_>,
+        mut clock: Stopwatch,
+        stuck: Vec<(usize, Core, WaitError)>,
+        init: Option<Vec<SemaphoreInit>>,
+    ) -> Result<Outcome, RunError> {
         if !stuck.is_empty() {
             self.poisoned = true;
             return Err(RunError::Roles(stuck));
@@ -633,7 +729,7 @@ impl<N: NocId> Resident<N> {
         if kernel.restores_semaphores {
             self.semaphores = init;
         }
-
+        let tile = self.tile;
         let math = Mailbox::of(1);
         let mut dst = Vec::with_capacity((kernel.dump_rows * mailbox::DUMP_ROW_WORDS) as usize);
         for row in 0..kernel.dump_rows {

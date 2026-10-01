@@ -34,7 +34,7 @@ pub use server::{
     Engine, EngineError, KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
-pub use topology::{attach_topology, Topology};
+pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
 pub use traffic::{
     device_time, record_transfers, take_transfers, tensor_traffic, Direction, TensorTraffic,
     Transfer,

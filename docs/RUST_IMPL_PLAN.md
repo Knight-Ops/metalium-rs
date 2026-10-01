@@ -1024,7 +1024,9 @@ card** (from 224 at the start of the phase), bit for bit on the Phase 7 golden, 
 weights, activations and gradients resident in GDDR. Per steady-state step exactly six tensors cross
 PCIe, 6224 B (`dL/dlogits`, the two biases and their gradients, and the logits), and the device is
 written 193 524 B in all, descriptors and programs included -- both asserted by the 9.5 gate. The
-loss stays on the host. What is left is
+loss stays on the host. Since 9.6 a session deals its GDDR ops over many Tensix tiles,
+bit-identically: 4.1 ms/step on eight tiles, and every op now floors at about 2 ms of host round
+trips per wave, which is what 9.7 removes. What is left is
 almost all compute on **a single Tensix tile**, sequenced by the host one round trip at a time. In
 order: spread matmul and element-wise work over many tiles (9.6); let each tile's B mover sequence
 gather, compute and scatter from an L1 work queue so an op is one host descriptor (9.7); double-

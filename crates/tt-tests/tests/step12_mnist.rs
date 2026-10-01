@@ -341,6 +341,25 @@ fn assert_steady_state_traffic(
 
 #[test]
 fn the_mlp_trains_on_a_reduced_dataset() {
+    reduced_run_matches_the_golden(Config::default());
+}
+
+/// Phase 9.6: the same run with every GDDR op dealt over four Tensix tiles.
+/// Splitting a matmul by output blocks with `K` whole, element-wise ops by
+/// tile and column sums by column changes no accumulation, so the claim is
+/// the single-tile golden bit for bit, and the same steady-state traffic.
+#[test]
+fn the_mlp_trains_on_four_tiles_matching_the_golden() {
+    reduced_run_matches_the_golden(Config {
+        tiles: Some(burn_tt::TileChoice::Count(4)),
+        ..Config::default()
+    });
+}
+
+/// The reduced run on a device configured by `config`, held to the golden
+/// and to [`assert_steady_state_traffic`]. Only the single-tile default
+/// blesses the golden.
+fn reduced_run_matches_the_golden(config: Config) {
     let split = mnist::load(true);
     let init = init();
     let (host, _) = train::<Autodiff<Flex>>(&split, &REDUCED, &init, &FlexDevice);
@@ -349,9 +368,9 @@ fn the_mlp_trains_on_a_reduced_dataset() {
         mean(&host[host.len() - steps..]) <= DESCENT * host[0],
         "the setup itself must train: host {host:?}"
     );
-    let bless = std::env::var_os("TT_BLESS").is_some();
+    let bless = std::env::var_os("TT_BLESS").is_some() && config.tiles.is_none();
     let want = golden();
-    with_device(Config::default(), |d| {
+    with_device(config, |d| {
         let before = burn_tt::tensor_traffic();
         // Counters after every step, so steady state can be told from the
         // first step's uploads.

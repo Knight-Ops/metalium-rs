@@ -242,10 +242,11 @@ struct Args {
 }
 
 const USAGE: &str = "\
-usage: tt-mnist [--card N | --cards 0,1] [--epochs E] [--steps S] [--host]
+usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
+  --tiles T     compute on T Tensix tiles of the card, or `all` (default 1)
   --epochs E    passes over the 60 000 training images (default 1)
   --steps S     stop after S steps
   --host        also train on the host CPU (burn-flex), for comparison";
@@ -257,6 +258,7 @@ fn args() -> Result<Args, String> {
         steps: usize::MAX,
         host: false,
     };
+    let mut tiles = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or(format!("{arg} needs a value\n\n{USAGE}"));
@@ -271,12 +273,17 @@ fn args() -> Result<Args, String> {
                     Topology::single(v.parse().map_err(|_| format!("--card {v}: not a number"))?);
             }
             "--cards" => a.topology = Topology::parse(&value()?).map_err(|e| e.to_string())?,
+            "--tiles" => tiles = Some(burn_tt::parse_tiles(&value()?).map_err(|e| e.to_string())?),
             "--epochs" => a.epochs = number(value()?)?,
             "--steps" => a.steps = number(value()?)?,
             "--host" => a.host = true,
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
+    }
+    // After the loop, so `--tiles` applies whichever order it came in.
+    if let Some(t) = tiles {
+        a.topology = a.topology.on_tiles(t).map_err(|e| e.to_string())?;
     }
     Ok(a)
 }
@@ -290,8 +297,13 @@ fn main() {
         }
     };
     let cards = match &a.topology {
-        Topology::Single { card, .. } => {
-            format!("/dev/tenstorrent/{card}, one Tensix tile, tensors resident in GDDR6")
+        Topology::Single { card, tile } => {
+            let tiles = match tile {
+                burn_tt::TileChoice::Count(n) => format!("{n} Tensix tiles"),
+                burn_tt::TileChoice::All => "every Tensix tile".into(),
+                _ => "one Tensix tile".into(),
+            };
+            format!("/dev/tenstorrent/{card}, {tiles}, tensors resident in GDDR6")
         }
         Topology::Cards { cards, .. } => format!(
             "/dev/tenstorrent/{{{}}}, matmuls sharded across the cards over Ethernet",

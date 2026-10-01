@@ -94,6 +94,54 @@ pub struct TlbReservation {
     pub mmap_offset_wc: u64,
 }
 
+/// Open a device node read-write and refuse a driver whose ioctl ABI is not the
+/// one `abi` describes.
+fn open_checked(path: &Path) -> Result<File, TransportError> {
+    let fd = File::options().read(true).write(true).open(path)?;
+    let info = ioctl::get_driver_info(fd.as_fd())?;
+    if info.driver_version != PINNED_API_VERSION {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "{} speaks tt-kmd ioctl API version {}, but tt-kmd is built against {}. \
+             The structs in `tt_kmd::abi` describe a different ABI than the loaded \
+             module; re-pin [tt-kmd] in PINS.toml against `modinfo tenstorrent`.",
+            path.display(),
+            info.driver_version,
+            PINNED_API_VERSION,
+        ))));
+    }
+    Ok(fd)
+}
+
+/// A driver file descriptor held only for its crash-cleanup write.
+///
+/// The driver keeps one cleanup write per descriptor (`chardev.c:539`
+/// overwrites it), so keeping several tiles safe takes several descriptors.
+/// This one maps no BAR, which is what makes [`Kmd::open`] cost about a
+/// quarter of a second on silicon (`MEASURED`, `silicon_perf::session_open_breakdown`)
+/// -- a session over a whole chip opened 120 of them. Opened without
+/// `O_APPEND`, as [`Kmd::open`] is, so it asks for no power state the main
+/// descriptor does not.
+pub struct CleanupWrite {
+    _fd: File,
+}
+
+impl CleanupWrite {
+    /// Open `/dev/tenstorrent/<index>` and register `data -> (x, y, addr)` on
+    /// `noc` to be written when this handle is dropped or the process dies.
+    pub fn register(
+        index: u16,
+        x: u8,
+        y: u8,
+        noc: u8,
+        addr: u64,
+        data: u32,
+    ) -> Result<Self, TransportError> {
+        let fd = open_checked(&Path::new(DEV_DIR).join(index.to_string()))?;
+        ioctl::set_noc_cleanup(fd.as_fd(), true, x, y, noc, addr, data)?;
+        Ok(CleanupWrite { _fd: fd })
+    }
+}
+
 impl Kmd {
     /// Open `/dev/tenstorrent/<index>`.
     pub fn open(index: u16) -> Result<Self, TransportError> {
@@ -121,19 +169,7 @@ impl Kmd {
         // Tensix array is clock gated -- must be asked for explicitly. Opening
         // with O_APPEND and forgetting that produces a chip on which nothing runs
         // and nothing says why.
-        let fd = File::options().read(true).write(true).open(&path)?;
-
-        let info = ioctl::get_driver_info(fd.as_fd())?;
-        if info.driver_version != PINNED_API_VERSION {
-            return Err(TransportError::Io(std::io::Error::other(format!(
-                "{} speaks tt-kmd ioctl API version {}, but tt-kmd is built against {}. \
-                 The structs in `tt_kmd::abi` describe a different ABI than the loaded \
-                 module; re-pin [tt-kmd] in PINS.toml against `modinfo tenstorrent`.",
-                path.display(),
-                info.driver_version,
-                PINNED_API_VERSION,
-            ))));
-        }
+        let fd = open_checked(&path)?;
 
         let dev = ioctl::get_device_info(fd.as_fd())?;
         let bdf = format!(

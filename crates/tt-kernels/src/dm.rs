@@ -145,25 +145,42 @@ impl<N: NocId> DataMover<N> {
         w: &Window,
         entries: &[[u32; 8]],
     ) -> Result<()> {
+        for chunk in entries.chunks(dm::LIST_MAX as usize) {
+            self.submit_list(d, w, chunk)?;
+            self.wait(d, w)?;
+        }
+        Ok(())
+    }
+
+    /// The first half of [`DataMover::run_list`] for at most
+    /// `tt_isa::dm::LIST_MAX` entries: check them, write them and start the
+    /// mover, without waiting. [`DataMover::wait`] is the other half; the host
+    /// can start other tiles' work in between.
+    pub fn submit_list<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        for chunk in entries.chunks(dm::LIST_MAX as usize) {
-            for e in chunk {
-                Entry::decode(self.usable as u32, *e).map_err(DmError::Invalid)?;
-            }
-            let bytes: Vec<u8> = chunk
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            d.l1_write(w, self.tile, dm::LIST, &bytes)?;
-            d.write32(w, self.tile, dm::OP, op::LIST)?;
-            d.write32(w, self.tile, dm::LEN, chunk.len() as u32)?;
-            self.seq = self.seq.wrapping_add(1).max(1);
-            d.write32(w, self.tile, dm::SEQ, self.seq)?;
-            self.wait(d, w)?;
+        if entries.len() > dm::LIST_MAX as usize {
+            return Err(DmError::Invalid(dm::error::LENGTH));
         }
+        for e in entries {
+            Entry::decode(self.usable as u32, *e).map_err(DmError::Invalid)?;
+        }
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        d.l1_write(w, self.tile, dm::LIST, &bytes)?;
+        d.write32(w, self.tile, dm::OP, op::LIST)?;
+        d.write32(w, self.tile, dm::LEN, entries.len() as u32)?;
+        self.seq = self.seq.wrapping_add(1).max(1);
+        d.write32(w, self.tile, dm::SEQ, self.seq)?;
         Ok(())
     }
 
@@ -195,7 +212,9 @@ impl<N: NocId> DataMover<N> {
         self.wait(d, w)
     }
 
-    fn wait<T: Transport>(&self, d: &mut Device<T>, w: &Window) -> Result<()> {
+    /// Wait for the last descriptor submitted to finish, and report its error.
+    /// Returns at once if nothing is outstanding.
+    pub fn wait<T: Transport>(&self, d: &mut Device<T>, w: &Window) -> Result<()> {
         let started = Instant::now();
         let simulated = d.transport().is_simulated();
         let mut ticks = 0u64;
