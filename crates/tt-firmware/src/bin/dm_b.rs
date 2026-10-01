@@ -9,7 +9,7 @@
 #![no_main]
 
 use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, Descriptor, Entry};
+use tt_isa::dm::{self, op, record, Descriptor, Entry};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
@@ -185,47 +185,76 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     Ok(())
 }
 
-/// Run the list at `dm::LIST`: plain entries are issued back to back and waited
-/// for together; a transposed read waits for its own tile before rearranging it;
-/// a kernel or a wait entry first waits for everything before it.
+/// Run one list entry: plain entries are issued without waiting; a transposed
+/// read waits for its own tile before rearranging it; a kernel or a wait entry
+/// first waits for everything before it.
+fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
+    match Entry::decode(usable, w)? {
+        Entry::Move { descriptor, transpose: true } => {
+            // Everything before it has landed, and the scratch is free.
+            noc::wait(TXN);
+            run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
+            publish();
+            transpose_from_scratch(descriptor.l1 as u64);
+            // Visible in L1 before anything else reads the slot.
+            publish();
+        }
+        Entry::Move { descriptor, .. } => issue(me, descriptor)?,
+        Entry::Kernel { generation } => {
+            // The operands it computes on must have landed.
+            noc::wait(TXN);
+            publish();
+            kernel(generation)?;
+        }
+        Entry::Wait => {
+            noc::wait(TXN);
+            publish();
+        }
+        Entry::Compute { kind, scalar, dst, a, b } => {
+            // Its operands may still be arriving.
+            noc::wait(TXN);
+            publish();
+            compute(kind, scalar, dst as u64, a as u64, b as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Read list entry `i`.
+fn entry(i: u64) -> [u32; 8] {
+    let at = dm::LIST + i * dm::ENTRY_BYTES;
+    let mut w = [0u32; 8];
+    for (k, word) in w.iter_mut().enumerate() {
+        *word = rd(at + k as u64 * 4);
+    }
+    w
+}
+
+/// Run the list at `dm::LIST`, entry by entry ([`exec`]). An op record
+/// (`dm::record`) is expanded here, on the tile, into the entries the host
+/// would otherwise have sent, and each runs exactly as a sent one would --
+/// through `Entry::decode` and every refusal in it.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
     if count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
-    for i in 0..count as u64 {
-        let at = dm::LIST + i * dm::ENTRY_BYTES;
-        let mut w = [0u32; 8];
-        for (k, word) in w.iter_mut().enumerate() {
-            *word = rd(at + k as u64 * 4);
+    let mut i = 0u64;
+    while i < count as u64 {
+        let head = entry(i);
+        let n = record::len(head[0]) as u64;
+        if n == 1 {
+            exec(me, usable, head)?;
+        } else {
+            if i + n > count as u64 {
+                return Err(dm::error::LENGTH);
+            }
+            let mut rec = [[0u32; 8]; 7];
+            for k in 0..n {
+                rec[k as usize] = entry(i + k);
+            }
+            record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
         }
-        match Entry::decode(usable, w)? {
-            Entry::Move { descriptor, transpose: true } => {
-                // Everything before it has landed, and the scratch is free.
-                noc::wait(TXN);
-                run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
-                publish();
-                transpose_from_scratch(descriptor.l1 as u64);
-                // Visible in L1 before anything else reads the slot.
-                publish();
-            }
-            Entry::Move { descriptor, .. } => issue(me, descriptor)?,
-            Entry::Kernel { generation } => {
-                // The operands it computes on must have landed.
-                noc::wait(TXN);
-                publish();
-                kernel(generation)?;
-            }
-            Entry::Wait => {
-                noc::wait(TXN);
-                publish();
-            }
-            Entry::Compute { kind, scalar, dst, a, b } => {
-                // Its operands may still be arriving.
-                noc::wait(TXN);
-                publish();
-                compute(kind, scalar, dst as u64, a as u64, b as u64);
-            }
-        }
+        i += n;
     }
     noc::wait(TXN);
     Ok(())

@@ -11,7 +11,10 @@
 //!   against the host-staged path, as `step18_dram_matmul`; element-wise and
 //!   column sums against `burn-flex`, as `step19_eltwise`);
 //! * an op that fits one list per tile is exactly one list per tile, on one
-//!   tile and on three, where the host-sequenced path took one per block step.
+//!   tile and on three, where the host-sequenced path took one per block step;
+//! * and since 9.7b, which sends op records (`tt_isa::dm::record`) that the
+//!   mover expands on the tile, "fits" covers any op of these kinds: a
+//!   record is a few entries however many tiles it names.
 
 use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
@@ -151,10 +154,11 @@ fn eltwise_runs_share_a_list() {
     });
 }
 
-/// A column sum long enough to need several lists still needs only as many
-/// as its entries take, and its rows still add in order.
+/// A column sum over 7000 rows was 878 entries -- two lists, and a host
+/// round trip each. As one op record (`tt_isa::dm::record::SUM`) it is one
+/// list of five entries, expanded on the tile, and its rows still add in order.
 #[test]
-fn a_column_sum_takes_only_the_lists_its_entries_need() {
+fn a_long_column_sum_is_one_list() {
     with_tiles(1, |s| {
         let (r, c) = (7000, 40);
         let av = floats(5, r * c);
@@ -169,16 +173,7 @@ fn a_column_sum_takes_only_the_lists_its_entries_need() {
         let per_tile = lists(s, Session::lists_per_tile, |s| {
             out = Some(s.sum_rows(&a).unwrap_or_else(|e| panic!("{e}")));
         });
-        // Two entries per row tile (read, add) and one write per column, over
-        // 219 row tiles and 2 columns, plus the waits between the old lists.
-        let rt = r.div_ceil(32);
-        let entries = 2 * (2 * rt + 1);
-        let at_least = entries.div_ceil(tt_isa::dm::LIST_MAX as usize) as u64;
-        assert!(
-            per_tile[0] >= at_least && per_tile[0] <= at_least + 1,
-            "{} lists for about {entries} entries",
-            per_tile[0]
-        );
+        assert_eq!(per_tile, vec![1], "lists");
         assert_bits(&s.download(&out.unwrap()).unwrap(), &want, "sum");
     });
 }

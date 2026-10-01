@@ -276,13 +276,15 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
             out.push(std::mem::take(cur));
         }
     };
-    let push = |cur: &mut Segment, out: &mut Vec<Segment>, e: [u32; 8]| {
+    // One entry, or one whole op record (`tt_isa::dm::record`), which a list
+    // never splits.
+    let push = |cur: &mut Segment, out: &mut Vec<Segment>, e: &[[u32; 8]]| {
         // A full list ends here; the mover waits for all of it before it
         // reports done, so the next list starts from a clean boundary.
-        if cur.entries.len() == LIST_MAX as usize {
+        if cur.entries.len() + e.len() > LIST_MAX as usize {
             close(cur, out);
         }
-        cur.entries.push(e);
+        cur.entries.extend_from_slice(e);
     };
     let mut after_list = false;
     for step in steps {
@@ -295,10 +297,13 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                     cur.what = what;
                 }
                 if after_list && !cur.entries.is_empty() {
-                    push(&mut cur, &mut out, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                    push(&mut cur, &mut out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
                 }
-                for e in entries {
-                    push(&mut cur, &mut out, e);
+                let mut i = 0;
+                while i < entries.len() {
+                    let n = tt_isa::dm::record::len(entries[i][0]).min(entries.len() - i);
+                    push(&mut cur, &mut out, &entries[i..i + n]);
+                    i += n;
                     if cur.what.is_empty() {
                         // A list that spilled into a new segment.
                         cur.what = what;

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
-use tt_isa::dm::{self, op, Descriptor, Entry};
+use tt_isa::dm::{self, op, record, Descriptor, Entry};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::{NocCoord, NocId};
@@ -168,8 +168,23 @@ impl<N: NocId> DataMover<N> {
         if entries.len() > dm::LIST_MAX as usize {
             return Err(DmError::Invalid(dm::error::LENGTH));
         }
-        for e in entries {
-            Entry::decode(self.usable as u32, *e).map_err(DmError::Invalid)?;
+        // The mover's own checks, run first, so a bad entry costs no PCIe: a
+        // plain entry decoded, a record expanded and every entry it makes
+        // decoded, as the mover will.
+        let usable = self.usable as u32;
+        let mut i = 0;
+        while i < entries.len() {
+            let n = record::len(entries[i][0]);
+            if n == 1 {
+                Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
+            } else {
+                let rec = entries
+                    .get(i..i + n)
+                    .ok_or(DmError::Invalid(dm::error::LENGTH))?;
+                record::expand(rec, |e| Entry::decode(usable, e).map(|_| ()))
+                    .map_err(DmError::Invalid)?;
+            }
+            i += n;
         }
         let bytes: Vec<u8> = entries
             .iter()

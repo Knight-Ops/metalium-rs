@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tt_device::{Device, Transport, TransportError, Window};
-use tt_isa::dm::{self, TILE_DATA, TILE_SLOT};
+use tt_isa::dm::record::{self, TensorRef};
+use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
 use tt_isa::isa::Instruction;
 use tt_isa::tile::L1Format;
@@ -208,6 +209,23 @@ impl DramTensor {
         [self.rows.div_ceil(32), self.cols.div_ceil(32)]
     }
 
+    /// This tensor as an op record names it (`tt_isa::dm::record::TensorRef`).
+    pub fn tensor_ref(&self) -> TensorRef {
+        let p = &self.placement;
+        let mut r = TensorRef {
+            n: p.channels.len() as u8,
+            first: p.first as u32,
+            ct: self.grid()[1] as u32,
+            ..TensorRef::default()
+        };
+        for (i, (c, b)) in p.channels.iter().zip(&p.base).enumerate() {
+            r.channels[i] = c.index();
+            // Inside a channel, which `CHANNEL_BYTES` keeps under 4 GiB.
+            r.base[i] = *b as u32;
+        }
+        r
+    }
+
     /// The slot of tile `(i, j)`.
     pub fn tile(&self, i: usize, j: usize) -> DramRange {
         let [_, ct] = self.grid();
@@ -351,8 +369,10 @@ impl DramTensor {
 /// One step of a [`Job`], run on one tile.
 #[derive(Clone, Debug)]
 pub enum Step {
-    /// A data-mover list (`tt_isa::dm::Entry`s) on the tile's RISCV B. Any
-    /// length: the session splits it into lists the mover takes.
+    /// A data-mover list on the tile's RISCV B: entries (`tt_isa::dm::Entry`)
+    /// and op records (`tt_isa::dm::record`), which the mover expands. Any
+    /// length: the session splits it into lists the mover takes, never inside
+    /// a record.
     List {
         /// What it is, for [`stats`].
         what: &'static str,
@@ -456,26 +476,9 @@ pub fn matmul_dram(
         )));
     }
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
-    // Tile (i, j) of op(X), as a list entry into L1 slot `to`.
-    let fetch = |x: &DramTensor, transposed: bool, i: usize, j: usize, to: u64| -> [u32; 8] {
-        let (slot, op) = if transposed {
-            (x.tile(j, i), dm::op::READ_TRANSPOSED)
-        } else {
-            (x.tile(i, j), dm::op::READ)
-        };
-        let ch = slot.channel();
-        [
-            op,
-            ch.index() as u32,
-            (i + j) as u32 % tt_isa::dram::PORTS as u32,
-            slot.offset() as u32,
-            to as u32,
-            TILE_SLOT as u32,
-            0,
-            0,
-        ]
-    };
+    let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
     let c = DramTensor::alloc(alloc, m, n)?;
+    let rc = c.tensor_ref();
     let mut jobs = Vec::new();
     for i0 in (0..mt).step_by(mc) {
         let rows = mc.min(mt - i0);
@@ -489,55 +492,57 @@ pub fn matmul_dram(
                     return Err(e.into());
                 }
             };
-            let mut list = Vec::new();
-            for i in 0..rows {
-                for kk in 0..kt {
-                    let to = matmul::MATMUL_STAGE + (i * kt + kk) as u64 * TILE_SLOT;
-                    list.push(fetch(a, a_transposed, i0 + i, kk, to));
-                }
-            }
-            for kk in 0..kt {
-                for j in 0..cols {
-                    let to = b_at + (kk * cols + j) as u64 * TILE_SLOT;
-                    list.push(fetch(b, b_transposed, kk, j0 + j, to));
-                }
-            }
+            let flags = u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
+            let gather = [
+                [
+                    record::GATHER,
+                    flags,
+                    matmul::MATMUL_STAGE as u32,
+                    b_at as u32,
+                    i0 as u32,
+                    rows as u32,
+                    j0 as u32,
+                    cols as u32,
+                ],
+                ra.encode()[0],
+                ra.encode()[1],
+                rb.encode()[0],
+                rb.encode()[1],
+            ];
             let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
                 matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
             });
-
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
-            let mut back = Vec::with_capacity(rows * cols);
-            for i in 0..rows {
-                for j in 0..cols {
-                    let out = outputs[i * cols + j].out;
-                    let slot = c.tile(i0 + i, j0 + j);
-                    let data = slot
-                        .channel()
-                        .range(slot.offset() + TILE_DATA, 4096)
-                        .expect("inside the slot");
-                    back.push([
-                        dm::op::WRITE,
-                        data.channel().index() as u32,
-                        (i + j) as u32 % tt_isa::dram::PORTS as u32,
-                        data.offset() as u32,
-                        out as u32,
-                        4096,
-                        0,
-                        0,
-                    ]);
-                }
-            }
+            // The outputs sit one slot apart from the first (`plan_layout_in`).
+            let out_at = outputs[0].out;
+            debug_assert!(outputs
+                .iter()
+                .enumerate()
+                .all(|(k, o)| o.out == out_at + k as u64 * TILE_SLOT));
+            let scatter = [
+                [
+                    record::SCATTER,
+                    out_at as u32,
+                    TILE_SLOT as u32,
+                    i0 as u32,
+                    rows as u32,
+                    j0 as u32,
+                    cols as u32,
+                    0,
+                ],
+                rc.encode()[0],
+                rc.encode()[1],
+            ];
             jobs.push(vec![
                 Step::List {
                     what: "matmul gather",
-                    entries: list,
+                    entries: gather.to_vec(),
                 },
                 Step::Matmul(roles),
                 Step::List {
                     what: "matmul scatter",
-                    entries: back,
+                    entries: scatter.to_vec(),
                 },
             ]);
         }
@@ -593,62 +598,37 @@ pub fn eltwise(
     let [rt, ct] = a.grid();
     // Two slots per tile in flight, inside the matmul staging area.
     const GROUP: usize = 96;
-    let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
     const _: () = assert!(
         matmul::MATMUL_STAGE + 2 * GROUP as u64 * TILE_SLOT <= tt_isa::mailbox::MAILBOX_BASE
     );
-    let read = |x: DramRange, to: u64, port: usize| {
-        [
-            dm::op::READ,
-            x.channel().index() as u32,
-            (port % tt_isa::dram::PORTS as usize) as u32,
-            x.offset() as u32,
-            to as u32,
-            TILE_SLOT as u32,
-            0,
-            0,
-        ]
-    };
-    let tiles: Vec<(usize, usize)> = (0..rt).flat_map(|i| (0..ct).map(move |j| (i, j))).collect();
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let rb = b
+        .filter(|_| binary)
+        .map_or(TensorRef::default(), DramTensor::tensor_ref);
+    let flags = u32::from(binary) | u32::from(row) << 1;
     let mut jobs = Vec::new();
-    for run in runs(tiles.len(), units, GROUP) {
-        let group = &tiles[run];
-        let mut list = Vec::new();
-        for (n, &(i, j)) in group.iter().enumerate() {
-            list.push(read(a.tile(i, j), slot(2 * n), n));
-            if let Some(b) = b.filter(|_| binary) {
-                let from = if row { b.tile(0, j) } else { b.tile(i, j) };
-                list.push(read(from, slot(2 * n + 1), n + 1));
-            }
-            list.push([
-                dm::op::COMPUTE,
+    for run in runs(rt * ct, units, GROUP) {
+        let record = [
+            [
+                record::ELTWISE,
                 op.kind,
                 op.scalar.to_bits(),
+                run.start as u32,
+                run.len() as u32,
+                flags,
+                matmul::MATMUL_STAGE as u32,
                 0,
-                slot(2 * n) as u32,
-                slot(2 * n) as u32,
-                slot(2 * n + 1) as u32,
-                0,
-            ]);
-            let o = out.tile(i, j);
-            let data = o
-                .channel()
-                .range(o.offset() + TILE_DATA, 4096)
-                .expect("inside the slot");
-            list.push([
-                dm::op::WRITE,
-                data.channel().index() as u32,
-                (n % tt_isa::dram::PORTS as usize) as u32,
-                data.offset() as u32,
-                (slot(2 * n) + TILE_DATA) as u32,
-                4096,
-                0,
-                0,
-            ]);
-        }
+            ],
+            ra.encode()[0],
+            ra.encode()[1],
+            rb.encode()[0],
+            rb.encode()[1],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
         jobs.push(vec![Step::List {
             what: "eltwise list",
-            entries: list,
+            entries: record.to_vec(),
         }]);
     }
     Ok(Work { out, jobs })
@@ -662,90 +642,36 @@ pub fn eltwise(
 pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
     let out = DramTensor::alloc(alloc, 1, a.cols)?;
     let [rt, ct] = a.grid();
-    let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
-    // Slots in the staging area; each column takes one accumulator and one
-    // per tile. Whole columns are packed into one mover list while they fit;
-    // a column taller than that spans several lists, accumulating in place.
-    const SLOTS: usize = 200;
-    let read = |from: DramRange, to: u64, i: usize| {
-        [
-            dm::op::READ,
-            from.channel().index() as u32,
-            (i % tt_isa::dram::PORTS as usize) as u32,
-            from.offset() as u32,
-            to as u32,
-            TILE_SLOT as u32,
-            0,
-            0,
-        ]
-    };
-    let sum = |acc: u64, tile: u64, first: bool| {
-        [
-            dm::op::COMPUTE,
-            dm::kind::COL_SUM,
-            u32::from(first),
-            0,
-            acc as u32,
-            tile as u32,
-            acc as u32,
-            0,
-        ]
-    };
-    let write = |j: usize, acc: u64| {
-        let o = out.tile(0, j);
-        let data = o
-            .channel()
-            .range(o.offset() + TILE_DATA, 4096)
-            .expect("in the slot");
-        [
-            dm::op::WRITE,
-            data.channel().index() as u32,
-            0,
-            data.offset() as u32,
-            (acc + TILE_DATA) as u32,
-            4096,
-            0,
-            0,
-        ]
-    };
+    // The schedule -- slots in the staging area, an accumulator per column,
+    // where a list's worth of slots runs out -- is `tt_isa::dm::record::SUM`'s.
+    // Its slots run into the matmul output area, which no column sum shares.
+    const _: () = assert!(
+        matmul::MATMUL_STAGE + record::SUM_SLOTS as u64 * TILE_SLOT
+            <= tt_isa::mailbox::MAILBOX_BASE
+    );
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let mut jobs = Vec::new();
     for columns in runs(ct, units, ct.max(1)) {
-        let mut job = Vec::new();
-        let mut list = Vec::new();
-        let mut flush = |list: &mut Vec<[u32; 8]>| {
-            job.push(Step::List {
-                what: "sum list",
-                entries: std::mem::take(list),
-            })
-        };
-        let mut used = 0;
-        for j in columns {
-            if used + 1 + rt.min(SLOTS - 1) > SLOTS {
-                flush(&mut list);
-                used = 0;
-            }
-            let acc = slot(used);
-            used += 1;
-            for i0 in (0..rt).step_by(SLOTS - 1) {
-                let rows = (rt - i0).min(SLOTS - 1);
-                if used + rows > SLOTS {
-                    // Only a column taller than a list reaches here: run what
-                    // is queued, keeping the accumulator slot where it is.
-                    flush(&mut list);
-                    used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
-                }
-                for i in i0..i0 + rows {
-                    list.push(read(a.tile(i, j), slot(used + i - i0), i));
-                }
-                for i in i0..i0 + rows {
-                    list.push(sum(acc, slot(used + i - i0), i == 0));
-                }
-                used += rows;
-            }
-            list.push(write(j, acc));
-        }
-        flush(&mut list);
-        jobs.push(job);
+        let record = [
+            [
+                record::SUM,
+                columns.start as u32,
+                columns.len() as u32,
+                rt as u32,
+                matmul::MATMUL_STAGE as u32,
+                0,
+                0,
+                0,
+            ],
+            ra.encode()[0],
+            ra.encode()[1],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![Step::List {
+            what: "sum list",
+            entries: record.to_vec(),
+        }]);
     }
     Ok(Work { out, jobs })
 }
@@ -782,7 +708,185 @@ pub mod stats {
 
 #[cfg(test)]
 mod tests {
-    use super::{blocks, runs};
+    use super::{blocks, reference, runs, DramAlloc, DramTensor, Eltwise, Job, Step};
+    use tt_isa::dm::{kind, op, record};
+    use tt_isa::dram::Dram;
+
+    /// One job as the mover runs it: every entry in order, records expanded,
+    /// a `WAIT` between what were separate lists, and each kernel as its
+    /// programs' first words (`None` for a list entry).
+    fn stream(job: &Job) -> Vec<Result<[u32; 8], Vec<u32>>> {
+        let mut out = Vec::new();
+        let mut after_list = false;
+        for step in job {
+            match step {
+                Step::List { entries, .. } => {
+                    if after_list {
+                        out.push(Ok([op::WAIT, 0, 0, 0, 0, 0, 0, 0]));
+                    }
+                    let mut i = 0;
+                    while i < entries.len() {
+                        let n = record::len(entries[i][0]);
+                        if n == 1 {
+                            out.push(Ok(entries[i]));
+                        } else {
+                            record::expand(&entries[i..i + n], |e| {
+                                out.push(Ok(e));
+                                Ok(())
+                            })
+                            .unwrap_or_else(|c| panic!("record refused: code {c}"));
+                        }
+                        i += n;
+                    }
+                    after_list = true;
+                }
+                Step::Matmul(roles) => {
+                    out.push(Err(roles.iter().map(|p| p.len() as u32).collect()));
+                    after_list = false;
+                }
+            }
+        }
+        out
+    }
+
+    /// Records expand to the entries the old builders made, job for job.
+    fn same_jobs(got: &[Job], want: &[Job], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: jobs");
+        for (k, (g, w)) in got.iter().zip(want).enumerate() {
+            let (g, w) = (stream(g), stream(w));
+            assert_eq!(g.len(), w.len(), "{what}: job {k} length");
+            for (e, (a, b)) in g.iter().zip(&w).enumerate() {
+                assert_eq!(a, b, "{what}: job {k}, entry {e}");
+            }
+        }
+    }
+
+    /// Two allocators in the same state, so both builders place their output
+    /// where the other does, and the same operands in each.
+    fn pair(dram: &Dram, shapes: &[[usize; 2]]) -> [(DramAlloc, Vec<DramTensor>); 2] {
+        [0, 1].map(|_| {
+            let mut a = DramAlloc::new(dram);
+            let t = shapes
+                .iter()
+                .map(|&[r, c]| DramTensor::alloc(&mut a, r, c).unwrap())
+                .collect();
+            (a, t)
+        })
+    }
+
+    const DRAMS: [u8; 3] = [0xFF, 0b0111_0110, 0b1];
+
+    #[test]
+    fn matmul_records_expand_to_the_old_lists() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let cases = [
+            ([64, 784], false, [784, 128], false),
+            ([64, 128], false, [128, 10], false),
+            ([64, 10], false, [128, 10], true),
+            ([64, 128], true, [64, 10], false),
+            ([37, 45], true, [37, 70], false),
+            ([96, 320], false, [320, 288], false),
+        ];
+        for mask in DRAMS {
+            let dram = Dram::from_usable_mask(mask);
+            for (sa, ta, sb, tb) in cases {
+                for units in [1, 3, 8] {
+                    let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[sa, sb]);
+                    let route = SrcRoute::Tf32FromFp32;
+                    let f = Fidelity::HiFi4;
+                    let got = super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units)
+                        .unwrap();
+                    let want =
+                        reference::matmul_dram(&mut a2, &t2[0], ta, &t2[1], tb, route, f, units)
+                            .unwrap();
+                    assert_eq!(got.out, want.out);
+                    same_jobs(
+                        &got.jobs,
+                        &want.jobs,
+                        &format!("{sa:?}@{sb:?} {mask:#x} {units}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eltwise_records_expand_to_the_old_lists() {
+        for mask in DRAMS {
+            let dram = Dram::from_usable_mask(mask);
+            for [r, c] in [[37, 70], [320, 320], [784, 128], [1, 1]] {
+                for (k, scalar, b) in [
+                    (kind::ADD, 0.0, Some(false)),
+                    (kind::ADD_ROW, 0.0, Some(true)),
+                    (kind::RELU, 0.0, None),
+                    (kind::MUL_SCALAR, 0.5, None),
+                ] {
+                    for units in [1, 3, 8] {
+                        let shapes = [[r, c], [if b == Some(true) { 1 } else { r }, c]];
+                        let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &shapes);
+                        let op = Eltwise { kind: k, scalar };
+                        let got =
+                            super::eltwise(&mut a1, op, &t1[0], b.map(|_| &t1[1]), units).unwrap();
+                        let want =
+                            reference::eltwise(&mut a2, op, &t2[0], b.map(|_| &t2[1]), units)
+                                .unwrap();
+                        assert_eq!(got.out, want.out);
+                        same_jobs(
+                            &got.jobs,
+                            &want.jobs,
+                            &format!("kind {k} [{r}, {c}] {mask:#x} {units}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sum_records_expand_to_the_old_lists() {
+        for mask in DRAMS {
+            let dram = Dram::from_usable_mask(mask);
+            for [r, c] in [[37, 70], [7000, 40], [96, 600], [6400, 33]] {
+                for units in [1, 3, 8] {
+                    let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[[r, c]]);
+                    let got = super::sum_rows(&mut a1, &t1[0], units).unwrap();
+                    let want = reference::sum_rows(&mut a2, &t2[0], units).unwrap();
+                    assert_eq!(got.out, want.out);
+                    same_jobs(
+                        &got.jobs,
+                        &want.jobs,
+                        &format!("sum [{r}, {c}] {mask:#x} {units}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A row view's records name its first tile, so they expand as the
+    /// view's own lists did.
+    #[test]
+    fn records_of_a_row_view_expand_to_the_old_lists() {
+        let dram = Dram::FULL;
+        let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[[512, 96], [512, 96]]);
+        let (v1, w1) = (
+            t1[0].rows_view(64, 128).unwrap(),
+            t1[1].rows_view(64, 128).unwrap(),
+        );
+        let (v2, w2) = (
+            t2[0].rows_view(64, 128).unwrap(),
+            t2[1].rows_view(64, 128).unwrap(),
+        );
+        let op = Eltwise {
+            kind: kind::MUL,
+            scalar: 0.0,
+        };
+        let got = super::eltwise(&mut a1, op, &v1, Some(&w1), 3).unwrap();
+        let want = reference::eltwise(&mut a2, op, &v2, Some(&w2), 3).unwrap();
+        same_jobs(&got.jobs, &want.jobs, "view");
+        let got = super::sum_rows(&mut a1, &v1, 2).unwrap();
+        let want = reference::sum_rows(&mut a2, &v2, 2).unwrap();
+        same_jobs(&got.jobs, &want.jobs, "view sum");
+    }
 
     #[test]
     fn runs_cover_every_item_once_evenly_and_within_the_limit() {
@@ -825,5 +929,329 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    //! The list builders as they were before op records (9.7a), kept as the
+    //! specification `tt_isa::dm::record::expand` is held to: every record
+    //! must expand to exactly the entries these built, with an `op::WAIT`
+    //! wherever one of their lists ended inside a job.
+    use super::*;
+    use tt_isa::dm;
+    use tt_isa::dram::DramRange;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dram(
+        alloc: &mut DramAlloc,
+        a: &DramTensor,
+        a_transposed: bool,
+        b: &DramTensor,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        units: usize,
+    ) -> Result<Work> {
+        let (m, ka) = if a_transposed {
+            (a.cols, a.rows)
+        } else {
+            (a.rows, a.cols)
+        };
+        let (kb, n) = if b_transposed {
+            (b.cols, b.rows)
+        } else {
+            (b.rows, b.cols)
+        };
+        if ka != kb {
+            return Err(TensorError::Shape(format!(
+                "[{m}, {ka}] @ [{kb}, {n}]: inner dimensions differ"
+            )));
+        }
+        let k = ka;
+        let (in_fmt, out_fmt) = route.formats();
+        let shape = matmul::plan_in([m, k, n], route, fidelity, Staging::Slots)
+            .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
+        let [mc, kc, nc] = shape.tiles;
+        let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+        if kc < kt {
+            return Err(TensorError::Shape(format!(
+                "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
+            )));
+        }
+        let [mc, nc] = blocks([mt, nt], [mc, nc], units);
+        // Tile (i, j) of op(X), as a list entry into L1 slot `to`.
+        let fetch = |x: &DramTensor, transposed: bool, i: usize, j: usize, to: u64| -> [u32; 8] {
+            let (slot, op) = if transposed {
+                (x.tile(j, i), dm::op::READ_TRANSPOSED)
+            } else {
+                (x.tile(i, j), dm::op::READ)
+            };
+            let ch = slot.channel();
+            [
+                op,
+                ch.index() as u32,
+                (i + j) as u32 % tt_isa::dram::PORTS as u32,
+                slot.offset() as u32,
+                to as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]
+        };
+        let c = DramTensor::alloc(alloc, m, n)?;
+        let mut jobs = Vec::new();
+        for i0 in (0..mt).step_by(mc) {
+            let rows = mc.min(mt - i0);
+            for j0 in (0..nt).step_by(nc) {
+                let cols = nc.min(nt - j0);
+                let tiles = [rows, kt, cols];
+                let (b_at, outputs) = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        alloc.free(&c.placement);
+                        return Err(e.into());
+                    }
+                };
+                let mut list = Vec::new();
+                for i in 0..rows {
+                    for kk in 0..kt {
+                        let to = matmul::MATMUL_STAGE + (i * kt + kk) as u64 * TILE_SLOT;
+                        list.push(fetch(a, a_transposed, i0 + i, kk, to));
+                    }
+                }
+                for kk in 0..kt {
+                    for j in 0..cols {
+                        let to = b_at + (kk * cols + j) as u64 * TILE_SLOT;
+                        list.push(fetch(b, b_transposed, kk, j0 + j, to));
+                    }
+                }
+                let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, || {
+                    matmul::matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
+                });
+
+                // Only the datums go back: the packer writes nothing else, and the
+                // unpacker skips the header whatever it holds (`step18_dram_matmul`).
+                let mut back = Vec::with_capacity(rows * cols);
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let out = outputs[i * cols + j].out;
+                        let slot = c.tile(i0 + i, j0 + j);
+                        let data = slot
+                            .channel()
+                            .range(slot.offset() + TILE_DATA, 4096)
+                            .expect("inside the slot");
+                        back.push([
+                            dm::op::WRITE,
+                            data.channel().index() as u32,
+                            (i + j) as u32 % tt_isa::dram::PORTS as u32,
+                            data.offset() as u32,
+                            out as u32,
+                            4096,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                jobs.push(vec![
+                    Step::List {
+                        what: "matmul gather",
+                        entries: list,
+                    },
+                    Step::Matmul(roles),
+                    Step::List {
+                        what: "matmul scatter",
+                        entries: back,
+                    },
+                ]);
+            }
+        }
+        Ok(Work { out: c, jobs })
+    }
+
+    pub fn eltwise(
+        alloc: &mut DramAlloc,
+        op: Eltwise,
+        a: &DramTensor,
+        b: Option<&DramTensor>,
+        units: usize,
+    ) -> Result<Work> {
+        use tt_isa::dm::kind;
+        let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU);
+        let row = op.kind == kind::ADD_ROW;
+        match (binary, b) {
+            (false, _) => {}
+            (true, None) => {
+                return Err(TensorError::Shape("a binary op needs two operands".into()))
+            }
+            (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => {
+                return Err(TensorError::Shape(format!(
+                    "[{}, {}] + row [{}, {}]",
+                    a.rows, a.cols, b.rows, b.cols
+                )))
+            }
+            (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
+                return Err(TensorError::Shape(format!(
+                    "[{}, {}] and [{}, {}] differ",
+                    a.rows, a.cols, b.rows, b.cols
+                )))
+            }
+            _ => {}
+        }
+        let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+        let [rt, ct] = a.grid();
+        // Two slots per tile in flight, inside the matmul staging area.
+        const GROUP: usize = 96;
+        let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
+        const _: () = assert!(
+            matmul::MATMUL_STAGE + 2 * GROUP as u64 * TILE_SLOT <= tt_isa::mailbox::MAILBOX_BASE
+        );
+        let read = |x: DramRange, to: u64, port: usize| {
+            [
+                dm::op::READ,
+                x.channel().index() as u32,
+                (port % tt_isa::dram::PORTS as usize) as u32,
+                x.offset() as u32,
+                to as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]
+        };
+        let tiles: Vec<(usize, usize)> =
+            (0..rt).flat_map(|i| (0..ct).map(move |j| (i, j))).collect();
+        let mut jobs = Vec::new();
+        for run in runs(tiles.len(), units, GROUP) {
+            let group = &tiles[run];
+            let mut list = Vec::new();
+            for (n, &(i, j)) in group.iter().enumerate() {
+                list.push(read(a.tile(i, j), slot(2 * n), n));
+                if let Some(b) = b.filter(|_| binary) {
+                    let from = if row { b.tile(0, j) } else { b.tile(i, j) };
+                    list.push(read(from, slot(2 * n + 1), n + 1));
+                }
+                list.push([
+                    dm::op::COMPUTE,
+                    op.kind,
+                    op.scalar.to_bits(),
+                    0,
+                    slot(2 * n) as u32,
+                    slot(2 * n) as u32,
+                    slot(2 * n + 1) as u32,
+                    0,
+                ]);
+                let o = out.tile(i, j);
+                let data = o
+                    .channel()
+                    .range(o.offset() + TILE_DATA, 4096)
+                    .expect("inside the slot");
+                list.push([
+                    dm::op::WRITE,
+                    data.channel().index() as u32,
+                    (n % tt_isa::dram::PORTS as usize) as u32,
+                    data.offset() as u32,
+                    (slot(2 * n) + TILE_DATA) as u32,
+                    4096,
+                    0,
+                    0,
+                ]);
+            }
+            jobs.push(vec![Step::List {
+                what: "eltwise list",
+                entries: list,
+            }]);
+        }
+        Ok(Work { out, jobs })
+    }
+
+    pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
+        let out = DramTensor::alloc(alloc, 1, a.cols)?;
+        let [rt, ct] = a.grid();
+        let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
+        // Slots in the staging area; each column takes one accumulator and one
+        // per tile. Whole columns are packed into one mover list while they fit;
+        // a column taller than that spans several lists, accumulating in place.
+        const SLOTS: usize = 200;
+        let read = |from: DramRange, to: u64, i: usize| {
+            [
+                dm::op::READ,
+                from.channel().index() as u32,
+                (i % tt_isa::dram::PORTS as usize) as u32,
+                from.offset() as u32,
+                to as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]
+        };
+        let sum = |acc: u64, tile: u64, first: bool| {
+            [
+                dm::op::COMPUTE,
+                dm::kind::COL_SUM,
+                u32::from(first),
+                0,
+                acc as u32,
+                tile as u32,
+                acc as u32,
+                0,
+            ]
+        };
+        let write = |j: usize, acc: u64| {
+            let o = out.tile(0, j);
+            let data = o
+                .channel()
+                .range(o.offset() + TILE_DATA, 4096)
+                .expect("in the slot");
+            [
+                dm::op::WRITE,
+                data.channel().index() as u32,
+                0,
+                data.offset() as u32,
+                (acc + TILE_DATA) as u32,
+                4096,
+                0,
+                0,
+            ]
+        };
+        let mut jobs = Vec::new();
+        for columns in runs(ct, units, ct.max(1)) {
+            let mut job = Vec::new();
+            let mut list = Vec::new();
+            let mut flush = |list: &mut Vec<[u32; 8]>| {
+                job.push(Step::List {
+                    what: "sum list",
+                    entries: std::mem::take(list),
+                })
+            };
+            let mut used = 0;
+            for j in columns {
+                if used + 1 + rt.min(SLOTS - 1) > SLOTS {
+                    flush(&mut list);
+                    used = 0;
+                }
+                let acc = slot(used);
+                used += 1;
+                for i0 in (0..rt).step_by(SLOTS - 1) {
+                    let rows = (rt - i0).min(SLOTS - 1);
+                    if used + rows > SLOTS {
+                        // Only a column taller than a list reaches here: run what
+                        // is queued, keeping the accumulator slot where it is.
+                        flush(&mut list);
+                        used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
+                    }
+                    for i in i0..i0 + rows {
+                        list.push(read(a.tile(i, j), slot(used + i - i0), i));
+                    }
+                    for i in i0..i0 + rows {
+                        list.push(sum(acc, slot(used + i - i0), i == 0));
+                    }
+                    used += rows;
+                }
+                list.push(write(j, acc));
+            }
+            flush(&mut list);
+            jobs.push(job);
+        }
+        Ok(Work { out, jobs })
     }
 }

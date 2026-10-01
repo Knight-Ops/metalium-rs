@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile (3.8 ms/step on 8 tiles). Next: 9.7b small descriptors |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile (3.7 ms/step on 8 tiles). Next: 9.7c resident programs |
 
 ---
 
@@ -1345,11 +1345,34 @@ cards for time):
     count, 1.75 ms at the uncached bulk path's ~150 MB/s (measurement M),
     which is its 2.0 ms; the matmul writes 150-715 KB. A steady MNIST step
     writes 193 KB, almost all of it lists.
-- [ ] **9.7b Small descriptors.** Send an op, not its entries: the mover
-      expands gather, compute and scatter from the tensors' placements (a
-      handful of words per tensor), so what crosses PCIe per op is constant in
-      the op's size. The list builders in `tensor.rs` are the specification
-      the firmware's expansion is checked against, entry for entry.
+- [x] **9.7b Op records.** The host sends an op, not its entries:
+      `tt_isa::dm::record` defines `GATHER`/`SCATTER` (a matmul block's
+      operands and outputs), `ELTWISE` (a run of tiles) and `SUM` (a run of
+      column sums, with `WAIT`s where its old lists ended), each a header plus
+      a 64-byte `TensorRef` per tensor (channels, per-channel bases, first
+      tile, width), and `record::expand` -- `no_std`, allocation-free, no
+      `divu` (`div_rem`: the instruction gate refused the first build) --
+      produces the entries on the tile, each run through `Entry::decode` as a
+      sent one is. The host expands every record first, so a bad one is still
+      refused before PCIe; `segments` never splits one. The 9.7a builders are
+      kept in `tensor::reference` as the specification: every record expands
+      to exactly their entries, job for job, over three channel masks, 1/3/8
+      tiles, row views and every op kind -- watched failing with the sum's
+      boundary `WAIT` dropped and with one port changed. Golden bit for bit;
+      ttsim and both cards 58/58 with the smoke tier.
+  - **Measured** (card 0): an add over 2048 tiles on 64 tiles 1.99 -> 0.58 ms
+    (263 KB -> 15 KB written); the column sum 2.29 -> 1.54 ms; the 512^3
+    matmul 1.43 -> 1.18 ms. A 7000-row column sum is one list of five entries.
+    Full MNIST 3.7 ms/step on 8 tiles, 5.8 on one; its ops are too small for
+    list bytes to have been their cost. Steady MNIST step: 193 -> 155 KB
+    written (one tile). **What is left is role programs**: the 512^3 matmul
+    still writes 605 KB on 1-8 tiles, rewriting each role's single program
+    slot whenever consecutive blocks differ in shape, and a program change
+    also ends a list (`xt@g1`, ragged at its edges, writes 74 KB).
+- [ ] **9.7c Resident programs.** Keep every kernel a session has used in
+      L1 (about 250 KB free above the trace buffer), in slots the `KERNEL`
+      entry names, so a block of a new shape costs no program write and no new
+      list.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait

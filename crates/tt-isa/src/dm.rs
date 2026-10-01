@@ -19,6 +19,8 @@
 
 use crate::dram::{Dram, DramRange};
 
+pub mod record;
+
 /// The mover's mailbox: the slot after the three role mailboxes
 /// ([`crate::mailbox::role`]), which ends exactly where the program region begins.
 pub const MAILBOX_BASE: u64 = crate::mailbox::role::BASE + 3 * crate::mailbox::role::STRIDE;
