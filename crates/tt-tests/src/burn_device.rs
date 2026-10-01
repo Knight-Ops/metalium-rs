@@ -218,6 +218,13 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.eltwise_op(&mut self.session, op, a, b, c)
         }
+        fn pow(
+            &mut self,
+            x: burn_tt::BufferId,
+            y: burn_tt::PowArg,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.pow(&mut self.session, x, y)
+        }
         fn sum_rows(
             &mut self,
             a: burn_tt::BufferId,

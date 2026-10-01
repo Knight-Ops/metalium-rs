@@ -40,6 +40,9 @@ pub const OUT_ROW: u32 = 128;
 /// A ternary op's third operand (`Operands::Ternary`): inside 32-bit `Dst`'s
 /// 512 rows (`Dst.md`).
 pub const C_ROW: u32 = 192;
+/// Rows a program may spill registers to (`log1p`, `pow`): no unpacker writes
+/// them, no packer reads them.
+pub const SPILL_ROW: u32 = 256;
 
 /// What a tile's second operand is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

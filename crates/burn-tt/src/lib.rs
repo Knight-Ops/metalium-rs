@@ -35,7 +35,7 @@ mod traffic;
 
 pub use server::{
     attach, device_traffic, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Elem,
-    Engine, EngineError, KmdEngine, MeshEngine, Serve,
+    Engine, EngineError, KmdEngine, MeshEngine, PowArg, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
 pub use trace::Trace;

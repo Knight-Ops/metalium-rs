@@ -328,3 +328,144 @@ fn compare_select_and_sign_stay_on_the_card() {
         }
     });
 }
+
+/// `got` within `rel` of Flex's `want` (plus Flex's own ulp); a NaN by class;
+/// infinities and zeros exactly.
+fn within(got: &[f32], want: &[f32], rel: impl Fn(usize) -> f64, what: &str) {
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        if w.is_nan() {
+            assert!(g.is_nan(), "{what}: element {i}: {g:e} vs NaN");
+        } else if w.is_infinite() || w == 0.0 {
+            assert_eq!(g, w, "{what}: element {i}");
+        } else {
+            // Within the bound of the range's ends the device may round over:
+            // an infinity for a near-`MAX`, a zero for a near-`MIN_POSITIVE`.
+            let b2 = 1.0 + 2.0 * (rel(i) + 1.2e-7);
+            let wa = (w as f64).abs();
+            if (wa * b2 > f32::MAX as f64 && g == w.signum() * f32::INFINITY)
+                || (wa < f32::MIN_POSITIVE as f64 * b2 && g == 0.0)
+            {
+                continue;
+            }
+            let r = (g as f64 - w as f64).abs() / (w as f64).abs();
+            assert!(
+                r <= rel(i) + 1.2e-7,
+                "{what}: element {i}: {g:e} vs Flex {w:e}: {r:e}"
+            );
+        }
+    }
+}
+
+/// S4's algebraic ops (10.2d) through Burn, on tensors big enough
+/// (`APPROX_MIN_TILES`) for an approximation to run on the device: `sqrt`,
+/// `log1p`, `powf` by a tensor, by an integer tensor and by scalars --
+/// integral ones by Flex's own dispatch (`ones`, the tensor, a product, a
+/// reciprocal) -- and `int_into_float`, exact. Resident, nothing downloaded,
+/// each within its derived bound of Flex.
+#[test]
+fn algebraic_ops_stay_on_the_card_within_their_bounds() {
+    use tt_kernels::sfpu::ops::{pow_bound, LOG1P_BOUND};
+    with_device(Config::default(), |d| {
+        let [r, c] = [64, 128];
+        let xv: Vec<f32> = floats(5, r * c).iter().map(|x| x.abs() + 0.25).collect();
+        let yv: Vec<f32> = floats(6, r * c)
+            .iter()
+            .map(|y| {
+                if y.is_finite() {
+                    y.clamp(-4.0, 4.0)
+                } else {
+                    *y
+                }
+            })
+            .collect();
+        let iv: Vec<i32> = (0..r * c).map(|i| (i as i32 % 7) - 3).collect();
+        let tt = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (x, y, fx, fy) = (tt(&xv), tt(&yv), fl(&xv), fl(&yv));
+        let ti = Tensor::<TtBackend, 2, Int>::from_data(TensorData::new(iv.clone(), [r, c]), &d)
+            .to_device(&d);
+        let fi =
+            Tensor::<Flex, 2, Int>::from_data(TensorData::new(iv.clone(), [r, c]), &FlexDevice);
+        let vals = |t: Tensor<TtBackend, 2>, what: &str| {
+            assert!(
+                on_device(&t.clone().into_primitive().tensor()),
+                "{what}: not on the device"
+            );
+            t.into_data().to_vec::<f32>().unwrap()
+        };
+        let host = |t: Tensor<Flex, 2>| t.into_data().to_vec::<f32>().unwrap();
+        let g = vals(resident("sqrt", || x.clone().sqrt()), "sqrt");
+        within(&g, &host(fx.clone().sqrt()), |_| 1.2e-7, "sqrt");
+        let g = vals(resident("log1p", || x.clone().log1p()), "log1p");
+        within(&g, &host(fx.clone().log1p()), |_| LOG1P_BOUND, "log1p");
+        let g = vals(resident("powf", || x.clone().powf(y.clone())), "powf");
+        within(
+            &g,
+            &host(fx.clone().powf(fy.clone())),
+            |i| pow_bound(xv[i], yv[i]),
+            "powf",
+        );
+        // `float_powi` by an `I32` tensor, which Burn's tensor API does not
+        // reach (its `powi` takes floats): through the backend's trait.
+        let g = vals(
+            resident("powi", || {
+                use burn::tensor::backend::ops::FloatTensorOps;
+                let p = <TtBackend as FloatTensorOps<TtBackend>>::float_powi(
+                    x.clone().into_primitive().tensor(),
+                    ti.clone().into_primitive(),
+                );
+                Tensor::from_primitive(burn::tensor::TensorPrimitive::Float(p))
+            }),
+            "powi",
+        );
+        within(
+            &g,
+            &host(fx.clone().powf(fi.clone().float())),
+            |i| pow_bound(xv[i], iv[i] as f32),
+            "powi",
+        );
+        // `x^1` is `x`, the tensor itself (Flex's dispatch): nothing moves.
+        let one = resident("powf_scalar(1)", || x.clone().powf_scalar(1.0));
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&one.into_data().to_vec::<f32>().unwrap()),
+            bits(&xv),
+            "powf_scalar(1)"
+        );
+        for e in [2.5f32, -0.5, 0.0, 2.0, -1.0, -2.0, 3.0] {
+            let what = format!("powf_scalar({e})");
+            let g = vals(resident(&what, || x.clone().powf_scalar(e)), &what);
+            within(
+                &g,
+                &host(fx.clone().powf_scalar(e)),
+                |i| pow_bound(xv[i], e),
+                &what,
+            );
+        }
+        let g = resident("int_into_float", || ti.clone().float());
+        assert!(
+            on_device(&g.clone().into_primitive().tensor()),
+            "int_into_float: not on the device"
+        );
+        let gb: Vec<u32> = g
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let fb: Vec<u32> = fi
+            .float()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(gb, fb, "int_into_float: as f32");
+    });
+}

@@ -245,6 +245,64 @@ fn device_op_ungated(
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
 }
 
+/// What [`device_pow`] raises to.
+#[derive(Copy, Clone)]
+enum PowY<'a> {
+    Tensor(&'a TtTensor),
+    Scalar(f32),
+    Int(&'a TtTensor),
+}
+
+/// `x^y` on the device (`tt_kernels::session::Session::pow`, four ops), if
+/// that is where the data is -- `x` an `F32` tensor, `y` one of its shape (or
+/// an `I32` one) or a scalar, one of them already on the device, none a
+/// transposed view; an approximation, so gated as [`device_eltwise`] gates
+/// one. `None` otherwise.
+fn device_pow(x: &TtTensor, y: PowY<'_>) -> Option<TtTensor> {
+    if crate::exact() || tiles(x) < APPROX_MIN_TILES {
+        return None;
+    }
+    let device = x.device;
+    if !x.is_storable() || x.elem() != Some(Elem::F32) || !crate::server::supports_dram(device) {
+        return None;
+    }
+    let yt = match y {
+        PowY::Tensor(t) | PowY::Int(t) => {
+            let want = if matches!(y, PowY::Int(_)) {
+                Elem::I32
+            } else {
+                Elem::F32
+            };
+            if t.elem() != Some(want) || t.shape() != x.shape() || t.device != device {
+                return None;
+            }
+            Some(t)
+        }
+        PowY::Scalar(_) => None,
+    };
+    if x.dram().is_none() && yt.is_none_or(|t| t.dram().is_none()) {
+        return None;
+    }
+    let dx = x.to_dram();
+    let dy = yt.map(|t| t.to_dram());
+    if dx.transposed || dy.is_some_and(|d| d.transposed) {
+        return None;
+    }
+    let arg = match y {
+        PowY::Tensor(_) => crate::server::PowArg::Tensor(dy?.buffer.id),
+        PowY::Int(_) => crate::server::PowArg::Int(dy?.buffer.id),
+        PowY::Scalar(v) => crate::server::PowArg::Scalar(v),
+    };
+    let (id, dims) = crate::server::pow(device, dx.buffer.id, arg);
+    Some(device_result_shaped(
+        device,
+        id,
+        dims,
+        x.shape(),
+        DType::F32,
+    ))
+}
+
 /// `t`, a device result, as `dtype` -- a comparison's requested bool store,
 /// which every store shares on the device (`Elem::Bool`).
 fn retyped(t: TtTensor, dtype: DType) -> TtTensor {
@@ -900,6 +958,100 @@ pub mod float {
         )
     }
 
+    // S4 (10.2d): approximations within their derived bounds.
+    unary_sfpu!(
+        float_sqrt,
+        kind_sfpu::SQRT,
+        "`sqrt x` on the device where the data is, within one ulp of the correctly rounded root, else Flex's."
+    );
+    unary_sfpu!(
+        float_log1p,
+        kind_sfpu::LOG1P,
+        "`ln(1 + x)` on the device where the data is, within `ops::LOG1P_BOUND`, else Flex's."
+    );
+
+    /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
+    /// (within `ops::pow_bound`); else Flex's.
+    pub fn float_powf(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_pow(&lhs, PowY::Tensor(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powf(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
+
+    /// `x^y`, `y` an integer tensor, as Flex's `powf(x, y as f32)`.
+    pub fn float_powi(
+        lhs: FloatTensor<TtBackend>,
+        rhs: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_pow(&lhs, PowY::Int(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powi(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
+
+    /// `x^v` for a non-integer `v`, as Flex's `float_powf_scalar_impl`.
+    pub fn float_powf_scalar_impl(
+        tensor: FloatTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let v = value.to_f64().expect("a float scalar") as f32;
+        if let Some(t) = device_pow(&tensor, PowY::Scalar(v)) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powf_scalar_impl(tensor.into_host(), value),
+            device,
+        )
+    }
+
+    /// Flex's dispatch, on the device's ops: `0` ones, `1` the tensor, `2` a
+    /// product, `-1` and `-2` reciprocals, anything else `powf`.
+    pub fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        match rhs.to_i64().expect("an integer exponent") {
+            0 => {
+                if let Some(t) = device_eltwise(kind_sfpu::FILL, 1.0, &lhs, None) {
+                    return t;
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::float_powi_scalar(lhs.into_host(), rhs),
+                    device,
+                )
+            }
+            1 => lhs,
+            2 => float_mul(lhs.clone(), lhs),
+            -1 => float_recip(lhs),
+            -2 => float_recip(float_mul(lhs.clone(), lhs)),
+            _ => float_powf_scalar_impl(lhs, rhs),
+        }
+    }
+
+    /// Flex's: an integer exponent is `powi_scalar`'s.
+    pub fn float_powf_scalar(
+        tensor: FloatTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        match value.try_as_integer() {
+            Some(exp) => float_powi_scalar(tensor, exp),
+            None => float_powf_scalar_impl(tensor, value),
+        }
+    }
+
     /// A cast to the tensor's own dtype is the tensor -- Burn's compositions
     /// cast to `F32` what already is (`hard_sigmoid`, forward and backward),
     /// and a host round trip for nothing would undo residency. Other casts are
@@ -1133,6 +1285,24 @@ pub mod int {
         device: &Device<TtBackend>,
     ) -> IntTensor<TtBackend> {
         to_device_resident(tensor, device)
+    }
+
+    /// `as f32` on the device where the data is (`kind_sfpu::I32_TO_F32`,
+    /// exact); other float dtypes, Flex's.
+    pub fn int_into_float(
+        tensor: IntTensor<TtBackend>,
+        out_dtype: burn_backend::FloatDType,
+    ) -> FloatTensor<TtBackend> {
+        if DType::from(out_dtype) == DType::F32 {
+            if let Some(t) = device_eltwise(kind_sfpu::I32_TO_F32, 0.0, &tensor, None) {
+                return t;
+            }
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_into_float(tensor.into_host(), out_dtype),
+            device,
+        )
     }
 
     /// A view where the stored matrix is kept, as `float_reshape`.

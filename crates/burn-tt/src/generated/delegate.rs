@@ -593,62 +593,34 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_log(tensor)
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_log1p(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_log1p(tensor)
     }
     fn float_powf(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_powf(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::float::float_powf(lhs, rhs)
     }
     fn float_powi(
         lhs: FloatTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_powi(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::float::float_powi(lhs, rhs)
     }
     fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_powi_scalar(lhs.into_flex(), rhs),
-            device,
-        )
+        crate::ops::float::float_powi_scalar(lhs, rhs)
     }
     fn float_powf_scalar(tensor: FloatTensor<TtBackend>, value: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_powf_scalar(tensor.into_flex(), value),
-            device,
-        )
+        crate::ops::float::float_powf_scalar(tensor, value)
     }
     fn float_powf_scalar_impl(
         tensor: FloatTensor<TtBackend>,
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_powf_scalar_impl(tensor.into_flex(), value),
-            device,
-        )
+        crate::ops::float::float_powf_scalar_impl(tensor, value)
     }
     fn float_sqrt(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sqrt(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_sqrt(tensor)
     }
     fn float_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_abs(tensor)
@@ -1075,11 +1047,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         tensor: IntTensor<TtBackend>,
         out_dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as IntTensorOps<Flex>>::int_into_float(tensor.into_flex(), out_dtype),
-            device,
-        )
+        crate::ops::int::int_into_float(tensor, out_dtype)
     }
     fn int_mask_where(
         tensor: IntTensor<TtBackend>,

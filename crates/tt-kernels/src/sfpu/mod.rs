@@ -541,13 +541,42 @@ impl Program {
     /// -- so within half an ulp plus 0.02 of one of `1/x`, hence at most one
     /// ulp from its correct rounding. (`step28_recip` holds the device to
     /// this program bit for bit, and the program to the bound.)
+    ///
+    /// Where `|x| > 2^100` the step's product `y (1 - x y)` would fall below
+    /// `2^-126` (`y` under `2^-100`, the correction under `2^-15` by the second
+    /// step) and flush, losing the step; and from `2^126` the seed itself is
+    /// zero though `1/x` may be normal -- the result was then only the seed,
+    /// 0.56% off, for `|x|` from about `2^111` (found by 10.2d's `log1p`
+    /// sweep). There the reciprocal is of `x' = x 2^-64`, seed and steps in
+    /// range, and the result `y' 2^-64`: both scalings exact multiplies (a
+    /// zero keeps its sign; a denormal result flushes, as documented). `max` is
+    /// the scaling's register meanwhile, and holds `f32::MAX` again after.
     pub fn recip(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
         assert!(d != x && t0 != x && t1 != x && d != t0 && d != t1 && t0 != t1);
-        self.approx_recip(x, d);
-        for _ in 0..2 {
-            self.nmad(x, d, LReg::ONE, t0);
-            self.mad(t0, d, d, d);
-        }
+        assert!(max != x && max != d && max != t0 && max != t1);
+        self.abs(x, t1);
+        self.loadi_bits(t0, 0x7180_0000); // 2^100
+        self.if_else(
+            Cond::Less(t0, t1),
+            |p| {
+                p.loadi_bits(max, 0x1f80_0000); // 2^-64
+                p.mul(x, max, t1);
+                p.approx_recip(t1, d);
+                for _ in 0..2 {
+                    p.nmad(t1, d, LReg::ONE, t0);
+                    p.mad(t0, d, d, d);
+                }
+                p.mul(d, max, d);
+                p.loadi_bits(max, f32::MAX.to_bits());
+            },
+            |p| {
+                p.approx_recip(x, d);
+                for _ in 0..2 {
+                    p.nmad(x, d, LReg::ONE, t0);
+                    p.mad(t0, d, d, d);
+                }
+            },
+        );
         // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
         // seed's infinity met `0 * inf` in the steps.
         self.abs(x, t1);

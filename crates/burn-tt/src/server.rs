@@ -25,6 +25,15 @@ use tt_kernels::session::{Session, SessionError, TileChoice};
 use crate::TtDevice;
 pub use tt_kernels::tensor::Elem;
 
+/// What [`Engine::pow`] raises to: a buffer of the base's shape, a scalar, or
+/// an `I32` buffer.
+#[derive(Copy, Clone, Debug)]
+pub enum PowArg {
+    Tensor(BufferId),
+    Scalar(f32),
+    Int(BufferId),
+}
+
 /// What a device can do for the backend, on its server thread.
 pub trait Engine {
     /// `A[m, k] @ B[k, n]`, row-major.
@@ -126,6 +135,11 @@ pub trait Engine {
             return Err(unsupported());
         }
         self.eltwise(op.kind, op.scalar, a, b)
+    }
+    /// `x^y` as `powf` (`tt_kernels::session::Session::pow`), result on the
+    /// device.
+    fn pow(&mut self, _x: BufferId, _y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
     }
     /// Everything the engine's device has moved across its transport so far
     /// (`tt_device::Device::traffic`): tensors, descriptors, programs and
@@ -242,6 +256,31 @@ impl DramBuffers {
     ) -> Result<Vec<f32>, EngineError> {
         let t = self.get(id)?;
         s.download(t).map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn pow<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BufferId,
+        y: PowArg,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        use tt_kernels::session::PowExponent;
+        let tx = self.get(x)?.clone();
+        let ty = match y {
+            PowArg::Tensor(b) | PowArg::Int(b) => Some(self.get(b)?.clone()),
+            PowArg::Scalar(_) => None,
+        };
+        let exp = match (y, &ty) {
+            (PowArg::Tensor(_), Some(t)) => PowExponent::Tensor(t),
+            (PowArg::Int(_), Some(t)) => PowExponent::Int(t),
+            (PowArg::Scalar(v), _) => PowExponent::Scalar(v),
+            _ => unreachable!(),
+        };
+        let c = s.pow(&tx, exp).map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
     }
 
     pub fn upload_bits<T: tt_device::Transport>(
@@ -668,6 +707,12 @@ pub(crate) fn eltwise_op(
     .unwrap_or_else(|e| panic!("element-wise {:#x} on {device}: {e}", op.kind))
 }
 
+/// `x^y` on the device, panicking on a device error.
+pub(crate) fn pow(device: TtDevice, x: BufferId, y: PowArg) -> (BufferId, [usize; 2]) {
+    timed_run("pow", device, move |engine| engine.pow(x, y))
+        .unwrap_or_else(|e| panic!("pow on {device}: {e}"))
+}
+
 /// A reduction on the device, panicking on a device error.
 pub(crate) fn reduce(
     device: TtDevice,
@@ -794,6 +839,10 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_op(&mut self.session, op, a, b, c)
+    }
+    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.pow(&mut self.session, x, y)
     }
     fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
