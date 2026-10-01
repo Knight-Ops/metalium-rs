@@ -25,5 +25,6 @@ pub mod profile;
 pub mod program_cache;
 pub mod runtime;
 pub mod session;
+pub mod sfpu;
 pub mod shard;
 pub mod tensor;

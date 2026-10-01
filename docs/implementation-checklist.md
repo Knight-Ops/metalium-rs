@@ -1490,7 +1490,7 @@ lets you trust Wormhole-sourced behaviour at all.
 **Compute** — [ ] `SHIFTXA`/`SHIFTXB`/`TRNSPSRCB` · [ ] `GAPOOL`/`DOTPV`
 
 **Frontend** — [ ] `WaitGate` (a silent gap; seven BH pages reason about its
-semantics) · [ ] `REPLAY` · [ ] `MOP`/`MOP_CFG`
+semantics) · [x] `REPLAY` (`step26_sfpu_isa`: SFPU row loops replayed match their unrolled form on ttsim and both cards) · [ ] `MOP`/`MOP_CFG`
 
 **Units** — [ ] the entire Scalar Unit (ThCon) · [ ] Mover (`XMOV`) ·
 [ ] Miscellaneous Unit
@@ -1548,7 +1548,12 @@ Documented, not speculative. These bite in Phases 2–4.
       definition. Untested against silicon, and ttsim models no timing, so the
       answers are from the documentation.
 - [ ] `SFPLUTFP32` writes to `LReg[LReg[7] & 15]` instead of `LReg[VD]`. *(Phase 10: S4.)*
-- [ ] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack. *(Phase 10: F2.)*
+- [x] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack.
+      Handled by construction (`hardware-coverage.md` F2): `tt_kernels::sfpu::Program`
+      emits only the plain push and pop, balanced by scope, and refuses a ninth level.
+      Blackhole's `SFPPOPC.md` says in a tip that Blackhole fixed the bug and in its
+      summary that the complex modes still must not be used on a full stack; the
+      builder follows the summary.
 - [ ] `SFPSTOCHRND` — stochastic rounding is biased toward increasing magnitude,
       and the new-in-Blackhole round-toward-zero mode sometimes rounds *away* from
       zero. **The functional models in the docs faithfully reproduce the buggy

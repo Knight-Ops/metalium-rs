@@ -46,7 +46,7 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0, F1 |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0, F1, X1; F2, F5 partial |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
@@ -115,13 +115,13 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 
 | Group | Instructions | Enc | Helper | Kernel | Sim | Si | Item |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x | | x | x | F2, F3 |
-| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x | | x | x | S1 |
+| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | | x | x | F3 |
+| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | | x | x | S1 |
 | Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
-| Move / abs | `SFPMOV`, `SFPABS` | x | | | x | x | S2 |
-| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | | | | | S2, S4, S6 |
-| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | | | | | S2 |
-| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | | | | | F2 |
+| Move / abs | `SFPMOV`, `SFPABS` | x | x | | x | x | S2 |
+| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | `~` `SFPSETSGN` | | `~` `SFPSETSGN` | `~` `SFPSETSGN` | S2, S4, S6 |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC` | | `~` `SFPSETCC` | `~` `SFPSETCC` | S2 |
+| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | | x | x | -- |
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
@@ -170,7 +170,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 
 | Feature | Enc | Helper | Kernel | Sim | Si | Item |
 |---|:-:|:-:|:-:|:-:|:-:|---|
-| `REPLAY` (record and replay, 32 entries per thread) | x | | | | | X1 |
+| `REPLAY` (record and replay, 32 entries per thread) | x | x | | x | x | X1 |
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
@@ -210,7 +210,10 @@ reverse index.
 
 ### X — Frontend expanders and tracing
 
-- [ ] **X1 `REPLAY`.** `tt_isa::frontend::replay`: `record(slot, body, exec)` and
+- [x] **X1 `REPLAY`.** Done for SFPU row loops (`tt_isa::frontend::{record, replay}`,
+      `REPLAY_BUFFER`; `Program::for_each_row_group`); `step26_sfpu_isa` runs every
+      case replayed and unrolled against one interpreter tile, ttsim and both cards,
+      and ttsim models `REPLAY` (no divergence). Was: `tt_isa::frontend::replay`: `record(slot, body, exec)` and
       `replay(slot)`, over a per-thread `ReplaySlots` allocator of the 32-entry buffer that
       refuses overlap, a body over 32 and a nested `REPLAY`. The buffer is per-thread state
       that survives between programs (divergence rows 47, 49), so a program records before
@@ -294,17 +297,28 @@ reverse index.
       -- copying rows 0..64 to 128..192, packed back as the tile: 3072 datums bit for
       bit. Watched failing with the odd half skipped and with the second tile's row
       off by four. ttsim and both cards; no divergence.
-- [ ] **F2 An SFPU program builder in `tt_isa::sfpu`.**
-  - [ ] An `LReg` newtype: 0–7 writable; 8–10 and 15 read-only constants; 11–14 only
-        through `SFPCONFIG`; 16 refused. Replaces the `u32` register arguments.
-  - [ ] Tile iteration: a program body written once over "a row group of lanes" and
-        expanded over the tile's row groups and both column halves.
-  - [ ] Conditional execution as a scope: `SFPSETCC`/`SFPPUSHC`/`SFPCOMPC`/`SFPPOPC`/
-        `SFPENCC` emitted balanced by construction (`if`/`else` closures), the stack depth
-        tracked so `SFPPOPC`'s complex modes are refused on a full stack (Tier 2 bug).
-  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as named, loaded-once program prologue.
-  - [ ] `stalls_automatically_after_mad` applied by the builder, so an `SFPNOP` is
-        inserted exactly where the documentation says automatic stalling misses.
+- [~] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
+      registers in `tt_isa::sfpu`). Gate: `step26_sfpu_isa` (below, with F5).
+  - [x] An `LReg` newtype (`tt_isa::sfpu::LReg`): `LReg::general(0..8)` writable,
+        `ZERO`/`ONE`/`C0_8373`/`LANE_X2` read-only, `ConfigLReg` 11–14 readable only,
+        16 not offered; a write to a non-writable one panics while building.
+  - [x] Tile iteration: `Program::for_each_row_group(rows, body)` -- the body written
+        once, handed an address offset; replayed through X1 when it fits (row
+        counter stepped by address modifier 7 on its last `Dst` access, entry 0 at no
+        increment, the counter cleared before and after), unrolled otherwise, and
+        `Program::loops` says which.
+  - [x] Conditional execution as a scope: `if_`, `if_else` emit `SFPPUSHC`,
+        `SFPSETCC`, `SFPCOMPC`, `SFPPOPC` balanced; depth tracked, a ninth level
+        refused; only the plain push and pop are ever emitted, so the Tier 2
+        `SFPPOPC` case cannot arise (and `SFPPOPC.md` contradicts itself on whether
+        Blackhole still has it).
+  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue -- with its first
+        user (S4's polynomial constants).
+  - [x] An `SFPNOP` exactly where `stalls_automatically_after_mad` says stalling
+        misses -- after any MAD-sub-unit instruction (`SFPMAD`, `SFPMUL`, `SFPADD`,
+        `SFPMULI`, `SFPADDI`, `SFPMUL24`, `SFPLUT`, `SFPLUTFP32`) -- including across
+        a replayed body's wrap-around; unit-tested to appear once, in the right
+        place.
 - [ ] **F3 The SFPU tile kernel.** T0 unpacks to `Dst`, T1 runs the SFPU program over the
       tile, T2 packs; the hand-offs by semaphores; buffers and semaphores declared through
       `tt_kernels::l1::Requirements`, programs through the program cache. Unary, binary
@@ -313,10 +327,28 @@ reverse index.
       tensor refs) that expands, like `ELTWISE`, into gathers, one `KERNEL` entry and
       scatters; a host-side registry from op id to program builder. Adding an op is then
       a builder and a gate, not a new arm in `dm_b.rs`.
-- [ ] **F5 Oracles.** `tt_isa::numerics` grows ports of the functional models named in
-      "Definition of done", each with a test against the page's pseudocode; a host
-      interpreter that runs an SFPU program over a tile through them, so any kernel's
-      expected output is computed, not hand-derived.
+- [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
+      register nothing has established is `None`, and reading it is refused), per-lane
+      `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
+      and address modifiers, the replay buffer (`REPLAY` expanded by its own model),
+      and `Dst`; one functional model per instruction, transcribed from its page, and
+      anything without one refused by name. Modelled so far: `SFPLOAD`/`SFPSTORE`
+      (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
+      `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
+      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPNOP`, and the `SETRWC`/`SETC16`
+      forms the builder emits. **Plan change:** each S item adds the models it
+      needs, and where a page defines a self-contained C function (`ApproxRecip`,
+      `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
+      against that C extracted from the pinned page and compiled as `fma.c` is;
+      the per-instruction ground truth is `step26_sfpu_isa` on the device.
+      Gate `step26_sfpu_isa`: fourteen builder programs (add, sub, mul, mad with a
+      two-half immediate, negated mad, a mad into its own operand then read, mov,
+      neg, abs, set sign, a BF16 immediate, a relu scope, if-else, three nested
+      scopes over every condition) over two tiles of every special (both zeros and
+      infinities, NaNs of both signs, denormals, extremes), each replayed and
+      unrolled, the device tile equal to the interpreter's bit for bit on ttsim and
+      both cards; `LReg[8]` measured (row P). Watched failing with a wrong `SFPABS`
+      model (silicon refuses it at the negative-NaN datum).
 - [ ] **F6 (optional) A Burn coverage generator.** `cargo xtask burn-coverage --check`,
       reading `OVERRIDDEN` and the pinned traits, so the table below cannot rot.
 
@@ -476,8 +508,8 @@ the item that must handle each. An item is not done while its hazard here is ope
 
 | Hazard | Source | Item |
 |---|---|---|
-| `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 |
-| `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 |
+| `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 -- closed: the builder inserts the NOP |
+| `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 -- closed: never emitted |
 | `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 |
 | `SFPSTOCHRND` biased; round-toward-zero sometimes rounds away | Tier 2 | S6 |
 | `SFPCAST_IntAbs` computes absolute value | Tier 2 | S5, S6 |

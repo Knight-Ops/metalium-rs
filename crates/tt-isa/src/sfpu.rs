@@ -108,6 +108,73 @@ pub const LREG_ZERO: u32 = 9;
 /// makes `SFPADD` a pure add: `VD = ±(1.0 * VB) ± VC`.
 pub const LREG_ONE: u32 = 10;
 
+/// One of the Vector Unit's seventeen `LReg`s (WH `LReg.md`), as an index the
+/// type has already checked: what an instruction may read, and -- through
+/// [`LReg::writable`] -- what it may write.
+///
+/// `LReg[0..8]` are general purpose. `LReg[8]`, `[9]`, `[10]` and `[15]` are
+/// read-only constants (`0.8373`, zero, `1.0`, and `2 * lane`); `LReg[11..15]`
+/// are written only through `SFPCONFIG` ([`ConfigLReg`]); `LReg[16]` belongs
+/// to `SFPLOADMACRO` and is not offered at all. A write to anything but
+/// `LReg[0..8]` is silently dropped by the hardware, which is why the type
+/// keeps the two apart rather than leaving it to a comment.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LReg(u8);
+
+impl LReg {
+    pub const L0: LReg = LReg(0);
+    pub const L1: LReg = LReg(1);
+    pub const L2: LReg = LReg(2);
+    pub const L3: LReg = LReg(3);
+    pub const L4: LReg = LReg(4);
+    pub const L5: LReg = LReg(5);
+    pub const L6: LReg = LReg(6);
+    pub const L7: LReg = LReg(7);
+    /// Read-only: `0.8373` in every lane.
+    pub const C0_8373: LReg = LReg(8);
+    /// Read-only: zero in every lane, the same bits for every type.
+    pub const ZERO: LReg = LReg(LREG_ZERO as u8);
+    /// Read-only: `1.0` in every lane.
+    pub const ONE: LReg = LReg(LREG_ONE as u8);
+    /// Read-only: lane `i` holds the integer `2 * i`.
+    pub const LANE_X2: LReg = LReg(15);
+
+    /// General-purpose register `i`, if `i < 8`.
+    pub const fn general(i: u32) -> Option<LReg> {
+        if i <= MAX_WRITABLE_LREG {
+            Some(LReg(i as u8))
+        } else {
+            None
+        }
+    }
+
+    pub const fn index(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Can an instruction write it? Only `LReg[0..8]`.
+    pub const fn writable(self) -> bool {
+        self.0 as u32 <= MAX_WRITABLE_LREG
+    }
+}
+
+/// `LReg[11..15]`: readable like any other, written only by `SFPCONFIG` from
+/// `LReg[0]` (`SFPCONFIG.md`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConfigLReg(u8);
+
+impl ConfigLReg {
+    pub const L11: ConfigLReg = ConfigLReg(11);
+    pub const L12: ConfigLReg = ConfigLReg(12);
+    pub const L13: ConfigLReg = ConfigLReg(13);
+    pub const L14: ConfigLReg = ConfigLReg(14);
+
+    /// The register, to read.
+    pub const fn lreg(self) -> LReg {
+        LReg(self.0)
+    }
+}
+
 /// Highest `LReg` index `SFPLOADI` and `SFPMAD` can write.
 ///
 /// `LReg[8]` upwards are constants; `LReg[11]` through `LReg[14]` are writable
