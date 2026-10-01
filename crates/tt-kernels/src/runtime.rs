@@ -223,6 +223,14 @@ pub enum RunError {
     /// Work queued earlier failed when the session waited for it
     /// (`crate::session::Session::sync`).
     Queued(String),
+    /// The tile's reset never finished: these roles' threads take no
+    /// instruction even after the backend pulse and every semaphore released.
+    /// Nothing the host can do from software clears it; a board reset does
+    /// (`docs/hardware-coverage.md`, "Hazards and known bugs").
+    Wedged {
+        tile: (u8, u8),
+        roles: Vec<Core>,
+    },
 }
 
 impl From<TransportError> for RunError {
@@ -251,6 +259,19 @@ impl std::fmt::Display for RunError {
                 f,
                 "{what} need {bytes} bytes of L1; the region holds {limit}"
             ),
+            RunError::Wedged {
+                tile: (x, y),
+                roles,
+            } => {
+                let names: Vec<&str> = roles.iter().map(|c| c.name()).collect();
+                write!(
+                    f,
+                    "tile ({x},{y}) is wedged: {} took no instruction after the reset \
+                     released every semaphore. Software cannot clear this; reset the \
+                     board (`tt-smi -r`, or a power cycle), or choose another tile",
+                    names.join(", ")
+                )
+            }
             RunError::Roles(stuck) => {
                 let parts: Vec<String> = stuck
                     .iter()

@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use tt_device::core_control::WaitError;
 use tt_device::tlb::WindowKind;
 use tt_device::{Device, Transport, TransportError};
 use tt_isa::isa::Instruction;
@@ -92,6 +93,13 @@ pub enum SessionError {
     },
     /// The reset program did not run.
     Reset(RunError),
+    /// Fewer tiles than asked for came out of reset; the rest are wedged
+    /// ([`RunError::Wedged`]) and need a board reset.
+    TooFewHealthy {
+        asked: usize,
+        healthy: usize,
+        wedged: Vec<(u8, u8)>,
+    },
 }
 
 impl From<TransportError> for SessionError {
@@ -115,11 +123,43 @@ impl std::fmt::Display for SessionError {
                 "{asked} Tensix tiles asked for, and this chip has {have}"
             ),
             SessionError::Reset(e) => write!(f, "resetting the tile: {e}"),
+            SessionError::TooFewHealthy {
+                asked,
+                healthy,
+                wedged,
+            } => write!(
+                f,
+                "{asked} Tensix tiles asked for, and only {healthy} came out of reset: \
+                 {wedged:?} are wedged, which software cannot clear; reset the board \
+                 (`tt-smi -r`, or a power cycle)"
+            ),
         }
     }
 }
 
 impl std::error::Error for SessionError {}
+
+/// Try `candidates` in order until `want` of them pass `probe`, returning
+/// those that passed and those that did not. `probe` says whether a tile came
+/// out of reset (`Ok(false)`: wedged, skipped); its error ends the search.
+fn healthy_tiles<C: Copy, E>(
+    candidates: &[C],
+    want: usize,
+    mut probe: impl FnMut(C) -> Result<bool, E>,
+) -> Result<(Vec<C>, Vec<C>), E> {
+    let (mut good, mut bad) = (Vec::new(), Vec::new());
+    for &c in candidates {
+        if good.len() == want {
+            break;
+        }
+        if probe(c)? {
+            good.push(c);
+        } else {
+            bad.push(c);
+        }
+    }
+    Ok((good, bad))
+}
 
 /// This chip's Tensix grid, asked of the ARC.
 ///
@@ -184,7 +224,23 @@ pub fn reset_thread_state<T: Transport>(
         unwedge: true,
         ..Kernel::new([&first, &program, &program], Schedule::InOrder)
     };
-    runtime::run(dev, tile, images, &kernel, RESET_BUDGET).map(|_| ())
+    // The reset program is a few hundred instructions on an idle tile: a role
+    // that does not finish it is blocked on state a failed run left behind,
+    // and no host access gets it moving again (the hazard table).
+    match runtime::run(dev, tile, images, &kernel, RESET_BUDGET) {
+        Ok(_) => Ok(()),
+        Err(RunError::Roles(stuck))
+            if stuck
+                .iter()
+                .all(|(_, _, e)| matches!(e, WaitError::TimedOut { .. })) =>
+        {
+            Err(RunError::Wedged {
+                tile: (tile.x(), tile.y()),
+                roles: stuck.into_iter().map(|(_, core, _)| core).collect(),
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `A[m,k] @ B[k,n]`, row-major, on `tile`, in as many runs as it takes
@@ -515,26 +571,30 @@ impl<T: Transport> Session<T> {
     ) -> Result<Self, SessionError> {
         let grid = tensix_grid(&mut dev)?;
         let have = grid.tile_count();
-        let tiles: Vec<(u8, u8)> = match choice {
-            TileChoice::Exactly(x, y) => vec![(x, y)],
+        // The tiles to try, in order, how many to keep, and whether a wedged
+        // one is an error (a tile named exactly) or skipped with a warning.
+        let (candidates, want, strict): (Vec<(u8, u8)>, usize, bool) = match choice {
+            TileChoice::Exactly(x, y) => (vec![(x, y)], 1, true),
             TileChoice::First => {
-                let t = grid
-                    .tiles::<Noc0>()
-                    .min_by_key(|t| (t.x(), t.y()))
-                    .expect("a chip with no Tensix tiles would have failed telemetry");
-                vec![(t.x(), t.y())]
+                let mut all: Vec<(u8, u8)> = grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect();
+                all.sort_unstable();
+                (all, 1, false)
             }
             TileChoice::Count(n) if n == 0 || n > have => {
                 return Err(SessionError::TooFewTiles { asked: n, have })
             }
-            TileChoice::Count(n) => grid
-                .tiles::<Noc0>()
-                .take(n)
-                .map(|t| (t.x(), t.y()))
-                .collect(),
-            TileChoice::All => grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect(),
+            TileChoice::Count(n) => (
+                grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect(),
+                n,
+                false,
+            ),
+            TileChoice::All => (
+                grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect(),
+                usize::MAX,
+                false,
+            ),
         };
-        for &(x, y) in &tiles {
+        for &(x, y) in &candidates {
             if !grid.contains(x, y) {
                 return Err(SessionError::NoSuchTile {
                     x,
@@ -543,24 +603,9 @@ impl<T: Transport> Session<T> {
                 });
             }
         }
-        let mut cleanup = Vec::new();
-        let mut units = Vec::with_capacity(tiles.len());
-        for (x, y) in tiles {
-            let tile = NocCoord::new(x, y).expect("a grid tile is a NoC coordinate");
-            cleanup.extend(register_cleanup(dev.transport(), tile)?);
-            units.push(Unit {
-                tile,
-                resident: None,
-                mover: None,
-                steps: 0,
-                lists: 0,
-                programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
-                queued: Default::default(),
-            });
-        }
         let mut session = Session {
             dev,
-            units,
+            units: Vec::new(),
             grid,
             images,
             profile: runtime::Profile::default(),
@@ -570,9 +615,40 @@ impl<T: Transport> Session<T> {
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
             barriers: 0,
             pending_frees: Vec::new(),
-            _cleanup: cleanup,
+            _cleanup: Vec::new(),
         };
-        session.prepare().map_err(SessionError::Reset)?;
+        let (_, wedged) = healthy_tiles(&candidates, want, |(x, y)| {
+            let tile = NocCoord::new(x, y).expect("a grid tile is a NoC coordinate");
+            session
+                ._cleanup
+                .extend(register_cleanup(session.dev.transport(), tile)?);
+            session.units.push(Unit {
+                tile,
+                resident: None,
+                mover: None,
+                steps: 0,
+                lists: 0,
+                programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
+                queued: Default::default(),
+            });
+            match session.prepare_unit(session.units.len() - 1) {
+                Ok(()) => Ok(true),
+                Err(e @ RunError::Wedged { .. }) if !strict => {
+                    eprintln!("session: {e}; skipped");
+                    session.units.pop();
+                    Ok(false)
+                }
+                Err(e) => Err(SessionError::Reset(e)),
+            }
+        })?;
+        let asked = if want == usize::MAX { 1 } else { want };
+        if session.units.len() < asked {
+            return Err(SessionError::TooFewHealthy {
+                asked,
+                healthy: session.units.len(),
+                wedged,
+            });
+        }
         Ok(session)
     }
 
@@ -1645,7 +1721,7 @@ impl Session<tt_kmd::Kmd> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime, segments, Instruction, Step};
+    use super::{healthy_tiles, runtime, segments, Instruction, RunError, SessionError, Step};
     use std::sync::Arc;
     use tt_isa::dm::{op, LIST_MAX};
 
@@ -1772,5 +1848,52 @@ mod tests {
             [LIST_MAX as usize, 3]
         );
         assert!(segments(vec![list(0, 1)]).is_empty());
+    }
+
+    /// A wedged tile is passed over for the next healthy one, and the search
+    /// stops once enough are found -- a wedged tile after that is never probed.
+    #[test]
+    fn wedged_tiles_are_skipped_for_the_next_healthy_one() {
+        let wedged = [2, 5];
+        let mut probed = Vec::new();
+        let (good, bad) = healthy_tiles(&[1, 2, 3, 4, 5, 6], 3, |t| {
+            probed.push(t);
+            Ok::<_, ()>(!wedged.contains(&t))
+        })
+        .unwrap();
+        assert_eq!(good, [1, 3, 4]);
+        assert_eq!(bad, [2]);
+        assert_eq!(probed, [1, 2, 3, 4], "5 is never reached");
+        // Too few healthy: every candidate tried, the caller reports the gap.
+        let (good, bad) =
+            healthy_tiles(&[2, 5, 7], 2, |t| Ok::<_, ()>(!wedged.contains(&t))).unwrap();
+        assert_eq!((good, bad), (vec![7], vec![2, 5]));
+        // Any other failure ends the search.
+        assert_eq!(
+            healthy_tiles(&[1, 2], 2, |t| if t == 1 { Err("io") } else { Ok(true) }),
+            Err("io")
+        );
+    }
+
+    /// Both errors say the tile, that software cannot clear it, and what does.
+    #[test]
+    fn a_wedged_tile_says_what_clears_it() {
+        let e = RunError::Wedged {
+            tile: (1, 2),
+            roles: vec![tt_isa::tensix::Core::T1],
+        };
+        let text = e.to_string();
+        assert!(text.contains("tile (1,2) is wedged"), "{text}");
+        assert!(text.contains("T1") && text.contains("tt-smi -r"), "{text}");
+        let e = SessionError::TooFewHealthy {
+            asked: 4,
+            healthy: 3,
+            wedged: vec![(1, 2)],
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains("only 3") && text.contains("(1, 2)") && text.contains("tt-smi -r"),
+            "{text}"
+        );
     }
 }

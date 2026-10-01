@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X4a-c; X2, X4d next |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X4a-c, X5a; X2, X4d, X5b next |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -285,6 +285,24 @@ reverse index.
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
       after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes
       per step down to the descriptors.
+- [~] **X5 Wedged tiles: detect, then recover** (the hazard table's open wedge row).
+  - [x] **X5a Detect at open, never fail opaquely.** A role that does not finish the
+        tile reset (`session::reset_thread_state`, a few hundred instructions on an
+        idle tile) is `RunError::Wedged { tile, roles }`, whose message names the tile
+        and threads and says a board reset (`tt-smi -r`, or a power cycle) clears it.
+        `Session::open` skips a wedged tile with a warning when tiles are chosen by
+        count (`First`, `Count`, `All`), taking the next healthy one, and fails with
+        that error for `Exactly`; too few healthy is `SessionError::TooFewHealthy`
+        listing the wedged tiles. Unit tests: the selection (a wedged tile passed over,
+        the search stopping once enough are found) and both messages. The signature it
+        keys on, every stuck role a timeout, is the one the wedged tile (1,2) gave on
+        both cards; no wedged tile exists to re-run it on since the boards were reset,
+        and none can be made safely on purpose.
+  - [ ] **X5b Recover in software.** Find what thread 1 is blocked on (the leading guess,
+        a math instruction waiting for `Src` banks, is unconfirmed) and release it --
+        only with encodings first confirmed on ttsim and in an isolated gate on a
+        healthy tile: the one attempt, an `UNVERIFIED` `UNPACR_NOP_SETDVALID` on the
+        wedged tile, took the host down.
 
 ### P — Prerequisites pulled in when they block
 
@@ -673,7 +691,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
 | Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
-| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevent (X4c); recovery needs a verified encoding first |
+| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevented (X4c), detected at open (X5a); recovery X5b |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
