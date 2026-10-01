@@ -469,3 +469,210 @@ fn algebraic_ops_stay_on_the_card_within_their_bounds() {
         assert_eq!(gb, fb, "int_into_float: as f32");
     });
 }
+
+/// `got` within `rel` (relative) plus `abs` of Flex's `want`, plus Flex's ulp;
+/// a NaN by class, an infinity exactly.
+fn close(got: f32, want: f32, rel: f64, abs: f64, what: &str) {
+    if want.is_nan() {
+        assert!(got.is_nan(), "{what}: {got:e} vs NaN");
+        return;
+    }
+    if want.is_infinite() {
+        assert_eq!(got, want, "{what}");
+        return;
+    }
+    let (g, w) = (got as f64, want as f64);
+    let tol = (rel + 1.2e-7) * w.abs() + abs + f32::MIN_POSITIVE as f64;
+    assert!(
+        (g - w).abs() <= tol,
+        "{what}: {got:e} vs Flex {want:e}: {:e} > {tol:e}",
+        (g - w).abs()
+    );
+}
+
+/// S4's exponential family (10.2e) through Burn, on resident tensors big
+/// enough to run approximations on the device: `tanh`, `erf`, `sigmoid`,
+/// `silu` (Burn's `x * sigmoid(x)`), `gelu`, and the backwards
+/// `sigmoid_backward` (exact) and `gelu_backward` -- nothing downloaded, each
+/// within its derived bound of Flex (`gelu` also Flex's own `1 + erf`
+/// cancellation, `|x| 2^-24`, as `step45`). Then Burn's autodiff reaching
+/// both backward kinds: the gradient of `sum(f(x) g)` is `f`'s backward of
+/// `g`.
+#[test]
+fn exp_family_activations_stay_on_the_card_within_their_bounds() {
+    use burn::backend::Autodiff;
+    use burn::tensor::activation;
+    use burn::tensor::backend::ops::ActivationOps;
+    use burn::tensor::TensorPrimitive;
+    use tt_kernels::sfpu::ops::{
+        gelu_backward_bound, ERF_BOUND, GELU_BOUND, SIGMOID_BOUND, TANH_BOUND,
+    };
+    let u = 1.0 / 16_777_216.0;
+    with_device(Config::default(), |d| {
+        let [r, c] = [64, 128];
+        // `floats`' range widened to both tails.
+        let xv: Vec<f32> = floats(7, r * c).iter().map(|x| x * 4.0).collect();
+        let gv: Vec<f32> = floats(8, r * c)
+            .iter()
+            .map(|g| {
+                if g.is_finite() {
+                    g.clamp(-3.0, 3.0)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let tt = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (x, g, fx, fg) = (tt(&xv), tt(&gv), fl(&xv), fl(&gv));
+        let vals = |t: Tensor<TtBackend, 2>, what: &str| {
+            assert!(
+                on_device(&t.clone().into_primitive().tensor()),
+                "{what}: not on the device"
+            );
+            t.into_data().to_vec::<f32>().unwrap()
+        };
+        let host = |t: Tensor<Flex, 2>| t.into_data().to_vec::<f32>().unwrap();
+        let check = |got: &[f32], want: &[f32], rel: f64, abs: &dyn Fn(usize) -> f64, what| {
+            for i in 0..r * c {
+                close(
+                    got[i],
+                    want[i],
+                    rel,
+                    abs(i),
+                    &format!("{what}({:e})", xv[i]),
+                );
+            }
+        };
+        let none = |_| 0.0;
+        let got = vals(resident("tanh", || x.clone().tanh()), "tanh");
+        check(&got, &host(fx.clone().tanh()), TANH_BOUND, &none, "tanh");
+        let got = vals(resident("erf", || x.clone().erf()), "erf");
+        check(&got, &host(fx.clone().erf()), ERF_BOUND, &none, "erf");
+        let got = vals(
+            resident("sigmoid", || activation::sigmoid(x.clone())),
+            "sigmoid",
+        );
+        check(
+            &got,
+            &host(activation::sigmoid(fx.clone())),
+            SIGMOID_BOUND,
+            &none,
+            "sigmoid",
+        );
+        // The sigmoid's bound and the product's rounding.
+        let got = vals(resident("silu", || activation::silu(x.clone())), "silu");
+        check(
+            &got,
+            &host(activation::silu(fx.clone())),
+            SIGMOID_BOUND + u,
+            &none,
+            "silu",
+        );
+        let gelu_abs = |i: usize| (xv[i] as f64).abs() * u;
+        let got = vals(resident("gelu", || activation::gelu(x.clone())), "gelu");
+        check(
+            &got,
+            &host(activation::gelu(fx.clone())),
+            GELU_BOUND,
+            &gelu_abs,
+            "gelu",
+        );
+        let prim = |t: &Tensor<TtBackend, 2>| t.clone().into_primitive().tensor();
+        let fprim = |t: &Tensor<Flex, 2>| t.clone().into_primitive().tensor();
+        let float = |p| Tensor::<TtBackend, 2>::from_primitive(TensorPrimitive::Float(p));
+        let ffloat = |p| Tensor::<Flex, 2>::from_primitive(TensorPrimitive::Float(p));
+        let want_gb = host(ffloat(<Flex as ActivationOps<Flex>>::gelu_backward(
+            fprim(&fx),
+            fprim(&fg),
+        )));
+        let got = vals(
+            resident("gelu_backward", || {
+                float(<TtBackend as ActivationOps<TtBackend>>::gelu_backward(
+                    prim(&x),
+                    prim(&g),
+                ))
+            }),
+            "gelu_backward",
+        );
+        let gb_abs = |i: usize| gelu_backward_bound(xv[i], gv[i]) + (gv[i] as f64).abs() * 2.0 * u;
+        check(&got, &want_gb, 0.0, &gb_abs, "gelu_backward");
+        // Exact: the same `s`, Flex's order of roundings.
+        let sv = host(activation::sigmoid(fx.clone()));
+        let s = tt(&sv);
+        let got = vals(
+            resident("sigmoid_backward", || {
+                float(<TtBackend as ActivationOps<TtBackend>>::sigmoid_backward(
+                    prim(&s),
+                    prim(&g),
+                ))
+            }),
+            "sigmoid_backward",
+        );
+        let want = host(ffloat(<Flex as ActivationOps<Flex>>::sigmoid_backward(
+            fprim(&fl(&sv)),
+            fprim(&fg),
+        )));
+        for i in 0..r * c {
+            // A denormal (result or Flex's own `s`) flushes to a zero.
+            let tiny = |v: f32| v != 0.0 && v.abs() < f32::MIN_POSITIVE;
+            assert!(
+                got[i].to_bits() == want[i].to_bits()
+                    || (got[i].is_nan() && want[i].is_nan())
+                    || ((tiny(want[i]) || tiny(sv[i])) && got[i] == 0.0),
+                "sigmoid_backward({:e}, {}): {:e} vs Flex {:e}",
+                sv[i],
+                gv[i],
+                got[i],
+                want[i]
+            );
+        }
+
+        // Autodiff: `d/dx sum(f(x) g) = f'(x) g`, through Burn's own backward.
+        type Ad = Autodiff<TtBackend>;
+        type Fd = Autodiff<Flex>;
+        let grad = |gelu: bool| {
+            let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+            let y = if gelu {
+                activation::gelu(xa.clone())
+            } else {
+                activation::sigmoid(xa.clone())
+            };
+            let gs = (y * Tensor::<Ad, 2>::from_inner(g.clone()))
+                .sum()
+                .backward();
+            xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap()
+        };
+        let fgrad = |gelu: bool| {
+            let xa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+            let y = if gelu {
+                activation::gelu(xa.clone())
+            } else {
+                activation::sigmoid(xa.clone())
+            };
+            let gs = (y * Tensor::<Fd, 2>::from_inner(fg.clone()))
+                .sum()
+                .backward();
+            xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap()
+        };
+        check(&grad(true), &fgrad(true), 0.0, &gb_abs, "autodiff gelu");
+        // `g s (1 - s)` with the device's `s`: its error `s SIGMOID_BOUND`
+        // moves `s (1 - s)` by at most that (`|1 - 2s| <= 1`), on top of both
+        // sides' three roundings.
+        let sig_abs = |i: usize| {
+            let s = sv[i] as f64;
+            (gv[i] as f64).abs() * s * SIGMOID_BOUND * 1.01
+        };
+        check(
+            &grad(false),
+            &fgrad(false),
+            6.0 * u,
+            &sig_abs,
+            "autodiff sigmoid",
+        );
+    });
+}

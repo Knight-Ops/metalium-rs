@@ -661,11 +661,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_tanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_tanh(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_tanh(tensor)
     }
     fn float_acos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -748,11 +744,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_erf(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_erf(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_erf(tensor)
     }
     fn float_cat(tensors: Vec<FloatTensor<TtBackend>>, dim: usize) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensors);
@@ -2641,11 +2633,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         crate::ops::activation::relu_backward(output, grad)
     }
     fn gelu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::gelu(tensor.into_flex()),
-            device,
-        )
+        crate::ops::activation::gelu(tensor)
     }
     fn prelu(
         tensor: FloatTensor<TtBackend>,
@@ -2657,28 +2645,16 @@ impl ActivationOps<TtBackend> for TtBackend {
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&x);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::gelu_backward(x.into_flex(), grad.into_flex()),
-            device,
-        )
+        crate::ops::activation::gelu_backward(x, grad)
     }
     fn sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::sigmoid(tensor.into_flex()),
-            device,
-        )
+        crate::ops::activation::sigmoid(tensor)
     }
     fn sigmoid_backward(
         output: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&output);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::sigmoid_backward(output.into_flex(), grad.into_flex()),
-            device,
-        )
+        crate::ops::activation::sigmoid_backward(output, grad)
     }
     fn hard_sigmoid(
         tensor: FloatTensor<TtBackend>,

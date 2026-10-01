@@ -969,6 +969,17 @@ pub mod float {
         kind_sfpu::LOG1P,
         "`ln(1 + x)` on the device where the data is, within `ops::LOG1P_BOUND`, else Flex's."
     );
+    // S4 (10.2e).
+    unary_sfpu!(
+        float_tanh,
+        kind_sfpu::TANH,
+        "`tanh x` on the device where the data is, within `ops::TANH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_erf,
+        kind_sfpu::ERF,
+        "`erf x` on the device where the data is, within `ops::ERF_BOUND`, else Flex's."
+    );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
     /// (within `ops::pow_bound`); else Flex's.
@@ -1270,6 +1281,65 @@ pub mod activation {
             device,
         )
     }
+
+    // S4 (10.2e): one SFPU op each, as Flex's fused closures are.
+    macro_rules! unary {
+        ($name:ident, $kind:ident, $doc:literal) => {
+            #[doc = $doc]
+            pub fn $name(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+                use tt_kernels::sfpu::ops::kind_sfpu;
+                if let Some(t) = device_eltwise(kind_sfpu::$kind, 0.0, &tensor, None) {
+                    return t;
+                }
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::$name(tensor.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    macro_rules! binary {
+        ($name:ident, $kind:ident, $doc:literal) => {
+            #[doc = $doc]
+            pub fn $name(
+                a: FloatTensor<TtBackend>,
+                grad: FloatTensor<TtBackend>,
+            ) -> FloatTensor<TtBackend> {
+                use tt_kernels::sfpu::ops::kind_sfpu;
+                if a.shape() == grad.shape() {
+                    if let Some(t) = device_eltwise(kind_sfpu::$kind, 0.0, &a, Some(&grad)) {
+                        return t;
+                    }
+                }
+                let device = a.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::$name(a.into_host(), grad.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    unary!(
+        sigmoid,
+        SIGMOID,
+        "Flex's two-branch `sigmoid` on the device where the data is, within `ops::SIGMOID_BOUND`; else Flex's."
+    );
+    binary!(
+        sigmoid_backward,
+        SIGMOID_BACKWARD,
+        "Flex's `g * s * (1 - s)`, exact, on the device where the data is; else Flex's."
+    );
+    unary!(
+        gelu,
+        GELU,
+        "Flex's `0.5 x (1 + erf(x / sqrt 2))` on the device where the data is, within `ops::GELU_BOUND`; else Flex's."
+    );
+    binary!(
+        gelu_backward,
+        GELU_BACKWARD,
+        "`g (Phi(x) + x phi(x))` on the device where the data is, within `ops::gelu_backward_bound`; else Flex's."
+    );
 }
 
 pub mod int {

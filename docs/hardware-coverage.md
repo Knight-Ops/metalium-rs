@@ -31,8 +31,12 @@ the logic ops on the card.
 hard-sigmoid train at 2.9 and 2.2 ms/step (from 6.8 and 5.4) with ReLU's traffic (row
 AJ). S4's algebraic ops are on the card (10.2d: `sqrt`, `log1p`, `pow` by tensor, integer
 tensor and scalar), and 10.2d's sweeps found and fixed two of 10.1's range-end bugs:
-`recip`/`div` above `2^111` and `exp` at exactly its overflow threshold. gelu, tanh,
-sigmoid and silu still run on the host -- 10.2e, next.
+`recip`/`div` above `2^111` and `exp` at exactly its overflow threshold. The
+exponential family's core is on the card too (10.2e, part: `expm1`, `tanh`, `erf`,
+`sigmoid`, `gelu` and both backwards), so all seven of `tt-mnist`'s activations now
+move only what ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9
+(row AK). The runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
+Next: the hyperbolics, `log_sigmoid` and `softmin` (rest of 10.2e), then trig (10.2f).
 
 ### After 10.1
 
@@ -860,7 +864,33 @@ Each names the measurement it must move. The Burn-side ones are in
         a product, `-1`/`-2` reciprocals, else `powf`), `int_into_float` to F32
         (exact); `step47_burn_activations::algebraic_ops_stay_on_the_card_within_
         their_bounds`. `RSQRT` has no Burn method; it waits for R3's norms.
-        Remaining: `tanh`, `erf`, `sin`/`cos` and the rest (10.2e, 10.2f).
+  - [~] **10.2e The exponential family and the activations on it** (part).
+        `expm1_program`: `exp`'s reduction, `p = e^r - 1 = r + r^2 q(r)`, then
+        `2 (h p + (h - 1/2))`, `h = 2^(n-1)` -- no cancellation near zero, no
+        overflow at `n = 128`; within `EXPM1_BOUND = 4.5u`. `sigmoid_program`:
+        Flex's two branches over one `e = e^-|x|`, within `SIGMOID_BOUND = EXP_BOUND
+        + 4u`. `tanh_program`: `sign(x) t/(t + 2)`, `t = expm1(2|x|)`, `x` itself
+        below `2^-12` and `±1` from 9.01; within `TANH_BOUND = 7.5u`. `erf_program`:
+        the Taylor series below `1/2`, then `1 - erfc` with `erfc = e^(-a^2)
+        erfcx(a)`, `a^2` split exactly (Dekker) and `erfcx` a Chebyshev fit computed
+        in the builder from `libm::erfc` (`ERFC_MID`, deg 16 to 3.92), evaluated by
+        Clenshaw; within `ERF_BOUND = 10.5u`, the fit and its evaluation measured
+        over every float of the interval. `gelu_program`: `2 Phi` by the branch
+        that does not cancel -- on the far negative side `erfc` itself (a second fit,
+        `ERFC_TAIL`, to 9.3), so it is relatively accurate where Flex's own `1 +
+        erf` is not; within `GELU_BOUND = 12.5u`; `gelu_backward` within
+        `gelu_backward_bound(x, g)` (absolute: the derivative crosses zero).
+        `sigmoid_backward` is exact, Flex's order of roundings. Found here: `SFPMAD`
+        is not fused and drops a denormal-range product (numerics rows E, F), so
+        the error-free transforms are Dekker's with 12-bit halves; and `exp`'s NaN
+        and overflow edge (10.2d). Gates: `step45_exp_family` (each kind bit for bit
+        to its program, the programs within their bounds of Flex), ttsim and both
+        cards. Burn: `float_tanh`, `float_erf`, `sigmoid{,_backward}`,
+        `gelu{,_backward}` -- `silu` follows, Burn's `x * sigmoid(x)` --
+        `step47_burn_activations::exp_family_activations_stay_on_the_card_within_
+        their_bounds`, which also takes Burn's autodiff through both backward
+        kinds. Remaining: `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid{,
+        _backward}`, `softmin`; then `sin`/`cos` and the rest (10.2f).
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1045,9 +1075,9 @@ path today, `~` when only some shapes do.
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
 | `float_cast` | `~` to the tensor's own dtype (a no-op); others S6 | S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
-| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` a four-op chain) | S4 |
-| `float_erf` | | S4 |
-| `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
+| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
+| `float_erf`, `float_tanh` | x (SFPU, derived bounds) | S4 |
+| `float_sin`, `float_cos`, `float_tan`, the other hyperbolics, inverse trig, `float_atan2` | | S4 |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |
@@ -1063,7 +1093,8 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
-| `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
+| `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
+| `log_sigmoid{,_backward}` | | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
 | `softmin` | | R2 |
 
