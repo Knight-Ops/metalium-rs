@@ -46,7 +46,7 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0 |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[~]` X3, F0, F1 |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
@@ -155,8 +155,8 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | Feature | State | Item |
 |---|---|---|
 | Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums | `[x]` | -- |
-| `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[ ]` | F1 |
-| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | F1, D1 |
+| `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
+| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
 | Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[ ]` | D3 |
@@ -281,12 +281,19 @@ reverse index.
       (`Session::download_padded`); a view of a dirty tensor filled through a copy
       with the parent's tiles untouched. Watched failing with the fills skipped
       (both tests, and step19) and with the sum unmasked. ttsim and both cards.
-- [ ] **F1 Whole-tile `Dst` round trip.** One 32×32 FP32 tile from GDDR into `Dst` by
-      `UnpackToDst` and packed back, every datum checked, on the three roles. Phase 5
-      did 128 datums; the step 8 lane map (`SFPLOAD`/`SFPSTORE` reach the even or the odd
-      columns of a four-row group) decides how the SFPU walks it. BF16: on silicon by
-      `UnpackToDst` (`silicon_measure::m08`), on ttsim through `Src` and `MOVA2D`
-      (row 31), whichever the kernel then uses on both.
+- [x] **F1 Whole-tile `Dst` round trip** (FP32; BF16 moves to D1, its first user).
+      A tile image's 1024 datums unpack as one flat run (`datapath::tile_descriptor`),
+      which lays the four faces down sixty-four `Dst` rows in the packer's order;
+      `datapath::unpack_tile_to_dst(l1, row)` retargets unpacker 0's base and
+      `REG5_Dest_cntx0_address` (`Dst` row = `OutAddr/16 - 4`) between tiles, and
+      `pack_tile_from_dst(l1, row)` rewrites the packer's configuration with
+      `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` = `row` (`Offset << 4` datums). Gate
+      `step25_dst_tile`: two tiles (normals across the exponent range, both zeros,
+      both infinities, the extremes) into rows 0 and 64, packed back from 64 first,
+      and an SFPU walk -- sixteen row groups, both column halves, `SFPLOAD`/`SFPSTORE`
+      -- copying rows 0..64 to 128..192, packed back as the tile: 3072 datums bit for
+      bit. Watched failing with the odd half skipped and with the second tile's row
+      off by four. ttsim and both cards; no divergence.
 - [ ] **F2 An SFPU program builder in `tt_isa::sfpu`.**
   - [ ] An `LReg` newtype: 0–7 writable; 8–10 and 15 read-only constants; 11–14 only
         through `SFPCONFIG`; 16 refused. Replaces the `u32` register arguments.

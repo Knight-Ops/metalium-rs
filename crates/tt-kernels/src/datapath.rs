@@ -684,3 +684,83 @@ pub fn dst_round_trip_roles(
     ];
     [unpack, math, pack]
 }
+
+/// Datums in a 32x32 FP32 tile.
+pub const TILE_DATUMS: u32 = 1024;
+/// `Dst` rows one FP32 tile fills, sixteen datums to a row: its four faces in
+/// order, each sixteen rows of one face row apiece.
+pub const TILE_DST_ROWS: u32 = TILE_DATUMS / 16;
+
+/// The `REG5_Dest_cntx0_address` that lands an unpack's first datum in `Dst`
+/// row `row`: `Dst` row is `OutAddr / 16 - 4` (`UNPACR_Regular.md:430-432`),
+/// so [`DST_BASE`] is row 0.
+pub const fn dst_address(row: u32) -> u32 {
+    (row + 4) * 16
+}
+
+/// A tile image's descriptor for a whole-tile unpack into `Dst`: its 1024
+/// datums as one flat run. The image is `tt_layout`'s face order, so the flat
+/// run lays the four faces down `Dst` one after another -- `Dst` row `16f + r`
+/// is face `f`'s row `r` -- which is the order the packer writes back and the
+/// SFPU's row groups walk (`tt_isa::sfpu::program`).
+pub fn tile_descriptor() -> TileDescriptor {
+    flat_descriptor(TILE_DATUMS)
+}
+
+/// Unpacker 0's configuration for whole FP32 tiles into `Dst`, starting with
+/// the tile at `l1` into row 0 (`ThreadConfig` from [`thread_config`]).
+pub fn tile_unpack_config(words: &mut ConfigWords, l1: u64) {
+    unpack_config(words, tile_descriptor(), l1);
+}
+
+/// Unpack the FP32 tile image at `l1` (header included, 16-byte aligned) into
+/// `Dst` rows `row..row + 64`, after whatever unpack came before: the
+/// previous one drains before the base and destination are rewritten, and
+/// the rewrite lands before this one starts (`ConfigurationUnit.md`).
+pub fn unpack_tile_to_dst(l1: u64, row: u32) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_unpacker0(Before::CONFIG).unwrap()];
+    let mut words = ConfigWords::new();
+    words
+        .set(thcon::THCON_SEC0_REG3_Base_address, tile_base_units(l1))
+        .unwrap()
+        .set(thcon::THCON_SEC0_REG5_Dest_cntx0_address, dst_address(row))
+        .unwrap();
+    p.extend(config_program(&words));
+    p.push(
+        backend::stallwait(
+            backend::block::UNPACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.push(set_adc_x_unpack(0, TILE_DATUMS - 1));
+    p.push(unpack_instruction());
+    p
+}
+
+/// Pack `Dst` rows `row..row + 64` -- one FP32 tile's datums, faces in order,
+/// no header -- to `l1_dest`, after whatever pack came before. The packer's
+/// configuration is rewritten whole (as the matmul's pack role does per
+/// tile), with the `Dst` read offset at `row`: the input address generator
+/// adds `DEST_TARGET_REG_CFG_PACK_SEC0_Offset << 4` datums, a row each
+/// (`Packers/InputAddressGenerator.md`).
+pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
+    let mut words = ConfigWords::new();
+    pack_config(&mut words, l1_dest);
+    words
+        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap();
+    p.extend(config_program(&words));
+    p.push(
+        backend::stallwait(
+            backend::block::PACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.extend(pack_rows(TILE_DST_ROWS));
+    p
+}
