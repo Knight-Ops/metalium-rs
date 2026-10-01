@@ -61,6 +61,155 @@ pub const fn arecip(mod1: u32, b: u32, c: u32, d: u32) -> u32 {
     }
 }
 
+/// `SFPLE.md`'s (and `SFPGT`'s, `SFPSWAP`'s) `SignMagIsSmaller`: `c < d`, each
+/// read as a sign-magnitude integer -- for FP32, the total order `-NaN < -inf
+/// < ... < -0 < +0 < ... < +inf < +NaN`, which is not IEEE's: `-0 < +0`, and
+/// NaNs are ordered.
+pub const fn sign_mag_is_smaller(c: u32, d: u32) -> bool {
+    let c = c ^ (((c as i32) >> 30) as u32 >> 1);
+    let d = d ^ (((d as i32) >> 30) as u32 >> 1);
+    (c as i32) < (d as i32)
+}
+
+/// `SFPLUT.md`'s `Lut8ToFp32`: one sign bit, a three-bit exponent `2^-e`, four
+/// mantissa bits; `0xff` is zero.
+pub const fn lut8_to_fp32(x: u8) -> u32 {
+    if x == 0xff {
+        return 0;
+    }
+    let (sign, exp, man) = ((x >> 7) as u32, ((x >> 4) & 7) as u32, (x & 0xf) as u32);
+    (sign << 31) | ((127 - exp) << 23) | (man << 19)
+}
+
+/// `SFPLUTFP32.md`'s `Lut16ToFp32`: FP16's fields, but exponent 0 is a normal
+/// binade (no denormals, no zero) and exponent 31 is a signed zero (no
+/// infinity, no NaN).
+pub const fn lut16_to_fp32(x: u16) -> u32 {
+    let (sign, exp, man) = (
+        (x >> 15) as u32,
+        ((x >> 10) & 0x1f) as u32,
+        (x & 0x3ff) as u32,
+    );
+    (sign << 31) | ((if exp == 0x1f { 0 } else { 112 + exp }) << 23) | (man << 13)
+}
+
+/// One lane of `SFPLUT` (`SFPLUT.md`): `l3` is `LReg[3]`, `coeffs` the
+/// register its magnitude picks (`LReg[0]` below 1.0, `LReg[1]` below 2.0,
+/// `LReg[2]` otherwise -- chosen by the caller, which holds the three), the
+/// product-sum `Lut8ToFp32(coeffs >> 8) * |l3| + Lut8ToFp32(coeffs)` by
+/// `SFPMAD`'s arithmetic, and `l3`'s sign if `retain_sign`.
+pub const fn lut(coeffs: u32, l3: u32, retain_sign: bool) -> u32 {
+    let b = l3 & 0x7fff_ffff;
+    let a = lut8_to_fp32(((coeffs >> 8) & 0xff) as u8);
+    let c = lut8_to_fp32((coeffs & 0xff) as u8);
+    let d = super::fma_bh(a, b, c);
+    if retain_sign {
+        (d & 0x7fff_ffff) | (l3 & 0x8000_0000)
+    } else {
+        d
+    }
+}
+
+/// Which of `LReg[0..3]` `SFPLUT` and `SFPLUTFP32` read for `|l3|`: 0 below
+/// 1.0, 1 below 2.0, 2 otherwise (a NaN magnitude compares above both).
+pub const fn lut_index(l3: u32) -> usize {
+    let b = l3 & 0x7fff_ffff;
+    if b < 0x3f80_0000 {
+        0
+    } else if b < 0x4000_0000 {
+        1
+    } else {
+        2
+    }
+}
+
+/// `SFPLUTFP32`'s table formats (`SFPLUTFP32_MOD1_*`, without the sign bit).
+pub mod lutfp32_mod1 {
+    pub const FP32_3ENTRY_TABLE: u32 = 0;
+    pub const FP16_6ENTRY_TABLE1: u32 = 2;
+    pub const FP16_6ENTRY_TABLE2: u32 = 3;
+    /// Overlaps `INDIRECT_VD` (8): the result goes to `LReg[LReg[7] & 15]`.
+    pub const FP16_3ENTRY_TABLE: u32 = 10;
+    pub const SGN_RETAIN: u32 = 4;
+    pub const INDIRECT_VD: u32 = 8;
+}
+
+/// One lane of `SFPLUTFP32` (`SFPLUTFP32.md`): `l` holds the lane's
+/// `LReg[0..8]`, `mod1` the instruction's. The value only; where it goes
+/// (`VD`, or `LReg[LReg[7] & 15]` when `mod1` has `INDIRECT_VD`) is the
+/// caller's.
+pub const fn lutfp32(mod1: u32, l: &[u32; 8]) -> u32 {
+    use lutfp32_mod1::*;
+    let l3 = l[3];
+    let b = l3 & 0x7fff_ffff;
+    let i = lut_index(l3);
+    let (a, c) = if mod1 & FP16_6ENTRY_TABLE1 != 0 {
+        if mod1 & FP16_3ENTRY_TABLE == FP16_3ENTRY_TABLE {
+            (
+                lut16_to_fp32((l[i] >> 16) as u16),
+                lut16_to_fp32((l[i] & 0xffff) as u16),
+            )
+        } else {
+            let cut = if mod1 & FP16_6ENTRY_TABLE2 == FP16_6ENTRY_TABLE2 {
+                0x4080_0000 // 4.0
+            } else {
+                0x4040_0000 // 3.0
+            };
+            let j = if b < 0x3f00_0000 {
+                0
+            } else if b < 0x3f80_0000 {
+                16
+            } else if b < 0x3fc0_0000 {
+                0
+            } else if b < 0x4000_0000 {
+                16
+            } else if b < cut {
+                0
+            } else {
+                16
+            };
+            (
+                lut16_to_fp32(((l[i] >> j) & 0xffff) as u16),
+                lut16_to_fp32(((l[4 + i] >> j) & 0xffff) as u16),
+            )
+        }
+    } else {
+        (l[i], l[4 + i])
+    };
+    let d = super::fma_bh(a, b, c);
+    if mod1 & SGN_RETAIN != 0 {
+        (d & 0x7fff_ffff) | (l3 & 0x8000_0000)
+    } else {
+        d
+    }
+}
+
+/// One lane of `SFPMUL24` (`SFPMUL24.md`, Blackhole only) with `VC` the zero
+/// constant -- the only form offered: a non-zero `c` adds the page's
+/// `NonContractualBehavior` shift-add. The low 23 bits of the product of `a`
+/// and `b`'s low 23 bits, or its high bits above them if `upper`.
+pub const fn mul24(a: u32, b: u32, upper: bool) -> u32 {
+    if upper {
+        (((a & 0x7f_ffff) as u64 * (b & 0x7f_ffff) as u64) >> 23) as u32
+    } else {
+        a.wrapping_mul(b) & 0x7f_ffff
+    }
+}
+
+/// One lane of `SFPCAST` from a sign-magnitude integer to FP32, rounding to
+/// nearest, ties to even (`SFPCAST_IntFloat.md`, `SFPCAST_MOD1_SM32_TO_FP32_RNE`).
+pub const fn cast_sm32_to_fp32_rne(c: u32) -> u32 {
+    let sign = c & 0x8000_0000;
+    let mag = c & 0x7fff_ffff;
+    let lz = if mag != 0 { mag.leading_zeros() } else { 157 };
+    let norm = mag << (lz & 31);
+    let mut d = sign.wrapping_add((157 - lz) << 23).wrapping_add(norm >> 8);
+    if norm & 0x80 != 0 && norm & 0x17f != 0 {
+        d = d.wrapping_add(1);
+    }
+    d
+}
+
 const RECIP_LUT: [u8; 128] = [
     127, 125, 123, 121, 119, 117, 116, 114, 112, 110, 109, 107, 105, 104, 102, 100, 99, 97, 96, 94,
     93, 91, 90, 88, 87, 85, 84, 83, 81, 80, 79, 77, 76, 75, 74, 72, 71, 70, 69, 68, 66, 65, 64, 63,
@@ -122,6 +271,67 @@ mod tests {
             arecip(arecip_mod1::RECIP, 0, (-1.0f32).to_bits(), 0),
             (-0.996_093_75f32).to_bits()
         );
+    }
+
+    /// `SFPCAST`'s conversion is the correctly rounded one: the host's `as
+    /// f32` on the magnitude, with the sign put back (so `-0` stays one).
+    #[test]
+    fn the_cast_rounds_as_the_host_does() {
+        let check = |c: u32| {
+            let mag = (c & 0x7fff_ffff) as f32;
+            let want = (c & 0x8000_0000) | mag.to_bits();
+            assert_eq!(cast_sm32_to_fp32_rne(c), want, "{c:#x}");
+        };
+        for c in [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0001,
+            0x00ff_ffff,
+            0x0100_0001,
+        ] {
+            check(c);
+        }
+        let mut x = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            check(x);
+            check(x >> (x % 31));
+        }
+    }
+
+    /// The sign-magnitude order, against the comparison it stands for on the
+    /// finite non-zero values and at the points where it differs from IEEE.
+    #[test]
+    fn the_sign_magnitude_order_is_the_float_order_where_ieee_has_one() {
+        let v = [
+            -3.5f32,
+            -1.0,
+            -1e-30,
+            1e-30,
+            1.0,
+            2.0,
+            f32::MAX,
+            f32::INFINITY,
+        ];
+        for &a in &v {
+            for &b in &v {
+                assert_eq!(
+                    sign_mag_is_smaller(a.to_bits(), b.to_bits()),
+                    a < b,
+                    "{a} {b}"
+                );
+            }
+        }
+        assert!(sign_mag_is_smaller((-0.0f32).to_bits(), 0.0f32.to_bits()));
+        assert!(sign_mag_is_smaller(f32::INFINITY.to_bits(), 0x7fc0_0000));
+        assert!(sign_mag_is_smaller(
+            0xffc0_0000,
+            f32::NEG_INFINITY.to_bits()
+        ));
     }
 
     /// The page's accuracy claims, over every input the tables reach.

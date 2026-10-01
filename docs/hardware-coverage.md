@@ -18,7 +18,17 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01, after 10.1)
+## Where things stand (2026-10-01, 10.2 in progress)
+
+10.2 (branch `phase10-2-activations`) has its instructions (10.2a): every SFPU
+instruction the rest of S2-S4 needs has a typed helper, an interpreter model and a
+device gate on ttsim and both cards, and the `SFPLUTFP32` hazard is closed. D3 (int
+and bool storage) moved into 10.2, so that comparisons and masks stay on the card.
+`tt-mnist --activation` now trains with any of seven of Burn's activations; every one
+but ReLU still runs on the host, at 2.2-3.4x ReLU's step time (row AI) -- what the
+rest of 10.2 removes.
+
+### After 10.1
 
 10.1 added, on top of the table below: reciprocal, division, `exp` and `log` on the SFPU
 (S3, S4a), lane movement (S8), `sum` and `max` over either dim (R1a), softmax and
@@ -54,9 +64,9 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
-| 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
+| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
@@ -123,18 +133,18 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
 | Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
-| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | `~` `SFPDIVP2` (0..128) | | `~` `SFPDIVP2` (row 66) | `~` `SFPDIVP2` | S2, S4 |
+| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | x (`SFPDIVP2` 0..128) | | x (`SFPDIVP2` from 128: row 66) | x | S2, S4 |
 | Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
 | Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | x | `~` (`exp`, `log`, `recip`) | x | x | -- |
-| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | x (flags; `SET_VD` masks raw) | `~` `SFPGT` (`RELU`) | x | x | S2 |
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
-| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | `~` `AND`, `OR` | `~` (masks) | `~` | `~` | S5 |
-| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT`, `SFPSHFT2` (rotate) | `~` (`exp`, `log`, reductions) | `~` | `~` | S5 |
-| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
-| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
+| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | x | `~` (masks) | x | x | S5 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | x (`SFPMUL24` with `VC` zero only; `SFPSHFT2` rotate) | `~` (`exp`, `log`, reductions) | x | x | S5 |
+| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | x (`SFPLUTFP32`'s indirect destination designed out) | `~` `SFPARECIP` | `~` (`SFPLUTFP32` only `Mod1` 2, 6: row 70) | x | S4 |
+| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | `~` `_IntFloat` round-to-nearest | | `~` | `~` | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
-| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | `~` `SFPTRANSP` | `~` (reductions) | `~` | `~` | S2 |
-| Configuration | `SFPCONFIG` | x | | | | | F2 |
+| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | x (`SFPSWAP` min/max) | `~` (reductions) | x | x | S2 |
+| Configuration | `SFPCONFIG` | x | `~` `LReg[11..15]` only (`Program::constant`) | | x | x | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
 | PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | | | | | S7 |
@@ -572,7 +582,7 @@ Each names the measurement it must move. The Burn-side ones are in
       -- copying rows 0..64 to 128..192, packed back as the tile: 3072 datums bit for
       bit. Watched failing with the odd half skipped and with the second tile's row
       off by four. ttsim and both cards; no divergence.
-- [~] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
+- [x] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
       registers in `tt_isa::sfpu`). Gate: `step26_sfpu_isa` (below, with F5).
   - [x] An `LReg` newtype (`tt_isa::sfpu::LReg`): `LReg::general(0..8)` writable,
         `ZERO`/`ONE`/`C0_8373`/`LANE_X2` read-only, `ConfigLReg` 11–14 readable only,
@@ -587,8 +597,12 @@ Each names the measurement it must move. The Burn-side ones are in
         refused; only the plain push and pop are ever emitted, so the Tier 2
         `SFPPOPC` case cannot arise (and `SFPPOPC.md` contradicts itself on whether
         Blackhole still has it).
-  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue -- with its first
-        user (S4's polynomial constants).
+  - [x] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue
+        (`Program::constant`, 10.2a): loads `L0` and writes the register, refused
+        inside a scope (`SFPCONFIG` takes its value and its predication from lanes
+        0..8 alone). The interpreter starts the four unknown, so a program that
+        reads one it did not write -- one an earlier program left (G11) -- is
+        refused there (`a_constant_is_known_only_to_the_program_that_writes_it`).
   - [x] An `SFPNOP` exactly where `stalls_automatically_after_mad` says stalling
         misses -- after any MAD-sub-unit instruction (`SFPMAD`, `SFPMUL`, `SFPADD`,
         `SFPMULI`, `SFPADDI`, `SFPMUL24`, `SFPLUT`, `SFPLUTFP32`) -- including across
@@ -630,7 +644,12 @@ Each names the measurement it must move. The Burn-side ones are in
       (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
       `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
       `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPGT` (flags, `VD`), `SFPARECIP`, `SFPNOP`, and the `SETRWC`/`SETC16`
-      forms the builder emits. **Plan change:** each S item adds the models it
+      forms the builder emits; since 10.2a also `SFPLE`, `SFPSWAP` (every
+      contractual mode), `SFPMULI`, `SFPADDI`, `SFPXOR`, `SFPNOT`, `SFPLZ`,
+      `SFPMUL24` (`VC` zero), `SFPCAST` (`_IntFloat`, round to nearest),
+      `SFPCONFIG` (`LReg[11..15]`), `SFPLUT` and `SFPLUTFP32` (every table, its
+      indirect destination included), and the backdoor-load rule (`VD >= 12`
+      refused by name). **Plan change:** each S item adds the models it
       needs, and where a page defines a self-contained C function (`ApproxRecip`,
       `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
       against that C extracted from the pinned page and compiled as `fma.c` is;
@@ -688,6 +707,31 @@ Each names the measurement it must move. The Burn-side ones are in
       the program within one ulp of Flex, at `[37, 70]` and `[96, 128]` with every
       special; `step27_burn_eltwise::division_through_burn_is_within_one_ulp_and_stays_resident`.
       ttsim and both cards. Burn: `float_recip`, `float_div`, `float_div_scalar`.
+- [~] **10.2a The instructions the rest of S2-S4 needs** (`tt_isa::numerics::sfpu`,
+      `tt_kernels::sfpu::{Program, interp}`). Helpers: `Cond::LessEq` (`SFPLE`),
+      `min_max` (`SFPSWAP`), `muli`/`addi` (BF16 immediates, refused otherwise),
+      `xor`, `not`, `leading_zeros`, `mul24` (`VC` the zero constant: anything
+      else adds the page's non-contractual shift-add), `sm32_to_float`,
+      `constant` (F2), `lut`, `lut_fp32` with `LutTable`. **The `SFPLUTFP32`
+      hazard designed out**: `FP16_3ENTRY_TABLE` is `Mod1 = 10`, which includes
+      `INDIRECT_VD`, so the helper loads `VD`'s index into `L7` first (clobbering
+      it) and sets `Mod1Mirror`'s `INDIRECT_VD` to match -- automatic stalling
+      reads the mirror, and with it clear it would assume `L7` unread and miss
+      the `L7` just written. Oracles: `SignMagIsSmaller`, `Lut8ToFp32`,
+      `Lut16ToFp32` held to the pages' own C (now compiled as C++20, since
+      `Lut16ToFp32` uses `std::bit_cast`; every LUT code, and pairs across every
+      sign and exponent class; watched failing with the FP16 bias off by one);
+      `SFPCAST`'s conversion against the host's rounding (400k integers). Gate:
+      `step26_sfpu_isa::every_new_instruction_matches_the_interpreter`, 21 cases
+      over the specials tiles, replayed and unrolled, device equal to the
+      interpreter bit for bit -- among them an `INT32` load and store passing
+      denormals and NaN payloads, both tables of `SFPCONFIG` constants, and the
+      Tier 2 bug measured: `SFPLUTFP32` at `Mod1 = 10` with `L7 = 5` writes `L5`
+      and leaves `VD`. `STEP26_CASE=<name>` runs one case alone, as each new
+      instruction was first run on silicon. Watched failing with `SFPMUL24`'s high
+      half shifted by 22. ttsim runs 17 of the 21 (row 70: `SFPLUTFP32` only at
+      `Mod1` 2 and 6, and no `Mod1Mirror`); silicon all 21, both cards. No program
+      depends on `SFPLUTFP32`: polynomials are `SFPMAD`'s, which ttsim runs.
 - [~] **S4 Transcendentals.** Done: `exp`, `log` (10.1). Range reduction by
       `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`, `SFPSHFT`),
       polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding of `x log2
@@ -897,7 +941,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 |---|---|---|
 | `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 -- closed: the builder inserts the NOP |
 | `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 -- closed: never emitted |
-| `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 |
+| `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 -- closed (10.2a): `Program::lut_fp32` points `L7` at `VD` and sets `Mod1Mirror`; measured on both cards (`step26`) |
 | `SFPSTOCHRND` biased; round-toward-zero sometimes rounds away | Tier 2 | S6 |
 | `SFPCAST_IntAbs` computes absolute value | Tier 2 | S5, S6 |
 | `SFPMUL` with `Mod1 > 1` refused by ttsim; `SFPMAD` spelling used | divergence row 17 | S1 |

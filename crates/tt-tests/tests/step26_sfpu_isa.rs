@@ -295,3 +295,330 @@ fn sfpdivp2_wraps_on_silicon_as_the_page_says() {
         }
     });
 }
+
+/// A 10.2a case: a prologue run once before the row loop (constants), a body
+/// as [`cases`]', and the format A and B are loaded and the result stored in
+/// -- `Int32` for the bit-level ops, so the pass-through of denormals and NaN
+/// payloads is part of the claim.
+struct Case {
+    name: &'static str,
+    prologue: Body,
+    body: Body,
+    fmt: Format,
+    /// ttsim runs it. `SFPLUTFP32` is modelled there only with `Mod1` 2 or 6,
+    /// and an encoding with `Mod1Mirror` set is refused at decode (divergence
+    /// row 70): those cases are silicon's alone.
+    sim: bool,
+}
+
+fn none(_: &mut Program) {}
+
+fn program_with(policy: LoopPolicy, c: &Case) -> Program {
+    let mut p = Program::with_policy(policy);
+    (c.prologue)(&mut p);
+    let (body, fmt) = (c.body, c.fmt);
+    p.for_each_row_group(64, |p, o| {
+        p.load(LReg::L0, fmt, o);
+        p.load(LReg::L1, fmt, 64 + o);
+        body(p);
+        p.store(LReg::L2, fmt, 128 + o);
+    });
+    p
+}
+
+/// The instructions milestone 10.2 adds (`hardware-coverage.md` 10.2a), one
+/// case each, plus the Tier 2 `SFPLUTFP32` destination measured directly.
+fn cases_10_2a() -> Vec<Case> {
+    use tt_kernels::sfpu::{ConfigLReg, LutTable};
+    let c = |name, prologue, body, fmt| Case {
+        name,
+        prologue,
+        body,
+        fmt,
+        sim: true,
+    };
+    let si = |name, prologue, body, fmt| Case {
+        name,
+        prologue,
+        body,
+        fmt,
+        sim: false,
+    };
+    vec![
+        c(
+            "an INT32 load and store pass every bit",
+            none,
+            |p| p.mov(LReg::L0, LReg::L2),
+            Format::Int32,
+        ),
+        c(
+            "less-or-equal, as a flag",
+            none,
+            |p| {
+                p.mov(LReg::L1, LReg::L2);
+                p.if_(Cond::LessEq(LReg::L0, LReg::L1), |p| {
+                    p.mov(LReg::L0, LReg::L2)
+                });
+            },
+            Format::Int32,
+        ),
+        c(
+            "SFPLE writing a mask",
+            none,
+            |p| {
+                p.raw(tt_isa::isa::generated::encode::sfple(1, 0, 8).unwrap());
+                p.mov(LReg::L0, LReg::L2);
+            },
+            Format::Int32,
+        ),
+        c(
+            "min of a swap",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L2);
+                p.mov(LReg::L1, LReg::L3);
+                p.min_max(LReg::L2, LReg::L3);
+            },
+            Format::Int32,
+        ),
+        c(
+            "max of a swap",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                p.mov(LReg::L1, LReg::L2);
+                p.min_max(LReg::L3, LReg::L2);
+            },
+            Format::Int32,
+        ),
+        c(
+            "multiply by a BF16 immediate",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L2);
+                p.muli(-3.0, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        c(
+            "add a BF16 immediate",
+            none,
+            |p| {
+                p.mov(LReg::L1, LReg::L2);
+                p.addi(0.75, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        c(
+            "xor",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L2);
+                p.xor(LReg::L1, LReg::L2);
+            },
+            Format::Int32,
+        ),
+        c("not", none, |p| p.not(LReg::L0, LReg::L2), Format::Int32),
+        c(
+            "leading zeros",
+            none,
+            |p| p.leading_zeros(LReg::L0, false, LReg::L2),
+            Format::Int32,
+        ),
+        c(
+            "leading zeros past the sign",
+            none,
+            |p| p.leading_zeros(LReg::L1, true, LReg::L2),
+            Format::Int32,
+        ),
+        c(
+            "a 23-bit product, low",
+            none,
+            |p| p.mul24(LReg::L0, LReg::L1, false, LReg::L2),
+            Format::Int32,
+        ),
+        c(
+            "a 23-bit product, high",
+            none,
+            |p| p.mul24(LReg::L0, LReg::L1, true, LReg::L2),
+            Format::Int32,
+        ),
+        c(
+            "a sign-magnitude integer to FP32",
+            none,
+            |p| p.sm32_to_float(LReg::L0, LReg::L2),
+            Format::Fp32,
+        ),
+        c(
+            "constants through SFPCONFIG",
+            |p| {
+                p.constant(ConfigLReg::L11, std::f32::consts::PI.to_bits());
+                p.constant(ConfigLReg::L14, 0xc0a0_0001);
+            },
+            |p| {
+                p.mad(LReg::L0, ConfigLReg::L11.lreg(), LReg::L1, LReg::L3);
+                p.add(LReg::L3, ConfigLReg::L14.lreg(), LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        c(
+            "an 8-bit table",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                p.loadi_bits(LReg::L0, 0x1a2b);
+                p.loadi_bits(LReg::L1, 0x9c05);
+                p.loadi_bits(LReg::L2, 0x37ff);
+                p.lut(true, LReg::L4);
+                p.mov(LReg::L4, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        si(
+            "an FP32 table",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                for (r, v) in [
+                    (0, 0.5f32),
+                    (1, -1.25),
+                    (2, 3.0),
+                    (4, 0.125),
+                    (5, 2.0),
+                    (6, -0.75),
+                ] {
+                    p.loadi(LReg::general(r).unwrap(), v);
+                }
+                p.lut_fp32(LutTable::Fp32, false, LReg::L7);
+                p.mov(LReg::L7, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        c(
+            "a six-entry FP16 table",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                for (r, v) in [
+                    (0, 0x3c00_b800u32),
+                    (1, 0x4100_3555),
+                    (2, 0xc200_0001),
+                    (4, 0x2e66_3a00),
+                    (5, 0xbc01_7bff),
+                    (6, 0x0400_fc00),
+                ] {
+                    p.loadi_bits(LReg::general(r).unwrap(), v);
+                }
+                p.lut_fp32(LutTable::Fp16Six { to_four: false }, true, LReg::L7);
+                p.mov(LReg::L7, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        si(
+            "a six-entry FP16 table split at 4.0",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                for (r, v) in [
+                    (0, 0x3c00_b800u32),
+                    (1, 0x4100_3555),
+                    (2, 0xc200_0001),
+                    (4, 0x2e66_3a00),
+                    (5, 0xbc01_7bff),
+                    (6, 0x0400_fc00),
+                ] {
+                    p.loadi_bits(LReg::general(r).unwrap(), v);
+                }
+                p.lut_fp32(LutTable::Fp16Six { to_four: true }, false, LReg::L7);
+                p.mov(LReg::L7, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        si(
+            "a three-entry FP16 table, the hazard designed out",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                for (r, v) in [(0, 0x3c00_b800u32), (1, 0x4100_3555), (2, 0xc200_7c00)] {
+                    p.loadi_bits(LReg::general(r).unwrap(), v);
+                }
+                p.lut_fp32(LutTable::Fp16Three, false, LReg::L2);
+            },
+            Format::Fp32,
+        ),
+        si(
+            "the FP16 three-entry table writes LReg[LReg[7] & 15], not VD (Tier 2)",
+            none,
+            |p| {
+                p.mov(LReg::L0, LReg::L3);
+                for (r, v) in [(0, 0x3c00_b800u32), (1, 0x4100_3555), (2, 0xc200_7c00)] {
+                    p.loadi_bits(LReg::general(r).unwrap(), v);
+                }
+                p.mov(LReg::L1, LReg::L2);
+                p.loadi_bits(LReg::L5, 0);
+                p.loadi_bits(LReg::L7, 5);
+                // `VD = 2`, `Mod1 = 10`, the mirror matching: the result lands in
+                // `L5`, and `L2` keeps B.
+                p.raw(tt_isa::isa::generated::encode::sfplutfp32(8, 2, 10).unwrap());
+                p.xor(LReg::L5, LReg::L2);
+            },
+            Format::Int32,
+        ),
+    ]
+}
+
+/// The 10.2a instructions against the interpreter, replayed and unrolled.
+/// `STEP26_CASE=<substring>` runs only the matching cases -- how each new
+/// instruction is first run alone on silicon, on a healthy gate tile, before
+/// any kernel uses it.
+#[test]
+fn every_new_instruction_matches_the_interpreter() {
+    let (a, b) = (operands(7), operands(11));
+    let only = std::env::var("STEP26_CASE").ok();
+    let cases: Vec<Case> = cases_10_2a()
+        .into_iter()
+        .filter(|c| only.as_deref().is_none_or(|o| c.name.contains(o)))
+        .filter(|c| c.sim || cfg!(feature = "silicon"))
+        .collect();
+    assert!(!cases.is_empty(), "STEP26_CASE={only:?} matches no case");
+    harness::in_device(|dev| {
+        for c in &cases {
+            let mut want: Option<Vec<u32>> = None;
+            for policy in [LoopPolicy::Replay, LoopPolicy::Unrolled] {
+                let p = program_with(policy, c);
+                let form = p.loops()[0];
+                if policy == LoopPolicy::Replay {
+                    assert!(
+                        matches!(form, LoopForm::Replayed { .. }),
+                        "{}: {form:?}",
+                        c.name
+                    );
+                }
+                let math = p.finish();
+                let mut v = Vector::new();
+                v.put_tile(0, &a);
+                v.put_tile(64, &b);
+                v.run(&math).unwrap_or_else(|e| panic!("{}: {e}", c.name));
+                let model = v.tile(128);
+                if let Some(w) = &want {
+                    assert_eq!(
+                        &model, w,
+                        "{}: the model differs replayed and unrolled",
+                        c.name
+                    );
+                }
+                let got = on_device(dev, &math, &a, &b);
+                for (i, (g, w)) in got.iter().zip(&model).enumerate() {
+                    assert_eq!(
+                        g, w,
+                        "{} ({form:?}): datum {i}: device {g:#010x}, model {w:#010x} \
+                         (a {:#010x}, b {:#010x})",
+                        c.name, a[i], b[i]
+                    );
+                }
+                println!("{}: {form:?}, 1024 datums", c.name);
+                want = Some(model);
+            }
+        }
+    });
+}

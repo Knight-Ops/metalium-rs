@@ -87,6 +87,8 @@ pub enum Cond {
     /// the total order `-NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN`
     /// (Blackhole's `SFPGT`, `SFPGT_MOD1_SET_CC`).
     Less(LReg, LReg),
+    /// `a <= b` in the same order (Blackhole's `SFPLE`, `SFPLE_MOD1_SET_CC`).
+    LessEq(LReg, LReg),
 }
 
 impl Cond {
@@ -98,6 +100,8 @@ impl Cond {
             Cond::Gte0(r) => (r, 4),
             Cond::Eq0(r) => (r, 6),
             Cond::Less(a, b) => return encode::sfpgt(a.index(), b.index(), 1).unwrap(),
+            // `SFPLE` holds where `VD <= VC`.
+            Cond::LessEq(a, b) => return encode::sfple(b.index(), a.index(), 1).unwrap(),
         };
         encode::sfpsetcc(0, vc.index(), 0, mod1).unwrap()
     }
@@ -393,6 +397,128 @@ impl Program {
         self.push(encode::sfptransp(0).unwrap());
     }
 
+    /// `lo, hi = min(lo, hi), max(lo, hi)` lanewise, in the sign-magnitude
+    /// order of [`Cond::Less`] -- so `-0 < +0` and NaNs sort to the ends by
+    /// sign: not IEEE's `min`/`max` (`SFPSWAP_MOD1_VEC_MIN_MAX`). Equal values
+    /// are swapped where negative, which leaves the same bits.
+    pub fn min_max(&mut self, lo: LReg, hi: LReg) {
+        assert!(lo != hi);
+        self.push(encode::sfpswap(hi.index(), Self::dst(lo), 1).unwrap());
+    }
+
+    /// `d = d * imm`, `imm` a BF16 constant, by `SFPMAD`'s arithmetic with a
+    /// `+0` addend (`SFPMULI`) -- so a `-0` product comes out `+0`; use
+    /// [`Program::mul`] where that sign matters.
+    pub fn muli(&mut self, imm: f32, d: LReg) {
+        self.push(encode::sfpmuli(bf16(imm), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = d + imm`, `imm` a BF16 constant (`SFPADDI`).
+    pub fn addi(&mut self, imm: f32, d: LReg) {
+        self.push(encode::sfpaddi(bf16(imm), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = d ^ c`, bitwise (`SFPXOR`, which takes `VD` as its other operand).
+    pub fn xor(&mut self, c: LReg, d: LReg) {
+        self.push(encode::sfpxor(c.index(), Self::dst(d)).unwrap());
+    }
+
+    /// `d = !s`, bitwise (`SFPNOT`).
+    pub fn not(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpnot(s.index(), Self::dst(d)).unwrap());
+    }
+
+    /// `d` = the leading zeros of `s`'s 32 bits, 32 for zero; of its low 31
+    /// if `ignore_sign` (`SFPLZ`, flags untouched).
+    pub fn leading_zeros(&mut self, s: LReg, ignore_sign: bool, d: LReg) {
+        let mod1 = if ignore_sign { 4 } else { 0 };
+        self.push(encode::sfplz(s.index(), Self::dst(d), mod1).unwrap());
+    }
+
+    /// `d` = the product of `a` and `b`'s low 23 bits: its low 23 bits, or if
+    /// `upper` the 23 above them (`SFPMUL24`, Blackhole only). `VC` is always
+    /// the zero constant -- any other value adds the page's
+    /// `NonContractualBehavior` shift-add, so it is not offered.
+    pub fn mul24(&mut self, a: LReg, b: LReg, upper: bool, d: LReg) {
+        let i = encode::Sfpmul24::ZERO
+            .va(a.index())
+            .vb(b.index())
+            .vc(LReg::ZERO.index())
+            .vd(Self::dst(d))
+            .mod1(u32::from(upper))
+            .encode()
+            .unwrap();
+        self.push(i);
+    }
+
+    /// `d` = the sign-magnitude integer in `s` as FP32, rounded to nearest
+    /// even (`SFPCAST_MOD1_SM32_TO_FP32_RNE`). A two's-complement integer
+    /// needs its magnitude and sign separated first.
+    pub fn sm32_to_float(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpcast(s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `c = bits` in every lane, for the rest of the program: the F2 prologue
+    /// for constants past the eight general registers (`SFPCONFIG` writing
+    /// `LReg[11..15]` from `LReg[0]`). **Uses `L0`**, so it belongs before the
+    /// program loads anything; and outside any scope, because `SFPCONFIG`
+    /// takes both its value and its predication from lanes 0..8 alone. Every
+    /// program writes the constants it reads: the interpreter starts these
+    /// registers unknown, so a program relying on one an earlier program left
+    /// (concepts review G11) is refused there.
+    pub fn constant(&mut self, c: ConfigLReg, bits: u32) {
+        assert_eq!(
+            self.depth, 0,
+            "SFPCONFIG inside a scope sees lanes 0..8's flags only"
+        );
+        self.loadi_bits(LReg::L0, bits);
+        self.push(encode::sfpconfig(0, c.lreg().index(), 0).unwrap());
+    }
+
+    /// `d = Lut8(c >> 8) * |L3| + Lut8(c)`, `c` being `L0` where `|L3| < 1`,
+    /// `L1` where `< 2` and `L2` otherwise, each holding two
+    /// [`tt_isa::numerics::sfpu::lut8_to_fp32`] codes; `L3`'s sign kept if
+    /// `retain_sign` (`SFPLUT`). The four registers are implied operands.
+    pub fn lut(&mut self, retain_sign: bool, d: LReg) {
+        let mod0 = if retain_sign { 4 } else { 0 };
+        self.push(encode::sfplut(Self::dst(d), mod0).unwrap());
+    }
+
+    /// `d = a * |L3| + c` with `(a, c)` from the table for `|L3|`'s range
+    /// (`SFPLUTFP32`, `table` saying where and in what format). `L3`'s sign
+    /// kept if `retain_sign`.
+    ///
+    /// The Tier 2 hazard is designed out here. `FP16_3ENTRY_TABLE` is
+    /// `Mod1 = 10`, which includes `INDIRECT_VD`, so the hardware writes
+    /// `LReg[LReg[7] & 15]` and not `VD`. For that table this method loads
+    /// `d`'s index into `L7` first, so the two are the same register: **`L7`
+    /// is clobbered**. It also sets the encoding's `Mod1Mirror` to match.
+    /// Automatic stalling reads `Mod1Mirror`, and with its `INDIRECT_VD` bit
+    /// clear it would assume `L7` is not read, so it would miss the `L7` just
+    /// written.
+    pub fn lut_fp32(&mut self, table: LutTable, retain_sign: bool, d: LReg) {
+        use tt_isa::numerics::sfpu::lutfp32_mod1 as m;
+        let vd = Self::dst(d);
+        let mut mod1 = match table {
+            LutTable::Fp32 => m::FP32_3ENTRY_TABLE,
+            LutTable::Fp16Six { to_four } => {
+                if to_four {
+                    m::FP16_6ENTRY_TABLE2
+                } else {
+                    m::FP16_6ENTRY_TABLE1
+                }
+            }
+            LutTable::Fp16Three => {
+                self.push(enc::loadi(7, enc::loadi_mode::USHORT, vd).unwrap());
+                m::FP16_3ENTRY_TABLE
+            }
+        };
+        if retain_sign {
+            mod1 |= m::SGN_RETAIN;
+        }
+        self.push(encode::sfplutfp32(mod1 & m::INDIRECT_VD, vd, mod1).unwrap());
+    }
+
     /// `d = ApproxRecip(|x|)` with `x`'s sign (`SFPARECIP`, Blackhole only):
     /// within 0.56% of `1/x` for `2^-126 <= |x| < 2^126`, infinite below and
     /// zero above.
@@ -573,6 +699,26 @@ impl Program {
     }
 }
 
+/// Where [`Program::lut_fp32`] finds its coefficients `(a, c)` for `|L3|`'s
+/// range `i` (0: below 1.0, 1: below 2.0, 2: above).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LutTable {
+    /// `a = L[i]`, `c = L[4 + i]`, FP32.
+    Fp32,
+    /// Six FP16-ish pairs: `L[i]` and `L[4 + i]` each hold two halves, the
+    /// half chosen by a further split at 0.5, 1.5, and 3.0 (`to_four`: 4.0).
+    Fp16Six { to_four: bool },
+    /// Three FP16-ish pairs, `a` and `c` the halves of `L[i]` (clobbers `L7`).
+    Fp16Three,
+}
+
+/// The BF16 immediate of an `f32` that is one, or a panic while building.
+fn bf16(v: f32) -> u32 {
+    let b = v.to_bits();
+    assert_eq!(b & 0xffff, 0, "{v} is not a BF16 value");
+    b >> 16
+}
+
 fn is_mad_unit(i: &Instruction) -> bool {
     matches!(
         i.def().mnemonic(),
@@ -651,6 +797,49 @@ mod tests {
         assert_eq!(nops.len(), 1, "{m:?}");
         assert_eq!(m[nops[0] + 1], "SFPIADD");
         assert!(matches!(m[nops[0] - 1], "SFPMAD" | "SFPADD"));
+    }
+
+    /// The FP16 three-entry table is `Mod1 = 10`, which includes
+    /// `INDIRECT_VD`: the builder points `L7` at `VD` first and sets the
+    /// mirror so stalling sees `L7` read. The other tables do neither.
+    #[test]
+    fn the_indirect_lut_points_l7_at_its_destination_and_says_so() {
+        let mut p = Program::new();
+        p.lut_fp32(LutTable::Fp16Three, false, LReg::L2);
+        p.lut_fp32(LutTable::Fp32, true, LReg::L4);
+        let ins = p.finish();
+        let i = ins
+            .iter()
+            .position(|i| i.def().mnemonic() == "SFPLUTFP32")
+            .unwrap();
+        let loadi = ins[i - 1];
+        assert_eq!(loadi.def().mnemonic(), "SFPLOADI");
+        assert_eq!(
+            (loadi.operand("VD"), loadi.operand("Imm16")),
+            (Some(7), Some(2))
+        );
+        assert_eq!(ins[i].operand("Mod1"), Some(10));
+        assert_eq!(ins[i].operand("Mod1Mirror"), Some(8));
+        let j = ins
+            .iter()
+            .rposition(|i| i.def().mnemonic() == "SFPLUTFP32")
+            .unwrap();
+        assert_eq!(ins[j].operand("Mod1"), Some(4));
+        assert_eq!(ins[j].operand("Mod1Mirror"), Some(0));
+        assert_ne!(ins[j - 1].def().mnemonic(), "SFPLOADI");
+    }
+
+    #[test]
+    #[should_panic(expected = "lanes 0..8")]
+    fn a_constant_inside_a_scope_is_refused() {
+        let mut p = Program::new();
+        p.if_(Cond::Lt0(LReg::L0), |p| p.constant(ConfigLReg::L12, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a BF16 value")]
+    fn an_immediate_that_is_not_bf16_is_refused() {
+        Program::new().muli(1.1, LReg::L0);
     }
 
     #[test]
