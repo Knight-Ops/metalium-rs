@@ -304,6 +304,34 @@ reverse index.
         healthy tile: the one attempt, an `UNVERIFIED` `UNPACR_NOP_SETDVALID` on the
         wedged tile, took the host down.
 
+### Performance follow-ups (measured, not yet scheduled)
+
+From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` rows V-Z;
+`tt-mnist` and `tt-mnist --infer` print the host-side split, `TT_PROFILE` the device's).
+Each names the measurement it must move. The Burn-side ones are in
+`burn-backend-parity.md` (B5, B8, B16).
+
+- [ ] **X6 A fast path for the mover's requests.** A GDDR read costs ~0.46 us an entry
+      however small (row W after row Y), and a matmul gather is one entry per tile: a
+      record should issue its moves straight to the NIU -- validated once per record,
+      not re-encoded and decoded per tile -- and write only the NIU registers that
+      change between requests (tt-metal's `*_set_state`/`*_with_state` pattern; the
+      register persistence to be checked on ttsim and in a gate first). Moves:
+      `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
+      the gather's share of a step (row V: 0.94 ms of 2.4).
+- [ ] **X7 Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
+      a call and a download of the same ~140 us past its sync (rows Z, measurement M:
+      uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
+      a tensor touches). Batch the read-backs per tensor, not per channel write; read
+      small tensors with the widest loads the BAR allows. Moves: per-call `upload` and
+      `download` in `tt-mnist`'s breakdown.
+- [ ] **X4d Traces** (above) are here too: worth ~0.2 ms a step at most until X6 and
+      B8 shrink the rest (row V).
+- Moved to Burn's roadmap with the numbers: **B8** async calls (a call's server round
+  trip is 32-49 us, ~0.2 ms of a 0.61 ms inference batch); **B5/D4** a slice not on a
+  tile row (batch 1000 inference: 46 ms a batch, 3 MB re-uploaded each); **B16** the loss
+  on the device for a small tensor now that ops do not wait one by one.
+
 ### P — Prerequisites pulled in when they block
 
 - [~] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
