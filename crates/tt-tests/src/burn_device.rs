@@ -222,6 +222,25 @@ fn attach_engine(
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }
+        fn begin_trace(&mut self) -> Result<(), EngineError> {
+            self.buffers.begin_trace(&mut self.session)
+        }
+        fn end_trace(&mut self) -> Result<u64, EngineError> {
+            self.buffers.end_trace(&mut self.session)
+        }
+        fn run_trace(
+            &mut self,
+            trace: u64,
+            input: burn_tt::BufferId,
+            values: &[f32],
+            output: burn_tt::BufferId,
+        ) -> Result<Vec<f32>, EngineError> {
+            self.buffers
+                .run_trace(&mut self.session, trace, input, values, output)
+        }
+        fn release_trace(&mut self, trace: u64) {
+            self.buffers.release_trace(&mut self.session, trace)
+        }
         fn matmul(
             &mut self,
             a: &[f32],

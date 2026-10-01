@@ -40,12 +40,16 @@ pub const IMAGES: Region = Region {
     end: tensix::Core::NC.default_reset_pc() as u64 + 0x2000,
 };
 
-/// The data mover's descriptor list and its transpose scratch slot.
+/// The data mover's descriptor list, its transpose scratch slot, and the
+/// chunk a trace streams through (`dm::op::CALL`).
 pub const MOVER: Region = Region {
-    name: "mover list and scratch",
+    name: "mover list, scratch and trace chunk",
     base: dm::LIST,
-    end: dm::SCRATCH + dm::TILE_SLOT,
+    end: dm::TRACE_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES,
 };
+
+const _: () = assert!(dm::SCRATCH + dm::TILE_SLOT <= dm::TRACE_CHUNK);
+const _: () = assert!(dm::TRACE_CHUNK % 16 == 0);
 
 /// The data arena: every kernel's operands, results, staging and circular
 /// buffers, placed by `tt_kernels::l1`.

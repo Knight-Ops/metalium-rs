@@ -438,9 +438,17 @@ pub const PACK_ADDR_MOD_NEXT_GROUP: u32 = 1;
 /// A final partial group gets the mask `(1 << remaining) - 1`, as `PACR.md`
 /// recommends. Runs on the pack thread, whose `ThreadConfig` it sets.
 pub fn pack_rows(rows: u32) -> Vec<Instruction> {
+    crate::loops::Item::unrolled(&pack_rows_items(rows))
+}
+
+/// [`pack_rows`] as loop items: every group's `PACR` but the last is the same
+/// word, so the groups are one `Repeat` (`crate::loops`), which a `MOP` takes
+/// in two words.
+pub fn pack_rows_items(rows: u32) -> Vec<crate::loops::Item> {
+    use crate::loops::Item;
     assert!(rows > 0, "nothing to pack");
     let groups = rows.div_ceil(4);
-    let mut p = vec![
+    let mut p: Vec<Item> = [
         state_id(),
         thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0),
         thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4),
@@ -452,24 +460,32 @@ pub fn pack_rows(rows: u32) -> Vec<Instruction> {
             .y0_val(0)
             .encode()
             .unwrap(),
-    ];
-    for g in 0..groups {
-        let last = g + 1 == groups;
-        let remaining = rows - 4 * g;
-        let mask = if remaining >= 4 {
-            0b1111
-        } else {
-            (1 << remaining) - 1
-        };
-        p.push(
-            encode::Pacr::ZERO
-                .read_intf_sel(mask)
-                .addr_mod(if last { 0 } else { PACK_ADDR_MOD_NEXT_GROUP })
-                .last(u32::from(last))
-                .encode()
-                .unwrap(),
-        );
+    ]
+    .into_iter()
+    .map(Item::I)
+    .collect();
+    let pacr = |mask: u32, last: bool| {
+        encode::Pacr::ZERO
+            .read_intf_sel(mask)
+            .addr_mod(if last { 0 } else { PACK_ADDR_MOD_NEXT_GROUP })
+            .last(u32::from(last))
+            .encode()
+            .unwrap()
+    };
+    // Every group but the last is whole (rows are packed from row 0).
+    if groups > 1 {
+        p.push(Item::Repeat {
+            times: groups - 1,
+            body: vec![Item::I(pacr(0b1111, false))],
+        });
     }
+    let remaining = rows - 4 * (groups - 1);
+    let mask = if remaining >= 4 {
+        0b1111
+    } else {
+        (1 << remaining) - 1
+    };
+    p.push(Item::I(pacr(mask, true)));
     p
 }
 

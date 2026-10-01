@@ -101,6 +101,31 @@ pub trait Engine {
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         None
     }
+    /// Start capturing a trace (`tt_kernels::trace`; [`crate::Trace`]).
+    fn begin_trace(&mut self) -> Result<(), EngineError> {
+        Err(no_traces())
+    }
+    /// End it: the trace's number.
+    fn end_trace(&mut self) -> Result<u64, EngineError> {
+        Err(no_traces())
+    }
+    /// Overwrite `input`'s values, replay `trace`, and read `output` back:
+    /// one round trip.
+    fn run_trace(
+        &mut self,
+        _trace: u64,
+        _input: BufferId,
+        _values: &[f32],
+        _output: BufferId,
+    ) -> Result<Vec<f32>, EngineError> {
+        Err(no_traces())
+    }
+    /// Give a trace back.
+    fn release_trace(&mut self, _trace: u64) {}
+}
+
+fn no_traces() -> EngineError {
+    EngineError("this engine does not capture traces".into())
 }
 
 fn unsupported() -> EngineError {
@@ -117,9 +142,52 @@ pub type BufferId = u64;
 pub struct DramBuffers {
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
+    next_trace: u64,
+    traces: HashMap<u64, tt_kernels::trace::TraceId>,
 }
 
 impl DramBuffers {
+    pub fn begin_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<(), EngineError> {
+        s.begin_trace().map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn end_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<u64, EngineError> {
+        let id = s.end_trace().map_err(|e| EngineError(e.to_string()))?;
+        self.next_trace += 1;
+        self.traces.insert(self.next_trace, id);
+        Ok(self.next_trace)
+    }
+
+    pub fn run_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        trace: u64,
+        input: BufferId,
+        values: &[f32],
+        output: BufferId,
+    ) -> Result<Vec<f32>, EngineError> {
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        s.write(self.get(input)?, values).map_err(e)?;
+        s.replay(id).map_err(e)?;
+        s.download(self.get(output)?).map_err(e)
+    }
+
+    pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
+        if let Some(id) = self.traces.remove(&trace) {
+            let _ = s.release_trace(id);
+        }
+    }
+
     pub fn upload<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -629,6 +697,29 @@ impl Engine for KmdEngine {
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
+    }
+    fn begin_trace(&mut self) -> Result<(), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace(&mut self.session)
+    }
+    fn end_trace(&mut self) -> Result<u64, EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.end_trace(&mut self.session)
+    }
+    fn run_trace(
+        &mut self,
+        trace: u64,
+        input: BufferId,
+        values: &[f32],
+        output: BufferId,
+    ) -> Result<Vec<f32>, EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.run_trace(&mut self.session, trace, input, values, output)
+    }
+    fn release_trace(&mut self, trace: u64) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.release_trace(&mut self.session, trace);
+        }
     }
 }
 

@@ -47,6 +47,14 @@ pub enum TensorError {
     },
     /// Shapes that do not compose, or an op this path does not support.
     Shape(String),
+    /// A trace refused (`crate::trace`).
+    Trace(crate::trace::TraceError),
+}
+
+impl From<crate::trace::TraceError> for TensorError {
+    fn from(e: crate::trace::TraceError) -> Self {
+        TensorError::Trace(e)
+    }
 }
 
 impl From<TransportError> for TensorError {
@@ -75,6 +83,7 @@ impl std::fmt::Display for TensorError {
                 write!(f, "no room in GDDR for {slots} tile slots per channel")
             }
             TensorError::Shape(s) => write!(f, "{s}"),
+            TensorError::Trace(e) => write!(f, "{e}"),
         }
     }
 }
@@ -118,6 +127,39 @@ impl Placement {
     pub fn tiles(&self) -> usize {
         self.tiles
     }
+
+    /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
+    pub(crate) fn region(&self) -> Option<DramRange> {
+        match self.channels[..] {
+            [c] => c.range(self.base[0], self.slots * TILE_SLOT),
+            _ => None,
+        }
+    }
+}
+
+/// Where a [`DramAlloc`]'s free space was at one moment: what a trace was
+/// captured against (`crate::trace`).
+#[derive(Clone, Debug)]
+pub(crate) struct FreeSnapshot {
+    channels: Vec<DramChannel>,
+    free: Vec<BTreeMap<u64, u64>>,
+}
+
+impl FreeSnapshot {
+    /// Were all of `p`'s slots free then -- so allocated since, and nothing
+    /// captured then can name them?
+    pub(crate) fn was_free(&self, p: &Placement) -> bool {
+        p.channels.iter().zip(&p.base).all(|(c, &at)| {
+            let len = p.slots * TILE_SLOT;
+            let Some(i) = self.channels.iter().position(|k| k == c) else {
+                return false;
+            };
+            self.free[i]
+                .range(..=at)
+                .next_back()
+                .is_some_and(|(&start, &l)| at + len <= start + l)
+        })
+    }
 }
 
 /// A first-fit allocator of slot regions, one free list per channel.
@@ -141,6 +183,34 @@ impl DramAlloc {
             .map(|_| BTreeMap::from([(0, usable)]))
             .collect();
         DramAlloc { channels, free }
+    }
+
+    /// `bytes` contiguous on channel `channel` (an index into the chip's
+    /// channels), in whole slots: a trace's stream (`crate::trace`).
+    pub fn alloc_on(&mut self, channel: usize, bytes: u64) -> Result<Placement> {
+        let n = self.channels.len();
+        if channel >= n {
+            return Err(TensorError::Shape(format!("channel {channel} of {n}")));
+        }
+        let slots = bytes.div_ceil(TILE_SLOT).max(1);
+        let len = slots * TILE_SLOT;
+        let Some((&at, &free)) = self.free[channel].iter().find(|(_, &l)| l >= len) else {
+            return Err(TensorError::Shape(format!(
+                "no {len} contiguous bytes left on channel {channel}"
+            )));
+        };
+        self.free[channel].remove(&at);
+        if free > len {
+            self.free[channel].insert(at + len, free - len);
+        }
+        Ok(Placement {
+            channels: vec![self.channels[channel]],
+            base: vec![at],
+            slots,
+            tiles: 1,
+            first: 0,
+            owned: true,
+        })
     }
 
     /// Room for `tiles` tile slots, interleaved.
@@ -178,9 +248,28 @@ impl DramAlloc {
         if !p.owned {
             return;
         }
-        for (i, &b) in p.base.iter().enumerate() {
+        // By channel, not position: an `alloc_on` placement has one.
+        for (c, &b) in p.channels.iter().zip(&p.base) {
+            let i = self
+                .channels
+                .iter()
+                .position(|k| k == c)
+                .expect("a placement's channel is the allocator's");
             release(&mut self.free[i], b, p.slots * TILE_SLOT);
         }
+    }
+
+    /// Where the free space is now ([`FreeSnapshot`]).
+    pub(crate) fn snapshot(&self) -> FreeSnapshot {
+        FreeSnapshot {
+            channels: self.channels.clone(),
+            free: self.free.clone(),
+        }
+    }
+
+    /// The chip's usable channels, in the allocator's order.
+    pub(crate) fn channel_count(&self) -> usize {
+        self.channels.len()
     }
 
     /// Free bytes on the fullest channel.
@@ -328,6 +417,33 @@ impl DramTensor {
             )));
         }
         let t = Self::alloc(alloc, rows, cols)?;
+        t.write(dev, w, values)?;
+        Ok(t)
+    }
+
+    /// Overwrite every datum of this tensor, in its own slots: a trace's input
+    /// between replays (`crate::trace`). The padding becomes zero, as an
+    /// upload's. A view (rows of another tensor) is refused: its slots are
+    /// someone else's.
+    pub fn write<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+        values: &[f32],
+    ) -> Result<()> {
+        let (rows, cols) = (self.rows, self.cols);
+        if values.len() != rows * cols {
+            return Err(TensorError::Shape(format!(
+                "{} values for a [{rows}, {cols}] tensor",
+                values.len()
+            )));
+        }
+        if !self.placement.owned {
+            return Err(TensorError::Shape(
+                "a view's slots are another tensor's: write that one".into(),
+            ));
+        }
+        let t = self;
         let (images, _) = matmul::tilize_f32(values, rows.max(1), cols.max(1), L1Format::Fp32);
         let img = matmul::TILE_IMAGE_BYTES;
         let per = t.placement.channels.len();
@@ -353,7 +469,7 @@ impl DramTensor {
         }
         // `tilize_f32` pads with zeros.
         t.set_pad(Pad::Zero);
-        Ok(t)
+        Ok(())
     }
 
     /// Rows `[first_row, first_row + rows)` of this tensor, all columns, as a
@@ -485,6 +601,9 @@ pub enum Step {
     Kernel {
         roles: Arc<[Vec<Instruction>; 3]>,
         init: Vec<crate::runtime::SemaphoreInit>,
+        /// Each role's MOP Expander configuration (`runtime::Kernel::mop`):
+        /// the kernels of one list share it, so a list ends where it changes.
+        mop: Box<[Option<tt_isa::frontend::mop::MopConfig>; 3]>,
     },
 }
 
@@ -552,6 +671,7 @@ pub fn matmul_dram(
     route: SrcRoute,
     fidelity: Fidelity,
     units: usize,
+    allow_mop: bool,
 ) -> Result<Work> {
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
@@ -618,9 +738,10 @@ pub fn matmul_dram(
                 rb.encode()[0],
                 rb.encode()[1],
             ];
-            let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
-                matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
-            });
+            let (roles, mop) =
+                matmul::kernel_programs(tiles, route, fidelity, sems, allow_mop, || {
+                    matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop)
+                });
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
             // The outputs sit one slot apart from the first (`plan_layout_in`).
@@ -648,7 +769,11 @@ pub fn matmul_dram(
                     what: "matmul gather",
                     entries: gather.to_vec(),
                 },
-                Step::Kernel { roles, init },
+                Step::Kernel {
+                    roles,
+                    init,
+                    mop: Box::new(mop),
+                },
                 Step::List {
                     what: "matmul scatter",
                     entries: scatter.to_vec(),
@@ -938,6 +1063,7 @@ pub fn sfpu_eltwise(
             Step::Kernel {
                 roles,
                 init: layout.init.clone(),
+                mop: Box::new([None; 3]),
             },
             Step::List {
                 what: "sfpu scatter",
@@ -1134,6 +1260,7 @@ pub fn sfpu_reduce(
             Step::Kernel {
                 roles,
                 init: layout.init.clone(),
+                mop: Box::new([None; 3]),
             },
             Step::List {
                 what: "reduce scatter",
@@ -1467,7 +1594,7 @@ mod tests {
                     }
                     after_list = true;
                 }
-                Step::Kernel { roles, init } => {
+                Step::Kernel { roles, init, .. } => {
                     let mut k: Vec<u32> = roles.iter().map(|p| p.len() as u32).collect();
                     k.extend(
                         init.iter()
@@ -1526,8 +1653,9 @@ mod tests {
                     let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[sa, sb]);
                     let route = SrcRoute::Tf32FromFp32;
                     let f = Fidelity::HiFi4;
-                    let got = super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units)
-                        .unwrap();
+                    let got =
+                        super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false)
+                            .unwrap();
                     let want =
                         reference::matmul_dram(&mut a2, &t2[0], ta, &t2[1], tb, route, f, units)
                             .unwrap();
@@ -1884,7 +2012,11 @@ mod reference {
                         what: "matmul gather",
                         entries: list,
                     },
-                    Step::Kernel { roles, init },
+                    Step::Kernel {
+                        roles,
+                        init,
+                        mop: Box::new([None; 3]),
+                    },
                     Step::List {
                         what: "matmul scatter",
                         entries: back,

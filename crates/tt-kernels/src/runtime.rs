@@ -571,6 +571,9 @@ pub struct Resident<N: NocId> {
     /// Every run's roles record their progress through the timestamper, into
     /// a stream the host configured and drains itself (`crate::profile`).
     profiling: bool,
+    /// The last setup run's generation and program, until taken: a trace's
+    /// capture records it as a kernel of its own (`crate::trace`).
+    last_setup: Option<(u32, Vec<Instruction>)>,
     /// Kernels [`Resident::reserve`]d and not yet closed, oldest first: their
     /// lists may be queued on the mover behind one another.
     reservations: std::collections::VecDeque<Stopwatch>,
@@ -595,6 +598,7 @@ impl<N: NocId> Resident<N> {
             slots: Default::default(),
             semaphores: None,
             semaphores_after: None,
+            last_setup: None,
             descriptors: Default::default(),
             pending: None,
             profiling: false,
@@ -817,6 +821,60 @@ impl<N: NocId> Resident<N> {
     }
 
     /// Kernels reserved and not yet closed.
+    /// `n` generations no kernel has had, for a trace's replay
+    /// (`crate::trace`): the first of them, the next kernel's after the last.
+    pub fn take_generations(&mut self, n: u32) -> u32 {
+        let first = self.generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(n);
+        first
+    }
+
+    /// The setup run [`Resident::reserve`] did last, if any since the last
+    /// call: its generation and its thread-0 program.
+    pub fn take_setup_run(&mut self) -> Option<(u32, Vec<Instruction>)> {
+        self.last_setup.take()
+    }
+
+    /// The last generation handed out.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// A replay wrote the roles' descriptors and ran its kernels without the
+    /// host (`crate::trace`): what this side remembers of the tile -- the
+    /// descriptor words, the semaphores -- is no longer known, so the next
+    /// kernel writes and sets up everything.
+    pub fn forget_tile_state(&mut self) {
+        *self.descriptors.borrow_mut() = [None; 3];
+        self.semaphores = None;
+        self.semaphores_after = None;
+    }
+
+    /// Role `thread`'s descriptor as a resident kernel runs it from a list:
+    /// what [`Resident::reserve`] writes, but for the program's address and
+    /// length, which the `KERNEL` entry writes on the tile. A trace stores it
+    /// as `POKE` entries (`crate::trace`).
+    pub fn queued_descriptor<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        kernel: &Kernel<'_>,
+        thread: usize,
+    ) -> Result<mailbox::Descriptor, RunError> {
+        let push_window = if dev.transport().is_simulated() {
+            mailbox::SIM_PUSH_WINDOW
+        } else {
+            0
+        };
+        Ok(mailbox::Descriptor {
+            thread_index: thread as u32,
+            dst_access_fmt: kernel.dst_fmt,
+            trace: u32::from(kernel.trace || self.profiling),
+            push_window,
+            mop_cfg: kernel.mop_words(thread)?,
+            ..Default::default()
+        })
+    }
+
     pub fn reserved(&self) -> usize {
         self.reservations.len()
     }
@@ -911,6 +969,7 @@ impl<N: NocId> Resident<N> {
         });
         if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
+            self.last_setup = Some((self.generation, setup.clone()));
             self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true, false, None)?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {

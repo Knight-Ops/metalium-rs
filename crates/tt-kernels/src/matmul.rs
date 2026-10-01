@@ -234,6 +234,7 @@ fn math_addr_mods() -> Vec<Instruction> {
 use crate::loops::Item;
 use tt_isa::backend::{self, Before};
 use tt_isa::cfg::generated::thcon;
+use tt_isa::frontend::mop::MopConfig;
 use tt_isa::matrix::{Banks, Loaded};
 use tt_isa::sync::{self, Semaphore, Unit};
 use tt_isa::tile::TileDescriptor;
@@ -524,7 +525,35 @@ pub fn matmul_roles(
     // `REPLAY` alone for now: a kernel step does not carry a MOP
     // configuration to the roles' mailboxes yet (X2b).
     let lower = |items: &[Item]| crate::loops::lower_with(items, false).words;
-    [lower(&unpack), lower(&math), Item::unrolled(&pack)]
+    [lower(&unpack), lower(&math), lower(&pack)]
+}
+
+/// [`matmul_roles`], lowered with the MOP as well: each role's words and the
+/// MOP configuration its loops took, for a kernel that carries it to the
+/// roles' mailboxes (`runtime::Kernel::mop`, `tensor::Step::Kernel`).
+///
+/// `allow_mop` false lowers with `REPLAY` alone: on ttsim, whose frontend
+/// FIFO takes a `MOP`'s whole expansion without backpressure and overflows
+/// where silicon would stall the expander (divergence row 68).
+pub fn matmul_kernel(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    in_fmt: L1Format,
+    out_fmt: u32,
+    fidelity: Fidelity,
+    allow_mop: bool,
+) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
+    let [unpack, math, pack] = matmul_items(outputs, sems, in_fmt, out_fmt, fidelity);
+    // With `allow_mop`, a `MOP` on the math role only: on silicon (row AE) one
+    // on the unpack or pack role made MNIST inference slower (0.487 -> 0.500,
+    // 0.528 ms a batch), and the math role's is no faster end to end on the
+    // fixed mover firmware, so the session passes `false`.
+    let (u, m, p) = (
+        crate::loops::lower_with(&unpack, false),
+        crate::loops::lower_with(&math, allow_mop),
+        crate::loops::lower_with(&pack, false),
+    );
+    ([u.words, m.words, p.words], [u.mop, m.mop, p.mop])
 }
 
 /// Key of the matmul's shared block (`crate::loops::Item::Shared`): one tile
@@ -712,7 +741,7 @@ pub fn matmul_items(
         crate::datapath::pack_config(&mut pw, output.out);
         pack.extend(i(config_program(&pw)));
         pack.extend(i(sync::take(sems.ready, Before::PACKER)));
-        pack.extend(i(crate::datapath::pack_rows(TILE_DST_ROWS)));
+        pack.extend(crate::datapath::pack_rows_items(TILE_DST_ROWS));
         pack.extend(i(sync::post_after(Unit::Packer, sems.free)));
     }
     unpack.push(Item::I(
@@ -1207,6 +1236,35 @@ pub(crate) fn programs(
     built
 }
 
+/// [`programs`] for [`matmul_kernel`]: the programs and their MOP
+/// configurations, built once per process.
+pub(crate) fn kernel_programs(
+    tiles: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    sems: MatmulSemaphores,
+    allow_mop: bool,
+    build: impl FnOnce() -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]),
+) -> (
+    std::sync::Arc<[Vec<Instruction>; 3]>,
+    [Option<MopConfig>; 3],
+) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = ([usize; 3], SrcRoute, Fidelity, MatmulSemaphores, bool);
+    type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (tiles, route, fidelity, sems, allow_mop);
+    if let Some(p) = cache.lock().unwrap().get(&key) {
+        return p.clone();
+    }
+    let (roles, mop) = build();
+    let built = (Arc::new(roles), mop);
+    cache.lock().unwrap().insert(key, built.clone());
+    built
+}
+
 /// The chunk shape for `A[m, k] @ B[k, n]`: `K` whole if at all possible,
 /// because splitting it moves part of the accumulation to the host; then the
 /// largest `mc * nc` that fits.
@@ -1498,9 +1556,24 @@ mod loop_tests {
             for f in [Fidelity::Lo, Fidelity::HiFi2, Fidelity::HiFi4] {
                 let items = matmul_items(&layout.outputs, layout.sems, L1Format::Fp32, 0, f);
                 for (r, it) in items.iter().enumerate() {
-                    let l = crate::loops::lower_with(it, false);
-                    let got = crate::loops::frontend_stream(&l.words, l.mop.as_ref()).unwrap();
-                    assert!(got == Item::unrolled(it), "{tiles:?} {f:?} role {r}");
+                    for allow_mop in [false, true] {
+                        let l = crate::loops::lower_with(it, allow_mop);
+                        let got = crate::loops::frontend_stream(&l.words, l.mop.as_ref()).unwrap();
+                        assert!(
+                            got == Item::unrolled(it),
+                            "{tiles:?} {f:?} role {r} mop {allow_mop}"
+                        );
+                    }
+                }
+                // What a GDDR kernel carries: the words with their MOP configurations.
+                let (words, mop) =
+                    matmul_kernel(&layout.outputs, layout.sems, L1Format::Fp32, 0, f, true);
+                for r in 0..3 {
+                    let got = crate::loops::frontend_stream(&words[r], mop[r].as_ref()).unwrap();
+                    assert!(
+                        got == Item::unrolled(&items[r]),
+                        "{tiles:?} {f:?} kernel role {r}"
+                    );
                 }
                 if f == Fidelity::Lo && tiles[1] > 1 {
                     // A pair costs about one word on the math role at LoFi:

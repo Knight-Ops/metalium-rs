@@ -30,6 +30,7 @@ mod ops;
 mod server;
 mod tensor;
 mod topology;
+mod trace;
 mod traffic;
 
 pub use server::{
@@ -37,6 +38,7 @@ pub use server::{
     Engine, EngineError, KmdEngine, MeshEngine, Serve,
 };
 pub use tensor::{TtQTensor, TtTensor};
+pub use trace::Trace;
 
 /// Keep on the device only what gives `burn-flex`'s bits exactly.
 ///

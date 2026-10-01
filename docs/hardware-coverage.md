@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X2a, X4a-c, X5a; X2b, X4d, X5b next |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X2, X4a-d, X5a; X5b, then the close |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -195,8 +195,11 @@ Pulled in only when a kernel needs them; each says which.
 
 ### Out of scope, and why
 
-- `[-]` **L2CPU tiles.** Harts leave reset only once per power cycle (`L2CPUTile/README.md:30`);
-  nothing a Burn backend needs runs better there than on the host.
+- `[-]` **L2CPU tiles.** Harts leave reset only once per power cycle (`L2CPUTile/README.md:30`).
+  Out of scope for Phase 10, but no longer for the reason first given ("nothing a Burn
+  backend needs runs better there"): the measured host round trips say the opposite. A
+  proposal to use the x280s as an on-card host -- driving traces, small ops, dispatch -- is
+  `feature-x280-on-card-dispatch.md`, awaiting a decision.
 - `[-]` **PCIe DMA engines.** No register-level documentation (open question 5);
   residency makes bulk transfer a startup cost.
 - `[-]` **A GDB stub over the debug interface.** No Blackhole bit layouts (open question 2).
@@ -220,7 +223,7 @@ reverse index.
       it replays. F2's row-group loop records its body once and replays it where it fits,
       unrolling (and saying so) where it does not. Gate: replayed programs bit-identical to
       their unrolled form on ttsim and both cards.
-- [~] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
+- [x] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
       after `MOPExpanderDoneCheck` (`ManualTTSync.md:57`); Auto TTSync takes the `MOP`'s
       resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
       unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
@@ -244,7 +247,7 @@ reverse index.
         `MOP_CFG` were Wormhole-only drawings: the generator now marks them `CONFIRMED`
         with this gate as evidence (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`: only a
         `WormholeOnly` layout, the gate must exist, every field must be exercised).
-  - [~] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
+  - [x] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
         MNIST golden bit for bit, program bytes and silicon time measured.
     - [x] **Kernels are push-bound, measured** (`silicon_perf::role_push_rate`): a
           matmul tile's unpack role pushes at the runner's ceiling and its backend
@@ -295,10 +298,16 @@ reverse index.
             modifier behaved in isolation (`step9`-style probe): unexplained, so the
             design uses plain increments only. Modifiers persist between programs:
             `step9`'s measurement now sets every entry it relies on.
-      - [ ] The MOP carried to the roles: `Step::Kernel` and the session's lists
+      - [x] The MOP carried to the roles: `Step::Kernel` and the session's lists
             take each role's `MopConfig` (a list's kernels share one descriptor, so
-            a list splits where it changes); then the K loops run under the `MOP`,
-            two words for up to 32 pairs.
+            a list splits where it changes), and `matmul_kernel` lowers the math
+            role's loops under one when asked. Measured (row AE): a `MOP` on the
+            unpack or pack role is slower than their replays, and on the math role
+            no faster end to end -- the matmul is backend-bound -- so the session
+            runs it without, which also keeps the matmul ttsim's path (row 68).
+            The expander stays gated (`step36_mop`, `step37_loops`) for a loop that
+            is push-bound. Full suite: ttsim, silicon 430/430; MNIST 91.96%, 2.0 /
+            1.6 ms a step (1 / 4 tiles), inference 0.45 ms a batch of 64.
 - [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
       mover brackets each list and each top-level entry or record with timestamper events
       when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,
@@ -316,7 +325,7 @@ reverse index.
       than the buffer holds, none lost. Watched failing with the drain disabled (the
       overflow refusal). Sim `[-]`: row 54. First use: row O, the reduced-MNIST
       breakdown. Burn: not applicable (no op).
-- [~] **X4 Dispatch: queue, barriers, batching, traces** (concepts review G8). Per-op
+- [x] **X4 Dispatch: queue, barriers, batching, traces** (concepts review G8). Per-op
       cost is the host's submission and wait (~100-200 us an op, measurement S), so:
   - [x] **X4b A barrier across movers by NoC atomics.** `tt_isa::noc::niu::Command::
         AtomicIncrement` (`CMD_AT`, `NOC_AT_LEN_BE`'s increment layout from
@@ -353,7 +362,70 @@ reverse index.
         layer forward with several lists per unit per op, eight queued passes bit for
         bit to the unbatched one; and an upload-then-op guard (row T: it does not
         reproduce the race, `tt-mnist` does). ttsim and both cards. MNIST: row U.
-  - [ ] **X4d Traces**: a step's lists kept in GDDR, replayed by reference.
+  - [x] **X4d Traces** -- opt-in capture and replay, inference first (tt-metal's
+        `BeginTraceCapture`/`ReplayTrace` the model, its footguns designed out). As built
+        (`tt_kernels::trace`, `Session::{begin_trace, end_trace, replay, release_trace,
+        write, trace_ops}`; Burn: `burn_tt::Trace`):
+    - **Opt in, from wherever the caller is.** `begin_trace` ... `end_trace` around any
+      stretch of a batching session's ops captures and runs it once; `replay(id)` runs it
+      again, queued like any op. Between replays `Session::write` overwrites a tensor the
+      trace reads (shape-checked, a view refused), and the tensors it wrote hold the
+      results. Untraced ops run as before, interleaved freely.
+    - **Replay without the host.** At `end_trace` each unit's stream goes to GDDR on its
+      own channel, padded with `WAIT`s so no record crosses a 64-entry chunk
+      (`trace::chunked`); a replay is one list per unit holding one `CALL`
+      (`tt_isa::dm::op::CALL`), which the mover runs a chunk at a time from
+      `dm::TRACE_CHUNK`. A `CALL` is a list of its own, and one inside a trace is
+      refused. Per-run values: each top-level `KERNEL`'s generation and each `BARRIER`'s
+      target are patched in the chunk by the `CALL`'s bases (`Resident::take_generations`,
+      the session's barrier count); the roles' descriptors are `POKE` entries
+      (`dm::op::POKE`, role-mailbox words only) wherever the stream has not set them yet;
+      a semaphore setup the host ran during the capture is a `KERNEL` of its own (thread
+      0 its program, held in the program cache; threads 1-2 a zero-length program). A
+      replay writes 40 bytes a unit over PCIe; the one-layer capture it repeats, 5.6 KB
+      (row AG).
+    - **Uncorruptible, or a typed refusal** (each provoked in `step39_traces`):
+      - a live trace holds every allocation that existed when its capture ended: a free
+        of one is deferred to the trace's release. The rule is exact without tracking
+        each op's tensors: frees during the capture are deferred too, so what is
+        allocated afterwards lies in what was free then (`tensor::FreeSnapshot`);
+      - the programs its kernels name are held in the program cache
+        (`ProgramCache::hold`; eviction, and the room-making clear, skip them);
+      - the session's epoch moves on at every tile reset and mover start, and a replay
+        against an older one is `TraceError::Stale`. A failed list -- a replay's too --
+        recovers its units as before, so it makes every trace stale, not only its own;
+      - a download, a `write` or a host-run kernel (`sync_run`: `run`, `prepare`, the
+        host matmul) during a capture is `TraceError::HostTransfer`; turning batching off
+        is `Capturing`. An upload is allowed: a constant the replay finds where it was;
+      - the descriptors and semaphores the host remembers are forgotten at a capture's
+        start (so it records everything its kernels need) and after a replay (so nothing
+        queued later trusts them).
+    - **Structured, so it can be optimized later.** Each op's `OpRecord` -- its name, its
+      range of every unit's stream, whether a barrier followed -- is kept with the trace
+      (`Session::trace_ops`); the placements each op read and wrote are the next field
+      it needs. Optimizing over the captured graph is **X4e**.
+    - **Burn.** `burn_tt::Trace::capture(&input, || forward(..))` captures on the
+      input's own buffer and returns the capture's output values; `run(values)` writes,
+      replays and downloads in one round trip. Both return host values, not a tensor: a
+      tensor of the output buffer would change under its holder at the next run. A
+      closure that falls back to the host is refused (the op panics, as a device error
+      does) and the capture is ended, never left open. Single-chip engines only; the
+      mesh engine refuses. `tt-mnist --infer --trace` replays per batch.
+    - Gates: `step39_traces` -- a layer's forward pass on one tile and on two (barriers)
+      replayed over three new inputs, each the same ops run fresh bit for bit, and each
+      replay's writes under a twentieth of the capture's; a freed weight deferred while
+      an allocation of its size lands elsewhere; every refusal. Watched failing: a `CALL`
+      over half its entries (replay 0, element 0 wrong). `step40_burn_trace` -- a Burn
+      MLP traced and run on new inputs against the fresh Burn ops bit for bit, and a host
+      fallback refused with the next capture working. ttsim and both cards. MNIST
+      inference traced: the same predictions; 2.59 ms a batch, of which 2.1 the input's
+      200 KB write from the host (row AG, X7).
+    - **Training: later, documented.** A training step is replayable once its weights are
+      updated in place (the optimizer writing the same buffers) and the loss stays on the
+      device; neither holds today (B16, and Burn's tensors are immutable). Until then a
+      training loop traces its forward pass at most. With the x280s as an on-card host
+      (`feature-x280-on-card-dispatch.md`), the host-side part of a step moves next to the
+      data and whole-step traces become the natural shape.
   Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
@@ -397,12 +469,14 @@ Each names the measurement it must move. The Burn-side ones are in
       a call and a download of the same ~140 us past its sync (rows Z, measurement M:
       uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
       a tensor touches). Batch the read-backs per tensor, not per channel write; read
-      small tensors with the widest loads the BAR allows. Moves: per-call `upload` and
+      small tensors with the widest loads the BAR allows. A large write is slow too: a
+      traced inference batch's 200 KB input takes 2.1 ms (~95 MB/s, against the WC
+      aperture's GB/s; row AG), most of a traced batch. Moves: per-call `upload` and
       `download` in `tt-mnist`'s breakdown. With it, the ordering rule as API (row AA):
       a fenced L1 write -- posted writes, then one read-back -- for every host write
       another agent may race, so a caller cannot forget it.
-- [ ] **X4d Traces** (above) are here too: worth ~0.2 ms a step at most until X6 and
-      B8 shrink the rest (row V).
+- [x] **X4d Traces** (above): a replay's host side is one entry a unit; what is left of
+      a traced inference batch is the input's write (X7) and the output's download.
 - Moved to Burn's roadmap with the numbers: **B8** async calls (a call's server round
   trip is 32-49 us, ~0.2 ms of a 0.61 ms inference batch); **B5/D4** a slice not on a
   tile row (batch 1000 inference: 46 ms a batch, 3 MB re-uploaded each); **B16** the loss

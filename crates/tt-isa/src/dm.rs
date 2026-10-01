@@ -150,6 +150,21 @@ pub mod op {
     /// 2^32, so the counter may wrap). With `n` units, the `k`-th barrier's
     /// target is `k * n`. Only in a list entry.
     pub const BARRIER: u32 = 9;
+    /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
+    /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
+    /// The mover reads the `count` entries from `offset` of `channel` in
+    /// chunks of [`super::TRACE_CHUNK_ENTRIES`] into [`super::TRACE_CHUNK`]
+    /// and runs them as a list's, except that each `KERNEL`'s generation is
+    /// offset by `generation_base` and each `BARRIER`'s target by
+    /// `barrier_base`, the values a replay's run gives them. A record never
+    /// spans a chunk (the capture pads with `WAIT`s), and a `CALL` inside a
+    /// call is refused. Only in a list entry.
+    pub const CALL: u32 = 10;
+    /// Write one word of a role's mailbox: `[POKE, address, value, 0, ...]`,
+    /// the address a word of `crate::mailbox::role`'s three mailboxes. A
+    /// trace's role descriptors, which the host writes for an ordinary list
+    /// and cannot write during a replay. Only in a list entry.
+    pub const POKE: u32 = 11;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -222,6 +237,11 @@ pub const LIST_MAX: u32 = 512;
 pub const ENTRY_BYTES: u64 = 32;
 /// The transpose scratch slot, after the list.
 pub const SCRATCH: u64 = LIST + LIST_MAX as u64 * ENTRY_BYTES;
+/// Where an [`op::CALL`] streams its entries, a chunk at a time: in the free
+/// L1 between the scratch slot and the data arena.
+pub const TRACE_CHUNK: u64 = 0x1_9100;
+/// Entries one chunk holds.
+pub const TRACE_CHUNK_ENTRIES: u32 = 64;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
 
 /// One FP32 32x32 tile as it is stored on the device: the 16-byte header
@@ -281,12 +301,32 @@ pub enum Entry {
     Wait,
     /// [`op::BARRIER`].
     Barrier { target: u32, x: u8, y: u8 },
+    /// [`op::CALL`]: run `count` entries from GDDR.
+    Call {
+        channel: u32,
+        offset: u32,
+        count: u32,
+        generation_base: u32,
+        barrier_base: u32,
+    },
+    /// [`op::POKE`]: one role-mailbox word.
+    Poke { address: u32, value: u32 },
 }
 
 impl Entry {
     /// Decode entry words against the `usable` mask. A transposed read must be
     /// exactly one slot into a 16-aligned L1 slot inside L1.
     pub fn decode(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
+        // The hot path first: a plain read or write is most of every list
+        // (`silicon_perf::mover_read_shapes` times it per entry).
+        if w[0] == op::READ || w[0] == op::WRITE {
+            return Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(
+                |descriptor| Entry::Move {
+                    descriptor,
+                    transform: Transform::None,
+                },
+            );
+        }
         let transform = match w[0] {
             op::READ_TRANSPOSED => Transform::Transpose,
             op::READ_BROADCAST_COL => Transform::BroadcastCol0,
@@ -346,6 +386,39 @@ impl Entry {
                 target: w[1],
                 x: w[2] as u8,
                 y: w[3] as u8,
+            });
+        }
+        if w[0] == op::CALL {
+            // Entries are 32 bytes, read 32-byte aligned; a channel's offset
+            // fits the word (`crate::dram`).
+            if w[3] == 0 || w[2] % ENTRY_BYTES as u32 != 0 || w[6] != 0 || w[7] != 0 {
+                return Err(error::OP);
+            }
+            if w[1] >= crate::dram::CHANNELS as u32 || usable & (1 << w[1]) == 0 {
+                return Err(error::RANGE);
+            }
+            return Ok(Entry::Call {
+                channel: w[1],
+                offset: w[2],
+                count: w[3],
+                generation_base: w[4],
+                barrier_base: w[5],
+            });
+        }
+        if w[0] == op::POKE {
+            let base = crate::mailbox::role::BASE;
+            let end = base + 3 * crate::mailbox::role::STRIDE;
+            let ok = w[1] % 4 == 0
+                && (w[1] as u64) >= base
+                && (w[1] as u64) < end
+                && (w[1] as u64 - base) % crate::mailbox::role::STRIDE
+                    < crate::mailbox::MAILBOX_SIZE;
+            if !ok || w[3..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Poke {
+                address: w[1],
+                value: w[2],
             });
         }
         if w[0] == op::COMPUTE {

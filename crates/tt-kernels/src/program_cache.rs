@@ -64,6 +64,8 @@ struct Resident {
     at: u64,
     last_use: u64,
     pinned: bool,
+    /// Traces that name it (`crate::trace`): never evicted while any does.
+    held: u32,
 }
 
 /// One tile's program cache: see the module documentation.
@@ -148,7 +150,7 @@ impl ProgramCache {
                 .resident
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| !r.pinned)
+                .filter(|(_, r)| !r.pinned && r.held == 0)
                 .min_by_key(|(_, r)| r.last_use)
                 .map(|(i, _)| i)
                 .ok_or(CacheError::Full { bytes })?;
@@ -163,6 +165,7 @@ impl ProgramCache {
             at,
             last_use: self.clock,
             pinned: true,
+            held: 0,
         });
         self.by_hash
             .entry(h)
@@ -188,10 +191,38 @@ impl ProgramCache {
         }
     }
 
+    /// A trace names the program at `at`: it stays resident, whatever is
+    /// placed after it, until [`ProgramCache::release`]. Returns whether one
+    /// is there.
+    pub fn hold(&mut self, at: u64) -> bool {
+        match self.resident.iter_mut().find(|r| r.at == at) {
+            Some(r) => {
+                r.held += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// One trace no longer names the program at `at`.
+    pub fn release(&mut self, at: u64) {
+        if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
+            r.held = r.held.saturating_sub(1);
+        }
+    }
+
     /// Nothing in flight names any program any more.
     pub fn unpin_all(&mut self) {
         for r in &mut self.resident {
             r.pinned = false;
+        }
+    }
+
+    /// Evict everything no trace holds: room made at once, as
+    /// [`ProgramCache::clear`] would, but for the programs a trace names.
+    pub fn clear_unheld(&mut self) {
+        while let Some(i) = self.resident.iter().position(|r| r.held == 0) {
+            self.evict(i);
         }
     }
 
@@ -352,5 +383,50 @@ mod tests {
             }
         }
         assert!(c.stats().hits > 0 && c.stats().evictions > 0);
+    }
+
+    #[test]
+    fn clearing_for_room_keeps_held_programs() {
+        let mut c = ProgramCache::new(tt_isa::l1::PROGRAM_CACHE);
+        let Ok(Placed::Upload(a)) = c.place(&[1, 2, 3]) else {
+            panic!("a first program is uploaded")
+        };
+        let Ok(Placed::Upload(b)) = c.place(&[4, 5, 6]) else {
+            panic!("a second program is uploaded")
+        };
+        assert!(c.hold(a));
+        c.unpin_all();
+        c.clear_unheld();
+        assert!(matches!(c.place(&[1, 2, 3]), Ok(Placed::Hit(at)) if at == a));
+        assert!(!c.hold(b), "the unheld program was evicted");
+    }
+
+    #[test]
+    fn a_held_program_is_never_evicted() {
+        let region = Region {
+            name: "test",
+            base: 0,
+            end: 1024,
+        };
+        let mut c = ProgramCache::new(region);
+        let a = vec![1u32; 96]; // 384 bytes
+        let Placed::Upload(at_a) = c.place(&a).unwrap() else {
+            panic!()
+        };
+        assert!(c.hold(at_a));
+        c.unpin_all();
+        // Two more of the same size do not fit beside `a`; `a` is held, so
+        // the second finds nothing it may evict.
+        let b = vec![2u32; 96];
+        assert!(matches!(c.place(&b), Ok(Placed::Upload(_))));
+        c.unpin_all();
+        let d = vec![3u32; 96];
+        assert!(
+            matches!(c.place(&d), Ok(Placed::Upload(_))),
+            "b is evicted, a is not"
+        );
+        c.unpin_all();
+        assert_eq!(c.place(&a).unwrap(), Placed::Hit(at_a));
+        c.release(at_a);
     }
 }

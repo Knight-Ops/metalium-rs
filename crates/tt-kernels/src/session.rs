@@ -47,6 +47,7 @@ use crate::matmul::{self, Fidelity, SrcRoute};
 use crate::program_cache::ProgramCache;
 use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
 use crate::tensor::{self, DramAlloc, DramTensor, Step, TensorError};
+use crate::trace::{self, TraceError, TraceId};
 
 /// Every baby RISC-V held in reset: what the cleanup write leaves behind, and
 /// the resting state between runs.
@@ -289,6 +290,14 @@ pub struct Session<T: Transport> {
     /// Placements freed while lists that may read them are queued: given back
     /// at the next sync.
     pending_frees: Vec<tensor::Placement>,
+    /// The trace being captured ([`Session::begin_trace`]).
+    capture: Option<trace::Capture>,
+    /// Finished traces, by number.
+    traces: std::collections::HashMap<u64, trace::Trace>,
+    next_trace: u64,
+    /// Moves on whenever a tile's state is lost -- a reset, a mover restart --
+    /// which every trace captured before is [`TraceError::Stale`] against.
+    epoch: u64,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -357,6 +366,9 @@ struct Segment {
     /// The semaphores those programs use, initialised as their kernel's setup
     /// would (`matmul::MatmulSemaphores::init`).
     init: Vec<runtime::SemaphoreInit>,
+    /// Its kernels' MOP configurations: one descriptor serves the list, so
+    /// every kernel in it has the same (`tensor::Step::Kernel::mop`).
+    mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
 }
@@ -427,7 +439,8 @@ fn place_programs<T: Transport>(
         }
         cache.unpin_all();
         if attempt == 0 {
-            cache.clear();
+            // All but what a trace holds, which its replays run.
+            cache.clear_unheld();
         }
     }
     Err(PlaceError::Failed(TensorError::Shape(
@@ -506,7 +519,7 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 cur.steps += 1;
                 after_list = true;
             }
-            Step::Kernel { roles, init } => {
+            Step::Kernel { roles, init, mop } => {
                 let resident = roles
                     .iter()
                     .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
@@ -526,9 +539,11 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                                 })
                         })
                 };
-                if !same_init || !fits || cur.entries.len() == LIST_MAX as usize {
+                let same_mop = cur.kernels.is_empty() || cur.mop == *mop;
+                if !same_init || !same_mop || !fits || cur.entries.len() == LIST_MAX as usize {
                     close(&mut cur, &mut out);
                 }
+                cur.mop = *mop;
                 cur.resident = resident;
                 if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
                     cur.resident_bytes += bytes;
@@ -615,6 +630,10 @@ impl<T: Transport> Session<T> {
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
             barriers: 0,
             pending_frees: Vec::new(),
+            capture: None,
+            traces: Default::default(),
+            next_trace: 0,
+            epoch: 0,
             _cleanup: Vec::new(),
         };
         let (_, wedged) = healthy_tiles(&candidates, want, |(x, y)| {
@@ -664,11 +683,16 @@ impl<T: Transport> Session<T> {
 
     fn prepare_unit(&mut self, u: usize) -> Result<(), RunError> {
         let Session {
-            dev, units, images, ..
+            dev,
+            units,
+            images,
+            epoch,
+            ..
         } = self;
         let unit = &mut units[u];
         // The reset holds RISCV B too; GDDR contents survive, the mover does
         // not, and what L1 holds is no longer the host's to vouch for.
+        *epoch += 1;
         unit.mover = None;
         unit.programs.clear();
         if let Some(r) = unit.resident.take() {
@@ -845,6 +869,7 @@ impl<T: Transport> Session<T> {
 
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        self.refuse_while_capturing("download")?;
         self.sync()?;
         let Session { dev, dram, .. } = self;
         let d = dram
@@ -856,6 +881,7 @@ impl<T: Transport> Session<T> {
     /// Every datum of every tile of `t`, padding included, row-major
     /// `[32 * rt, 32 * ct]` (`DramTensor::download_padded`).
     pub fn download_padded(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        self.refuse_while_capturing("download")?;
         self.sync()?;
         let Session { dev, dram, .. } = self;
         let d = dram
@@ -866,19 +892,38 @@ impl<T: Transport> Session<T> {
 
     /// Give a tensor's slots back.
     pub fn free(&mut self, t: DramTensor) -> Result<(), TensorError> {
+        self.free_placement(t.placement)
+    }
+
+    fn free_placement(&mut self, p: tensor::Placement) -> Result<(), TensorError> {
+        if !p.owned() {
+            return Ok(());
+        }
+        // A trace's: its replays read or write it (`crate::trace`).
+        if let Some(c) = self.capture.as_mut() {
+            c.freed.push(p);
+            return Ok(());
+        }
+        if let Some(t) = self.traces.values_mut().find(|t| t.holds(&p)) {
+            t.freed.push(p);
+            return Ok(());
+        }
         // A queued list may still read it, and the next allocation must not
         // hand its slots to an upload that would land first.
         if self.units.iter().any(|u| !u.queued.is_empty()) {
-            self.pending_frees.push(t.placement);
+            self.pending_frees.push(p);
             return Ok(());
         }
-        self.dram_state()?.alloc.free(&t.placement);
+        self.dram_state()?.alloc.free(&p);
         Ok(())
     }
 
     /// Queue ops on the movers and wait only at a sync point (the default),
     /// or run each op to completion. Syncs first.
     pub fn set_batching(&mut self, on: bool) -> Result<(), TensorError> {
+        if self.capture.is_some() && !on {
+            return Err(TraceError::Capturing.into());
+        }
         self.sync()?;
         self.batching = on;
         Ok(())
@@ -971,6 +1016,7 @@ impl<T: Transport> Session<T> {
             dram,
             profiling,
             barriers,
+            epoch,
             ..
         } = self;
         let idle = units.iter().all(|u| u.queued.is_empty());
@@ -980,6 +1026,9 @@ impl<T: Transport> Session<T> {
             .as_ref()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
         if unit.mover.is_none() {
+            // The barrier counter starts again below, and nothing the mover
+            // was running survives: traces captured before are stale.
+            *epoch += 1;
             unit.mover = Some(DataMover::start(
                 dev,
                 r.window(),
@@ -1009,6 +1058,35 @@ impl<T: Transport> Session<T> {
     /// share as few lists as fit, then -- with more than one unit -- a barrier
     /// on every unit, since the next op may read what any unit wrote.
     fn enqueue_work(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+        let starts: Option<Vec<usize>> = self
+            .capture
+            .as_ref()
+            .map(|c| c.units.iter().map(|u| u.stream.len()).collect());
+        let mut what = "";
+        let result = self.enqueue_work_inner(jobs, budget, &mut what);
+        if let (Some(c), Some(starts)) = (self.capture.as_mut(), starts) {
+            // Part of an op captured is no op a replay could run.
+            c.failed |= result.is_err();
+            c.ops.push(trace::OpRecord {
+                what,
+                entries: c
+                    .units
+                    .iter()
+                    .zip(starts)
+                    .map(|(u, s)| s..u.stream.len())
+                    .collect(),
+                barrier: self.units.len() > 1,
+            });
+        }
+        result
+    }
+
+    fn enqueue_work_inner(
+        &mut self,
+        jobs: Vec<tensor::Job>,
+        budget: u64,
+        what: &mut &'static str,
+    ) -> Result<(), TensorError> {
         let n = self.units.len();
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
         for (j, job) in jobs.into_iter().enumerate() {
@@ -1021,6 +1099,9 @@ impl<T: Transport> Session<T> {
         }
         for (u, steps) in queues.into_iter().enumerate() {
             for seg in segments(steps) {
+                if what.is_empty() {
+                    *what = seg.what;
+                }
                 self.enqueue_segment(u, &seg, budget)?;
             }
         }
@@ -1038,6 +1119,15 @@ impl<T: Transport> Session<T> {
                 0,
                 0,
             ];
+            if let Some(c) = self.capture.as_mut() {
+                // Relative to the capture's first: a replay adds its own.
+                let rel = target.wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
+                c.barriers += 1;
+                for uc in &mut c.units {
+                    uc.stream
+                        .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
+                }
+            }
             for u in 0..n {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
@@ -1061,6 +1151,9 @@ impl<T: Transport> Session<T> {
     /// that would write what queued runs read (`Resident::needs_idle`) waits
     /// for the unit to drain first, as does a full program cache.
     fn enqueue_segment(&mut self, u: usize, seg: &Segment, budget: u64) -> Result<(), TensorError> {
+        if self.capture.is_some() && !seg.kernel_roles.is_empty() && !seg.resident {
+            return Err(TraceError::NotResident.into());
+        }
         self.ensure_unit(u)?;
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
@@ -1096,6 +1189,7 @@ impl<T: Transport> Session<T> {
             let [unpack, math, pack] = &**roles;
             let kernel = Kernel {
                 restores_semaphores: true,
+                mop: seg.mop,
                 ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
             };
             let idle = {
@@ -1123,6 +1217,15 @@ impl<T: Transport> Session<T> {
                 entries[at][1] = g;
             }
         }
+        if self.capture.is_some() {
+            if let Err(e) = self.capture_segment(u, seg, &entries) {
+                let r = self.units[u].resident.as_mut().unwrap();
+                if !seg.kernel_roles.is_empty() {
+                    let _ = r.reserved_done(&mut self.dev, false);
+                }
+                return Err(e);
+            }
+        }
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
@@ -1146,6 +1249,429 @@ impl<T: Transport> Session<T> {
         unit.lists += 1;
         unit.steps += seg.steps;
         Ok(())
+    }
+
+    /// Add a segment about to be enqueued on unit `u` to the capture, as a
+    /// replay will run it: before its kernel, the setup run [`Resident::reserve`]
+    /// did for it, if any, as a kernel of its own, and `POKE`s for whatever
+    /// of the roles' descriptors the stream has not set; then its entries,
+    /// each `KERNEL`'s generation relative and its programs held.
+    fn capture_segment(
+        &mut self,
+        u: usize,
+        seg: &Segment,
+        entries: &[[u32; 8]],
+    ) -> Result<(), TensorError> {
+        use tt_isa::dm::op;
+        let mut kernel_descriptors = None;
+        let mut setup = None;
+        if let Some(roles) = seg.kernel_roles.first() {
+            let [unpack, math, pack] = &**roles;
+            let kernel = Kernel {
+                restores_semaphores: true,
+                mop: seg.mop,
+                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
+            };
+            let Session { dev, units, .. } = self;
+            let r = units[u].resident.as_mut().unwrap();
+            let mut d = Vec::with_capacity(3);
+            for t in 0..3 {
+                d.push(r.queued_descriptor(dev, &kernel, t)?);
+            }
+            kernel_descriptors = Some((d, kernel.dst_fmt));
+            setup = r.take_setup_run();
+        }
+        let mut held = Vec::new();
+        let mut out = std::mem::take(&mut self.capture.as_mut().unwrap().units[u]);
+        let base = out.generation_base;
+        let push_window = if self.dev.transport().is_simulated() {
+            tt_isa::mailbox::SIM_PUSH_WINDOW
+        } else {
+            0
+        };
+        let result = (|| {
+            if let (Some((generation, program)), Some((_, dst_fmt))) = (&setup, &kernel_descriptors)
+            {
+                // As the host staged it (`Resident::begin`): thread 0 alone,
+                // the others given nothing to run.
+                let at = self.place_held(u, program)?;
+                held.push(at);
+                out.poke_descriptor(
+                    0,
+                    &tt_isa::mailbox::Descriptor {
+                        thread_index: 0,
+                        dst_access_fmt: *dst_fmt,
+                        push_window,
+                        ..Default::default()
+                    },
+                );
+                let (at, len) = (at as u32, program.len() as u32);
+                let rel = generation.wrapping_sub(base);
+                out.stream.push([op::KERNEL, rel, at, len, at, 0, at, 0]);
+            }
+            if let Some((descriptors, _)) = &kernel_descriptors {
+                for (t, d) in descriptors.iter().enumerate() {
+                    out.poke_descriptor(t, d);
+                }
+            }
+            for e in entries {
+                let mut e = *e;
+                if e[0] == op::KERNEL {
+                    e[1] = e[1].wrapping_sub(base);
+                    for t in 0..3 {
+                        let at = e[2 + 2 * t] as u64;
+                        if at != 0 && self.units[u].programs.hold(at) {
+                            held.push(at);
+                        }
+                    }
+                }
+                out.stream.push(e);
+            }
+            Ok(())
+        })();
+        out.held_programs.extend(held);
+        self.capture.as_mut().unwrap().units[u] = out;
+        result
+    }
+
+    /// Put `program` in unit `u`'s program cache and hold it there for a
+    /// trace: its address.
+    fn place_held(&mut self, u: usize, program: &[Instruction]) -> Result<u64, TensorError> {
+        use crate::program_cache::{CacheError, Placed};
+        let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
+        for attempt in 0..2 {
+            let Session { dev, units, .. } = self;
+            let unit = &mut units[u];
+            let w = unit.resident.as_ref().unwrap().window();
+            let at = match unit.programs.place(&words) {
+                Ok(Placed::Hit(at)) => at,
+                Ok(Placed::Upload(at)) => {
+                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    dev.l1_write(w, unit.tile, at, &bytes)?;
+                    at
+                }
+                Ok(Placed::Bypass) => return Err(TraceError::NotResident.into()),
+                // What queued lists run is pinned: room once they are done.
+                Err(CacheError::Full { .. }) if attempt == 0 => {
+                    self.drain_unit(u)?;
+                    continue;
+                }
+                Err(CacheError::Full { bytes }) => {
+                    return Err(TensorError::Shape(format!(
+                        "no {bytes} bytes in the program cache beside what traces hold"
+                    )))
+                }
+            };
+            unit.programs.hold(at);
+            return Ok(at);
+        }
+        unreachable!("the second attempt returns")
+    }
+
+    fn refuse_while_capturing(&self, what: &'static str) -> Result<(), TensorError> {
+        match self.capture {
+            Some(_) => Err(TraceError::HostTransfer(what).into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Start capturing a trace (`crate::trace`): every op from here to
+    /// [`Session::end_trace`] runs as usual and is recorded, to be run again
+    /// by [`Session::replay`]. Only on a batching session. Waits for what is
+    /// queued, and forgets what the host knows of the tiles' descriptors and
+    /// semaphores, so the capture records all its kernels need.
+    pub fn begin_trace(&mut self) -> Result<(), TensorError> {
+        if self.capture.is_some() {
+            return Err(TraceError::Capturing.into());
+        }
+        if !self.batching {
+            return Err(TraceError::NotBatching.into());
+        }
+        self.dram_state()?;
+        self.sync()?;
+        for u in 0..self.units.len() {
+            self.ensure_unit(u)?;
+        }
+        let units = self
+            .units
+            .iter_mut()
+            .map(|unit| {
+                let r = unit.resident.as_mut().expect("started above");
+                r.forget_tile_state();
+                // A setup run before the capture is not the capture's.
+                let _ = r.take_setup_run();
+                trace::UnitCapture {
+                    generation_base: r.generation(),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        self.capture = Some(trace::Capture {
+            epoch: self.epoch,
+            barriers_base: self.barriers,
+            barriers: 0,
+            units,
+            freed: Vec::new(),
+            ops: Vec::new(),
+            failed: false,
+        });
+        Ok(())
+    }
+
+    /// End the capture: wait for its ops, and store each unit's stream in
+    /// GDDR. On any failure nothing is kept, and what the capture held is
+    /// given back.
+    pub fn end_trace(&mut self) -> Result<TraceId, TensorError> {
+        let Some(capture) = self.capture.take() else {
+            return Err(TraceError::NotCapturing.into());
+        };
+        let held: Vec<Vec<u64>> = capture
+            .units
+            .iter()
+            .map(|u| u.held_programs.clone())
+            .collect();
+        let result = self.store_trace(capture);
+        if result.is_err() {
+            for (u, held) in held.iter().enumerate() {
+                for &at in held {
+                    self.units[u].programs.release(at);
+                }
+            }
+        }
+        result
+    }
+
+    fn store_trace(&mut self, capture: trace::Capture) -> Result<TraceId, TensorError> {
+        let synced = self.sync();
+        let trace::Capture {
+            epoch,
+            barriers,
+            units,
+            freed,
+            ops,
+            failed,
+            ..
+        } = capture;
+        // What the capture deferred is the session's to give back now.
+        let give_back = |s: &mut Self, freed: Vec<tensor::Placement>| {
+            for p in freed {
+                let _ = s.free_placement(p);
+            }
+        };
+        if let Err(e) = synced {
+            give_back(self, freed);
+            return Err(e);
+        }
+        if epoch != self.epoch {
+            give_back(self, freed);
+            return Err(TraceError::Stale.into());
+        }
+        if failed {
+            give_back(self, freed);
+            return Err(TensorError::Shape(
+                "an op failed during the trace capture: nothing was kept".into(),
+            ));
+        }
+        if units.iter().all(|u| u.stream.is_empty()) {
+            give_back(self, freed);
+            return Err(TraceError::Empty.into());
+        }
+        let mut stored: Vec<Option<trace::UnitTrace>> = Vec::with_capacity(units.len());
+        let mut failure = None;
+        for (u, uc) in units.into_iter().enumerate() {
+            if uc.stream.is_empty() {
+                stored.push(None);
+                continue;
+            }
+            match self.store_stream(u, &uc) {
+                Ok(t) => stored.push(Some(t)),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            for t in stored.into_iter().flatten() {
+                if let Ok(d) = self.dram_state() {
+                    d.alloc.free(&t.stream);
+                }
+            }
+            give_back(self, freed);
+            return Err(e);
+        }
+        let free_at_end = self.dram_state()?.alloc.snapshot();
+        let id = self.next_trace;
+        self.next_trace += 1;
+        self.traces.insert(
+            id,
+            trace::Trace {
+                epoch,
+                units: stored,
+                barriers,
+                free_at_end,
+                freed,
+                ops,
+            },
+        );
+        Ok(TraceId(id))
+    }
+
+    /// Unit `u`'s captured stream, laid out for streaming and written to GDDR.
+    fn store_stream(
+        &mut self,
+        u: usize,
+        uc: &trace::UnitCapture,
+    ) -> Result<trace::UnitTrace, TensorError> {
+        let words = trace::chunked(&uc.stream);
+        let bytes: Vec<u8> = words
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let generations = {
+            let r = self.units[u].resident.as_ref().unwrap();
+            r.generation().wrapping_sub(uc.generation_base)
+        };
+        let Session { dev, dram, .. } = self;
+        let d = dram.as_mut().expect("checked at the capture's start");
+        // Each unit's on its own channel where there are enough, so the
+        // movers' reads of their streams spread out.
+        let stream = d
+            .alloc
+            .alloc_on(u % d.alloc.channel_count(), bytes.len() as u64)?;
+        let range = stream.region().expect("a one-channel placement");
+        // Whole slots, as every GDDR write here is.
+        let mut bytes = bytes;
+        bytes.resize(range.len() as usize, 0);
+        let written = dev.dram_write(&d.w4, range, &bytes);
+        if let Err(e) = written {
+            d.alloc.free(&stream);
+            return Err(e.into());
+        }
+        Ok(trace::UnitTrace {
+            channel: range.channel().index() as u32,
+            offset: range.offset() as u32,
+            count: words.len() as u32,
+            generations,
+            held_programs: uc.held_programs.clone(),
+            stream,
+        })
+    }
+
+    /// Run trace `id` again: one `CALL` entry on each unit's mover
+    /// (`tt_isa::dm::op::CALL`), queued like any op. Between replays,
+    /// [`Session::write`] puts new values into the tensors it reads.
+    pub fn replay(&mut self, id: TraceId) -> Result<(), TensorError> {
+        if self.capture.is_some() {
+            return Err(TraceError::Capturing.into());
+        }
+        if !self.batching {
+            return Err(TraceError::NotBatching.into());
+        }
+        if !self.traces.contains_key(&id.0) {
+            return Err(TraceError::Unknown(id.0).into());
+        }
+        // A mover stopped since (a failed list) starts here, which moves the
+        // epoch on as well.
+        for u in 0..self.units.len() {
+            self.ensure_unit(u)?;
+        }
+        let t = &self.traces[&id.0];
+        if t.epoch != self.epoch {
+            return Err(TraceError::Stale.into());
+        }
+        let calls: Vec<Option<[u32; 4]>> = t
+            .units
+            .iter()
+            .map(|ut| {
+                ut.as_ref()
+                    .map(|ut| [ut.channel, ut.offset, ut.count, ut.generations])
+            })
+            .collect();
+        let barriers = t.barriers;
+        let n = self.units.len() as u32;
+        let barrier_base = self.barriers.wrapping_mul(n);
+        let Session { dev, units, .. } = self;
+        for (unit, call) in units.iter_mut().zip(calls) {
+            let Some([channel, offset, count, generations]) = call else {
+                continue;
+            };
+            let r = unit.resident.as_mut().unwrap();
+            let generation_base = r.take_generations(generations).wrapping_sub(1);
+            let entry = [
+                tt_isa::dm::op::CALL,
+                channel,
+                offset,
+                count,
+                generation_base,
+                barrier_base,
+                0,
+                0,
+            ];
+            let m = unit.mover.as_mut().unwrap();
+            let number = m.enqueue(dev, r.window(), &[entry])?;
+            unit.queued.push_back(QueuedList {
+                number,
+                kernels: false,
+                what: "trace",
+            });
+            unit.lists += 1;
+            // The replay sets the roles' descriptors and semaphores without
+            // the host.
+            r.forget_tile_state();
+        }
+        self.barriers = self.barriers.wrapping_add(barriers);
+        Ok(())
+    }
+
+    /// Give trace `id` back: once nothing queued runs it, its programs may be
+    /// evicted, its stream's slots are free, and the frees it deferred happen.
+    pub fn release_trace(&mut self, id: TraceId) -> Result<(), TensorError> {
+        if !self.traces.contains_key(&id.0) {
+            return Err(TraceError::Unknown(id.0).into());
+        }
+        self.sync()?;
+        let t = self.traces.remove(&id.0).expect("checked above");
+        for (unit, ut) in self.units.iter_mut().zip(t.units) {
+            let Some(ut) = ut else { continue };
+            for at in ut.held_programs {
+                unit.programs.release(at);
+            }
+            if let Some(d) = self.dram.as_mut() {
+                d.alloc.free(&ut.stream);
+            }
+        }
+        for p in t.freed {
+            // Another trace may hold it too.
+            self.free_placement(p)?;
+        }
+        Ok(())
+    }
+
+    /// The ops trace `id` captured, in order (`crate::trace::OpRecord`).
+    pub fn trace_ops(&self, id: TraceId) -> Result<&[trace::OpRecord], TensorError> {
+        self.traces
+            .get(&id.0)
+            .map(|t| &t.ops[..])
+            .ok_or(TraceError::Unknown(id.0).into())
+    }
+
+    /// Is a capture open?
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Overwrite `t`'s values in place (`DramTensor::write`): a trace's input
+    /// between replays. Waits for what is queued, which may read it.
+    pub fn write(&mut self, t: &DramTensor, values: &[f32]) -> Result<(), TensorError> {
+        self.refuse_while_capturing("write")?;
+        self.sync()?;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        t.write(dev, &d.w4, values)
     }
 
     /// Free GDDR bytes on the fullest channel.
@@ -1317,6 +1843,12 @@ impl<T: Transport> Session<T> {
             }
         };
         let units = self.units.len();
+        // No `MOP` in the matmul: with its loops replayed it is backend-bound,
+        // and the math role's `MOP` measured no faster end to end on silicon
+        // (row AE) -- while ttsim's FIFO overflows under one (row 68), so the
+        // default would be a path only silicon runs. `step36_mop` and
+        // `step37_loops` keep the expander gated.
+        let allow_mop = false;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -1329,6 +1861,7 @@ impl<T: Transport> Session<T> {
                     route,
                     fidelity,
                     units,
+                    allow_mop,
                 )
             })
             .and_then(|work| self.execute(work, budget));
@@ -1523,6 +2056,7 @@ impl<T: Transport> Session<T> {
                     // found them, which is what lets the mover run them back
                     // to back.
                     restores_semaphores: true,
+                    mop: seg.mop,
                     ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
                 };
                 let generations = r.reserve(
@@ -1685,7 +2219,11 @@ impl<T: Transport> Session<T> {
 
     /// The device, with every unit's role cores held again.
     /// [`Session::sync`] for the paths that report a `RunError`.
+    /// Wait for what is queued before a host-run kernel -- which no trace can
+    /// capture, so one during a capture is refused.
     fn sync_run(&mut self) -> Result<(), RunError> {
+        self.refuse_while_capturing("host-run kernel")
+            .map_err(|e| RunError::Queued(e.to_string()))?;
         self.sync().map_err(|e| RunError::Queued(e.to_string()))
     }
 
@@ -1767,6 +2305,7 @@ mod tests {
                 Step::Kernel {
                     roles: roles.clone(),
                     init: init.clone(),
+                    mop: Box::new([None; 3]),
                 },
                 list(1, 2),
             ]
@@ -1799,6 +2338,7 @@ mod tests {
             |roles: &Arc<[Vec<Instruction>; 3]>, init: &Vec<runtime::SemaphoreInit>| Step::Kernel {
                 roles: roles.clone(),
                 init: init.clone(),
+                mop: Box::new([None; 3]),
             };
         let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
         assert_eq!(segs.len(), 1, "every program is resident: one list");
@@ -1821,6 +2361,7 @@ mod tests {
         let k = |roles: &Arc<[Vec<Instruction>; 3]>| Step::Kernel {
             roles: roles.clone(),
             init: init.clone(),
+            mop: Box::new([None; 3]),
         };
         let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
@@ -1840,6 +2381,7 @@ mod tests {
             .map(|n| Step::Kernel {
                 roles: p(n),
                 init: init.clone(),
+                mop: Box::new([None; 3]),
             })
             .collect();
         let segs = segments(steps);

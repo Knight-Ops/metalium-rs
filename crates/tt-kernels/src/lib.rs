@@ -29,3 +29,4 @@ pub mod session;
 pub mod sfpu;
 pub mod shard;
 pub mod tensor;
+pub mod trace;
