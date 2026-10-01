@@ -1220,14 +1220,16 @@ host; the reduced golden bit for bit on ttsim and both cards after every slice):
       is not a multiple of 32 should be wrong; the crop on download hides the
       rows themselves. MNIST's batches are whole tiles. `tt-metal-concepts-review.md`
       G1; the fix (a typed pad state per tensor) is `hardware-coverage.md` F0.
-- [ ] **`silicon_eth_link::host_driven_tt_link_*` are flaky** (found by Phase 10's
+- [x] **`silicon_eth_link::host_driven_tt_link_*` are flaky** (found by Phase 10's
       full-suite run, 2026-10-01): in the full suite and in their own group, one to
       three of the four `host_driven_tt_link_card{0,1}_to_card{1,0}_x{3,13}` fail per
       pass, each after ~2.6 s, a different set each time, and each passes run alone.
-      `main` (8800cdb) fails the same way, so it predates Phase 10; the Ethernet movers'
-      tests (`silicon_eth_link::mover::*`) and the sharded MNIST pass throughout.
-      Next: read what the 2.6 s failure is (the runner's log does not keep test
-      output), and fix the access rather than retrying it.
+      **Cause: the test, not the link.** The missing bytes were always the payload's
+      tail, holding the receiver's `0xEE` sentinel: the host's sentinel write is posted,
+      and now and then landed after the Ethernet frames and overwrote them. A read-back
+      of both buffers' last words before the transfer starts fixes it: 3 failures in 40
+      runs before, 6 in 60 with only the sender's read-back, 0 in 60 with both
+      (`ttsim-divergence.md` row AA). The test now prints each mismatched range too.
 - [ ] **A `BufferId` can outlive its engine** (found by review): `DramBuffers`
       numbers from 1 per attach (`burn-tt/src/server.rs`), so a tensor kept across
       a detach and re-attach reads another tensor's buffer, and dropping it frees
@@ -1498,7 +1500,7 @@ lets you trust Wormhole-sourced behaviour at all.
 **Compute** — [ ] `SHIFTXA`/`SHIFTXB`/`TRNSPSRCB` · [ ] `GAPOOL`/`DOTPV`
 
 **Frontend** — [ ] `WaitGate` (a silent gap; seven BH pages reason about its
-semantics) · [x] `REPLAY` (`step26_sfpu_isa`: SFPU row loops replayed match their unrolled form on ttsim and both cards) · [ ] `MOP`/`MOP_CFG`
+semantics) · [x] `REPLAY` (`step26_sfpu_isa`: SFPU row loops replayed match their unrolled form on ttsim and both cards) · [x] `MOP`/`MOP_CFG` (`step36_mop`: both templates against the page's model, configuration from the role mailbox, ttsim and both cards; generator marks them `CONFIRMED`)
 
 **Units** — [ ] the entire Scalar Unit (ThCon) · [ ] Mover (`XMOV`) ·
 [ ] Miscellaneous Unit

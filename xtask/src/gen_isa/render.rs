@@ -243,8 +243,10 @@ fn header(out: &mut String, input: &Input<'_>, instructions: usize, layouts: usi
          //!\n\
          //! Provenance: {} documented for Blackhole, {} shared with Wormhole and stated\n\
          //! to be identical, {} superseded on Blackhole, {} Wormhole-only and therefore\n\
-         //! **`UNVERIFIED`**, and {} **`MEASURED`** against ttsim where the specification\n\
-         //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`).\n\
+         //! **`UNVERIFIED`**, {} **`MEASURED`** against ttsim where the specification\n\
+         //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and {}\n\
+         //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate\n\
+         //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).\n\
          //!\n\
          //! Names are the `Bits32.lua` diagram keys, so a name in the specification can\n\
          //! be found here without translation — except that a Blackhole-specific form\n\
@@ -261,6 +263,7 @@ fn header(out: &mut String, input: &Input<'_>, instructions: usize, layouts: usi
         counts.get("SupersededOnBlackhole").copied().unwrap_or(0),
         counts.get("WormholeOnly").copied().unwrap_or(0),
         counts.get("Measured").copied().unwrap_or(0),
+        counts.get("Confirmed").copied().unwrap_or(0),
     )
     .unwrap();
 }
@@ -343,6 +346,9 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
                 quoted(widened)
             )
         }
+        Provenance::Confirmed { evidence } => {
+            format!("Provenance::Confirmed {{ evidence: \"{evidence}\" }}")
+        }
         other => format!("Provenance::{}", other.variant_name()),
     };
     let mnemonic = &e.mnemonic;
@@ -359,6 +365,10 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
         Provenance::WormholeOnly => format!(
             "**`UNVERIFIED`.** `{page}` is a Wormhole page and Blackhole has none, so this \
              layout is a hypothesis until silicon or the simulator confirms it."
+        ),
+        Provenance::Confirmed { evidence } => format!(
+            "**`CONFIRMED`** on Blackhole, ttsim and silicon, by `{evidence}`: the layout of \
+             `{page}` (a Wormhole page; Blackhole has none), every field exercised."
         ),
         Provenance::Measured {
             evidence,

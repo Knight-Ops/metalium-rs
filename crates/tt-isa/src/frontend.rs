@@ -17,6 +17,8 @@
 use crate::isa::generated::{defs, encode};
 use crate::isa::Instruction;
 
+pub mod mop;
+
 /// Instructions the replay buffer holds, per thread.
 pub const REPLAY_BUFFER: u32 = 32;
 

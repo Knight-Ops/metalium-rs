@@ -519,6 +519,12 @@ pub const COPROCESSOR_DONE_CHECK: u64 = PC_BUF_BASE + 0x04;
 /// configuration (`ManualTTSync.md`).
 pub const MOP_EXPANDER_DONE_CHECK: u64 = PC_BUF_BASE + 0x08;
 
+/// `TENSIX_MOP_CFG_BASE`: the issuing core's thread's nine `MopCfg` words
+/// (`BabyRISCV/README.md:120`, `MOPExpander.md` "Configuration"), in RISC-V
+/// T0, T1 and T2 only. **Write-only**: a load is `UndefinedBehavior`. Write
+/// only once [`MOP_EXPANDER_DONE_CHECK`] says no expansion is in progress.
+pub const MOP_CFG_BASE: u64 = 0xFFB8_0000;
+
 /// Upper bound of the range subject to the Manual TTSync load-adjacency hazard.
 ///
 /// After *starting* a load from [`COPROCESSOR_DONE_CHECK`] or

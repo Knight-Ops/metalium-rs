@@ -91,6 +91,10 @@ pub struct Kernel<'a> {
     /// Have each role release blocked semaphores before pushing
     /// (`mailbox::UNWEDGE`): a tile reset on silicon.
     pub unwedge: bool,
+    /// Each role's MOP Expander configuration for this run, loaded by its
+    /// runner before the program is pushed (`tt_isa::frontend::mop`,
+    /// `mailbox::MOP_CFG`). `None` leaves the expander as it is.
+    pub mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
 }
 
 impl<'a> Kernel<'a> {
@@ -107,7 +111,17 @@ impl<'a> Kernel<'a> {
             trace: false,
             restores_semaphores: false,
             unwedge: false,
+            mop: [None; 3],
         }
+    }
+
+    /// Role `thread`'s MOP words, checked: a configuration the expander cannot
+    /// run as the page describes it is refused before anything is staged.
+    fn mop_words(&self, thread: usize) -> Result<Option<[u32; 9]>, RunError> {
+        self.mop[thread]
+            .map(|c| c.config_words())
+            .transpose()
+            .map_err(|e| RunError::Mop { thread, reason: e })
     }
 }
 
@@ -223,6 +237,11 @@ pub enum RunError {
     /// Work queued earlier failed when the session waited for it
     /// (`crate::session::Session::sync`).
     Queued(String),
+    /// Role `thread`'s MOP Expander configuration was refused.
+    Mop {
+        thread: usize,
+        reason: tt_isa::frontend::mop::MopError,
+    },
     /// The tile's reset never finished: these roles' threads take no
     /// instruction even after the backend pulse and every semaphore released.
     /// Nothing the host can do from software clears it; a board reset does
@@ -255,6 +274,9 @@ impl std::fmt::Display for RunError {
             ),
             RunError::Setup(e) => write!(f, "setup run: {e}"),
             RunError::Queued(e) => write!(f, "{e}"),
+            RunError::Mop { thread, reason } => {
+                write!(f, "role {thread}'s MOP configuration: {reason}")
+            }
             RunError::DoesNotFit { what, bytes, limit } => write!(
                 f,
                 "{what} need {bytes} bytes of L1; the region holds {limit}"
@@ -394,6 +416,7 @@ pub fn run<T: Transport, N: NocId>(
             trace: u32::from(traced),
             push_window,
             unwedge: u32::from(kernel.unwedge),
+            mop_cfg: kernel.mop_words(thread)?,
             ..Default::default()
         };
         for (at, v) in d.writes(mb) {
@@ -541,7 +564,7 @@ pub struct Resident<N: NocId> {
     /// Each role's descriptor words as last written, but for the program's
     /// address and length (which a `KERNEL` entry rewrites on the tile): a
     /// word that already holds its value is not written again.
-    descriptors: std::cell::RefCell<[Option<[u32; 9]>; 3]>,
+    descriptors: std::cell::RefCell<[Option<[u32; mailbox::DESCRIPTOR_WORDS]>; 3]>,
     /// A [`Resident::submit`]ted kernel's phases so far, until it is
     /// [`Resident::complete`]d.
     pending: Option<Stopwatch>,
@@ -578,7 +601,7 @@ impl<N: NocId> Resident<N> {
             reservations: Default::default(),
         };
         for thread in 0..3 {
-            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false, false)?;
+            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false, false, None)?;
             dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
         }
         dev.load_and_start_together(&r.window, tile, images)?;
@@ -777,6 +800,9 @@ impl<N: NocId> Resident<N> {
                 dst_access_fmt: kernel.dst_fmt,
                 trace: u32::from(self.profiling),
                 push_window,
+                // A MOP configuration different from the queued kernels'
+                // would be rewritten under them.
+                mop_cfg: kernel.mop_words(thread).ok().flatten(),
                 ..Default::default()
             };
             let mb = Mailbox::of(thread as u32);
@@ -885,7 +911,7 @@ impl<N: NocId> Resident<N> {
         });
         if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
-            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true, false)?;
+            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true, false, None)?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {
                 self.poisoned = true;
@@ -922,6 +948,7 @@ impl<N: NocId> Resident<N> {
                 kernel.dst_fmt,
                 false,
                 resident_programs,
+                kernel.mop_words(thread)?,
             )?;
         }
         clock.lap(dev, Phase::Programs);
@@ -1016,6 +1043,7 @@ impl<N: NocId> Resident<N> {
         dst_fmt: u32,
         go: bool,
         resident_programs: bool,
+        mop_cfg: Option<[u32; 9]>,
     ) -> Result<(), RunError> {
         let (w, tile) = (&self.window, self.tile);
         let mb = Mailbox::of(thread as u32);
@@ -1039,6 +1067,7 @@ impl<N: NocId> Resident<N> {
             dump_row_count: dump,
             trace: u32::from(traced),
             push_window,
+            mop_cfg,
             ..Default::default()
         };
         let mut descs = self.descriptors.borrow_mut();

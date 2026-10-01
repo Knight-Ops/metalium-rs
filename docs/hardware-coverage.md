@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X4a-c, X5a; X2, X4d, X5b next |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X2a, X4a-c, X5a; X2b, X4d, X5b next |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -171,7 +171,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | Feature | Enc | Helper | Kernel | Sim | Si | Item |
 |---|:-:|:-:|:-:|:-:|:-:|---|
 | `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
-| `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
+| `MOP` / `MOP_CFG` (MOP Expander templates) | x (`CONFIRMED`) | x (`frontend::mop`, mailbox `MOP_CFG`) | (X2b) | x | x | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
@@ -220,11 +220,32 @@ reverse index.
       it replays. F2's row-group loop records its body once and replays it where it fits,
       unrolling (and saying so) where it does not. Gate: replayed programs bit-identical to
       their unrolled form on ttsim and both cards.
-- [ ] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
+- [~] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
       after `MOPExpanderDoneCheck` (`ManualTTSync.md:57`); Auto TTSync takes the `MOP`'s
       resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
       unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
       down; silicon time measured.
+  - [x] **X2a The expander, configured from the mailbox.** `tt_isa::frontend::mop`:
+        `MopConfig` (templates 0 and 1, Blackhole's ten-bit counts) refusing what the page
+        marks unsupported -- the count overrides, the start/inner/end shape with the
+        iteration-count bug, a `MOP` in a loop slot -- and `expand`, the page's functional
+        model, as the oracle. A kernel's `mop: [Option<MopConfig>; 3]` goes into each
+        role's mailbox (`mailbox::MOP_CFG_VALID`, `MOP_CFG`, nine words); the runner waits
+        on `MOPExpanderDoneCheck` and writes them to `TENSIX_MOP_CFG_BASE` before
+        pushing, so nothing but instructions is ever in the stream. The session's
+        descriptor comparison covers the words, so a queued kernel's configuration is
+        never rewritten under it. Gate `step36_mop`: template 1 (start, last and two end
+        ops; alternating loop ops) and template 0 (a mask over both halves, 20
+        iterations) as integer adds whose sum counts each slot -- the device's tile bit
+        for bit the interpreter's on the model's expansion, and the first sum checked by
+        hand; and two runs of one `MOP` under two configurations give their own sums
+        (watched failing: the hand count off by one; no configuration loaded, ttsim's
+        contract exit). ttsim, then silicon alone on the gate tile, both cards. `MOP` and
+        `MOP_CFG` were Wormhole-only drawings: the generator now marks them `CONFIRMED`
+        with this gate as evidence (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`: only a
+        `WormholeOnly` layout, the gate must exist, every field must be exercised).
+  - [ ] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
+        MNIST golden bit for bit, program bytes and silicon time measured.
 - [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
       mover brackets each list and each top-level entry or record with timestamper events
       when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,
@@ -324,7 +345,9 @@ Each names the measurement it must move. The Burn-side ones are in
       uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
       a tensor touches). Batch the read-backs per tensor, not per channel write; read
       small tensors with the widest loads the BAR allows. Moves: per-call `upload` and
-      `download` in `tt-mnist`'s breakdown.
+      `download` in `tt-mnist`'s breakdown. With it, the ordering rule as API (row AA):
+      a fenced L1 write -- posted writes, then one read-back -- for every host write
+      another agent may race, so a caller cannot forget it.
 - [ ] **X4d Traces** (above) are here too: worth ~0.2 ms a step at most until X6 and
       B8 shrink the rest (row V).
 - Moved to Burn's roadmap with the numbers: **B8** async calls (a call's server round
@@ -734,6 +757,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
 | Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
+| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevented (X4c), detected at open (X5a); recovery X5b |
 

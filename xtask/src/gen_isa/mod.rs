@@ -188,6 +188,12 @@ pub fn load() -> Result<Sources, String> {
         &mut provenance,
         &mut mnemonics,
     )?;
+    measured::confirm(
+        measured::CONFIRMED,
+        &measured::gate_exists(&root),
+        &diagrams,
+        &mut provenance,
+    )?;
     check::structure(&diagrams)?;
 
     let mut provenance_counts: BTreeMap<&'static str, usize> = BTreeMap::new();

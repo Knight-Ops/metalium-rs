@@ -10,7 +10,7 @@
 //! parameters, so `PushesTo` still rules out the pairings that hang.
 
 use crate::cfg::write_config_field;
-use crate::tensix::{push_word, read_dst32, wait_for_coprocessor};
+use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor};
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::role::Mailbox;
@@ -218,6 +218,19 @@ where
     // covers the push-then-load direction, not this one, so drain the store queue
     // before pushing anything that depends on the new value.
     publish();
+
+    // This run's MOP Expander configuration (`tt_isa::frontend::mop`), loaded
+    // once the expander is idle and before anything is pushed that could use
+    // it.
+    // SAFETY: fixed mailbox words, written by the host before the generation.
+    if unsafe { l1_read32(mb.mop_cfg_valid()) } != 0 {
+        let mut cfg = [0u32; 9];
+        for (k, w) in cfg.iter_mut().enumerate() {
+            // SAFETY: as above.
+            *w = unsafe { l1_read32(mb.mop_cfg(k as u32)) };
+        }
+        load_mop_config(&cfg);
+    }
 
     trace(tracing, Thread::INDEX, mailbox::trace::START);
     let mut i = 0;
