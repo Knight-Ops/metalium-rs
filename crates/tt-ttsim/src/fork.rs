@@ -55,6 +55,28 @@ impl std::error::Error for ForkError {}
 /// `_Exit` (which uses 1).
 const PANIC_EXIT_CODE: i32 = 101;
 
+/// Held exclusively for the instant of every `fork`, and shared by
+/// [`outside_fork`] while a parent thread does library work.
+///
+/// A forked child inherits only the thread that forked, but every lock in the
+/// address space as it stood: a lock another thread held at that instant is
+/// held forever in the child, and the first thing in the child to take it
+/// waits forever. `cargo test` runs tests on several threads at once, so a
+/// test computing its `burn-flex` reference in the parent while another test
+/// forks is exactly that. Seen once in the end-to-end tier: a training gate's
+/// child waiting on a futex, its server thread idle, for ten minutes; every
+/// test passed alone.
+static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Run `f` in the parent -- library work a test does outside any
+/// [`fork_scope`], such as computing a host reference -- so that no other
+/// thread forks while it runs. Any number may run at once; a fork waits for all
+/// of them.
+pub fn outside_fork<R>(f: impl FnOnce() -> R) -> R {
+    let _shared = GATE.read().unwrap_or_else(|p| p.into_inner());
+    f()
+}
+
 /// Run `f` in a forked child process and wait for it.
 ///
 /// Returns `Ok(())` if the child completed without panicking, and a [`ForkError`]
@@ -66,7 +88,8 @@ const PANIC_EXIT_CODE: i32 = 101;
 ///
 /// Fork at a quiescent point — with no `libttsim` call in progress. Since the
 /// simulator only advances inside `clock`, any point in ordinary sequential code
-/// qualifies.
+/// qualifies. Library work in the parent that may run while another test forks
+/// goes through [`outside_fork`].
 ///
 /// The child inherits the parent's buffered stdio, so both streams are flushed
 /// before forking to avoid duplicated output.
@@ -78,11 +101,16 @@ pub fn fork_scope<F: FnOnce()>(f: F) -> Result<(), ForkError> {
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
 
-    // SAFETY: fork has no preconditions. The child below performs no allocation
-    // that could deadlock on a lock held by another thread at fork time — with one
-    // exception noted in the module docs: the closure itself is arbitrary Rust. In
-    // practice test bodies are simple and this is the pattern ttsim prescribes.
+    // No thread is inside `outside_fork` while this is held, so no library
+    // lock those threads take is held across the fork.
+    let exclusive = GATE.write().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: fork has no preconditions. The child may still meet a lock held
+    // at fork time by a thread doing library work *outside* `outside_fork`
+    // (see `GATE`), which is why parent-side work goes through it.
     let pid = unsafe { libc::fork() };
+    // Both processes release their own copy: the child's is the forking
+    // thread's, which is the child's only thread.
+    drop(exclusive);
 
     match pid {
         -1 => Err(ForkError::Fork(io::Error::last_os_error())),
@@ -123,6 +151,33 @@ pub fn fork_scope<F: FnOnce()>(f: F) -> Result<(), ForkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hazard `GATE` exists for: a lock another thread holds at the
+    /// instant of `fork` is held forever in the child. With the work that
+    /// holds it inside `outside_fork`, the fork waits for it, and the child
+    /// takes the lock at once. (Without the gate the child would wait forever;
+    /// the alarm turns that into a failure rather than a hung suite.)
+    #[test]
+    fn a_lock_held_by_parent_work_is_not_inherited_by_the_child() {
+        use std::sync::{mpsc, Mutex};
+        static LIBRARY: Mutex<()> = Mutex::new(());
+        let (held, wait) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            outside_fork(|| {
+                let _lock = LIBRARY.lock().unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            })
+        });
+        wait.recv().unwrap();
+        let r = fork_scope(|| {
+            // SAFETY: arms a signal for this child only; nothing else uses it.
+            unsafe { libc::alarm(5) };
+            drop(LIBRARY.lock().unwrap());
+        });
+        worker.join().unwrap();
+        r.expect("the child must get the lock the parent's work released");
+    }
 
     #[test]
     fn clean_child_succeeds() {

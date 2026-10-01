@@ -129,26 +129,60 @@ use tt_isa::matrix::Banks;
 use tt_isa::sync::{self, Semaphore, Unit};
 use tt_isa::tile::TileDescriptor;
 
-/// Math -> pack: "`Dst` holds a finished output tile".
-pub const DST_READY: Semaphore = match Semaphore::new(0) {
-    Some(s) => s,
-    None => unreachable!(),
-};
+/// The matmul's names for the two semaphores its math and pack roles hand
+/// `Dst` over with, as its plan assigned them. The semaphores themselves are
+/// ordinary `crate::l1` declarations, as any kernel's are -- a starting value
+/// and a live range -- and what a run initialises comes from the plan
+/// ([`Layout::init`]), so nothing here is special to a matmul but which is
+/// which.
+///
+/// `ready` is math -> pack, "`Dst` holds a finished output tile"; `free` is
+/// pack -> math, "the packer has finished reading `Dst`; it may be cleared",
+/// and starts at one, so the first output tile does not wait.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct MatmulSemaphores {
+    pub ready: Semaphore,
+    pub free: Semaphore,
+}
 
-/// Pack -> math: "the packer has finished reading `Dst`; it may be cleared".
-/// Starts at one, so the first output tile does not wait.
-pub const DST_FREE: Semaphore = match Semaphore::new(1) {
-    Some(s) => s,
-    None => unreachable!(),
-};
+impl MatmulSemaphores {
+    /// Declare the pair in `req`, live in `live`: `ready` starting at zero
+    /// and `free` at one. A run leaves both where they started -- each `ready`
+    /// posted is taken, and `free` is taken and given back once per output
+    /// tile -- which is what lets a resident tile skip the setup run between
+    /// matmuls (`Kernel::restores_semaphores`).
+    pub fn declare(
+        req: &mut crate::l1::Requirements,
+        live: std::ops::Range<u32>,
+    ) -> (crate::l1::Sem, crate::l1::Sem) {
+        (
+            req.semaphore("matmul Dst ready", 0, live.clone()),
+            req.semaphore("matmul Dst free", 1, live),
+        )
+    }
 
-/// The semaphores [`tile_roles`] and [`matmul_roles`] expect a concurrent run to
-/// initialise. Every run leaves them as it found them: each `DST_READY` posted
-/// is taken, and `DST_FREE` is taken once per tile and given back once per tile.
-pub const TILE_SEMAPHORES: [(Semaphore, u8, u8); 2] = [
-    (DST_READY, 0, sync::MAX_VALUE),
-    (DST_FREE, 1, sync::MAX_VALUE),
-];
+    /// The pair as `plan` placed it.
+    pub fn planned(
+        plan: &crate::l1::Plan,
+        (ready, free): (crate::l1::Sem, crate::l1::Sem),
+    ) -> Self {
+        MatmulSemaphores {
+            ready: plan.semaphore(ready),
+            free: plan.semaphore(free),
+        }
+    }
+
+    /// The pair, and their initialisation, for a matmul that is the whole of
+    /// a tile's work: a plan of nothing else.
+    pub fn alone() -> (Self, Vec<crate::runtime::SemaphoreInit>) {
+        let mut req = crate::l1::Requirements::new(1);
+        let sems = Self::declare(&mut req, 0..1);
+        let plan = req
+            .plan(tt_isa::l1::DATA)
+            .expect("two semaphores always fit");
+        (Self::planned(&plan, sems), plan.semaphore_init())
+    }
+}
 
 /// One output tile: the `(A, B)` tile-image pairs it accumulates, in order, and
 /// where its 1024 datums are packed.
@@ -243,9 +277,10 @@ fn retarget(a_tile: u64, b_tile: u64) -> Vec<Instruction> {
 /// takes `A_k` face `(i, k')` into `SrcB` and `B_k` face `(k', j)` into `SrcA`,
 /// `k' = 0, 1`, and two `MVMUL`s, one per eight-row half of `SrcB`. That is
 /// sixteen unpack pairs per `k` through two banks each, so the roles must run
-/// concurrently (`harness::Run::concurrent` with [`TILE_SEMAPHORES`]).
+/// concurrently (`harness::Run::concurrent` with the plan's `Layout::init`).
 pub fn tile_roles(
     pairs: &[(u64, u64)],
+    sems: MatmulSemaphores,
     in_fmt: L1Format,
     out_fmt: u32,
     fidelity: Fidelity,
@@ -256,6 +291,7 @@ pub fn tile_roles(
             pairs: pairs.to_vec(),
             out,
         }],
+        sems,
         in_fmt,
         out_fmt,
         fidelity,
@@ -297,8 +333,8 @@ impl Fidelity {
 /// [`tile_roles`] for several output tiles, one after another through `Dst`.
 ///
 /// The math role clears `Dst` for each output tile only once the pack role has
-/// finished reading the last one ([`DST_FREE`]), and the pack role packs each
-/// only once the math role has finished writing it ([`DST_READY`]). One output
+/// finished reading the last one (`sems.free`), and the pack role packs each
+/// only once the math role has finished writing it (`sems.ready`). One output
 /// tile is in `Dst` at a time; double-buffering it is Phase 9.
 ///
 /// With more than one fidelity phase, each `SrcB` half gets one `MVMUL` per
@@ -308,6 +344,7 @@ impl Fidelity {
 /// nothing depends on whether the phase counter wraps.
 pub fn matmul_roles(
     outputs: &[OutputTile],
+    sems: MatmulSemaphores,
     in_fmt: L1Format,
     out_fmt: u32,
     fidelity: Fidelity,
@@ -334,7 +371,7 @@ pub fn matmul_roles(
     let mut banks = Banks::after_reset();
     let mut current = (a0, b0);
     for output in outputs {
-        math.extend(sync::take(DST_FREE, Before::MATRIX));
+        math.extend(sync::take(sems.free, Before::MATRIX));
         // (mode, use_dst32b, addr_mod, imm10): all of `Dst`.
         math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
         for &(a, b) in &output.pairs {
@@ -383,14 +420,14 @@ pub fn matmul_roles(
                 }
             }
         }
-        math.extend(sync::post_after(Unit::Matrix, DST_READY));
+        math.extend(sync::post_after(Unit::Matrix, sems.ready));
 
         let mut pw = ConfigWords::new();
         crate::datapath::pack_config(&mut pw, output.out);
         pack.extend(config_program(&pw));
-        pack.extend(sync::take(DST_READY, Before::PACKER));
+        pack.extend(sync::take(sems.ready, Before::PACKER));
         pack.extend(crate::datapath::pack_rows(TILE_DST_ROWS));
-        pack.extend(sync::post_after(Unit::Packer, DST_FREE));
+        pack.extend(sync::post_after(Unit::Packer, sems.free));
     }
     unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
     unpack.push(backend::wait_for_unpacker1(Before::EVERYTHING).unwrap());
@@ -454,11 +491,15 @@ pub fn detilize_packed(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Where [`stage_matmul`] puts things in L1: `A`'s tiles from here, then
-/// `B`'s, then the packed output tiles from [`MATMUL_OUT`].
-pub const MATMUL_STAGE: u64 = 0x2_0000;
-/// Where the packed output tiles go.
+/// Where [`stage_matmul`] puts things in L1 on the host-staged path: `A`'s
+/// tiles from here, then `B`'s, then the packed output tiles from
+/// [`MATMUL_OUT`]. The start of the data arena (`tt_isa::l1::DATA`); the
+/// GDDR path's layout is planned there instead ([`plan_layout_in`] with
+/// [`Staging::Slots`], through `crate::l1`).
+pub const MATMUL_STAGE: u64 = tt_isa::l1::DATA.base;
+/// Where the packed output tiles go on the host-staged path.
 pub const MATMUL_OUT: u64 = 0x8_0000;
+const _: () = assert!(MATMUL_OUT > MATMUL_STAGE && MATMUL_OUT < tt_isa::l1::DATA.end);
 
 /// A matmul `C[m, n] = A[m, k] @ B[k, n]` laid out for the device: both
 /// operands tiled and padded by `tt_layout`, and the output tiles planned.
@@ -469,6 +510,8 @@ pub struct StagedMatmul {
     pub b: Vec<u8>,
     pub b_at: u64,
     pub outputs: Vec<OutputTile>,
+    pub sems: MatmulSemaphores,
+    pub init: Vec<crate::runtime::SemaphoreInit>,
 }
 
 impl StagedMatmul {
@@ -486,15 +529,29 @@ pub fn tile_image_bytes(format: L1Format) -> u64 {
         .total_bytes() as u64
 }
 
+/// Where a matmul run's operands and outputs go in L1, and which semaphores
+/// it hands `Dst` over with.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    /// `B`'s first byte (`A`'s is the first of the run's staging).
+    pub b_at: u64,
+    /// One per output tile, row-major.
+    pub outputs: Vec<OutputTile>,
+    pub sems: MatmulSemaphores,
+    /// What a concurrent run of it initialises: every semaphore of its plan.
+    pub init: Vec<crate::runtime::SemaphoreInit>,
+}
+
 /// Where a `[mt, kt] @ [kt, nt]`-tile matmul's operands and outputs go in L1,
-/// without the data: `B`'s first byte, and one [`OutputTile`] per output tile.
+/// without the data: `B`'s first byte, one [`OutputTile`] per output tile, and
+/// its semaphores.
 ///
 /// Refuses a shape whose operands would overrun [`MATMUL_OUT`] or whose output
 /// would overrun the mailbox, as [`RunError::DoesNotFit`](crate::runtime::RunError).
 pub fn plan_layout(
     tiles: [usize; 3],
     in_fmt: L1Format,
-) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
+) -> Result<Layout, crate::runtime::RunError> {
     plan_layout_in(tiles, in_fmt, Staging::Host)
 }
 
@@ -516,19 +573,14 @@ pub fn plan_layout_in(
     [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
     staging: Staging,
-) -> Result<(u64, Vec<OutputTile>), crate::runtime::RunError> {
+) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
-    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    if staging == Staging::Slots {
+        return plan_slots([mt, kt, nt], in_fmt);
+    }
     let (img, align, out_stride, out_skip) = match staging {
         Staging::Host => (tile_image_bytes(in_fmt), 16, 1024 * 4, 0),
-        Staging::Slots => {
-            assert_eq!(
-                tile_image_bytes(in_fmt),
-                TILE_DATA + 4096,
-                "slot staging holds FP32 tiles"
-            );
-            (TILE_SLOT, TILE_SLOT, TILE_SLOT, TILE_DATA)
-        }
+        Staging::Slots => unreachable!("planned by plan_slots"),
     };
     let a_bytes = (mt * kt) as u64 * img;
     let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(align);
@@ -565,7 +617,122 @@ pub fn plan_layout_in(
             });
         }
     }
-    Ok((b_at, outputs))
+    let (sems, init) = MatmulSemaphores::alone();
+    Ok(Layout {
+        b_at,
+        outputs,
+        sems,
+        init,
+    })
+}
+
+/// The GDDR path's L1 layout ([`Staging::Slots`]): its kernel's needs as
+/// `crate::l1` requirements -- `A`'s and `B`'s tiles, rings from the mover to
+/// the unpacker, and the output tiles, a ring from the packer back to the
+/// mover -- planned in the data arena. One stage, so all three live at once.
+pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
+    use crate::l1::{Endpoint, Requirements};
+    use tt_isa::dm::TILE_SLOT;
+    let mut req = Requirements::new(1);
+    let ring = |req: &mut Requirements, name, pages: usize, from, to| {
+        // C64: a slot is read from GDDR under the 64-byte congruence rule
+        // (divergence row 64), and a slot is a whole number of 64-byte units.
+        req.cb(
+            name,
+            TILE_SLOT,
+            pages as u32,
+            tt_isa::dram::ALIGN,
+            from,
+            to,
+            0..1,
+        )
+    };
+    let a = ring(
+        &mut req,
+        "matmul A",
+        mt * kt,
+        Endpoint::Mover,
+        Endpoint::Unpack,
+    );
+    let b = ring(
+        &mut req,
+        "matmul B",
+        kt * nt,
+        Endpoint::Mover,
+        Endpoint::Unpack,
+    );
+    let out = ring(
+        &mut req,
+        "matmul out",
+        mt * nt,
+        Endpoint::Pack,
+        Endpoint::Mover,
+    );
+    let sems = MatmulSemaphores::declare(&mut req, 0..1);
+    MatmulBuffers {
+        req,
+        a,
+        b,
+        out,
+        sems,
+    }
+}
+
+/// A matmul's declared buffers ([`matmul_requirements`]).
+pub struct MatmulBuffers {
+    pub req: crate::l1::Requirements,
+    pub a: crate::l1::Buf,
+    pub b: crate::l1::Buf,
+    pub out: crate::l1::Buf,
+    /// `Dst` ready and free ([`MatmulSemaphores`]).
+    pub sems: (crate::l1::Sem, crate::l1::Sem),
+}
+
+fn plan_slots(
+    [mt, kt, nt]: [usize; 3],
+    in_fmt: L1Format,
+) -> Result<Layout, crate::runtime::RunError> {
+    use crate::l1::PlanError;
+    use crate::runtime::RunError;
+    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    assert_eq!(
+        tile_image_bytes(in_fmt),
+        TILE_DATA + 4096,
+        "slot staging holds FP32 tiles"
+    );
+    let m = matmul_requirements([mt, kt, nt]);
+    let plan = m.req.plan(tt_isa::l1::DATA).map_err(|e| match e {
+        PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
+            what: name,
+            bytes,
+            limit: arena,
+        },
+        e => panic!("the matmul's own requirements are invalid: {e}"),
+    })?;
+    let (a_at, b_at, out_at) = (plan.addr(m.a), plan.addr(m.b), plan.addr(m.out));
+    let mut outputs = Vec::with_capacity(mt * nt);
+    for i in 0..mt {
+        for j in 0..nt {
+            let pairs = (0..kt)
+                .map(|kk| {
+                    (
+                        a_at + (i * kt + kk) as u64 * TILE_SLOT,
+                        b_at + (kk * nt + j) as u64 * TILE_SLOT,
+                    )
+                })
+                .collect();
+            outputs.push(OutputTile {
+                pairs,
+                out: out_at + (i * nt + j) as u64 * TILE_SLOT + TILE_DATA,
+            });
+        }
+    }
+    Ok(Layout {
+        b_at,
+        outputs,
+        sems: MatmulSemaphores::planned(&plan, m.sems),
+        init: plan.semaphore_init(),
+    })
 }
 
 /// Tile `a` and `b` (row-major) in `in_fmt` and plan one [`OutputTile`] per
@@ -582,7 +749,12 @@ pub fn stage_matmul(
     in_fmt: L1Format,
 ) -> Result<StagedMatmul, crate::runtime::RunError> {
     let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
-    let (b_at, outputs) = plan_layout(tiles, in_fmt)?;
+    let Layout {
+        b_at,
+        outputs,
+        sems,
+        init,
+    } = plan_layout(tiles, in_fmt)?;
     let (ta, la) = tilize_f32(a, m, k, in_fmt);
     let (tb, lb) = tilize_f32(b, k, n, in_fmt);
     assert_eq!(la.tiles_per_matrix(), tiles[0] * tiles[1]);
@@ -596,6 +768,8 @@ pub fn stage_matmul(
         b: tb,
         b_at,
         outputs,
+        sems,
+        init,
     })
 }
 
@@ -665,8 +839,8 @@ pub fn matmul_with(
     let (in_fmt, out_fmt) = route.formats();
     let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
     let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
-    let roles = programs((tiles, Staging::Host), route, fidelity, || {
-        matmul_roles(&staged.outputs, in_fmt, out_fmt, fidelity)
+    let roles = programs((tiles, Staging::Host), route, fidelity, staged.sems, || {
+        matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity)
     });
     let [unpack, math, pack] = &*roles;
     let stage = [
@@ -677,9 +851,9 @@ pub fn matmul_with(
     let kernel = Kernel {
         stage: &stage,
         read_back: &read_back,
-        // `TILE_SEMAPHORES`: every run leaves them as it found them.
+        // Every run leaves its semaphores as it found them (`MatmulSemaphores`).
         restores_semaphores: true,
-        ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&TILE_SEMAPHORES))
+        ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&staged.init))
     };
     let out = run(&kernel)?;
     Ok(detilize_packed(&out.l1[0], m, n))
@@ -712,11 +886,11 @@ pub fn chunk_fits_in(
     if staging == Staging::Slots && in_fmt != L1Format::Fp32 {
         return false;
     }
-    let Ok((_, outputs)) = plan_layout_in(tiles, in_fmt, staging) else {
+    let Ok(layout) = plan_layout_in(tiles, in_fmt, staging) else {
         return false;
     };
-    let roles = programs((tiles, staging), route, fidelity, || {
-        matmul_roles(&outputs, in_fmt, out_fmt, fidelity)
+    let roles = programs((tiles, staging), route, fidelity, layout.sems, || {
+        matmul_roles(&layout.outputs, layout.sems, in_fmt, out_fmt, fidelity)
     });
     roles
         .iter()
@@ -733,15 +907,18 @@ pub(crate) fn programs(
     tiles: ([usize; 3], Staging),
     route: SrcRoute,
     fidelity: Fidelity,
+    sems: MatmulSemaphores,
     build: impl FnOnce() -> [Vec<Instruction>; 3],
 ) -> std::sync::Arc<[Vec<Instruction>; 3]> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    type Key = (([usize; 3], Staging), SrcRoute, Fidelity);
+    // The semaphores are part of the programs: the same shape planned beside
+    // another kernel may be given different ones.
+    type Key = (([usize; 3], Staging), SrcRoute, Fidelity, MatmulSemaphores);
     type Roles = Arc<[Vec<Instruction>; 3]>;
     static CACHE: OnceLock<Mutex<HashMap<Key, Roles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity);
+    let key = (tiles, route, fidelity, sems);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -898,9 +1075,9 @@ mod tests {
         // Two MVMULs per face pair, neither with an address modifier, and a
         // SETRWC without a fidelity reset before each: what every gate before
         // fidelity was a parameter ran.
-        let (b_at, outputs) = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
-        let _ = b_at;
-        let [_, math, _] = matmul_roles(&outputs, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+        let l = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
+        let [_, math, _] =
+            matmul_roles(&l.outputs, l.sems, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
         let mvmuls = math
             .iter()
             .filter(|i| i.word() >> 24 == encode::Mvmul::ZERO.encode().unwrap().word() >> 24)
@@ -908,9 +1085,36 @@ mod tests {
         assert_eq!(mvmuls, 16);
     }
 
+    /// The semaphores are the plan's, not constants: a matmul planned alone
+    /// gets two distinct ones, and the same layout with the pair swapped builds
+    /// programs that differ exactly where they post and take them.
+    #[test]
+    fn the_roles_use_the_semaphores_they_are_given() {
+        let l = plan_layout([1, 2, 1], L1Format::Fp32).unwrap();
+        assert_ne!(l.sems.ready, l.sems.free);
+        let swapped = MatmulSemaphores {
+            ready: l.sems.free,
+            free: l.sems.ready,
+        };
+        let a = matmul_roles(&l.outputs, l.sems, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+        let b = matmul_roles(&l.outputs, swapped, L1Format::Fp32, TF32_CODE, Fidelity::Lo);
+        assert_eq!(a[0], b[0], "the unpacker uses no semaphore");
+        for role in [1, 2] {
+            assert_eq!(a[role].len(), b[role].len());
+            let differ = a[role]
+                .iter()
+                .zip(&b[role])
+                .filter(|(x, y)| x.word() != y.word())
+                .count();
+            // One output tile: a take (`SEMWAIT`, `SEMGET`) and a post
+            // (`SEMPOST`) per role, each naming its semaphore.
+            assert_eq!(differ, 3, "role {role}");
+        }
+    }
+
     #[test]
     fn each_phase_is_one_more_mvmul_per_half() {
-        let (_, outputs) = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
+        let l = plan_layout([1, 1, 1], L1Format::Fp32).unwrap();
         let opcode = encode::Mvmul::ZERO.encode().unwrap().word() >> 24;
         for f in [
             Fidelity::Lo,
@@ -918,7 +1122,7 @@ mod tests {
             Fidelity::HiFi3,
             Fidelity::HiFi4,
         ] {
-            let [_, math, _] = matmul_roles(&outputs, L1Format::Fp32, TF32_CODE, f);
+            let [_, math, _] = matmul_roles(&l.outputs, l.sems, L1Format::Fp32, TF32_CODE, f);
             let n = math.iter().filter(|i| i.word() >> 24 == opcode).count();
             assert_eq!(n as u32, 16 * f.phases(), "{f:?}");
         }

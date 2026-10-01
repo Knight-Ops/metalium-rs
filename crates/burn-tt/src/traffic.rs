@@ -44,14 +44,59 @@ pub fn tensor_traffic() -> TensorTraffic {
     }
 }
 
-pub(crate) fn uploaded(bytes: usize) {
-    UP.fetch_add(bytes as u64, Ordering::Relaxed);
-    UPLOADS.fetch_add(1, Ordering::Relaxed);
+/// Which way a tensor crossed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Direction {
+    Up,
+    Down,
 }
 
-pub(crate) fn downloaded(bytes: usize) {
-    DOWN.fetch_add(bytes as u64, Ordering::Relaxed);
+/// One tensor crossing PCIe: which way, and its `[rows, cols]` as stored on
+/// the device (a transposed view downloads as its buffer).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Transfer {
+    pub direction: Direction,
+    pub shape: [usize; 2],
+}
+
+/// The transfer log, while one is being kept.
+static LOG: std::sync::Mutex<Option<Vec<Transfer>>> = std::sync::Mutex::new(None);
+
+/// Start (`true`) or stop keeping a log of every transfer, for a gate that
+/// wants to say *which* tensors crossed rather than how many bytes did.
+/// Off by default, so a long run does not grow it.
+pub fn record_transfers(on: bool) {
+    *LOG.lock().unwrap_or_else(|p| p.into_inner()) = on.then(Vec::new);
+}
+
+/// The transfers logged since the last call (empty if no log is kept).
+pub fn take_transfers() -> Vec<Transfer> {
+    LOG.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
+
+fn log(direction: Direction, rows: usize, cols: usize) {
+    if let Some(l) = LOG.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        l.push(Transfer {
+            direction,
+            shape: [rows, cols],
+        });
+    }
+}
+
+pub(crate) fn uploaded(rows: usize, cols: usize) {
+    UP.fetch_add((rows * cols * 4) as u64, Ordering::Relaxed);
+    UPLOADS.fetch_add(1, Ordering::Relaxed);
+    log(Direction::Up, rows, cols);
+}
+
+pub(crate) fn downloaded(rows: usize, cols: usize) {
+    DOWN.fetch_add((rows * cols * 4) as u64, Ordering::Relaxed);
     DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+    log(Direction::Down, rows, cols);
 }
 
 /// Wall-clock time spent in device calls, by kind: where a training step's

@@ -60,14 +60,17 @@ fn run_with<R>(
     dev.release_tensix_backend(&w, tile).unwrap();
 
     dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
-    dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, DST_FMT_FP32)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::PROGRAM_LEN, program.len() as u32)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, 4).unwrap();
+    let d = mailbox::Descriptor {
+        thread_index: CORE_THREAD,
+        dst_access_fmt: DST_FMT_FP32,
+        program_len: program.len() as u32,
+        dump_row_count: 4,
+        push_window: mailbox::SIM_PUSH_WINDOW,
+        ..Default::default()
+    };
+    for (at, v) in d.writes(mailbox::role::Mailbox::single_core()) {
+        dev.write32(&w, tile, at, v).unwrap();
+    }
     for (i, insn) in program.iter().enumerate() {
         dev.write32(&w, tile, mailbox::PROGRAM + (i as u64) * 4, insn.word())
             .unwrap();

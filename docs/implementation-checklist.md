@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles). Next: 9.8 overlap, with the circular-buffer runtime |
 
 ---
 
@@ -136,6 +136,16 @@ Set up early; retrofitting is expensive.
 - [x] **Version control**, so the pinning discipline above is enforceable.
 - [x] **CI: simulator suite on every commit.** Deterministic, so no flakes.
       Also fmt, clippy under `-D warnings`, and a type-check of the silicon suite.
+- [x] **Test tiers** (2026-10-01). The simulator is for validation; whole Burn
+      training runs are the `e2e` feature of `tt-tests` (ignored without it,
+      on by default with `silicon`), and the everyday smoke test is
+      `cargo xtask silicon --smoke`: burn-tt against burn-flex on the cards.
+      Measured: all 59 test binaries ran in 53 s, 80% of it the four training
+      runs in `step12_mnist`. Default `cargo test` 54 -> 36 s; the e2e tier
+      28 s (CI runs both); smoke 42 s for both cards, where the reduced
+      training run takes 1.2 s against ttsim's 25. `xtask silicon` now refuses
+      a filter that matches nothing, so a stale smoke entry cannot shrink the
+      run unseen. See the README's test tiers.
 - [x] **CI: `cargo xtask check-no-sim-in-ship`** wired in.
 - [x] **CI: `cargo xtask gen-cfg --check`**, so the committed configuration table
       cannot drift from the pinned header.
@@ -531,7 +541,8 @@ misattribution.
       default, which is the first real use of the generated table — and a test
       proves changing it changes the readback, so the path is not inert.
 - [x] **Broad instruction corpus, encoded bit-exact.** `cargo xtask gen-isa`
-      parses `Diagrams/Src/Bits32.lua` into 148 instruction encodings and 19 datum
+      parses `Diagrams/Src/Bits32.lua` into 148 instruction encodings (161 since the
+      measured Blackhole layouts, `isa/generated.rs`'s header) and 19 datum
       layouts, each cross-checked against the hand-written `TT_*(…)` syntax block
       on the page that embeds its diagram. The two sources agree on names, widths,
       signedness **and slot bit positions** across 167 pairs, with ten documented
@@ -1241,11 +1252,26 @@ tensors in `burn-tt`, 9.5 gates.
       Per step: element-wise 2.4, matmul 2.4, column sums 0.3, downloads 0.3
       (logits, two bias gradients), uploads 0.2 (`g2`, two biases), host
       0.2 ms. Tensor traffic per step: about 13 KB up, 3 KB down.
-- [ ] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
-      allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum / SGD on
-      device, with fallback counted by `Device::traffic`.
-- [ ] **9.5** Reduced MNIST golden bit for bit with everything resident; PCIe
-      bytes per steady-state step asserted.
+- [x] **9.4 `TtTensor` storage `Host | Device(DramTensor)`**, a DRAM page
+      allocator, row-slice views, and matmul / eltwise / ReLU / bias-sum on
+      device. *Done as 9.4a and 9.4b above*; SGD on rank-1 biases stays on the
+      host (see 9.5).
+- [x] **9.5 The residency gate.** `step12_mnist::the_mlp_trains_on_a_reduced_dataset`
+      samples `burn_tt::tensor_traffic`, the new `burn_tt::device_traffic` (the
+      engine's `Device::traffic`, queued behind every job) and the new opt-in
+      transfer log (`record_transfers` / `take_transfers`, direction and shape)
+      after every step. After the first step, **every step moves exactly six
+      tensors**, each listed in the test with why: up `b1` `[1,128]` and `b2`
+      `[1,10]` after the host's SGD step (rank-1), and `dL/dlogits` `[64,10]`
+      from the host's loss; down the logits `[64,10]` and the two bias
+      gradients -- 6224 B in all. **The device is written exactly 193 524 B per
+      step** (428 writes, 12 retargets) on ttsim and both cards alike;
+      reads (~19 KB on silicon, ~29 KB on ttsim) are mostly completion polls and
+      are printed, not asserted. The golden still holds bit for bit on all
+      three. Watched failing with ReLU forced to the host: step 1 lists two
+      `NOT EXPECTED` transfers by shape. The figure that matters for 9.7: the
+      device writes are **31x the tensor bytes** -- mover lists, kernel
+      descriptors and programs, one host round trip per chunk.
 - [x] **`tt-mnist`: the milestone as one binary.** A shippable crate whose
       binary trains the MNIST MLP through Burn on the card, with MNIST
       (deflated at build time, `miniz_oxide`) and the firmware embedded, and
@@ -1261,20 +1287,170 @@ tiles, done in turn. The next slices, each gated as the ones above were
 (ttsim for correctness, bit for bit against the golden and `burn-flex`; both
 cards for time):
 
-- [ ] **9.6 Many tiles.** A `Session` over a set of tiles, each with its
-      resident roles and its own B mover. Matmul split by output tile blocks
-      (`M` and `N`, `K` whole, so still bit-identical), element-wise and
-      column sums split by tile. The movers already read any channel, so the
-      interleaved placement feeds them all. Expected: matmul and element-wise
-      (4.8 ms of the 5.8) scale with tile count until the host's descriptor
-      round trips dominate -- which is the next item.
-- [ ] **9.7 One launch per op, not per chunk.** Today the host submits every
-      mover list and every kernel generation and polls for each: tens of
-      microseconds per round trip, several per op. Move the sequencing onto
-      the device: a per-tile work queue in L1 that the B mover drains (gather
-      -> signal the roles -> scatter), with the roles waiting on an L1 flag
-      rather than on the host. The host then writes one descriptor per op and
-      polls once.
+- [x] **9.6 Many tiles.** `TileChoice::Count(n)` / `All` opens a `Session`
+      over `n` tiles, each a unit with its own resident roles and B mover
+      sharing one TLB window (so 120 tiles fit the 201-window pool). A GDDR op
+      is now a set of independent `tensor::Job`s -- matmul output blocks
+      (`tensor::blocks` shrinks the one-tile plan's block until every unit has
+      one, `K` whole), element-wise tile runs and column-sum column runs
+      (`tensor::runs`, balanced) -- dealt round-robin and run in **waves**:
+      one step started on every unit (`Resident::submit`,
+      `DataMover::submit_list`), then every unit waited for. On ttsim one wait
+      ticks every tile (row 23), on silicon they are separate tiles. Each extra
+      tile's crash-cleanup write is held by a `tt_kmd::CleanupWrite`, a driver
+      descriptor that maps no BAR: `Kmd::open` costs 247 ms on silicon and made
+      a 120-tile open take 29 s, `CleanupWrite::register` 0.74 ms (0.38 s).
+      `TT_TILES=n|all` (and `tt-mnist --tiles`) pick the count; the default
+      stays one tile. Gates: `step20_many_tiles` (MNIST's and larger
+      products, transposed and ragged, at 1, 2, 3 and 8 tiles bit-identical to
+      the host-staged path; element-wise and column sums against `burn-flex`;
+      every unit did a share; a stuck kernel on one tile recovers on silicon),
+      and `step12_mnist::the_mlp_trains_on_four_tiles_matching_the_golden`
+      (the golden bit for bit, and the 9.5 steady-state budget: 6224 B of
+      tensors, 349 372 B written per step against one tile's 193 524 --
+      per-tile descriptors and programs). Watched failing with the last job
+      dropped and with every unit but the first left unwaited (wrong data, not
+      just a missing count). ttsim and both cards: 38/38. `tensor::runs` and
+      `blocks` unit-tested.
+  - **Measured** (`silicon_perf::many_tiles_sweep`, card 0, release):
+    `[512,512]@[512,512]` HiFi4 9.99 -> 5.2 (8 tiles) -> 2.2 ms (64) -> 3.65
+    ms (120); an add over 2048 tiles 15.8 -> 3.6 -> 1.96 -> 2.06 ms; a column
+    sum over 32 columns 45.6 -> 6.4 -> 2.3 -> 2.3 ms. Everything floors at
+    about 2 ms, the host's per-wave round trips, and the matmul gets *slower*
+    past 64 tiles: smaller blocks, more of them, each with its own program
+    writes. **Full MNIST, one card: 5.8 -> 4.1 ms/step on 8 tiles** (5.0 on
+    all 120), accuracy 91.96% unchanged; the gain is element-wise (2.4 ->
+    0.8 ms), while MNIST's small matmuls stay at 2.4 ms -- bound by the host's
+    round trips per block, which is 9.7.
+- [x] **9.7a One launch per op per tile.** The B mover runs the resident
+      roles itself: a `dm::op::KERNEL` list entry waits for the moves before
+      it, posts the next generation to the three role mailboxes in local L1
+      and polls their `ACK`s (through a fence: the L0 cache is not coherent,
+      Tier 1 bug #7), reporting `error::ROLE` if one panics; `op::WAIT` keeps
+      the barrier that separate lists used to give. The host stages a kernel's
+      programs once and reserves its generations (`Resident::reserve` /
+      `reserved_done`), and `session::segments` turns a tile's steps into as
+      few lists as fit: one per op per tile unless it passes `LIST_MAX`
+      entries or the tile's programs change. Gates: `step21_one_launch`
+      (MNIST's first layer, four blocks on one tile, was 12 host round trips
+      and is 1, on one tile and on three; two element-wise runs share a list;
+      a 7000-row column sum takes only the lists its entries need), the
+      golden at one and four tiles, `segments` unit-tested. Watched failing
+      with one list per step (12, 2 and 4 round trips) and with B not waiting
+      for the `ACK`s (wrong products). ttsim and both cards: 58/58 with the
+      smoke tier. Per MNIST step, one tile: 428 -> 250 PCIe write calls.
+  - **Measured** (card 0): full MNIST 3.8 ms/step on 8 tiles (from 4.1), 5.7
+    on one; `[512,512]@[512,512]` 1.43 ms on 64 tiles (from 2.2), 2.30 on 120
+    (from 3.65). **The floor is now the lists' bytes, not the round trips**:
+    the add over 2048 tiles writes 263 KB of descriptors whatever the tile
+    count, 1.75 ms at the uncached bulk path's ~150 MB/s (measurement M),
+    which is its 2.0 ms; the matmul writes 150-715 KB. A steady MNIST step
+    writes 193 KB, almost all of it lists.
+- [x] **9.7b Op records.** The host sends an op, not its entries:
+      `tt_isa::dm::record` defines `GATHER`/`SCATTER` (a matmul block's
+      operands and outputs), `ELTWISE` (a run of tiles) and `SUM` (a run of
+      column sums, with `WAIT`s where its old lists ended), each a header plus
+      a 64-byte `TensorRef` per tensor (channels, per-channel bases, first
+      tile, width), and `record::expand` -- `no_std`, allocation-free, no
+      `divu` (`div_rem`: the instruction gate refused the first build) --
+      produces the entries on the tile, each run through `Entry::decode` as a
+      sent one is. The host expands every record first, so a bad one is still
+      refused before PCIe; `segments` never splits one. The 9.7a builders are
+      kept in `tensor::reference` as the specification: every record expands
+      to exactly their entries, job for job, over three channel masks, 1/3/8
+      tiles, row views and every op kind -- watched failing with the sum's
+      boundary `WAIT` dropped and with one port changed. Golden bit for bit;
+      ttsim and both cards 58/58 with the smoke tier.
+  - **Measured** (card 0): an add over 2048 tiles on 64 tiles 1.99 -> 0.58 ms
+    (263 KB -> 15 KB written); the column sum 2.29 -> 1.54 ms; the 512^3
+    matmul 1.43 -> 1.18 ms. A 7000-row column sum is one list of five entries.
+    Full MNIST 3.7 ms/step on 8 tiles, 5.8 on one; its ops are too small for
+    list bytes to have been their cost. Steady MNIST step: 193 -> 155 KB
+    written (one tile). **What is left is role programs**: the 512^3 matmul
+    still writes 605 KB on 1-8 tiles, rewriting each role's single program
+    slot whenever consecutive blocks differ in shape, and a program change
+    also ends a list (`xt@g1`, ragged at its edges, writes 74 KB).
+- [x] **L1 planning, step 1** (design: `RUST_IMPL_PLAN.md`, "L1 planning and
+      circular buffers"). `tt_isa::l1` maps every fixed region of a tile's L1,
+      ordered and disjoint at compile time, leaving the data arena.
+      `tt_kernels::l1` plans `Requirements` -- scratch and circular buffers
+      with producer and consumer endpoints, live ranges over a kernel's
+      stages, semaphores -- by liveness into the arena, with an independent
+      `check`, handles that refuse a foreign plan, and `Requirements::fuse`,
+      which joins one kernel's output ring to the next's input. Unit and
+      property tests (500 random kernel pairs and their fusions), and the
+      checker watched refusing an aliasing plan and the property test
+      catching a planner that ignores liveness. Ported: the GDDR matmul's
+      layout (A and B as rings from the mover to the unpacker, the outputs as
+      a ring from the packer to the mover) and the element-wise and column-sum
+      staging. Golden bit for bit; ttsim and both cards 84/84 with the smoke
+      tier. The host-staged path keeps its fixed layout.
+- [x] **Semaphores are planned, not named.** Every semaphore is a
+      `Requirements::semaphore(name, initial, live)` declaration, and a plan's
+      `semaphore_init()` is the whole of what a concurrent run initialises, so
+      `runtime`, `session` and the mover-driven `Step::Kernel` carry a generic
+      init list and know nothing of a matmul. The matmul's `DST_READY`,
+      `DST_FREE` and `TILE_SEMAPHORES` constants are gone; `MatmulSemaphores`
+      is only the matmul's names for its two (`ready` from 0, `free` from 1),
+      and the programs memo is keyed by them. Found on the way: two semaphores
+      of different stages may share a number only if they start at the same
+      value, or the second inherits the first's -- now a planner rule and a
+      `check` refusal, both tested. Gates: the roles' programs differ exactly
+      at the semaphore instructions when the pair is swapped; golden bit for
+      bit; ttsim and both cards 78/78 with the smoke tier; the two-card
+      sharded MNIST reproduces the golden.
+  - **Hardware, 2026-10-01:** the X 3 cable link reports "not Up on both
+    ends" on every run (`silicon_eth_link`'s host-driven X 3 tests and every
+    mover test, which takes the first two links); X 13 is Up and the
+    host-driven X 13 tests pass. Ethernet code is unchanged since Phase 8, so
+    this is link state, not a regression. **Cleared by a device reset:**
+    afterwards `silicon_eth_link` 10/10 (both X 3 directions, the mover and
+    the sharded matmul), the two-card sharded MNIST golden, and the smoke tier
+    26/26 on both cards. If it recurs, reset the cards before suspecting the
+    code.
+- [x] **Forking while another test thread is inside Burn could hang a child.**
+      A forked child keeps every lock as it stood; one held by a thread
+      computing a `burn-flex` reference in the parent is held forever. Seen
+      once (a training gate's child on a futex for ten minutes; every test
+      passed alone). `tt_ttsim::fork_scope` now takes a gate exclusively for
+      the fork, and parent-side library work goes through `outside_fork`,
+      which shares it (step9, step11, step12). Watched: with the gate removed,
+      `a_lock_held_by_parent_work_is_not_inherited_by_the_child` hangs until
+      its alarm.
+- [x] **9.7c Resident programs.** Each tile keeps the kernels it runs in
+      `tt_isa::l1::PROGRAM_CACHE` (252 KB), mirrored on the host by
+      `tt_kernels::program_cache::ProgramCache`: keyed by the program's words,
+      first fit with coalescing, least recently used evicted first, anything a
+      list in flight names pinned, programs over half the region bypassed to
+      the fixed slots, everything forgotten on a tile reset, and hit, miss,
+      upload, eviction and bypass counters (`Session::program_cache_stats`).
+      A role runner pushes from `mailbox::PROGRAM_ADDR` when it is non-zero
+      (refused outside the region), and a `KERNEL` entry names each role's
+      `(address, words)`, written by B before the generation -- so a list may
+      run kernels of any number of shapes, and `segments` splits only on a
+      change of semaphore setup or past the cache's capacity. Gates:
+      `step22_program_cache` (a two-shape `[512,512]@[512,512]` is one list,
+      and its second run uploads nothing; 300 KB of kernels through the 252 KB
+      region evicts, and every evicted kernel is right when it returns), cache
+      and `segments` unit tests including a random placement soak, the golden
+      at one and four tiles. Watched failing with B ignoring the addresses
+      (wrong products). ttsim and both cards 134/134 with the smoke tier.
+  - **Found on silicon only:** a stale `PROGRAM_ADDR` from the previous
+    process pointed a tile reset's runner into the cache, and the reset hung
+    -- L1 survives between processes, and the plain `runtime::run` path wrote
+    the descriptor field by field and had no reason to know the new word.
+    `probe_cfgreg` had the same gap (no `TRACE`, `PUSH_WINDOW`). Every runner
+    descriptor is now a `mailbox::Descriptor`, written whole, with a test
+    that it covers every word the runner reads.
+  - **Measured** (card 0): full MNIST **2.5 ms/step on 8 tiles** (from 3.7),
+    5.1 on one (from 5.8), accuracy 91.96%; its matmuls 2.08 -> 0.89 ms per
+    step on 8 tiles. `[512,512]@[512,512]` 9.65 -> 6.89 ms on one tile (605
+    KB -> 15 KB written) and 4.46 -> 1.32 ms on eight. Steady MNIST step on
+    one tile 155 -> 35 KB written. Past 8 tiles the matmul slows again (2.0 ms
+    on 120, 3600 PCIe calls): what is left is per-tile submission, a
+    descriptor write and a list per tile, which is the next floor.
+  - The validation tier grew from 36 to 59 s, about 20 of it
+    `step22_program_cache`.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait

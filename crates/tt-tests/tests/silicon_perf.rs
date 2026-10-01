@@ -303,3 +303,166 @@ fn dram_matmul_breakdown() {
         panic!("{e}");
     }
 }
+
+/// Phase 9.6: how GDDR ops scale with the number of Tensix tiles a session
+/// deals them over. A matmul bigger than MNIST's (`[512, 512] @ [512, 512]`,
+/// 256 output tiles), an element-wise add over 2048 tiles and a column sum
+/// over 32 columns, each the median of five after a warm-up, at every tile
+/// count from 1 to the whole chip. Also how long opening the session took,
+/// since every tile is reset and has its roles loaded in turn.
+#[test]
+#[ignore = "benchmark"]
+fn many_tiles_sweep() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::tensor::Eltwise;
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    for choice in [1, 2, 4, 8, 16, 32, 64]
+        .map(TileChoice::Count)
+        .into_iter()
+        .chain([TileChoice::All])
+    {
+        if let Err(e) = fork_scope(|| {
+            let t0 = Instant::now();
+            let mut s = Session::open_card(card, tt_firmware_images::ROLES, choice)
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            let open = t0.elapsed();
+            let tiles = s.tiles().len();
+            let n = 512;
+            let a = s.upload(&pattern_f32(n * n, 1), n, n).unwrap();
+            let b = s.upload(&pattern_f32(n * n, 2), n, n).unwrap();
+            let (er, ec) = (2048, 1024);
+            let x = s.upload(&pattern_f32(er * ec, 3), er, ec).unwrap();
+            let y = s.upload(&pattern_f32(er * ec, 4), er, ec).unwrap();
+            let time = |label: &str,
+                        s: &mut Session<tt_kmd::Kmd>,
+                        op: &mut dyn FnMut(&mut Session<tt_kmd::Kmd>)| {
+                op(s);
+                let mut v = Vec::new();
+                for _ in 0..5 {
+                    let before = s.device().traffic();
+                    let t = Instant::now();
+                    op(s);
+                    v.push((t.elapsed(), s.device().traffic() - before));
+                }
+                let calls = v[0].1.write_calls + v[0].1.read_calls;
+                let (written, read) = (v[0].1.bytes_written, v[0].1.bytes_read);
+                let med = median(v.into_iter().map(|p| p.0).collect());
+                println!(
+                    "MEASURE {tiles:>3} tiles {label:<22} {med:>10.2?}  {calls:>6} PCIe calls, {written:>8} B written, {read:>6} B read"
+                );
+            };
+            time("matmul 512^3 HiFi4", &mut s, &mut |s| {
+                let c = s
+                    .matmul_dram(
+                        &a,
+                        false,
+                        &b,
+                        false,
+                        SrcRoute::Tf32FromFp32,
+                        Fidelity::HiFi4,
+                        400_000,
+                    )
+                    .unwrap_or_else(|e| panic!("{e}"));
+                s.free(c).unwrap();
+            });
+            time("add [2048, 1024]", &mut s, &mut |s| {
+                let o = s
+                    .eltwise(
+                        Eltwise {
+                            kind: tt_isa::dm::kind::ADD,
+                            scalar: 0.0,
+                        },
+                        &x,
+                        Some(&y),
+                    )
+                    .unwrap_or_else(|e| panic!("{e}"));
+                s.free(o).unwrap();
+            });
+            time("sum rows [2048, 1024]", &mut s, &mut |s| {
+                let o = s.sum_rows(&x).unwrap_or_else(|e| panic!("{e}"));
+                s.free(o).unwrap();
+            });
+            println!("MEASURE {tiles:>3} tiles open                   {open:>10.2?}");
+        }) {
+            panic!("{choice:?}: {e}");
+        }
+    }
+}
+
+fn pattern_f32(n: usize, seed: u32) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) % 2001) as f32 / 1000.0 - 1.0
+        })
+        .collect()
+}
+
+/// Where opening a session's time goes, per tile: the extra driver file
+/// descriptor that holds the tile's cleanup write, the tile reset, the
+/// per-thread state reset and the resident roles' start.
+#[test]
+#[ignore = "benchmark"]
+fn session_open_breakdown() {
+    use tt_kernels::runtime::Resident;
+    use tt_kernels::session::{reset_thread_state, reset_tile};
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let t = Instant::now();
+        let extra: Vec<_> = (0..4).map(|_| tt_kmd::Kmd::open(card).unwrap()).collect();
+        println!("MEASURE open: Kmd::open {:>10.2?} each", t.elapsed() / 4);
+        drop(extra);
+        let (x, y) = tt_tests::backend::GATE_TILE;
+        let t = Instant::now();
+        let held: Vec<_> = (0..4)
+            .map(|_| {
+                tt_kmd::CleanupWrite::register(
+                    card,
+                    x,
+                    y,
+                    0,
+                    tt_isa::tensix::SOFT_RESET_0,
+                    tt_kernels::session::ALL_BABIES_HELD,
+                )
+                .unwrap()
+            })
+            .collect();
+        println!(
+            "MEASURE open: CleanupWrite::register {:>10.2?} each",
+            t.elapsed() / 4
+        );
+        drop(held);
+        let mut dev = open_card(card);
+        let images = tt_firmware_images::ROLES;
+        let tile = tile(
+            &mut dev,
+            tt_tests::backend::GATE_TILE.0,
+            tt_tests::backend::GATE_TILE.1,
+        );
+        for _ in 0..3 {
+            let t = Instant::now();
+            reset_tile(&mut dev, tile).unwrap();
+            let a = t.elapsed();
+            reset_thread_state(&mut dev, tile, &images).unwrap();
+            let b = t.elapsed();
+            let r = Resident::start(&mut dev, tile, &images, 400_000).unwrap();
+            let c = t.elapsed();
+            r.stop(&mut dev, &images).unwrap();
+            println!(
+                "MEASURE open: reset_tile {a:>9.2?}  reset_thread_state {:>9.2?}  Resident::start {:>9.2?}",
+                b - a,
+                c - b
+            );
+        }
+        scrub(&mut dev);
+    }) {
+        panic!("{e}");
+    }
+}

@@ -131,6 +131,7 @@ where
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
     let push_window = unsafe { l1_read32(mb.push_window()) };
+    let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -144,6 +145,18 @@ where
     {
         fail_in(mb, panic_code::EXPLICIT);
     }
+    // A resident program (`mailbox::PROGRAM_ADDR`) must lie in the program
+    // cache, so a stale or corrupt address cannot push arbitrary L1.
+    let program = if program_addr == 0 {
+        mb.program()
+    } else {
+        if program_addr % 16 != 0
+            || !tt_isa::l1::PROGRAM_CACHE.contains(program_addr, program_len as u64 * 4)
+        {
+            fail_in(mb, panic_code::EXPLICIT);
+        }
+        program_addr
+    };
 
     // Set the shape of the Dst mapping deliberately rather than inheriting whatever
     // reset left behind, exactly as the step 4 firmware does.
@@ -175,7 +188,7 @@ where
         // SAFETY: the word is inside the staged program, whose length was checked
         // above; `Riscv` may push to `Thread`, which the type system checked; the
         // backend is out of reset.
-        unsafe { push_word::<Riscv, Thread>(l1_read32(mb.program() + (i as u64) * 4)) }
+        unsafe { push_word::<Riscv, Thread>(l1_read32(program + (i as u64) * 4)) }
         i += 1;
         // Flow control for the simulator (`mailbox::PUSH_WINDOW`): silicon
         // stalls a push into a full FIFO, ttsim kills the process.

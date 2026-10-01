@@ -112,8 +112,8 @@ impl TtTensor {
                     std::backtrace::Backtrace::force_capture()
                 );
             }
-            let v = server::download(self.device, d.buffer.id);
             let (r, c) = (d.buffer.rows, d.buffer.cols);
+            let v = server::download(self.device, d.buffer.id, r, c);
             let v = if d.transposed {
                 let mut t = vec![0f32; v.len()];
                 for i in 0..r {

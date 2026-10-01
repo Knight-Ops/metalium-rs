@@ -29,7 +29,7 @@
 pub mod fork;
 pub mod transport;
 
-pub use fork::{fork_scope, ForkError};
+pub use fork::{fork_scope, outside_fork, ForkError};
 pub use transport::LibTtsim;
 
 use std::path::{Path, PathBuf};

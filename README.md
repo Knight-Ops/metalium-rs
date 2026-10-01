@@ -1,103 +1,107 @@
 # metal-rs
 
-A native-Rust path to Tenstorrent Blackhole, developed against the
-[ttsim](https://github.com/tenstorrent/ttsim) simulator.
+A native-Rust stack for Tenstorrent Blackhole (p150a cards): bare-metal firmware
+for the baby RISC-V cores, host device access, Tensix kernels, and a Burn backend.
+No Python, no C++, no TT-Metalium. Developed against the
+[ttsim](https://github.com/tenstorrent/ttsim) simulator and run on two p150a cards.
 
-Progress is tracked in [`docs/implementation-checklist.md`](docs/implementation-checklist.md).
+What it does today: a Burn MLP trains on MNIST with every matmul, element-wise op,
+ReLU, bias-gradient sum and weight update on the card, and the dataset, weights and
+activations resident in GDDR6 (`crates/tt-mnist`). The loss and the rank-1 bias
+updates still run on the host: six small tensors cross PCIe per step. A session can spread work over many Tensix
+tiles, and matmuls can be sharded over two cabled cards via Ethernet.
 
-This repository currently contains the **baseline vertical slice**: the smallest
-thing that proves the whole stack, end to end, and the abstractions every later
-phase builds on. `RUST_IMPL_PLAN.md` describes the larger programme it is the
-first part of.
-
-## What works today
-
-```
-host ──libttsim──> chip
-  └ PCIe TLB window  → a Tensix tile's L1, read and written        (step 2)
-  └ firmware image   → L1, RISCV core released from reset          (step 3)
-  └ core pushes      → SFPLOADI ×4, SFPMUL, SFPSTORE               (step 4)
-  └ core reads Dst   → L1 mailbox
-  └ host reads       → 0x40C0_0000   (3.0 × 2.0 = 6.0, bit-exact)
-```
-
-`cargo test` runs all of it, deterministically, with no hardware.
+| Doc | What it holds |
+|---|---|
+| [`docs/RUST_IMPL_PLAN.md`](docs/RUST_IMPL_PLAN.md) | The plan: why each layer is shaped as it is |
+| [`docs/implementation-checklist.md`](docs/implementation-checklist.md) | What is done, per phase; "Silicon operating notes" |
+| [`docs/ttsim-divergence.md`](docs/ttsim-divergence.md) | Where ttsim and silicon disagree, by row number (code cites the rows) |
 
 ## Getting started
 
 ```bash
-cargo xtask fetch-ttsim   # downloads the pinned libttsim builds into vendor/
-cargo xtask fetch-spec    # downloads the pinned ISA specification into vendor/
-cargo test                # builds the riscv32im firmware and runs every gate
+cargo xtask fetch-ttsim   # pinned libttsim builds (1, 2 and 4 chip) into vendor/
+cargo xtask fetch-spec    # pinned ISA specification tree into vendor/
+cargo xtask fetch-mnist   # MNIST into vendor/mnist/; tt-mnist's build.rs needs it
+cargo xtask fetch-kmd     # optional: tt-kmd's ioctl.h, for its ABI layout test
+cargo test                # builds the riscv32im firmware and runs the validation tier
 ```
 
-The firmware is built automatically by `crates/tt-tests/build.rs`; there is no
-separate step. `rustup` needs the `riscv32im-unknown-none-elf` target and the
-`llvm-tools` component, both of which `rust-toolchain.toml` requests.
+The firmware is built by `crates/tt-firmware-images/build.rs` as part of any
+build that depends on it. `rust-toolchain.toml` requests the
+`riscv32im-unknown-none-elf` target and the `llvm-tools` component it needs.
+`cargo xtask` with no arguments prints every task.
+
+### Test tiers
+
+| Tier | Command | What it is |
+|---|---|---|
+| Validation | `cargo test` | Host tests and every simulator gate: ISA, kernels, data mover, residency, many tiles. Bit-exact against ttsim. |
+| End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole Burn training runs on ttsim, held to `crates/tt-tests/tests/golden/mnist_reduced.txt`. Run when the arithmetic changes; CI runs it on every push. |
+| Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs. |
+| Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`, which implies `e2e`). |
+
+`cargo xtask silicon --help` lists the options (`--device N|all`, `--filter`,
+`--keep-going`, `--timeout-secs`, `--include-ignored`, `--list`). See
+[`xtask/README.md`](xtask/README.md).
 
 ## Layout
 
-| Crate | What it is |
-|---|---|
-| `tt-isa` | `no_std`, no dependencies. Instruction encoders, register maps, coordinate spaces. Compiled for **both** the host and `riscv32im`. |
-| `tt-device` | Host-side device access: the `Transport` trait, TLB windows, L1 addressing, core reset and firmware loading. |
-| `tt-firmware` | Bare-metal `riscv32im` binaries. A separate workspace; built by `xtask`/`build.rs`, never by the host `cargo build`. |
-| `tt-ttsim-sys` | Raw FFI over the ten `libttsim_*` entry points. |
-| `tt-ttsim` | Safe singleton wrapper, fork isolation, and the `Transport` implementation. **Dev-only** — `cargo xtask check-no-sim-in-ship` enforces that it stays out of shippable graphs. |
-| `tt-tests` | Gates that span several crates, including every simulator gate. |
+| Crate | Ships | What it is |
+|---|---|---|
+| [`tt-isa`](crates/tt-isa) | yes | `no_std`, no dependencies. Encoders, register maps, coordinates, L1 map, mover protocol. Built for host and `riscv32im`. |
+| [`tt-device`](crates/tt-device) | yes | `Transport` trait, `Device`, TLB windows, ARC telemetry, GDDR, Ethernet tiles. |
+| [`tt-kmd`](crates/tt-kmd) | yes | The silicon `Transport`: `/dev/tenstorrent/N` via the tt-kmd driver. |
+| [`tt-layout`](crates/tt-layout) | yes | Host tilize / detilize. |
+| [`tt-kernels`](crates/tt-kernels) | yes | Tensix kernels, `Session`, GDDR tensors, L1 planner, data mover, multi-chip shard. |
+| [`tt-firmware-images`](crates/tt-firmware-images) | yes | Builds and embeds the firmware images. |
+| [`burn-tt`](crates/burn-tt) | yes | The Burn backend. |
+| [`tt-mnist`](crates/tt-mnist) | yes | Self-contained MNIST training binary. |
+| [`tt-firmware`](crates/tt-firmware) | (embedded) | Bare-metal `riscv32im` firmware. A separate workspace. |
+| [`tt-ttsim-sys`](crates/tt-ttsim-sys), [`tt-ttsim`](crates/tt-ttsim) | no | The simulator binding and its `Transport`. |
+| [`tt-tests`](crates/tt-tests) | no | Every cross-crate gate, on ttsim or on silicon. |
+| [`xtask`](xtask) | no | Fetching pins, generators, ship check, silicon runner. |
+
+**Dev-only crates never reach a shipped artifact.** `cargo xtask check-no-sim-in-ship`
+fails if any crate in `SHIPPABLE` (`xtask/src/ship.rs`) depends on `tt-ttsim` or
+`tt-ttsim-sys`, or if a workspace member is in neither list.
 
 ## Things worth knowing before reading the code
 
-**Every ttsim contract violation terminates the process.** No return code, no
-unwinding, no panic hook. Two consequences shape the design: `tt_ttsim::transport`
-validates each access against ttsim's decode map *before* making it, and every
-simulator test body runs inside `fork_scope`, so a fatal error becomes a failing
-assertion instead of a vanished test runner.
-`crates/tt-ttsim/tests/fatality.rs` pins five accesses as genuinely fatal, so the
-validation layer cannot quietly become unnecessary.
+- **Every ttsim contract violation terminates the process** (`_Exit`, no unwinding).
+  `tt_ttsim::transport` validates each access against ttsim's decode map first, and
+  every simulator gate runs in `fork_scope`, so a fatal error becomes a failed test.
+- **There is no backdoor into tile memory.** Everything goes through PCIe TLB
+  windows, and `INSTRN_BUF_BASE` and `Dst` are not NoC-visible, so a baby RISC-V core
+  must push Tensix instructions and read results.
+- **On silicon, read the Tensix grid from the ARC before touching a tile.**
+  Harvested (fused-off) tiles do not reject an access: the NoC hangs, and the
+  recovery reset drops the PCIe link. `tt_kernels::session::Session` does this in the
+  right order; `Device::tensix_grid` is the query. Run silicon gates one per process
+  through `cargo xtask silicon`. Details: "Silicon operating notes" in
+  `docs/implementation-checklist.md`.
+- **Divergences are logged, not worked around silently**
+  ([`docs/ttsim-divergence.md`](docs/ttsim-divergence.md)). Tests that cannot pass
+  on ttsim are `#[cfg(feature = "silicon")]`, so they still compile.
+- **Upstream revisions are pinned and hash-verified in `PINS.toml`**: the
+  specification, ttsim, tt-metal's `cfg_defines.h`, tt-kmd's `ioctl.h`, MNIST, Burn.
+- **Three files are generated, never hand-edited**, each with a `--check` mode run
+  in CI:
 
-**There is no backdoor into tile memory.** `libttsim_tile_rd_bytes` is
-unsupported on Blackhole, so everything goes through PCIe TLB windows. And
-`INSTRN_BUF_BASE` and `Dst` are both unmapped to the NoC, so the host can neither
-push a Tensix instruction nor read a compute result — a baby RISC-V core has to
-sit in the middle. That is why step 3 is a hard prerequisite for step 4.
+  | Command | Output |
+  |---|---|
+  | `cargo xtask gen-cfg` | `crates/tt-isa/src/cfg/generated.rs`, backend config fields from `cfg_defines.h` |
+  | `cargo xtask gen-isa` | `crates/tt-isa/src/isa/generated.rs`, encodings from `Bits32.lua`, cross-checked against the spec's `TT_*(...)` syntax blocks |
+  | `cargo xtask gen-burn-delegate` | `crates/burn-tt/src/generated/delegate.rs`, forwarding of every burn-backend op to burn-flex |
 
-**Simulator divergences are logged, not worked around silently.** See
-[`docs/ttsim-divergence.md`](docs/ttsim-divergence.md). Tests that cannot pass
-against ttsim are `#[cfg(feature = "silicon")]` — compiled always so they cannot
-rot, run only with `--features silicon` against real hardware.
-
-**Upstream revisions are pinned in `PINS.toml`.** The specification commit, the
-ttsim release, and the tt-metal commit for `cfg_defines.h`. They are specification
-inputs, not dependencies: bumping one invalidates the gates until they are re-run.
-All three are hash-verified — the specification by a digest over the contents of
-the files the generators read, because GitHub does not promise that source
-tarballs are byte-stable.
-
-**Two tables are generated, never transcribed.** `cargo xtask gen-cfg` produces
-the 820 backend-configuration fields from `cfg_defines.h`; `cargo xtask gen-isa`
-produces 148 instruction encodings and 19 datum layouts from
-`Diagrams/Src/Bits32.lua`. Both are committed and both are `--check`ed in CI, so a
-pin bump cannot silently diverge from the code that depends on it.
-
-**The instruction table is checked against a second, independent description.**
-The specification describes the encodings twice: as the drawing script the
-diagrams are rendered from, and as the hand-written `TT_*(…)` syntax block on each
-page. Neither is generated from the other, so `gen-isa` compares them — names,
-widths, signedness, and, because a macro argument is one slot of the word and
-`<< k` places a term inside it, the absolute bit positions. 167 pairs agree, with
-ten documented exceptions.
-
-**Every encoding records which chip it is evidence for.** The Blackhole tree is a
-delta over Wormhole's, so a fact from a Wormhole page is a hypothesis — and that
-is 74 of 148 encodings. Rather than marking them by hand, provenance is derived
-from which tree embeds each diagram. One consequence worth knowing: Wormhole's
-`SFPSTORE` puts `AddrMod` in a different place, and it is reachable only as
-`isa::generated::defs::wormhole::SFPSTORE`.
+- **Every encoding records which chip it is evidence for** (`isa::Provenance`). A
+  Wormhole-only layout is `UNVERIFIED`; layouts measured where the spec draws only Wormhole live in
+  `xtask/src/gen_isa/Bits32_BH.lua`. The Wormhole forms are under
+  `isa::generated::defs::wormhole`.
 
 ## Not done yet
 
-Silicon gates (no hardware on hand), the `Kmd` transport and the `ttsim-qemu`
-path, and everything from the tensor layer upwards. The instruction set is
-encoded but mostly not yet *executed* against the simulator: `UNPACR`, `MVMUL`
-and `PACR` need the units that feed them, which is Phases 5 and 6.
+The `ttsim-qemu` path; keeping tensors in GDDR across a multi-card mesh (today
+`Topology::Cards` stages from the host per matmul); spreading a multi-card topology
+over more than one tile per card; resident programs (Phase 9.7c). The checklist's
+"Phase 9 -- next steps" is the current list.

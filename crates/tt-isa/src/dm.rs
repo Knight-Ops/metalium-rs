@@ -19,6 +19,8 @@
 
 use crate::dram::{Dram, DramRange};
 
+pub mod record;
+
 /// The mover's mailbox: the slot after the three role mailboxes
 /// ([`crate::mailbox::role`]), which ends exactly where the program region begins.
 pub const MAILBOX_BASE: u64 = crate::mailbox::role::BASE + 3 * crate::mailbox::role::STRIDE;
@@ -78,6 +80,21 @@ pub mod op {
     /// own FP32 unit: `[COMPUTE, kind, scalar, 0, dst, a, b, 0]`, each address a
     /// tile slot. See [`super::kind`]. Only in a list entry.
     pub const COMPUTE: u32 = 5;
+    /// Run the tile's resident roles once: `[KERNEL, generation, a0, l0, a1,
+    /// l1, a2, l2]`. The mover waits for every move before it; then, for each
+    /// role `t` whose `at` is non-zero, writes `at` and `lt` to its mailbox's
+    /// `PROGRAM_ADDR` and `PROGRAM_LEN` -- a program resident in the program
+    /// cache (`crate::l1::PROGRAM_CACHE`) -- and then `generation` to all three
+    /// `GENERATION`s (`crate::mailbox::role`), and waits until each has
+    /// acknowledged it, or reports [`super::error::ROLE`] if one panics. With
+    /// every `at` zero the roles run what the host staged. So a whole op, of
+    /// any number of block shapes, is one list and one host round trip. Only in
+    /// a list entry.
+    pub const KERNEL: u32 = 6;
+    /// Wait for every move before it to complete: the boundary between what
+    /// were separate lists, whose entries may reuse each other's L1 slots.
+    /// Only in a list entry.
+    pub const WAIT: u32 = 7;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -156,6 +173,15 @@ pub enum Entry {
         a: u32,
         b: u32,
     },
+    /// [`op::KERNEL`]: point each role at its program, if named, post
+    /// `generation`, and wait for it.
+    Kernel {
+        generation: u32,
+        /// Per role, `(address, words)` of a resident program, or `(0, 0)`.
+        programs: [(u32, u32); 3],
+    },
+    /// [`op::WAIT`].
+    Wait,
 }
 
 impl Entry {
@@ -179,6 +205,35 @@ impl Entry {
         }
         if w[0] == op::LIST {
             return Err(error::OP);
+        }
+        if w[0] == op::KERNEL {
+            // Zero is what a resident runner reads as "not resident".
+            if w[1] == 0 {
+                return Err(error::GENERATION);
+            }
+            let cache = crate::l1::PROGRAM_CACHE;
+            let mut programs = [(0, 0); 3];
+            for (t, p) in programs.iter_mut().enumerate() {
+                let (at, len) = (w[2 + 2 * t], w[3 + 2 * t]);
+                if at == 0 && len == 0 {
+                    continue;
+                }
+                let bytes = len as u64 * 4;
+                if at % 16 != 0
+                    || len > crate::mailbox::PROGRAM_MAX
+                    || !cache.contains(at as u64, bytes)
+                {
+                    return Err(error::PROGRAM);
+                }
+                *p = (at, len);
+            }
+            return Ok(Entry::Kernel {
+                generation: w[1],
+                programs,
+            });
+        }
+        if w[0] == op::WAIT {
+            return Ok(Entry::Wait);
         }
         if w[0] == op::COMPUTE {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
@@ -218,6 +273,13 @@ pub mod error {
     pub const ALIGNMENT: u32 = 4;
     /// Zero bytes.
     pub const LENGTH: u32 = 5;
+    /// A role panicked while running an [`super::op::KERNEL`] entry.
+    pub const ROLE: u32 = 6;
+    /// A [`super::op::KERNEL`] entry with generation zero.
+    pub const GENERATION: u32 = 7;
+    /// A [`super::op::KERNEL`] entry naming a program outside the program
+    /// cache, misaligned, or longer than a program may be.
+    pub const PROGRAM: u32 = 8;
 }
 
 /// A descriptor, as both sides see it.
@@ -382,6 +444,57 @@ mod tests {
         let mut bad = c;
         bad[6] = crate::tensix::L1_SIZE as u32 - 64;
         assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
+        // A kernel entry names a non-zero generation; a wait takes nothing.
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 7, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Kernel {
+                generation: 7,
+                programs: [(0, 0); 3]
+            })
+        );
+        // Resident programs: inside the cache, aligned, no longer than a slot.
+        let at = crate::l1::PROGRAM_CACHE.base as u32;
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 7, at, 10, 0, 0, at + 64, 3]),
+            Ok(Entry::Kernel {
+                generation: 7,
+                programs: [(at, 10), (0, 0), (at + 64, 3)]
+            })
+        );
+        for bad in [
+            [op::KERNEL, 7, 0x2_0000, 10, 0, 0, 0, 0],
+            [op::KERNEL, 7, at + 4, 10, 0, 0, 0, 0],
+            [
+                op::KERNEL,
+                7,
+                at,
+                crate::mailbox::PROGRAM_MAX + 1,
+                0,
+                0,
+                0,
+                0,
+            ],
+            [
+                op::KERNEL,
+                7,
+                crate::tensix::L1_SIZE as u32 - 16,
+                8,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ] {
+            assert_eq!(Entry::decode(ALL, bad), Err(error::PROGRAM), "{bad:x?}");
+        }
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 0, 0, 0, 0, 0, 0, 0]),
+            Err(error::GENERATION)
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Wait)
+        );
     }
 
     #[test]

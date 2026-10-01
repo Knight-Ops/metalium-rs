@@ -39,6 +39,8 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tensor::{backend::Backend, Tensor, TensorData};
 use burn_tt::{Fidelity, TtBackend};
 use tt_tests::burn_device::{with_device, Config};
+// Reference work in the parent goes through it, so no test forks mid-Burn.
+use tt_ttsim::outside_fork;
 
 struct Lcg(u64);
 
@@ -172,7 +174,7 @@ fn random_matmuls_are_within_the_derived_bound() {
     for (sa, sb) in [([40, 70], [70, 33]), ([64, 784], [784, 128])] {
         let mut rng = Lcg(0xf10a7 + sa[1] as u64);
         let (a, b) = (units(&mut rng, &sa), units(&mut rng, &sb));
-        let want = values(product::<Flex, 2>(&a, &b, &FlexDevice));
+        let want = outside_fork(|| values(product::<Flex, 2>(&a, &b, &FlexDevice)));
         let limit = bound(
             &values(a.clone()),
             &values(b.clone()),
@@ -197,7 +199,7 @@ fn at_lo_fidelity_the_same_product_breaks_the_bound() {
     let (sa, sb) = ([40, 70], [70, 33]);
     let mut rng = Lcg(0xf10a7 + sa[1] as u64);
     let (a, b) = (units(&mut rng, &sa), units(&mut rng, &sb));
-    let want = values(product::<Flex, 2>(&a, &b, &FlexDevice));
+    let want = outside_fork(|| values(product::<Flex, 2>(&a, &b, &FlexDevice)));
     let limit = bound(&values(a.clone()), &values(b.clone()), [40, 70, 33]);
     let lo = Config {
         fidelity: Fidelity::Lo,
@@ -251,7 +253,7 @@ fn a_linear_layers_gradients_are_within_the_bound() {
             values(bias.grad(&grads).unwrap().into_data()),
         ]
     }
-    let [dx0, dw0, db0] = grads::<Autodiff<Flex>>(&x, &w, &bias, &g, &FlexDevice);
+    let [dx0, dw0, db0] = outside_fork(|| grads::<Autodiff<Flex>>(&x, &w, &bias, &g, &FlexDevice));
 
     let t = |d: &TensorData, r: usize, c: usize| -> Vec<f32> {
         let v = values(d.clone());

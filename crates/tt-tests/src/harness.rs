@@ -291,24 +291,24 @@ pub fn run(dev: &mut Dev<'_>, spec: &Run<'_>) -> Outcome {
     }
 
     dev.write32(&w, tile, mailbox::STATUS, 0).unwrap();
-    dev.write32(&w, tile, mailbox::THREAD_INDEX, CORE_THREAD)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DST_ACCESS_FMT, spec.dst_fmt)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::PROGRAM_LEN, program.len() as u32)
-        .unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_FIRST, 0).unwrap();
-    dev.write32(&w, tile, mailbox::DUMP_ROW_COUNT, spec.dump_rows)
-        .unwrap();
     assert!(!spec.trace, "tracing is for role runs");
-    dev.write32(&w, tile, mailbox::TRACE, 0).unwrap();
     let push_window = if ON_SILICON {
         0
     } else {
         mailbox::SIM_PUSH_WINDOW
     };
-    dev.write32(&w, tile, mailbox::PUSH_WINDOW, push_window)
-        .unwrap();
+    // Whole, so nothing a previous process left in L1 survives into this run.
+    let d = mailbox::Descriptor {
+        thread_index: CORE_THREAD,
+        dst_access_fmt: spec.dst_fmt,
+        program_len: program.len() as u32,
+        dump_row_count: spec.dump_rows,
+        push_window,
+        ..Default::default()
+    };
+    for (at, v) in d.writes(mailbox::role::Mailbox::single_core()) {
+        dev.write32(&w, tile, at, v).unwrap();
+    }
     dev.write(&w, tile, mailbox::PROGRAM, &program_bytes(&program))
         .unwrap();
     for row in 0..spec.dump_rows {

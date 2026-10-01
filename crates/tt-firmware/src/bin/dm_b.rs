@@ -9,8 +9,9 @@
 #![no_main]
 
 use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, Descriptor, Entry};
-use tt_isa::mailbox::offset;
+use tt_isa::dm::{self, op, record, Descriptor, Entry};
+use tt_isa::mailbox::role::Mailbox;
+use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(2) {
@@ -150,6 +151,43 @@ fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
     }
 }
 
+/// Post `generation` to the three resident roles and wait for each to
+/// acknowledge it (`dm::op::KERNEL`). The roles' programs and descriptors were
+/// staged by the host; everything this list moved before is already in L1.
+///
+/// The roles' acknowledgements are stores by other cores, which do not
+/// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
+/// goes through a fence.
+fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
+    // Each role's resident program first, if named (checked by
+    // `Entry::decode`), so the generation that starts the run finds it.
+    for (t, (at, len)) in programs.into_iter().enumerate() {
+        if at != 0 {
+            let mb = Mailbox::of(t as u32);
+            wr(mb.program_addr(), at);
+            wr(mb.program_len(), len);
+        }
+    }
+    publish();
+    for t in 0..3 {
+        wr(Mailbox::of(t).generation(), generation);
+    }
+    publish();
+    for t in 0..3 {
+        let mb = Mailbox::of(t);
+        loop {
+            publish();
+            if rd(mb.ack()) == generation {
+                break;
+            }
+            if rd(mb.status()) == status::PANICKED {
+                return Err(dm::error::ROLE);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run one descriptor to completion.
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
@@ -157,36 +195,76 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     Ok(())
 }
 
-/// Run the list at `dm::LIST`: plain entries are issued back to back and waited
-/// for together; a transposed read waits for its own tile before rearranging it.
+/// Run one list entry: plain entries are issued without waiting; a transposed
+/// read waits for its own tile before rearranging it; a kernel or a wait entry
+/// first waits for everything before it.
+fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
+    match Entry::decode(usable, w)? {
+        Entry::Move { descriptor, transpose: true } => {
+            // Everything before it has landed, and the scratch is free.
+            noc::wait(TXN);
+            run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
+            publish();
+            transpose_from_scratch(descriptor.l1 as u64);
+            // Visible in L1 before anything else reads the slot.
+            publish();
+        }
+        Entry::Move { descriptor, .. } => issue(me, descriptor)?,
+        Entry::Kernel { generation, programs } => {
+            // The operands it computes on must have landed.
+            noc::wait(TXN);
+            publish();
+            kernel(generation, programs)?;
+        }
+        Entry::Wait => {
+            noc::wait(TXN);
+            publish();
+        }
+        Entry::Compute { kind, scalar, dst, a, b } => {
+            // Its operands may still be arriving.
+            noc::wait(TXN);
+            publish();
+            compute(kind, scalar, dst as u64, a as u64, b as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Read list entry `i`.
+fn entry(i: u64) -> [u32; 8] {
+    let at = dm::LIST + i * dm::ENTRY_BYTES;
+    let mut w = [0u32; 8];
+    for (k, word) in w.iter_mut().enumerate() {
+        *word = rd(at + k as u64 * 4);
+    }
+    w
+}
+
+/// Run the list at `dm::LIST`, entry by entry ([`exec`]). An op record
+/// (`dm::record`) is expanded here, on the tile, into the entries the host
+/// would otherwise have sent, and each runs exactly as a sent one would --
+/// through `Entry::decode` and every refusal in it.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
     if count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
-    for i in 0..count as u64 {
-        let at = dm::LIST + i * dm::ENTRY_BYTES;
-        let mut w = [0u32; 8];
-        for (k, word) in w.iter_mut().enumerate() {
-            *word = rd(at + k as u64 * 4);
-        }
-        match Entry::decode(usable, w)? {
-            Entry::Move { descriptor, transpose: true } => {
-                // Everything before it has landed, and the scratch is free.
-                noc::wait(TXN);
-                run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
-                publish();
-                transpose_from_scratch(descriptor.l1 as u64);
-                // Visible in L1 before anything else reads the slot.
-                publish();
+    let mut i = 0u64;
+    while i < count as u64 {
+        let head = entry(i);
+        let n = record::len(head[0]) as u64;
+        if n == 1 {
+            exec(me, usable, head)?;
+        } else {
+            if i + n > count as u64 {
+                return Err(dm::error::LENGTH);
             }
-            Entry::Move { descriptor, .. } => issue(me, descriptor)?,
-            Entry::Compute { kind, scalar, dst, a, b } => {
-                // Its operands may still be arriving.
-                noc::wait(TXN);
-                publish();
-                compute(kind, scalar, dst as u64, a as u64, b as u64);
+            let mut rec = [[0u32; 8]; 7];
+            for k in 0..n {
+                rec[k as usize] = entry(i + k);
             }
+            record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
         }
+        i += n;
     }
     noc::wait(TXN);
     Ok(())

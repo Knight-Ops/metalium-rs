@@ -48,6 +48,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         release: false,
         timeout: Duration::from_secs(120),
     };
+    let mut smoke = false;
     let mut args = args.peekable();
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -73,6 +74,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                         .map_err(|_| format!("`--timeout-secs {v}`: expected a number"))?,
                 );
             }
+            "--smoke" => smoke = true,
             "--include-ignored" => o.include_ignored = true,
             "--keep-going" => o.keep_going = true,
             "--list" => o.list_only = true,
@@ -81,8 +83,26 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
+    if smoke {
+        o.filters.extend(SMOKE.iter().map(|s| s.to_string()));
+    }
     Ok(o)
 }
+
+/// What `--smoke` runs, in order: the device backend against `burn-flex`,
+/// cheapest claim first, so a broken op fails before a training run spends a
+/// minute finding it. Simulator validation is plain `cargo test`; this is the
+/// tier that says burn-tt still computes what Burn's CPU backend computes, on
+/// the hardware it is for.
+pub const SMOKE: &[&str] = &[
+    "step19_eltwise::",
+    "step11_burn::",
+    "step20_many_tiles::eltwise",
+    "step20_many_tiles::column_sums",
+    "step12_mnist::the_first_forward_pass",
+    "step12_mnist::the_mlp_trains_on_a_reduced_dataset",
+    "step12_mnist::the_mlp_trains_on_four_tiles",
+];
 
 pub const USAGE: &str = "\
 usage: cargo xtask silicon [options]
@@ -91,6 +111,9 @@ usage: cargo xtask silicon [options]
                         `all` runs the whole selection on each card in turn
   --filter S            run only tests whose `binary::test` name contains S;
                         repeatable, and the selection runs in filter order
+  --smoke               the everyday smoke test: burn-tt against burn-flex,
+                        from single ops up to the reduced training runs
+                        (adds the filters in `SMOKE`, after any given)
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
   --timeout-secs N      per-test wall-clock limit (default 120)
@@ -126,6 +149,16 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     if !o.filters.is_empty() {
         // Filter order is run order, so a caller can say "Phase 2, then Phase 3"
         // and have the riskier group gate the next one.
+        // A filter that matches nothing is a typo or a renamed test, and with
+        // `--smoke` a stale preset entry; either way, say so rather than run less.
+        let unmatched: Vec<&String> = o
+            .filters
+            .iter()
+            .filter(|f| !selection.iter().any(|s| s.0.contains(f.as_str())))
+            .collect();
+        if !unmatched.is_empty() {
+            return Err(format!("no test matches the filter(s) {unmatched:?}"));
+        }
         let mut ordered = Vec::new();
         for f in &o.filters {
             for s in &selection {

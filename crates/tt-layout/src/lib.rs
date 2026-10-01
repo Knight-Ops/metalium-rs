@@ -12,15 +12,15 @@
 //!
 //! FP32, BF16 and FP16. The image model underneath handles block-float sizing (see
 //! `tt_isa::tile`), but no BFP encoder exists: the packer's encode direction is
-//! documented only in the Wormhole tree and cannot be checked against anything until
-//! the packers run, in Phase 6.
+//! documented only in the Wormhole tree, and nothing on the device path packs a
+//! block-float format yet to check one against.
 //!
 //! # Padding
 //!
 //! A tensor whose last two dimensions are not multiples of the tile's `X` and `Y`
 //! extents is padded, and [`detilize`] drops the padding again. The packer can do
-//! this in hardware with edge masking (`Packers/EdgeMasking.md`), which is the
-//! Phase 6 answer for the write-back direction; this is the host-side one.
+//! this in hardware with edge masking (`Packers/EdgeMasking.md`), which nothing
+//! uses yet: the device path pads to whole tiles; this is the host-side answer.
 
 #![forbid(unsafe_code)]
 

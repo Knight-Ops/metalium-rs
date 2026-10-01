@@ -88,12 +88,20 @@ pub const GENERATION: u64 = MAILBOX_BASE + 0x38;
 /// runs.
 pub const ACK: u64 = MAILBOX_BASE + 0x3C;
 
+/// Zero: the runner pushes its program from its fixed slot ([`PROGRAM`], or
+/// its role's). Non-zero: from this address -- a resident program in the
+/// program cache (`crate::l1::PROGRAM_CACHE`), placed there by the host and
+/// named, with [`PROGRAM_LEN`], by whoever starts the run: the host, or the
+/// data mover's `KERNEL` entry (`crate::dm::op::KERNEL`). The runner refuses an
+/// address outside the cache region.
+pub const PROGRAM_ADDR: u64 = MAILBOX_BASE + 0x40;
+
 /// The [`PUSH_WINDOW`] the host uses on the simulator: well under the 28
 /// instructions the first frontend FIFO holds (`PushTensixInstruction.md:15`).
 pub const SIM_PUSH_WINDOW: u32 = 16;
 
 /// Total size the firmware may assume is its own.
-pub const MAILBOX_SIZE: u64 = 0x40;
+pub const MAILBOX_SIZE: u64 = 0x44;
 
 /// Where the host points the timestamper's event buffer: after the program
 /// slots, 256 events.
@@ -175,6 +183,7 @@ const _: () = assert!(DUMP_ROW_FIRST + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PUSH_WINDOW + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(ACK + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(PROGRAM_ADDR + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
 
@@ -252,6 +261,9 @@ pub mod role {
         pub const fn ack(self) -> u64 {
             self.base + (super::ACK - super::MAILBOX_BASE)
         }
+        pub const fn program_addr(self) -> u64 {
+            self.base + (super::PROGRAM_ADDR - super::MAILBOX_BASE)
+        }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {
             self.program
@@ -273,6 +285,41 @@ pub mod role {
         assert!(Mailbox::of(2).program() + super::PROGRAM_SLOT == super::PROGRAM_REGION_END);
     const _: () =
         assert!(super::dump_offset(super::DUMP_MAX_ROWS, 0) - super::MAILBOX_BASE <= STRIDE);
+}
+
+/// Everything a runner reads from its mailbox at the start of a run, written
+/// whole ([`Descriptor::writes`]) so no field is left as an earlier run left
+/// it. L1 survives between processes on silicon, so a field one writer forgets
+/// is whatever the last process put there: a stale [`PROGRAM_ADDR`] once
+/// pointed a tile reset's runner into the program cache, and it hung. ttsim
+/// starts every process from zeroed L1, which is why it hid there.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Descriptor {
+    pub thread_index: u32,
+    pub dst_access_fmt: u32,
+    pub program_len: u32,
+    pub dump_row_first: u32,
+    pub dump_row_count: u32,
+    pub trace: u32,
+    pub push_window: u32,
+    /// Zero: the fixed slot ([`PROGRAM_ADDR`]).
+    pub program_addr: u32,
+}
+
+impl Descriptor {
+    /// `(address, value)` for every field, in `mb`.
+    pub const fn writes(&self, mb: role::Mailbox) -> [(u64, u32); 8] {
+        [
+            (mb.thread_index(), self.thread_index),
+            (mb.dst_access_fmt(), self.dst_access_fmt),
+            (mb.program_len(), self.program_len),
+            (mb.dump_row_first(), self.dump_row_first),
+            (mb.dump_row_count(), self.dump_row_count),
+            (mb.trace(), self.trace),
+            (mb.push_window(), self.push_window),
+            (mb.program_addr(), self.program_addr),
+        ]
+    }
 }
 
 /// Values written to [`STATUS`].
@@ -335,6 +382,27 @@ mod tests {
             // Nothing else the host stages lands in a slot.
             assert!(a.dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) < PROGRAM_REGION);
         }
+    }
+
+    /// A descriptor names every word the runner reads before pushing: the
+    /// ones from [`THREAD_INDEX`] to [`PUSH_WINDOW`], and [`PROGRAM_ADDR`].
+    #[test]
+    fn a_descriptor_writes_every_word_the_runner_reads() {
+        let mb = role::Mailbox::single_core();
+        let mut at = Descriptor::default().writes(mb).map(|w| w.0);
+        at.sort_unstable();
+        let mut want = [
+            THREAD_INDEX,
+            DST_ACCESS_FMT,
+            PROGRAM_LEN,
+            DUMP_ROW_COUNT,
+            DUMP_ROW_FIRST,
+            TRACE,
+            PUSH_WINDOW,
+            PROGRAM_ADDR,
+        ];
+        want.sort_unstable();
+        assert_eq!(at, want);
     }
 
     #[test]

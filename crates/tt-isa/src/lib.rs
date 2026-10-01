@@ -18,6 +18,7 @@ pub mod dm;
 pub mod dram;
 pub mod eth;
 pub mod isa;
+pub mod l1;
 pub mod mailbox;
 pub mod matrix;
 pub mod noc;
