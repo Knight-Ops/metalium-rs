@@ -100,8 +100,17 @@ pub const PROGRAM_ADDR: u64 = MAILBOX_BASE + 0x40;
 /// instructions the first frontend FIFO holds (`PushTensixInstruction.md:15`).
 pub const SIM_PUSH_WINDOW: u32 = 16;
 
+/// Non-zero: before pushing, the runner releases every Tensix semaphore a
+/// thread may be blocked on, from the RISC-V side
+/// (`crate::tensix::SEMAPHORE_ACCESS`): posting each that reads zero, round
+/// after round. A thread left in `SEMWAIT` by a failed kernel survives the
+/// backend reset (divergence row 65), and a reset program pushed behind it
+/// would queue forever; a semaphore post by the RISC-V core does not queue
+/// behind anything. Set by the host's tile reset on silicon only.
+pub const UNWEDGE: u64 = MAILBOX_BASE + 0x44;
+
 /// Total size the firmware may assume is its own.
-pub const MAILBOX_SIZE: u64 = 0x44;
+pub const MAILBOX_SIZE: u64 = 0x48;
 
 /// Where the host points the timestamper's event buffer: after the program
 /// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
@@ -284,6 +293,9 @@ pub mod role {
         pub const fn panic_code(self) -> u64 {
             self.base + (super::PANIC_CODE - super::MAILBOX_BASE)
         }
+        pub const fn unwedge(self) -> u64 {
+            self.base + (super::UNWEDGE - super::MAILBOX_BASE)
+        }
         pub const fn thread_index(self) -> u64 {
             self.base + (super::THREAD_INDEX - super::MAILBOX_BASE)
         }
@@ -354,11 +366,13 @@ pub struct Descriptor {
     pub push_window: u32,
     /// Zero: the fixed slot ([`PROGRAM_ADDR`]).
     pub program_addr: u32,
+    /// [`UNWEDGE`].
+    pub unwedge: u32,
 }
 
 impl Descriptor {
     /// `(address, value)` for every field, in `mb`.
-    pub const fn writes(&self, mb: role::Mailbox) -> [(u64, u32); 8] {
+    pub const fn writes(&self, mb: role::Mailbox) -> [(u64, u32); 9] {
         [
             (mb.thread_index(), self.thread_index),
             (mb.dst_access_fmt(), self.dst_access_fmt),
@@ -368,6 +382,7 @@ impl Descriptor {
             (mb.trace(), self.trace),
             (mb.push_window(), self.push_window),
             (mb.program_addr(), self.program_addr),
+            (mb.unwedge(), self.unwedge),
         ]
     }
 }
@@ -450,6 +465,7 @@ mod tests {
             TRACE,
             PUSH_WINDOW,
             PROGRAM_ADDR,
+            UNWEDGE,
         ];
         want.sort_unstable();
         assert_eq!(at, want);

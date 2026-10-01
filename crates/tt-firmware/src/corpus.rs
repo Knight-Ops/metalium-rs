@@ -67,6 +67,42 @@ fn trace(on: bool, thread: u32, event: u32) {
     }
 }
 
+/// Release whatever a failed kernel left a Tensix thread blocked on
+/// (`mailbox::UNWEDGE`): post every semaphore that reads zero, in rounds, so
+/// a `SEMWAIT` the backend reset did not clear completes -- and any later one
+/// in what it had queued behind it. The reset program the runner then pushes
+/// initialises every semaphore afresh, so the posts leave nothing behind.
+fn unwedge() {
+    use tt_isa::tensix::SEMAPHORE_ACCESS;
+    // Until nothing has consumed a post for 64 rounds running: whatever the
+    // thread had queued behind its first wait has run (each later wait taking
+    // the next round's post), or it waits on something no post can release.
+    // Bounded, so a tile wedged some other way still reaches the reset.
+    let (mut quiet, mut rounds) = (0u32, 0u32);
+    while quiet < 64 && rounds < 1 << 20 {
+        rounds += 1;
+        let mut posted = false;
+        for i in 0..8u64 {
+            let at = SEMAPHORE_ACCESS + 4 * i;
+            // SAFETY: the documented semaphore window of this core; a load
+            // reads a value, an even store posts.
+            unsafe {
+                if l1_read32(at) == 0 {
+                    l1_write32(at, 0);
+                    posted = true;
+                }
+            }
+        }
+        quiet = if posted { 0 } else { quiet + 1 };
+        publish();
+        for _ in 0..256 {
+            // Not `spin_loop`: its `pause` is an encoding Blackhole lacks.
+            // SAFETY: a no-op.
+            unsafe { core::arch::asm!("nop") };
+        }
+    }
+}
+
 fn run_in<Riscv, Thread>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
@@ -132,6 +168,10 @@ where
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
     let push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
+    // SAFETY: as above.
+    if unsafe { l1_read32(mb.unwedge()) } != 0 {
+        unwedge();
+    }
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.

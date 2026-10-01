@@ -47,7 +47,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a, S8, R1a, R2 (softmax); X2, X4 next |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[~]` S3, S4a, S8, R1a, R2 (softmax), X4a-c; X2, X4d next |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -263,9 +263,22 @@ reverse index.
         `step33_barrier::queued_lists_run_in_order_without_waiting`: forty chained
         copies enqueued without waiting -- past the slots and the ring -- arrive whole.
         Watched failing with every list placed at entry 0. ttsim and both cards.
-  - [ ] **X4c Batching in the session**: ops queue with their outputs placed; a sync
+  - [x] **X4c Batching in the session**: ops queue with their outputs placed; a sync
         point (download, explicit) submits them, barriers between multi-unit ops; then
-        burn-tt's ops are asynchronous for free.
+        burn-tt's ops are asynchronous for free. `Session::{sync, set_batching}`
+        (`TT_BATCH`, default on): each segment is enqueued on the mover's queue, a
+        barrier list follows a multi-unit op, frees wait for the lists that may read
+        them, and downloads, runs and profiles sync first. Two hazards found on
+        silicon, both closed (table below): a full program cache never makes room
+        while lists are queued (the programs they run stay pinned; the session drains
+        and places again), and an upload is visible through every port of its channels
+        before `dram_write` returns (divergence row T). Gate `step34_batching`: a
+        40-op chain of four SFPU kinds through a cache cut to about two kinds'
+        programs, bit for bit to the interpreter, with evictions (watched failing with
+        eviction allowed while queued: ttsim's contract-violation exit); a four-unit
+        layer forward with several lists per unit per op, eight queued passes bit for
+        bit to the unbatched one; and an upload-then-op guard (row T: it does not
+        reproduce the race, `tt-mnist` does). ttsim and both cards. MNIST: row U.
   - [ ] **X4d Traces**: a step's lists kept in GDDR, replayed by reference.
   Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
@@ -658,6 +671,9 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `DOTPV`, `SHIFTXB`, `MOVDBGA2D` unimplemented on ttsim | divergence row 50 | M4 |
 | `STALLWAIT` must block the *consumer*; units run concurrently on silicon | divergence row 46 | F3 |
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
+| Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
+| A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
+| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause not confirmed; a math instruction waiting for `Src` banks the pulse gave back is the leading guess. Recovery needs a board reset; trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | open -- prevent (X4c); recovery needs a verified encoding first |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.

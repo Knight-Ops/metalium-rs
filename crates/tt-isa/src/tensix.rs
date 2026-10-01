@@ -254,6 +254,13 @@ pub const NCRISC_RESET_PC: u64 = 0xFFB1_2238;
 /// Bit 0 enables the override.
 pub const NCRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_223C;
 
+/// `SemaphoreAccess[i]` at `PC_BUF_BASE + 4 * PC_BUF_SEMAPHORE_BASE`, in the
+/// address space of RISC-V T0, T1 and T2 only (`SyncUnit.md`, "RISCV access to
+/// semaphores"; `BabyRISCV/README.md:128`): a load reads semaphore `i`'s value,
+/// a store of an even value posts it (`SEMPOST`), of an odd one gets it
+/// (`SEMGET`) -- atomically, and without queueing behind the Tensix thread.
+pub const SEMAPHORE_ACCESS: u64 = 0xFFE8_0020;
+
 /// The tile's debug timestamper (`TensixTile/DebugTimestamper.md`, identical to
 /// Wormhole's): a 64-bit cycle counter, and an event stream that appends
 /// `{token, counter}` records to a buffer in L1, one store per event.

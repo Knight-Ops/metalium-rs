@@ -176,8 +176,12 @@ pub fn reset_thread_state<T: Transport>(
     // semaphore, which the backend pulse does not (row 65); otherwise thread 1
     // or 2's reset would queue behind it forever.
     let first = [datapath::release_semaphores(), program.clone()].concat();
+    // And the role cores, before pushing anything, release from the RISC-V
+    // side a semaphore their own thread is blocked on: thread 0's reset could
+    // not, queued behind the block (`mailbox::UNWEDGE`).
     let kernel = Kernel {
         dump_rows: 0,
+        unwedge: true,
         ..Kernel::new([&first, &program, &program], Schedule::InOrder)
     };
     runtime::run(dev, tile, images, &kernel, RESET_BUDGET).map(|_| ())
@@ -221,6 +225,14 @@ pub struct Session<T: Transport> {
     profiling: Option<Vec<crate::profile::UnitProfile>>,
     /// Which unit element-wise ops run on ([`Session::set_eltwise_unit`]).
     eltwise_unit: tensor::EltwiseUnit,
+    /// Queue ops on the movers and wait only at a sync point
+    /// ([`Session::sync`]), rather than one host round trip per op.
+    batching: bool,
+    /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
+    barriers: u32,
+    /// Placements freed while lists that may read them are queued: given back
+    /// at the next sync.
+    pending_frees: Vec<tensor::Placement>,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -245,6 +257,17 @@ struct Unit {
     /// The host's mirror of this tile's resident programs
     /// (`tt_isa::l1::PROGRAM_CACHE`).
     programs: ProgramCache,
+    /// Lists enqueued on this tile's mover and not yet retired, oldest first
+    /// ([`Session::sync`]).
+    queued: std::collections::VecDeque<QueuedList>,
+}
+
+/// A list on a mover's queue: its number, whether it reserved kernels (to
+/// close when it is retired), and what it was, for an error.
+struct QueuedList {
+    number: u32,
+    kernels: bool,
+    what: &'static str,
 }
 
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
@@ -294,7 +317,8 @@ fn place_programs<T: Transport>(
     tile: NocCoord<Noc0>,
     cache: &mut ProgramCache,
     seg: &Segment,
-) -> Result<Vec<[(u32, u32); 3]>, TensorError> {
+    in_flight: bool,
+) -> Result<Vec<[(u32, u32); 3]>, PlaceError> {
     use crate::program_cache::{CacheError, Placed};
     for attempt in 0..2 {
         let mut placed: Vec<[(u32, u32); 3]> = Vec::with_capacity(seg.kernel_roles.len());
@@ -317,13 +341,14 @@ fn place_programs<T: Transport>(
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                        dev.l1_write(window, tile, at, &bytes)?;
+                        dev.l1_write(window, tile, at, &bytes)
+                            .map_err(|e| PlaceError::Failed(e.into()))?;
                         at
                     }
                     Ok(Placed::Bypass) => {
-                        return Err(TensorError::Shape(
+                        return Err(PlaceError::Failed(TensorError::Shape(
                             "a resident list names a program too large to cache".into(),
-                        ))
+                        )))
                     }
                     Err(CacheError::Full { .. }) => {
                         full = true;
@@ -337,14 +362,39 @@ fn place_programs<T: Transport>(
         if !full {
             return Ok(placed);
         }
+        // Lists still queued run programs pinned here: making room now would
+        // overwrite them under a running list (as it did, on silicon, some
+        // fourteen thousand lists into a batched MNIST run). The caller
+        // drains the queue and asks again.
+        if in_flight {
+            return Err(PlaceError::Full);
+        }
         cache.unpin_all();
         if attempt == 0 {
             cache.clear();
         }
     }
-    Err(TensorError::Shape(
+    Err(PlaceError::Failed(TensorError::Shape(
         "a list's programs do not fit an empty program cache".into(),
-    ))
+    )))
+}
+
+/// Why [`place_programs`] placed nothing.
+enum PlaceError {
+    /// The cache is full of programs queued lists still name.
+    Full,
+    Failed(TensorError),
+}
+
+impl From<PlaceError> for TensorError {
+    fn from(p: PlaceError) -> Self {
+        match p {
+            PlaceError::Full => TensorError::Shape(
+                "the program cache is full of programs queued lists still run".into(),
+            ),
+            PlaceError::Failed(e) => e,
+        }
+    }
 }
 
 /// One unit's steps as mover lists, in order. Consecutive steps share a list
@@ -505,6 +555,7 @@ impl<T: Transport> Session<T> {
                 steps: 0,
                 lists: 0,
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
+                queued: Default::default(),
             });
         }
         let mut session = Session {
@@ -516,6 +567,9 @@ impl<T: Transport> Session<T> {
             dram: None,
             profiling: None,
             eltwise_unit: tensor::EltwiseUnit::default(),
+            batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
+            barriers: 0,
+            pending_frees: Vec::new(),
             _cleanup: cleanup,
         };
         session.prepare().map_err(SessionError::Reset)?;
@@ -525,6 +579,7 @@ impl<T: Transport> Session<T> {
     /// Put every tile back to a known state: step 4 again, then the role
     /// images loaded and left resident.
     pub fn prepare(&mut self) -> Result<(), RunError> {
+        self.sync_run()?;
         for u in 0..self.units.len() {
             self.prepare_unit(u)?;
         }
@@ -569,6 +624,7 @@ impl<T: Transport> Session<T> {
     /// Refused on the simulator, which does not model the event stream
     /// (divergence row 54).
     pub fn profile_start(&mut self) -> Result<(), RunError> {
+        self.sync_run()?;
         if self.dev.transport().is_simulated() {
             return Err(RunError::Transport(TransportError::Hazard {
                 address: tt_isa::tensix::timestamper::TIMESTAMP,
@@ -612,6 +668,7 @@ impl<T: Transport> Session<T> {
     /// Stop profiling and return what was recorded since
     /// [`Session::profile_start`], with the tiles' clock measured over it.
     pub fn profile_stop(&mut self) -> Result<crate::profile::DeviceProfile, RunError> {
+        self.sync_run()?;
         let Some(mut units) = self.profiling.take() else {
             return Err(RunError::Transport(TransportError::Hazard {
                 address: 0,
@@ -712,6 +769,7 @@ impl<T: Transport> Session<T> {
 
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        self.sync()?;
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
@@ -722,6 +780,7 @@ impl<T: Transport> Session<T> {
     /// Every datum of every tile of `t`, padding included, row-major
     /// `[32 * rt, 32 * ct]` (`DramTensor::download_padded`).
     pub fn download_padded(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        self.sync()?;
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
@@ -731,7 +790,272 @@ impl<T: Transport> Session<T> {
 
     /// Give a tensor's slots back.
     pub fn free(&mut self, t: DramTensor) -> Result<(), TensorError> {
+        // A queued list may still read it, and the next allocation must not
+        // hand its slots to an upload that would land first.
+        if self.units.iter().any(|u| !u.queued.is_empty()) {
+            self.pending_frees.push(t.placement);
+            return Ok(());
+        }
         self.dram_state()?.alloc.free(&t.placement);
+        Ok(())
+    }
+
+    /// Queue ops on the movers and wait only at a sync point (the default),
+    /// or run each op to completion. Syncs first.
+    pub fn set_batching(&mut self, on: bool) -> Result<(), TensorError> {
+        self.sync()?;
+        self.batching = on;
+        Ok(())
+    }
+
+    /// Wait for everything queued on every unit, close its kernels, give back
+    /// what was freed meanwhile, and report the first failure -- naming the op
+    /// whose list failed -- after recovering every unit (a unit waiting at a
+    /// barrier for the one that failed is stopped too).
+    pub fn sync(&mut self) -> Result<(), TensorError> {
+        let mut first: Option<TensorError> = None;
+        for u in 0..self.units.len() {
+            if let Err(e) = self.drain_unit(u) {
+                first.get_or_insert(e);
+            }
+        }
+        if let Some(e) = first {
+            for u in 0..self.units.len() {
+                let had_kernels = self.units[u].queued.iter().any(|q| q.kernels);
+                self.units[u].queued.clear();
+                self.recover(&[(u, had_kernels)]);
+            }
+            self.barriers = 0;
+            if let Some(m) = self.units.first().and_then(|u| u.resident.as_ref()) {
+                let (w, t) = (m.window(), self.units[0].tile);
+                let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
+            }
+            self.apply_pending_frees();
+            return Err(e);
+        }
+        self.apply_pending_frees();
+        Ok(())
+    }
+
+    fn apply_pending_frees(&mut self) {
+        let frees = std::mem::take(&mut self.pending_frees);
+        if let Ok(d) = self.dram_state() {
+            for p in &frees {
+                d.alloc.free(p);
+            }
+        }
+    }
+
+    /// Wait for unit `u`'s queue to drain, closing each list's kernels in
+    /// order, and unpin its programs.
+    fn drain_unit(&mut self, u: usize) -> Result<(), TensorError> {
+        if self.units[u].queued.is_empty() {
+            return Ok(());
+        }
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let (Some(r), Some(m)) = (unit.resident.as_mut(), unit.mover.as_mut()) else {
+            unit.queued.clear();
+            return Ok(());
+        };
+        let result = m.drain(dev, r.window());
+        let ok = result.is_ok();
+        while let Some(q) = unit.queued.front() {
+            if q.kernels {
+                let _ = r.reserved_done(dev, ok);
+            }
+            if ok {
+                unit.queued.pop_front();
+            } else {
+                break;
+            }
+        }
+        if ok {
+            unit.programs.unpin_all();
+            self.drain(u)?;
+            return Ok(());
+        }
+        let (what, number) = unit.queued.front().map_or(("", 0), |q| (q.what, q.number));
+        Err(TensorError::Shape(format!(
+            "queued list {number}, `{what}`, on tile ({}, {}) failed: {}",
+            unit.tile.x(),
+            unit.tile.y(),
+            result.err().map_or_else(String::new, |e| e.to_string())
+        )))
+    }
+
+    /// Start unit `u`'s roles and mover if they are not running.
+    fn ensure_unit(&mut self, u: usize) -> Result<(), TensorError> {
+        if self.units[u].resident.is_none() {
+            self.prepare_unit(u)?;
+        }
+        let Session {
+            dev,
+            units,
+            dram,
+            profiling,
+            ..
+        } = self;
+        let unit = &mut units[u];
+        let r = unit.resident.as_ref().expect("prepared above");
+        let d = dram
+            .as_ref()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if unit.mover.is_none() {
+            unit.mover = Some(DataMover::start(
+                dev,
+                r.window(),
+                unit.tile,
+                &d.dram,
+                d.image,
+            )?);
+            if profiling.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue an op's jobs ([`Session::execute`] with batching): each unit's
+    /// share as few lists as fit, then -- with more than one unit -- a barrier
+    /// on every unit, since the next op may read what any unit wrote.
+    fn enqueue_work(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+        let n = self.units.len();
+        let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
+        for (j, job) in jobs.into_iter().enumerate() {
+            queues[j % n].extend(job);
+        }
+        if n > 1 {
+            for u in 0..n {
+                self.ensure_unit(u)?;
+            }
+        }
+        for (u, steps) in queues.into_iter().enumerate() {
+            for seg in segments(steps) {
+                self.enqueue_segment(u, &seg, budget)?;
+            }
+        }
+        if n > 1 {
+            self.barriers = self.barriers.wrapping_add(1);
+            let target = self.barriers.wrapping_mul(n as u32);
+            let c = self.units[0].tile;
+            let entry = [
+                tt_isa::dm::op::BARRIER,
+                target,
+                c.x() as u32,
+                c.y() as u32,
+                0,
+                0,
+                0,
+                0,
+            ];
+            for u in 0..n {
+                let Session { dev, units, .. } = self;
+                let unit = &mut units[u];
+                let (r, m) = (
+                    unit.resident.as_ref().unwrap(),
+                    unit.mover.as_mut().unwrap(),
+                );
+                let number = m.enqueue(dev, r.window(), &[entry])?;
+                unit.queued.push_back(QueuedList {
+                    number,
+                    kernels: false,
+                    what: "barrier",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue one segment on unit `u`: its programs placed (and pinned until
+    /// the queue drains), its kernels reserved, its list enqueued. A kernel
+    /// that would write what queued runs read (`Resident::needs_idle`) waits
+    /// for the unit to drain first, as does a full program cache.
+    fn enqueue_segment(&mut self, u: usize, seg: &Segment, budget: u64) -> Result<(), TensorError> {
+        self.ensure_unit(u)?;
+        let mut entries = seg.entries.clone();
+        if seg.resident && !seg.kernels.is_empty() {
+            let placed = {
+                let Session { dev, units, .. } = self;
+                let unit = &mut units[u];
+                let w = unit.resident.as_ref().unwrap().window();
+                let in_flight = !unit.queued.is_empty();
+                match place_programs(dev, w, unit.tile, &mut unit.programs, seg, in_flight) {
+                    Ok(p) => Ok(p),
+                    Err(PlaceError::Full) => Err(()),
+                    Err(PlaceError::Failed(e)) => return Err(e),
+                }
+            };
+            let placed = match placed {
+                Ok(p) => p,
+                Err(()) => {
+                    self.drain_unit(u)?;
+                    let Session { dev, units, .. } = self;
+                    let unit = &mut units[u];
+                    let w = unit.resident.as_ref().unwrap().window();
+                    place_programs(dev, w, unit.tile, &mut unit.programs, seg, false)?
+                }
+            };
+            for (&at, p) in seg.kernels.iter().zip(placed) {
+                for (t, (addr, len)) in p.into_iter().enumerate() {
+                    entries[at][2 + 2 * t] = addr;
+                    entries[at][3 + 2 * t] = len;
+                }
+            }
+        }
+        if let Some(roles) = seg.kernel_roles.first() {
+            let [unpack, math, pack] = &**roles;
+            let kernel = Kernel {
+                restores_semaphores: true,
+                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
+            };
+            let idle = {
+                let Session { dev, units, .. } = self;
+                let r = units[u].resident.as_ref().unwrap();
+                r.needs_idle(dev, &kernel, seg.resident)
+            };
+            if idle {
+                self.drain_unit(u)?;
+            }
+            let Session {
+                dev, units, images, ..
+            } = self;
+            let unit = &mut units[u];
+            let r = unit.resident.as_mut().unwrap();
+            let generations = r.reserve(
+                dev,
+                images,
+                &kernel,
+                budget,
+                seg.kernels.len() as u32,
+                seg.resident,
+            )?;
+            for (&at, g) in seg.kernels.iter().zip(generations) {
+                entries[at][1] = g;
+            }
+        }
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let (r, m) = (
+            unit.resident.as_mut().unwrap(),
+            unit.mover.as_mut().unwrap(),
+        );
+        let number = match m.enqueue(dev, r.window(), &entries) {
+            Ok(n) => n,
+            Err(e) => {
+                if !seg.kernel_roles.is_empty() {
+                    let _ = r.reserved_done(dev, false);
+                }
+                return Err(e.into());
+            }
+        };
+        unit.queued.push_back(QueuedList {
+            number,
+            kernels: !seg.kernel_roles.is_empty(),
+            what: seg.what,
+        });
+        unit.lists += 1;
+        unit.steps += seg.steps;
         Ok(())
     }
 
@@ -857,7 +1181,7 @@ impl<T: Transport> Session<T> {
         let units = self.units.len();
         if t.placement.owned() {
             let jobs = tensor::fill_pad(t, 0.0, units)?;
-            self.run_jobs(jobs, RESET_BUDGET)?;
+            self.submit_jobs(jobs, RESET_BUDGET)?;
             t.set_pad(Pad::Zero);
             return Ok(None);
         }
@@ -870,7 +1194,7 @@ impl<T: Transport> Session<T> {
             None,
         )?;
         let jobs = tensor::fill_pad(&copy, 0.0, units)?;
-        if let Err(e) = self.run_jobs(jobs, RESET_BUDGET) {
+        if let Err(e) = self.submit_jobs(jobs, RESET_BUDGET) {
             let _ = self.free(copy);
             return Err(e);
         }
@@ -941,6 +1265,35 @@ impl<T: Transport> Session<T> {
     /// same wave are finished first, so nothing is left running.
     fn execute(&mut self, work: tensor::Work, budget: u64) -> Result<DramTensor, TensorError> {
         let tensor::Work { out, jobs } = work;
+        if self.batching {
+            let queued = self.enqueue_work(jobs, budget);
+            // A profile drains each tile's stream after every op, so its
+            // buffer never holds more than one op's events.
+            let synced = match &queued {
+                Ok(()) if self.profiling.is_some() => self.sync(),
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Part of the op may be queued without its barrier:
+                    // drain everything and start the barriers again.
+                    let _ = self.sync();
+                    self.barriers = 0;
+                    let c = self.units[0].tile;
+                    if let Some(r) = self.units[0].resident.as_ref() {
+                        let _ = self
+                            .dev
+                            .write32(r.window(), c, tt_isa::dm::BARRIER_COUNTER, 0);
+                    }
+                    Ok(())
+                }
+            };
+            if let Err(e) = queued.and(synced) {
+                if let Ok(d) = self.dram_state() {
+                    d.alloc.free(&out.placement);
+                }
+                return Err(e);
+            }
+            return Ok(out);
+        }
         if let Err(e) = self.run_jobs(jobs, budget) {
             if let Ok(d) = self.dram_state() {
                 d.alloc.free(&out.placement);
@@ -950,10 +1303,26 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Jobs whose output already exists (an in-place fill), by whichever path
+    /// the session dispatches on: queued behind what is queued, or run now.
+    /// Never the direct path while lists are queued: it writes the mover's
+    /// list ring over them.
+    fn submit_jobs(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+        if self.batching {
+            self.enqueue_work(jobs, budget)
+        } else {
+            self.run_jobs(jobs, budget)
+        }
+    }
+
     /// The body of [`Session::execute`], for jobs whose output already exists
     /// (an in-place fill): deal them out, run them in waves, recover a unit
     /// whose list failed.
     fn run_jobs(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+        debug_assert!(
+            self.units.iter().all(|u| u.queued.is_empty()),
+            "the direct path would write the list ring under queued lists"
+        );
         let n = self.units.len();
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
         for (j, job) in jobs.into_iter().enumerate() {
@@ -1048,7 +1417,7 @@ impl<T: Transport> Session<T> {
         let mut entries = seg.entries.clone();
         if seg.resident {
             let window = r.window();
-            let placed = place_programs(dev, window, unit.tile, &mut unit.programs, seg)?;
+            let placed = place_programs(dev, window, unit.tile, &mut unit.programs, seg, false)?;
             for (&at, p) in seg.kernels.iter().zip(placed) {
                 for (t, (addr, len)) in p.into_iter().enumerate() {
                     entries[at][2 + 2 * t] = addr;
@@ -1083,8 +1452,8 @@ impl<T: Transport> Session<T> {
         };
         let mover = unit.mover.as_mut().expect("started above");
         if let Err(e) = mover.submit_list(dev, r.window(), &entries) {
-            if let Some(k) = &kernel {
-                let _ = r.reserved_done(dev, k, false);
+            if kernel.is_some() {
+                let _ = r.reserved_done(dev, false);
             }
             return Err(e.into());
         }
@@ -1100,8 +1469,8 @@ impl<T: Transport> Session<T> {
         let out = mover.wait(dev, r.window());
         // Nothing in flight names a program any more.
         unit.programs.unpin_all();
-        if let Some(k) = &kernel {
-            r.reserved_done(dev, k, out.is_ok())?;
+        if kernel.is_some() {
+            r.reserved_done(dev, out.is_ok())?;
         }
         Ok(out?)
     }
@@ -1125,6 +1494,7 @@ impl<T: Transport> Session<T> {
     /// tile and restarts them before it is returned, so the session stays
     /// usable.
     pub fn run(&mut self, kernel: &Kernel<'_>, budget: u64) -> Result<runtime::Outcome, RunError> {
+        self.sync_run()?;
         if self.units[0].resident.is_none() {
             self.prepare_unit(0)?;
         }
@@ -1194,6 +1564,22 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.programs.stats()).collect()
     }
 
+    /// Shrink every unit's program cache to its first `bytes`, emptied: for
+    /// gates that need it to fill (`step34_batching`). Waits for queued work
+    /// first, since what is resident is forgotten.
+    #[doc(hidden)]
+    pub fn limit_program_cache(&mut self, bytes: u64) -> Result<(), TensorError> {
+        self.sync()?;
+        let full = tt_isa::l1::PROGRAM_CACHE;
+        for unit in &mut self.units {
+            unit.programs = ProgramCache::new(tt_isa::l1::Region {
+                end: full.base + bytes.min(full.len()),
+                ..full
+            });
+        }
+        Ok(())
+    }
+
     /// Mover lists submitted to each unit so far, in unit order: the host's
     /// round trips for GDDR ops.
     pub fn lists_per_tile(&self) -> Vec<u64> {
@@ -1209,7 +1595,13 @@ impl<T: Transport> Session<T> {
     }
 
     /// The device, with every unit's role cores held again.
+    /// [`Session::sync`] for the paths that report a `RunError`.
+    fn sync_run(&mut self) -> Result<(), RunError> {
+        self.sync().map_err(|e| RunError::Queued(e.to_string()))
+    }
+
     pub fn into_device(mut self) -> Device<T> {
+        let _ = self.sync();
         for u in &mut self.units {
             if let Some(r) = u.resident.take() {
                 let _ = r.stop(&mut self.dev, &self.images);

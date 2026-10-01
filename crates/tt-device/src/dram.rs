@@ -54,11 +54,29 @@ impl<T: Transport> Device<T> {
     ///
     /// Any window works; a [`crate::tlb::WindowKind::FourGib`] one covers a whole
     /// channel with one retarget.
+    ///
+    /// Returns once the bytes are visible through every endpoint of the
+    /// channel, not merely posted: the last word is read back through each of
+    /// its [`tt_isa::dram::PORTS`] endpoints, as UMD's DRAM barrier touches
+    /// every port. The movers read through all three (records rotate the port),
+    /// and a read through one port is no fence for writes taken by another.
+    /// Without it a mover told to read the range -- by a list, which reaches it
+    /// over the tile's L1 -- can overtake the writes: on silicon a batched
+    /// MNIST's test batches read part stale images (divergence row T).
     pub fn dram_write(&mut self, window: &Window, range: DramRange, data: &[u8]) -> Result<()> {
         check_len(range, data.len())?;
         let at = range.channel().endpoint(0).expect("port 0 exists");
         // GDDR is memory by construction: the bulk path.
-        self.write_memory(window, at, range.offset(), data)
+        self.write_memory(window, at, range.offset(), data)?;
+        if data.len() >= 4 {
+            let last = range.offset() + data.len() as u64 - 4;
+            let mut word = [0u8; 4];
+            for port in 0..tt_isa::dram::PORTS {
+                let via = range.channel().endpoint(port).expect("in range");
+                self.read_memory(window, via, last, &mut word)?;
+            }
+        }
+        Ok(())
     }
 
     /// Read `range` into `out`, through the channel's first endpoint.
