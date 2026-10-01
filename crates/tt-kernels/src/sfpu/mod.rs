@@ -301,6 +301,8 @@ impl Program {
     /// `d = s` with the sign bit of `sign` (`SFPSETSGN` taking it from `VD`,
     /// which is why `sign` is moved into `d` first).
     pub fn copy_sign(&mut self, s: LReg, sign: LReg, d: LReg) {
+        // `d` takes `sign` first: an `s` in `d` would be gone before it is read.
+        assert!(s != d || s == sign, "copy_sign into its own source");
         if sign != d {
             self.mov(sign, d);
         }
@@ -578,8 +580,11 @@ impl Program {
             },
         );
         // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
-        // seed's infinity met `0 * inf` in the steps.
-        self.abs(x, t1);
+        // seed's infinity met `0 * inf` in the steps. The magnitude by mask,
+        // not `SFPABS`, which leaves a negative NaN negative -- it then passed
+        // for a zero and came out `-inf` (found in 10.2e).
+        self.loadi_bits(t0, 0x7fff_ffff);
+        self.and(x, t0, t1);
         self.loadi_bits(t0, 0x0080_0000);
         self.if_(Cond::Less(t1, t0), |p| {
             p.loadi_bits(t0, 0x7f80_0000);

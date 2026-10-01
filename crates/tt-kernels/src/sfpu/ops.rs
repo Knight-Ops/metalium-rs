@@ -104,6 +104,28 @@ pub mod kind_sfpu {
     pub const POW_FIX_S: u32 = 0x128;
     /// An `I32` as `F32`, `as f32`'s rounding (Flex's `int_into_float`).
     pub const I32_TO_F32: u32 = 0x129;
+    /// `e^a - 1`, within [`super::EXPM1_BOUND`] (10.2e).
+    pub const EXPM1: u32 = 0x12a;
+    /// `1 / (1 + e^-a)` in Flex's two branches, within [`super::SIGMOID_BOUND`].
+    pub const SIGMOID: u32 = 0x12b;
+    /// `g * s * (1 - s)`, `s` the sigmoid's output (`A`) and `g` the gradient
+    /// (`B`), exact as Flex's order.
+    pub const SIGMOID_BACKWARD: u32 = 0x12c;
+    /// `tanh a`, within [`super::TANH_BOUND`].
+    pub const TANH: u32 = 0x12d;
+    /// `erf a`, within [`super::ERF_BOUND`].
+    pub const ERF: u32 = 0x12e;
+    /// `gelu`'s second stage: `0.5 a (1 + erf(a/sqrt 2))` (Flex's) from `a`
+    /// (`A`) and its `GELU_EXP` (`B`), within [`super::GELU_BOUND`]. One
+    /// program would not fit a role's slot (`mailbox::PROGRAM_MAX`).
+    pub const GELU: u32 = 0x12f;
+    /// `gelu_backward`'s second stage, ternary: `g (Phi(a) + a phi(a))` from
+    /// `a`, its `GELU_EXP` and the gradient `g`, within
+    /// [`super::gelu_backward_bound`].
+    pub const GELU_BACKWARD: u32 = 0x130;
+    /// Both's first stage: `e^(-v^2)`, `v = a/sqrt 2` split
+    /// (`super::gelu_exp_program`).
+    pub const GELU_EXP: u32 = 0x131;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -183,7 +205,14 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::DIV_SCALAR
         | kind_sfpu::EXP
         | kind_sfpu::LOG
-        | kind_sfpu::SQRT..=kind_sfpu::LOG_ABS => Accuracy::Approximate,
+        | kind_sfpu::SQRT..=kind_sfpu::LOG_ABS
+        | kind_sfpu::EXPM1
+        | kind_sfpu::SIGMOID
+        | kind_sfpu::TANH
+        | kind_sfpu::ERF
+        | kind_sfpu::GELU
+        | kind_sfpu::GELU_BACKWARD
+        | kind_sfpu::GELU_EXP => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -243,7 +272,10 @@ pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
     // met `e^(ln f32::MAX)`, whose `z` rounds to exactly this.)
     p.loadi_bits(k, 0x42b1_7218); // 88.72284
     p.if_(Cond::LessEq(k, x), |p| p.loadi_bits(d, 0x7f80_0000));
-    p.abs(x, t);
+    // The magnitude by mask: `SFPABS` leaves a negative NaN negative, and
+    // `e^-NaN` came out `0` (found in 10.2e).
+    p.loadi_bits(k, 0x7fff_ffff);
+    p.and(x, k, t);
     p.loadi_bits(k, 0x7f80_0000);
     p.if_(Cond::Less(k, t), |p| p.loadi_bits(d, 0x7fc0_0000));
 }
@@ -470,6 +502,641 @@ pub fn log1p_program(p: &mut Program, x: LReg, d: LReg, spill: u32) {
     });
 }
 
+/// [`expm1_program`]'s derived bound, relative to `e^x - 1`.
+pub const EXPM1_BOUND: f64 = 4.5 / 16_777_216.0;
+
+/// `e^x - 1` of `x` into `d`, every register but `x` and `d` scratch: accurate
+/// near zero, where `e^x` then a subtraction would cancel.
+///
+/// The reduction is `exp_program`'s (`n = round(x log2 e)`, `r = x - n ln 2`
+/// by Cody and Waite, `|r| <= ln2/2`); `p = e^r - 1 = r + r^2 q(r)`, `q` the
+/// Taylor series of `(e^r - 1 - r)/r^2` to `r^6/8!` in Horner form (remainder
+/// below `5.7e-10` of `p`); then `e^x - 1 = 2 (h p + (h - 1/2))` with `h =
+/// 2^(n-1)`, one rounding in the fma, the doubling exact -- `h` rather than
+/// `2^n` so that `n = 128` (`x` from 88.38) does not overflow, and `h - 1/2`
+/// exact up to `n = 24`, beyond which the result is `e^x` to `2^-24` anyway.
+///
+/// Error, relative, in `u = 2^-24`: at `n = 0`, `r = x` exactly and the result
+/// is `p` alone (`q`'s roundings damped by `r^2/2 / r <= 0.17`, `r^2`'s by the
+/// same: `0.42u`, the fma `u`). Elsewhere `r` carries the reduction's rounding,
+/// `2^-24 |r| + 2^-30 <= 2.2e-8` absolute, which the result amplifies by at
+/// most `2^n e^r / |e^x - 1| <= 6.83` (at `n = 1`): `2.47u`; `p`'s error
+/// enters as `2^n |p| / |e^x - 1| <= 2` times `0.42u`, and the fma rounds once:
+/// under [`EXPM1_BOUND`] `= 4.5u` in all. Below `-18` the result is `-1`
+/// (`e^-18 < 2^-25`), from 88.72284 `+inf`; a NaN stays one.
+pub fn expm1_program(p: &mut Program, x: LReg, d: LReg) {
+    use LReg as R;
+    let regs: Vec<LReg> = [R::L0, R::L1, R::L2, R::L3, R::L4, R::L5, R::L6, R::L7]
+        .into_iter()
+        .filter(|r| *r != x && *r != d)
+        .collect();
+    let (k, magic, t, nf, r, c) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    p.loadi(k, std::f32::consts::LOG2_E);
+    p.loadi_bits(magic, 0x4b40_0000);
+    p.mad(x, k, magic, t);
+    p.sub(t, magic, nf);
+    p.loadi_bits(k, 0x3f31_8000); // ln2_hi
+    p.nmad(nf, k, x, r);
+    p.loadi_bits(k, 0xb95e_8083); // ln2_lo
+    p.nmad(nf, k, r, r);
+    // q = 1/2 + r(1/6 + r(1/24 + r(1/120 + r(1/720 + r(1/5040 + r/40320)))))
+    p.loadi(d, 1.0 / 40320.0);
+    for coeff in [
+        1.0 / 5040.0,
+        1.0 / 720.0,
+        1.0 / 120.0,
+        1.0 / 24.0,
+        1.0 / 6.0,
+        0.5,
+    ] {
+        p.loadi(c, coeff);
+        p.mad(d, r, c, d);
+    }
+    // p = r + r^2 q, into `d`.
+    p.mul(r, r, nf);
+    p.mad(nf, d, r, d);
+    // h = 2^(n-1): `n = bits(t) - bits(magic)`, into the exponent of 0.5.
+    p.isub_from(t, magic);
+    p.shl(magic, 23, magic);
+    p.loadi_bits(c, 0x3f00_0000);
+    p.iadd(c, magic);
+    p.loadi(c, 0.5);
+    p.sub(magic, c, nf);
+    p.mad(magic, d, nf, d);
+    p.add(d, d, d);
+    // The range, and a NaN.
+    p.loadi(k, -18.0);
+    p.if_(Cond::Less(x, k), |p| p.loadi(d, -1.0));
+    p.loadi_bits(k, 0x42b1_7218); // 88.72284
+    p.if_(Cond::LessEq(k, x), |p| p.loadi_bits(d, 0x7f80_0000));
+    // The magnitude by mask: `SFPABS` leaves a negative NaN negative, and
+    // `e^-NaN` came out `0` (found in 10.2e).
+    p.loadi_bits(k, 0x7fff_ffff);
+    p.and(x, k, t);
+    p.loadi_bits(k, 0x7f80_0000);
+    p.if_(Cond::Less(k, t), |p| p.loadi_bits(d, 0x7fc0_0000));
+}
+
+/// [`sigmoid_program`]'s derived bound, relative.
+pub const SIGMOID_BOUND: f64 = EXP_BOUND + 4.0 / 16_777_216.0;
+
+/// The sigmoid of `x` (in `L0`, spilled at `spill`) into `L7`, as Flex has it:
+/// `1/(1 + e)` for `x >= 0` and `e/(1 + e)` below, `e = e^-|x|` -- one
+/// exponential, never of a positive argument.
+///
+/// Error: `e` within `EXP_BOUND`, which `1/(1 + e)` carries scaled by `e/(1 +
+/// e) <= 1/2` and `e/(1 + e)` by `1/(1 + e) <= 1`; `1 + e` rounds once, the
+/// reciprocal is within an ulp (`2u`), the product rounds once: under
+/// [`SIGMOID_BOUND`] `= EXP_BOUND + 4u`. `±inf` give `1` and `0`; a NaN stays
+/// one; below `-87.3`, where the value would be denormal, `0`.
+pub fn sigmoid_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    p.store(R::L0, Format::Int32, spill);
+    p.abs(R::L0, R::L1);
+    p.neg(R::L1, R::L1);
+    exp_program(p, R::L1, R::L2);
+    // `e` in `L2`; `den = 1 + e`; `y = 1/den`.
+    p.add(R::L2, R::ONE, R::L3);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(R::L3, R::L7, R::L4, R::L5, R::L6);
+    p.load(R::L0, Format::Int32, spill);
+    p.if_(Cond::Lt0(R::L0), |p| p.mul(R::L2, R::L7, R::L7));
+    // `-0` is `>= 0`: `1/2`, which the `x >= 0` branch gave.
+    p.if_(Cond::Lt0(R::L0), |p| {
+        p.loadi_bits(R::L5, 0x7fff_ffff);
+        p.and(R::L0, R::L5, R::L4);
+        p.if_(Cond::Eq0(R::L4), |p| p.loadi(R::L7, 0.5));
+    });
+}
+
+/// [`tanh_program`]'s derived bound, relative.
+pub const TANH_BOUND: f64 = 7.5 / 16_777_216.0;
+
+/// `tanh x` of `x` (in `L0`, raw bits, spilled at `spill`) into `L7`: `sign(x) t/(t + 2)`, `t = e^(2|x|)
+/// - 1` ([`expm1_program`], so no cancellation near zero).
+///
+/// Error: `t` within `EXPM1_BOUND` (`2|x|` exact), which the quotient carries
+/// scaled by `2/(t + 2) <= 1`; `t + 2` rounds once (`u`), the quotient is
+/// within an ulp (`2u`): under [`TANH_BOUND`] `= 7.5u`. Below `|x| = 2^-12`
+/// the result is `x` itself (`tanh x = x (1 - x^2/3 + ...)`, `x^2/3 < 2^-26`),
+/// bits and all -- a denormal kept, as the host keeps it; from `|x| = 9.01`
+/// it is `±1` (`1 - tanh 9.01 < 2^-25`); a NaN stays one.
+pub fn tanh_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let x = R::L0;
+    // `expm1` keeps only its input and output: `x` waits in `Dst`.
+    p.store(x, Format::Int32, spill);
+    p.abs(x, R::L1);
+    p.add(R::L1, R::L1, R::L1);
+    expm1_program(p, R::L1, R::L7);
+    p.load(x, Format::Int32, spill);
+    let (t, den, y, q) = (R::L7, R::L2, R::L3, R::L4);
+    p.loadi(den, 2.0);
+    p.add(t, den, den);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(den, y, R::L1, R::L5, R::L6);
+    p.loadi_bits(R::L6, 0x7f80_0000);
+    divide(p, t, den, y, q, R::L5, R::L1, R::L6);
+    p.copy_sign(q, x, R::L7);
+    // Small: `x`. Large: `±1`. NaN: NaN (the quotient `inf/inf` is one too,
+    // but its sign is not the input's).
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, R::L1);
+    p.loadi_bits(R::L5, 0x3980_0000); // 2^-12
+    p.if_(Cond::Less(R::L1, R::L5), |p| p.mov(x, R::L7));
+    p.loadi(R::L5, 9.01);
+    p.if_(Cond::LessEq(R::L5, R::L1), |p| {
+        p.copy_sign(R::ONE, x, R::L7)
+    });
+    p.loadi_bits(R::L5, 0x7f80_0000);
+    p.if_(Cond::Less(R::L5, R::L1), |p| {
+        p.loadi_bits(R::L7, 0x7fc0_0000)
+    });
+}
+
+/// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
+/// `deg`: its error over every float of the interval is measured by
+/// `transcendental::the_erfcx_fit_and_its_evaluation_are_within_their_parts`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Piece {
+    pub lo: f64,
+    pub hi: f64,
+    pub deg: usize,
+}
+
+/// The fit [`erfc_mid`] uses: where `erf` is `1 - erfc` without loss.
+pub const ERFC_MID: Piece = Piece {
+    lo: 0.5,
+    hi: 3.92,
+    deg: 16,
+};
+/// The fit beyond it, for `erfc` itself (the normal CDF's far tail, `gelu`):
+/// to 9.3, past which `erfc` is below `2^-126` relative to anything it
+/// multiplies there.
+pub const ERFC_TAIL: Piece = Piece {
+    lo: 3.92,
+    hi: 9.3,
+    deg: 12,
+};
+pub const ERFC_LO: f64 = ERFC_MID.lo;
+pub const ERFC_HI: f64 = ERFC_MID.hi;
+pub const ERFC_DEG: usize = ERFC_MID.deg;
+
+/// `erfcx(x) = e^(x^2) erfc(x)` in `f64`, from `libm`'s `erfc`.
+pub fn erfcx64(x: f64) -> f64 {
+    libm::erfc(x) * (x * x).exp()
+}
+
+/// The Chebyshev coefficients of `erfcx` on `[ERFC_LO, ERFC_HI]`, `c_0`
+/// halved (`f = c_0 + sum c_k T_k(t)`), as `f32`, computed once from
+/// [`erfcx64`] at 64 Chebyshev nodes -- in the builder, so no coefficient is
+/// transcribed from anywhere. `erfcx` is entire and smooth here, so the
+/// series converges fast; the truncation and the rounding of each
+/// coefficient to `f32` are both inside the measured fit error.
+pub fn erfcx_cheb() -> &'static [f32] {
+    piece_cheb(ERFC_MID)
+}
+
+/// [`erfcx_cheb`] for any [`Piece`] of the two.
+pub fn piece_cheb(piece: Piece) -> &'static [f32] {
+    static MID: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    static TAIL: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let cell = if piece == ERFC_MID {
+        &MID
+    } else {
+        assert_eq!(piece, ERFC_TAIL);
+        &TAIL
+    };
+    cell.get_or_init(|| {
+        let m = 64usize;
+        let (mid, half) = ((piece.hi + piece.lo) / 2.0, (piece.hi - piece.lo) / 2.0);
+        let f: Vec<f64> = (0..m)
+            .map(|j| {
+                let th = std::f64::consts::PI * (j as f64 + 0.5) / m as f64;
+                erfcx64(mid + half * th.cos())
+            })
+            .collect();
+        (0..=piece.deg)
+            .map(|k| {
+                let c: f64 = (0..m)
+                    .map(|j| {
+                        let th = std::f64::consts::PI * (j as f64 + 0.5) / m as f64;
+                        f[j] * (k as f64 * th).cos()
+                    })
+                    .sum::<f64>()
+                    * 2.0
+                    / m as f64;
+                (if k == 0 { c / 2.0 } else { c }) as f32
+            })
+            .collect()
+    })
+}
+
+/// The Clenshaw sum of [`erfcx_cheb`] at `a` as the SFPU computes it, in
+/// `f32` with `fma_bh`: what the program's `Q` is, for the tests to hold.
+pub fn erfcx_clenshaw_f32(a: f32) -> f32 {
+    piece_clenshaw_f32(ERFC_MID, a)
+}
+
+/// [`erfcx_clenshaw_f32`] for any [`Piece`].
+pub fn piece_clenshaw_f32(piece: Piece, a: f32) -> f32 {
+    use tt_isa::numerics::fma_bh;
+    let (s1, s0) = clenshaw_map(piece);
+    let f = |x: f32| x.to_bits();
+    let g = f32::from_bits;
+    let t = g(fma_bh(f(a), f(s1), f(s0)));
+    let tt = g(fma_bh(f(t), f(1.0), f(t)));
+    let c = piece_cheb(piece);
+    let (mut b1, mut b2) = (0.0f32, 0.0f32);
+    for k in (1..=piece.deg).rev() {
+        let tmp = g(fma_bh(f(1.0), f(c[k]), f(-b2)));
+        let b0 = g(fma_bh(f(tt), f(b1), f(tmp)));
+        b2 = b1;
+        b1 = b0;
+    }
+    let tmp = g(fma_bh(f(1.0), f(c[0]), f(-b2)));
+    g(fma_bh(f(t), f(b1), f(tmp)))
+}
+
+/// `t = s1 a + s0` maps `[ERFC_LO, ERFC_HI]` to `[-1, 1]`.
+fn clenshaw_map(piece: Piece) -> (f32, f32) {
+    let s1 = 2.0 / (piece.hi - piece.lo);
+    let s0 = -(piece.hi + piece.lo) / (piece.hi - piece.lo);
+    (s1 as f32, s0 as f32)
+}
+
+/// `erfc(a)` for `a` in `[ERFC_LO, ERFC_HI)` (`a` in `L0`, which is spilled at
+/// `spill` and `spill + 64`) into `L7`: `e^(-a^2) erfcx(a)`, the square split
+/// exactly (`a^2 = hi + lo`, `lo` by an fma) so the exponential's argument is
+/// exact to first order -- `e^(-hi)(1 - lo)` -- and `erfcx` by the Clenshaw
+/// recurrence over [`erfcx_cheb`] (stable where Horner on the monomial form
+/// of a degree-16 fit would not be). Lanes outside the interval get a finite
+/// value the caller replaces. Every register scratch.
+pub fn erfc_mid(p: &mut Program, spill: u32) {
+    use LReg as R;
+    erfc_exp(p, spill, false);
+    p.load(R::L0, Format::Int32, spill);
+    clenshaw(p, ERFC_MID, R::L6);
+    p.load(R::L0, Format::Int32, spill + 64);
+    // `E (1 - lo)` as a product of normals: `E - E lo` would form `E lo`,
+    // which is denormal from `E < 2^-110` and which `SFPMAD` then drops (found
+    // in 10.2e, `gelu` near `x = -13`).
+    p.sub(R::ONE, R::L0, R::L0);
+    p.mul(R::L7, R::L0, R::L7);
+    p.mul(R::L7, R::L6, R::L7);
+}
+
+/// Veltkamp's split of `a` into `hi + lo`, twelve significant bits each, `c`
+/// holding `4097` (`2^12 + 1`): every product of two halves is exact even in
+/// `SFPMAD`'s 27-bit product, which is what Dekker's exact product needs here
+/// -- the SFPU's multiply-add is not fused (`Miscellaneous/FMA/README.md`: the
+/// product keeps four extra bits, then a sticky one), so `fma(a, b, -fl(a b))`
+/// is not the product's rounding error on this hardware (found in 10.2e).
+/// `a` times 4097 must be finite.
+fn split12(p: &mut Program, a: LReg, hi: LReg, lo: LReg, c: LReg) {
+    p.mul(a, c, lo);
+    p.sub(lo, a, hi);
+    p.sub(lo, hi, hi);
+    p.sub(a, hi, lo);
+}
+
+/// [`split12`] of an `f32` on the host, as the SFPU computes it.
+fn split12_host(a: f32) -> (f32, f32) {
+    let t = a * 4097.0;
+    let hi = t - (t - a);
+    (hi, a - hi)
+}
+
+/// `e^(-hi)` into `L7`, `a` in `L0` spilled at `spill` and `lo` -- with
+/// `a^2 = hi + lo` exactly to the last term (Dekker: `a = ah + al` split,
+/// `hi = fl(ah^2 + 2 ah al)`, `lo` its exact remainder plus `al^2`; each
+/// product of halves exact), plus a correction already at `spill + 128` if
+/// `extra` (`2 v_hi v_lo`, where `a` is the high part of a split argument) --
+/// at `spill + 64`. `a < 2^115`. Every register scratch.
+fn erfc_exp(p: &mut Program, spill: u32, extra: bool) {
+    use LReg as R;
+    let (sa, slo) = (spill, spill + 64);
+    p.store(R::L0, Format::Int32, sa);
+    p.loadi(R::L6, 4097.0);
+    split12(p, R::L0, R::L1, R::L2, R::L6);
+    // `p2 = 2 ah al` (exact); `hi = fl(ah^2 + p2)`; `d = hi - ah^2` (exact,
+    // Fast2Sum, `ah^2 >= p2`); `lo = (p2 - d) + al^2`.
+    p.mul(R::L1, R::L2, R::L3);
+    p.add(R::L3, R::L3, R::L3);
+    p.mad(R::L1, R::L1, R::L3, R::L4);
+    p.nmad(R::L1, R::L1, R::L4, R::L5);
+    p.sub(R::L3, R::L5, R::L3);
+    p.mad(R::L2, R::L2, R::L3, R::L3);
+    if extra {
+        p.load(R::L5, Format::Int32, spill + 128);
+        p.add(R::L3, R::L5, R::L3);
+    }
+    p.store(R::L3, Format::Int32, slo);
+    p.neg(R::L4, R::L2);
+    exp_program(p, R::L2, R::L7);
+}
+
+/// The Clenshaw sum of `piece`'s fit at `a` (`L0`, kept) into `out`;
+/// `L1..L6` but `out` and `L7` scratch.
+fn clenshaw(p: &mut Program, piece: Piece, out: LReg) {
+    use LReg as R;
+    let (s1, s0) = clenshaw_map(piece);
+    p.loadi(R::L1, s1);
+    p.loadi(R::L2, s0);
+    p.mad(R::L0, R::L1, R::L2, R::L1);
+    p.add(R::L1, R::L1, R::L2);
+    let (t, tt) = (R::L1, R::L2);
+    let free: Vec<LReg> = [R::L3, R::L4, R::L5, R::L6]
+        .into_iter()
+        .filter(|r| *r != out)
+        .collect();
+    let (mut b1, mut b2, tmp) = (free[0], free[1], free[2]);
+    p.mov(R::ZERO, b1);
+    p.mov(R::ZERO, b2);
+    let c = piece_cheb(piece);
+    for k in (1..=piece.deg).rev() {
+        p.loadi(tmp, c[k]);
+        p.sub(tmp, b2, tmp);
+        // `b0` into `b2`'s register; then the names rotate.
+        p.mad(tt, b1, tmp, b2);
+        std::mem::swap(&mut b1, &mut b2);
+    }
+    p.loadi(tmp, c[0]);
+    p.sub(tmp, b2, tmp);
+    p.mad(t, b1, tmp, out);
+}
+
+/// `erf`'s Taylor series below [`ERFC_LO`]: `x P(x^2)`, `P` to `t^8` (the next
+/// term under `2.5e-11` of the sum at `|x| = 1/2`), in Horner form. `x` in
+/// `L0` (kept), the result in `d`, `L1..L5` scratch.
+fn erf_taylor(p: &mut Program, d: LReg) {
+    use LReg as R;
+    p.mul(R::L0, R::L0, R::L1);
+    let two_rtpi = 2.0 / std::f64::consts::PI.sqrt();
+    let mut fact = 1.0f64;
+    let coeff: Vec<f32> = (0..=8)
+        .map(|n| {
+            if n > 0 {
+                fact *= n as f64;
+            }
+            (two_rtpi * if n % 2 == 0 { 1.0 } else { -1.0 } / (fact * (2 * n + 1) as f64)) as f32
+        })
+        .collect();
+    p.loadi(d, coeff[8]);
+    for n in (0..8).rev() {
+        p.loadi(R::L2, coeff[n]);
+        p.mad(d, R::L1, R::L2, d);
+    }
+    p.mul(d, R::L0, d);
+}
+
+/// [`erf_program`]'s derived bound, relative.
+pub const ERF_BOUND: f64 = 10.5 / 16_777_216.0;
+
+/// [`erfc_mid`]'s relative bound (and its tail piece's): `EXP_BOUND` (2.2u),
+/// `lo`'s correction (u), the measured evaluation and fit together (under
+/// 5.25u: 5.07u on [`ERFC_MID`], 3.48u on [`ERFC_TAIL`]), two roundings (2u).
+pub const ERFC_BOUND: f64 = 10.5 / 16_777_216.0;
+
+/// `erf x` of `x` (in `L0`, raw bits, spilled at `spill..spill + 192`) into `L7`.
+///
+/// Below `|x| = 1/2` the Taylor series ([`erf_taylor`]); from there to 3.92,
+/// `1 - erfc(|x|)` with the sign ([`erfc_mid`]: `erfc <= 0.48`, so its
+/// relative error reaches `erf` scaled by `erfc/erf <= 0.92`); from 3.92 `±1`
+/// (`erfc(3.92) < 2^-24`). Error, in `u = 2^-24`: the series' Horner roundings
+/// are damped by `t = x^2 <= 1/4` to under `1.2u`, the square and the final
+/// product `u` each; the tail's `erfc` is within `EXP_BOUND` (2.2u, the
+/// exponential of an exact argument), `u` (`lo`'s first-order correction drops
+/// `lo^2/2 < 2^-46`), the Clenshaw sum's measured error (under 5u, mostly the
+/// interval map `t = s1 a + s0` rounded) and the fit's (under 0.25u; both over
+/// every float, `the_erfcx_fit_and_its_evaluation_are_within_their_parts`), and
+/// two roundings, `2u` -- [`ERFC_BOUND`] `= 10.5u` -- of which `erf` takes at
+/// most `0.92`, plus the subtraction's `u`: under [`ERF_BOUND`] `= 10.5u` in
+/// all. A denormal flushes
+/// (its `erf` is `+0`/`-0`); a NaN stays one.
+pub fn erf_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let sx = spill + 128;
+    p.store(R::L0, Format::Int32, sx);
+    p.loadi_bits(R::L1, 0x7fff_ffff);
+    p.and(R::L0, R::L1, R::L0);
+    erfc_mid(p, spill);
+    // `1 - erfc`, magnitude, into `L7`.
+    p.sub(R::ONE, R::L7, R::L7);
+    p.load(R::L0, Format::Int32, sx);
+    erf_taylor(p, R::L6);
+    p.copy_sign(R::L7, R::L0, R::L5);
+    p.mov(R::L5, R::L7);
+    p.loadi_bits(R::L1, 0x7fff_ffff);
+    p.and(R::L0, R::L1, R::L2);
+    p.loadi(R::L1, ERFC_LO as f32);
+    p.if_(Cond::Less(R::L2, R::L1), |p| p.mov(R::L6, R::L7));
+    p.loadi(R::L1, ERFC_HI as f32);
+    p.if_(Cond::LessEq(R::L1, R::L2), |p| {
+        p.copy_sign(R::ONE, R::L0, R::L7)
+    });
+    p.loadi_bits(R::L1, 0x7f80_0000);
+    p.if_(Cond::Less(R::L1, R::L2), |p| {
+        p.loadi_bits(R::L7, 0x7fc0_0000)
+    });
+}
+
+/// [`gelu_program`]'s derived bound for `gelu`, relative.
+pub const GELU_BOUND: f64 = 12.5 / 16_777_216.0;
+
+/// The bound on `gelu_backward(x, g)`'s error, absolute: the derivative `Phi +
+/// x phi` can cancel (it is zero near `x = -0.75`), so its bound is on each
+/// term's magnitude -- `GELU_BOUND` of `Phi`, `5.2u` of `|x| phi` (the
+/// exponential of an exact argument, `lo`'s correction, the constant's and the
+/// product's roundings), a rounding of the sum -- times `|g|`, and the final
+/// product's rounding.
+pub fn gelu_backward_bound(x: f32, g: f32) -> f64 {
+    let u = 1.0 / 16_777_216.0;
+    let (x, g) = (x as f64, (g as f64).abs());
+    let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let cdf = 0.5 * libm::erfc(-x / std::f64::consts::SQRT_2);
+    let d = cdf + x * phi;
+    (GELU_BOUND * cdf + 5.2 * u * x.abs() * phi + u * d.abs()) * g + u * (g * d).abs()
+}
+
+/// Flex's `gelu` (`0.5 x (1 + erf(x/sqrt 2))`) of `x` (in `L0`, raw bits) into
+/// `L7` -- or with `grad` (a `Dst` row) its `gelu_backward`, `g (Phi + x
+/// phi)`. Spills at `spill..spill + 256`.
+///
+/// `2 Phi = 1 + erf(v)`, `v = x/sqrt 2`, each range by the branch that does
+/// not cancel: below `|v| = 1/2` `1 + erf(v)` by the series; above it
+/// `erfc(|v|)` (for `v < 0`) or `2 - erfc(v)`, `erfc` by [`ERFC_MID`] to 3.92
+/// and [`ERFC_TAIL`] to 9.3 -- so the far negative side, where Flex's own `1 +
+/// erf` cancels, is relatively accurate. `v` is split, `v_hi + v_lo` with the
+/// constant's own error in `v_lo`, and `e^(-v^2)` takes `2 v_hi v_lo` in its
+/// first-order correction: the argument is exact to `2^-47`, which the tail's
+/// `e^(-v^2)` would otherwise amplify by `2 v^2`. Error of `gelu`, relative, in
+/// `u`: `erfc` within `ERFC_BOUND` (10.5u; the fits evaluated at `v_hi`, `u`
+/// more), its complement `2 - erfc` within a third of that, the series path
+/// `4.5u`, the product `h 2Phi` (`h = x/2`, exact) `u`: under [`GELU_BOUND`] `=
+/// 12.5u`. The derivative's density is `e^(-v^2)/sqrt(2 pi)`, from the same
+/// exponential ([`gelu_backward_bound`]). `gelu(-inf)` is NaN as Flex's is (`-inf
+/// * 0`), `+inf` itself, a NaN stays one.
+pub fn gelu_exp_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let (s_a, s_lo, s_x2, s_x) = (spill, spill + 64, spill + 128, spill + 192);
+    let c = std::f32::consts::FRAC_1_SQRT_2;
+    let c_tail = (std::f64::consts::FRAC_1_SQRT_2 - c as f64) as f32;
+    let (c_hi, c_lo) = split12_host(c);
+    p.store(R::L0, Format::Int32, s_x);
+    // Dekker's product `x c = v_hi + err`, `x` split (`x_hi`, `x_lo`), `c`'s
+    // halves from the host; `v_lo = err + x c_tail`, the constant's own error.
+    p.loadi(R::L6, 4097.0);
+    split12(p, R::L0, R::L1, R::L2, R::L6);
+    p.loadi(R::L6, c);
+    p.mul(R::L0, R::L6, R::L3);
+    p.neg(R::L3, R::L4);
+    p.loadi(R::L6, c_hi);
+    p.mad(R::L1, R::L6, R::L4, R::L4);
+    p.loadi(R::L5, c_lo);
+    p.mad(R::L1, R::L5, R::L4, R::L4);
+    p.mad(R::L2, R::L6, R::L4, R::L4);
+    p.mad(R::L2, R::L5, R::L4, R::L4);
+    p.loadi(R::L6, c_tail);
+    p.mad(R::L0, R::L6, R::L4, R::L4);
+    // `v_hi` in `L3`, `v_lo` in `L4`; the correction `2 v_hi v_lo`.
+    p.mul(R::L3, R::L4, R::L5);
+    p.add(R::L5, R::L5, R::L5);
+    p.store(R::L5, Format::Int32, s_x2);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(R::L3, R::L5, R::L0);
+    // Beyond 9.3 (and where `a 4097` would overflow) `e^(-v^2)` is `0`: the
+    // split's arithmetic is then not to be trusted, and nothing needs it.
+    p.loadi(R::L5, ERFC_TAIL.hi as f32);
+    p.if_(Cond::LessEq(R::L5, R::L0), |p| p.mov(R::ZERO, R::L0));
+    erfc_exp(p, s_a, true);
+    // `E = e^(-hi) (1 - lo)` into `L7`.
+    p.load(R::L1, Format::Int32, s_lo);
+    // `E (1 - lo)` as a product of normals: `E - E lo` would form `E lo`,
+    // which is denormal from `E < 2^-110` and which `SFPMAD` then drops (found
+    // in 10.2e, `gelu` near `x = -13`).
+    p.sub(R::ONE, R::L1, R::L1);
+    p.mul(R::L7, R::L1, R::L7);
+    p.load(R::L0, Format::Int32, s_x);
+    p.loadi(R::L1, std::f32::consts::FRAC_1_SQRT_2);
+    p.mul(R::L0, R::L1, R::L1);
+    p.loadi_bits(R::L2, 0x7fff_ffff);
+    p.and(R::L1, R::L2, R::L1);
+    p.loadi(R::L2, ERFC_TAIL.hi as f32);
+    p.if_(Cond::LessEq(R::L2, R::L1), |p| p.mov(R::ZERO, R::L7));
+    // A NaN sorts above 9.3 too: it stays one.
+    p.loadi_bits(R::L2, 0x7f80_0000);
+    p.if_(Cond::Less(R::L2, R::L1), |p| {
+        p.loadi_bits(R::L7, 0x7fc0_0000)
+    });
+}
+
+/// [`gelu_exp_program`]'s output, `e`, at row `e_row` -- with `x` in `L0` --
+/// to `gelu` into `L7`, or with `grad` (a `Dst` row) to `gelu_backward`.
+/// Spills at `spill..spill + 256`.
+pub fn gelu_program(p: &mut Program, spill: u32, e_row: u32, grad: Option<u32>) {
+    use LReg as R;
+    let (s_a, s_e, s_q, s_x) = (spill, spill + 64, spill + 128, spill + 192);
+    let c = std::f32::consts::FRAC_1_SQRT_2;
+    p.store(R::L0, Format::Int32, s_x);
+    p.loadi(R::L1, c);
+    p.mul(R::L0, R::L1, R::L1);
+    p.loadi_bits(R::L3, 0x7fff_ffff);
+    p.and(R::L1, R::L3, R::L0);
+    p.store(R::L0, Format::Int32, s_a);
+    p.load(R::L7, Format::Int32, e_row);
+    p.store(R::L7, Format::Int32, s_e);
+    // Both fits at `a = |v_hi|`; the first waits in a slot.
+    clenshaw(p, ERFC_MID, R::L6);
+    p.store(R::L6, Format::Int32, s_q);
+    clenshaw(p, ERFC_TAIL, R::L6);
+    p.loadi(R::L1, ERFC_MID.hi as f32);
+    p.if_(Cond::Less(R::L0, R::L1), |p| {
+        p.load(R::L6, Format::Int32, s_q)
+    });
+    // `Q` waits in its slot, `E` in `L7` (and its slot).
+    p.store(R::L6, Format::Int32, s_q);
+    // The series at `v_hi` (`L0`), into `L6`: `2 Phi` below `|v| = 1/2`.
+    p.load(R::L1, Format::Int32, s_x);
+    p.loadi(R::L2, c);
+    p.mul(R::L1, R::L2, R::L0);
+    erf_taylor(p, R::L6);
+    p.add(R::L6, R::ONE, R::L6);
+    // `v >= 1/2`: `2 - E Q`, and `2` from 3.92.
+    p.load(R::L7, Format::Int32, s_e);
+    p.load(R::L5, Format::Int32, s_q);
+    p.loadi_bits(R::L3, 0x7fff_ffff);
+    p.and(R::L0, R::L3, R::L4);
+    p.loadi(R::L3, ERFC_MID.lo as f32);
+    p.if_(Cond::LessEq(R::L3, R::L4), |p| {
+        p.if_(Cond::Gte0(R::L0), |p| {
+            p.mul(R::L7, R::L5, R::L2);
+            p.loadi(R::L3, 2.0);
+            p.sub(R::L3, R::L2, R::L6);
+        })
+    });
+    p.loadi(R::L3, ERFC_MID.hi as f32);
+    p.if_(Cond::LessEq(R::L3, R::L4), |p| {
+        p.if_(Cond::Gte0(R::L0), |p| p.loadi(R::L6, 2.0))
+    });
+    // `x` into `L0`, the branches' flag `a >= 1/2 and v < 0` kept as `L4`
+    // (`a`) and `L1` (`v`'s sign, from `x`).
+    p.load(R::L0, Format::Int32, s_x);
+    p.loadi(R::L1, 0.5);
+    p.mul(R::L0, R::L1, R::L2);
+    let negative_far = |p: &mut Program, then: &dyn Fn(&mut Program)| {
+        p.loadi(R::L3, ERFC_MID.lo as f32);
+        p.if_(Cond::LessEq(R::L3, R::L4), |p| {
+            p.if_(Cond::Lt0(R::L0), then)
+        });
+    };
+    let beyond = |p: &mut Program, then: &dyn Fn(&mut Program)| {
+        p.loadi(R::L3, ERFC_TAIL.hi as f32);
+        p.if_(Cond::LessEq(R::L3, R::L4), |p| {
+            p.if_(Cond::Lt0(R::L0), then)
+        });
+    };
+    match grad {
+        None => {
+            // `(x/2) 2Phi`; on the negative side `((x/2) E) Q`, which no
+            // intermediate underflows (`E Q` alone would, from `x` near -13).
+            p.mul(R::L2, R::L6, R::L7);
+            negative_far(p, &|p| {
+                p.load(R::L6, Format::Int32, s_e);
+                p.mul(R::L2, R::L6, R::L6);
+                p.mul(R::L6, R::L5, R::L7);
+            });
+            beyond(p, &|p| p.mul(R::L2, R::ZERO, R::L7));
+        }
+        Some(g) => {
+            // `Phi + x phi`, `phi = E / sqrt(2 pi)`; on the negative side
+            // `E (Q/2 + x / sqrt(2 pi))`, for the same reason.
+            let k = (1.0 / (2.0 * std::f64::consts::PI).sqrt()) as f32;
+            p.mul(R::L6, R::L1, R::L6);
+            p.loadi(R::L3, k);
+            p.mul(R::L7, R::L3, R::L2);
+            p.mad(R::L0, R::L2, R::L6, R::L6);
+            negative_far(p, &|p| {
+                p.mul(R::L5, R::L1, R::L5);
+                p.loadi(R::L3, k);
+                p.mad(R::L0, R::L3, R::L5, R::L5);
+                p.load(R::L7, Format::Int32, s_e);
+                p.mul(R::L7, R::L5, R::L6);
+            });
+            beyond(p, &|p| p.mov(R::ZERO, R::L6));
+            // `±inf`: Flex's `x * pdf` is `inf * 0`, a NaN.
+            p.loadi_bits(R::L3, 0x7fff_ffff);
+            p.and(R::L0, R::L3, R::L4);
+            p.loadi_bits(R::L3, 0x7f80_0000);
+            p.if_(Cond::LessEq(R::L3, R::L4), |p| {
+                p.loadi_bits(R::L6, 0x7fc0_0000)
+            });
+            p.load(R::L1, Format::Fp32, g);
+            p.mul(R::L1, R::L6, R::L7);
+        }
+    }
+}
+
 /// `n`, a two's-complement `i32`, as FP32 in place, rounding to nearest even
 /// as `as f32` does: the magnitude made sign-magnitude for `SFPCAST`, the sign
 /// put back; `i32::MIN`, whose magnitude has no 31-bit form, by name. `t`, `c`
@@ -608,7 +1275,10 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
         | kind_sfpu::PRELU
-        | kind_sfpu::POW_FIX_S => Operands::Binary,
+        | kind_sfpu::POW_FIX_S
+        | kind_sfpu::SIGMOID_BACKWARD
+        | kind_sfpu::GELU => Operands::Binary,
+        kind_sfpu::GELU_BACKWARD => Operands::Ternary,
         kind_sfpu::POW_FIX => Operands::Ternary,
         kind_sfpu::MASK_WHERE => Operands::Ternary,
         kind::MUL_SCALAR
@@ -622,7 +1292,12 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::NEG..=kind_sfpu::HARD_SIGMOID
         | kind_sfpu::EQ_S..=kind_sfpu::IS_INF
         | kind_sfpu::FILL..=kind_sfpu::LOG_ABS
-        | kind_sfpu::I32_TO_F32 => Operands::Unary,
+        | kind_sfpu::I32_TO_F32
+        | kind_sfpu::EXPM1
+        | kind_sfpu::SIGMOID
+        | kind_sfpu::TANH
+        | kind_sfpu::ERF
+        | kind_sfpu::GELU_EXP => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -1259,6 +1934,72 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
                 Operands::Binary
             }
         }
+        kind_sfpu::EXPM1 => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                expm1_program(p, LReg::L0, LReg::L7);
+                p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::SIGMOID => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                sigmoid_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        // Flex's `g * s * (1 - s)`, left to right: three roundings, as here.
+        kind_sfpu::SIGMOID_BACKWARD => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                p.sub(LReg::ONE, LReg::L0, LReg::L2);
+                p.mul(LReg::L1, LReg::L0, LReg::L3);
+                p.mul(LReg::L3, LReg::L2, LReg::L2);
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Binary
+        }
+        kind_sfpu::TANH => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                tanh_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::ERF => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                erf_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::GELU_EXP => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                gelu_exp_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::GELU | kind_sfpu::GELU_BACKWARD => {
+            let backward = kind == kind_sfpu::GELU_BACKWARD;
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                let grad = backward.then_some(super::kernel::C_ROW + o);
+                gelu_program(p, super::kernel::SPILL_ROW + o, B_ROW + o, grad);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            if backward {
+                Operands::Ternary
+            } else {
+                Operands::Binary
+            }
+        }
         kind_sfpu::I32_TO_F32 => {
             p.for_each_row_group(64, |p, o| {
                 p.load(LReg::L1, Format::Int32, A_ROW + o);
@@ -1328,6 +2069,24 @@ pub fn pow_reference(x: &[f32], y: Option<&[f32]>, s: f32, rows: usize, cols: us
     match y {
         Some(y) => reference_op(kind_sfpu::POW_FIX, [0.0; 2], n, &[x, y, &e], rows, cols),
         None => reference_op(kind_sfpu::POW_FIX_S, [s, 0.0], n, &[x, &e], rows, cols),
+    }
+}
+
+/// What the device's two-stage `gelu` (`g` `None`) or `gelu_backward`
+/// computes: `GELU_EXP`, then `GELU` or `GELU_BACKWARD`, by their programs.
+pub fn gelu_reference(x: &[f32], g: Option<&[f32]>, rows: usize, cols: usize) -> Vec<f32> {
+    let n = Broadcast::None;
+    let e = reference_op(kind_sfpu::GELU_EXP, [0.0; 2], n, &[x], rows, cols);
+    match g {
+        None => reference_op(kind_sfpu::GELU, [0.0; 2], n, &[x, &e], rows, cols),
+        Some(g) => reference_op(
+            kind_sfpu::GELU_BACKWARD,
+            [0.0; 2],
+            n,
+            &[x, &e, g],
+            rows,
+            cols,
+        ),
     }
 }
 
@@ -1997,6 +2756,315 @@ mod transcendental {
             let b = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(b(&got), b(&viat), "a scalar exponent {s} is a tensor of it");
         }
+    }
+
+    #[test]
+    fn expm1_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            1.0e-30,
+            -1.0e-30,
+            1.0e-7,
+            0.3466,
+            -0.3466,
+            0.3467,
+            1.0,
+            -1.0,
+            -17.9,
+            -18.0,
+            -18.1,
+            88.38,
+            88.7,
+            f32::from_bits(0x42b1_7217),
+            f32::from_bits(0x42b1_7218),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        sweep(
+            kind_sfpu::EXPM1,
+            grid(-18.0, 88.7, 60_000)
+                .chain(grid(-1.0, 1.0, 20_000))
+                .chain(binades(32).filter(|x| *x < 88.0 && *x > 1.0e-30))
+                .chain(
+                    binades(32)
+                        .filter(|x| *x < 18.0 && *x > 1.0e-30)
+                        .map(|x| -x),
+                )
+                .chain(specials),
+            f64::exp_m1,
+            EXPM1_BOUND,
+        );
+    }
+
+    #[test]
+    fn sigmoid_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            20.0,
+            -20.0,
+            87.0,
+            -87.0,
+            -88.0,
+            -103.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let sig = |x: f64| {
+            let v = if x >= 0.0 {
+                1.0 / (1.0 + (-x).exp())
+            } else {
+                x.exp() / (1.0 + x.exp())
+            };
+            // A value the device's exponential flushes.
+            if (-x).exp() > f32::MAX as f64 * 1.000001 || x < -87.33 {
+                0.0
+            } else {
+                v
+            }
+        };
+        sweep(
+            kind_sfpu::SIGMOID,
+            grid(-87.0, 30.0, 60_000)
+                .chain(grid(-1.0, 1.0, 20_000))
+                .chain(specials),
+            sig,
+            SIGMOID_BOUND,
+        );
+    }
+
+    #[test]
+    fn tanh_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            2.4e-4,
+            -2.4e-4,
+            2.45e-4,
+            0.5,
+            9.0,
+            9.01,
+            9.02,
+            20.0,
+            -20.0,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        sweep(
+            kind_sfpu::TANH,
+            grid(-10.0, 10.0, 60_000)
+                .chain(grid(-0.01, 0.01, 20_000))
+                .chain(binades(64).filter(|x| *x < 10.0).flat_map(|x| [x, -x]))
+                .chain(specials),
+            f64::tanh,
+            TANH_BOUND,
+        );
+    }
+
+    /// A NaN of either sign and any payload comes out a NaN from every
+    /// approximation: `SFPABS` leaves a negative NaN negative, which made
+    /// `exp(-NaN)` `0` and `recip(-NaN)` `-inf` until 10.2e masked the sign.
+    #[test]
+    fn every_approximation_keeps_a_nan_of_either_sign() {
+        let nans = [
+            0x7fc0_0000u32,
+            0xffc0_0000,
+            0x7f80_0001,
+            0xff80_0001,
+            0xffff_ffff,
+            0x7fff_ffff,
+        ];
+        let a: Vec<f32> = (0..1024)
+            .map(|i| f32::from_bits(nans[i % nans.len()]))
+            .collect();
+        for kind in (0x100..0x140).filter(|&k| {
+            accuracy(k) == Accuracy::Approximate && operands(k) == Some(Operands::Unary)
+        }) {
+            let got = reference(kind, 0.5, &a, None, 32, 32);
+            for (i, g) in got.iter().enumerate() {
+                assert!(
+                    g.is_nan(),
+                    "kind {kind:#x}({:#010x}) = {g:e}",
+                    a[i].to_bits()
+                );
+            }
+        }
+    }
+
+    /// The two measured parts of [`ERF_BOUND`], over every float of
+    /// `[ERFC_LO, ERFC_HI)` (every 64th in a debug build): the fit -- the
+    /// `f32` coefficients' series, summed exactly, against `erfcx` -- and its
+    /// evaluation -- the SFPU's Clenshaw sum (`fma_bh`) against that exact sum.
+    #[test]
+    fn the_erfcx_fit_and_its_evaluation_are_within_their_parts() {
+        for piece in [ERFC_MID, ERFC_TAIL] {
+            let c = piece_cheb(piece);
+            let (mid, half) = ((piece.hi + piece.lo) / 2.0, (piece.hi - piece.lo) / 2.0);
+            let exact_sum = |a: f64| {
+                let t = (a - mid) / half;
+                let (mut b1, mut b2) = (0.0f64, 0.0f64);
+                for k in (1..=piece.deg).rev() {
+                    let b0 = c[k] as f64 + 2.0 * t * b1 - b2;
+                    b2 = b1;
+                    b1 = b0;
+                }
+                c[0] as f64 + t * b1 - b2
+            };
+            let stride = if cfg!(debug_assertions) { 64 } else { 1 };
+            let (lo, hi) = ((piece.lo as f32).to_bits(), (piece.hi as f32).to_bits());
+            let (mut fit, mut eval) = (0.0f64, 0.0f64);
+            for b in (lo..hi).step_by(stride) {
+                let a = f32::from_bits(b);
+                let s = exact_sum(a as f64);
+                fit = fit.max((s - erfcx64(a as f64)).abs() / erfcx64(a as f64));
+                eval = eval.max((piece_clenshaw_f32(piece, a) as f64 - s).abs() / s);
+            }
+            let u = 1.0 / 16_777_216.0;
+            println!(
+                "erfcx on {piece:?}: fit {:.3}u, evaluation {:.3}u",
+                fit / u,
+                eval / u
+            );
+            // `ERFC_BOUND` allows the two together 5.25u: the evaluation's
+            // map rounding dominates the first piece, the coefficients'
+            // rounding to `f32` the second's fit.
+            assert!(
+                fit + eval < 5.25 * u,
+                "{piece:?}: fit {fit:e}, evaluation {eval:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn erf_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            0.4999,
+            0.5,
+            0.5001,
+            1.0,
+            -1.0,
+            3.9199,
+            3.92,
+            3.9201,
+            6.0,
+            -6.0,
+            1.0e-30,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        sweep(
+            kind_sfpu::ERF,
+            grid(-4.5, 4.5, 80_000)
+                .chain(grid(-0.6, 0.6, 20_000))
+                .chain(
+                    binades(64)
+                        .filter(|x| *x < 5.0 && *x > 1.0e-30)
+                        .flat_map(|x| [x, -x]),
+                )
+                .chain(specials),
+            libm::erf,
+            ERF_BOUND,
+        );
+    }
+
+    /// `gelu` against the exact `0.5 x erfc(-x/sqrt 2)` (Flex's formula's
+    /// value), relative, over its whole range: the far negative side, where
+    /// Flex's `1 + erf` cancels, included.
+    #[test]
+    fn gelu_is_within_its_derived_bound() {
+        let mut xs: Vec<f32> = grid(-13.5, 6.0, 80_000).collect();
+        xs.extend(grid(-1.5, 1.5, 20_000));
+        xs.extend(
+            binades(48)
+                .filter(|x| *x < 13.0 && *x > 1.0e-30)
+                .flat_map(|x| [x, -x]),
+        );
+        xs.extend([
+            0.0,
+            -0.0,
+            0.707,
+            -0.707,
+            0.708,
+            5.5437,
+            -5.5437,
+            -13.15,
+            -13.2,
+            1.0e-30,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ]);
+        let exact = |x: f64| 0.5 * x * libm::erfc(-x / std::f64::consts::SQRT_2);
+        let mut worst = 0.0f64;
+        for chunk in xs.chunks(1024) {
+            let mut a = chunk.to_vec();
+            a.resize(1024, 1.0);
+            let got = gelu_reference(&a, None, 32, 32);
+            for (x, g) in chunk.iter().zip(&got) {
+                let w = exact(*x as f64);
+                if x.is_nan() || *x == f32::NEG_INFINITY {
+                    assert!(g.is_nan(), "gelu({x}) = {g}");
+                } else if w.is_infinite() {
+                    assert_eq!(*g as f64, w, "gelu({x})");
+                } else if w.abs() < f32::MIN_POSITIVE as f64 {
+                    assert_eq!(*g, 0.0, "gelu({x:e}) = {g:e}: a denormal flushes");
+                } else {
+                    let rel = (*g as f64 - w).abs() / w.abs();
+                    worst = worst.max(rel);
+                    assert!(
+                        rel <= GELU_BOUND,
+                        "gelu({x:e}) = {g:e}, exact {w:e}: {rel:e}"
+                    );
+                }
+            }
+        }
+        println!("gelu: worst {:.3} ulps", worst * 8_388_608.0);
+    }
+
+    #[test]
+    fn gelu_backward_is_within_its_derived_bound() {
+        let xs: Vec<f32> = grid(-13.0, 6.0, 60_000)
+            .chain(grid(-1.0, 0.0, 20_000))
+            .collect();
+        let exact = |x: f64| {
+            let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            0.5 * libm::erfc(-x / std::f64::consts::SQRT_2) + x * phi
+        };
+        let mut worst = 0.0f64;
+        for chunk in xs.chunks(1024) {
+            let mut a = chunk.to_vec();
+            a.resize(1024, 1.0);
+            let g: Vec<f32> = (0..1024).map(|i| [1.0f32, -2.5, 0.125][i % 3]).collect();
+            let got = gelu_reference(&a, Some(&g), 32, 32);
+            for i in 0..chunk.len() {
+                let w = g[i] as f64 * exact(a[i] as f64);
+                let err = (got[i] as f64 - w).abs();
+                let bound = gelu_backward_bound(a[i], g[i]);
+                if w.abs() < f32::MIN_POSITIVE as f64 {
+                    continue;
+                }
+                worst = worst.max(err / bound);
+                assert!(
+                    err <= bound,
+                    "gelu'({:e}) * {} = {:e}, exact {w:e}: {err:e} > {bound:e}",
+                    a[i],
+                    g[i],
+                    got[i]
+                );
+            }
+        }
+        println!("gelu_backward: worst {worst:.3} of the bound");
     }
 
     #[test]

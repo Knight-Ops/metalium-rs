@@ -45,6 +45,10 @@ burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
 libloading = "0.8"
 libc = "0.2"
+# The reference `erfc` the SFPU's `erf` fits its tail to, at program build time
+# (`tt_kernels::sfpu::ops::erfc_fit`): pure Rust, already in the tree as
+# burn-flex's.
+libm = "0.2"
 
 # `tt-mnist`'s build script deflates 55 MB of MNIST; unoptimised, that is
 # most of a minute.
