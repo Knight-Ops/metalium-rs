@@ -242,7 +242,24 @@ reverse index.
       than the buffer holds, none lost. Watched failing with the drain disabled (the
       overflow refusal). Sim `[-]`: row 54. First use: row O, the reduced-MNIST
       breakdown. Burn: not applicable (no op).
-- [ ] **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
+- [~] **X4 Dispatch: queue, barriers, batching, traces** (concepts review G8). Per-op
+      cost is the host's submission and wait (~100-200 us an op, measurement S), so:
+  - [x] **X4b A barrier across movers by NoC atomics.** `tt_isa::noc::niu::Command::
+        AtomicIncrement` (`CMD_AT`, `NOC_AT_LEN_BE`'s increment layout from
+        `Bits32.lua`), and `dm::op::BARRIER` -- wait for this unit's moves, increment
+        the coordinator tile's `dm::BARRIER_COUNTER`, poll it by NoC read until the
+        target (`k * n` for the `k`-th barrier of `n` units). Gate `step33_barrier`:
+        tile A's read after a barrier sees tile B's GDDR write before it, A's list
+        submitted first; three rounds, every arrival counted. Watched failing with A's
+        barrier after its read (round 2 reads stale bytes). ttsim models the atomic;
+        both cards.
+  - [ ] **X4a A command queue on the mover**: list descriptors queued, so the host
+        enqueues without waiting.
+  - [ ] **X4c Batching in the session**: ops queue with their outputs placed; a sync
+        point (download, explicit) submits them, barriers between multi-unit ops; then
+        burn-tt's ops are asynchronous for free.
+  - [ ] **X4d Traces**: a step's lists kept in GDDR, replayed by reference.
+  Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
       after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes

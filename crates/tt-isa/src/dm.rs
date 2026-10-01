@@ -69,6 +69,15 @@ pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
 /// off between lists. Zero on the simulator, which does not model the event
 /// stream (divergence row 54).
 pub const TRACE: u64 = MAILBOX_BASE + 0x50;
+/// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
+/// mover mailbox; zeroed by the host before the session's first barrier.
+pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
+/// Where a mover's barrier polls land in its own L1: the same offset modulo
+/// 16 as the counter, as a NoC read between L1s requires.
+pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
+/// Where the atomic increment's old value lands.
+pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
+const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
 
 pub mod op {
     /// DRAM -> L1.
@@ -107,6 +116,14 @@ pub mod op {
     /// tensor so read is a whole tile to broadcast across a `[rows, cols]`
     /// one, element for element. Only in a list entry.
     pub const READ_BROADCAST_COL: u32 = 8;
+    /// Wait until every unit of a session has reached this point:
+    /// `[BARRIER, target, x, y, 0, 0, 0, 0]`. The mover waits for its own
+    /// moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the L1
+    /// of the coordinating tile `(x, y)` by a NoC atomic increment, and polls
+    /// that counter over the NoC until it reaches `target` (compared modulo
+    /// 2^32, so the counter may wrap). With `n` units, the `k`-th barrier's
+    /// target is `k * n`. Only in a list entry.
+    pub const BARRIER: u32 = 9;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -236,6 +253,8 @@ pub enum Entry {
     },
     /// [`op::WAIT`].
     Wait,
+    /// [`op::BARRIER`].
+    Barrier { target: u32, x: u8, y: u8 },
 }
 
 impl Entry {
@@ -292,6 +311,16 @@ impl Entry {
         }
         if w[0] == op::WAIT {
             return Ok(Entry::Wait);
+        }
+        if w[0] == op::BARRIER {
+            if w[2] > 0x3f || w[3] > 0x3f || w[4..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Barrier {
+                target: w[1],
+                x: w[2] as u8,
+                y: w[3] as u8,
+            });
         }
         if w[0] == op::COMPUTE {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;

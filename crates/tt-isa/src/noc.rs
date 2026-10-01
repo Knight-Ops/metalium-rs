@@ -335,6 +335,16 @@ pub mod niu {
             to: crate::dram::DramRange,
             port: u8,
         },
+        /// Add `value` to the 32-bit word at `to` -- the L1 of a Tensix or
+        /// Ethernet tile, never MMIO or DRAM -- atomically, and write the word's
+        /// old value to this tile's L1 at `ret_local` (`NoC/Atomics.md`,
+        /// "Atomic increment": `IntWidth` 31 for a full-width add, `Ofs` the
+        /// word's place in its 16-byte unit, so the old value is the result).
+        AtomicIncrement {
+            to: Endpoint,
+            value: u32,
+            ret_local: u32,
+        },
     }
 
     /// Why a [`Command`] was refused.
@@ -353,6 +363,10 @@ pub mod niu {
 
     const CMD_WR: u32 = 2;
     const CMD_RD: u32 = 0;
+    const CMD_AT: u32 = 1;
+    /// `NOC_AT_LEN_BE`'s opcode for an increment (`Bits32.lua`,
+    /// `NOC_AT_LEN_BE_Increment`: bits 12..16 = 1).
+    const AT_INCREMENT: u32 = 1 << 12;
     const WR_INLINE: u32 = 1 << 3;
     const RESP_MARKED: u32 = 1 << 4;
 
@@ -414,6 +428,23 @@ pub mod niu {
                     let (to, len) = dram_endpoint(to, port)?;
                     check_dram(from_local, to.addr, len, 16)?;
                     (local(from_local), to, CMD_WR | RESP_MARKED, len, 0)
+                }
+                Command::AtomicIncrement {
+                    to,
+                    value,
+                    ret_local,
+                } => {
+                    if to.addr % 4 != 0
+                        || ret_local % 4 != 0
+                        || to.addr >= MMIO_START
+                        || ret_local >= MMIO_START
+                    {
+                        return Err(RequestError::Alignment);
+                    }
+                    // `IntWidth` 31: all 32 bits; `Ofs`: the word within its
+                    // 16-byte unit, so `L1Address` is `to.addr` itself.
+                    let len_be = AT_INCREMENT | (31 << 2) | ((to.addr >> 2) & 3);
+                    (to, local(ret_local), CMD_AT | RESP_MARKED, len_be, value)
                 }
             };
             Ok([

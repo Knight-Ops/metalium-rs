@@ -18,6 +18,11 @@ const TXN: TxnId = match TxnId::new(2) {
     Some(t) => t,
     None => panic!(),
 };
+/// The barrier's own requests, apart from the moves'.
+const BARRIER_TXN: TxnId = match TxnId::new(3) {
+    Some(t) => t,
+    None => panic!(),
+};
 
 fn rd(addr: u64) -> u32 {
     // SAFETY: every address used is an aligned word of the mover's mailbox, its
@@ -247,6 +252,35 @@ fn trace(on: bool, event: u32, detail: u32) {
     }
 }
 
+/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter,
+/// then NoC reads of it until it reaches `target`. The reads land in this
+/// tile's L1, which the NoC writes without invalidating the L0 cache: every
+/// check goes through a fence (`publish`).
+fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
+    use tt_isa::noc::niu::Endpoint;
+    let counter = Endpoint { x, y, addr: dm::BARRIER_COUNTER as u32 };
+    noc::issue(
+        &Command::AtomicIncrement { to: counter, value: 1, ret_local: dm::BARRIER_RET as u32 },
+        me,
+        BARRIER_TXN,
+    )
+    .map_err(|_| dm::error::ALIGNMENT)?;
+    noc::wait(BARRIER_TXN);
+    loop {
+        noc::issue(
+            &Command::Read { from: counter, to_local: dm::BARRIER_POLL as u32, len: 4 },
+            me,
+            BARRIER_TXN,
+        )
+        .map_err(|_| dm::error::ALIGNMENT)?;
+        noc::wait(BARRIER_TXN);
+        publish();
+        if (rd(dm::BARRIER_POLL).wrapping_sub(target) as i32) >= 0 {
+            return Ok(());
+        }
+    }
+}
+
 /// Run one descriptor to completion.
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
@@ -285,6 +319,12 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         Entry::Wait => {
             noc::wait(TXN);
             publish();
+        }
+        Entry::Barrier { target, x, y } => {
+            // Everything this unit moved before it has landed.
+            noc::wait(TXN);
+            publish();
+            barrier(me, target, x, y)?;
         }
         Entry::Compute {
             kind,
