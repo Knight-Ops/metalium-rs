@@ -350,9 +350,10 @@ fn many_tiles_sweep() {
                     v.push((t.elapsed(), s.device().traffic() - before));
                 }
                 let calls = v[0].1.write_calls + v[0].1.read_calls;
+                let (written, read) = (v[0].1.bytes_written, v[0].1.bytes_read);
                 let med = median(v.into_iter().map(|p| p.0).collect());
                 println!(
-                    "MEASURE {tiles:>3} tiles {label:<22} {med:>10.2?}  {calls:>6} PCIe calls"
+                    "MEASURE {tiles:>3} tiles {label:<22} {med:>10.2?}  {calls:>6} PCIe calls, {written:>8} B written, {read:>6} B read"
                 );
             };
             time("matmul 512^3 HiFi4", &mut s, &mut |s| {

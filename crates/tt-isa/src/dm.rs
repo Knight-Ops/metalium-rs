@@ -78,6 +78,18 @@ pub mod op {
     /// own FP32 unit: `[COMPUTE, kind, scalar, 0, dst, a, b, 0]`, each address a
     /// tile slot. See [`super::kind`]. Only in a list entry.
     pub const COMPUTE: u32 = 5;
+    /// Run the tile's resident roles once: `[KERNEL, generation, 0, ...]`.
+    /// The mover waits for every move before it, then writes `generation` to
+    /// the three role mailboxes' `GENERATION` (`crate::mailbox::role`) and waits
+    /// until each has acknowledged it -- or reports [`super::error::ROLE`] if
+    /// one panics. The host has staged the roles' programs and descriptors and
+    /// says which generation is next, so a whole op -- gather, compute, scatter
+    /// -- is one list and one host round trip. Only in a list entry.
+    pub const KERNEL: u32 = 6;
+    /// Wait for every move before it to complete: the boundary between what
+    /// were separate lists, whose entries may reuse each other's L1 slots.
+    /// Only in a list entry.
+    pub const WAIT: u32 = 7;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -156,6 +168,10 @@ pub enum Entry {
         a: u32,
         b: u32,
     },
+    /// [`op::KERNEL`]: post `generation` to the resident roles, and wait for it.
+    Kernel { generation: u32 },
+    /// [`op::WAIT`].
+    Wait,
 }
 
 impl Entry {
@@ -179,6 +195,16 @@ impl Entry {
         }
         if w[0] == op::LIST {
             return Err(error::OP);
+        }
+        if w[0] == op::KERNEL {
+            // Zero is what a resident runner reads as "not resident".
+            if w[1] == 0 {
+                return Err(error::GENERATION);
+            }
+            return Ok(Entry::Kernel { generation: w[1] });
+        }
+        if w[0] == op::WAIT {
+            return Ok(Entry::Wait);
         }
         if w[0] == op::COMPUTE {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
@@ -218,6 +244,10 @@ pub mod error {
     pub const ALIGNMENT: u32 = 4;
     /// Zero bytes.
     pub const LENGTH: u32 = 5;
+    /// A role panicked while running an [`super::op::KERNEL`] entry.
+    pub const ROLE: u32 = 6;
+    /// A [`super::op::KERNEL`] entry with generation zero.
+    pub const GENERATION: u32 = 7;
 }
 
 /// A descriptor, as both sides see it.
@@ -382,6 +412,19 @@ mod tests {
         let mut bad = c;
         bad[6] = crate::tensix::L1_SIZE as u32 - 64;
         assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
+        // A kernel entry names a non-zero generation; a wait takes nothing.
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 7, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Kernel { generation: 7 })
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::KERNEL, 0, 0, 0, 0, 0, 0, 0]),
+            Err(error::GENERATION)
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Wait)
+        );
     }
 
     #[test]

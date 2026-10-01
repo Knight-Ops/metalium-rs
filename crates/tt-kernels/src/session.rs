@@ -31,8 +31,11 @@
 //! tiles -- and since no job's arithmetic depends on where it runs, the
 //! result is the same bits whatever the number of units.
 
+use std::sync::Arc;
+
 use tt_device::tlb::WindowKind;
 use tt_device::{Device, Transport, TransportError};
+use tt_isa::isa::Instruction;
 use tt_isa::noc::grid::Tensix;
 use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
@@ -231,6 +234,8 @@ struct Unit {
     /// Steps completed on this tile, for a gate that wants to know every
     /// unit did its share.
     steps: u64,
+    /// Mover lists submitted to this tile: one host round trip each.
+    lists: u64,
 }
 
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
@@ -242,10 +247,89 @@ struct DramState {
     w4: tt_device::Window,
 }
 
-/// A step of a wave, started on one unit and waiting to be finished.
-enum Started<'s> {
-    List,
-    Matmul(Kernel<'s>),
+/// One mover list for one unit: list entries, the `KERNEL` entries among
+/// them (whose generation is filled in when the list is started), and the
+/// matmul programs those kernels run.
+#[derive(Default)]
+struct Segment {
+    /// What it is, for [`tensor::stats`]: its first step's.
+    what: &'static str,
+    entries: Vec<[u32; 8]>,
+    /// Indices into `entries` of the `KERNEL` entries.
+    kernels: Vec<usize>,
+    roles: Option<Arc<[Vec<Instruction>; 3]>>,
+    /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
+    steps: u64,
+}
+
+/// One unit's steps as mover lists, in order. Consecutive steps share a list
+/// until it is full (`tt_isa::dm::LIST_MAX`) or a kernel's programs differ from
+/// the list's: a tile's role program slots hold one kernel at a time. What
+/// were separate lists are separated by a `WAIT` entry, since their entries
+/// may reuse each other's L1 slots; a `KERNEL` entry waits by itself.
+fn segments(steps: Vec<Step>) -> Vec<Segment> {
+    use tt_isa::dm::{op, LIST_MAX};
+    let mut out = Vec::new();
+    let mut cur = Segment::default();
+    let close = |cur: &mut Segment, out: &mut Vec<Segment>| {
+        if !cur.entries.is_empty() {
+            out.push(std::mem::take(cur));
+        }
+    };
+    let push = |cur: &mut Segment, out: &mut Vec<Segment>, e: [u32; 8]| {
+        // A full list ends here; the mover waits for all of it before it
+        // reports done, so the next list starts from a clean boundary.
+        if cur.entries.len() == LIST_MAX as usize {
+            close(cur, out);
+        }
+        cur.entries.push(e);
+    };
+    let mut after_list = false;
+    for step in steps {
+        match step {
+            Step::List { what, entries } => {
+                if entries.is_empty() {
+                    continue;
+                }
+                if cur.what.is_empty() {
+                    cur.what = what;
+                }
+                if after_list && !cur.entries.is_empty() {
+                    push(&mut cur, &mut out, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                }
+                for e in entries {
+                    push(&mut cur, &mut out, e);
+                    if cur.what.is_empty() {
+                        // A list that spilled into a new segment.
+                        cur.what = what;
+                    }
+                }
+                cur.steps += 1;
+                after_list = true;
+            }
+            Step::Matmul(roles) => {
+                let same = cur.roles.as_ref().is_none_or(|r| {
+                    Arc::ptr_eq(r, &roles)
+                        || r.iter().zip(roles.iter()).all(|(a, b)| {
+                            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
+                        })
+                });
+                if !same || cur.entries.len() == LIST_MAX as usize {
+                    close(&mut cur, &mut out);
+                }
+                if cur.what.is_empty() {
+                    cur.what = "matmul";
+                }
+                cur.roles = Some(roles);
+                cur.kernels.push(cur.entries.len());
+                cur.entries.push([op::KERNEL, 0, 0, 0, 0, 0, 0, 0]);
+                cur.steps += 1;
+                after_list = false;
+            }
+        }
+    }
+    close(&mut cur, &mut out);
+    out
 }
 
 impl<T: Transport> Session<T> {
@@ -307,6 +391,7 @@ impl<T: Transport> Session<T> {
                 resident: None,
                 mover: None,
                 steps: 0,
+                lists: 0,
             });
         }
         let mut session = Session {
@@ -460,36 +545,26 @@ impl<T: Transport> Session<T> {
     /// Run an op's jobs over the units (see the module documentation) and
     /// return its output, or free the output and return the first error.
     ///
-    /// A unit whose step fails is recovered before the error is returned --
-    /// its mover restarted for a list, its tile reset and roles restarted for a
-    /// kernel -- so the session stays usable. The other units' steps of the
+    /// Each unit's steps are run as few mover lists as they fit in
+    /// ([`segments`]): the mover runs the matmul kernels itself
+    /// (`tt_isa::dm::op::KERNEL`), so a unit's whole share of an op -- gathers,
+    /// kernels, scatters -- is usually one list, one submission and one wait.
+    ///
+    /// A unit whose list fails is recovered before the error is returned -- its
+    /// mover restarted, and if the list ran kernels, its tile reset and roles
+    /// restarted -- so the session stays usable. The other units' lists of the
     /// same wave are finished first, so nothing is left running.
     fn execute(&mut self, work: tensor::Work, budget: u64) -> Result<DramTensor, TensorError> {
         let tensor::Work { out, jobs } = work;
         let n = self.units.len();
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
         for (j, job) in jobs.into_iter().enumerate() {
-            let q = &mut queues[j % n];
-            for step in job {
-                match step {
-                    Step::List { what, entries } => {
-                        for piece in entries.chunks(tt_isa::dm::LIST_MAX as usize) {
-                            q.push(Step::List {
-                                what,
-                                entries: piece.to_vec(),
-                            });
-                        }
-                    }
-                    s => q.push(s),
-                }
-            }
+            queues[j % n].extend(job);
         }
+        let queues: Vec<Vec<Segment>> = queues.into_iter().map(segments).collect();
         let waves = queues.iter().map(Vec::len).max().unwrap_or(0);
         for w in 0..waves {
-            let what = match queues.iter().find_map(|q| q.get(w)) {
-                Some(Step::List { what, .. }) => *what,
-                _ => "matmul compute",
-            };
+            let what = queues.iter().find_map(|q| q.get(w)).map_or("", |s| s.what);
             let failed = tensor::stats::timed(what, || self.wave(&queues, w, budget));
             if let Some((failed, error)) = failed {
                 self.recover(&failed);
@@ -502,12 +577,12 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    /// Step `w` of every queue that has one: started on every unit, then
-    /// finished on every unit. Returns the units that failed, how, and the
-    /// first error.
+    /// Segment `w` of every queue that has one: started on every unit, then
+    /// finished on every unit. Returns the units that failed, whether their
+    /// segment ran kernels, and the first error.
     fn wave(
         &mut self,
-        queues: &[Vec<Step>],
+        queues: &[Vec<Segment>],
         w: usize,
         budget: u64,
     ) -> Option<(Vec<(usize, bool)>, TensorError)> {
@@ -515,22 +590,23 @@ impl<T: Transport> Session<T> {
         let mut first: Option<TensorError> = None;
         let mut started = Vec::new();
         for (u, q) in queues.iter().enumerate() {
-            let Some(step) = q.get(w) else { continue };
-            match self.start(u, step, budget) {
-                Ok(Some(s)) => started.push((u, s)),
-                Ok(None) => self.units[u].steps += 1,
+            let Some(seg) = q.get(w) else { continue };
+            match self.start(u, seg, budget) {
+                Ok(s) => {
+                    self.units[u].lists += 1;
+                    started.push((u, seg, s))
+                }
                 Err(e) => {
-                    failed.push((u, matches!(step, Step::Matmul(_))));
+                    failed.push((u, seg.roles.is_some()));
                     first.get_or_insert(e);
                 }
             }
         }
-        for (u, s) in started {
-            let kernel = matches!(s, Started::Matmul(_));
-            match self.finish(u, s, budget) {
-                Ok(()) => self.units[u].steps += 1,
+        for (u, seg, s) in started {
+            match self.finish(u, s) {
+                Ok(()) => self.units[u].steps += seg.steps,
                 Err(e) => {
-                    failed.push((u, kernel));
+                    failed.push((u, seg.roles.is_some()));
                     first.get_or_insert(e);
                 }
             }
@@ -538,13 +614,14 @@ impl<T: Transport> Session<T> {
         first.map(|e| (failed, e))
     }
 
-    /// Start `step` on unit `u`: `Ok(None)` if there was nothing to start.
+    /// Start `seg` on unit `u`: stage its kernel and reserve a generation per
+    /// kernel entry, if it has any, then submit the list.
     fn start<'s>(
         &mut self,
         u: usize,
-        step: &'s Step,
+        seg: &'s Segment,
         budget: u64,
-    ) -> Result<Option<Started<'s>>, TensorError> {
+    ) -> Result<Option<Kernel<'s>>, TensorError> {
         if self.units[u].resident.is_none() {
             self.prepare_unit(u)?;
         }
@@ -557,63 +634,61 @@ impl<T: Transport> Session<T> {
         } = self;
         let unit = &mut units[u];
         let r = unit.resident.as_mut().expect("prepared above");
-        match step {
-            Step::List { entries, .. } if entries.is_empty() => Ok(None),
-            Step::List { entries, .. } => {
-                let d = dram
-                    .as_ref()
-                    .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-                if unit.mover.is_none() {
-                    unit.mover = Some(DataMover::start(
-                        dev,
-                        r.window(),
-                        unit.tile,
-                        &d.dram,
-                        d.image,
-                    )?);
-                }
-                let mover = unit.mover.as_mut().expect("started above");
-                mover.submit_list(dev, r.window(), entries)?;
-                Ok(Some(Started::List))
-            }
-            Step::Matmul(roles) => {
+        let d = dram
+            .as_ref()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        if unit.mover.is_none() {
+            unit.mover = Some(DataMover::start(
+                dev,
+                r.window(),
+                unit.tile,
+                &d.dram,
+                d.image,
+            )?);
+        }
+        let mut entries = seg.entries.clone();
+        let kernel = match &seg.roles {
+            None => None,
+            Some(roles) => {
                 let [unpack, math, pack] = &**roles;
                 let kernel = Kernel {
-                    // `TILE_SEMAPHORES`: every run leaves them as it found them.
+                    // `TILE_SEMAPHORES`: every run leaves them as it found them,
+                    // which is what lets the mover run them back to back.
                     restores_semaphores: true,
                     ..Kernel::new(
                         [unpack, math, pack],
                         Schedule::Concurrent(&matmul::TILE_SEMAPHORES),
                     )
                 };
-                r.submit(dev, images, &kernel, budget)?;
-                Ok(Some(Started::Matmul(kernel)))
+                let generations =
+                    r.reserve(dev, images, &kernel, budget, seg.kernels.len() as u32)?;
+                for (&at, g) in seg.kernels.iter().zip(generations) {
+                    entries[at][1] = g;
+                }
+                Some(kernel)
             }
+        };
+        let mover = unit.mover.as_mut().expect("started above");
+        if let Err(e) = mover.submit_list(dev, r.window(), &entries) {
+            if let Some(k) = &kernel {
+                let _ = r.reserved_done(dev, k, false);
+            }
+            return Err(e.into());
         }
+        Ok(kernel)
     }
 
-    /// Wait for a started step on unit `u` to finish.
-    fn finish(&mut self, u: usize, s: Started<'_>, budget: u64) -> Result<(), TensorError> {
-        let Session {
-            dev,
-            units,
-            images,
-            profile,
-            ..
-        } = self;
+    /// Wait for unit `u`'s list to finish, and close its kernel reservation.
+    fn finish(&mut self, u: usize, kernel: Option<Kernel<'_>>) -> Result<(), TensorError> {
+        let Session { dev, units, .. } = self;
         let unit = &mut units[u];
-        let r = unit.resident.as_mut().expect("a step was started on it");
-        match s {
-            Started::List => {
-                let mover = unit.mover.as_ref().expect("a list was started on it");
-                mover.wait(dev, r.window())?;
-            }
-            Started::Matmul(kernel) => {
-                let o = r.complete(dev, images, &kernel, budget)?;
-                profile.phases.extend_from_slice(&o.profile.phases);
-            }
+        let r = unit.resident.as_mut().expect("a list was started on it");
+        let mover = unit.mover.as_ref().expect("a list was started on it");
+        let out = mover.wait(dev, r.window());
+        if let Some(k) = &kernel {
+            r.reserved_done(dev, k, out.is_ok())?;
         }
-        Ok(())
+        Ok(out?)
     }
 
     /// After a failed wave: restart the mover of a unit whose list failed, and
@@ -696,6 +771,12 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.steps).collect()
     }
 
+    /// Mover lists submitted to each unit so far, in unit order: the host's
+    /// round trips for GDDR ops.
+    pub fn lists_per_tile(&self) -> Vec<u64> {
+        self.units.iter().map(|u| u.lists).collect()
+    }
+
     pub fn grid(&self) -> &Tensix {
         &self.grid
     }
@@ -744,5 +825,74 @@ impl Session<tt_kmd::Kmd> {
             )?;
             Ok(Some(Box::new(extra)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{segments, Step};
+    use std::sync::Arc;
+    use tt_isa::dm::{op, LIST_MAX};
+
+    fn list(n: usize, tag: u32) -> Step {
+        Step::List {
+            what: "test",
+            entries: vec![[op::READ, tag, 0, 0, 0, 0, 0, 0]; n],
+        }
+    }
+
+    fn ops(s: &super::Segment) -> Vec<u32> {
+        s.entries.iter().map(|e| e[0]).collect()
+    }
+
+    #[test]
+    fn separate_lists_share_one_with_a_wait_between_them() {
+        let segs = segments(vec![list(2, 1), list(1, 2)]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(ops(&segs[0]), [op::READ, op::READ, op::WAIT, op::READ]);
+        assert!(segs[0].kernels.is_empty() && segs[0].roles.is_none());
+    }
+
+    #[test]
+    fn a_kernel_needs_no_wait_on_either_side_and_blocks_reuse_its_programs() {
+        let roles = Arc::new([Vec::new(), Vec::new(), Vec::new()]);
+        let block = || vec![list(2, 1), Step::Matmul(roles.clone()), list(1, 2)];
+        let segs = segments([block(), block()].concat());
+        assert_eq!(segs.len(), 1, "same programs: one list");
+        assert_eq!(
+            ops(&segs[0]),
+            [
+                op::READ,
+                op::READ,
+                op::KERNEL,
+                op::READ,
+                op::WAIT,
+                op::READ,
+                op::READ,
+                op::KERNEL,
+                op::READ
+            ]
+        );
+        assert_eq!(segs[0].kernels, [2, 7]);
+    }
+
+    #[test]
+    fn different_programs_start_a_new_list() {
+        let a = Arc::new([Vec::new(), Vec::new(), Vec::new()]);
+        let b = Arc::new([vec![tt_isa::sfpu::nop()], Vec::new(), Vec::new()]);
+        let segs = segments(vec![Step::Matmul(a), list(1, 1), Step::Matmul(b)]);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(ops(&segs[1]), [op::KERNEL]);
+    }
+
+    #[test]
+    fn a_long_list_spills_into_the_next_at_the_limit() {
+        let n = LIST_MAX as usize + 3;
+        let segs = segments(vec![list(n, 1)]);
+        assert_eq!(
+            segs.iter().map(|s| s.entries.len()).collect::<Vec<_>>(),
+            [LIST_MAX as usize, 3]
+        );
+        assert!(segments(vec![list(0, 1)]).is_empty());
     }
 }

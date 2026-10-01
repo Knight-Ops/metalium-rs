@@ -37,7 +37,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles (4.1 ms/step on 8). Next: 9.7 one launch per op |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile (3.8 ms/step on 8 tiles). Next: 9.7b small descriptors |
 
 ---
 
@@ -1321,13 +1321,35 @@ cards for time):
     all 120), accuracy 91.96% unchanged; the gain is element-wise (2.4 ->
     0.8 ms), while MNIST's small matmuls stay at 2.4 ms -- bound by the host's
     round trips per block, which is 9.7.
-- [ ] **9.7 One launch per op, not per chunk.** Today the host submits every
-      mover list and every kernel generation and polls for each: tens of
-      microseconds per round trip, several per op. Move the sequencing onto
-      the device: a per-tile work queue in L1 that the B mover drains (gather
-      -> signal the roles -> scatter), with the roles waiting on an L1 flag
-      rather than on the host. The host then writes one descriptor per op and
-      polls once.
+- [x] **9.7a One launch per op per tile.** The B mover runs the resident
+      roles itself: a `dm::op::KERNEL` list entry waits for the moves before
+      it, posts the next generation to the three role mailboxes in local L1
+      and polls their `ACK`s (through a fence: the L0 cache is not coherent,
+      Tier 1 bug #7), reporting `error::ROLE` if one panics; `op::WAIT` keeps
+      the barrier that separate lists used to give. The host stages a kernel's
+      programs once and reserves its generations (`Resident::reserve` /
+      `reserved_done`), and `session::segments` turns a tile's steps into as
+      few lists as fit: one per op per tile unless it passes `LIST_MAX`
+      entries or the tile's programs change. Gates: `step21_one_launch`
+      (MNIST's first layer, four blocks on one tile, was 12 host round trips
+      and is 1, on one tile and on three; two element-wise runs share a list;
+      a 7000-row column sum takes only the lists its entries need), the
+      golden at one and four tiles, `segments` unit-tested. Watched failing
+      with one list per step (12, 2 and 4 round trips) and with B not waiting
+      for the `ACK`s (wrong products). ttsim and both cards: 58/58 with the
+      smoke tier. Per MNIST step, one tile: 428 -> 250 PCIe write calls.
+  - **Measured** (card 0): full MNIST 3.8 ms/step on 8 tiles (from 4.1), 5.7
+    on one; `[512,512]@[512,512]` 1.43 ms on 64 tiles (from 2.2), 2.30 on 120
+    (from 3.65). **The floor is now the lists' bytes, not the round trips**:
+    the add over 2048 tiles writes 263 KB of descriptors whatever the tile
+    count, 1.75 ms at the uncached bulk path's ~150 MB/s (measurement M),
+    which is its 2.0 ms; the matmul writes 150-715 KB. A steady MNIST step
+    writes 193 KB, almost all of it lists.
+- [ ] **9.7b Small descriptors.** Send an op, not its entries: the mover
+      expands gather, compute and scatter from the tensors' placements (a
+      handful of words per tensor), so what crosses PCIe per op is constant in
+      the op's size. The list builders in `tensor.rs` are the specification
+      the firmware's expansion is checked against, entry for entry.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait

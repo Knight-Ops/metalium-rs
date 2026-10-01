@@ -10,7 +10,8 @@
 
 use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::dm::{self, op, Descriptor, Entry};
-use tt_isa::mailbox::offset;
+use tt_isa::mailbox::role::Mailbox;
+use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(2) {
@@ -150,6 +151,33 @@ fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
     }
 }
 
+/// Post `generation` to the three resident roles and wait for each to
+/// acknowledge it (`dm::op::KERNEL`). The roles' programs and descriptors were
+/// staged by the host; everything this list moved before is already in L1.
+///
+/// The roles' acknowledgements are stores by other cores, which do not
+/// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
+/// goes through a fence.
+fn kernel(generation: u32) -> Result<(), u32> {
+    for t in 0..3 {
+        wr(Mailbox::of(t).generation(), generation);
+    }
+    publish();
+    for t in 0..3 {
+        let mb = Mailbox::of(t);
+        loop {
+            publish();
+            if rd(mb.ack()) == generation {
+                break;
+            }
+            if rd(mb.status()) == status::PANICKED {
+                return Err(dm::error::ROLE);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run one descriptor to completion.
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
@@ -158,7 +186,8 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 }
 
 /// Run the list at `dm::LIST`: plain entries are issued back to back and waited
-/// for together; a transposed read waits for its own tile before rearranging it.
+/// for together; a transposed read waits for its own tile before rearranging it;
+/// a kernel or a wait entry first waits for everything before it.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
     if count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
@@ -180,6 +209,16 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
                 publish();
             }
             Entry::Move { descriptor, .. } => issue(me, descriptor)?,
+            Entry::Kernel { generation } => {
+                // The operands it computes on must have landed.
+                noc::wait(TXN);
+                publish();
+                kernel(generation)?;
+            }
+            Entry::Wait => {
+                noc::wait(TXN);
+                publish();
+            }
             Entry::Compute { kind, scalar, dst, a, b } => {
                 // Its operands may still be arriving.
                 noc::wait(TXN);

@@ -628,6 +628,66 @@ impl<N: NocId> Resident<N> {
         self.finish(dev, kernel, clock, stuck, init)
     }
 
+    /// Stage `kernel` to be run `count` times by the tile's data mover rather
+    /// than by the host (`tt_isa::dm::op::KERNEL`), and return the generations
+    /// to post, in order: `first..first + count`. Nothing runs until the mover
+    /// posts them; [`Resident::reserved_done`] closes the reservation once the
+    /// mover's list has finished.
+    ///
+    /// Only for a kernel that restores its semaphores: the mover runs the
+    /// kernel back to back with no setup between runs, which is right only if
+    /// every run leaves them as the next expects (`Kernel::restores_semaphores`).
+    /// Its setup, if the tile does not already hold them, runs here first.
+    pub fn reserve<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        images: &RoleImages<'_>,
+        kernel: &Kernel<'_>,
+        budget: u64,
+        count: u32,
+    ) -> Result<std::ops::Range<u32>, RunError> {
+        if count == 0 || !kernel.restores_semaphores || kernel.dump_rows != 0 || kernel.trace {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "only a semaphore-restoring kernel with no dump or trace can run from \
+                         the data mover",
+            }));
+        }
+        let clock = self.begin(dev, images, kernel, budget)?;
+        let first = self.generation;
+        self.generation += count - 1;
+        self.pending = Some(clock);
+        Ok(first..first + count)
+    }
+
+    /// The mover has run every generation [`Resident::reserve`] handed out and
+    /// reported each acknowledged; with `Ok(false)` from the mover -- a role
+    /// panicked or the list failed -- the tile is poisoned, as a failed
+    /// [`Resident::complete`] leaves it.
+    pub fn reserved_done<T: Transport>(
+        &mut self,
+        dev: &mut Device<T>,
+        kernel: &Kernel<'_>,
+        ran: bool,
+    ) -> Result<(), RunError> {
+        let Some(mut clock) = self.pending.take() else {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "no reserved kernel to close",
+            }));
+        };
+        clock.lap(dev, Phase::Wait);
+        if !ran {
+            self.poisoned = true;
+            self.semaphores = None;
+            return Ok(());
+        }
+        if let Schedule::Concurrent(init) = kernel.schedule {
+            self.semaphores = Some(init.to_vec());
+        }
+        Ok(())
+    }
+
     /// Stage `kernel` and its programs, running its setup first if it needs
     /// one, and move to the next generation; nothing is released yet.
     fn begin<T: Transport>(
