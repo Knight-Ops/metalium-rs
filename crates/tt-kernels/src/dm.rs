@@ -30,6 +30,12 @@ pub enum DmError {
     },
     /// B did not reach its prologue.
     NotStarted,
+    /// Queued list `list` failed with this code (`tt_isa::dm::QUEUE_ERROR`);
+    /// the queue has stopped.
+    Queued {
+        list: u32,
+        code: u32,
+    },
 }
 
 impl From<TransportError> for DmError {
@@ -48,6 +54,12 @@ impl std::fmt::Display for DmError {
                 write!(f, "descriptor {seq} did not finish (last finished: {done})")
             }
             DmError::NotStarted => write!(f, "RISCV B did not start the data mover"),
+            DmError::Queued { list, code } => {
+                write!(
+                    f,
+                    "queued list {list} failed (code {code}); the queue has stopped"
+                )
+            }
         }
     }
 }
@@ -56,11 +68,46 @@ impl std::error::Error for DmError {}
 
 pub type Result<T> = std::result::Result<T, DmError>;
 
+/// Where a list of `n` entries fits in the queue's ring (`tt_isa::dm::LIST`,
+/// `LIST_MAX` entries) beside the lists in flight, oldest first, the next
+/// free entry being `write_at`: after the newest, or wrapped to the start
+/// before the oldest. Never across the end: the mover reads a list as one run.
+fn ring_room(
+    in_flight: &std::collections::VecDeque<(u32, u32, u32)>,
+    write_at: u32,
+    n: u32,
+) -> Option<u32> {
+    let max = dm::LIST_MAX;
+    let Some(&(_, oldest, _)) = in_flight.front() else {
+        return Some(0);
+    };
+    if write_at > oldest {
+        if write_at + n <= max {
+            Some(write_at)
+        } else if n <= oldest {
+            Some(0)
+        } else {
+            None
+        }
+    } else if write_at + n <= oldest {
+        Some(write_at)
+    } else {
+        None
+    }
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
     usable: u8,
     seq: u32,
+    /// Lists enqueued so far (`tt_isa::dm::QUEUE_HEAD`).
+    head: u32,
+    /// Enqueued lists not yet seen finished: `(number, first entry,
+    /// entries)`, oldest first.
+    in_flight: std::collections::VecDeque<(u32, u32, u32)>,
+    /// The ring entry the next list is written from.
+    write_at: u32,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -85,7 +132,16 @@ impl<N: NocId> DataMover<N> {
         d.write32(w, tile, dm::USABLE, dram.usable_mask() as u32)?;
         // L1 survives between processes: a stale `TRACE` from a profiled run
         // would have the mover store to a timestamper ttsim does not model.
-        for word in [dm::SEQ, dm::DONE, dm::ERROR, dm::TRACE] {
+        for word in [
+            dm::SEQ,
+            dm::DONE,
+            dm::ERROR,
+            dm::TRACE,
+            dm::QUEUE_HEAD,
+            dm::QUEUE_DONE,
+            dm::QUEUE_ERROR,
+            dm::QUEUE_ERROR_AT,
+        ] {
             d.write32(w, tile, word, 0)?;
         }
         let status_at = dm::MAILBOX_BASE + offset::STATUS;
@@ -104,6 +160,9 @@ impl<N: NocId> DataMover<N> {
             tile,
             usable: dram.usable_mask(),
             seq: 0,
+            head: 0,
+            in_flight: Default::default(),
+            write_at: 0,
             deadline: Duration::from_secs(1),
         })
     }
@@ -229,6 +288,149 @@ impl<N: NocId> DataMover<N> {
         self.wait(d, w)
     }
 
+    /// Check `entries` as the mover will, so a bad entry costs no PCIe: a
+    /// plain entry decoded, a record expanded and every entry it makes decoded.
+    fn check(&self, entries: &[[u32; 8]]) -> Result<()> {
+        if entries.is_empty() || entries.len() > dm::LIST_MAX as usize {
+            return Err(DmError::Invalid(dm::error::LENGTH));
+        }
+        let usable = self.usable as u32;
+        let mut i = 0;
+        while i < entries.len() {
+            let n = record::len(entries[i][0]);
+            if n == 1 {
+                Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
+            } else {
+                let rec = entries
+                    .get(i..i + n)
+                    .ok_or(DmError::Invalid(dm::error::LENGTH))?;
+                record::expand(rec, |e| Entry::decode(usable, e).map(|_| ()))
+                    .map_err(DmError::Invalid)?;
+            }
+            i += n;
+        }
+        Ok(())
+    }
+
+    /// Queue a list (`tt_isa::dm::QUEUE_HEAD`) and return its number, without
+    /// waiting for it -- only, if the ring or the slots are full, for the
+    /// oldest lists to finish. [`DataMover::wait_for`] waits for a number.
+    /// The single-descriptor path ([`DataMover::submit_list`]) must not be in
+    /// use meanwhile.
+    pub fn enqueue<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<u32> {
+        self.check(entries)?;
+        let n = entries.len() as u32;
+        let first = loop {
+            self.refresh(d, w)?;
+            if let Some(at) = self.room(n) {
+                if self.in_flight.len() < dm::QUEUE_LEN as usize {
+                    break at;
+                }
+            }
+            // Full: wait for the oldest list, which frees its slot and entries.
+            let oldest = self
+                .in_flight
+                .front()
+                .expect("full means something in flight")
+                .0;
+            self.wait_for(d, w, oldest)?;
+        };
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        d.l1_write(
+            w,
+            self.tile,
+            dm::LIST + first as u64 * dm::ENTRY_BYTES,
+            &bytes,
+        )?;
+        let slot = dm::QUEUE_SLOTS + (self.head % dm::QUEUE_LEN) as u64 * 4;
+        d.write32(w, self.tile, slot, dm::queue_slot(first, n))?;
+        self.head = self.head.wrapping_add(1);
+        d.write32(w, self.tile, dm::QUEUE_HEAD, self.head)?;
+        self.in_flight.push_back((self.head, first, n));
+        self.write_at = first + n;
+        Ok(self.head)
+    }
+
+    fn room(&self, n: u32) -> Option<u32> {
+        ring_room(&self.in_flight, self.write_at, n)
+    }
+
+    /// Read how far the queue has got, forgetting the lists that finished;
+    /// a failed list is reported, with its number.
+    pub fn refresh<T: Transport>(&mut self, d: &mut Device<T>, w: &Window) -> Result<u32> {
+        if self.in_flight.is_empty() {
+            return Ok(self.head);
+        }
+        let error = d.read32(w, self.tile, dm::QUEUE_ERROR)?;
+        if error != dm::error::NONE {
+            let at = d.read32(w, self.tile, dm::QUEUE_ERROR_AT)?;
+            return Err(DmError::Queued {
+                list: at,
+                code: error,
+            });
+        }
+        let done = d.read32(w, self.tile, dm::QUEUE_DONE)?;
+        while let Some(&(number, _, _)) = self.in_flight.front() {
+            if (done.wrapping_sub(number) as i32) >= 0 {
+                self.in_flight.pop_front();
+            } else {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    /// Wait until list `number` (from [`DataMover::enqueue`]) has finished.
+    /// Fails if a list fails, or if the queue makes no progress for the
+    /// deadline (on ttsim, for a budget of simulated cycles).
+    pub fn wait_for<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        number: u32,
+    ) -> Result<()> {
+        let simulated = d.transport().is_simulated();
+        let (mut last, mut since, mut ticks) = (self.refresh(d, w)?, Instant::now(), 0u64);
+        loop {
+            let done = self.refresh(d, w)?;
+            if (done.wrapping_sub(number) as i32) >= 0 {
+                return Ok(());
+            }
+            if done != last {
+                (last, since, ticks) = (done, Instant::now(), 0);
+            }
+            let stuck = if simulated {
+                ticks > 50_000_000
+            } else {
+                since.elapsed() > self.deadline
+            };
+            if stuck {
+                return Err(DmError::TimedOut { seq: number, done });
+            }
+            d.tick(CYCLES_PER_POLL);
+            ticks += CYCLES_PER_POLL as u64;
+        }
+    }
+
+    /// Wait for every list enqueued so far.
+    pub fn drain<T: Transport>(&mut self, d: &mut Device<T>, w: &Window) -> Result<()> {
+        self.wait_for(d, w, self.head)
+    }
+
+    /// Are lists enqueued and not yet seen finished?
+    pub fn busy(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
     /// Wait for the last descriptor submitted to finish, and report its error.
     /// Returns at once if nothing is outstanding.
     pub fn wait<T: Transport>(&self, d: &mut Device<T>, w: &Window) -> Result<()> {
@@ -263,5 +465,58 @@ impl<N: NocId> DataMover<N> {
     pub fn stop<T: Transport>(self, d: &mut Device<T>, w: &Window) -> Result<()> {
         d.set_core_reset(w, self.tile, tt_isa::tensix::Core::B, true)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ring {
+    use super::ring_room;
+    use std::collections::VecDeque;
+    use tt_isa::dm::LIST_MAX;
+
+    /// Lists go after the newest, wrap to the start once the end is too
+    /// near, never overlap a list in flight, and never cross the end.
+    #[test]
+    fn lists_fit_beside_what_is_in_flight() {
+        let mut q = VecDeque::new();
+        assert_eq!(ring_room(&q, 77, 10), Some(0), "empty: from the start");
+        q.push_back((1, 0, 300));
+        assert_eq!(ring_room(&q, 300, 200), Some(300));
+        assert_eq!(
+            ring_room(&q, 300, 213),
+            None,
+            "past the end, and nothing at the start"
+        );
+        q.push_back((2, 300, 200));
+        q.pop_front(); // list 1 done: 0..300 free
+        assert_eq!(ring_room(&q, 500, 100), Some(0), "wrapped");
+        q.push_back((3, 0, 100));
+        assert_eq!(ring_room(&q, 100, 200), Some(100), "up to the oldest");
+        assert_eq!(ring_room(&q, 100, 201), None, "into the oldest");
+        // A random soak: whatever is placed never overlaps what is in flight.
+        let mut s = 12345u32;
+        let (mut q, mut at, mut number) = (VecDeque::new(), 0u32, 0u32);
+        for _ in 0..10_000 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = 1 + (s >> 8) % 200;
+            if s % 3 == 0 && !q.is_empty() {
+                q.pop_front();
+                continue;
+            }
+            if let Some(first) = ring_room(&q, at, n) {
+                assert!(first + n <= LIST_MAX);
+                for &(_, f, len) in &q {
+                    assert!(
+                        first + n <= f || f + len <= first,
+                        "{first}+{n} over {f}+{len}"
+                    );
+                }
+                number += 1;
+                q.push_back((number, first, n));
+                at = first + n;
+            } else {
+                q.pop_front();
+            }
+        }
     }
 }

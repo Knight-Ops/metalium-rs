@@ -99,3 +99,51 @@ fn work_after_a_barrier_sees_another_tile_s_work_before_it() {
         b.stop(d, &w).unwrap();
     });
 }
+
+/// X4a: lists queued without waiting run in order. Forty lists -- more than
+/// the sixteen slots, and more entries than the ring holds, so the host
+/// waits for room -- each copy the previous list's output region to the next
+/// through L1; the last region is the first's bytes only if every list ran,
+/// and in order.
+#[test]
+fn queued_lists_run_in_order_without_waiting() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tensix_grid(d).tiles::<tt_isa::noc::Noc0>().next().unwrap();
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+        let ch = dram.channels().next().unwrap();
+        let region = |k: u32| ch.range(0x80_0000 + k as u64 * 0x2000, LEN as u64).unwrap();
+        let data = pattern(99);
+        d.dram_write(&w4, region(0), &data).unwrap();
+        let lists = 40u32;
+        for k in 1..=lists {
+            d.dram_write(&w4, region(k), &vec![0u8; LEN as usize])
+                .unwrap();
+        }
+        let mut last = 0;
+        for k in 0..lists {
+            let (from, to) = (region(k), region(k + 1));
+            let e = |o: u32, r: tt_isa::dram::DramRange| {
+                [o, ch.index() as u32, 0, r.offset() as u32, L1_AT, LEN, 0, 0]
+            };
+            // Padded with waits, so forty lists overrun the ring's 512 entries.
+            let mut list = vec![
+                e(op::READ, from),
+                [op::WAIT, 0, 0, 0, 0, 0, 0, 0],
+                e(op::WRITE, to),
+            ];
+            list.extend(std::iter::repeat_n([op::WAIT, 0, 0, 0, 0, 0, 0, 0], 20));
+            last = m.enqueue(d, &w, &list).unwrap();
+        }
+        m.drain(d, &w).unwrap();
+        assert_eq!(last, lists);
+        assert!(!m.busy());
+        let mut back = vec![0u8; LEN as usize];
+        d.dram_read(&w4, region(lists), &mut back).unwrap();
+        assert!(back == data, "the chain broke");
+        m.stop(d, &w).unwrap();
+    });
+}

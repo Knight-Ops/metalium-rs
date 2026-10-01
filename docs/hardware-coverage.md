@@ -253,8 +253,16 @@ reverse index.
         submitted first; three rounds, every arrival counted. Watched failing with A's
         barrier after its read (round 2 reads stale bytes). ttsim models the atomic;
         both cards.
-  - [ ] **X4a A command queue on the mover**: list descriptors queued, so the host
-        enqueues without waiting.
+  - [x] **X4a A command queue on the mover.** `tt_isa::dm::QUEUE_*`: sixteen slots
+        `(first entry, entries)` over the 512-entry list ring; the mover runs queued
+        lists in order and counts them done, and a failed list stops the queue with
+        its number and code. `DataMover::{enqueue, wait_for, drain, refresh}`: the host
+        writes a list where it fits beside those in flight (`ring_room`, never across
+        the end; unit test with a 10k-step soak) and waits only for room or a result;
+        a stuck queue times out on no progress. Gate
+        `step33_barrier::queued_lists_run_in_order_without_waiting`: forty chained
+        copies enqueued without waiting -- past the slots and the ring -- arrive whole.
+        Watched failing with every list placed at entry 0. ttsim and both cards.
   - [ ] **X4c Batching in the session**: ops queue with their outputs placed; a sync
         point (download, explicit) submits them, barriers between multi-unit ops; then
         burn-tt's ops are asynchronous for free.

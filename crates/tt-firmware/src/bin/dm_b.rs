@@ -343,7 +343,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     Ok(())
 }
 
-/// Read list entry `i`.
+/// Read list entry `i` of the ring.
 fn entry(i: u64) -> [u32; 8] {
     let at = dm::LIST + i * dm::ENTRY_BYTES;
     let mut w = [0u32; 8];
@@ -362,15 +362,20 @@ fn entry(i: u64) -> [u32; 8] {
 /// bracketed by timestamper events (`tt_isa::mailbox::trace`); a record's
 /// expanded moves are not, so the events per list stay bounded by its length.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
+    run_list_at(me, usable, 0, count)
+}
+
+/// [`run_list`] of the `count` entries from ring entry `first`.
+fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
-    if count > dm::LIST_MAX {
+    if count > dm::LIST_MAX || first + count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
     let traced = rd(dm::TRACE) != 0;
     trace(traced, ev::LIST_BEGIN, count);
     let mut i = 0u64;
     while i < count as u64 {
-        let head = entry(i);
+        let head = entry(first as u64 + i);
         let n = record::len(head[0]) as u64;
         trace(traced, ev::ENTRY_BEGIN, head[0]);
         if n == 1 {
@@ -381,7 +386,7 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
             }
             let mut rec = [[0u32; 8]; 7];
             for k in 0..n {
-                rec[k as usize] = entry(i + k);
+                rec[k as usize] = entry(first as u64 + i + k);
             }
             record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
         }
@@ -406,6 +411,24 @@ pub extern "Rust" fn firmware_main() -> ! {
         publish();
         // Compared against DONE in L1 rather than a local copy, so the whole
         // of the mover's state is the mailbox, which the host can read and reset.
+        // The queue first: lists the host enqueued, in order, until one
+        // fails (which stops the queue until the host restarts the mover).
+        let done = rd(dm::QUEUE_DONE);
+        if done != rd(dm::QUEUE_HEAD) && rd(dm::QUEUE_ERROR) == dm::error::NONE {
+            let slot = rd(dm::QUEUE_SLOTS + (done % dm::QUEUE_LEN) as u64 * 4);
+            let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
+            // Everything the list moved has landed before it is reported.
+            publish();
+            match result {
+                Ok(()) => wr(dm::QUEUE_DONE, done.wrapping_add(1)),
+                Err(code) => {
+                    wr(dm::QUEUE_ERROR_AT, done.wrapping_add(1));
+                    wr(dm::QUEUE_ERROR, code);
+                }
+            }
+            publish();
+            continue;
+        }
         let seq = rd(dm::SEQ);
         if seq == 0 || seq == rd(dm::DONE) {
             continue;

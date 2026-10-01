@@ -79,6 +79,32 @@ pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
 pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
 const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
 
+/// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
+/// list into the ring of entries at [`LIST`] (never across its end), a slot
+/// `(first entry, entries)` into [`QUEUE_SLOTS`], and then bumps
+/// [`QUEUE_HEAD`]; the mover runs queued lists in order, bumping
+/// [`QUEUE_DONE`] after each. So the host enqueues and goes on, and waits only
+/// when it needs a result. A list that fails stops the queue:
+/// [`QUEUE_ERROR`] says why and [`QUEUE_ERROR_AT`] which list, and nothing
+/// more runs until the host restarts the mover.
+pub const QUEUE_HEAD: u64 = MAILBOX_BASE + 0x90;
+/// Lists run so far (wrapping).
+pub const QUEUE_DONE: u64 = MAILBOX_BASE + 0x94;
+/// The first failed list's `tt_isa::dm::error` code, or [`error::NONE`].
+pub const QUEUE_ERROR: u64 = MAILBOX_BASE + 0x98;
+/// The failed list's number: `QUEUE_DONE + 1` when it failed.
+pub const QUEUE_ERROR_AT: u64 = MAILBOX_BASE + 0x9C;
+/// The slots: list `n` is in slot `n % QUEUE_LEN`, as `first | entries << 16`.
+pub const QUEUE_SLOTS: u64 = MAILBOX_BASE + 0xA0;
+/// Slots in the queue.
+pub const QUEUE_LEN: u32 = 16;
+const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= MAILBOX_BASE + 0x100);
+
+/// A queue slot's word: a list of `entries` from ring entry `first`.
+pub const fn queue_slot(first: u32, entries: u32) -> u32 {
+    first | (entries << 16)
+}
+
 pub mod op {
     /// DRAM -> L1.
     pub const READ: u32 = 1;
