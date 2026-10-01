@@ -3,8 +3,9 @@
 //!
 //! Approximations, held twice as `step29_exp_log` holds `exp` and `log`: the
 //! device **bit for bit** to its programs run by the interpreter
-//! (`tt_kernels::sfpu::ops::reference_op`, `pow_reference` for `pow`'s
-//! four-stage chain), and the programs to `burn-flex` within the bounds
+//! (`tt_kernels::sfpu::ops::reference_op`, `pow_reference` for `pow` -- an
+//! `I32` exponent's `POW_I` held to `POW` of its `as f32`), and the programs
+//! to `burn-flex` within the bounds
 //! derived on them (`sqrt` one ulp of the correct rounding; `RSQRT_BOUND`,
 //! `LOG1P_BOUND`, `pow_bound(x, y)`) plus Flex's own ulp. Special values
 //! exactly; a denormal input flushes (numerics row D). The cast is exact.
@@ -189,7 +190,7 @@ fn sqrt_rsqrt_and_log1p_are_their_programs_within_their_bounds() {
 }
 
 #[test]
-fn pow_is_its_chain_within_its_bound() {
+fn pow_is_its_program_within_its_bound() {
     with_session(|s| {
         for (r, c) in [(37, 70), (64, 64)] {
             let n = r * c;

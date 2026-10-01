@@ -2,8 +2,8 @@
 //! activations built on it, on the SFPU.
 //!
 //! As `step29_exp_log` and `step44_algebraic`: the device **bit for bit** to its
-//! programs (`tt_kernels::sfpu::ops::reference_op`; `gelu_reference` for the
-//! two-stage `gelu` and its backward), and the programs to `burn-flex` within
+//! programs (`tt_kernels::sfpu::ops::reference_op`, `gelu_reference`), and the
+//! programs to `burn-flex` within
 //! the bounds derived on them (`EXPM1_BOUND`, `SIGMOID_BOUND`, `TANH_BOUND`,
 //! `ERF_BOUND`, `GELU_BOUND`, `gelu_backward_bound`) plus Flex's own error --
 //! an ulp, and for `gelu` the cancellation of Flex's own `1 + erf` on the
@@ -191,7 +191,7 @@ fn the_unary_kinds_are_their_programs_within_their_bounds() {
 }
 
 #[test]
-fn gelu_and_the_backwards_are_their_chains_within_their_bounds() {
+fn gelu_and_the_backwards_are_their_programs_within_their_bounds() {
     with_session(|s| {
         for (r, c) in [(37, 70), (64, 64)] {
             let (xv, gv) = (values(2, r * c), values(3, r * c));
@@ -207,9 +207,7 @@ fn gelu_and_the_backwards_are_their_chains_within_their_bounds() {
                 .collect();
             let (x, g) = (s.upload(&xv, r, c).unwrap(), s.upload(&gv, r, c).unwrap());
             let (fx, fg) = (flex(&xv, r, c), flex(&gv, r, c));
-            // `gelu`: `GELU_EXP`, then `GELU`.
-            let e = run(s, GELU_EXP, &[&x]);
-            let out = run(s, GELU, &[&x, &e]);
+            let out = run(s, GELU, &[&x]);
             let got = s.download(&out).unwrap();
             same(&got, &gelu_reference(&xv, None, r, c), "gelu");
             let want = host(activation::gelu(fx.clone()));
@@ -224,8 +222,7 @@ fn gelu_and_the_backwards_are_their_chains_within_their_bounds() {
                 );
             }
             s.free(out).unwrap();
-            // `gelu_backward`: the same first stage, then the ternary one.
-            let out = run(s, GELU_BACKWARD, &[&x, &e, &g]);
+            let out = run(s, GELU_BACKWARD, &[&x, &g]);
             let got = s.download(&out).unwrap();
             same(&got, &gelu_reference(&xv, Some(&gv), r, c), "gelu_backward");
             let want = host(Tensor::from_primitive(
@@ -245,7 +242,6 @@ fn gelu_and_the_backwards_are_their_chains_within_their_bounds() {
                 );
             }
             s.free(out).unwrap();
-            s.free(e).unwrap();
             // `sigmoid_backward`, exact: Flex's `g * s * (1 - s)`.
             let sv = host(activation::sigmoid(fx.clone()));
             let sd = s.upload(&sv, r, c).unwrap();

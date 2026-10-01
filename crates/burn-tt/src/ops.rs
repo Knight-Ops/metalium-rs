@@ -253,7 +253,7 @@ enum PowY<'a> {
     Int(&'a TtTensor),
 }
 
-/// `x^y` on the device (`tt_kernels::session::Session::pow`, four ops), if
+/// `x^y` on the device (`tt_kernels::session::Session::pow`, one op), if
 /// that is where the data is -- `x` an `F32` tensor, `y` one of its shape (or
 /// an `I32` one) or a scalar, one of them already on the device, none a
 /// transposed view; an approximation, so gated as [`device_eltwise`] gates

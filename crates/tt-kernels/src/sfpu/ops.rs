@@ -94,14 +94,12 @@ pub mod kind_sfpu {
     pub const RSQRT: u32 = 0x124;
     /// `ln(1 + a)`, within [`super::LOG1P_BOUND`].
     pub const LOG1P: u32 = 0x125;
-    /// `ln |a|`: the first stage of `pow` (`crate::session::Session::pow`),
-    /// within `LOG_BOUND`.
-    pub const LOG_ABS: u32 = 0x126;
-    /// `pow`'s last stage, ternary: `x`, `y` and `e = e^(y ln|x|)` to `powf`'s
-    /// value (`pow_fix`): `e` where nothing is special.
-    pub const POW_FIX: u32 = 0x127;
-    /// The same with `y` the scalar: `x` and `e`.
-    pub const POW_FIX_S: u32 = 0x128;
+    /// `a^b` as `powf` (`super::pow_program`), within [`super::pow_bound`].
+    pub const POW: u32 = 0x126;
+    /// `a^s`, `s` the scalar.
+    pub const POW_S: u32 = 0x127;
+    /// `a^b`, `b` an `I32` tensor (`as f32` first, as Flex's `powi`).
+    pub const POW_I: u32 = 0x128;
     /// An `I32` as `F32`, `as f32`'s rounding (Flex's `int_into_float`).
     pub const I32_TO_F32: u32 = 0x129;
     /// `e^a - 1`, within [`super::EXPM1_BOUND`] (10.2e).
@@ -115,17 +113,12 @@ pub mod kind_sfpu {
     pub const TANH: u32 = 0x12d;
     /// `erf a`, within [`super::ERF_BOUND`].
     pub const ERF: u32 = 0x12e;
-    /// `gelu`'s second stage: `0.5 a (1 + erf(a/sqrt 2))` (Flex's) from `a`
-    /// (`A`) and its `GELU_EXP` (`B`), within [`super::GELU_BOUND`]. One
-    /// program would not fit a role's slot (`mailbox::PROGRAM_MAX`).
+    /// `0.5 a (1 + erf(a/sqrt 2))` (Flex's `gelu`), within
+    /// [`super::GELU_BOUND`].
     pub const GELU: u32 = 0x12f;
-    /// `gelu_backward`'s second stage, ternary: `g (Phi(a) + a phi(a))` from
-    /// `a`, its `GELU_EXP` and the gradient `g`, within
+    /// `g (Phi(a) + a phi(a))` from `a` (`A`) and the gradient `g` (`B`), within
     /// [`super::gelu_backward_bound`].
     pub const GELU_BACKWARD: u32 = 0x130;
-    /// Both's first stage: `e^(-v^2)`, `v = a/sqrt 2` split
-    /// (`super::gelu_exp_program`).
-    pub const GELU_EXP: u32 = 0x131;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -180,7 +173,7 @@ pub fn elems(kind: u32) -> Option<Sig> {
         kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
         kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
-        kind_sfpu::POW_FIX => sig(&[F32, F32, F32], F32),
+        kind_sfpu::POW_I => sig(&[F32, Elem::I32], F32),
         kind_sfpu::I32_TO_F32 => sig(&[Elem::I32], F32),
         _ => sig(&[F32, F32], F32),
     }
@@ -205,14 +198,13 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::DIV_SCALAR
         | kind_sfpu::EXP
         | kind_sfpu::LOG
-        | kind_sfpu::SQRT..=kind_sfpu::LOG_ABS
+        | kind_sfpu::SQRT..=kind_sfpu::POW_I
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
-        | kind_sfpu::GELU_BACKWARD
-        | kind_sfpu::GELU_EXP => Accuracy::Approximate,
+        | kind_sfpu::GELU_BACKWARD => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -1031,10 +1023,10 @@ pub fn gelu_exp_program(p: &mut Program, spill: u32) {
     });
 }
 
-/// [`gelu_exp_program`]'s output, `e`, at row `e_row` -- with `x` in `L0` --
-/// to `gelu` into `L7`, or with `grad` (a `Dst` row) to `gelu_backward`.
-/// Spills at `spill..spill + 256`.
-pub fn gelu_program(p: &mut Program, spill: u32, e_row: u32, grad: Option<u32>) {
+/// [`gelu_exp_program`]'s output, `e` in `L7` -- with `x` in `L0`, as it
+/// leaves them -- to `gelu` into `L7`, or with `grad` (a `Dst` row) to
+/// `gelu_backward`. Spills at `spill..spill + 256`, [`gelu_exp_program`]'s.
+pub fn gelu_program(p: &mut Program, spill: u32, grad: Option<u32>) {
     use LReg as R;
     let (s_a, s_e, s_q, s_x) = (spill, spill + 64, spill + 128, spill + 192);
     let c = std::f32::consts::FRAC_1_SQRT_2;
@@ -1044,7 +1036,6 @@ pub fn gelu_program(p: &mut Program, spill: u32, e_row: u32, grad: Option<u32>) 
     p.loadi_bits(R::L3, 0x7fff_ffff);
     p.and(R::L1, R::L3, R::L0);
     p.store(R::L0, Format::Int32, s_a);
-    p.load(R::L7, Format::Int32, e_row);
     p.store(R::L7, Format::Int32, s_e);
     // Both fits at `a = |v_hi|`; the first waits in a slot.
     clenshaw(p, ERFC_MID, R::L6);
@@ -1165,11 +1156,56 @@ pub fn pow_bound(x: f32, y: f32) -> f64 {
     z * (LOG_BOUND + 1.0 / 16_777_216.0) * 1.01 + EXP_BOUND
 }
 
-/// `powf`'s special values over `e = e^(y ln|x|)`, the chain's general case
-/// (`crate::session::Session::pow`: `LOG_ABS`, a multiply, `EXP`, then this):
-/// `x` in `L0`, `y` in `L1`, `e` in `L7` (raw bits), the result in `L7`. One
-/// program would not fit a role's program slot (`mailbox::PROGRAM_MAX`), so
-/// the stages are ops; the arithmetic, and so [`pow_bound`], are the same.
+/// Where [`pow_program`] reads `y`, for one row group.
+#[derive(Copy, Clone, Debug)]
+enum PowY {
+    Row(u32),
+    IntRow(u32),
+    Scalar(f32),
+}
+
+impl PowY {
+    fn at(self, o: u32) -> Self {
+        match self {
+            PowY::Row(r) => PowY::Row(r + o),
+            PowY::IntRow(r) => PowY::IntRow(r + o),
+            s => s,
+        }
+    }
+
+    /// `y` into `d` as FP32 raw bits; `t`, `c` scratch.
+    fn load(self, p: &mut Program, d: LReg, t: LReg, c: LReg) {
+        match self {
+            PowY::Row(r) => p.load(d, Format::Int32, r),
+            PowY::IntRow(r) => {
+                p.load(d, Format::Int32, r);
+                i32_to_float(p, d, t, c);
+            }
+            PowY::Scalar(s) => p.loadi_bits(d, s.to_bits()),
+        }
+    }
+}
+
+/// `powf(x, y)` of `x` at `Dst` row `x_row` into `L7` (raw bits): `e^(y
+/// ln|x|)` by [`log_program`], a multiply and [`exp_program`] -- one program
+/// since the runner repeats a long row loop (X8) -- then [`pow_fix`]'s
+/// special values over it; within [`pow_bound`].
+fn pow_program(p: &mut Program, x_row: u32, y: PowY) {
+    use LReg as R;
+    p.load(R::L0, Format::Fp32, x_row);
+    p.abs(R::L0, R::L0);
+    log_program(p, R::L0, R::L7);
+    // A denormal `y` is flushed as the multiply's operand (numerics row D).
+    y.load(p, R::L1, R::L2, R::L3);
+    p.mul(R::L7, R::L1, R::L0);
+    exp_program(p, R::L0, R::L7);
+    p.load(R::L0, Format::Int32, x_row);
+    y.load(p, R::L1, R::L2, R::L3);
+    pow_fix(p);
+}
+
+/// `powf`'s special values over `e = e^(y ln|x|)` ([`pow_program`]'s general
+/// case): `x` in `L0`, `y` in `L1`, `e` in `L7` (raw bits), the result in `L7`.
 ///
 /// Each scope over the last: a negative finite non-zero base gives NaN for a
 /// non-integer `y` and is negated for an odd one (`-inf` and `-0` take only
@@ -1275,11 +1311,10 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
         | kind_sfpu::PRELU
-        | kind_sfpu::POW_FIX_S
+        | kind_sfpu::POW
+        | kind_sfpu::POW_I
         | kind_sfpu::SIGMOID_BACKWARD
-        | kind_sfpu::GELU => Operands::Binary,
-        kind_sfpu::GELU_BACKWARD => Operands::Ternary,
-        kind_sfpu::POW_FIX => Operands::Ternary,
+        | kind_sfpu::GELU_BACKWARD => Operands::Binary,
         kind_sfpu::MASK_WHERE => Operands::Ternary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
@@ -1291,13 +1326,14 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::BOOL_NOT
         | kind_sfpu::NEG..=kind_sfpu::HARD_SIGMOID
         | kind_sfpu::EQ_S..=kind_sfpu::IS_INF
-        | kind_sfpu::FILL..=kind_sfpu::LOG_ABS
+        | kind_sfpu::FILL..=kind_sfpu::LOG1P
+        | kind_sfpu::POW_S
         | kind_sfpu::I32_TO_F32
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
         | kind_sfpu::ERF
-        | kind_sfpu::GELU_EXP => Operands::Unary,
+        | kind_sfpu::GELU => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -1920,31 +1956,18 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             });
             Operands::Unary
         }
-        kind_sfpu::LOG_ABS => {
+        kind_sfpu::POW | kind_sfpu::POW_S | kind_sfpu::POW_I => {
+            let y = match kind {
+                kind_sfpu::POW => PowY::Row(B_ROW),
+                kind_sfpu::POW_I => PowY::IntRow(B_ROW),
+                _ => PowY::Scalar(scalar),
+            };
             p.for_each_row_group(64, |p, o| {
-                p.load(LReg::L0, Format::Fp32, A_ROW + o);
-                p.abs(LReg::L0, LReg::L0);
-                log_program(p, LReg::L0, LReg::L7);
-                p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
-            });
-            Operands::Unary
-        }
-        kind_sfpu::POW_FIX | kind_sfpu::POW_FIX_S => {
-            let ternary = kind == kind_sfpu::POW_FIX;
-            p.for_each_row_group(64, |p, o| {
-                p.load(LReg::L0, Format::Int32, A_ROW + o);
-                if ternary {
-                    p.load(LReg::L1, Format::Int32, B_ROW + o);
-                    p.load(LReg::L7, Format::Int32, super::kernel::C_ROW + o);
-                } else {
-                    p.loadi_bits(LReg::L1, scalar.to_bits());
-                    p.load(LReg::L7, Format::Int32, B_ROW + o);
-                }
-                pow_fix(p);
+                pow_program(p, A_ROW + o, y.at(o));
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
-            if ternary {
-                Operands::Ternary
+            if kind == kind_sfpu::POW_S {
+                Operands::Unary
             } else {
                 Operands::Binary
             }
@@ -1993,26 +2016,19 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             });
             Operands::Unary
         }
-        kind_sfpu::GELU_EXP => {
-            p.for_each_row_group(64, |p, o| {
-                p.load(LReg::L0, Format::Int32, A_ROW + o);
-                gelu_exp_program(p, super::kernel::SPILL_ROW + o);
-                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
-            });
-            Operands::Unary
-        }
         kind_sfpu::GELU | kind_sfpu::GELU_BACKWARD => {
             let backward = kind == kind_sfpu::GELU_BACKWARD;
             p.for_each_row_group(64, |p, o| {
+                let spill = super::kernel::SPILL_ROW + o;
                 p.load(LReg::L0, Format::Int32, A_ROW + o);
-                let grad = backward.then_some(super::kernel::C_ROW + o);
-                gelu_program(p, super::kernel::SPILL_ROW + o, B_ROW + o, grad);
+                gelu_exp_program(p, spill);
+                gelu_program(p, spill, backward.then_some(B_ROW + o));
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             if backward {
-                Operands::Ternary
-            } else {
                 Operands::Binary
+            } else {
+                Operands::Unary
             }
         }
         kind_sfpu::I32_TO_F32 => {
@@ -2071,37 +2087,22 @@ pub fn reference_for(
     reference_op(kind, [scalar, 0.0], bcast, &inputs, rows, cols)
 }
 
-/// What [`crate::session::Session::pow`] computes, by the same chain's
-/// programs: `y` an `F32` tensor of `x`'s shape or (`y` `None`) the scalar `s`.
+/// What [`crate::session::Session::pow`] computes: `POW` with `y` an `F32`
+/// tensor of `x`'s shape, or (`y` `None`) `POW_S` with the scalar `s`.
 pub fn pow_reference(x: &[f32], y: Option<&[f32]>, s: f32, rows: usize, cols: usize) -> Vec<f32> {
     let n = Broadcast::None;
-    let l = reference_op(kind_sfpu::LOG_ABS, [0.0; 2], n, &[x], rows, cols);
-    let z = match y {
-        Some(y) => reference_op(kind::MUL, [0.0; 2], n, &[&l, y], rows, cols),
-        None => reference_op(kind::MUL_SCALAR, [s, 0.0], n, &[&l], rows, cols),
-    };
-    let e = reference_op(kind_sfpu::EXP, [0.0; 2], n, &[&z], rows, cols);
     match y {
-        Some(y) => reference_op(kind_sfpu::POW_FIX, [0.0; 2], n, &[x, y, &e], rows, cols),
-        None => reference_op(kind_sfpu::POW_FIX_S, [s, 0.0], n, &[x, &e], rows, cols),
+        Some(y) => reference_op(kind_sfpu::POW, [0.0; 2], n, &[x, y], rows, cols),
+        None => reference_op(kind_sfpu::POW_S, [s, 0.0], n, &[x], rows, cols),
     }
 }
 
-/// What the device's two-stage `gelu` (`g` `None`) or `gelu_backward`
-/// computes: `GELU_EXP`, then `GELU` or `GELU_BACKWARD`, by their programs.
+/// What the device's `gelu` (`g` `None`) or `gelu_backward` computes.
 pub fn gelu_reference(x: &[f32], g: Option<&[f32]>, rows: usize, cols: usize) -> Vec<f32> {
     let n = Broadcast::None;
-    let e = reference_op(kind_sfpu::GELU_EXP, [0.0; 2], n, &[x], rows, cols);
     match g {
-        None => reference_op(kind_sfpu::GELU, [0.0; 2], n, &[x, &e], rows, cols),
-        Some(g) => reference_op(
-            kind_sfpu::GELU_BACKWARD,
-            [0.0; 2],
-            n,
-            &[x, &e, g],
-            rows,
-            cols,
-        ),
+        None => reference_op(kind_sfpu::GELU, [0.0; 2], n, &[x], rows, cols),
+        Some(g) => reference_op(kind_sfpu::GELU_BACKWARD, [0.0; 2], n, &[x, g], rows, cols),
     }
 }
 

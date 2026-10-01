@@ -1642,6 +1642,12 @@ impl Eltwise {
             EQ_S..=LE_S => !ieee_compare(kind, 0.0, s),
             MASK_FILL => b_zero || is_zero(s),
             MASK_WHERE => b_zero || c_zero,
+            // 10.2d-e: `f(±0) = ±0`.
+            SQRT | EXPM1 | TANH | ERF | GELU => true,
+            // `0^s = 0` for `s > 0`.
+            POW_S => s > 0.0,
+            // `g (1/2)` and `g 0 1`: zero with the gradient's padding.
+            GELU_BACKWARD | SIGMOID_BACKWARD => b_zero,
             _ => false,
         }
     }
@@ -1797,6 +1803,69 @@ mod tests {
     use tt_isa::dm::TILE_DATA;
     use tt_isa::dm::{kind, op, record};
     use tt_isa::dram::Dram;
+
+    /// Every padding claim of an SFPU kind (`Eltwise::zero_at_zero`) holds
+    /// for its program: zero `A` (either sign), and the other operands zero
+    /// where the claim takes them zero and anything (a value, `±inf`, NaN)
+    /// where not, by the interpreter.
+    #[test]
+    fn every_zero_at_zero_claim_holds_for_the_program() {
+        use crate::sfpu::kernel::Operands;
+        use crate::sfpu::ops::{elems, operands, reference_op, Broadcast};
+        use crate::tensor::Elem;
+        let scalars = [0.0, 1.0, -1.0, 2.0, 0.5, -0.0, f32::NAN];
+        let floats = [1.0, -2.0, f32::INFINITY, f32::NAN];
+        let mut checked = 0;
+        for kind in 0x100..0x140 {
+            let Some(ops) = operands(kind) else { continue };
+            let n = match ops {
+                Operands::Unary => 1,
+                Operands::Ternary => 3,
+                _ => 2,
+            };
+            let sig = elems(kind).unwrap();
+            let others = |i: usize| -> Vec<f32> {
+                match sig.inputs.get(i) {
+                    Some(Elem::F32) | None => floats.to_vec(),
+                    Some(Elem::Bool) => vec![f32::from_bits(1)],
+                    Some(Elem::I32) => [1, u32::MAX, 0x8000_0000].map(f32::from_bits).to_vec(),
+                }
+            };
+            for s in scalars {
+                for s2 in scalars {
+                    let e = Eltwise {
+                        kind,
+                        scalar: s,
+                        scalar2: s2,
+                    };
+                    for (bz, cz) in [(true, true), (false, true), (true, false), (false, false)] {
+                        if (n < 2 && !bz) || (n < 3 && !cz) || !e.zero_at_zero(kind, bz, cz) {
+                            continue;
+                        }
+                        let bs = if bz { vec![0.0] } else { others(1) };
+                        let cs = if cz { vec![0.0] } else { others(2) };
+                        for a in [0.0f32, -0.0] {
+                            for &b in &bs {
+                                for &c in &cs {
+                                    let t = [vec![a; 1024], vec![b; 1024], vec![c; 1024]];
+                                    let ins: Vec<&[f32]> = t[..n].iter().map(|v| &v[..]).collect();
+                                    let out =
+                                        reference_op(kind, [s, s2], Broadcast::None, &ins, 32, 32);
+                                    assert!(
+                                        out[0].to_bits() & 0x7fff_ffff == 0,
+                                        "{kind:#x} ({s}, {s2}) of {a}, {b}, {c}: {}",
+                                        out[0]
+                                    );
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+    }
 
     /// One job as the mover runs it: every entry in order, records expanded,
     /// a `WAIT` between what were separate lists, and each kernel as its

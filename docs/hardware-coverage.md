@@ -842,16 +842,17 @@ Each names the measurement it must move. The Burn-side ones are in
         (bits and all, denormals included), `ln u` alone from `2^24`; within
         `LOG1P_BOUND = 11.12u`, worst 3.0 ulps. `x` is spilled to `Dst` rows 256..
         (`kernel::SPILL_ROW`) across `log_program`, which takes every register.
-        **`pow` is a chain of four ops** (`Session::pow`): `LOG_ABS`, a multiply,
-        `EXP`, then `POW_FIX` (ternary) or `POW_FIX_S` (a scalar exponent) for
-        `powf`'s special values -- one program unrolls to 9187 words, past a role's
-        8192-word slot. Within `pow_bound(x, y) = |y ln x| (LOG_BOUND + 2^-24) 1.01 +
+        **`pow` is one op** (`Session::pow`: `POW`, `POW_S` for a scalar exponent,
+        `POW_I` for an `I32` one): `log|x|`, a multiply, `exp`, then `powf`'s special
+        values (`pow_program`). First landed as a chain of four ops, since one
+        program unrolled to 9187 words, past a role's 8192-word slot; folded back
+        once the runner repeats blocks (X8). Within `pow_bound(x, y) = |y ln x| (LOG_BOUND + 2^-24) 1.01 +
         EXP_BOUND`, derived (worst 0.46 of it); every pairing of 22 special bases and
         22 special exponents equal to `powf`'s, signs of zeros and infinities
         included; the integer and odd tests on `y` by the magic-number round. An
-        `I32` exponent goes through `I32_TO_F32` first (`as f32`, exact; `i32::MIN`
-        by name); `FILL` writes a constant (Flex's `ones` for `x^0`). Gate
-        `step44_algebraic`: each kind and the chain bit for bit to their programs,
+        `I32` exponent is converted in the program (`as f32`, exact; `i32::MIN` by
+        name; `I32_TO_F32` the same alone); `FILL` writes a constant (Flex's `ones` for `x^0`). Gate
+        `step44_algebraic`: each kind bit for bit to their programs,
         the programs within their bounds of Flex, the cast equal to Flex's
         `int_into_float`; ttsim and both cards. Burn: `float_sqrt`, `float_log1p`,
         `float_powf`, `float_powi`, `float_powf_scalar{,_impl}` and

@@ -1872,62 +1872,31 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    /// `x^y` as `powf` (S4, 10.2d): `e^(y ln|x|)` by `LOG_ABS`, a multiply and
-    /// `EXP`, then the special values by `POW_FIX` -- four ops, since one
-    /// program would not fit a role's slot; within `sfpu::ops::pow_bound`.
-    /// `y` the same shape as `x`, a scalar, or an `I32` tensor (converted first,
-    /// `I32_TO_F32`). The intermediates are freed.
+    /// `x^y` as `powf` (S4, 10.2d): `e^(y ln|x|)` and the special values, one
+    /// SFPU op (`POW`, `POW_S`, `POW_I`); within `sfpu::ops::pow_bound`. `y`
+    /// the same shape as `x`, a scalar, or an `I32` tensor (`as f32` in the
+    /// program).
     pub fn pow(&mut self, x: &DramTensor, y: PowExponent<'_>) -> Result<DramTensor, TensorError> {
         use crate::sfpu::ops::kind_sfpu::*;
-        use tensor::Eltwise;
-        let op = |kind, scalar| Eltwise {
+        let op = |kind, scalar| tensor::Eltwise {
             kind,
             scalar,
             scalar2: 0.0,
         };
-        let same = |t: &DramTensor| -> Result<(), TensorError> {
-            if (t.rows, t.cols) == (x.rows, x.cols) {
-                Ok(())
-            } else {
-                Err(TensorError::Shape(format!(
+        let (op, t) = match y {
+            PowExponent::Tensor(t) => (op(POW, 0.0), Some(t)),
+            PowExponent::Int(t) => (op(POW_I, 0.0), Some(t)),
+            PowExponent::Scalar(s) => (op(POW_S, s), None),
+        };
+        if let Some(t) = t {
+            if (t.rows, t.cols) != (x.rows, x.cols) {
+                return Err(TensorError::Shape(format!(
                     "pow: an exponent [{}, {}] for [{}, {}]",
                     t.rows, t.cols, x.rows, x.cols
-                )))
+                )));
             }
-        };
-        let converted = match y {
-            PowExponent::Int(n) => {
-                same(n)?;
-                Some(self.eltwise(op(I32_TO_F32, 0.0), n, None)?)
-            }
-            _ => None,
-        };
-        let yt = match y {
-            PowExponent::Tensor(t) => {
-                same(t)?;
-                Some(t)
-            }
-            PowExponent::Int(_) => converted.as_ref(),
-            PowExponent::Scalar(_) => None,
-        };
-        let l = self.eltwise(op(LOG_ABS, 0.0), x, None)?;
-        let z = match (yt, y) {
-            (Some(t), _) => self.eltwise(op(tt_isa::dm::kind::MUL, 0.0), &l, Some(t))?,
-            (None, PowExponent::Scalar(s)) => {
-                self.eltwise(op(tt_isa::dm::kind::MUL_SCALAR, s), &l, None)?
-            }
-            _ => unreachable!("an exponent tensor or a scalar"),
-        };
-        let e = self.eltwise(op(EXP, 0.0), &z, None)?;
-        let out = match (yt, y) {
-            (Some(t), _) => self.eltwise3(op(POW_FIX, 0.0), x, Some(t), Some(&e))?,
-            (None, PowExponent::Scalar(s)) => self.eltwise(op(POW_FIX_S, s), x, Some(&e))?,
-            _ => unreachable!(),
-        };
-        for t in [Some(l), Some(z), Some(e), converted].into_iter().flatten() {
-            self.free(t)?;
         }
-        Ok(out)
+        self.eltwise(op, x, t)
     }
 
     /// Run element-wise ops on `unit` from now on: by default whichever is
