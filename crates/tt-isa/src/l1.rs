@@ -33,7 +33,7 @@ impl Region {
 }
 
 /// The five baby RISC-V images, from B's hardwired reset PC 0 to the end of
-/// NC's slot (NC is not used, and its slot is kept clear).
+/// NC's slot (which holds only the jump to NC's mover image, `dm::nc::stub`).
 pub const IMAGES: Region = Region {
     name: "firmware images",
     base: 0,
@@ -80,16 +80,26 @@ pub const TRACE: Region = Region {
     end: mailbox::TRACE_BUFFER + mailbox::TRACE_BUFFER_BYTES,
 };
 
-/// The rest of L1, kept for resident kernel programs (Phase 9.7c).
+/// The rest of L1 below [`NC_MOVER`], kept for resident kernel programs
+/// (Phase 9.7c).
 pub const PROGRAM_CACHE: Region = Region {
     name: "program cache",
     base: mailbox::TRACE_BUFFER + mailbox::TRACE_BUFFER_BYTES,
+    end: dm::nc::IMAGE_BASE,
+};
+
+/// RISCV NC's mover: its image, list ring, scratch and trace chunk
+/// (`dm::nc`), at the top of L1.
+pub const NC_MOVER: Region = Region {
+    name: "NC mover image, list, scratch and trace chunk",
+    base: dm::nc::IMAGE_BASE,
     end: tensix::L1_SIZE,
 };
+const _: () = assert!(dm::nc::END <= tensix::L1_SIZE);
 
 /// Every region, in address order. The gap between [`MOVER`] and [`DATA`] is
 /// unused.
-pub const REGIONS: [Region; 7] = [
+pub const REGIONS: [Region; 8] = [
     IMAGES,
     MOVER,
     DATA,
@@ -97,6 +107,7 @@ pub const REGIONS: [Region; 7] = [
     PROGRAMS,
     TRACE,
     PROGRAM_CACHE,
+    NC_MOVER,
 ];
 
 const fn ordered(r: &[Region]) -> bool {

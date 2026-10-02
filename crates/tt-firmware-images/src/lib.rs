@@ -64,8 +64,17 @@ pub const DM_B: Image = (
     tt_isa::dm::IMAGE_BASE,
 );
 
+/// RISCV NC's bring-up probe (`tt-firmware/src/bin/nc_probe.rs`), loaded at
+/// NC's image base; NC reaches it through the stub at its reset PC
+/// (`tt_isa::dm::nc::stub`).
+pub const NC_PROBE: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_NC_PROBE")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 9] = [
+const ENTRIES: [(&str, &str); 10] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -75,6 +84,7 @@ const ENTRIES: [(&str, &str); 9] = [
     ("role_t2", env!("FIRMWARE_ROLE_T2_ENTRY")),
     ("eth_e1", env!("FIRMWARE_ETH_E1_ENTRY")),
     ("dm_b", env!("FIRMWARE_DM_B_ENTRY")),
+    ("nc_probe", env!("FIRMWARE_NC_PROBE_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -130,5 +140,16 @@ mod tests {
         assert_eq!(entry("dm_b").map(u64::from), Some(at));
         assert_eq!(at, core.default_reset_pc() as u64);
         assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);
+    }
+
+    /// NC's images run from `dm::nc::IMAGE_BASE`, reached by the stub, and
+    /// stay below NC's list ring.
+    #[test]
+    fn the_nc_images_are_linked_at_ncs_image_base() {
+        let (core, image, at) = NC_PROBE;
+        assert_eq!(core, Core::NC);
+        assert_eq!(entry("nc_probe").map(u64::from), Some(at));
+        assert_eq!(at, tt_isa::dm::nc::IMAGE_BASE);
+        assert!(image.len() as u64 <= tt_isa::dm::nc::IMAGE_MAX);
     }
 }

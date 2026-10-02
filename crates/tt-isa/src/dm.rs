@@ -249,6 +249,48 @@ pub const TRACE_CHUNK: u64 = 0x1_9100;
 pub const TRACE_CHUNK_ENTRIES: u32 = 64;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
 
+/// RISCV NC's mover: where its image, list ring, scratch and mailbox live.
+///
+/// NC's own slot, from its default reset PC (`0x1_2000`) to the mover's list
+/// (`0x1_4000`), is 8 KiB, and the mover image is twice that. So the image
+/// lives in [`crate::l1::NC_MOVER`] at the top of L1, and NC's reset PC holds
+/// a two-instruction jump to it ([`nc::stub`]). Its reset PC is never moved:
+/// ttsim refuses NC's reset-PC override (divergence row 43), and the default
+/// is the same on silicon. NC fetches only from L1 on Blackhole -- no
+/// instruction RAM (`BabyRISCV/README.md:39`) -- so the image runs in place.
+pub mod nc {
+    /// Where NC starts on leaving reset: the stub.
+    pub const STUB_AT: u64 = crate::tensix::Core::NC.default_reset_pc() as u64;
+    /// Where the image is linked and loaded: the start of
+    /// [`crate::l1::NC_MOVER`].
+    pub const IMAGE_BASE: u64 = 0x17_0000;
+    pub const IMAGE_MAX: u64 = 0x8000;
+    /// NC's list ring, as [`super::LIST`] is B's.
+    pub const LIST: u64 = IMAGE_BASE + IMAGE_MAX;
+    /// NC's transpose scratch slot, as [`super::SCRATCH`] is B's.
+    pub const SCRATCH: u64 = LIST + super::LIST_MAX as u64 * super::ENTRY_BYTES;
+    /// Where NC's `CALL`s stream their entries, as [`super::TRACE_CHUNK`].
+    pub const TRACE_CHUNK: u64 = SCRATCH + super::TILE_SLOT.next_multiple_of(256);
+    /// The end of what NC's mover uses.
+    pub const END: u64 = TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES;
+    /// NC's mover mailbox: B's layout ([`super::SEQ`] and on, offset by
+    /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
+    pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
+    const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
+    const _: () = assert!(END <= crate::tensix::L1_SIZE);
+    const _: () = assert!(STUB_AT + 8 <= super::LIST);
+
+    /// The two instructions at [`STUB_AT`]: `lui t0, %hi(target)` and
+    /// `jalr x0, %lo(target)(t0)`, for a `target` that is a multiple of 4 KiB
+    /// (so the low part is 0).
+    pub const fn stub(target: u64) -> [u32; 2] {
+        assert!(target % 0x1000 == 0 && target < 1 << 31);
+        let lui_t0 = (target as u32) | (5 << 7) | 0x37;
+        let jalr_x0_t0 = (5 << 15) | 0x67;
+        [lui_t0, jalr_x0_t0]
+    }
+}
+
 /// One FP32 32x32 tile as it is stored on the device: the 16-byte header
 /// (zero, as `tt_layout` writes it), 1024 datums in face order, and padding to
 /// a multiple of [`crate::dram::ALIGN`] -- so every slot is 64-byte aligned
@@ -531,6 +573,12 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_nc_stub_jumps_to_the_image() {
+        // `lui t0, 0x170` and `jr t0`, as llvm-objdump decodes these words.
+        assert_eq!(nc::stub(nc::IMAGE_BASE), [0x0017_02B7, 0x0002_8067]);
+    }
+
     use super::*;
 
     const ALL: u32 = 0xFF;
