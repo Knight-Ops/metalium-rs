@@ -398,10 +398,35 @@ pub mod float {
     // Within one ulp of Flex's correctly rounded quotient, not bit for bit:
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
-    // `atan2(lhs, rhs)` within `ops::ATAN2_BOUND`, a denormal operand read as
-    // a zero; tensors of one shape (a broadcast's row program would not fit
-    // a slot), others Flex's.
-    binary!(float_atan2, tt_kernels::sfpu::ops::kind_sfpu::ATAN2);
+
+    /// `atan2(lhs, rhs)` on the device where the data is, within
+    /// `ops::ATAN2_BOUND`, a denormal operand read as a zero of its sign; else
+    /// Flex's. Operands of one shape only: a broadcast is refused, not sent to
+    /// the host -- the device has no program for it (its row form would not
+    /// fit a slot, `hardware-coverage.md` 10.2f), and burn-flex is not to be
+    /// relied on.
+    pub fn float_atan2(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        assert!(
+            lhs.shape() == rhs.shape(),
+            "float_atan2 of shapes {:?} and {:?}: burn-tt computes atan2 of tensors \
+             of one shape only (no broadcast; hardware-coverage.md 10.2f) -- expand \
+             the smaller operand first",
+            lhs.shape(),
+            rhs.shape()
+        );
+        let kind = tt_kernels::sfpu::ops::kind_sfpu::ATAN2;
+        if let Some(t) = device_eltwise(kind, 0.0, &lhs, Some(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_atan2(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
 
     /// `1/x` on the device where the data is, within one ulp of Flex's
     /// (`kind_sfpu::RECIP`), else Flex's.

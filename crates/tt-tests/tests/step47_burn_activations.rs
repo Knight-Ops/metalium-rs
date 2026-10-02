@@ -875,6 +875,17 @@ fn trig_stays_on_the_card_within_their_bounds() {
         check(&got, &host(fx.clone().tan()), TAN_BOUND, "tan");
         let got = vals(resident("atan", || x.clone().atan()), "atan");
         check(&got, &host(fx.clone().atan()), ATAN_BOUND, "atan");
+        // A broadcast `atan2` is refused, not run on the host.
+        let row = Tensor::<TtBackend, 2>::from_data(TensorData::new(gv[..c].to_vec(), [1, c]), &d)
+            .to_device(&d);
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| x.clone().atan2(row)))
+                .expect_err("a broadcast atan2 is refused");
+        let msg = refused
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains("one shape only"), "{msg}");
         // `floats` has no denormals, which `atan2` reads as zeros.
         let got = vals(resident("atan2", || x.clone().atan2(g.clone())), "atan2");
         check(
