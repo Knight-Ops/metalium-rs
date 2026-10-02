@@ -386,7 +386,8 @@ fn signal() {
 /// Every read through a fence: the peer's stores do not invalidate this core's
 /// L0 data cache.
 #[inline(never)]
-fn wait_peer(peer: dm::Mover, target: u32) -> Result<(), u32> {
+fn wait_peer(peer: dm::Peer, target: u32) -> Result<(), u32> {
+    let peer = peer.mover();
     loop {
         publish();
         if (rd(peer.at(dm::PROGRESS)).wrapping_sub(target) as i32) >= 0 {

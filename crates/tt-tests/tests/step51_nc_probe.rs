@@ -131,6 +131,24 @@ fn nc_runs_from_its_stub_and_moves_data_on_both_nocs() {
                 "channel {}: NoC #0's read did not land",
                 ch.index()
             );
+            // The initiator kept every register NC wrote (checklist 9.14):
+            // a later request may leave the unchanged ones unwritten.
+            // NOC_CTRL is compared whole, so a hardware write to its reserved
+            // bits shows here too.
+            for (noc, mask_at, ctrl_at) in [("NoC #1", 0xE8, 0xF0), ("NoC #0", 0xEC, 0xF4)] {
+                let mask = d.read32(&w, t, nc::MAILBOX_BASE + mask_at).unwrap();
+                let ctrl = d.read32(&w, t, nc::MAILBOX_BASE + ctrl_at).unwrap();
+                println!(
+                    "channel {}: {noc}: registers changed {mask:#x}, NOC_CTRL {ctrl:#x}",
+                    ch.index()
+                );
+                assert_eq!(
+                    mask,
+                    0,
+                    "channel {}: {noc}'s initiator changed registers",
+                    ch.index()
+                );
+            }
         }
         d.set_core_reset(&w, t, Core::NC, true).unwrap();
     });

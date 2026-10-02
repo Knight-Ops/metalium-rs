@@ -282,6 +282,23 @@ pub struct Mover {
     pub trace_chunk: u64,
 }
 
+/// Which of a tile's two movers, as an entry names it ([`op::WAIT_PEER`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Peer {
+    B,
+    NC,
+}
+
+impl Peer {
+    /// The mover's addresses.
+    pub const fn mover(self) -> Mover {
+        match self {
+            Peer::B => Mover::B,
+            Peer::NC => Mover::NC,
+        }
+    }
+}
+
 impl Mover {
     /// RISCV B's mover: the image at its hardwired reset PC.
     pub const B: Mover = Mover {
@@ -434,7 +451,10 @@ pub enum Entry {
     /// [`op::SIGNAL`].
     Signal,
     /// [`op::WAIT_PEER`]: the peer mover, and the progress count to wait for.
-    WaitPeer { peer: Mover, target: u32 },
+    /// A one-byte [`Peer`], not a [`Mover`]: every `Entry` is as large as its
+    /// largest variant, and the mover's per-entry path decodes one each time
+    /// (a `Mover` here cost every entry ~100 cycles on card 0).
+    WaitPeer { peer: Peer, target: u32 },
 }
 
 impl Entry {
@@ -451,14 +471,7 @@ impl Entry {
                 },
             );
         }
-        Self::decode_other(usable, w)
-    }
 
-    /// [`Entry::decode`] for everything but a plain read or write: out of
-    /// line, so the mover's per-entry path, which inlines `decode`, carries
-    /// only the move's decode (`sections.x`, `.text.hot`).
-    #[inline(never)]
-    fn decode_other(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
         let transform = match w[0] {
             op::READ_TRANSPOSED => Transform::Transpose,
             op::READ_BROADCAST_COL => Transform::BroadcastCol0,
@@ -565,8 +578,8 @@ impl Entry {
         }
         if w[0] == op::WAIT_PEER {
             let peer = match w[1] {
-                0 => Mover::B,
-                1 => Mover::NC,
+                0 => Peer::B,
+                1 => Peer::NC,
                 _ => return Err(error::OP),
             };
             if w[3..].iter().any(|&v| v != 0) {

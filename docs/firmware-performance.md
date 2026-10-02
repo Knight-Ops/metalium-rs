@@ -334,6 +334,31 @@ difference is the host polling for the ack and posting the next send over PCIe.
   - The single-port write path changed in nothing else: port hint 0 maps to port
     0 on NoC #0.
 - [ ] **Per-request cost** (checklist 9.14).
+  - **Where a 4 KiB read entry's ~350 cycles go** (2026-10-02). Measured with a
+    temporary build stamping the wall clock between stages, about 8 cycles per
+    stamp taken off:
+
+    | Stage | Cycles |
+    |---|--:|
+    | Fetch the entry, record length, trace check | ~30 |
+    | Decode and dispatch (`Entry::decode`) | ~88 |
+    | Build the request (`Command::registers`) | ~110 |
+    | In-flight cap check | ~14 |
+    | Initiator-busy poll | ~9 |
+    | The ten NIU register writes | ~10 |
+    | Issue and read-back | ~6 |
+    | Return and trace | ~47 |
+
+  - **The NIU's MMIO is nearly free; the software around it is not.**
+    `Command::registers` re-checks every request after `Descriptor::decode`
+    has checked the whole move.
+  - **Writing only the registers that change was tried and dropped.**
+    - Every register reads back as written (`step51_nc_probe`, card 0).
+    - But comparing against a copy cost more than the writes it saved: +21
+      cycles per entry.
+  - **Entry size matters.** Carrying a whole `dm::Mover` in an `Entry` variant
+    made every decode about 100 cycles slower, as did decoding rare kinds out
+    of line. Both were fixed by a one-byte `dm::Peer` and inline decode.
   - ~350 cycles per entry at any size up to 4 KiB.
   - Each request rebuilds and writes ten NIU registers.
   - GATHER records expand into one ~4 KiB read per tile.
