@@ -156,6 +156,37 @@ NC runs the same mover image (`dm_nc`). One tile, per entry, `BENCH_MOVER=nc`:
 - **NC can take any share of the moves.**
 - **The 4 KiB read is up from 339 cycles** (the cap-8 default; see above).
 
+### What a second mover buys: reads on B, writes on NC
+
+`copy_pipeline` copies GDDR → L1 → GDDR in 64 KiB blocks, double-buffered,
+writes on NoC #1, three ways:
+
+- B alone, sequential.
+- B alone, pipelined: block k+1's reads go out with block k's writes.
+- Split: B reads, NC writes, synchronised by `SIGNAL` / `WAIT_PEER`.
+
+Copy rate in GB/s (each byte read and written once):
+
+| Entries | Scheme | 1 tile | 4 | 16 | 120 |
+|---|---|--:|--:|--:|--:|
+| 4 KiB | B pipelined | 5.7 | 22.6 | 90 | 171 |
+| 4 KiB | **Split** | **9.1** | **36.0** | **143** | 173 |
+| 16 KiB | B pipelined | 19.8 | 78.7 | 152 | 164 |
+| 16 KiB | **Split** | **26.4** | **84.5** | 156 | 165 |
+| 64 KiB | B pipelined | 28.8 | 85.5 | 161 | 164 |
+| 64 KiB | Split | 29.7 | 89.9 | 157 | 164 |
+
+- **The split pays where per-entry cost is the limit:** small entries, or few
+  tiles busy. 4 KiB copies run 1.6× faster on one to 16 tiles, because each core
+  issues half the entries.
+- **Large entries:** B alone already overlaps reads and writes by
+  software-pipelining, so the second core adds 3–5%.
+- **At 120 tiles every scheme meets the card's copy ceiling,** about 165–173
+  GB/s each way.
+- **Ops that compute:** the further gain is that B blocks on a `KERNEL` entry
+  while the roles run, and NC can keep moving meanwhile. Not yet measured: it
+  needs the split in `Session`.
+
 ### Why card-wide writes stop at about 160 (NoC #0) and 270 (NoC #1) GB/s
 
 **One channel absorbs a full channel of writes from 120 tiles, on either NoC:**

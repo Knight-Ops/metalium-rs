@@ -1206,3 +1206,301 @@ fn gddr_in_flight() {
         }
     });
 }
+
+/// How a tile copies GDDR -> L1 -> GDDR, block by block ([`copy_lists`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum CopyScheme {
+    /// B alone: read a block, wait, write it, wait.
+    Sequential,
+    /// B alone, software-pipelined: block k+1's read goes out with block
+    /// k's write, then one wait for both.
+    Pipelined,
+    /// B reads, NC writes: B signals each block read; NC waits for it, writes
+    /// it and signals; B waits for NC before refilling a buffer.
+    Split,
+}
+
+/// The size of a block: double-buffered in L1.
+const COPY_BLOCK: u32 = 65536;
+
+/// Blocks per tile per run: 1 MiB each way, or half that with entries under
+/// 16 KiB, so a list stays under `dm::LIST_MAX` entries and a tile's two
+/// movers under the trace buffer's 1024 events.
+fn copy_blocks() -> u32 {
+    if copy_entry() < 16384 {
+        8
+    } else {
+        16
+    }
+}
+const COPY_DST: u64 = BASE + (256 << 20);
+
+/// `COPY_ENTRY`: the entry size a block is moved in (default the whole
+/// block): small entries make each mover's per-entry cost the limit.
+fn copy_entry() -> u32 {
+    std::env::var("COPY_ENTRY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(COPY_BLOCK)
+}
+
+/// Tile `t`'s lists for one run: B's, and NC's (empty but for
+/// [`CopyScheme::Split`]). Block `k` comes from channel `(k + t) % 8` at the
+/// tile's MiB there, through L1 buffer `k % 2`, and goes to the same place
+/// above [`COPY_DST`]. `base_b` and `base_nc` are the movers' progress words
+/// before the run, which the waits count from.
+fn copy_lists(
+    f: &Fleet,
+    t: usize,
+    n: usize,
+    copy: CopyScheme,
+    base_b: u32,
+    base_nc: u32,
+) -> (Vec<Entry>, Vec<Entry>) {
+    let chans: Vec<u8> = f.dram.channels().map(|c| c.index()).collect();
+    let nc_ = chans.len() as u32;
+    let coord = f.movers[0].tile();
+    let piece = copy_entry();
+    let block = |k: u32, kind: u32| -> Vec<Entry> {
+        let ch = chans[((k + t as u32) % nc_) as usize];
+        let off = t as u64 * (1 << 20) + ((k / nc_) * COPY_BLOCK) as u64;
+        let dram = if kind == op::READ { BASE } else { COPY_DST } + off;
+        (0..COPY_BLOCK / piece)
+            .map(|p| {
+                entry(
+                    kind,
+                    ch,
+                    0,
+                    dram + (p * piece) as u64,
+                    L1 + (k % 2) * COPY_BLOCK + p * piece,
+                    piece,
+                )
+            })
+            .collect()
+    };
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    let signal = [op::SIGNAL, 0, 0, 0, 0, 0, 0, 0];
+    let wait_peer = |peer: u32, target: u32| [op::WAIT_PEER, peer, target, 0, 0, 0, 0, 0];
+    let mut b = vec![[
+        op::BARRIER,
+        n as u32,
+        coord.x() as u32,
+        coord.y() as u32,
+        0,
+        0,
+        0,
+        0,
+    ]];
+    let mut nc = Vec::new();
+    match copy {
+        CopyScheme::Sequential => {
+            for k in 0..copy_blocks() {
+                b.extend(block(k, op::READ));
+                b.push(wait);
+                b.extend(block(k, op::WRITE));
+                b.push(wait);
+            }
+        }
+        CopyScheme::Pipelined => {
+            b.extend(block(0, op::READ));
+            b.push(wait);
+            for k in 0..copy_blocks() {
+                if k + 1 < copy_blocks() {
+                    b.extend(block(k + 1, op::READ));
+                }
+                b.extend(block(k, op::WRITE));
+                b.push(wait);
+            }
+        }
+        CopyScheme::Split => {
+            for k in 0..copy_blocks() {
+                if k >= 2 {
+                    // Buffer k % 2 is free once NC has written block k - 2.
+                    b.push(wait_peer(1, base_nc.wrapping_add(k - 1)));
+                }
+                b.extend(block(k, op::READ));
+                b.push(signal);
+                nc.push(wait_peer(0, base_b.wrapping_add(k + 1)));
+                nc.extend(block(k, op::WRITE));
+                nc.push(signal);
+            }
+        }
+    }
+    (b, nc)
+}
+
+/// [`copy_pipeline`]'s run of `n` tiles: bytes copied over the earliest
+/// barrier release to the latest list end of either mover, on tile 0's clock.
+fn copy_run(
+    d: &mut Dev<'_>,
+    f: &mut Fleet,
+    ncs: &mut [DataMover<Noc0>],
+    n: usize,
+    copy: CopyScheme,
+) -> f64 {
+    let coord = f.movers[0].tile();
+    d.write32(&f.w, coord, dm::BARRIER_COUNTER, 0).unwrap();
+    let mut lists = Vec::new();
+    for t in 0..n {
+        let tile = f.movers[t].tile();
+        let base_b = d.read32(&f.w, tile, dm::Mover::B.at(dm::PROGRESS)).unwrap();
+        let base_nc = d
+            .read32(&f.w, tile, dm::Mover::NC.at(dm::PROGRESS))
+            .unwrap();
+        lists.push(copy_lists(f, t, n, copy, base_b, base_nc));
+        d.configure_trace(&f.w, tile, TRACE_BUFFER, TRACE_BUFFER_BYTES)
+            .unwrap();
+    }
+    for (t, (b, nc)) in lists.iter().enumerate() {
+        // NC's first, so it is waiting when B's first signal comes.
+        if !nc.is_empty() {
+            ncs[t].enqueue(d, &f.w, nc).unwrap();
+        }
+        f.movers[t].enqueue(d, &f.w, b).unwrap();
+    }
+    for t in 0..n {
+        f.movers[t].drain(d, &f.w).unwrap();
+        if !lists[t].1.is_empty() {
+            ncs[t].drain(d, &f.w).unwrap();
+        }
+    }
+    let (mut first, mut last) = (i64::MAX, i64::MIN);
+    for t in 0..n {
+        let trace = d
+            .read_trace(&f.w, f.movers[t].tile(), TRACE_BUFFER)
+            .unwrap();
+        // B's barrier is the first entry to end on the tile: NC's first
+        // entry waits on B's first signal, after it.
+        let released = trace
+            .iter()
+            .find(|e| ev::split(e.token) == (ev::MOVER, ev::ENTRY_END))
+            .expect("no barrier end")
+            .cycles;
+        let end = trace
+            .iter()
+            .filter(|e| ev::split(e.token) == (ev::MOVER, ev::LIST_END))
+            .map(|e| e.cycles)
+            .max()
+            .expect("no list end");
+        first = first.min(released as i64 - f.offset[t]);
+        last = last.max(end as i64 - f.offset[t]);
+    }
+    let bytes = (copy_blocks() * COPY_BLOCK) as f64 * n as f64;
+    f.c.rate(bytes, (last - first) as f64)
+}
+
+/// GDDR -> L1 -> GDDR copies, double-buffered, B alone against B reading
+/// while NC writes (`CopyScheme`): what a second mover per tile buys once each
+/// tile's reads and writes can overlap. Writes go out on NoC #1 in every
+/// scheme, so only the scheduling differs. `AGG_TILES` picks the tile counts.
+#[test]
+#[ignore = "benchmark"]
+fn copy_pipeline() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let have = f.movers.len();
+        let mut ncs: Vec<DataMover<Noc0>> = f
+            .movers
+            .iter()
+            .map(|m| {
+                DataMover::start_on(
+                    d,
+                    &f.w,
+                    m.tile(),
+                    &f.dram,
+                    dm::Mover::NC,
+                    tt_firmware_images::DM_NC.1,
+                )
+                .unwrap()
+            })
+            .collect();
+        for (m, nc) in f.movers.iter().zip(&ncs) {
+            m.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
+            nc.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
+            d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 1)
+                .unwrap();
+        }
+        let counts: Vec<usize> = match std::env::var("AGG_TILES") {
+            Ok(s) => s
+                .split(',')
+                .map(|n| n.trim().parse::<usize>().unwrap().min(have))
+                .collect(),
+            Err(_) => vec![1, 4, 16, 64, have],
+        };
+        let card = f.c.gddr_card();
+        // Tile 0's and the last tile that runs, for the check.
+        let check = [0usize, counts.iter().copied().max().unwrap_or(1) - 1];
+        for &t in &check {
+            for ch in f.dram.channels() {
+                let data = pattern(1 << 20, t as u32 * 16 + ch.index() as u32 + 1);
+                d.dram_write(
+                    &f.w4,
+                    ch.range(BASE + t as u64 * (1 << 20), 1 << 20).unwrap(),
+                    &data,
+                )
+                .unwrap();
+            }
+        }
+        for copy in [
+            CopyScheme::Sequential,
+            CopyScheme::Pipelined,
+            CopyScheme::Split,
+        ] {
+            for &n in &counts {
+                copy_run(d, &mut f, &mut ncs, n, copy);
+                let rates: Vec<f64> = (0..REPS)
+                    .map(|_| copy_run(d, &mut f, &mut ncs, n, copy))
+                    .collect();
+                let bytes = (copy_blocks() * COPY_BLOCK) as f64 * n as f64;
+                report_rate(
+                    &format!("copy {copy:?} {n:>3} tiles"),
+                    "device",
+                    bytes,
+                    Stats::of(rates.iter().map(|r| bytes / r * 1e6)),
+                    card.as_ref(),
+                );
+            }
+            // Every byte of the checked tiles' copies landed: their
+            // destinations against their sources.
+            for &t in &check {
+                for ch in f.dram.channels() {
+                    let want = pattern(1 << 20, t as u32 * 16 + ch.index() as u32 + 1);
+                    let used =
+                        (copy_blocks() / f.dram.channel_count() as u32 * COPY_BLOCK) as usize;
+                    let mut back = vec![0u8; used];
+                    d.dram_read(
+                        &f.w4,
+                        ch.range(COPY_DST + t as u64 * (1 << 20), used as u64)
+                            .unwrap(),
+                        &mut back,
+                    )
+                    .unwrap();
+                    assert!(
+                        back[..] == want[..used],
+                        "{copy:?}: tile {t}'s copy in ch {} did not land",
+                        ch.index()
+                    );
+                    d.dram_write(
+                        &f.w4,
+                        ch.range(COPY_DST + t as u64 * (1 << 20), used as u64)
+                            .unwrap(),
+                        &vec![0u8; used],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for nc in ncs {
+            d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 0)
+                .unwrap();
+            nc.stop(d, &f.w).unwrap();
+        }
+        let Fleet { w, movers, .. } = f;
+        for m in movers {
+            let t = m.tile();
+            m.set_write_noc(d, &w, Niu::Noc0).unwrap();
+            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+    });
+}
