@@ -889,8 +889,18 @@ Each names the measurement it must move. The Burn-side ones are in
         `gelu{,_backward}` -- `silu` follows, Burn's `x * sigmoid(x)` --
         `step47_burn_activations::exp_family_activations_stay_on_the_card_within_
         their_bounds`, which also takes Burn's autodiff through both backward
-        kinds. Remaining: `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid{,
-        _backward}`, `softmin`; then `sin`/`cos` and the rest (10.2f).
+        kinds. `sinh_cosh_program`: one `expm1` of `a = |x|`, then `(t + t/e)/2`
+        or `(e + 1/e)/2`, `e = t + 1` (no cancellation); from `a = 88` the
+        argument halved and the result `w (w/2)`, so nothing overflows before
+        the result does (89.4159); `sinh` is `x` itself below `2^-12`. Within
+        `SINH_BOUND = COSH_BOUND = 12.5u` (the large side's two `expm1`s;
+        worst measured 2.2 ulps). Burn: `float_sinh`, `float_cosh`;
+        `step47_burn_activations::hyperbolics_log_sigmoid_and_softmin_stay_on_
+        the_card_within_their_bounds`, with Burn's autodiff of `sinh` (`g cosh
+        x`); watched failing with `float_cosh` routed to `SINH`, and `step45`
+        with `sinh`'s sign dropped. Remaining: `asinh`, `acosh`, `atanh`,
+        `log_sigmoid{,_backward}`, `softmin`; then `sin`/`cos` and the rest
+        (10.2f).
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1076,8 +1086,9 @@ path today, `~` when only some shapes do.
 | `float_cast` | `~` to the tensor's own dtype (a no-op); others S6 | S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
-| `float_erf`, `float_tanh` | x (SFPU, derived bounds) | S4 |
-| `float_sin`, `float_cos`, `float_tan`, the other hyperbolics, inverse trig, `float_atan2` | | S4 |
+| `float_erf`, `float_tanh`, `float_sinh`, `float_cosh` | x (SFPU, derived bounds) | S4 |
+| `float_asinh`, `float_acosh`, `float_atanh` | | S4 (10.2e) |
+| `float_sin`, `float_cos`, `float_tan`, inverse trig, `float_atan2` | | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |

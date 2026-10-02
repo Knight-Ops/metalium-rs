@@ -121,6 +121,8 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_powi_scalar",
             "float_tanh",
             "float_erf",
+            "float_sinh",
+            "float_cosh",
         ],
     ),
     (

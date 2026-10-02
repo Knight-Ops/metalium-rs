@@ -676,3 +676,69 @@ fn exp_family_activations_stay_on_the_card_within_their_bounds() {
         );
     });
 }
+
+/// The rest of 10.2e through Burn: each op on resident tensors against Flex
+/// within its bound, nothing moved, computed on the device -- and Burn's
+/// autodiff through them, whose backwards are this backend's ops too
+/// (`sinh`'s is `g cosh x`).
+#[test]
+fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
+    use burn::backend::Autodiff;
+    use tt_kernels::sfpu::ops::{COSH_BOUND, SINH_BOUND};
+    let u = 1.0 / 16_777_216.0;
+    with_device(Config::default(), |d| {
+        let [r, c] = [64, 128];
+        // `floats`' range widened to both tails, and past `sinh`'s overflow.
+        let xv: Vec<f32> = floats(9, r * c).iter().map(|x| x * 23.0).collect();
+        let gv: Vec<f32> = floats(10, r * c)
+            .iter()
+            .map(|g| {
+                if g.is_finite() {
+                    g.clamp(-3.0, 3.0)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let tt = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (x, g, fx, fg) = (tt(&xv), tt(&gv), fl(&xv), fl(&gv));
+        let vals = |t: Tensor<TtBackend, 2>, what: &str| {
+            assert!(
+                on_device(&t.clone().into_primitive().tensor()),
+                "{what}: not on the device"
+            );
+            t.into_data().to_vec::<f32>().unwrap()
+        };
+        let host = |t: Tensor<Flex, 2>| t.into_data().to_vec::<f32>().unwrap();
+        let check = |got: &[f32], want: &[f32], rel: f64, what| {
+            for i in 0..r * c {
+                close(got[i], want[i], rel, 0.0, &format!("{what}({:e})", xv[i]));
+            }
+        };
+        let got = vals(resident("sinh", || x.clone().sinh()), "sinh");
+        check(&got, &host(fx.clone().sinh()), SINH_BOUND, "sinh");
+        let got = vals(resident("cosh", || x.clone().cosh()), "cosh");
+        check(&got, &host(fx.clone().cosh()), COSH_BOUND, "cosh");
+
+        // Autodiff: `d/dx sum(sinh(x) g) = g cosh x`, the product one rounding
+        // on each side.
+        type Ad = Autodiff<TtBackend>;
+        type Fd = Autodiff<Flex>;
+        let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+        let gs = (xa.clone().sinh() * Tensor::<Ad, 2>::from_inner(g.clone()))
+            .sum()
+            .backward();
+        let got = xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        let fa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+        let gs = (fa.clone().sinh() * Tensor::<Fd, 2>::from_inner(fg.clone()))
+            .sum()
+            .backward();
+        let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        check(&got, &want, COSH_BOUND + 2.0 * u, "autodiff sinh");
+    });
+}

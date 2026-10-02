@@ -980,6 +980,16 @@ pub mod float {
         kind_sfpu::ERF,
         "`erf x` on the device where the data is, within `ops::ERF_BOUND`, else Flex's."
     );
+    unary_sfpu!(
+        float_sinh,
+        kind_sfpu::SINH,
+        "`sinh x` on the device where the data is, within `ops::SINH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_cosh,
+        kind_sfpu::COSH,
+        "`cosh x` on the device where the data is, within `ops::COSH_BOUND`, else Flex's."
+    );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
     /// (within `ops::pow_bound`); else Flex's.

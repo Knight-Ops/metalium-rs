@@ -119,6 +119,10 @@ pub mod kind_sfpu {
     /// `g (Phi(a) + a phi(a))` from `a` (`A`) and the gradient `g` (`B`), within
     /// [`super::gelu_backward_bound`].
     pub const GELU_BACKWARD: u32 = 0x130;
+    /// `sinh a`, within [`super::SINH_BOUND`] (`super::sinh_cosh_program`).
+    pub const SINH: u32 = 0x131;
+    /// `cosh a`, within [`super::COSH_BOUND`].
+    pub const COSH: u32 = 0x132;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -204,7 +208,9 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
-        | kind_sfpu::GELU_BACKWARD => Accuracy::Approximate,
+        | kind_sfpu::GELU_BACKWARD
+        | kind_sfpu::SINH
+        | kind_sfpu::COSH => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -644,6 +650,78 @@ pub fn tanh_program(p: &mut Program, spill: u32) {
     p.if_(Cond::Less(R::L5, R::L1), |p| {
         p.loadi_bits(R::L7, 0x7fc0_0000)
     });
+}
+
+/// [`sinh_cosh_program`]'s derived bound for `sinh`, relative.
+pub const SINH_BOUND: f64 = 12.5 / 16_777_216.0;
+/// The same for `cosh`.
+pub const COSH_BOUND: f64 = SINH_BOUND;
+
+/// `sinh x` (or `cosh x` where `cosh`) of `x` (in `L0`, raw bits, spilled at
+/// `spill`) into `L7`, from one [`expm1_program`] of `a = |x|`: `t = e^a - 1`,
+/// `e = t + 1`, `sinh a = (t + t/e)/2` (no cancellation near zero) and `cosh a
+/// = (e + 1/e)/2`. From `a = 88`, where `e^a` nears `f32::MAX`, the argument
+/// is `a/2` (exact) and the result `w (w/2)`, `w = e^(a/2)`: `e^-a` is then
+/// below `2^-126` of `e^a`, and the product overflows only where the result
+/// does (`a > 89.4159`).
+///
+/// Error, relative, in `u = 2^-24`, `E = EXPM1_BOUND = 4.5u` (`a` exact).
+/// Below 88: `e = t + 1` is within `E t/(t+1) + u <= E + u`. `sinh`: `t/e`
+/// within `E/(t+1) + u + 2u` (the quotient an ulp, `divide`), which the sum
+/// `t + t/e` weighs by at most `1/2` (`t/e <= t`); the sum rounds once, the
+/// halving is exact: `E + 1.5u + u = 7u`. `cosh`: `1/e` within `E + u + 2u`
+/// (`recip`, an ulp), weighed by at most `1/2`; the sum rounds once: `E + 3u =
+/// 7.5u`. From 88: `w` within `E + u`, twice in the product, which rounds
+/// once: `2E + 3u = 12u`, and dropping `e^-a` costs below `2^-250`. Under
+/// [`SINH_BOUND`] `= 12.5u` both, the second-order terms (products of these,
+/// below `1e-13`) included. Below `|x| = 2^-12` `sinh x` is `x` itself (`x^2/6
+/// < 2^-26`), bits and all; `±inf` give `±inf` (`cosh`: `+inf`), a NaN stays
+/// one.
+pub fn sinh_cosh_program(p: &mut Program, spill: u32, cosh: bool) {
+    use LReg as R;
+    let (x, a) = (R::L0, R::L1);
+    // `expm1` keeps only its input and output: `x` waits in `Dst`.
+    p.store(x, Format::Int32, spill);
+    // The magnitude by mask (`SFPABS` leaves a negative NaN negative).
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    p.loadi(R::L5, 88.0);
+    p.if_(Cond::LessEq(R::L5, a), |p| {
+        p.loadi(R::L5, 0.5);
+        p.mul(a, R::L5, a);
+    });
+    expm1_program(p, a, R::L7);
+    let (t, e, y, q) = (R::L7, R::L2, R::L3, R::L4);
+    p.add(t, R::ONE, e);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(e, y, R::L1, R::L5, R::L6);
+    if cosh {
+        p.add(e, y, q);
+    } else {
+        p.loadi_bits(R::L6, 0x7f80_0000);
+        divide(p, t, e, y, q, R::L5, R::L1, R::L6);
+        p.add(t, q, q);
+    }
+    p.loadi(R::L5, 0.5);
+    p.mul(q, R::L5, q);
+    p.load(x, Format::Int32, spill);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    p.loadi(R::L5, 88.0);
+    p.if_(Cond::LessEq(R::L5, a), |p| {
+        p.loadi(R::L5, 0.5);
+        p.mul(e, R::L5, y);
+        p.mul(e, y, q);
+    });
+    if cosh {
+        p.mov(q, R::L7);
+    } else {
+        p.copy_sign(q, x, R::L7);
+        p.loadi_bits(R::L5, 0x3980_0000); // 2^-12
+        p.if_(Cond::Less(a, R::L5), |p| p.mov(x, R::L7));
+    }
+    p.loadi_bits(R::L5, 0x7f80_0000);
+    p.if_(Cond::Less(R::L5, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
 }
 
 /// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
@@ -1333,7 +1411,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
         | kind_sfpu::ERF
-        | kind_sfpu::GELU => Operands::Unary,
+        | kind_sfpu::GELU
+        | kind_sfpu::SINH
+        | kind_sfpu::COSH => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2030,6 +2110,14 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             } else {
                 Operands::Unary
             }
+        }
+        kind_sfpu::SINH | kind_sfpu::COSH => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                sinh_cosh_program(p, super::kernel::SPILL_ROW + o, kind == kind_sfpu::COSH);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
         }
         kind_sfpu::I32_TO_F32 => {
             p.for_each_row_group(64, |p, o| {
@@ -2890,6 +2978,49 @@ mod transcendental {
             f64::tanh,
             TANH_BOUND,
         );
+    }
+
+    /// The switch to `x` itself (`2^-12`), the large branch (88), `expm1`'s own
+    /// overflow edge (88.72) and the result's (89.4159), every binade.
+    fn hyperbolic_inputs() -> impl Iterator<Item = f32> {
+        let specials = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x397f_ffff),
+            f32::from_bits(0x3980_0000),
+            0.5,
+            1.0,
+            9.0,
+            87.99,
+            88.0,
+            88.38,
+            88.72,
+            f32::from_bits(0x42b1_7218),
+            89.41,
+            89.4159,
+            89.416,
+            89.42,
+            100.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        grid(-90.0, 90.0, 60_000)
+            .chain(grid(-1.0, 1.0, 20_000))
+            .chain(binades(32).filter(|x| *x < 90.0))
+            .chain(specials)
+            .flat_map(|x| [x, -x])
+    }
+
+    #[test]
+    fn sinh_is_within_its_derived_bound() {
+        sweep(kind_sfpu::SINH, hyperbolic_inputs(), f64::sinh, SINH_BOUND);
+    }
+
+    #[test]
+    fn cosh_is_within_its_derived_bound() {
+        sweep(kind_sfpu::COSH, hyperbolic_inputs(), f64::cosh, COSH_BOUND);
     }
 
     /// A NaN of either sign and any payload comes out a NaN from every

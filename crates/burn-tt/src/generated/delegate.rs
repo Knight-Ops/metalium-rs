@@ -647,18 +647,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_cosh(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_cosh(tensor)
     }
     fn float_sinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sinh(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_sinh(tensor)
     }
     fn float_tanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_tanh(tensor)
