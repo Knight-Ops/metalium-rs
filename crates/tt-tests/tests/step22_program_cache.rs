@@ -170,7 +170,7 @@ fn a_matmul_of_two_block_shapes_is_one_list_and_then_no_uploads() {
 fn evicted_programs_run_correctly_when_they_return() {
     with_session(|s| {
         // About 92 + 49 + 102 + 57 KB of programs on one tile (the cache's
-        // own counts, on ttsim): more than the 252 KB region, so the fourth
+        // own counts, on ttsim): more than the 240 KB region, so the fourth
         // evicts and the second round finds the first three gone.
         let ops = [
             ([512, 512, 512], Fidelity::HiFi4),

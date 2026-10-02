@@ -466,3 +466,66 @@ fn session_open_breakdown() {
         panic!("{e}");
     }
 }
+
+/// Element-wise on the SFPU against the data mover's FP32 unit: one op's wall
+/// time, by tiles per unit, on 1 and 8 units -- the measurement that decides
+/// when a run goes to the SFPU (`tt_kernels::tensor::EltwiseUnit`). Each
+/// figure the median of seven after a warm-up; also the PCIe writes per op.
+#[test]
+#[ignore = "benchmark"]
+fn eltwise_unit_sweep() {
+    use tt_isa::dm::kind;
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::tensor::{Eltwise, EltwiseUnit};
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    for units in [1, 8] {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(units))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            for per_unit in [1, 2, 4, 8, 16, 32, 64] {
+                let tiles = per_unit * units;
+                let (r, c) = (32 * tiles, 32);
+                let x = s.upload(&pattern_f32(r * c, 3), r, c).unwrap();
+                let y = s.upload(&pattern_f32(r * c, 4), r, c).unwrap();
+                let mut line = format!("{units} units, {per_unit:>2} tiles/unit:");
+                for unit in [EltwiseUnit::Mover, EltwiseUnit::Sfpu] {
+                    s.set_eltwise_unit(unit);
+                    for (name, k) in [("add", kind::ADD), ("relu", kind::RELU)] {
+                        let op = Eltwise {
+                            kind: k,
+                            scalar: 0.0,
+                        };
+                        let other = (k == kind::ADD).then_some(&y);
+                        let o = s.eltwise(op, &x, other).unwrap();
+                        s.free(o).unwrap();
+                        let mut v = Vec::new();
+                        let mut writes = 0;
+                        for _ in 0..7 {
+                            let before = s.device().traffic();
+                            let t = Instant::now();
+                            let o = s.eltwise(op, &x, other).unwrap();
+                            v.push(t.elapsed());
+                            writes = (s.device().traffic() - before).bytes_written;
+                            s.free(o).unwrap();
+                        }
+                        let med = median(v);
+                        line += &format!(
+                            "  {unit:?} {name} {:>7.1} us ({writes} B)",
+                            med.as_secs_f64() * 1e6
+                        );
+                    }
+                }
+                println!("{line}");
+                s.free(x).unwrap();
+                s.free(y).unwrap();
+            }
+        }) {
+            panic!("{e}");
+        }
+    }
+}

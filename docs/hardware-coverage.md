@@ -5,6 +5,8 @@ coverage"). The plan says *why*; this file says *which parts of a Blackhole Tens
 this stack can drive, which it cannot yet, and in what order the rest arrives*. It is the
 progress record: an item is ticked here or nowhere.
 
+Execution order, branches and the per-item workflow: the "Execution" section at the end.
+
 Companion guides: [`tt-metal-concepts-review.md`](tt-metal-concepts-review.md) (the
 Tenstorrent concepts this stack lacks, G1–G16, and the hardware sharp edges to handle in
 code) and [`burn-backend-parity.md`](burn-backend-parity.md) (the `burn-tt` surface and
@@ -16,15 +18,15 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01)
+## Where things stand (2026-10-01, after 10.0)
 
 Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
 
 | Unit | What runs there today | Where |
 |---|---|---|
 | **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
-| **B core FP32 unit** | every element-wise op and the column sum: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`, `COL_SUM` -- one datum at a time, `fadd.s`/`fsub.s`/`fmul.s` | `tt_isa::dm::kind` (`dm.rs:108-135`), `dm_b.rs::{compute, col_sum, per_datum}` |
-| **SFPU** | nothing a tensor op uses. Gates only (`step4_tensix`, `step5_corpus`, `step8_eltwise` at 128 datums), and `Dst` zeroing in `runtime.rs` | `tt_isa::sfpu` |
+| **B core FP32 unit** | the column sum, small element-wise ops spread over many units, and the reference for every element-wise op; padding fills | `tt_isa::dm::kind`, `dm_b.rs::{compute, col_sum, per_datum, fill_pad}` |
+| **SFPU** | every element-wise op where it is cheaper (`Auto`): `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` | `tt_kernels::sfpu::{ops, kernel}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
 The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
@@ -44,12 +46,12 @@ only a feature list.
 
 | # | Milestone | Items | State |
 |--:|---|---|---|
-| 10.0 | SFPU foundation; today's element-wise ops move from the B core to the SFPU | F1–F5, S1 | `[ ]` |
-| 10.1 | Softmax and cross-entropy on the device | S3, S4 (`exp`, `log`), R1 (`max`, `sum`), R2 | `[ ]` |
+| 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
-| 10.3 | Reductions over any dim, pooling, device transpose, norms | M2, M3, R1, R3 | `[ ]` |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
-| 10.5 | Indexing and convolution | D4, D6 | `[ ]` |
+| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
@@ -87,6 +89,9 @@ it, and a line that does not apply says why in the item.
 6. **Findings logged**: every ttsim refusal or ttsim/silicon disagreement met on the way
    is a row in `ttsim-divergence.md`, and every measured fact a "Measured, not quoted"
    entry.
+7. **Padding declared** (F0, from `tt-metal-concepts-review.md` G1): the op states the pad
+   it needs from each input and the pad it leaves (`OpPadding`), and a ragged-shape gate
+   chains it into an accumulation.
 
 An op that works only on silicon (ttsim refuses an instruction it needs) can be ticked
 with the simulator line `[-]` and the divergence row cited, as `DOTPV` is today.
@@ -110,13 +115,13 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 
 | Group | Instructions | Enc | Helper | Kernel | Sim | Si | Item |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x | | x | x | F2, F3 |
-| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x | | x | x | S1 |
+| Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
+| Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
 | Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
-| Move / abs | `SFPMOV`, `SFPABS` | x | | | x | x | S2 |
-| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | | | | | S2, S4, S6 |
-| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | | | | | S2 |
-| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | | | | | F2 |
+| Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
+| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | `~` `SFPSETSGN` | | `~` `SFPSETSGN` | `~` `SFPSETSGN` | S2, S4, S6 |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
+| Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
@@ -149,26 +154,29 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 
 | Feature | State | Item |
 |---|---|---|
-| Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums | `[x]` | -- |
-| `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[ ]` | F1 |
-| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | F1, D1 |
+| Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums, a datum sub-run of a tile (base moved) | `[x]` | -- |
+| `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
+| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
 | Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[ ]` | D3 |
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
 
-### Frontend and scheduling
+### Frontend and tracing
 
-These are Phase 9 items, listed so the inventory is whole; they are tracked in the
-checklist, not here.
+Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
+`BabyRISCV/AutoTTSync.md` (the expanders and the Wait Gate), `DebugTimestamper.md`.
 
-| Feature | Where tracked |
-|---|---|
-| `MOP` / `MOP_CFG` expansion, `REPLAY` | checklist Phase 9 |
-| `.ttinsn` fusion (four pushes per cycle) | checklist Phase 9 |
-| Hazards as data, the wait planner | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
-| Three-thread pipelining, double buffering | checklist 9.8 |
+| Feature | Enc | Helper | Kernel | Sim | Si | Item |
+|---|:-:|:-:|:-:|:-:|:-:|---|
+| `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
+| `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
+| Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
+| Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
+| `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
+| Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
+| Three-thread pipelining, double buffering | -- | | | | | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
 
@@ -200,55 +208,187 @@ Pulled in only when a kernel needs them; each says which.
 In dependency order. Each names the Burn methods it unlocks; the Burn table below is the
 reverse index.
 
+### X — Frontend expanders and tracing
+
+- [x] **X1 `REPLAY`.** Done for SFPU row loops (`tt_isa::frontend::{record, replay}`,
+      `REPLAY_BUFFER`; `Program::for_each_row_group`); `step26_sfpu_isa` runs every
+      case replayed and unrolled against one interpreter tile, ttsim and both cards,
+      and ttsim models `REPLAY` (no divergence). Was: `tt_isa::frontend::replay`: `record(slot, body, exec)` and
+      `replay(slot)`, over a per-thread `ReplaySlots` allocator of the 32-entry buffer that
+      refuses overlap, a body over 32 and a nested `REPLAY`. The buffer is per-thread state
+      that survives between programs (divergence rows 47, 49), so a program records before
+      it replays. F2's row-group loop records its body once and replays it where it fits,
+      unrolling (and saying so) where it does not. Gate: replayed programs bit-identical to
+      their unrolled form on ttsim and both cards.
+- [ ] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
+      after `MOPExpanderDoneCheck` (`ManualTTSync.md:57`); Auto TTSync takes the `MOP`'s
+      resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
+      unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
+      down; silicon time measured.
+- [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
+      mover brackets each list and each top-level entry or record with timestamper events
+      when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,
+      the op or record kind as detail); role runners record start/pushed/retired per run
+      under `Resident::set_profiling`. `Session::profile_start`/`profile_stop` arm every
+      unit, drain each stream after every wave (so the 1024-event buffer bounds a wave,
+      not a profile), and return a `DeviceProfile`: spans per unit, checked to nest,
+      Chrome trace JSON on the host's time line, the clock measured (row N).
+      `TT_PROFILE=<path>` profiles a whole burn-tt attachment. Helper/oracle: unit tests
+      of the token layout, pairing, refusal of a non-nesting stream and the export.
+      Gates (`step23_profile`): on ttsim, profiling refused with its reason and the
+      session usable after; on silicon (both cards), two tiles running an add and a
+      ragged matmul -- every entry inside a list, exactly one run of each role inside
+      each `KERNEL` entry, no role run outside one -- and 300 lists on one tile, more
+      than the buffer holds, none lost. Watched failing with the drain disabled (the
+      overflow refusal). Sim `[-]`: row 54. First use: row O, the reduced-MNIST
+      breakdown. Burn: not applicable (no op).
+- [ ] **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
+      capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
+      B streaming the list from GDDR; a trace binds its tensors and refuses to replay
+      after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes
+      per step down to the descriptors.
+
+### P — Prerequisites pulled in when they block
+
+- [ ] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
+      `prod(leading)` stacked tile grids, a batch stride in `TensorRef` (0 = broadcast),
+      last-dim-preserving reshapes as views. Blocks R1 over leading dims, R3, D6, R4.
+- [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
+      a matmul's K is not capped by L1. Blocks D6's im2col.
+
 ### F — SFPU foundation (blocks every S item)
 
-- [ ] **F0 Padding is a property of the tensor, not an assumption.** Today a ragged
-      edge tile's padding is zero only until an op writes it: `ADD_ROW` puts the bias
-      there and `COL_SUM` sums it (checklist Phase 9, open bug). Every SFPU op makes
-      this worse (`exp(0) = 1`). Each `DramTensor` carries its pad state; each op
-      declares the pad it needs and the pad it leaves, and the runtime refills edge
-      tiles only when they differ. Design in `tt-metal-concepts-review.md` G1. First
-      gate: a 50-row `add` then `sum_dim(0)` against `burn-flex`, which should fail
-      before the fix.
-- [ ] **F1 Whole-tile `Dst` round trip.** One 32×32 FP32 tile from GDDR into `Dst` by
-      `UnpackToDst` and packed back, every datum checked, on the three roles. Phase 5
-      did 128 datums; the step 8 lane map (`SFPLOAD`/`SFPSTORE` reach the even or the odd
-      columns of a four-row group) decides how the SFPU walks it. BF16: on silicon by
-      `UnpackToDst` (`silicon_measure::m08`), on ttsim through `Src` and `MOVA2D`
-      (row 31), whichever the kernel then uses on both.
-- [ ] **F2 An SFPU program builder in `tt_isa::sfpu`.**
-  - [ ] An `LReg` newtype: 0–7 writable; 8–10 and 15 read-only constants; 11–14 only
-        through `SFPCONFIG`; 16 refused. Replaces the `u32` register arguments.
-  - [ ] Tile iteration: a program body written once over "a row group of lanes" and
-        expanded over the tile's row groups and both column halves.
-  - [ ] Conditional execution as a scope: `SFPSETCC`/`SFPPUSHC`/`SFPCOMPC`/`SFPPOPC`/
-        `SFPENCC` emitted balanced by construction (`if`/`else` closures), the stack depth
-        tracked so `SFPPOPC`'s complex modes are refused on a full stack (Tier 2 bug).
-  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as named, loaded-once program prologue.
-  - [ ] `stalls_automatically_after_mad` applied by the builder, so an `SFPNOP` is
-        inserted exactly where the documentation says automatic stalling misses.
-- [ ] **F3 The SFPU tile kernel.** T0 unpacks to `Dst`, T1 runs the SFPU program over the
-      tile, T2 packs; the hand-offs by semaphores; buffers and semaphores declared through
-      `tt_kernels::l1::Requirements`, programs through the program cache. Unary, binary
-      (two operands in two `Dst` regions) and binary-with-scalar shapes.
-- [ ] **F4 Dispatch without new firmware.** A `record::SFPU` (op id, scalar parameters,
-      tensor refs) that expands, like `ELTWISE`, into gathers, one `KERNEL` entry and
-      scatters; a host-side registry from op id to program builder. Adding an op is then
-      a builder and a gate, not a new arm in `dm_b.rs`.
-- [ ] **F5 Oracles.** `tt_isa::numerics` grows ports of the functional models named in
-      "Definition of done", each with a test against the page's pseudocode; a host
-      interpreter that runs an SFPU program over a tile through them, so any kernel's
-      expected output is computed, not hand-derived.
+- [x] **F0 Padding is a property of the tensor, not an assumption.** `DramTensor`
+      carries `pad: Pad` (`Zero` | `Undefined`; a tensor with no ragged edge is
+      always `Zero`), upload sets `Zero`, and every op implements `OpPadding`
+      (`requires(input) -> PadNeed`, `produces(inputs) -> Pad`, from the op's
+      algebra: `ADD_ROW` and `MUL_SCALAR` by a non-finite scalar leave
+      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). `COL_SUM` reads
+      only a ragged tensor's valid rows (`record::SUM`'s `last_rows`, the compute
+      entry's new parameter word) and zeroes its result's padding rows, so it
+      needs nothing; the matmul needs `Zero` on both operands, which the session
+      supplies by `record::FILL_PAD` over the edge tiles only, in place on a
+      tensor that owns its slots and through a bit-exact copy (`kind::COPY`) for a
+      view, so a parent's padding -- and its views' claims -- are never changed by
+      a view's fill. MNIST's tensors need no fill (its ragged ones are uploads and
+      matmul outputs), so the golden and the 9.5 budget are unchanged. Unit tests:
+      the fill touches each edge tile exactly once with the right valid region,
+      over three channel masks and 1/3/8 units; each op's declared pad; the
+      masked `SUM` record still expands to its reference builder's entries; the
+      compute entry's parameter is refused where a kind takes none or out of
+      range. Gates: `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`
+      (un-ignored) and `step24_padding` -- {`ADD_ROW`, `MUL_SCALAR(inf)`, `RELU`}
+      into the column sum and into matmuls with a ragged `K` in either operand and
+      orientation, dirty on both sides of `K`, at `[37, 70]` and `[50, 40]`,
+      against Flex bit for bit; every `pad()` claim checked against the raw tiles
+      (`Session::download_padded`); a view of a dirty tensor filled through a copy
+      with the parent's tiles untouched. Watched failing with the fills skipped
+      (both tests, and step19) and with the sum unmasked. ttsim and both cards.
+- [x] **F1 Whole-tile `Dst` round trip** (FP32; BF16 moves to D1, its first user).
+      A tile image's 1024 datums unpack as one flat run (`datapath::tile_descriptor`),
+      which lays the four faces down sixty-four `Dst` rows in the packer's order;
+      `datapath::unpack_tile_to_dst(l1, row)` retargets unpacker 0's base and
+      `REG5_Dest_cntx0_address` (`Dst` row = `OutAddr/16 - 4`) between tiles, and
+      `pack_tile_from_dst(l1, row)` rewrites the packer's configuration with
+      `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` = `row` (`Offset << 4` datums). Gate
+      `step25_dst_tile`: two tiles (normals across the exponent range, both zeros,
+      both infinities, the extremes) into rows 0 and 64, packed back from 64 first,
+      and an SFPU walk -- sixteen row groups, both column halves, `SFPLOAD`/`SFPSTORE`
+      -- copying rows 0..64 to 128..192, packed back as the tile: 3072 datums bit for
+      bit. Watched failing with the odd half skipped and with the second tile's row
+      off by four. ttsim and both cards; no divergence.
+- [~] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
+      registers in `tt_isa::sfpu`). Gate: `step26_sfpu_isa` (below, with F5).
+  - [x] An `LReg` newtype (`tt_isa::sfpu::LReg`): `LReg::general(0..8)` writable,
+        `ZERO`/`ONE`/`C0_8373`/`LANE_X2` read-only, `ConfigLReg` 11–14 readable only,
+        16 not offered; a write to a non-writable one panics while building.
+  - [x] Tile iteration: `Program::for_each_row_group(rows, body)` -- the body written
+        once, handed an address offset; replayed through X1 when it fits (row
+        counter stepped by address modifier 7 on its last `Dst` access, entry 0 at no
+        increment, the counter cleared before and after), unrolled otherwise, and
+        `Program::loops` says which.
+  - [x] Conditional execution as a scope: `if_`, `if_else` emit `SFPPUSHC`,
+        `SFPSETCC`, `SFPCOMPC`, `SFPPOPC` balanced; depth tracked, a ninth level
+        refused; only the plain push and pop are ever emitted, so the Tier 2
+        `SFPPOPC` case cannot arise (and `SFPPOPC.md` contradicts itself on whether
+        Blackhole still has it).
+  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue -- with its first
+        user (S4's polynomial constants).
+  - [x] An `SFPNOP` exactly where `stalls_automatically_after_mad` says stalling
+        misses -- after any MAD-sub-unit instruction (`SFPMAD`, `SFPMUL`, `SFPADD`,
+        `SFPMULI`, `SFPADDI`, `SFPMUL24`, `SFPLUT`, `SFPLUTFP32`) -- including across
+        a replayed body's wrap-around; unit-tested to appear once, in the right
+        place.
+- [x] **F3 The SFPU tile kernel** (`tt_kernels::sfpu::kernel`). T0 unpacks each tile's
+      `A` to `Dst` rows 0..64 and `B` to 64..128 -- or, for a row broadcast, `B`'s row 0
+      laid four times per face into rows 64..72 by sub-run unpacks
+      (`datapath::unpack_datums_to_dst`, the base moved because an uncompressed unpack
+      always starts at datum 0) -- T1 runs the op's program writing rows 128..192, T2
+      packs them; three semaphores (`unpacked`, `computed`, `free`), declared through
+      `crate::l1` in the order that numbers them as a matmul's are, so the two
+      alternate with no setup run; slots planned in the data arena. Unary, binary and
+      row-broadcast shapes; binary-with-scalar is a unary program with an immediate.
+      Every role carries the state it needs (G11): found on the way, a matmul leaves
+      unpacker 0's ADC Z at its last face and the next kernel read the wrong datums --
+      the unpack role now clears the ADCs, `unpack_config` always writes descriptor
+      words 0 and 1, and every SFPU program starts with address modifier 0 at no
+      increment and the `Dst` row counter cleared. Gated through S1 and `step19`.
+- [x] **F4 Dispatch without new firmware** for SFPU ops; two new mover records for the
+      operands. `tensor::sfpu_eltwise` makes each run of tiles a job: `READ_RUN`
+      (operands into consecutive slots, with a row-broadcast flag), `Step::Kernel`,
+      `WRITE_RUN` (outputs back) -- the matmul's gather/kernel/scatter shape, since the
+      session patches only top-level `KERNEL` entries. Programs memoised by op, scalar
+      and run length; the run length is measured from the programs, the longest whose
+      role programs fit a slot (`ADD_ROW`'s unrolled loop gets shorter runs -- found by
+      MNIST's evaluation batch on one tile, now `step19::the_longest_runs_fit_and_match_flex`,
+      watched failing with code 8 without it). Adding an op is a program in
+      `sfpu::ops` and a gate. `EltwiseUnit::{Auto, Sfpu, Mover}`: `Auto`, the default,
+      picks by `tensor::sfpu_is_cheaper`, a linear cost model per op from
+      `silicon_perf::eltwise_unit_sweep` (measurement Q); `TT_ELTWISE=auto|sfpu|mover`
+      for burn-tt.
+- [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
+      register nothing has established is `None`, and reading it is refused), per-lane
+      `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
+      and address modifiers, the replay buffer (`REPLAY` expanded by its own model),
+      and `Dst`; one functional model per instruction, transcribed from its page, and
+      anything without one refused by name. Modelled so far: `SFPLOAD`/`SFPSTORE`
+      (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
+      `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
+      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPNOP`, and the `SETRWC`/`SETC16`
+      forms the builder emits. **Plan change:** each S item adds the models it
+      needs, and where a page defines a self-contained C function (`ApproxRecip`,
+      `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
+      against that C extracted from the pinned page and compiled as `fma.c` is;
+      the per-instruction ground truth is `step26_sfpu_isa` on the device.
+      Gate `step26_sfpu_isa`: fourteen builder programs (add, sub, mul, mad with a
+      two-half immediate, negated mad, a mad into its own operand then read, mov,
+      neg, abs, set sign, a BF16 immediate, a relu scope, if-else, three nested
+      scopes over every condition) over two tiles of every special (both zeros and
+      infinities, NaNs of both signs, denormals, extremes), each replayed and
+      unrolled, the device tile equal to the interpreter's bit for bit on ttsim and
+      both cards; `LReg[8]` measured (row P). Watched failing with a wrong `SFPABS`
+      model (silicon refuses it at the negative-NaN datum).
 - [ ] **F6 (optional) A Burn coverage generator.** `cargo xtask burn-coverage --check`,
       reading `OVERRIDDEN` and the pinned traits, so the table below cannot rot.
 
 ### S — SFPU operations
 
-- [ ] **S1 Today's element-wise ops on the SFPU** (was checklist 9.9): `ADD`, `SUB`, `MUL`,
-      `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`. `fma_bh` says the results equal
-      the B core's for every normal case; the gate is `step19_eltwise` bit-identical and
-      the MNIST golden unchanged. The B-core path stays, as the reference and the fallback.
-      Burn: no new methods; `float_add_scalar`, `float_sub_scalar` come free.
+- [x] **S1 Today's element-wise ops on the SFPU** (was checklist 9.9): `ADD`, `SUB`,
+      `MUL`, `MUL_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW`, and new `ADD_SCALAR`
+      (mover and SFPU) for `float_add_scalar`/`float_sub_scalar` (`x - s` as `x + -s`,
+      the same bits). `RELU`'s predicate is the mover's integer test, `+0 < x <= +inf`,
+      as two `SFPGT`s in the total order. Oracle: each program equals the mover's
+      arithmetic in the interpreter over every special (`sfpu::ops` unit test). Gates:
+      `step19_eltwise::every_kind_matches_flex_bit_for_bit` on both units, forced, over
+      both zeros, infinities, NaNs, denormal-adjacent values at `[37, 70]`, `[64, 128]`,
+      `[784, 128]`; the padding and long-run tests; `step27_burn_eltwise` (every
+      overridden element-wise method on resident tensors against Flex, no upload or
+      download during the op; in `SMOKE`; watched failing with `sub_scalar`'s sign
+      unflipped); the MNIST golden bit for bit at 1 and 4 tiles with the 9.5 budget;
+      ttsim and both cards. **Measured** (Q, R): per op the SFPU costs ~26 us + ~3 us a
+      tile against the mover's ~9 us + 8-22 us a tile, so small ops spread over many
+      units stay on the mover; full MNIST 5.1 -> 3.8 ms/step on one tile, 2.5 -> 2.4 on
+      eight, 2.3 on 32, accuracy 91.96%.
 - [ ] **S2 Compare, select, sign.** `SFPGT`/`SFPLE`/`SFPSETCC` writing 1.0/0.0, `SFPSWAP`'s
       min/max mode, `SFPABS`, `SFPSETSGN`. Burn: `float_{equal,not_equal,greater,
       greater_equal,lower,lower_equal}{,_elem}`, `float_mask_where`, `float_mask_fill`,
@@ -338,11 +478,11 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
-| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (B core) | S1 |
+| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (SFPU or mover by size) | S1 |
 | `float_sum_dim` | `~` dim 0 only (B core) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
-| `float_add_scalar`, `float_sub_scalar` | | S1 |
+| `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
 | `float_div{,_scalar}`, `float_recip`, `float_remainder{,_scalar}` | | S3 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
@@ -360,7 +500,7 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `relu`, `relu_backward` | x (B core) | S1 |
+| `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
 | `softmax`, `log_softmax`, `softmin` | | R2 |
@@ -398,8 +538,8 @@ the item that must handle each. An item is not done while its hazard here is ope
 
 | Hazard | Source | Item |
 |---|---|---|
-| `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 |
-| `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 |
+| `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 -- closed: the builder inserts the NOP |
+| `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 -- closed: never emitted |
 | `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 |
 | `SFPSTOCHRND` biased; round-toward-zero sometimes rounds away | Tier 2 | S6 |
 | `SFPCAST_IntAbs` computes absolute value | Tier 2 | S5, S6 |
@@ -414,3 +554,29 @@ the item that must handle each. An item is not done while its hazard here is ope
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
+
+---
+
+## Execution
+
+**Branches.** One per milestone, stacked: `phase10-0-sfpu-foundation` off `main`, each
+later milestone off the previous one (`phase10-1-softmax`, `phase10-2-activations`,
+`phase10-3-reductions`, `phase10-4-formats`, `phase10-5-indexing-conv`, `phase10-6-rest`).
+A milestone's branch is green on ttsim and both cards before the next one starts.
+
+**Per item.** The `tt-isa` helper and its unit tests; the oracle; the ttsim gate, watched
+failing once; `cargo xtask silicon --release --device all --filter <gate>`; the Burn
+override with its Flex comparison, residency check and `SMOKE` entry; then the docs, in the
+same commit as the code:
+
+1. here: the item ticked, its inventory row's columns, its Burn table rows, its hazard row
+   closed, the milestone's state, the date in "Where things stand";
+2. `ttsim-divergence.md`: a numbered row per refusal or disagreement, a lettered row per
+   measurement, cited from the item;
+3. `implementation-checklist.md`: the Tier 2 bug entries and silicon-verification backlog
+   entries the item settles, and the milestone line `10.N` when it closes;
+4. at a milestone's close, `RUST_IMPL_PLAN.md`'s Phase 10 status and any
+   `burn-backend-parity.md` row that cites the item.
+
+**Order inside 10.0.** X3 (so S1's gain is measured on the device), F0, F1, F2 with X1, F5,
+F3, F4, S1, F6.

@@ -498,12 +498,26 @@ pub struct Resident<N: NocId> {
     /// definitions too, which cost more than the PCIe writes it saved
     /// (`MEASURED`: 14 us per descriptor write, on silicon).
     slots: std::cell::RefCell<[Vec<u32>; 3]>,
-    /// The semaphore set the tile is known to hold, as initialised: set by a
-    /// setup run, kept by kernels that restore it, dropped by anything else.
+    /// The semaphores the tile is known to hold, as `(semaphore, value, max)`:
+    /// set by a setup run, kept by kernels that restore theirs, dropped by
+    /// anything else. A kernel touches only the semaphores it declares, so the
+    /// others' entries stay true across it -- which is what lets a matmul and
+    /// an SFPU kernel whose initial values agree alternate with no setup run
+    /// between them.
     semaphores: Option<Vec<SemaphoreInit>>,
+    /// What [`Resident::semaphores`] becomes once the kernel staged by
+    /// [`Resident::begin`] completes and restores its own.
+    semaphores_after: Option<Vec<SemaphoreInit>>,
+    /// Each role's descriptor words as last written, but for the program's
+    /// address and length (which a `KERNEL` entry rewrites on the tile): a
+    /// word that already holds its value is not written again.
+    descriptors: std::cell::RefCell<[Option<[u32; 8]>; 3]>,
     /// A [`Resident::submit`]ted kernel's phases so far, until it is
     /// [`Resident::complete`]d.
     pending: Option<Stopwatch>,
+    /// Every run's roles record their progress through the timestamper, into
+    /// a stream the host configured and drains itself (`crate::profile`).
+    profiling: bool,
 }
 
 impl<N: NocId> Resident<N> {
@@ -524,7 +538,10 @@ impl<N: NocId> Resident<N> {
             poisoned: false,
             slots: Default::default(),
             semaphores: None,
+            semaphores_after: None,
+            descriptors: Default::default(),
             pending: None,
+            profiling: false,
         };
         for thread in 0..3 {
             r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
@@ -541,6 +558,14 @@ impl<N: NocId> Resident<N> {
 
     pub fn tile(&self) -> NocCoord<N> {
         self.tile
+    }
+
+    /// Have every later run's roles record their progress through the tile's
+    /// timestamper, whose stream the caller has configured and will read
+    /// (`crate::profile`). A kernel that asks for its own trace
+    /// (`Kernel::trace`) reconfigures the stream, so it is refused meanwhile.
+    pub fn set_profiling(&mut self, on: bool) {
+        self.profiling = on;
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on
@@ -702,8 +727,8 @@ impl<N: NocId> Resident<N> {
             self.semaphores = None;
             return Ok(());
         }
-        if let Schedule::Concurrent(init) = kernel.schedule {
-            self.semaphores = Some(init.to_vec());
+        if let Schedule::Concurrent(_) = kernel.schedule {
+            self.semaphores = self.semaphores_after.take();
         }
         Ok(())
     }
@@ -745,8 +770,23 @@ impl<N: NocId> Resident<N> {
         // The setup only initialises semaphores (nothing to clear), and they
         // already hold that: nothing to do.
         let clears = kernel.clear_dst && kernel.dump_rows > 0;
-        let skip_setup = !clears && init.is_some() && self.semaphores == init;
-        self.semaphores = None;
+        let known = self.semaphores.take();
+        let holds = match (&init, &known) {
+            (Some(i), Some(k)) => i.iter().all(|e| k.contains(e)),
+            _ => false,
+        };
+        let skip_setup = !clears && holds;
+        // After the kernel: its own semaphores as it found them, everyone
+        // else's untouched.
+        self.semaphores_after = init.as_ref().map(|i| {
+            let mut after: Vec<SemaphoreInit> = known
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(s, ..)| !i.iter().any(|(t, ..)| t == s))
+                .collect();
+            after.extend(i.iter().copied());
+            after
+        });
         if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
             self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true)?;
@@ -756,6 +796,12 @@ impl<N: NocId> Resident<N> {
                 return Err(RunError::Setup(e));
             }
             clock.lap(dev, Phase::Setup);
+        }
+        if kernel.trace && self.profiling {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: mailbox::TRACE_BUFFER,
+                reason: "a traced kernel would reset a profile's timestamper stream",
+            }));
         }
         if kernel.trace {
             dev.configure_trace(
@@ -776,7 +822,7 @@ impl<N: NocId> Resident<N> {
                 thread,
                 program,
                 dump,
-                kernel.trace,
+                kernel.trace || self.profiling,
                 kernel.dst_fmt,
                 false,
             )?;
@@ -806,8 +852,10 @@ impl<N: NocId> Resident<N> {
             self.poisoned = true;
             return Err(RunError::Roles(stuck));
         }
-        if kernel.restores_semaphores {
-            self.semaphores = init;
+        if kernel.restores_semaphores && init.is_some() {
+            self.semaphores = self.semaphores_after.take();
+        } else {
+            self.semaphores_after = None;
         }
         let tile = self.tile;
         let math = Mailbox::of(1);
@@ -894,9 +942,19 @@ impl<N: NocId> Resident<N> {
             push_window,
             ..Default::default()
         };
-        for (at, v) in d.writes(mb) {
-            dev.write32(w, tile, at, v)?;
+        let mut descs = self.descriptors.borrow_mut();
+        let last = descs[thread];
+        // Forget it first: if a write fails, the cache claims nothing.
+        descs[thread] = None;
+        let writes = d.writes(mb);
+        for (k, &(at, v)) in writes.iter().enumerate() {
+            let rewritten_on_tile = at == mb.program_len() || at == mb.program_addr();
+            if rewritten_on_tile || last.is_none_or(|l| l[k] != v) {
+                dev.write32(w, tile, at, v)?;
+            }
         }
+        descs[thread] = Some(writes.map(|(_, v)| v));
+        drop(descs);
         let mut slots = self.slots.borrow_mut();
         let words = program.iter().map(|i| i.word());
         if !program.is_empty() && !slots[thread].iter().copied().eq(words.clone()) {

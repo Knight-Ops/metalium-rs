@@ -27,7 +27,8 @@ fn rd(addr: u64) -> u32 {
 }
 
 fn wr(addr: u64, v: u32) {
-    // SAFETY: as `rd`.
+    // SAFETY: as `rd`, or the timestamper's `TIMESTAMP` register, where a
+    // store only appends an event.
     unsafe { l1_write32(addr, v) }
 }
 
@@ -83,7 +84,7 @@ fn transpose_from_scratch(dst: u64) {
 }
 
 /// One compute entry over the 1024 datums of three tile slots (`dm::kind`).
-fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
+fn compute(kind: u32, s: u32, param: u32, dst: u64, a: u64, b: u64) {
     let (dst, a, b) = (dst + dm::TILE_DATA, a + dm::TILE_DATA, b + dm::TILE_DATA);
     // Same-shape kinds pair datum i with datum i whatever the face order, so
     // they walk the tile straight through (`tt_firmware::float`'s loops).
@@ -96,7 +97,18 @@ fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
             dm::kind::SUB => float::sub_n(pd, pa, pb, 1024),
             dm::kind::MUL => float::mul_n(pd, pa, pb, 1024),
             dm::kind::MUL_SCALAR => float::mul_scalar_n(pd, pa, s, 1024),
-            dm::kind::COL_SUM => col_sum(s != 0, dst, a),
+            dm::kind::COL_SUM => col_sum(s != 0, dm::kind::extent(param) as usize, dst, a),
+            dm::kind::FILL_PAD => fill_pad(s, param, dst),
+            dm::kind::ADD_SCALAR => {
+                for i in 0..1024 {
+                    *pd.add(i) = float::add(*pa.add(i), s);
+                }
+            }
+            dm::kind::COPY => {
+                for i in 0..1024 {
+                    *pd.add(i) = *pa.add(i);
+                }
+            }
             _ => per_datum(kind, dst, a, b),
         }
     }
@@ -104,16 +116,36 @@ fn compute(kind: u32, s: u32, dst: u64, a: u64, b: u64) {
     publish();
 }
 
-/// `dm::kind::COL_SUM`: row 0 of `dst` accumulates each column of `a`, rows
-/// in order. The addresses are the datums' (past the header).
-fn col_sum(first: bool, dst: u64, a: u64) {
+/// `dm::kind::COL_SUM`: row 0 of `dst` accumulates each column of `a`'s
+/// first `rows` rows, in order; the first tile of a column also zeroes `dst`'s
+/// other rows. The addresses are the datums' (past the header).
+fn col_sum(first: bool, rows: usize, dst: u64, a: u64) {
     for c in 0..32usize {
         let at = dst + dm::face_index(0, c) as u64 * 4;
         let mut acc = if first { 0 } else { rd(at) };
-        for r in 0..32usize {
+        for r in 0..rows {
             acc = float::add(acc, rd(a + dm::face_index(r, c) as u64 * 4));
         }
         wr(at, acc);
+        if first {
+            for r in 1..32usize {
+                wr(dst + dm::face_index(r, c) as u64 * 4, 0);
+            }
+        }
+    }
+}
+
+/// `dm::kind::FILL_PAD`: `v` at every datum of `dst` outside its first
+/// `param & 0xff` rows and `param >> 8` columns (`0` meaning 32).
+fn fill_pad(v: u32, param: u32, dst: u64) {
+    let rows = dm::kind::extent(param & 0xff) as usize;
+    let cols = dm::kind::extent(param >> 8) as usize;
+    for r in 0..32usize {
+        for c in 0..32usize {
+            if r >= rows || c >= cols {
+                wr(dst + dm::face_index(r, c) as u64 * 4, v);
+            }
+        }
     }
 }
 
@@ -188,6 +220,17 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
     Ok(())
 }
 
+/// Record `event` through the tile's timestamper, if this list is traced
+/// (`dm::TRACE`). One 128-bit event per store, so the mover's events and the
+/// role runners' share one stream without interleaving.
+fn trace(on: bool, event: u32, detail: u32) {
+    use tt_isa::mailbox::trace as ev;
+    use tt_isa::tensix::timestamper as ts;
+    if on {
+        wr(ts::TIMESTAMP, ts::event_128(ev::token_with(ev::MOVER, event, detail)));
+    }
+}
+
 /// Run one descriptor to completion.
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
@@ -220,11 +263,18 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             noc::wait(TXN);
             publish();
         }
-        Entry::Compute { kind, scalar, dst, a, b } => {
+        Entry::Compute {
+            kind,
+            param,
+            scalar,
+            dst,
+            a,
+            b,
+        } => {
             // Its operands may still be arriving.
             noc::wait(TXN);
             publish();
-            compute(kind, scalar, dst as u64, a as u64, b as u64);
+            compute(kind, scalar, param, dst as u64, a as u64, b as u64);
         }
     }
     Ok(())
@@ -244,14 +294,22 @@ fn entry(i: u64) -> [u32; 8] {
 /// (`dm::record`) is expanded here, on the tile, into the entries the host
 /// would otherwise have sent, and each runs exactly as a sent one would --
 /// through `Entry::decode` and every refusal in it.
+///
+/// With `dm::TRACE` set, the list, and each entry or record in it, is
+/// bracketed by timestamper events (`tt_isa::mailbox::trace`); a record's
+/// expanded moves are not, so the events per list stay bounded by its length.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
+    use tt_isa::mailbox::trace as ev;
     if count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
+    let traced = rd(dm::TRACE) != 0;
+    trace(traced, ev::LIST_BEGIN, count);
     let mut i = 0u64;
     while i < count as u64 {
         let head = entry(i);
         let n = record::len(head[0]) as u64;
+        trace(traced, ev::ENTRY_BEGIN, head[0]);
         if n == 1 {
             exec(me, usable, head)?;
         } else {
@@ -264,9 +322,11 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
             }
             record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
         }
+        trace(traced, ev::ENTRY_END, head[0]);
         i += n;
     }
     noc::wait(TXN);
+    trace(traced, ev::LIST_END, count);
     Ok(())
 }
 

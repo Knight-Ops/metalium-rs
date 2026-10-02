@@ -4,12 +4,21 @@
 //! and write it there, so what crosses PCIe per op is descriptors, not data.
 //!
 //! A [`DramTensor`] is a row-major `[rows, cols]` FP32 matrix stored as 32x32
-//! tiles, one `tt_isa::dm::TILE_SLOT` each (zero-padded at the ragged edges,
-//! which is the identity for every accumulation), interleaved across the chip's
+//! tiles, one `tt_isa::dm::TILE_SLOT` each, interleaved across the chip's
 //! usable channels: tile `t` of the row-major tile grid lives on channel
 //! `channels[t % n]`, slot `t / n` of the tensor's region there. Spreading tiles
 //! over channels is what lets later work read them in parallel; for now it also
 //! means the allocator's regions stay small.
+//!
+//! **Padding.** A ragged tensor's edge tiles hold datums past its last row or
+//! column, and the hardware computes whole tiles, so what they hold reaches
+//! anything that accumulates over them. It is a property of the tensor, not an
+//! assumption: [`DramTensor::pad`] says what the padding holds ([`Pad`]), every
+//! op says what it needs of its inputs' and what it leaves in its output's
+//! ([`OpPadding`]), and the session refills edge tiles -- only those, so the
+//! cost is the perimeter, never the area -- when a need and a pad differ
+//! (`hardware-coverage.md` F0, `tt-metal-concepts-review.md` G1). Upload
+//! writes zeros.
 
 use std::collections::BTreeMap;
 
@@ -90,6 +99,11 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// Did this placement allocate its slots, or is it a view of another's?
+    pub fn owned(&self) -> bool {
+        self.owned
+    }
+
     /// Tile `t`'s slot.
     pub fn slot(&self, t: usize) -> DramRange {
         assert!(t < self.tiles, "tile {t} of {}", self.tiles);
@@ -195,15 +209,67 @@ fn release(free: &mut BTreeMap<u64, u64>, at: u64, len: u64) {
     free.insert(at, len);
 }
 
+/// What a tensor's padding holds: the datums of its edge tiles past its last
+/// row or column. A tensor with no ragged edge has none, and is always
+/// [`Pad::Zero`] (`DramTensor::set_pad`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Pad {
+    /// Zeros, of either sign: the identity of a sum, so a matmul's `K` and a
+    /// column sum may run over it.
+    Zero,
+    /// Whatever an op left there.
+    Undefined,
+}
+
+/// What an op needs of an input's padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PadNeed {
+    /// Nothing: the op never lets padding reach a real datum.
+    Any,
+    /// [`Pad::Zero`].
+    Zero,
+}
+
+/// An op's padding rules, as data: what it needs of each input's padding and
+/// what it leaves in its output's, from the op's algebra (`f(0) == 0` is a
+/// fact about `f`). Part of every device op's definition
+/// (`hardware-coverage.md`, Definition of done, line 7).
+pub trait OpPadding {
+    fn requires(&self, input: usize) -> PadNeed;
+    /// The output's padding, given the inputs' tensors (their pads and shapes).
+    fn produces(&self, inputs: &[&DramTensor]) -> Pad;
+}
+
 /// An FP32 `[rows, cols]` matrix in GDDR, tiled. See the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DramTensor {
     pub rows: usize,
     pub cols: usize,
     pub placement: Placement,
+    /// What the padding holds. Behind a cell because filling it changes no
+    /// element of the tensor: the session refreshes it through a shared
+    /// reference ([`DramTensor::set_pad`]).
+    pad: std::cell::Cell<Pad>,
 }
 
 impl DramTensor {
+    /// What the padding holds.
+    pub fn pad(&self) -> Pad {
+        self.pad.get()
+    }
+
+    /// Record what the padding holds. A tensor with no ragged edge has no
+    /// padding, which is trivially zero.
+    pub fn set_pad(&self, pad: Pad) {
+        self.pad
+            .set(if self.has_padding() { pad } else { Pad::Zero });
+    }
+
+    /// Does any tile hold datums past the last row or column?
+    pub fn has_padding(&self) -> bool {
+        self.rows % 32 != 0 || self.cols % 32 != 0
+    }
+
     /// Tile rows and columns.
     pub fn grid(&self) -> [usize; 2] {
         [self.rows.div_ceil(32), self.cols.div_ceil(32)]
@@ -235,11 +301,14 @@ impl DramTensor {
     /// Allocate a `[rows, cols]` tensor, contents undefined.
     pub fn alloc(alloc: &mut DramAlloc, rows: usize, cols: usize) -> Result<Self> {
         let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
-        Ok(DramTensor {
+        let t = DramTensor {
             rows,
             cols,
             placement: alloc.alloc(tiles)?,
-        })
+            pad: std::cell::Cell::new(Pad::Undefined),
+        };
+        t.set_pad(Pad::Undefined);
+        Ok(t)
     }
 
     /// Upload row-major `values`: tilized on the host once, then one bulk
@@ -282,6 +351,8 @@ impl DramTensor {
                 .expect("allocated");
             dev.dram_write(w, r, bytes)?;
         }
+        // `tilize_f32` pads with zeros.
+        t.set_pad(Pad::Zero);
         Ok(t)
     }
 
@@ -302,7 +373,7 @@ impl DramTensor {
                 self.rows
             )));
         }
-        Ok(DramTensor {
+        let v = DramTensor {
             rows,
             cols: self.cols,
             placement: Placement {
@@ -311,7 +382,12 @@ impl DramTensor {
                 owned: false,
                 ..self.placement.clone()
             },
-        })
+            pad: self.pad.clone(),
+        };
+        // A view that stops at a tile row has none of the parent's padding
+        // rows, only its padding columns: no better known than the parent's.
+        v.set_pad(self.pad());
+        Ok(v)
     }
 
     /// Download to row-major values: one bulk read per channel, or, for a
@@ -363,6 +439,29 @@ impl DramTensor {
             packed.extend_from_slice(&regions[c][at..at + 4096]);
         }
         Ok(matmul::detilize_packed(&packed, self.rows, self.cols))
+    }
+
+    /// Download every datum of every tile, padding included, as a row-major
+    /// `[32 * rt, 32 * ct]` matrix: what the hardware sees, for checking what
+    /// [`DramTensor::pad`] claims.
+    pub fn download_padded<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+    ) -> Result<Vec<f32>> {
+        let [rt, ct] = self.grid();
+        let mut packed = vec![0u8; rt * ct * 4096];
+        for i in 0..rt {
+            for j in 0..ct {
+                let s = self.tile(i, j);
+                let r = s
+                    .channel()
+                    .range(s.offset() + TILE_DATA, 4096)
+                    .expect("in the slot");
+                dev.dram_read(w, r, &mut packed[(i * ct + j) * 4096..][..4096])?;
+            }
+        }
+        Ok(matmul::detilize_packed(&packed, 32 * rt, 32 * ct))
     }
 }
 
@@ -580,6 +679,30 @@ pub struct Eltwise {
     pub scalar: f32,
 }
 
+/// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
+/// shape or, for `ADD_ROW`, one row as wide.
+fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
+    use tt_isa::dm::kind;
+    let binary = !matches!(
+        op.kind,
+        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+    );
+    let row = op.kind == kind::ADD_ROW;
+    match (binary, b) {
+        (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),
+        (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => Err(TensorError::Shape(
+            format!("[{}, {}] + row [{}, {}]", a.rows, a.cols, b.rows, b.cols),
+        )),
+        (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
+            Err(TensorError::Shape(format!(
+                "[{}, {}] and [{}, {}] differ",
+                a.rows, a.cols, b.rows, b.cols
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Element-wise `a (op) b` -- or `a (op) scalar` -- with everything in GDDR,
 /// computed tile by tile by the data mover's FP32 unit in L1
 /// (`tt_isa::dm::kind`). For `ADD_ROW`, `b` is `[1, cols]` and its row is
@@ -597,7 +720,11 @@ pub fn eltwise(
     units: usize,
 ) -> Result<Work> {
     use tt_isa::dm::kind;
-    let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU);
+    check_eltwise(op, a, b)?;
+    let binary = !matches!(
+        op.kind,
+        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+    );
     let row = op.kind == kind::ADD_ROW;
     match (binary, b) {
         (false, _) => {}
@@ -654,6 +781,202 @@ pub fn eltwise(
     Ok(Work { out, jobs })
 }
 
+/// Which unit computes an element-wise op. Both give the same bits
+/// (`step19_eltwise`); they differ in cost.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EltwiseUnit {
+    /// The data mover's FP32 unit, datum by datum (`tt_isa::dm::kind`).
+    Mover,
+    /// The SFPU, through `crate::sfpu::kernel` -- where the op has a program
+    /// (`crate::sfpu::ops`); the mover otherwise.
+    Sfpu,
+    /// Whichever [`sfpu_is_cheaper`] predicts is faster for the op's size.
+    #[default]
+    Auto,
+}
+
+/// Does the SFPU finish `kind` over `tiles` tiles on `units` units sooner than
+/// the mover? A linear model of each, per op: a fixed cost growing with the
+/// units (the host's per-unit submission; the SFPU's kernel reservation costs
+/// more than a list), plus a cost per tile of the largest share. The
+/// constants are `silicon_perf::eltwise_unit_sweep`'s, on card 0 (divergence
+/// measurement Q): the mover takes ~8 us a tile for the `fadd.s`-shaped kinds
+/// and ~22 us for the per-datum ones (`RELU`, `RELU_BACKWARD`, `ADD_ROW`), the
+/// SFPU ~2-4 us; a list costs ~9 us plus ~2 us a unit, a kernel ~26 us plus
+/// ~4.4 us a unit. So a small op spread thin stays on the mover and anything
+/// with a few tiles a unit goes to the SFPU.
+pub fn sfpu_is_cheaper(kind: u32, tiles: usize, units: usize) -> bool {
+    use tt_isa::dm::kind as k;
+    let per_unit = tiles.div_ceil(units.max(1)).max(1) as f64;
+    let u = units.max(1) as f64 - 1.0;
+    let (mover_tile, sfpu_tile) = match kind {
+        k::RELU | k::RELU_BACKWARD | k::ADD_ROW => (22.4, 2.4),
+        k::MUL_SCALAR | k::ADD_SCALAR => (7.9, 2.4),
+        _ => (7.9, 3.0),
+    };
+    let mover = 9.5 + 2.0 * u + per_unit * mover_tile;
+    let sfpu = 26.0 + 4.4 * u + per_unit * sfpu_tile;
+    sfpu < mover
+}
+
+/// [`eltwise`] on the SFPU: each run of tiles a job of three steps -- the
+/// mover gathers the run's operands into L1 (`record::READ_RUN`), the
+/// resident roles run the SFPU kernel over them (`crate::sfpu::kernel`), the
+/// mover scatters the outputs (`record::WRITE_RUN`). `None` when the op has no
+/// SFPU program.
+///
+/// The roles' programs are memoised by op, scalar and run length, so a
+/// model's repeated ops reuse them, and so does the program cache.
+pub fn sfpu_eltwise(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+    units: usize,
+) -> Result<Option<Work>> {
+    use crate::sfpu::kernel::Operands;
+    let Some((operands, _)) = crate::sfpu::ops::program(op.kind, op.scalar) else {
+        return Ok(None);
+    };
+    check_eltwise(op, a, b)?;
+    let group = sfpu_group(op, operands);
+    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let [rt, ct] = a.grid();
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let rb = b.map(DramTensor::tensor_ref);
+    let mut jobs = Vec::new();
+    for run in runs(rt * ct, units, group) {
+        let len = run.len();
+        let (layout, roles) = match sfpu_programs(op, operands, len) {
+            Ok(p) => p,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(e);
+            }
+        };
+        let read = |x: &TensorRef, at: u64, flags: u32| {
+            [
+                [
+                    record::READ_RUN,
+                    run.start as u32,
+                    len as u32,
+                    at as u32,
+                    flags,
+                    0,
+                    0,
+                    0,
+                ],
+                x.encode()[0],
+                x.encode()[1],
+            ]
+        };
+        let mut gather = read(&ra, layout.a_at, 0).to_vec();
+        if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
+            gather.extend(read(
+                rb,
+                b_at,
+                u32::from(operands == Operands::RowBroadcast),
+            ));
+        }
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![
+            Step::List {
+                what: "sfpu gather",
+                entries: gather,
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+            },
+            Step::List {
+                what: "sfpu scatter",
+                entries: scatter.to_vec(),
+            },
+        ]);
+    }
+    Ok(Some(Work { out, jobs }))
+}
+
+type SfpuPrograms = (crate::sfpu::kernel::Layout, Arc<[Vec<Instruction>; 3]>);
+
+/// Most tiles one SFPU run of `op` may take: 64, or fewer if the data arena
+/// cannot hold their slots or a role's program -- which grows by a fixed
+/// amount per tile -- would outgrow a program slot (`mailbox::PROGRAM_MAX`).
+/// Measured from the programs themselves, at one tile and at two, so an op
+/// with a long program (`ADD_ROW`'s unrolled loop) gets shorter runs rather
+/// than a refusal.
+#[cfg(test)]
+pub(crate) fn sfpu_group_for_tests(
+    kind: u32,
+    scalar: f32,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
+    sfpu_group(Eltwise { kind, scalar }, operands)
+}
+
+fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
+    const GROUP: usize = 64;
+    let lens = |n: usize| -> [usize; 3] {
+        let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
+        let (_, math) =
+            crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+        crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
+    };
+    let (one, two) = (lens(1), lens(2));
+    let max = tt_isa::mailbox::PROGRAM_MAX as usize;
+    let by_program = (0..3)
+        .map(|r| {
+            let per = two[r] - one[r];
+            let fixed = one[r] - per;
+            (max - fixed) / per.max(1)
+        })
+        .min()
+        .unwrap();
+    GROUP
+        .min(crate::sfpu::kernel::max_tiles(operands))
+        .min(by_program)
+        .max(1)
+}
+
+/// One run's layout and role programs, memoised by op, scalar and length.
+fn sfpu_programs(
+    op: Eltwise,
+    operands: crate::sfpu::kernel::Operands,
+    len: usize,
+) -> Result<SfpuPrograms> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Memo = Mutex<HashMap<(u32, u32, usize), SfpuPrograms>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op.kind, op.scalar.to_bits(), len);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Ok(p.clone());
+    }
+    let layout = crate::sfpu::kernel::plan_layout(len, operands)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (_, math) = crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+    let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
+    let p = (layout, roles);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, p.clone());
+    Ok(p)
+}
+
 /// The sum over rows of `a`, as a `[1, cols]` tensor, in `burn-flex`'s order:
 /// from `+0.0`, adding rows in order (`tt_isa::dm::kind::COL_SUM`).
 ///
@@ -675,7 +998,7 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
                 columns.len() as u32,
                 rt as u32,
                 stage as u32,
-                0,
+                (a.rows % 32) as u32,
                 0,
                 0,
             ],
@@ -690,6 +1013,114 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
         }]);
     }
     Ok(Work { out, jobs })
+}
+
+/// [`sum_rows`]'s padding rules. It reads only a ragged tensor's valid rows
+/// (`record::SUM`), so it needs nothing of the input's padding; its output's
+/// padding rows are zeroed, and its padding columns are sums of the input's.
+pub struct SumRows;
+
+impl OpPadding for SumRows {
+    fn requires(&self, _: usize) -> PadNeed {
+        PadNeed::Any
+    }
+    fn produces(&self, inputs: &[&DramTensor]) -> Pad {
+        let a = inputs[0];
+        if a.pad() == Pad::Zero || a.cols % 32 == 0 {
+            Pad::Zero
+        } else {
+            Pad::Undefined
+        }
+    }
+}
+
+/// [`matmul_dram`]'s padding rules. The Matrix Unit runs over whole tiles, so
+/// both operands' padding along `K` enters every product; zero there, and
+/// along `M` and `N`, gives zero in the output's padding too.
+pub struct MatmulPadding;
+
+impl OpPadding for MatmulPadding {
+    fn requires(&self, _: usize) -> PadNeed {
+        PadNeed::Zero
+    }
+    fn produces(&self, _: &[&DramTensor]) -> Pad {
+        Pad::Zero
+    }
+}
+
+impl OpPadding for Eltwise {
+    /// The data mover computes a tile's datums independently, so padding
+    /// never reaches a real datum.
+    fn requires(&self, _: usize) -> PadNeed {
+        PadNeed::Any
+    }
+    fn produces(&self, inputs: &[&DramTensor]) -> Pad {
+        use tt_isa::dm::kind;
+        let zero = |i: usize| inputs.get(i).is_some_and(|t| t.pad() == Pad::Zero);
+        let z = match self.kind {
+            // `0 (op) 0` is a zero.
+            kind::ADD | kind::SUB | kind::MUL => zero(0) && zero(1),
+            // `0 * s` is a zero unless `s` is infinite or NaN.
+            kind::MUL_SCALAR => zero(0) && self.scalar.is_finite(),
+            // `0 + s` is a zero only if `s` is.
+            kind::ADD_SCALAR => zero(0) && self.scalar == 0.0,
+            kind::RELU => zero(0),
+            kind::COPY => zero(0),
+            // `a > 0 ? g : 0`: zero where either is.
+            kind::RELU_BACKWARD => zero(0) || zero(1),
+            // The row goes into every row, padding rows included; a tensor
+            // with none keeps only padding columns, `0 + 0`.
+            kind::ADD_ROW => zero(0) && zero(1) && inputs[0].rows % 32 == 0,
+            _ => false,
+        };
+        if z {
+            Pad::Zero
+        } else {
+            Pad::Undefined
+        }
+    }
+}
+
+/// Set `t`'s padding to `value` in place: a [`record::FILL_PAD`] over its edge
+/// tiles only, dealt out in runs to `units` tiles. Nothing at all when `t`
+/// has no ragged edge.
+pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
+    const GROUP: usize = 192;
+    let [rt, ct] = t.grid();
+    let (rows, cols) = (t.rows % 32, t.cols % 32);
+    let edges = if rows != 0 { ct } else { 0 }
+        + if cols != 0 {
+            rt - usize::from(rows != 0)
+        } else {
+            0
+        };
+    if edges == 0 {
+        return Ok(Vec::new());
+    }
+    let stage = staging("fill-pad slots", GROUP)?;
+    let r = t.tensor_ref();
+    Ok(runs(edges, units, GROUP)
+        .into_iter()
+        .map(|run| {
+            vec![Step::List {
+                what: "fill-pad list",
+                entries: vec![
+                    [
+                        record::FILL_PAD,
+                        value.to_bits(),
+                        run.start as u32,
+                        run.len() as u32,
+                        rows as u32,
+                        cols as u32,
+                        stage as u32,
+                        rt as u32,
+                    ],
+                    r.encode()[0],
+                    r.encode()[1],
+                ],
+            }]
+        })
+        .collect())
 }
 
 /// Host wall-clock time in each stage of the DRAM ops, process-wide: where a
@@ -724,7 +1155,11 @@ pub mod stats {
 
 #[cfg(test)]
 mod tests {
-    use super::{blocks, reference, runs, DramAlloc, DramTensor, Eltwise, Job, Step};
+    use super::{
+        blocks, reference, runs, DramAlloc, DramTensor, Eltwise, Job, MatmulPadding, OpPadding,
+        Pad, PadNeed, Step, SumRows,
+    };
+    use tt_isa::dm::TILE_DATA;
     use tt_isa::dm::{kind, op, record};
     use tt_isa::dram::Dram;
 
@@ -861,6 +1296,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A fill touches exactly the edge tiles, each once, with the valid region
+    /// of the tile it is: the corner both edges', the rest one edge's.
+    #[test]
+    fn fill_pad_touches_each_edge_tile_once() {
+        use std::collections::BTreeMap;
+        for mask in DRAMS {
+            let dram = Dram::from_usable_mask(mask);
+            for [r, c] in [[37, 70], [64, 70], [37, 64], [64, 64], [1, 1], [500, 33]] {
+                for units in [1, 3, 8] {
+                    let mut a = DramAlloc::new(&dram);
+                    let t = DramTensor::alloc(&mut a, r, c).unwrap();
+                    let [rt, ct] = t.grid();
+                    let mut want = BTreeMap::new();
+                    for i in 0..rt {
+                        for j in 0..ct {
+                            let vr = if i == rt - 1 { r % 32 } else { 0 };
+                            let vc = if j == ct - 1 { c % 32 } else { 0 };
+                            if vr != 0 || vc != 0 {
+                                let s = t.tile(i, j);
+                                let key = (s.channel().index() as u32, s.offset() as u32);
+                                want.insert(
+                                    key,
+                                    kind::fill_param(
+                                        if vr == 0 { 32 } else { vr as u32 },
+                                        if vc == 0 { 32 } else { vc as u32 },
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    let jobs = super::fill_pad(&t, f32::NEG_INFINITY, units).unwrap();
+                    let mut got = BTreeMap::new();
+                    for job in &jobs {
+                        let e: Vec<_> = stream(job).into_iter().map(Result::unwrap).collect();
+                        for w in e.chunks(3) {
+                            let (rd, cp, wr) = (w[0], w[1], w[2]);
+                            assert_eq!((rd[0], cp[0], wr[0]), (op::READ, op::COMPUTE, op::WRITE));
+                            assert_eq!(cp[1], kind::FILL_PAD);
+                            assert_eq!(cp[2], f32::NEG_INFINITY.to_bits());
+                            assert_eq!((cp[4], cp[5]), (rd[4], rd[4]), "in place, in its slot");
+                            assert_eq!((wr[1], wr[3]), (rd[1], rd[3] + TILE_DATA as u32));
+                            assert!(got.insert((rd[1], rd[3]), cp[3]).is_none(), "twice");
+                        }
+                    }
+                    assert_eq!(got, want, "[{r}, {c}] {mask:#x} {units}");
+                    assert!(jobs.len() <= units.max(1) || want.len() > 192 * units);
+                }
+            }
+        }
+    }
+
+    /// The pad an op leaves, from its algebra.
+    #[test]
+    fn ops_declare_the_padding_they_leave() {
+        let dram = Dram::from_usable_mask(0xFF);
+        let mut a = DramAlloc::new(&dram);
+        let zero = DramTensor::alloc(&mut a, 37, 70).unwrap();
+        zero.set_pad(Pad::Zero);
+        let undef = DramTensor::alloc(&mut a, 37, 70).unwrap();
+        let row = DramTensor::alloc(&mut a, 1, 70).unwrap();
+        row.set_pad(Pad::Zero);
+        let whole = DramTensor::alloc(&mut a, 64, 64).unwrap();
+        assert_eq!(
+            whole.pad(),
+            Pad::Zero,
+            "no ragged edge, nothing to be wrong"
+        );
+        assert_eq!(undef.pad(), Pad::Undefined);
+        let e = |kind, scalar| Eltwise { kind, scalar };
+        let p = |op: Eltwise, ins: &[&DramTensor]| op.produces(ins);
+        assert_eq!(p(e(kind::ADD, 0.0), &[&zero, &zero]), Pad::Zero);
+        assert_eq!(p(e(kind::ADD, 0.0), &[&zero, &undef]), Pad::Undefined);
+        assert_eq!(p(e(kind::MUL_SCALAR, 3.0), &[&zero]), Pad::Zero);
+        assert_eq!(
+            p(e(kind::MUL_SCALAR, f32::INFINITY), &[&zero]),
+            Pad::Undefined
+        );
+        assert_eq!(p(e(kind::MUL_SCALAR, f32::NAN), &[&zero]), Pad::Undefined);
+        assert_eq!(p(e(kind::RELU_BACKWARD, 0.0), &[&undef, &zero]), Pad::Zero);
+        assert_eq!(p(e(kind::ADD_ROW, 0.0), &[&zero, &row]), Pad::Undefined);
+        assert_eq!(p(e(kind::COPY, 0.0), &[&zero]), Pad::Zero);
+        assert_eq!(SumRows.produces(&[&undef]), Pad::Undefined);
+        assert_eq!(SumRows.produces(&[&zero]), Pad::Zero);
+        assert_eq!(SumRows.requires(0), PadNeed::Any);
+        assert_eq!(MatmulPadding.requires(1), PadNeed::Zero);
+        assert_eq!(super::fill_pad(&whole, 0.0, 4).unwrap().len(), 0);
     }
 
     #[test]
@@ -1104,7 +1627,10 @@ mod reference {
         units: usize,
     ) -> Result<Work> {
         use tt_isa::dm::kind;
-        let binary = !matches!(op.kind, kind::MUL_SCALAR | kind::RELU);
+        let binary = !matches!(
+            op.kind,
+            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+        );
         let row = op.kind == kind::ADD_ROW;
         match (binary, b) {
             (false, _) => {}
@@ -1211,12 +1737,14 @@ mod reference {
                 0,
             ]
         };
-        let sum = |acc: u64, tile: u64, first: bool| {
+        // Of the last tile row, only the tensor's valid rows (`0`: all 32).
+        let last_rows = (a.rows % 32) as u32;
+        let sum = |acc: u64, tile: u64, first: bool, last: bool| {
             [
                 dm::op::COMPUTE,
                 dm::kind::COL_SUM,
                 u32::from(first),
-                0,
+                if last { last_rows } else { 0 },
                 acc as u32,
                 tile as u32,
                 acc as u32,
@@ -1270,7 +1798,7 @@ mod reference {
                         list.push(read(a.tile(i, j), slot(used + i - i0), i));
                     }
                     for i in i0..i0 + rows {
-                        list.push(sum(acc, slot(used + i - i0), i == 0));
+                        list.push(sum(acc, slot(used + i - i0), i == 0, i == rt - 1));
                     }
                     used += rows;
                 }

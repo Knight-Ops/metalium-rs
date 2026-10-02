@@ -216,6 +216,11 @@ pub struct Session<T: Transport> {
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
+    /// Each unit's timestamper stream so far, between
+    /// [`Session::profile_start`] and [`Session::profile_stop`].
+    profiling: Option<Vec<crate::profile::UnitProfile>>,
+    /// Which unit element-wise ops run on ([`Session::set_eltwise_unit`]).
+    eltwise_unit: tensor::EltwiseUnit,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -509,6 +514,8 @@ impl<T: Transport> Session<T> {
             images,
             profile: runtime::Profile::default(),
             dram: None,
+            profiling: None,
+            eltwise_unit: tensor::EltwiseUnit::default(),
             _cleanup: cleanup,
         };
         session.prepare().map_err(SessionError::Reset)?;
@@ -538,8 +545,128 @@ impl<T: Transport> Session<T> {
         }
         reset_tile(dev, unit.tile)?;
         reset_thread_state(dev, unit.tile, images)?;
-        unit.resident = Some(Resident::start(dev, unit.tile, images, RESET_BUDGET)?);
+        let mut r = Resident::start(dev, unit.tile, images, RESET_BUDGET)?;
+        if self.profiling.is_some() {
+            // What the stream held since the last drain belonged to the run
+            // that failed; the profile goes on from an empty one.
+            r.set_profiling(true);
+            dev.configure_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+                tt_isa::mailbox::TRACE_BUFFER_BYTES,
+            )?;
+        }
+        unit.resident = Some(r);
         Ok(())
+    }
+
+    /// Record what every unit's data mover and role runners do from now on,
+    /// through each tile's debug timestamper (`crate::profile`), until
+    /// [`Session::profile_stop`]. Each unit's stream is drained after every
+    /// wave, so a profile may span any number of ops.
+    ///
+    /// Refused on the simulator, which does not model the event stream
+    /// (divergence row 54).
+    pub fn profile_start(&mut self) -> Result<(), RunError> {
+        if self.dev.transport().is_simulated() {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: tt_isa::tensix::timestamper::TIMESTAMP,
+                reason: "ttsim does not model the timestamper's event stream (divergence row 54)",
+            }));
+        }
+        if self.profiling.is_some() {
+            return Ok(());
+        }
+        self.profiling = Some(Vec::new());
+        let mut units = Vec::with_capacity(self.units.len());
+        for u in 0..self.units.len() {
+            if self.units[u].resident.is_none() {
+                self.prepare_unit(u)?;
+            }
+            let Session { dev, units: us, .. } = self;
+            let unit = &mut us[u];
+            let r = unit.resident.as_mut().expect("prepared above");
+            dev.configure_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+                tt_isa::mailbox::TRACE_BUFFER_BYTES,
+            )?;
+            r.set_profiling(true);
+            if unit.mover.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
+            let counter_at_start = dev.wall_clock(r.window(), unit.tile)?;
+            units.push(crate::profile::UnitProfile {
+                tile: unit.tile,
+                events: Vec::new(),
+                counter_at_start,
+                host_at_start: std::time::Instant::now(),
+            });
+        }
+        self.profiling = Some(units);
+        Ok(())
+    }
+
+    /// Stop profiling and return what was recorded since
+    /// [`Session::profile_start`], with the tiles' clock measured over it.
+    pub fn profile_stop(&mut self) -> Result<crate::profile::DeviceProfile, RunError> {
+        let Some(mut units) = self.profiling.take() else {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason: "profile_stop without profile_start",
+            }));
+        };
+        let mut ticks_per_us = 0.0;
+        for (u, p) in units.iter_mut().enumerate() {
+            let Session { dev, units: us, .. } = self;
+            let unit = &mut us[u];
+            let Some(r) = unit.resident.as_mut() else {
+                continue;
+            };
+            p.events.extend(dev.read_trace(
+                r.window(),
+                unit.tile,
+                tt_isa::mailbox::TRACE_BUFFER,
+            )?);
+            r.set_profiling(false);
+            if unit.mover.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 0)?;
+            }
+            if u == 0 {
+                let now = dev.wall_clock(r.window(), unit.tile)?;
+                let us_elapsed = p.host_at_start.elapsed().as_secs_f64() * 1e6;
+                ticks_per_us = (now - p.counter_at_start) as f64 / us_elapsed;
+            }
+        }
+        Ok(crate::profile::DeviceProfile {
+            units,
+            ticks_per_us,
+        })
+    }
+
+    /// Move unit `u`'s events into the profile and start its stream empty
+    /// again, so the 1024-event buffer bounds one wave, not a whole profile.
+    fn drain(&mut self, u: usize) -> Result<(), TransportError> {
+        let Session {
+            dev,
+            units,
+            profiling,
+            ..
+        } = self;
+        let (Some(p), Some(r)) = (profiling.as_mut(), units[u].resident.as_ref()) else {
+            return Ok(());
+        };
+        let tile = units[u].tile;
+        let events = dev.read_trace(r.window(), tile, tt_isa::mailbox::TRACE_BUFFER)?;
+        p[u].events.extend(events);
+        dev.configure_trace(
+            r.window(),
+            tile,
+            tt_isa::mailbox::TRACE_BUFFER,
+            tt_isa::mailbox::TRACE_BUFFER_BYTES,
+        )
     }
 
     /// Keep tensors in GDDR from now on: read the chip's channels and set up an
@@ -592,6 +719,16 @@ impl<T: Transport> Session<T> {
         t.download(dev, &d.w4)
     }
 
+    /// Every datum of every tile of `t`, padding included, row-major
+    /// `[32 * rt, 32 * ct]` (`DramTensor::download_padded`).
+    pub fn download_padded(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        t.download_padded(dev, &d.w4)
+    }
+
     /// Give a tensor's slots back.
     pub fn free(&mut self, t: DramTensor) -> Result<(), TensorError> {
         self.dram_state()?.alloc.free(&t.placement);
@@ -603,25 +740,102 @@ impl<T: Transport> Session<T> {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
     }
 
-    /// Element-wise `a (op) b` in GDDR ([`tensor::eltwise`]), on the data
-    /// movers' FP32 units. No Tensix run, so the resident roles are untouched.
+    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`])
+    /// or the data movers' FP32 units ([`tensor::eltwise`]), as
+    /// [`Session::set_eltwise_unit`] says.
     pub fn eltwise(
         &mut self,
         op: tensor::Eltwise,
         a: &DramTensor,
         b: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
+        use tensor::OpPadding;
         let units = self.units.len();
-        let work = tensor::eltwise(&mut self.dram_state()?.alloc, op, a, b, units)?;
-        self.execute(work, RESET_BUDGET)
+        let unit = self.eltwise_unit;
+        let alloc = &mut self.dram_state()?.alloc;
+        let [rt, ct] = a.grid();
+        let sfpu = match unit {
+            tensor::EltwiseUnit::Sfpu => true,
+            tensor::EltwiseUnit::Mover => false,
+            tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(op.kind, rt * ct, units),
+        };
+        let work = if sfpu {
+            tensor::sfpu_eltwise(alloc, op, a, b, units)?
+        } else {
+            None
+        };
+        let work = match work {
+            Some(w) => w,
+            None => tensor::eltwise(alloc, op, a, b, units)?,
+        };
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(op.produces(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>()));
+        Ok(out)
+    }
+
+    /// Run element-wise ops on `unit` from now on: by default whichever is
+    /// cheaper for the op's size (`tensor::sfpu_is_cheaper`), or always the
+    /// SFPU (where the op has a program), or always the data mover's FP32
+    /// unit, which stays as the reference and the fallback. Bit-identical
+    /// whichever (`step19_eltwise`).
+    pub fn set_eltwise_unit(&mut self, unit: tensor::EltwiseUnit) {
+        self.eltwise_unit = unit;
+    }
+
+    pub fn eltwise_unit(&self) -> tensor::EltwiseUnit {
+        self.eltwise_unit
     }
 
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
     /// ([`tensor::sum_rows`]).
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
+        use tensor::OpPadding;
         let units = self.units.len();
         let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units)?;
-        self.execute(work, RESET_BUDGET)
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(tensor::SumRows.produces(&[a]));
+        Ok(out)
+    }
+
+    /// Make `t`'s padding what an op needs (`tensor::PadNeed`): nothing when
+    /// it already is, or when `t` has no ragged edge; otherwise its edge tiles
+    /// refilled ([`tensor::fill_pad`]). In place when `t` owns its slots; a
+    /// view shares its parent's, so it is copied first, and the copy --
+    /// returned, for the caller to use instead and free -- is filled.
+    ///
+    /// In-place fills write zeros only, so no view of `t` that claims zero
+    /// padding is ever made wrong by one.
+    fn meet(
+        &mut self,
+        t: &DramTensor,
+        need: tensor::PadNeed,
+    ) -> Result<Option<DramTensor>, TensorError> {
+        use tensor::{Pad, PadNeed};
+        if need == PadNeed::Any || t.pad() == Pad::Zero {
+            return Ok(None);
+        }
+        let units = self.units.len();
+        if t.placement.owned() {
+            let jobs = tensor::fill_pad(t, 0.0, units)?;
+            self.run_jobs(jobs, RESET_BUDGET)?;
+            t.set_pad(Pad::Zero);
+            return Ok(None);
+        }
+        let copy = self.eltwise(
+            tensor::Eltwise {
+                kind: tt_isa::dm::kind::COPY,
+                scalar: 0.0,
+            },
+            t,
+            None,
+        )?;
+        let jobs = tensor::fill_pad(&copy, 0.0, units)?;
+        if let Err(e) = self.run_jobs(jobs, RESET_BUDGET) {
+            let _ = self.free(copy);
+            return Err(e);
+        }
+        copy.set_pad(Pad::Zero);
+        Ok(Some(copy))
     }
 
     /// `op(A) @ op(B)` with every operand and the result in GDDR
@@ -637,18 +851,40 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
+        use tensor::OpPadding;
+        let need = tensor::MatmulPadding;
+        let ca = self.meet(a, need.requires(0))?;
+        let cb = match self.meet(b, need.requires(1)) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(c) = ca {
+                    let _ = self.free(c);
+                }
+                return Err(e);
+            }
+        };
         let units = self.units.len();
-        let work = tensor::matmul_dram(
-            &mut self.dram_state()?.alloc,
-            a,
-            a_transposed,
-            b,
-            b_transposed,
-            route,
-            fidelity,
-            units,
-        )?;
-        self.execute(work, budget)
+        let out = self
+            .dram_state()
+            .and_then(|d| {
+                tensor::matmul_dram(
+                    &mut d.alloc,
+                    ca.as_ref().unwrap_or(a),
+                    a_transposed,
+                    cb.as_ref().unwrap_or(b),
+                    b_transposed,
+                    route,
+                    fidelity,
+                    units,
+                )
+            })
+            .and_then(|work| self.execute(work, budget));
+        for c in [ca, cb].into_iter().flatten() {
+            self.free(c)?;
+        }
+        let out = out?;
+        out.set_pad(need.produces(&[a, b]));
+        Ok(out)
     }
 
     /// Run an op's jobs over the units (see the module documentation) and
@@ -665,6 +901,19 @@ impl<T: Transport> Session<T> {
     /// same wave are finished first, so nothing is left running.
     fn execute(&mut self, work: tensor::Work, budget: u64) -> Result<DramTensor, TensorError> {
         let tensor::Work { out, jobs } = work;
+        if let Err(e) = self.run_jobs(jobs, budget) {
+            if let Ok(d) = self.dram_state() {
+                d.alloc.free(&out.placement);
+            }
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    /// The body of [`Session::execute`], for jobs whose output already exists
+    /// (an in-place fill): deal them out, run them in waves, recover a unit
+    /// whose list failed.
+    fn run_jobs(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
         let n = self.units.len();
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
         for (j, job) in jobs.into_iter().enumerate() {
@@ -677,13 +926,10 @@ impl<T: Transport> Session<T> {
             let failed = tensor::stats::timed(what, || self.wave(&queues, w, budget));
             if let Some((failed, error)) = failed {
                 self.recover(&failed);
-                if let Ok(d) = self.dram_state() {
-                    d.alloc.free(&out.placement);
-                }
                 return Err(error);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Segment `w` of every queue that has one: started on every unit, then
@@ -712,7 +958,7 @@ impl<T: Transport> Session<T> {
             }
         }
         for (u, seg, s) in started {
-            match self.finish(u, s) {
+            match self.finish(u, s).and_then(|()| Ok(self.drain(u)?)) {
                 Ok(()) => self.units[u].steps += seg.steps,
                 Err(e) => {
                     failed.push((u, seg.roles.is_some()));
@@ -739,6 +985,7 @@ impl<T: Transport> Session<T> {
             units,
             images,
             dram,
+            profiling,
             ..
         } = self;
         let unit = &mut units[u];
@@ -754,6 +1001,9 @@ impl<T: Transport> Session<T> {
                 &d.dram,
                 d.image,
             )?);
+            if profiling.is_some() {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+            }
         }
         let mut entries = seg.entries.clone();
         if seg.resident {
@@ -839,9 +1089,12 @@ impl<T: Transport> Session<T> {
             self.prepare_unit(0)?;
         }
         let r = self.units[0].resident.as_mut().expect("prepared above");
-        let out = r.run(&mut self.dev, &self.images, kernel, budget);
+        let mut out = r.run(&mut self.dev, &self.images, kernel, budget);
         if let Ok(o) = &out {
             self.profile.phases.extend_from_slice(&o.profile.phases);
+            if let Err(e) = self.drain(0) {
+                out = Err(e.into());
+            }
         }
         if out.is_err() {
             self.units[0].resident = None;

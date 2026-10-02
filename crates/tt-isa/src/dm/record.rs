@@ -35,10 +35,32 @@ pub const SCATTER: u32 = 0x11;
 /// the kind takes `B`, bit 1 `B` is one row broadcast down `A`. `B` is all zero
 /// when the kind takes none.
 pub const ELTWISE: u32 = 0x12;
-/// A run of column sums: `[SUM, first, count, rt, stage, 0, 0, 0]` + `A` +
-/// `OUT`. Columns `first..first + count` of `A`'s tile grid, `rt` tiles tall,
-/// each summed in row order into row 0 of an accumulator slot.
+/// A run of column sums: `[SUM, first, count, rt, stage, last_rows, 0, 0]` +
+/// `A` + `OUT`. Columns `first..first + count` of `A`'s tile grid, `rt` tiles
+/// tall, each summed in row order into row 0 of an accumulator slot; of the
+/// last tile row only its first `last_rows` rows (`0`: all 32), so a ragged
+/// tensor's padding never reaches a sum.
 pub const SUM: u32 = 0x13;
+/// Set the padding of a run of a tensor's edge tiles: `[FILL_PAD, value,
+/// first, count, rows, cols, stage, rt]` + `A`, where `rows` and `cols` are
+/// the valid rows of the last tile row and columns of the last tile column
+/// (`0`: 32, that edge is not ragged) and `rt` the tile rows. The edge tiles,
+/// numbered: the last tile row left to right if its rows are ragged, then the
+/// last tile column top to bottom (without a corner already counted) if its
+/// columns are; tiles `first..first + count` of that numbering are each read
+/// into slot `n` of the staging area at `stage`, filled with `value` outside
+/// the valid region ([`super::kind::FILL_PAD`]) and written back in place.
+pub const FILL_PAD: u32 = 0x14;
+/// A run of whole tiles, GDDR -> L1: `[READ_RUN, first, count, at, flags, 0,
+/// 0, 0]` + `X`. Tiles `first..first + count` of `X` in row-major order, each
+/// into the next tile slot from `at`. `flags` bit 0: `X` is one tile row
+/// broadcast down the run -- tile `(0, j)` read for every tile `(i, j)` --
+/// which is how a `[1, n]` bias meets a `[m, n]` tensor.
+pub const READ_RUN: u32 = 0x15;
+/// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
+/// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
+/// tile `first + n` of `X`, row-major. What a kernel's packer wrote goes back.
+pub const WRITE_RUN: u32 = 0x16;
 
 /// Slots of the staging area a column sum uses at once, accumulator included.
 pub const SUM_SLOTS: usize = 200;
@@ -52,7 +74,7 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 pub const fn len(op: u32) -> usize {
     match op {
         GATHER | SUM => 5,
-        SCATTER => 3,
+        SCATTER | FILL_PAD | READ_RUN | WRITE_RUN => 3,
         ELTWISE => 7,
         _ => 1,
     }
@@ -289,10 +311,107 @@ pub fn expand(
             }
         }
         SUM => {
-            let [_, first, count, rt, stage, ..] = h;
+            let [_, first, count, rt, stage, last_rows, ..] = h;
             let (count, rt) = (extent(count)?, extent(rt)?);
+            if last_rows > 31 {
+                return Err(super::error::LENGTH);
+            }
             let (a, out) = (tensor(rec, 1)?, tensor(rec, 3)?);
-            sum(&a, &out, first, count, rt as usize, stage, &mut emit)?;
+            sum(
+                &a,
+                &out,
+                first,
+                count,
+                rt as usize,
+                stage,
+                last_rows,
+                &mut emit,
+            )?;
+        }
+        READ_RUN | WRITE_RUN => {
+            let [_, first, count, at, flags, ..] = h;
+            let count = extent(count)?;
+            let x = tensor(rec, 1)?;
+            if x.ct == 0 {
+                return Err(super::error::LENGTH);
+            }
+            let row = h[0] == READ_RUN && flags & 1 != 0;
+            let (mut i, mut j) = div_rem(first, x.ct);
+            for n in 0..count {
+                if n > 0 {
+                    j += 1;
+                    if j == x.ct {
+                        (i, j) = (i + 1, 0);
+                    }
+                }
+                let slot = at + n * TILE_SLOT as u32;
+                let (ch, off) = x.tile(if row { 0 } else { i }, j)?;
+                emit(if h[0] == READ_RUN {
+                    [op::READ, ch, n % PORTS, off, slot, TILE_SLOT as u32, 0, 0]
+                } else {
+                    [
+                        op::WRITE,
+                        ch,
+                        n % PORTS,
+                        off + TILE_DATA as u32,
+                        slot + TILE_DATA as u32,
+                        4096,
+                        0,
+                        0,
+                    ]
+                })?;
+            }
+        }
+        FILL_PAD => {
+            let [_, value, first, count, rows, cols, stage, rt] = h;
+            let (count, rt) = (extent(count)?, extent(rt)?);
+            let a = tensor(rec, 1)?;
+            if a.ct == 0 || rows > 31 || cols > 31 {
+                return Err(super::error::LENGTH);
+            }
+            let (ragged_r, ragged_c) = (rows != 0, cols != 0);
+            let along_row = if ragged_r { a.ct } else { 0 };
+            let down_col = if ragged_c {
+                rt - u32::from(ragged_r)
+            } else {
+                0
+            };
+            if first + count > along_row + down_col {
+                return Err(super::error::LENGTH);
+            }
+            for n in 0..count {
+                let e = first + n;
+                let (i, j) = if e < along_row {
+                    (rt - 1, e)
+                } else {
+                    (e - along_row, a.ct - 1)
+                };
+                let (ch, off) = a.tile(i, j)?;
+                let at = stage + n * TILE_SLOT as u32;
+                emit([op::READ, ch, n % PORTS, off, at, TILE_SLOT as u32, 0, 0])?;
+                let vr = if i == rt - 1 { rows } else { 0 };
+                let vc = if j == a.ct - 1 { cols } else { 0 };
+                emit([
+                    op::COMPUTE,
+                    super::kind::FILL_PAD,
+                    value,
+                    vr | vc << 8,
+                    at,
+                    at,
+                    at,
+                    0,
+                ])?;
+                emit([
+                    op::WRITE,
+                    ch,
+                    n % PORTS,
+                    off + TILE_DATA as u32,
+                    at + TILE_DATA as u32,
+                    4096,
+                    0,
+                    0,
+                ])?;
+            }
         }
         _ => return Err(super::error::OP),
     }
@@ -304,6 +423,7 @@ pub fn expand(
 /// worth of slots while they fit; a column taller than that spans several,
 /// accumulating in place. Where it started a new list, a [`op::WAIT`] stands
 /// in, since the next entries reuse the slots.
+#[allow(clippy::too_many_arguments)]
 fn sum(
     a: &TensorRef,
     out: &TensorRef,
@@ -311,6 +431,7 @@ fn sum(
     count: u32,
     rt: usize,
     stage: u32,
+    last_rows: u32,
     emit: &mut impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
     const SLOTS: usize = SUM_SLOTS;
@@ -371,7 +492,7 @@ fn sum(
                         op::COMPUTE,
                         super::kind::COL_SUM,
                         u32::from(i == 0),
-                        0,
+                        if i == rt - 1 { last_rows } else { 0 },
                         acc,
                         slot(used + i - i0),
                         acc,

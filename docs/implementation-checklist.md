@@ -1210,15 +1210,24 @@ host; the reduced golden bit for bit on ttsim and both cards after every slice):
       `attach_topology`, or `TT_TOPOLOGY=0` / `0,1` for the silicon harness, so a
       benchmark runs on one card or both unchanged. Two cards are Phase 8's
       mesh: host-staged, per-chunk resets, chips in turn -- 233 ms/step.
-- [ ] **Padding rows are not kept zero** (reproduced on ttsim:
-      `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`, ignored until
-      fixed; 50 rows give `-133` for Flex's `-105`, 14 padding rows times `b`, and the
+- [x] **Padding rows are not kept zero** -- fixed by `hardware-coverage.md` F0
+      (a typed pad state per tensor, a masked column sum, edge-tile refills
+      before a matmul); `step19_eltwise::padding_rows_stay_out_of_a_later_accumulation`
+      un-ignored and green on ttsim and both cards. Was (reproduced on ttsim, 50 rows give `-133` for Flex's `-105`, 14 padding rows times `b`, and the
       `(x + b)^T @ (y + d)` weight-gradient shape is wrong too):
       `ADD_ROW` adds the bias into a ragged tile's padding rows and `COL_SUM`
       sums all 32 rows (`dm_b.rs`), so `(x + b).sum_dim(0)` on a row count that
       is not a multiple of 32 should be wrong; the crop on download hides the
       rows themselves. MNIST's batches are whole tiles. `tt-metal-concepts-review.md`
       G1; the fix (a typed pad state per tensor) is `hardware-coverage.md` F0.
+- [ ] **`silicon_eth_link::host_driven_tt_link_*` are flaky** (found by Phase 10's
+      full-suite run, 2026-10-01): in the full suite and in their own group, one to
+      three of the four `host_driven_tt_link_card{0,1}_to_card{1,0}_x{3,13}` fail per
+      pass, each after ~2.6 s, a different set each time, and each passes run alone.
+      `main` (8800cdb) fails the same way, so it predates Phase 10; the Ethernet movers'
+      tests (`silicon_eth_link::mover::*`) and the sharded MNIST pass throughout.
+      Next: read what the 2.6 s failure is (the runner's log does not keep test
+      output), and fix the access rather than retrying it.
 - [ ] **A `BufferId` can outlive its engine** (found by review): `DramBuffers`
       numbers from 1 per attach (`burn-tt/src/server.rs`), so a tensor kept across
       a detach and re-attach reads another tensor's buffer, and dropping it frees
@@ -1427,7 +1436,7 @@ tiles, done in turn. The slices from there:
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait
       planner from the plan belong here).
-- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10 (S1, milestone 10.0).
+- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10, and done there (S1, milestone 10.0).
 - [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
       host tilizing: tilize in parallel, or upload row-major and let the movers
       tilize on the device.
@@ -1440,7 +1449,7 @@ tiles, done in turn. The slices from there:
 
 - [ ] A `Device` write fence as API, rather than read-backs at call sites
       (Phase 8: posted writes race other agents).
-- [ ] `MOP`/`REPLAY` expansion.
+- [-] `MOP`/`REPLAY` expansion -- moved to Phase 10 (`hardware-coverage.md` X1, X2).
 - [ ] NoC multicast for operands many tiles share (matmul `in0`/`in1`).
 - [ ] `.ttinsn` fusion — up to four adjacent pushes per cycle. Deferred from the
       baseline because fused words disassemble as garbage and the instruction-set
@@ -1456,8 +1465,8 @@ every Tensix unit and what drives it, the work items (F foundation, S SFPU, M Ma
 R reductions, D formats and data movement), milestones 10.0–10.6, and the Burn op coverage
 table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
 
-- [ ] **10.0** SFPU foundation; today's element-wise ops on the SFPU (was 9.9).
-- [ ] **10.1** Softmax and cross-entropy on the device (was 9.12).
+- [x] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9). Branch `phase10-0-sfpu-foundation`; full silicon suite 381/386 on both cards, the five being two since-fixed `step23` assertions and the pre-existing Ethernet flake above.
+- [ ] **10.1** Softmax and cross-entropy on the device (was 9.12); `MOP`; op-list traces.
 - [ ] **10.2** Activation and math breadth.
 - [ ] **10.3** Reductions over any dim, pooling, device transpose, norms.
 - [ ] **10.4** Formats and integers.
@@ -1489,7 +1498,7 @@ lets you trust Wormhole-sourced behaviour at all.
 **Compute** — [ ] `SHIFTXA`/`SHIFTXB`/`TRNSPSRCB` · [ ] `GAPOOL`/`DOTPV`
 
 **Frontend** — [ ] `WaitGate` (a silent gap; seven BH pages reason about its
-semantics) · [ ] `REPLAY` · [ ] `MOP`/`MOP_CFG`
+semantics) · [x] `REPLAY` (`step26_sfpu_isa`: SFPU row loops replayed match their unrolled form on ttsim and both cards) · [ ] `MOP`/`MOP_CFG`
 
 **Units** — [ ] the entire Scalar Unit (ThCon) · [ ] Mover (`XMOV`) ·
 [ ] Miscellaneous Unit
@@ -1547,7 +1556,12 @@ Documented, not speculative. These bite in Phases 2–4.
       definition. Untested against silicon, and ttsim models no timing, so the
       answers are from the documentation.
 - [ ] `SFPLUTFP32` writes to `LReg[LReg[7] & 15]` instead of `LReg[VD]`. *(Phase 10: S4.)*
-- [ ] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack. *(Phase 10: F2.)*
+- [x] `SFPPOPC` — complex modes must not be used with a full conditional-execution stack.
+      Handled by construction (`hardware-coverage.md` F2): `tt_kernels::sfpu::Program`
+      emits only the plain push and pop, balanced by scope, and refuses a ninth level.
+      Blackhole's `SFPPOPC.md` says in a tip that Blackhole fixed the bug and in its
+      summary that the complex modes still must not be used on a full stack; the
+      builder follows the summary.
 - [ ] `SFPSTOCHRND` — stochastic rounding is biased toward increasing magnitude,
       and the new-in-Blackhole round-toward-zero mode sometimes rounds *away* from
       zero. **The functional models in the docs faithfully reproduce the buggy

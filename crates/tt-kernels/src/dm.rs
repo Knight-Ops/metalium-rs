@@ -83,7 +83,9 @@ impl<N: NocId> DataMover<N> {
         d.write32(w, tile, dm::MY_X, tile.x() as u32)?;
         d.write32(w, tile, dm::MY_Y, tile.y() as u32)?;
         d.write32(w, tile, dm::USABLE, dram.usable_mask() as u32)?;
-        for word in [dm::SEQ, dm::DONE, dm::ERROR] {
+        // L1 survives between processes: a stale `TRACE` from a profiled run
+        // would have the mover store to a timestamper ttsim does not model.
+        for word in [dm::SEQ, dm::DONE, dm::ERROR, dm::TRACE] {
             d.write32(w, tile, word, 0)?;
         }
         let status_at = dm::MAILBOX_BASE + offset::STATUS;

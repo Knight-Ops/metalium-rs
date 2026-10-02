@@ -1,7 +1,8 @@
 //! Phase 9 gate: element-wise ops on tensors in GDDR, against `burn-flex`.
 //!
-//! The data mover computes them in L1 with the baby RISC-V's FP32 unit
-//! (`tt_isa::dm::kind`). The claim is Flex's result bit for bit, which is what
+//! Since Phase 10 (S1) they run on the SFPU (`tt_kernels::sfpu::ops`), and the
+//! data mover's FP32 unit (`tt_isa::dm::kind`) stays as the reference: every
+//! kind is checked on both. The claim is Flex's result bit for bit, which is what
 //! keeps a training run's loss curve on the golden: `fadd.s`/`fsub.s`/`fmul.s`
 //! round to nearest even, so they differ from IEEE only where an operand or
 //! result is denormal, which the operands here avoid -- and one test records
@@ -11,7 +12,7 @@ use burn::tensor::{activation, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use tt_isa::dm::kind;
 use tt_kernels::session::{Session, TileChoice};
-use tt_kernels::tensor::Eltwise;
+use tt_kernels::tensor::{Eltwise, EltwiseUnit};
 use tt_tests::backend::GATE_TILE;
 use tt_ttsim::fork_scope;
 
@@ -118,70 +119,89 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
 #[test]
 fn every_kind_matches_flex_bit_for_bit() {
     with_session(|s| {
-        // Ragged, more tiles than one mover list holds, and MNIST's own.
-        for [r, c] in [[37, 70], [64, 128], [784, 128]] {
-            let (av, bv) = (edgy(r as u64, r * c), edgy(c as u64 + 99, r * c));
-            let row = edgy(5, c);
-            let a = s.upload(&av, r, c).unwrap();
-            let b = s.upload(&bv, r, c).unwrap();
-            let bias = s.upload(&row, 1, c).unwrap();
-            let (fa, fb) = (flex(&av, r, c), flex(&bv, r, c));
-            let cases: Vec<(&str, u32, f32, bool, Vec<u32>)> = vec![
-                ("add", kind::ADD, 0.0, false, bits(fa.clone() + fb.clone())),
-                ("sub", kind::SUB, 0.0, false, bits(fa.clone() - fb.clone())),
-                ("mul", kind::MUL, 0.0, false, bits(fa.clone() * fb.clone())),
-                (
-                    "mul 0.5",
-                    kind::MUL_SCALAR,
-                    0.5,
-                    false,
-                    bits(fa.clone() * 0.5),
-                ),
-                (
-                    "mul 0.1",
-                    kind::MUL_SCALAR,
-                    0.1,
-                    false,
-                    bits(fa.clone() * 0.1),
-                ),
-                (
-                    "relu",
-                    kind::RELU,
-                    0.0,
-                    false,
-                    bits(activation::relu(fa.clone())),
-                ),
-                (
-                    "relu backward",
-                    kind::RELU_BACKWARD,
-                    0.0,
-                    false,
-                    // Flex's own closure (`burn-flex` `ops/activation.rs:32`).
-                    av.iter()
-                        .zip(&bv)
-                        .map(|(&o, &g)| if o > 0.0 { g } else { 0.0 }.to_bits())
-                        .collect(),
-                ),
-                (
-                    "add row",
-                    kind::ADD_ROW,
-                    0.0,
-                    true,
-                    bits(fa.clone() + flex(&row, 1, c)),
-                ),
-            ];
-            for (label, k, scalar, use_row, want) in cases {
-                let op = Eltwise { kind: k, scalar };
-                let other = if use_row { Some(&bias) } else { Some(&b) };
-                let out = s
-                    .eltwise(op, &a, other)
-                    .unwrap_or_else(|e| panic!("{label}: {e}"));
-                let got = s.download(&out).unwrap();
-                assert_same(&got, &want, &format!("[{r}, {c}] {label}"));
-                s.free(out).unwrap();
-            }
-            for t in [a, b, bias] {
-                s.free(t).unwrap();
+        // On the SFPU (the default) and on the mover's FP32 unit, which stays
+        // as the reference: the same bits from both.
+        for unit in [EltwiseUnit::Sfpu, EltwiseUnit::Mover] {
+            s.set_eltwise_unit(unit);
+            // Ragged, more tiles than one mover list holds, and MNIST's own.
+            for [r, c] in [[37, 70], [64, 128], [784, 128]] {
+                let (av, bv) = (edgy(r as u64, r * c), edgy(c as u64 + 99, r * c));
+                let row = edgy(5, c);
+                let a = s.upload(&av, r, c).unwrap();
+                let b = s.upload(&bv, r, c).unwrap();
+                let bias = s.upload(&row, 1, c).unwrap();
+                let (fa, fb) = (flex(&av, r, c), flex(&bv, r, c));
+                let cases: Vec<(&str, u32, f32, bool, Vec<u32>)> = vec![
+                    ("add", kind::ADD, 0.0, false, bits(fa.clone() + fb.clone())),
+                    ("sub", kind::SUB, 0.0, false, bits(fa.clone() - fb.clone())),
+                    ("mul", kind::MUL, 0.0, false, bits(fa.clone() * fb.clone())),
+                    (
+                        "mul 0.5",
+                        kind::MUL_SCALAR,
+                        0.5,
+                        false,
+                        bits(fa.clone() * 0.5),
+                    ),
+                    (
+                        "mul 0.1",
+                        kind::MUL_SCALAR,
+                        0.1,
+                        false,
+                        bits(fa.clone() * 0.1),
+                    ),
+                    (
+                        "add 0.1",
+                        kind::ADD_SCALAR,
+                        0.1,
+                        false,
+                        bits(fa.clone() + 0.1),
+                    ),
+                    (
+                        "sub 3 (add -3)",
+                        kind::ADD_SCALAR,
+                        -3.0,
+                        false,
+                        bits(fa.clone() - 3.0),
+                    ),
+                    (
+                        "relu",
+                        kind::RELU,
+                        0.0,
+                        false,
+                        bits(activation::relu(fa.clone())),
+                    ),
+                    (
+                        "relu backward",
+                        kind::RELU_BACKWARD,
+                        0.0,
+                        false,
+                        // Flex's own closure (`burn-flex` `ops/activation.rs:32`).
+                        av.iter()
+                            .zip(&bv)
+                            .map(|(&o, &g)| if o > 0.0 { g } else { 0.0 }.to_bits())
+                            .collect(),
+                    ),
+                    (
+                        "add row",
+                        kind::ADD_ROW,
+                        0.0,
+                        true,
+                        bits(fa.clone() + flex(&row, 1, c)),
+                    ),
+                ];
+                for (label, k, scalar, use_row, want) in cases {
+                    let op = Eltwise { kind: k, scalar };
+                    let other = if use_row { Some(&bias) } else { Some(&b) };
+                    let out = s
+                        .eltwise(op, &a, other)
+                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+                    let got = s.download(&out).unwrap();
+                    assert_same(&got, &want, &format!("{unit:?} [{r}, {c}] {label}"));
+                    s.free(out).unwrap();
+                }
+                for t in [a, b, bias] {
+                    s.free(t).unwrap();
+                }
             }
         }
     });
@@ -301,7 +321,6 @@ fn ints(seed: usize, n: usize) -> Vec<f32> {
 /// matmul whose `K` is the row dimension (a weight gradient's, `h^T @ g`).
 /// A whole number of tile rows is the control: it has no padding to leak.
 #[test]
-#[ignore = "known bug: ADD_ROW writes padding rows (hardware-coverage F0); un-ignore with the fix"]
 fn padding_rows_stay_out_of_a_later_accumulation() {
     with_session(|s| {
         let c = 40;
@@ -351,6 +370,52 @@ fn padding_rows_stay_out_of_a_later_accumulation() {
             for t in [x, b, y, d, xb, yd, sum, prod] {
                 s.free(t).unwrap();
             }
+        }
+    });
+}
+
+/// Runs as long as the SFPU kernel allows: on one tile, a tensor of hundreds
+/// of tiles is dealt in the longest runs that fit, and `ADD_ROW`'s unrolled
+/// program makes its runs shorter than the rest's
+/// (`tt_kernels::tensor::sfpu_eltwise`). Found by MNIST's evaluation batch,
+/// which the gates' shapes were too small to reach.
+#[test]
+fn the_longest_runs_fit_and_match_flex() {
+    with_session(|s| {
+        let (r, c) = (2048, 96);
+        let (av, row) = (edgy(11, r * c), edgy(12, c));
+        let a = s.upload(&av, r, c).unwrap();
+        let bias = s.upload(&row, 1, c).unwrap();
+        let fa = flex(&av, r, c);
+        for (label, op, other, want) in [
+            (
+                "add row",
+                Eltwise {
+                    kind: kind::ADD_ROW,
+                    scalar: 0.0,
+                },
+                Some(&bias),
+                bits(fa.clone() + flex(&row, 1, c)),
+            ),
+            (
+                "add",
+                Eltwise {
+                    kind: kind::ADD,
+                    scalar: 0.0,
+                },
+                Some(&a),
+                bits(fa.clone() + fa.clone()),
+            ),
+        ] {
+            let out = s
+                .eltwise(op, &a, other)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_same(
+                &s.download(&out).unwrap(),
+                &want,
+                &format!("[{r}, {c}] {label}"),
+            );
+            s.free(out).unwrap();
         }
     });
 }

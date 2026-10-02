@@ -138,6 +138,36 @@ pub mod float {
         )
     }
 
+    /// On the device where the data is, else Flex's; the scalar converted as
+    /// Flex converts it.
+    pub fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let s = rhs.to_f64().expect("a float scalar") as f32;
+        if let Some(t) = device_eltwise(kind::ADD_SCALAR, s, &lhs, None) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_add_scalar(lhs.into_host(), rhs),
+            device,
+        )
+    }
+
+    /// `x - s` as `x + (-s)`: the same bits in IEEE arithmetic, signed zeros
+    /// included (`ADD_SCALAR`). On the device where the data is, else Flex's.
+    pub fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let s = rhs.to_f64().expect("a float scalar") as f32;
+        if let Some(t) = device_eltwise(kind::ADD_SCALAR, -s, &lhs, None) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_sub_scalar(lhs.into_host(), rhs),
+            device,
+        )
+    }
+
     /// `lhs @ rhs` over the last two dimensions, with the leading ones
     /// broadcast as Burn broadcasts them, on the device both are tagged with.
     ///

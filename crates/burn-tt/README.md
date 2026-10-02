@@ -57,6 +57,11 @@ gated in `tt-tests` (`step11_burn`, `step19_eltwise`, `step20_many_tiles`,
   an unattached device or a failed run panics. It never silently falls back.
 - `TT_TRACE_FALLBACK=1` prints a backtrace whenever a device tensor is downloaded
   for a host op: the way to find what is still crossing PCIe.
+- `TT_PROFILE=<path>` records a device-side profile of everything an attachment
+  runs -- each tile's mover lists, entries and records, and its role runs, by the
+  tile's own cycle counter -- and writes it as Chrome trace JSON (Perfetto,
+  `chrome://tracing`) on detach; `{chip}` in the path becomes the card. Silicon
+  only: ttsim does not model the timestamper's event stream.
 - `Topology::Cards` keeps nothing in GDDR yet (matmuls only, host-staged) and
   computes on one tile per card; `on_tiles` refuses more.
 - Random ops run on Flex, seeded through `Flex::seed`.

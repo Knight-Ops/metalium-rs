@@ -993,6 +993,16 @@ norm, a convolution -- falls back on its first unsupported op.
 Burn op coverage table live in [`hardware-coverage.md`](hardware-coverage.md), which is the
 progress record. Checklist items 9.9 and 9.12 moved there.
 
+**Where it stands (2026-10-01).** Milestone 10.0 is done: a device profiler through the
+timestamper (X3); padding as a typed property of every tensor (F0, which fixed the ragged
+`ADD_ROW` -> sum bug); whole tiles through `Dst` (F1); the SFPU program builder with
+typed registers, scoped conditional execution, automatic `SFPNOP`s and `REPLAY`-driven row
+loops (F2, X1) and an interpreter that predicts any program bit for bit, held to ttsim and
+both cards instruction by instruction (F5); the SFPU tile kernel and its dispatch (F3, F4);
+and every element-wise op on the SFPU, bit-identical to the mover and to Flex, chosen
+per op by a measured cost model (S1). MNIST: 3.8 ms/step on one tile (from 5.1), 2.4 on
+eight. Next: 10.1, softmax and cross-entropy.
+
 **Ordering: SFPU foundation first.** The foundation -- whole-tile `UnpackToDst` and pack, an
 SFPU program builder with typed `LReg`s and scoped conditional execution, one three-role SFPU
 tile kernel, a `record::SFPU` dispatched through the existing mover, and ported functional
