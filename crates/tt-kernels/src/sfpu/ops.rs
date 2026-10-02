@@ -129,6 +129,13 @@ pub mod kind_sfpu {
     pub const ACOSH: u32 = 0x134;
     /// `atanh a`, within [`super::ATANH_BOUND`] (`super::atanh_program`).
     pub const ATANH: u32 = 0x135;
+    /// `ln(sigmoid a)` (Flex's `log_sigmoid`), within
+    /// [`super::LOG_SIGMOID_BOUND`] (`super::log_sigmoid_program`).
+    pub const LOG_SIGMOID: u32 = 0x136;
+    /// `g sigmoid(-a)` from `a` (`A`) and the gradient `g` (`B`), Flex's
+    /// `log_sigmoid_backward`, within [`super::SIGMOID_BOUND`] and the
+    /// product's rounding.
+    pub const LOG_SIGMOID_BACKWARD: u32 = 0x137;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -215,7 +222,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
-        | kind_sfpu::SINH..=kind_sfpu::ATANH => Accuracy::Approximate,
+        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -856,6 +863,44 @@ pub fn atanh_program(p: &mut Program, spill: u32) {
     // Beyond `1`, NaNs and `±inf` included: NaN. The quotient alone does not
     // say so from `|x| ~ 2^126`, where `1/(1 - a)` flushes to a zero.
     p.if_(Cond::Less(R::ONE, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+}
+
+/// [`log_sigmoid_program`]'s derived bound, relative.
+pub const LOG_SIGMOID_BOUND: f64 = EXP_BOUND + LOG1P_BOUND + 1.0 / 16_777_216.0;
+
+/// `ln(sigmoid x)` of `x` (in `L0`, raw bits) into `L7`, Flex's two branches
+/// as one: `-l` for `x >= 0` and `x - l` below, `l = log1p(e)`, `e =
+/// e^-|x|` -- one exponential, never of a positive argument, and one
+/// [`log1p_program`]; neither side cancels (`x - l` adds magnitudes). Spills
+/// at `spill..spill + 128`.
+///
+/// Error, relative: `e` within `EXP_BOUND` (`-|x|` exact), which `log1p`
+/// carries scaled by `e/((1 + e) ln(1 + e)) <= 1`, adding [`LOG1P_BOUND`];
+/// `x - l` weighs `l`'s error by `l/(|x| + l) <= 1` and rounds once: under
+/// [`LOG_SIGMOID_BOUND`] `= EXP_BOUND + LOG1P_BOUND + u` (`14.3u`). From `x =
+/// 87.3`, where `e` would be denormal, `-0`; `-inf` gives `-inf`, `+inf`
+/// `-0`; a NaN stays one.
+pub fn log_sigmoid_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let x = R::L0;
+    let sx = spill + 64;
+    p.store(x, Format::Int32, sx);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, R::L1);
+    p.neg(R::L1, R::L1);
+    exp_program(p, R::L1, R::L2);
+    p.mov(R::L2, R::L0);
+    log1p_program(p, R::L0, R::L7, spill);
+    p.load(x, Format::Int32, sx);
+    p.neg(R::L7, R::L1);
+    p.if_(Cond::Lt0(x), |p| p.add(x, R::L1, R::L1));
+    p.mov(R::L1, R::L7);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, R::L1);
+    p.loadi_bits(R::L5, 0x7f80_0000);
+    p.if_(Cond::Less(R::L5, R::L1), |p| {
+        p.loadi_bits(R::L7, 0x7fc0_0000)
+    });
 }
 
 /// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
@@ -1526,7 +1571,8 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::POW
         | kind_sfpu::POW_I
         | kind_sfpu::SIGMOID_BACKWARD
-        | kind_sfpu::GELU_BACKWARD => Operands::Binary,
+        | kind_sfpu::GELU_BACKWARD
+        | kind_sfpu::LOG_SIGMOID_BACKWARD => Operands::Binary,
         kind_sfpu::MASK_WHERE => Operands::Ternary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
@@ -1546,7 +1592,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
-        | kind_sfpu::SINH..=kind_sfpu::ATANH => Operands::Unary,
+        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2264,6 +2310,27 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
+        }
+        kind_sfpu::LOG_SIGMOID => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                log_sigmoid_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        // Flex's `g * sigmoid(-x)`: the sigmoid of the negated input (exact),
+        // then one product.
+        kind_sfpu::LOG_SIGMOID_BACKWARD => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L1, Format::Fp32, A_ROW + o);
+                p.neg(LReg::L1, LReg::L0);
+                sigmoid_program(p, super::kernel::SPILL_ROW + o);
+                p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                p.mul(LReg::L1, LReg::L7, LReg::L2);
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Binary
         }
         kind_sfpu::I32_TO_F32 => {
             p.for_each_row_group(64, |p, o| {
@@ -3227,6 +3294,47 @@ mod transcendental {
             inverse_hyperbolic_inputs(),
             f64::atanh,
             ATANH_BOUND,
+        );
+    }
+
+    #[test]
+    fn log_sigmoid_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            1.0e-30,
+            -1.0e-30,
+            1.0,
+            -1.0,
+            17.0,
+            -17.0,
+            87.0,
+            87.3,
+            87.4,
+            -87.4,
+            -100.0,
+            1.0e30,
+            -1.0e30,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let ls = |x: f64| {
+            if x >= 0.0 {
+                -(-x).exp().ln_1p()
+            } else {
+                x - x.exp().ln_1p()
+            }
+        };
+        sweep(
+            kind_sfpu::LOG_SIGMOID,
+            grid(-90.0, 90.0, 60_000)
+                .chain(grid(-1.0, 1.0, 20_000))
+                .chain(binades(32).flat_map(|x| [x, -x]))
+                .chain(specials),
+            ls,
+            LOG_SIGMOID_BOUND,
         );
     }
 

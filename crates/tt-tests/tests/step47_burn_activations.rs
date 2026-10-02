@@ -697,7 +697,11 @@ fn flex_atanh_error(x: f32) -> f64 {
 #[test]
 fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
-    use tt_kernels::sfpu::ops::{ACOSH_BOUND, ASINH_BOUND, ATANH_BOUND, COSH_BOUND, SINH_BOUND};
+    use burn::tensor::activation;
+    use tt_kernels::sfpu::ops::{
+        ACOSH_BOUND, ASINH_BOUND, ATANH_BOUND, COSH_BOUND, LOG_SIGMOID_BOUND, SIGMOID_BOUND,
+        SINH_BOUND,
+    };
     let u = 1.0 / 16_777_216.0;
     with_device(Config::default(), |d| {
         let [r, c] = [64, 128];
@@ -780,5 +784,39 @@ fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
             .backward();
         let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
         check(&got, &want, COSH_BOUND + 2.0 * u, "autodiff sinh");
+
+        let got = vals(
+            resident("log_sigmoid", || activation::log_sigmoid(x.clone())),
+            "log_sigmoid",
+        );
+        check(
+            &got,
+            &host(activation::log_sigmoid(fx.clone())),
+            LOG_SIGMOID_BOUND,
+            "log_sigmoid",
+        );
+        // Autodiff: Burn's `log_sigmoid` backward is `log_sigmoid_backward`,
+        // `g sigmoid(-x)` -- the sigmoid's bound and a product's rounding on
+        // each side; a denormal sigmoid flushes (numerics row D).
+        let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+        // The `sum` is R1b's (on the host): only the values are held here.
+        let gs = (activation::log_sigmoid(xa.clone()) * Tensor::<Ad, 2>::from_inner(g.clone()))
+            .sum()
+            .backward();
+        let got = xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        let fa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+        let gs = (activation::log_sigmoid(fa.clone()) * Tensor::<Fd, 2>::from_inner(fg.clone()))
+            .sum()
+            .backward();
+        let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        for i in 0..r * c {
+            close(
+                got[i],
+                want[i],
+                SIGMOID_BOUND + 2.0 * u,
+                (gv[i] as f64).abs() * f32::MIN_POSITIVE as f64,
+                &format!("autodiff log_sigmoid({:e})", xv[i]),
+            );
+        }
     });
 }

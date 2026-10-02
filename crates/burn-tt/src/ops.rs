@@ -1365,6 +1365,16 @@ pub mod activation {
         GELU_BACKWARD,
         "`g (Phi(x) + x phi(x))` on the device where the data is, within `ops::gelu_backward_bound`; else Flex's."
     );
+    unary!(
+        log_sigmoid,
+        LOG_SIGMOID,
+        "Flex's two-branch `log_sigmoid` on the device where the data is, within `ops::LOG_SIGMOID_BOUND`; else Flex's."
+    );
+    binary!(
+        log_sigmoid_backward,
+        LOG_SIGMOID_BACKWARD,
+        "Flex's `g * sigmoid(-x)` on the device where the data is, within `ops::SIGMOID_BOUND` and the product's rounding; else Flex's."
+    );
 }
 
 pub mod int {

@@ -908,8 +908,16 @@ Each names the measurement it must move. The Burn-side ones are in
         (found by its sweep). Flex's `atanh` is std's, which loses up to `42x`
         its roundings near `-1` (numerics row G); the gates add that error,
         derived. Burn: `float_{asinh, acosh, atanh}`; `step45` watched failing
-        with `ln 2` dropped. Remaining: `log_sigmoid{,_backward}`, `softmin`;
-        then `sin`/`cos` and the rest (10.2f).
+        with `ln 2` dropped. `log_sigmoid_program`: Flex's two branches as one,
+        `min(x, 0) - log1p(e^-|x|)` (one `exp`, one `log1p`, no cancellation),
+        within `LOG_SIGMOID_BOUND = EXP_BOUND + LOG1P_BOUND + u` (14.3u; worst
+        measured 3.2 ulps); `log_sigmoid_backward` is Flex's `g sigmoid(-x)` on
+        the device's sigmoid, within `SIGMOID_BOUND` and the product -- a
+        denormal sigmoid flushes there (numerics row D), where Flex's times `g`
+        can be normal. Burn: `log_sigmoid{,_backward}`, with Burn's autodiff
+        through it (its `sum` is R1b's, on the host); `step45` watched failing
+        with the backward's negation dropped. Remaining: `softmin`; then
+        `sin`/`cos` and the rest (10.2f).
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1113,7 +1121,7 @@ path today, `~` when only some shapes do.
 | `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
-| `log_sigmoid{,_backward}` | | S4 |
+| `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
 | `softmin` | | R2 |
 

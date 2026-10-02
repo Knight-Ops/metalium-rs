@@ -2644,11 +2644,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         crate::ops::activation::hard_sigmoid(tensor, alpha, beta)
     }
     fn log_sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::log_sigmoid(tensor.into_flex()),
-            device,
-        )
+        crate::ops::activation::log_sigmoid(tensor)
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         crate::ops::activation::softmax(tensor, dim)
@@ -2660,11 +2656,7 @@ impl ActivationOps<TtBackend> for TtBackend {
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&x);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::log_sigmoid_backward(x.into_flex(), grad.into_flex()),
-            device,
-        )
+        crate::ops::activation::log_sigmoid_backward(x, grad)
     }
 }
 

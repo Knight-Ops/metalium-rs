@@ -6,7 +6,8 @@
 //! programs to `burn-flex` within
 //! the bounds derived on them (`EXPM1_BOUND`, `SIGMOID_BOUND`, `TANH_BOUND`,
 //! `ERF_BOUND`, `GELU_BOUND`, `gelu_backward_bound`, `SINH_BOUND`, `COSH_BOUND`,
-//! `ASINH_BOUND`, `ACOSH_BOUND`, `ATANH_BOUND`) plus Flex's own error --
+//! `ASINH_BOUND`, `ACOSH_BOUND`, `ATANH_BOUND`, `LOG_SIGMOID_BOUND`) plus Flex's
+//! own error --
 //! an ulp, and for `gelu` the cancellation of Flex's own `1 + erf` on the
 //! negative side (`|x| 2^-24` absolute), which the device's `erfc` does not
 //! suffer (`ops::transcendental` holds the device to the exact value there).
@@ -18,8 +19,8 @@ use burn_flex::{Flex, FlexDevice};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::ops::{
     gelu_backward_bound, gelu_reference, kind_sfpu::*, reference_op, Broadcast, ACOSH_BOUND,
-    ASINH_BOUND, ATANH_BOUND, COSH_BOUND, ERF_BOUND, EXPM1_BOUND, GELU_BOUND, SIGMOID_BOUND,
-    SINH_BOUND, TANH_BOUND,
+    ASINH_BOUND, ATANH_BOUND, COSH_BOUND, ERF_BOUND, EXPM1_BOUND, GELU_BOUND, LOG_SIGMOID_BOUND,
+    SIGMOID_BOUND, SINH_BOUND, TANH_BOUND,
 };
 use tt_kernels::tensor::{DramTensor, Eltwise};
 use tt_tests::backend::GATE_TILE;
@@ -194,6 +195,12 @@ fn the_unary_kinds_are_their_programs_within_their_bounds() {
                 (ASINH, host(fa.clone().asinh()), ASINH_BOUND, "asinh"),
                 (ACOSH, host(fa.clone().acosh()), ACOSH_BOUND, "acosh"),
                 (ATANH, host(fa.clone().atanh()), ATANH_BOUND, "atanh"),
+                (
+                    LOG_SIGMOID,
+                    host(activation::log_sigmoid(fa.clone())),
+                    LOG_SIGMOID_BOUND,
+                    "log_sigmoid",
+                ),
             ] {
                 let out = run(s, kind, &[&a]);
                 let got = s.download(&out).unwrap();
@@ -274,6 +281,42 @@ fn gelu_and_the_backwards_are_their_programs_within_their_bounds() {
                 );
             }
             s.free(out).unwrap();
+            // `log_sigmoid_backward`: Flex's `g * sigmoid(-x)`, the sigmoid's
+            // bound and a product's rounding on each side.
+            let out = run(s, LOG_SIGMOID_BACKWARD, &[&x, &g]);
+            let got = s.download(&out).unwrap();
+            s.free(out).unwrap();
+            same(
+                &got,
+                &reference_op(
+                    LOG_SIGMOID_BACKWARD,
+                    [0.0; 2],
+                    Broadcast::None,
+                    &[&xv, &gv],
+                    r,
+                    c,
+                ),
+                "log_sigmoid_backward",
+            );
+            let want = host(Tensor::from_primitive(
+                burn::tensor::TensorPrimitive::Float(
+                    <Flex as ActivationOps<Flex>>::log_sigmoid_backward(
+                        fx.clone().into_primitive().tensor(),
+                        fg.clone().into_primitive().tensor(),
+                    ),
+                ),
+            ));
+            for i in 0..r * c {
+                close(
+                    got[i],
+                    want[i],
+                    SIGMOID_BOUND + 2.0 / 16_777_216.0,
+                    // A denormal sigmoid flushes (numerics row D), the product
+                    // then a zero.
+                    (gv[i] as f64).abs() * f32::MIN_POSITIVE as f64,
+                    &format!("log_sigmoid'({:e}) * {}", xv[i], gv[i]),
+                );
+            }
             // `sigmoid_backward`, exact: Flex's `g * s * (1 - s)`.
             let sv = host(activation::sigmoid(fx.clone()));
             let sd = s.upload(&sv, r, c).unwrap();

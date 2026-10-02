@@ -172,6 +172,8 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "sigmoid_backward",
             "gelu",
             "gelu_backward",
+            "log_sigmoid",
+            "log_sigmoid_backward",
         ],
     ),
     ("QTensorOps", &["q_device", "q_to_device", "q_into_data"]),
