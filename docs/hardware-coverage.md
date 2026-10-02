@@ -18,7 +18,7 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01, 10.2 in progress)
+## Where things stand (2026-10-02, 10.2 in progress)
 
 10.2 (branch `phase10-2-activations`) has its instructions (10.2a): every SFPU
 instruction the rest of S2-S4 needs has a typed helper, an interpreter model and a
@@ -32,11 +32,12 @@ hard-sigmoid train at 2.9 and 2.2 ms/step (from 6.8 and 5.4) with ReLU's traffic
 AJ). S4's algebraic ops are on the card (10.2d: `sqrt`, `log1p`, `pow` by tensor, integer
 tensor and scalar), and 10.2d's sweeps found and fixed two of 10.1's range-end bugs:
 `recip`/`div` above `2^111` and `exp` at exactly its overflow threshold. The
-exponential family's core is on the card too (10.2e, part: `expm1`, `tanh`, `erf`,
-`sigmoid`, `gelu` and both backwards), so all seven of `tt-mnist`'s activations now
-move only what ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9
-(row AK). The runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
-Next: the hyperbolics, `log_sigmoid` and `softmin` (rest of 10.2e), then trig (10.2f).
+exponential family is on the card (10.2e: `expm1`, `tanh`, `erf`, `sigmoid`, `gelu`
+and both backwards, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid` and its
+backward, `softmin`), so all seven of `tt-mnist`'s activations now move only what
+ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9 (row AK). The
+runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
+Next: trig (10.2f).
 
 ### After 10.1
 
@@ -74,7 +75,7 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends) |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
@@ -864,7 +865,7 @@ Each names the measurement it must move. The Burn-side ones are in
         a product, `-1`/`-2` reciprocals, else `powf`), `int_into_float` to F32
         (exact); `step47_burn_activations::algebraic_ops_stay_on_the_card_within_
         their_bounds`. `RSQRT` has no Burn method; it waits for R3's norms.
-  - [~] **10.2e The exponential family and the activations on it** (part).
+  - [x] **10.2e The exponential family and the activations on it.**
         `expm1_program`: `exp`'s reduction, `p = e^r - 1 = r + r^2 q(r)`, then
         `2 (h p + (h - 1/2))`, `h = 2^(n-1)` -- no cancellation near zero, no
         overflow at `n = 128`; within `EXPM1_BOUND = 4.5u`. `sigmoid_program`:
@@ -895,8 +896,8 @@ Each names the measurement it must move. The Burn-side ones are in
         the result does (89.4159); `sinh` is `x` itself below `2^-12`. Within
         `SINH_BOUND = COSH_BOUND = 12.5u` (the large side's two `expm1`s;
         worst measured 2.2 ulps). Burn: `float_sinh`, `float_cosh`;
-        `step47_burn_activations::hyperbolics_log_sigmoid_and_softmin_stay_on_
-        the_card_within_their_bounds`, with Burn's autodiff of `sinh` (`g cosh
+        `step47_burn_activations::hyperbolics_and_log_sigmoid_stay_on_the_card_
+        within_their_bounds`, with Burn's autodiff of `sinh` (`g cosh
         x`); watched failing with `float_cosh` routed to `SINH`, and `step45`
         with `sinh`'s sign dropped. `asinh_acosh_program`, `atanh_program`: one
         `log1p` each, of an argument that does not cancel -- `a + a^2/(1 +
@@ -916,8 +917,11 @@ Each names the measurement it must move. The Burn-side ones are in
         denormal sigmoid flushes there (numerics row D), where Flex's times `g`
         can be normal. Burn: `log_sigmoid{,_backward}`, with Burn's autodiff
         through it (its `sum` is R1b's, on the host); `step45` watched failing
-        with the backward's negation dropped. Remaining: `softmin`; then
-        `sin`/`cos` and the rest (10.2f).
+        with the backward's negation dropped. `softmin` is R2's composition
+        on the device's exact `NEG` (Burn's default, the softmax of `-x`), within
+        the softmax's bound (`step32_burn_softmax`, both dims, three shapes, and
+        on the host below eight tiles; watched failing with the negation
+        off). Next: `sin`/`cos` and the rest (10.2f).
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1004,7 +1008,8 @@ Each names the measurement it must move. The Burn-side ones are in
 - [~] **R2 Softmax, log-softmax on the device**; cross-entropy waits on D4. `softmax`
       and `log_softmax` (either dim of a resident matrix) run Burn's own composition
       -- max, broadcast subtract, `exp`, sum, broadcast divide or `log` and subtract --
-      on the device end to end, decided once on the whole input. Against Flex's fused
+      on the device end to end, decided once on the whole input; `softmin`
+      (10.2e) the same on an exact `NEG`. Against Flex's fused
       softmax: a bound derived from the parts' (`EXP_BOUND` twice, the sum's order, the
       division's ulp, Flex's own counterparts); measured worst `1.0e-6` relative.
       Burn's `CrossEntropyLoss` gathers the target column with an integer index
@@ -1123,7 +1128,7 @@ path today, `~` when only some shapes do.
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
 | `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
-| `softmin` | | R2 |
+| `softmin` | x (device composition, derived bound; from 8 tiles) | R2 |
 
 ### `ModuleOps`
 

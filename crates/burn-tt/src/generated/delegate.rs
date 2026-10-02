@@ -2652,6 +2652,9 @@ impl ActivationOps<TtBackend> for TtBackend {
     fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         crate::ops::activation::log_softmax(tensor, dim)
     }
+    fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        crate::ops::activation::softmin(tensor, dim)
+    }
     fn log_sigmoid_backward(
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,

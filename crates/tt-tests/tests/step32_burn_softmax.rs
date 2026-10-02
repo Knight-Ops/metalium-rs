@@ -60,6 +60,7 @@ fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
                 let sum = t.clone().sum_dim(dim);
                 let soft = activation::softmax(t.clone(), dim);
                 let logsoft = activation::log_softmax(t.clone(), dim);
+                let softmin = activation::softmin(t.clone(), dim);
                 let during = tensor_traffic() - before;
                 assert_eq!(
                     (during.uploads, during.downloads),
@@ -71,6 +72,7 @@ fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
                     ("sum", &sum),
                     ("softmax", &soft),
                     ("log_softmax", &logsoft),
+                    ("softmin", &softmin),
                 ] {
                     assert!(resident(x), "[{r}, {c}] dim {dim}: {name} ran on the host");
                 }
@@ -102,6 +104,19 @@ fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
                     assert!(
                         rel <= sm_bound || (*s == 0.0 && w.abs() < f32::MIN_POSITIVE * 4.0),
                         "[{r}, {c}] dim {dim} softmax: {s:e} vs {w:e}, {rel:e} > {sm_bound:e}"
+                    );
+                }
+                // Softmin is the softmax of `-x`, the negation exact on both
+                // sides: the softmax's bound.
+                for (s, w) in floats(softmin)
+                    .iter()
+                    .zip(floats(activation::softmin(f.clone(), dim)))
+                {
+                    let rel = (*s as f64 - w as f64).abs()
+                        / (w as f64).abs().max(f32::MIN_POSITIVE as f64);
+                    assert!(
+                        rel <= sm_bound || (*s == 0.0 && w.abs() < f32::MIN_POSITIVE * 4.0),
+                        "[{r}, {c}] dim {dim} softmin: {s:e} vs {w:e}, {rel:e} > {sm_bound:e}"
                     );
                 }
                 let flex_ls = floats(activation::log_softmax(f.clone(), dim));
@@ -139,9 +154,14 @@ fn a_small_tensor_s_approximations_stay_on_the_host() {
             Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d).to_device(&d);
         let f = Tensor::<Flex, 2>::from_data(TensorData::new(v, [r, c]), &FlexDevice);
         let soft = activation::softmax(t.clone(), 1);
+        let softmin = activation::softmin(t.clone(), 1);
         let ex = t.clone().exp();
-        assert!(!resident(&soft) && !resident(&ex), "two tiles: the host's");
+        assert!(
+            !resident(&soft) && !resident(&softmin) && !resident(&ex),
+            "two tiles: the host's"
+        );
         assert_eq!(floats(soft), floats(activation::softmax(f.clone(), 1)));
+        assert_eq!(floats(softmin), floats(activation::softmin(f.clone(), 1)));
         assert_eq!(floats(ex), floats(f.exp()));
     });
 }

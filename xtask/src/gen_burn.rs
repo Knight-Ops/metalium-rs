@@ -165,6 +165,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "relu_backward",
             "softmax",
             "log_softmax",
+            "softmin",
             "leaky_relu",
             "hard_sigmoid",
             "prelu",

@@ -695,7 +695,7 @@ fn flex_atanh_error(x: f32) -> f64 {
 /// autodiff through them, whose backwards are this backend's ops too
 /// (`sinh`'s is `g cosh x`).
 #[test]
-fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
+fn hyperbolics_and_log_sigmoid_stay_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
     use burn::tensor::activation;
     use tt_kernels::sfpu::ops::{

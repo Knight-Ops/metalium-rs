@@ -1150,7 +1150,7 @@ pub mod activation {
     /// backend's ops, so on a device-resident matrix every step runs on the
     /// device; anything else is Flex's fused softmax.
     pub fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        match device_softmax(&tensor, dim, false) {
+        match device_softmax(&tensor, dim, false, false) {
             Some(t) => t,
             None => {
                 let device = tensor.device;
@@ -1165,7 +1165,7 @@ pub mod activation {
     /// Burn's own composition (`ActivationOps::log_softmax`'s default: the
     /// max-shifted log-sum-exp), on the device; else Flex's.
     pub fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        match device_softmax(&tensor, dim, true) {
+        match device_softmax(&tensor, dim, true, false) {
             Some(t) => t,
             None => {
                 let device = tensor.device;
@@ -1177,16 +1177,39 @@ pub mod activation {
         }
     }
 
-    /// Softmax (or log-softmax) of a resident matrix along `dim`, every step on
-    /// the device: decided once, on the whole input, so the small per-row
-    /// statistics in the middle stay there too.
-    fn device_softmax(t: &TtTensor, dim: usize, log: bool) -> Option<TtTensor> {
+    /// Burn's own composition (`ActivationOps::softmin`'s default: the
+    /// softmax of `-x`), on the device -- the negation exact; else Flex's.
+    pub fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        match device_softmax(&tensor, dim, false, true) {
+            Some(t) => t,
+            None => {
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::softmin(tensor.into_host(), dim),
+                    device,
+                )
+            }
+        }
+    }
+
+    /// Softmax (or log-softmax) of a resident matrix along `dim` -- of its
+    /// negation where `negate` (softmin) -- every step on the device: decided
+    /// once, on the whole input, so the small per-row statistics in the middle
+    /// stay there too.
+    fn device_softmax(t: &TtTensor, dim: usize, log: bool, negate: bool) -> Option<TtTensor> {
         use super::float::device_reduce_ungated as reduce;
         use tt_kernels::sfpu::ops::kind_sfpu;
         use tt_kernels::sfpu::reduce::ReduceOp;
         if !resident_matrix(t) || dim > 1 {
             return None;
         }
+        let neg;
+        let t = if negate {
+            neg = device_eltwise_ungated(kind_sfpu::NEG, 0.0, t, None)?;
+            &neg
+        } else {
+            t
+        };
         let max = reduce(t, ReduceOp::Max, dim)?;
         let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
         let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
