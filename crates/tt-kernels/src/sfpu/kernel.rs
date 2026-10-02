@@ -51,6 +51,10 @@ pub enum Operands {
     /// one `SFPLOAD` of either group gives every lane its column's value
     /// (`Program`s read them with [`bias_row`]).
     RowBroadcast,
+    /// `A`, and `B`'s first column broadcast across every column: the mover
+    /// makes `B`'s tile so (`tt_isa::dm::op::READ_BROADCAST_COL`), and the
+    /// kernel unpacks it as [`Operands::Binary`] does.
+    ColBroadcast,
 }
 
 /// The `Dst` row of the broadcast row's group for row group `g` of a tile:
@@ -144,7 +148,7 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
         unpack.extend(sync::take(s.free, Before::UNPACKER));
         unpack.extend(unpack_tile_to_dst(slot(layout.a_at, n), A_ROW));
         match (operands, layout.b_at) {
-            (Operands::Binary, Some(b)) => {
+            (Operands::Binary | Operands::ColBroadcast, Some(b)) => {
                 unpack.extend(unpack_tile_to_dst(slot(b, n), B_ROW));
             }
             (Operands::RowBroadcast, Some(b)) => {
@@ -190,7 +194,12 @@ mod tests {
     #[test]
     fn the_semaphores_agree_with_a_matmul_s() {
         let (_, matmul) = crate::matmul::MatmulSemaphores::alone();
-        for operands in [Operands::Unary, Operands::Binary, Operands::RowBroadcast] {
+        for operands in [
+            Operands::Unary,
+            Operands::Binary,
+            Operands::RowBroadcast,
+            Operands::ColBroadcast,
+        ] {
             let sfpu = plan_layout(8, operands).unwrap().init;
             for m in &matmul {
                 assert!(

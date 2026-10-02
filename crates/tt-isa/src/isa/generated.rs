@@ -9,9 +9,11 @@
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 24 superseded on Blackhole, 66 Wormhole-only and therefore
-//! **`UNVERIFIED`**, and 13 **`MEASURED`** against ttsim where the specification
-//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`).
+//! to be identical, 24 superseded on Blackhole, 63 Wormhole-only and therefore
+//! **`UNVERIFIED`**, 13 **`MEASURED`** against ttsim where the specification
+//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 3
+//! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate
+//! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).
 //!
 //! Names are the `Bits32.lua` diagram keys, so a name in the specification can
 //! be found here without translation — except that a Blackhole-specific form
@@ -994,7 +996,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/DMANOP.md",
     );
 
-    /// `ADDDMAREG`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `ADDDMAREG`. **`CONFIRMED`** on Blackhole, ttsim and silicon, by `crates/tt-tests/tests/step38_gpr_add.rs::adddmareg_adds_two_registers`: the layout of `WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md` (a Wormhole page; Blackhole has none), every field exercised.
     pub static ADDDMAREG: InstructionDef = InstructionDef::new(
         "ADDDMAREG",
         "ADDDMAREG",
@@ -1006,7 +1008,9 @@ pub mod defs {
         ],
         &[(Field::new("", 23, 1, false, None), 0)],
         0x007c0000,
-        Provenance::WormholeOnly,
+        Provenance::Confirmed {
+            evidence: "crates/tt-tests/tests/step38_gpr_add.rs::adddmareg_adds_two_registers",
+        },
         "WormholeB0/TensixTile/TensixCoprocessor/ADDDMAREG.md",
     );
 
@@ -1305,7 +1309,7 @@ pub mod defs {
         "BlackholeA0/TensixTile/TensixCoprocessor/SFPSTORE.md",
     );
 
-    /// `MOP`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOP.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `MOP`. **`CONFIRMED`** on Blackhole, ttsim and silicon, by `crates/tt-tests/tests/step36_mop.rs::a_mop_expands_as_the_page_models_it`: the layout of `WormholeB0/TensixTile/TensixCoprocessor/MOP.md` (a Wormhole page; Blackhole has none), every field exercised.
     pub static MOP: InstructionDef = InstructionDef::new(
         "MOP",
         "MOP",
@@ -1317,11 +1321,13 @@ pub mod defs {
         ],
         &[],
         0x00000000,
-        Provenance::WormholeOnly,
+        Provenance::Confirmed {
+            evidence: "crates/tt-tests/tests/step36_mop.rs::a_mop_expands_as_the_page_models_it",
+        },
         "WormholeB0/TensixTile/TensixCoprocessor/MOP.md",
     );
 
-    /// `MOP_CFG`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MOP_CFG.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `MOP_CFG`. **`CONFIRMED`** on Blackhole, ttsim and silicon, by `crates/tt-tests/tests/step36_mop.rs::a_mop_expands_as_the_page_models_it`: the layout of `WormholeB0/TensixTile/TensixCoprocessor/MOP_CFG.md` (a Wormhole page; Blackhole has none), every field exercised.
     pub static MOP_CFG: InstructionDef = InstructionDef::new(
         "MOP_CFG",
         "MOP_CFG",
@@ -1329,7 +1335,9 @@ pub mod defs {
         &[Field::new("MaskHi", 0, 16, false, None)],
         &[],
         0x00ff0000,
-        Provenance::WormholeOnly,
+        Provenance::Confirmed {
+            evidence: "crates/tt-tests/tests/step36_mop.rs::a_mop_expands_as_the_page_models_it",
+        },
         "WormholeB0/TensixTile/TensixCoprocessor/MOP_CFG.md",
     );
 

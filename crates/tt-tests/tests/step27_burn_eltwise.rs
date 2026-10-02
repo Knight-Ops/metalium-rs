@@ -11,6 +11,14 @@
 use burn::tensor::{activation, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, TtBackend};
+
+/// Was `t` computed on the device (`TtTensor::computed_on_device`)?
+fn computed_on_device(t: &Tensor<TtBackend, 2>) -> bool {
+    match t.clone().into_primitive() {
+        burn::tensor::TensorPrimitive::Float(p) => p.computed_on_device(),
+        _ => false,
+    }
+}
 use tt_tests::burn_device::{with_device, Config};
 
 fn values(seed: u64, n: usize) -> Vec<f32> {
@@ -53,6 +61,8 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
             };
             let (a, b, row) = (ta(&av, [r, c]), ta(&bv, [r, c]), ta(&rowv, [1, c]));
             let (fa, fb, frow) = (fl(&av, [r, c]), fl(&bv, [r, c]), fl(&rowv, [1, c]));
+            let colv = values(6, r);
+            let (col, fcol) = (ta(&colv, [r, 1]), fl(&colv, [r, 1]));
             type Case = (
                 &'static str,
                 Box<dyn Fn() -> Tensor<TtBackend, 2>>,
@@ -90,6 +100,38 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
                         move || a.clone() + row.clone()
                     }),
                     bits(fa.clone() + frow.clone()),
+                ),
+                (
+                    "subtract a row",
+                    Box::new({
+                        let (a, row) = (a.clone(), row.clone());
+                        move || a.clone() - row.clone()
+                    }),
+                    bits(fa.clone() - frow.clone()),
+                ),
+                (
+                    "a row times (on the left)",
+                    Box::new({
+                        let (a, row) = (a.clone(), row.clone());
+                        move || row.clone() * a.clone()
+                    }),
+                    bits(frow.clone() * fa.clone()),
+                ),
+                (
+                    "subtract a column",
+                    Box::new({
+                        let (a, col) = (a.clone(), col.clone());
+                        move || a.clone() - col.clone()
+                    }),
+                    bits(fa.clone() - fcol.clone()),
+                ),
+                (
+                    "a column plus (on the left)",
+                    Box::new({
+                        let (a, col) = (a.clone(), col.clone());
+                        move || col.clone() + a.clone()
+                    }),
+                    bits(fcol.clone() + fa.clone()),
                 ),
                 (
                     "mul_scalar",
@@ -147,6 +189,124 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
                             "[{r}, {c}] {name}: element {i}: {g:#010x} vs {w:#010x}"
                         );
                     }
+                }
+            }
+        }
+    });
+}
+
+/// The SFPU's approximations through Burn: within the one ulp their gates
+/// derive (`step28_division`), resident throughout.
+#[test]
+fn division_through_burn_is_within_one_ulp_and_stays_resident() {
+    with_device(Config::default(), |d| {
+        // Eight tiles: the size from which these approximations run on the
+        // device (`burn-tt`'s `APPROX_MIN_TILES`).
+        let [r, c] = [64, 128];
+        let (av, bv) = (values(4, r * c), values(5, r * c));
+        let ta = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (a, b, fa, fb) = (ta(&av), ta(&bv), fl(&av), fl(&bv));
+        // Positive operands for `log`, uploaded as they are: an `abs` first
+        // would run on the host copy, and `log` after it too.
+        let posv: Vec<f32> = av.iter().map(|x| x.abs()).collect();
+        let (pos, fpos) = (ta(&posv), fl(&posv));
+        type Case = (
+            &'static str,
+            Box<dyn Fn() -> Tensor<TtBackend, 2>>,
+            Vec<u32>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "div",
+                Box::new({
+                    let (a, b) = (a.clone(), b.clone());
+                    move || a.clone() / b.clone()
+                }),
+                bits(fa.clone() / fb.clone()),
+            ),
+            (
+                "recip",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone().recip()
+                }),
+                bits(fa.clone().recip()),
+            ),
+            (
+                "div_scalar",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone() / 0.3
+                }),
+                bits(fa.clone() / 0.3),
+            ),
+            (
+                "exp",
+                Box::new({
+                    let a = a.clone();
+                    move || a.clone().exp()
+                }),
+                bits(fa.clone().exp()),
+            ),
+            (
+                "log",
+                Box::new({
+                    let p = pos.clone();
+                    move || p.clone().log()
+                }),
+                bits(fpos.clone().log()),
+            ),
+        ];
+        for (name, op, want) in cases {
+            let before = tensor_traffic();
+            let out = op();
+            let during = tensor_traffic() - before;
+            assert!(
+                computed_on_device(&out),
+                "{name}: the result was computed on the host"
+            );
+            assert_eq!(
+                (during.downloads, during.uploads),
+                (0, 0),
+                "{name}: {during:?}"
+            );
+            for (i, (g, w)) in bits(out).iter().zip(&want).enumerate() {
+                let (gf, wf) = (f32::from_bits(*g), f32::from_bits(*w));
+                if wf.is_nan() {
+                    assert!(gf.is_nan(), "{name}: element {i}");
+                } else if wf.is_infinite() || wf == 0.0 || wf.abs() < f32::MIN_POSITIVE {
+                    assert_eq!(
+                        gf.abs(),
+                        if wf.abs() < f32::MIN_POSITIVE {
+                            0.0
+                        } else {
+                            wf.abs()
+                        },
+                        "{name}: element {i}"
+                    );
+                } else if name == "exp" || name == "log" {
+                    // Their derived relative bounds, plus Flex's own ulp.
+                    let bound = if name == "exp" {
+                        tt_kernels::sfpu::ops::EXP_BOUND
+                    } else {
+                        tt_kernels::sfpu::ops::LOG_BOUND
+                    };
+                    let rel = (gf as f64 - wf as f64).abs() / (wf as f64).abs();
+                    assert!(
+                        rel <= bound + 1.2e-7,
+                        "{name}: element {i}: {gf:e} vs {wf:e}"
+                    );
+                } else {
+                    let ulps = (*g as i64 - *w as i64).unsigned_abs();
+                    assert!(
+                        ulps <= 1,
+                        "{name}: element {i}: {gf:e} vs {wf:e}, {ulps} ulps"
+                    );
                 }
             }
         }

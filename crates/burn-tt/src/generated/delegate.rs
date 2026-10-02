@@ -240,18 +240,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_div(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::float::float_div(lhs, rhs)
     }
     fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_div_scalar(lhs.into_flex(), rhs),
-            device,
-        )
+        crate::ops::float::float_div_scalar(lhs, rhs)
     }
     fn float_remainder(
         lhs: FloatTensor<TtBackend>,
@@ -295,11 +287,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_recip(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_recip(tensor)
     }
     fn float_transpose(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_transpose(tensor)
@@ -326,11 +314,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_reshape(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_flex(), shape),
-            device,
-        )
+        crate::ops::float::float_reshape(tensor, shape)
     }
     fn float_gather(
         dim: usize,
@@ -715,18 +699,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_exp(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_exp(tensor)
     }
     fn float_log(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_log(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_log(tensor)
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);
@@ -971,11 +947,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_max_dim(tensor.into_flex(), dim),
-            device,
-        )
+        crate::ops::float::float_max_dim(tensor, dim)
     }
     fn float_max_dim_with_indices(
         tensor: FloatTensor<TtBackend>,
@@ -2943,11 +2915,10 @@ impl ActivationOps<TtBackend> for TtBackend {
         )
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as ActivationOps<Flex>>::softmax(tensor.into_flex(), dim),
-            device,
-        )
+        crate::ops::activation::softmax(tensor, dim)
+    }
+    fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        crate::ops::activation::log_softmax(tensor, dim)
     }
     fn log_sigmoid_backward(
         x: FloatTensor<TtBackend>,

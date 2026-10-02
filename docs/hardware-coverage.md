@@ -18,7 +18,13 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01, after 10.0)
+## Where things stand (2026-10-01, after 10.1)
+
+10.1 added, on top of the table below: reciprocal, division, `exp` and `log` on the SFPU
+(S3, S4a), lane movement (S8), `sum` and `max` over either dim (R1a), softmax and
+log-softmax on the device (R2); the matmul's loops replayed and the MOP Expander gated
+(X1, X2); the movers' queues, barriers, batching and traces (X4); and wedged tiles
+detected and recovered (X5). The table is 10.0's.
 
 Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
 
@@ -47,7 +53,7 @@ only a feature list.
 | # | Milestone | Items | State |
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
-| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4 | `[ ]` |
+| 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
@@ -117,17 +123,17 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
 | Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
-| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | | | | | S2, S4 |
+| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | `~` `SFPDIVP2` (0..128) | | `~` `SFPDIVP2` (row 66) | `~` `SFPDIVP2` | S2, S4 |
 | Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
-| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | `~` `SFPSETSGN` | | `~` `SFPSETSGN` | `~` `SFPSETSGN` | S2, S4, S6 |
+| Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | x | `~` (`exp`, `log`, `recip`) | x | x | -- |
 | Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
-| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | | | | | S5 |
-| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | | | | | S5, S8 |
-| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | | | | | S3, S4 |
+| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | `~` `AND`, `OR` | `~` (masks) | `~` | `~` | S5 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT`, `SFPSHFT2` (rotate) | `~` (`exp`, `log`, reductions) | `~` | `~` | S5 |
+| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
 | Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
-| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | | | | | S2, S8 |
+| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | `~` `SFPTRANSP` | `~` (reductions) | `~` | `~` | S2 |
 | Configuration | `SFPCONFIG` | x | | | | | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
@@ -171,7 +177,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | Feature | Enc | Helper | Kernel | Sim | Si | Item |
 |---|:-:|:-:|:-:|:-:|:-:|---|
 | `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
-| `MOP` / `MOP_CFG` (MOP Expander templates) | x | | | | | X2 |
+| `MOP` / `MOP_CFG` (MOP Expander templates) | x (`CONFIRMED`) | x (`frontend::mop`, mailbox `MOP_CFG`) | (X2b) | x | x | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
@@ -195,8 +201,11 @@ Pulled in only when a kernel needs them; each says which.
 
 ### Out of scope, and why
 
-- `[-]` **L2CPU tiles.** Harts leave reset only once per power cycle (`L2CPUTile/README.md:30`);
-  nothing a Burn backend needs runs better there than on the host.
+- `[-]` **L2CPU tiles.** Harts leave reset only once per power cycle (`L2CPUTile/README.md:30`).
+  Out of scope for Phase 10, but no longer for the reason first given ("nothing a Burn
+  backend needs runs better there"): the measured host round trips say the opposite. A
+  proposal to use the x280s as an on-card host -- driving traces, small ops, dispatch -- is
+  `feature-x280-on-card-dispatch.md`, awaiting a decision.
 - `[-]` **PCIe DMA engines.** No register-level documentation (open question 5);
   residency makes bulk transfer a startup cost.
 - `[-]` **A GDB stub over the debug interface.** No Blackhole bit layouts (open question 2).
@@ -220,11 +229,91 @@ reverse index.
       it replays. F2's row-group loop records its body once and replays it where it fits,
       unrolling (and saying so) where it does not. Gate: replayed programs bit-identical to
       their unrolled form on ttsim and both cards.
-- [ ] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
+- [x] **X2 `MOP` / `MOP_CFG`.** Typed templates behind a builder; reconfiguration only
       after `MOPExpanderDoneCheck` (`ManualTTSync.md:57`); Auto TTSync takes the `MOP`'s
       resource declaration (`AutoTTSync.md:26`). Applied to the matmul inner loop, the
       unpacker face loops and `pack_rows`. Gate: MNIST golden bit for bit; program bytes
       down; silicon time measured.
+  - [x] **X2a The expander, configured from the mailbox.** `tt_isa::frontend::mop`:
+        `MopConfig` (templates 0 and 1, Blackhole's ten-bit counts) refusing what the page
+        marks unsupported -- the count overrides, the start/inner/end shape with the
+        iteration-count bug, a `MOP` in a loop slot -- and `expand`, the page's functional
+        model, as the oracle. A kernel's `mop: [Option<MopConfig>; 3]` goes into each
+        role's mailbox (`mailbox::MOP_CFG_VALID`, `MOP_CFG`, nine words); the runner waits
+        on `MOPExpanderDoneCheck` and writes them to `TENSIX_MOP_CFG_BASE` before
+        pushing, so nothing but instructions is ever in the stream. The session's
+        descriptor comparison covers the words, so a queued kernel's configuration is
+        never rewritten under it. Gate `step36_mop`: template 1 (start, last and two end
+        ops; alternating loop ops) and template 0 (a mask over both halves, 20
+        iterations) as integer adds whose sum counts each slot -- the device's tile bit
+        for bit the interpreter's on the model's expansion, and the first sum checked by
+        hand; and two runs of one `MOP` under two configurations give their own sums
+        (watched failing: the hand count off by one; no configuration loaded, ttsim's
+        contract exit). ttsim, then silicon alone on the gate tile, both cards. `MOP` and
+        `MOP_CFG` were Wormhole-only drawings: the generator now marks them `CONFIRMED`
+        with this gate as evidence (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`: only a
+        `WormholeOnly` layout, the gate must exist, every field must be exercised).
+  - [x] **X2b Applied**: the matmul's `MVMUL` loop, the unpacker face loops, `pack_rows`;
+        MNIST golden bit for bit, program bytes and silicon time measured.
+    - [x] **Kernels are push-bound, measured** (`silicon_perf::role_push_rate`): a
+          matmul tile's unpack role pushes at the runner's ceiling and its backend
+          finishes the moment the last word lands, so fewer words is faster. The
+          runner itself now pushes in batches of sixteen (2.8 cycles a word, was
+          7.6): every kernel about 2.5x faster to issue (row AB). Full suite 424/424.
+    - [x] **The loop planner** (`tt_kernels::loops`): `Item::Repeat` lowered to a
+          `MOP` looping a `REPLAY` of the recorded body (the loop that saves the
+          most takes the one configuration), plain `REPLAY`, or unrolled, each
+          choice recorded with its reason; a program with `REPLAY`s of its own is
+          left unrolled. Unit tests: the modelled frontend's output
+          (`loops::frontend_stream`, MOP then Replay Expander) is the unrolled
+          program word for word. Gate `step37_loops`: lowered and unrolled store
+          the same counted sum, and the lowered is under a quarter of the words
+          (watched failing: one `MOP` dropped, short by exactly its five
+          iterations). ttsim and both cards: a `MOP` looping a `REPLAY` on silicon.
+    - [~] **The matmul in loops** (`matmul::matmul_items`, lowered by
+          `loops::lower_with`):
+      - [x] Faces in the order `fi`, `k`, `fj`: each `Dst` face still takes its
+            `k = 0` product before its `k = 1` within a pair, so every datum
+            accumulates as before -- the MNIST golden is bit for bit -- and each `A`
+            face is unpacked once for the two `MVMUL` groups that read it
+            (`mvmul_release_a`, then `_both`). The unpackers' `X` range is set once.
+            A pair's face block is the same words for every pair: 24 on the unpack
+            role, 32 on the math role at LoFi.
+      - [x] Tiles stepped by GPR arithmetic where the pairs are evenly spaced (the
+            gather's layout): each operand's base and stride in GPRs 24-27, and per
+            pair the same eight words -- wait, `ADDDMAREG` base += stride, `WRCFG`
+            both -- so each output's K loop is one `Repeat` of the face block and the
+            step, 32 words, replayed (`gpr_step`; uneven pairs keep the explicit
+            retarget and share the face block). `ADDDMAREG` gated alone first
+            (`step38_gpr_add`, both forms on silicon, the register form on ttsim --
+            row 67 -- and now `CONFIRMED`). A body already in the buffer is replayed
+            by the next output without recording it again.
+      - [x] Measured (row AC): a 1x8x1 tile's unpack 514 -> 116 words, LoFi math
+            269 -> 53; MNIST inference 0.61 -> 0.53 ms a batch. Full suite 430/430.
+      - [x] Math at every fidelity in one replayed unit per `fi`: each `MVMUL`
+            names its `Dst` row within the `fi` (the same for both), the RWCs' `Dst`
+            holds the `fi`'s base, and address modifiers do the rest
+            (`matmul::MATH_AM_*`): 1 the phase, 2 a half's end (`SrcB` on 8), 3 a
+            group's end (`SrcB` back), 4 an `fi`'s end (`Dst` on 32). A unit is 32
+            `MVMUL`s at HiFi4, so a pair's math is a reset and two `REPLAY`s; the
+            planner now writes out a loop too long to record as items, so the loops
+            inside it still replay. MNIST golden bit for bit; HiFi4 math for a
+            1x8x1 tile 653 -> 75 words, the kernel now held by the backend, not by
+            pushing (row AD). A first version moved the base by `Dst`'s carriage
+            return (`DestCR`) and left output face (1, 0) wrong on ttsim, though each
+            modifier behaved in isolation (`step9`-style probe): unexplained, so the
+            design uses plain increments only. Modifiers persist between programs:
+            `step9`'s measurement now sets every entry it relies on.
+      - [x] The MOP carried to the roles: `Step::Kernel` and the session's lists
+            take each role's `MopConfig` (a list's kernels share one descriptor, so
+            a list splits where it changes), and `matmul_kernel` lowers the math
+            role's loops under one when asked. Measured (row AE): a `MOP` on the
+            unpack or pack role is slower than their replays, and on the math role
+            no faster end to end -- the matmul is backend-bound -- so the session
+            runs it without, which also keeps the matmul ttsim's path (row 68).
+            The expander stays gated (`step36_mop`, `step37_loops`) for a loop that
+            is push-bound. Full suite: ttsim, silicon 430/430; MNIST 91.96%, 2.0 /
+            1.6 ms a step (1 / 4 tiles), inference 0.45 ms a batch of 64.
 - [x] **X3 The debug timestamper as a device profiler** (concepts review G13). The B
       mover brackets each list and each top-level entry or record with timestamper events
       when `dm::TRACE` is set (tokens: `tt_isa::mailbox::trace`, source in bits 8..12,
@@ -242,17 +331,203 @@ reverse index.
       than the buffer holds, none lost. Watched failing with the drain disabled (the
       overflow refusal). Sim `[-]`: row 54. First use: row O, the reduced-MNIST
       breakdown. Burn: not applicable (no op).
-- [ ] **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
+- [x] **X4 Dispatch: queue, barriers, batching, traces** (concepts review G8). Per-op
+      cost is the host's submission and wait (~100-200 us an op, measurement S), so:
+  - [x] **X4b A barrier across movers by NoC atomics.** `tt_isa::noc::niu::Command::
+        AtomicIncrement` (`CMD_AT`, `NOC_AT_LEN_BE`'s increment layout from
+        `Bits32.lua`), and `dm::op::BARRIER` -- wait for this unit's moves, increment
+        the coordinator tile's `dm::BARRIER_COUNTER`, poll it by NoC read until the
+        target (`k * n` for the `k`-th barrier of `n` units). Gate `step33_barrier`:
+        tile A's read after a barrier sees tile B's GDDR write before it, A's list
+        submitted first; three rounds, every arrival counted. Watched failing with A's
+        barrier after its read (round 2 reads stale bytes). ttsim models the atomic;
+        both cards.
+  - [x] **X4a A command queue on the mover.** `tt_isa::dm::QUEUE_*`: sixteen slots
+        `(first entry, entries)` over the 512-entry list ring; the mover runs queued
+        lists in order and counts them done, and a failed list stops the queue with
+        its number and code. `DataMover::{enqueue, wait_for, drain, refresh}`: the host
+        writes a list where it fits beside those in flight (`ring_room`, never across
+        the end; unit test with a 10k-step soak) and waits only for room or a result;
+        a stuck queue times out on no progress. Gate
+        `step33_barrier::queued_lists_run_in_order_without_waiting`: forty chained
+        copies enqueued without waiting -- past the slots and the ring -- arrive whole.
+        Watched failing with every list placed at entry 0. ttsim and both cards.
+  - [x] **X4c Batching in the session**: ops queue with their outputs placed; a sync
+        point (download, explicit) submits them, barriers between multi-unit ops; then
+        burn-tt's ops are asynchronous for free. `Session::{sync, set_batching}`
+        (`TT_BATCH`, default on): each segment is enqueued on the mover's queue, a
+        barrier list follows a multi-unit op, frees wait for the lists that may read
+        them, and downloads, runs and profiles sync first. Two hazards found on
+        silicon, both closed (table below): a full program cache never makes room
+        while lists are queued (the programs they run stay pinned; the session drains
+        and places again), and an upload is visible through every port of its channels
+        before `dram_write` returns (divergence row T). Gate `step34_batching`: a
+        40-op chain of four SFPU kinds through a cache cut to about two kinds'
+        programs, bit for bit to the interpreter, with evictions (watched failing with
+        eviction allowed while queued: ttsim's contract-violation exit); a four-unit
+        layer forward with several lists per unit per op, eight queued passes bit for
+        bit to the unbatched one; and an upload-then-op guard (row T: it does not
+        reproduce the race, `tt-mnist` does). ttsim and both cards. MNIST: row U.
+  - [x] **X4d Traces** -- opt-in capture and replay, inference first (tt-metal's
+        `BeginTraceCapture`/`ReplayTrace` the model, its footguns designed out). As built
+        (`tt_kernels::trace`, `Session::{begin_trace, end_trace, replay, release_trace,
+        write, trace_ops}`; Burn: `burn_tt::Trace`):
+    - **Opt in, from wherever the caller is.** `begin_trace` ... `end_trace` around any
+      stretch of a batching session's ops captures and runs it once; `replay(id)` runs it
+      again, queued like any op. Between replays `Session::write` overwrites a tensor the
+      trace reads (shape-checked, a view refused), and the tensors it wrote hold the
+      results. Untraced ops run as before, interleaved freely.
+    - **Replay without the host.** At `end_trace` each unit's stream goes to GDDR on its
+      own channel, padded with `WAIT`s so no record crosses a 64-entry chunk
+      (`trace::chunked`); a replay is one list per unit holding one `CALL`
+      (`tt_isa::dm::op::CALL`), which the mover runs a chunk at a time from
+      `dm::TRACE_CHUNK`. A `CALL` is a list of its own, and one inside a trace is
+      refused. Per-run values: each top-level `KERNEL`'s generation and each `BARRIER`'s
+      target are patched in the chunk by the `CALL`'s bases (`Resident::take_generations`,
+      the session's barrier count); the roles' descriptors are `POKE` entries
+      (`dm::op::POKE`, role-mailbox words only) wherever the stream has not set them yet;
+      a semaphore setup the host ran during the capture is a `KERNEL` of its own (thread
+      0 its program, held in the program cache; threads 1-2 a zero-length program). A
+      replay writes 40 bytes a unit over PCIe; the one-layer capture it repeats, 5.6 KB
+      (row AG).
+    - **Uncorruptible, or a typed refusal** (each provoked in `step39_traces`):
+      - a live trace holds every allocation that existed when its capture ended: a free
+        of one is deferred to the trace's release. The rule is exact without tracking
+        each op's tensors: frees during the capture are deferred too, so what is
+        allocated afterwards lies in what was free then (`tensor::FreeSnapshot`);
+      - the programs its kernels name are held in the program cache
+        (`ProgramCache::hold`; eviction, and the room-making clear, skip them);
+      - the session's epoch moves on at every tile reset and mover start, and a replay
+        against an older one is `TraceError::Stale`. A failed list -- a replay's too --
+        recovers its units as before, so it makes every trace stale, not only its own;
+      - a download, a `write` or a host-run kernel (`sync_run`: `run`, `prepare`, the
+        host matmul) during a capture is `TraceError::HostTransfer`; turning batching off
+        is `Capturing`. An upload is allowed: a constant the replay finds where it was;
+      - the descriptors and semaphores the host remembers are forgotten at a capture's
+        start (so it records everything its kernels need) and after a replay (so nothing
+        queued later trusts them).
+    - **Structured, so it can be optimized later.** Each op's `OpRecord` -- its name, its
+      range of every unit's stream, whether a barrier followed -- is kept with the trace
+      (`Session::trace_ops`); the placements each op read and wrote are the next field
+      it needs. Optimizing over the captured graph is **X4e**.
+    - **Burn.** `burn_tt::Trace::capture(&input, || forward(..))` captures on the
+      input's own buffer and returns the capture's output values; `run(values)` writes,
+      replays and downloads in one round trip. Both return host values, not a tensor: a
+      tensor of the output buffer would change under its holder at the next run. A
+      closure that falls back to the host is refused (the op panics, as a device error
+      does) and the capture is ended, never left open. Single-chip engines only; the
+      mesh engine refuses. `tt-mnist --infer --trace` replays per batch.
+    - Gates: `step39_traces` -- a layer's forward pass on one tile and on two (barriers)
+      replayed over three new inputs, each the same ops run fresh bit for bit, and each
+      replay's writes under a twentieth of the capture's; a freed weight deferred while
+      an allocation of its size lands elsewhere; every refusal. Watched failing: a `CALL`
+      over half its entries (replay 0, element 0 wrong). `step40_burn_trace` -- a Burn
+      MLP traced and run on new inputs against the fresh Burn ops bit for bit, and a host
+      fallback refused with the next capture working. ttsim and both cards. MNIST
+      inference traced: the same predictions; 2.59 ms a batch, of which 2.1 the input's
+      200 KB write from the host (row AG, X7).
+    - **Training: later, documented.** A training step is replayable once its weights are
+      updated in place (the optimizer writing the same buffers) and the loss stays on the
+      device; neither holds today (B16, and Burn's tensors are immutable). Until then a
+      training loop traces its forward pass at most. With the x280s as an on-card host
+      (`feature-x280-on-card-dispatch.md`), the host-side part of a step moves next to the
+      data and whole-step traces become the natural shape.
+  Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
       after one is freed. Gate: MNIST golden with steps replayed, steady-state PCIe writes
       per step down to the descriptors.
+- [x] **X5 Wedged tiles: detect, then recover** (the hazard table's open wedge row).
+  - [x] **X5a Detect at open, never fail opaquely.** A role that does not finish the
+        tile reset (`session::reset_thread_state`, a few hundred instructions on an
+        idle tile) is `RunError::Wedged { tile, roles }`, whose message names the tile
+        and threads and says a board reset (`tt-smi -r`, or a power cycle) clears it.
+        `Session::open` skips a wedged tile with a warning when tiles are chosen by
+        count (`First`, `Count`, `All`), taking the next healthy one, and fails with
+        that error for `Exactly`; too few healthy is `SessionError::TooFewHealthy`
+        listing the wedged tiles. Unit tests: the selection (a wedged tile passed over,
+        the search stopping once enough are found) and both messages. The signature it
+        keys on, every stuck role a timeout, is the one the wedged tile (1,2) gave on
+        both cards -- and the deliberate wedge of X5b gives again.
+  - [x] **X5b Recover in software.** The cause, from the specification and then
+        reproduced: a Matrix Unit instruction that reads `Src` waits by itself until its
+        bank's `AllowedClient` is the Matrix Unit (`STALLWAIT.md`, C7/C8), and the
+        backend pulse hands every bank to the unpackers (`SoftReset.md`, bits 15-16). One
+        caught waiting by the pulse waits for good, and its thread takes nothing more --
+        an unpacker caught waiting the other way is released by the same pulse, which is
+        why only thread 1 stayed stuck. The recovery (`session::unwedge_tile`): the
+        pulse, then `datapath::src_feeder` on thread 0 -- four plain `UNPACR`s, the
+        matmul's own encoding, one into each bank of each `Src`, none of which can wait
+        on a freshly pulsed tile -- which gives the stuck instruction its banks, then
+        the pulse again to take them back. `prepare_unit` tries it once when the
+        thread reset or the roles' restart comes back `Wedged`, logs the outcome, and
+        reports `Wedged` (message updated) if the tile is still stuck. No `UNVERIFIED`
+        encoding anywhere. Gate `step41_unwedge`: a math role of one `MVMUL` with
+        nothing to feed it (verified encodings only) wedges tile (2,3) through the pulse
+        and thread reset -- `Wedged` is asserted, so the gate is not vacuous -- the
+        feeding run finishes, the roles restart, and a matmul is bit for bit the one
+        before; the session does the same by itself after a failed kernel; and the
+        recovery on a healthy tile leaves it healthy, the isolated gate run first.
+        Watched failing with an empty feeder ("the feeding run did not finish"). ttsim:
+        the wedge and the release by the feeder; it has no pulse to take the banks back
+        (row 69), so there the session reports `Wedged` instead of computing from
+        them. Silicon: both cards, four runs each. The wedge that started this (tile
+        (1,2), from programs overwritten under a queued list) is gone with the boards'
+        reset and prevented since X4c; another cause the feeder does not release still
+        ends in `Wedged` and a board reset.
+
+### Performance follow-ups (measured, not yet scheduled)
+
+From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` rows V-Z;
+`tt-mnist` and `tt-mnist --infer` print the host-side split, `TT_PROFILE` the device's).
+Each names the measurement it must move. The Burn-side ones are in
+`burn-backend-parity.md` (B5, B8, B16).
+
+- [ ] **X6 A fast path for the mover's requests.** A GDDR read costs ~0.46 us an entry
+      however small (row W after row Y), and a matmul gather is one entry per tile: a
+      record should issue its moves straight to the NIU -- validated once per record,
+      not re-encoded and decoded per tile -- and write only the NIU registers that
+      change between requests (tt-metal's `*_set_state`/`*_with_state` pattern; the
+      register persistence to be checked on ttsim and in a gate first). Moves:
+      `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
+      the gather's share of a step (row V: 0.94 ms of 2.4).
+- [ ] **X7 Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
+      a call and a download of the same ~140 us past its sync (rows Z, measurement M:
+      uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
+      a tensor touches). Batch the read-backs per tensor, not per channel write; read
+      small tensors with the widest loads the BAR allows. A large write is slow too: a
+      traced inference batch's 200 KB input takes 2.1 ms (~95 MB/s, against the WC
+      aperture's GB/s; row AG), most of a traced batch. Moves: per-call `upload` and
+      `download` in `tt-mnist`'s breakdown. With it, the ordering rule as API (row AA):
+      a fenced L1 write -- posted writes, then one read-back -- for every host write
+      another agent may race, so a caller cannot forget it.
+- [x] **X4d Traces** (above): a replay's host side is one entry a unit; what is left of
+      a traced inference batch is the input's write (X7) and the output's download.
+- Moved to Burn's roadmap with the numbers: **B8** async calls (a call's server round
+  trip is 32-49 us, ~0.2 ms of a 0.61 ms inference batch); **B5/D4** a slice not on a
+  tile row (batch 1000 inference: 46 ms a batch, 3 MB re-uploaded each); **B16** the loss
+  on the device for a small tensor now that ops do not wait one by one.
 
 ### P — Prerequisites pulled in when they block
 
-- [ ] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
+- [~] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
       `prod(leading)` stacked tile grids, a batch stride in `TensorRef` (0 = broadcast),
       last-dim-preserving reshapes as views. Blocks R1 over leading dims, R3, D6, R4.
+  - [x] **P1a Storage and element-wise.** `burn-tt` stores an F32 tensor of any rank
+        as `[product of the leading dims, last dim]` (`tensor::stored_dims`, rank 1 as
+        one row); `float_reshape` keeping that matrix is a view; element-wise ops of
+        one shape, and broadcasts that are a row or column of the stored matrix and
+        give the larger operand's shape by NumPy's rule, run on the device;
+        `to_device` uploads any rank. Pulled in because it blocked batching: a
+        linear layer's rank-1 bias put four transfers -- and so four syncs -- in
+        every MNIST step; the steady step now moves only the logits and their
+        gradient (the 9.5 budget, `step12_mnist`). Gate `step35_burn_rank_n`:
+        rank 1 and 3, row and column broadcasts, reshape views, against Flex bit
+        for bit (a NaN by class) and downloading nothing; `[6, 1, 4] + [1, 6, 1]`,
+        a column by the matrices but `[6, 6, 4]` by the rule, still right (watched
+        failing without the rule's check). ttsim and both cards.
+  - [ ] **P1b Batch stride.** `TensorRef` batch stride (0 = broadcast) for batched
+        matmul and reductions over leading dims.
 - [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
       a matmul's K is not capped by L1. Blocks D6's im2col.
 
@@ -354,7 +629,7 @@ reverse index.
       anything without one refused by name. Modelled so far: `SFPLOAD`/`SFPSTORE`
       (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
       `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
-      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPNOP`, and the `SETRWC`/`SETC16`
+      `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPGT` (flags, `VD`), `SFPARECIP`, `SFPNOP`, and the `SETRWC`/`SETC16`
       forms the builder emits. **Plan change:** each S item adds the models it
       needs, and where a page defines a self-contained C function (`ApproxRecip`,
       `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
@@ -395,16 +670,45 @@ reverse index.
       `float_clamp{,_min,_max}`, `float_abs`, `float_neg`, `float_sign`, `leaky_relu`,
       `hard_sigmoid`, `prelu`. Needs bool tensors on the device (`BoolTensorOps` storage,
       D3).
-- [ ] **S3 Reciprocal and division.** `SFPARECIP` (Blackhole-only) for the seed, Newton
-      steps by `SFPMAD` to full precision, the bound derived from the seed's documented
-      accuracy. Burn: `float_recip`, `float_div`, `float_div_scalar`, `float_remainder{,_scalar}`.
-- [ ] **S4 Transcendentals.** Range reduction by `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, then
-      `SFPMAD` polynomials or `SFPLUTFP32` (its `LReg[LReg[7] & 15]` destination bug
-      handled inside the helper, Tier 2). In order: `exp`, `log`, `sqrt`/`rsqrt`, then
-      `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos`. Burn: `float_exp`, `float_log`,
-      `float_log1p`, `float_sqrt`, `float_powf{,_scalar}`, `float_powi*`, `float_tanh`,
-      `float_erf`, `float_sin`, `float_cos`, then the rest of the trig family;
-      `sigmoid`, `gelu`, `log_sigmoid` and their backwards.
+- [x] **S3 Reciprocal and division** (`float_remainder{,_scalar}` moves to S6, which
+      brings `floor`). `tt_isa::numerics::sfpu::{approx_recip, approx_exp, arecip}` port
+      `SFPARECIP.md`'s functional model, the tables copied out of the page by script and
+      held to the page's own C -- extracted from the pinned tree and compiled by
+      `tt-tests/build.rs` (`sfpu_models_oracle`, every input reaching a table or
+      branch; watched failing with one table entry changed). `Program::recip`: the
+      `SFPARECIP` seed (`e0 < 0.0056`), two Newton steps in fma form, fix-ups for
+      `±0`/denormal (`±inf`) and `±inf` (`±0`) -- within one ulp of the correctly
+      rounded reciprocal, the bound derived on the method; division is the product and
+      one fma correction on finite non-zero lanes, within one ulp (`ops::divide`).
+      SFPU-only kinds (`kind_sfpu::{RECIP, DIV, DIV_SCALAR}`, above the mover's) go to
+      the SFPU whatever the unit setting. `sfpu::ops::reference` runs any op's program
+      over a whole tensor in the interpreter, the oracle for every later op. Gates:
+      unit tests (93% of 3072 results correctly rounded, the rest one ulp off; IEEE
+      special cases); `step28_division` -- device equal to the program bit for bit,
+      the program within one ulp of Flex, at `[37, 70]` and `[96, 128]` with every
+      special; `step27_burn_eltwise::division_through_burn_is_within_one_ulp_and_stays_resident`.
+      ttsim and both cards. Burn: `float_recip`, `float_div`, `float_div_scalar`.
+- [~] **S4 Transcendentals.** Done: `exp`, `log` (10.1). Range reduction by
+      `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`, `SFPSHFT`),
+      polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding of `x log2
+      e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
+      bound `ops::EXP_BOUND = 1.3e-7` relative, derived on `exp_program`. `log`: `x =
+      2^e m`, `m` in `[sqrt(2)/2, sqrt(2))`, `2 atanh(f/(2+f))` through the corrected
+      division, `e ln2` in two parts; bound `ops::LOG_BOUND = 7.12 * 2^-24` relative,
+      derived on `log_program`. Oracle: interpreter models of `SFPIADD`, `SFPSHFT`,
+      `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN`, `SFPDIVP2`, each held to the
+      device in `step26_sfpu_isa`; sweeps of 64k (`exp`, worst 0.86 ulps) and 80k
+      (`log`, worst 1.91 ulps, near 1) inputs within the derived bounds; an arity test
+      keeping `ops::operands` and `ops::program` in step. Gates: `step29_exp_log`
+      (device equal to the program bit for bit; the program within the bound plus
+      Flex's ulp of Flex, every special); `step27_burn_eltwise` now also asserts each
+      result was *computed on the device* (`TtTensor::computed_on_device` -- a host
+      fallback on operands with host copies moves no bytes, so the traffic check
+      alone was vacuous; watched failing with `float_exp` forced to the host). ttsim
+      and both cards; ttsim refuses `SFPDIVP2` by 128 or more (row 66), so the
+      builder does not emit it. Burn: `float_exp`, `float_log`. Remaining: `sqrt`/
+      `rsqrt`, `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos` and the rest (10.2), with
+      F2's `SFPCONFIG` prologue for their constants.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -416,7 +720,11 @@ reverse index.
 - [ ] **S7 The PRNG.** Seeded per tile from `Backend::seed`. The claim is distributional
       (a stated statistical test), not bit-exact against Flex, whose generator is
       different. Burn: `float_random`, dropout.
-- [ ] **S8 Lane movement.** `SFPTRANSP`, `SFPSHFT2` for reductions inside a tile (feeds R1).
+- [x] **S8 Lane movement.** `Program::rotate_row` (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`),
+      `Program::transpose4` (`SFPTRANSP`), with `Program::and`/`or` (`SFPAND`, `SFPOR`)
+      for lane masks; interpreter models of all four held to silicon in
+      `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
+      transpose then add). First user: R1's in-tile folds.
 - [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
       else here works without it.
 
@@ -436,11 +744,56 @@ reverse index.
 
 ### R — Reductions and composites
 
-- [ ] **R1 Reductions over any dim.** `sum`, `mean`, `max`, `min`, `argmax`, `argmin`,
-      `prod`, full and per dim (today only `sum_dim(0)`, on the B core). Within a tile by
-      S8/M2, across tiles by the mover (or NoC atomics). Sum order stated against Flex's,
-      as `COL_SUM`'s is.
-- [ ] **R2 Softmax, log-softmax, cross-entropy on the device** (was checklist 9.12): max,
+- [~] **R1 Reductions over any dim.** Done (R1a): `sum` and `max` over either dim of
+      a matrix (`Session::reduce`, `sfpu::reduce`): a reduce kernel -- many input tiles
+      into one output tile, four semaphores numbered compatibly with the matmul's and
+      the element-wise kernel's -- that accumulates lanewise in `Dst`, masks a ragged
+      edge's padding lanes to the identity by lane index (`LReg[15]`, `SFPAND`,
+      `SFPSHFT`), and folds within the tile by rotations (over columns, the result
+      replicated across the row: broadcast-ready) or `SFPTRANSP` (over rows); the
+      gather reads a tile column in column-major order (`READ_RUN` flag bit 2). Max is
+      exact (total order: a positive NaN propagates, a negative one is ordered below
+      `-inf`); a sum over columns is in tree order, within `2 (n-1) u sum|x|` of
+      Flex's; a sum over rows stays on the mover, in Flex's order. Oracle: the same
+      programs in the interpreter (`reduce::reference`), exact on integer data for
+      every shape. Gates: `step31_reduce` (device equal to the program bit for bit;
+      max equal to Flex's, sums within the bound; ragged shapes, lines of up to 32
+      tiles), `step32_burn_softmax`. Burn: `float_max_dim`, `float_sum_dim` (both
+      dims). Remaining (R1b, 10.3): `mean`, `min`, `prod`, `argmax`/`argmin`,
+      `any`/`all`, full reductions, `cum*`, more than ~200 tiles along the reduced
+      dimension (one pass's L1 limit; refused with a typed error today).
+- [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
+      `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
+      laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
+      (`tt_isa::dm::op::READ_BROADCAST_COL`, `READ_RUN` flag bit 1, `Transform` on
+      the decoded entry). The session reads the broadcast from the shapes
+      (`tensor::broadcast_of`) and sends to the SFPU whatever the mover cannot do;
+      padding rules know a broadcast lands in the padding along its dimension.
+      Burn's element-wise ops take a broadcast operand on either side where the op
+      commutes. Gates: `step30_broadcast` (row and column, the four kinds, `[37, 70]`
+      and `[64, 96]`; Flex bit for bit, `DIV` within one ulp; device equal to the
+      program; padding claims checked against raw tiles) and `step27_burn_eltwise`'s
+      broadcast cases; ttsim and both cards.
+- [~] **R2 Softmax, log-softmax on the device**; cross-entropy waits on D4. `softmax`
+      and `log_softmax` (either dim of a resident matrix) run Burn's own composition
+      -- max, broadcast subtract, `exp`, sum, broadcast divide or `log` and subtract --
+      on the device end to end, decided once on the whole input. Against Flex's fused
+      softmax: a bound derived from the parts' (`EXP_BOUND` twice, the sum's order, the
+      division's ulp, Flex's own counterparts); measured worst `1.0e-6` relative.
+      Burn's `CrossEntropyLoss` gathers the target column with an integer index
+      tensor (`float_gather`, D4), so MNIST's loss -- and its logits download -- stays
+      on the host for now. **Placement** (measurement S): an SFPU kernel op costs
+      100-200 us whatever its size, a tile's download ~190 us, so the approximate ops
+      (division, `exp`, `log`, the SFPU's reductions) reached through Burn's methods run
+      on the host below eight tiles (`burn-tt`'s `APPROX_MIN_TILES`) -- autodiff's own
+      `log_softmax` on MNIST's two-tile logits took the step from 3.8 to 7.9 ms/step
+      on the device -- and softmax compositions decide on their input's size. Heuristic
+      until submission is asynchronous or a lookahead exists (X4, B8, B13, B16).
+      **Exact mode** (`burn_tt::set_exact`, `TT_EXACT=1`): only ops that give Flex's
+      bits run on the device; the MNIST golden runs so. Gates: `step32_burn_softmax`
+      (every step resident, both dims, three shapes; a two-tile tensor on the host and
+      bit-identical); the MNIST golden in exact mode. Was: **R2 Softmax, log-softmax,
+      cross-entropy on the device** (was checklist 9.12): max,
       subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
       per-step logits download goes away as a consequence, not as the goal. Burn:
       `softmax`, `log_softmax`, `softmin`.
@@ -478,19 +831,22 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
-| `float_add`, `float_sub`, `float_mul` (incl. `[1, n]` row broadcast), `float_mul_scalar` | x (SFPU or mover by size) | S1 |
-| `float_sum_dim` | `~` dim 0 only (B core) | R1 |
+| `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU or mover by size) | S1, P1a |
+| `float_sum_dim` | x (dim 0 the mover's, exact; dim 1 the SFPU's, order bound) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
-| `float_div{,_scalar}`, `float_recip`, `float_remainder{,_scalar}` | | S3 |
+| `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
+| `float_remainder{,_scalar}` | | S6 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
-| `float_exp`, `float_log`, `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
+| `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
+| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
 | `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
-| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max*`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
+| `float_max_dim` | x (SFPU, exact value) | R1 |
+| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
 | `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add`, `float_select{,_add}`, `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
@@ -503,7 +859,8 @@ path today, `~` when only some shapes do.
 | `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
-| `softmax`, `log_softmax`, `softmin` | | R2 |
+| `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
+| `softmin` | | R2 |
 
 ### `ModuleOps`
 
@@ -551,6 +908,11 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `DOTPV`, `SHIFTXB`, `MOVDBGA2D` unimplemented on ttsim | divergence row 50 | M4 |
 | `STALLWAIT` must block the *consumer*; units run concurrently on silicon | divergence row 46 | F3 |
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
+| Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
+| A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
+| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
+| The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
+| A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.

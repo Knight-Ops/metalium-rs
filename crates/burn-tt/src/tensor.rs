@@ -32,7 +32,11 @@ pub struct TtTensor {
 #[derive(Debug)]
 pub(crate) struct Cell {
     host: OnceLock<FlexTensor>,
-    dram: OnceLock<DramRef>,
+    /// The device copy, uploaded at most once -- shared by the cells of a
+    /// reshape that keeps the stored matrix ([`TtTensor::reshaped_host`]),
+    /// so a parameter reshaped on every forward pass (a bias) is uploaded
+    /// once, by whichever of them meets the device first.
+    dram: Arc<OnceLock<DramRef>>,
     shape: Shape,
     dtype: DType,
 }
@@ -73,7 +77,7 @@ impl TtTensor {
         TtTensor {
             cell: Arc::new(Cell {
                 host,
-                dram: OnceLock::new(),
+                dram: Arc::new(OnceLock::new()),
                 shape,
                 dtype,
             }),
@@ -88,12 +92,20 @@ impl TtTensor {
         TtTensor {
             cell: Arc::new(Cell {
                 host: OnceLock::new(),
-                dram: cell,
+                dram: Arc::new(cell),
                 shape,
                 dtype: DType::F32,
             }),
             device,
         }
+    }
+
+    /// Was this tensor computed on the device: a device copy and, so far, no
+    /// host one? What a residency gate checks of an op's result -- a host
+    /// fallback on operands that still had host copies moves no bytes, so
+    /// the traffic counters alone cannot tell.
+    pub fn computed_on_device(&self) -> bool {
+        self.cell.dram.get().is_some() && self.cell.host.get().is_none()
     }
 
     /// The host copy, downloaded the first time it is needed.
@@ -129,6 +141,27 @@ impl TtTensor {
         })
     }
 
+    /// `self` reshaped on the host to `shape`, which is stored as the same
+    /// matrix ([`stored_dims`]): the new tensor holds `host` (the host copy
+    /// reshaped) and shares `self`'s device-copy slot, so one upload serves
+    /// both. Only for a tensor with no device copy yet, or an untransposed
+    /// one -- a transposed view's buffer is not the reshape's.
+    pub(crate) fn reshaped_host(&self, host: FlexTensor, shape: Shape) -> TtTensor {
+        debug_assert_eq!(stored_dims(&shape.to_vec()), self.stored());
+        debug_assert!(self.dram().is_none_or(|d| !d.transposed));
+        let h = OnceLock::new();
+        let _ = h.set(host);
+        TtTensor {
+            cell: Arc::new(Cell {
+                host: h,
+                dram: self.cell.dram.clone(),
+                shape,
+                dtype: self.cell.dtype,
+            }),
+            device: self.device,
+        }
+    }
+
     /// The host copy, owned: taken if this is the only reference to it.
     pub(crate) fn into_host(self) -> FlexTensor {
         match Arc::try_unwrap(self.cell) {
@@ -153,12 +186,14 @@ impl TtTensor {
         self.cell.dram.get()
     }
 
-    /// The device copy, uploaded the first time it is needed. Only for an F32
-    /// matrix: callers check [`TtTensor::is_matrix_f32`].
+    /// The device copy, uploaded the first time it is needed, as the matrix
+    /// [`stored_dims`] gives. Only for an F32 tensor of rank one or more:
+    /// callers check [`TtTensor::is_stored_f32`] (or the stricter
+    /// [`TtTensor::is_matrix_f32`]).
     pub(crate) fn to_dram(&self) -> &DramRef {
         self.cell.dram.get_or_init(|| {
-            let dims = self.cell.shape.to_vec();
-            let (rows, cols) = (dims[0], dims[1]);
+            let [rows, cols] =
+                stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
             let values = self
                 .host()
                 .clone()
@@ -177,6 +212,18 @@ impl TtTensor {
                 transposed: false,
             }
         })
+    }
+
+    /// An F32 tensor the device can hold: any rank but zero, not empty, as the
+    /// matrix [`stored_dims`] gives. What the element-wise path takes.
+    pub(crate) fn is_stored_f32(&self) -> bool {
+        self.cell.dtype == DType::F32
+            && stored_dims(&self.cell.shape.to_vec()).is_some_and(|[r, c]| r > 0 && c > 0)
+    }
+
+    /// The matrix this tensor is (or would be) stored as on the device.
+    pub(crate) fn stored(&self) -> Option<[usize; 2]> {
+        stored_dims(&self.cell.shape.to_vec())
     }
 
     /// A rank-2 F32 tensor: what the device path takes.
@@ -222,5 +269,29 @@ impl QTensorPrimitive for TtQTensor {
     }
     fn default_scheme() -> QuantScheme {
         FlexQTensor::default_scheme()
+    }
+}
+
+/// How a tensor of `shape` is laid out on the device: the matrix
+/// `[product of the leading dimensions, last dimension]`, rank 1 as one row.
+/// Row-major order is the same either way, so a reshape that keeps this
+/// matrix is a view, and an element-wise op between two tensors of one
+/// shape is the op on their matrices. `None` for a scalar (rank 0).
+pub(crate) fn stored_dims(shape: &[usize]) -> Option<[usize; 2]> {
+    let (&last, leading) = shape.split_last()?;
+    Some([leading.iter().product(), last])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_dims;
+
+    #[test]
+    fn a_tensor_is_stored_as_its_leading_dimensions_by_its_last() {
+        assert_eq!(stored_dims(&[]), None);
+        assert_eq!(stored_dims(&[128]), Some([1, 128]));
+        assert_eq!(stored_dims(&[64, 10]), Some([64, 10]));
+        assert_eq!(stored_dims(&[2, 3, 4]), Some([6, 4]));
+        assert_eq!(stored_dims(&[2, 0, 4]), Some([0, 4]));
     }
 }

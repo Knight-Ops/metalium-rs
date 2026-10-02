@@ -18,6 +18,8 @@ pub struct Config {
     /// The Tensix tiles the device computes on; `None` is the gate tile
     /// (`harness::tensix_tile`), or on silicon what `TT_TILES` says.
     pub tiles: Option<burn_tt::TileChoice>,
+    /// `burn_tt::set_exact`: only ops that give Flex's bits on the device.
+    pub exact: bool,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             fidelity: Fidelity::HiFi4,
             budget: 4_000_000,
             tiles: None,
+            exact: false,
         }
     }
 }
@@ -38,6 +41,7 @@ impl Default for Config {
 #[track_caller]
 pub fn with_device(config: Config, f: impl FnOnce(TtDevice)) {
     if let Err(e) = tt_ttsim::fork_scope(|| {
+        burn_tt::set_exact(config.exact);
         let device = device();
         let _guard = attach_engine(device, config)
             .unwrap_or_else(|e| panic!("could not attach {device}: {e}"));
@@ -199,6 +203,14 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.sum_rows(&mut self.session, a)
         }
+        fn reduce(
+            &mut self,
+            a: burn_tt::BufferId,
+            op: tt_kernels::sfpu::reduce::ReduceOp,
+            axis: tt_kernels::sfpu::reduce::Axis,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.reduce(&mut self.session, a, op, axis)
+        }
         fn slice_rows(
             &mut self,
             a: burn_tt::BufferId,
@@ -209,6 +221,25 @@ fn attach_engine(
         }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
+        }
+        fn begin_trace(&mut self) -> Result<(), EngineError> {
+            self.buffers.begin_trace(&mut self.session)
+        }
+        fn end_trace(&mut self) -> Result<u64, EngineError> {
+            self.buffers.end_trace(&mut self.session)
+        }
+        fn run_trace(
+            &mut self,
+            trace: u64,
+            input: burn_tt::BufferId,
+            values: &[f32],
+            output: burn_tt::BufferId,
+        ) -> Result<Vec<f32>, EngineError> {
+            self.buffers
+                .run_trace(&mut self.session, trace, input, values, output)
+        }
+        fn release_trace(&mut self, trace: u64) {
+            self.buffers.release_trace(&mut self.session, trace)
         }
         fn matmul(
             &mut self,

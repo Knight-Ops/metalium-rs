@@ -424,6 +424,16 @@ with teeth.
 * Hangs: per this repo's rule, a hang is fixed in the API that hung (budgets in
   `tt_kernels::runtime`), not by a watchdog around runs; `Timeout` carries which op and tile.
 
+### 4.3a Exact mode and approximate ops (Phase 10)
+
+Some device ops are approximations held to derived bounds rather than to Flex's bits
+(`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
+`log`, sums over columns (tree order), softmax. `burn_tt::set_exact(true)` or
+`TT_EXACT=1` keeps on the device only what gives Flex's bits exactly; a run that must
+reproduce a host golden sets it (the MNIST golden does). Below eight tiles the
+approximate ops run on the host whatever the mode (`APPROX_MIN_TILES`, measured: their
+fixed cost outweighs a download) -- a placement heuristic B16 should replace.
+
 ### 4.4 `sync`, async dispatch, determinism
 
 Today every job blocks the calling thread (`server.rs:378-394`), so `sync` is trivially
@@ -520,10 +530,10 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B2** | Engine registry, lazy auto-attach, `init`/`TtConfig`, default tiles from the grid, card lock, `device_count`/`enumerate` (edges 1, 3, 4, 23) | B1 | §2.2 gate; `tt-mnist` without attach code |
 | **B3** | Attachment generation in `Buffer`; `supports_dram` cache per attachment (edges 20, 21) | -- | test: tensor from attachment 1 read after re-attach is `StaleTensor`, watched failing on today's code (wrong data) |
 | **B4** | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
-| **B5** | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
+| **B5** (storage, views and element-wise done: `hardware-coverage.md` P1a; partial-row download open -- measured: a 1000-row batch of a resident set is a host slice and a 3 MB re-upload every batch, 46 ms a batch against 2.1 on the host, row X) | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
 | **B6** | Batched matmul on resident operands (edge 9) | B5 | `[8,64,64]@[8,64,64]` under strict: zero downloads; bit-identical to per-batch host-staged |
 | **B7** | `download_many`, real readback futures, batched `tr_execute` | B1 | one server job per transaction |
-| **B8** | Async dispatch with client-assigned ids; `sync` as barrier | B1, B3 | MNIST golden bit for bit; ms/step recorded |
+| **B8** | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
 | **B9** | `name`, `memory_cleanup`, `memory_persistent_allocations`; OOM retry | B2 | unit tests §2.1 |
 | **B10** | Vendored conformance crate on ttsim, eager policy, expected-failures | B2, B0 | §5.2 gate |
 | **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on both cards |
@@ -533,7 +543,7 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B13c** | Matmul + bias + ReLU epilogue fuser | B13b, HC:S1 | Linear+ReLU is one device job |
 | **B14** | `DistributedBackend` (host all-reduce), `distributed` feature on by default | B2 | `burn-train` DDP over two cards trains MNIST (slowly); Ethernet all-reduce with checklist 9.11 |
 | **B15** | Integration gates: `Learner` run with checkpoint round trip; `burn-store` safetensors load (F32 + BF16); one `burn-onnx` model | B0, B2, B4 | each matches Flex; reports archived |
-| **B16** | Cost-aware placement for isolated device ops between host ops (edge 11) | B0 report data | a `burn-onnx` CNN is never slower on burn-tt than on Flex |
+| **B16** | Cost-aware placement for isolated device ops between host ops (edge 11). With the session batching (`hardware-coverage.md` X4c) an op no longer costs a host wait, so `APPROX_MIN_TILES` and `SOFTMAX_DEVICE_MIN_TILES` (8) are worth re-measuring: below them MNIST's `[64, 10]` loss runs on the host, the last per-step sync (row V) | B0 report data | a `burn-onnx` CNN is never slower on burn-tt than on Flex; MNIST's steady step moves nothing once the loss is resident |
 
 Coverage work proper (S1-S9, M1-M4, R1-R4, D1-D6) proceeds in parallel; each landed item
 shrinks the report and the expected-failures list, and B0's report is how its "downloads

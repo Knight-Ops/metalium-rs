@@ -281,11 +281,6 @@ fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)
     let t = |direction, shape| Transfer { direction, shape };
     vec![
         (
-            t(Up, [1, HIDDEN]),
-            "b1, after the host's SGD step (rank-1 ops stay on the host)",
-        ),
-        (t(Up, [1, CLASSES]), "b2, likewise"),
-        (
             t(Down, [batch, CLASSES]),
             "the logits, for the loss on the host",
         ),
@@ -293,8 +288,6 @@ fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)
             t(Up, [batch, CLASSES]),
             "dL/dlogits, from the host's loss backward",
         ),
-        (t(Down, [1, CLASSES]), "dL/db2, for the host's SGD step"),
-        (t(Down, [1, HIDDEN]), "dL/db1, likewise"),
     ]
 }
 
@@ -351,7 +344,10 @@ fn assert_steady_state_traffic(
     ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
 )]
 fn the_mlp_trains_on_a_reduced_dataset() {
-    reduced_run_matches_the_golden(Config::default());
+    reduced_run_matches_the_golden(Config {
+        exact: true,
+        ..Config::default()
+    });
 }
 
 /// Phase 9.6: the same run with every GDDR op dealt over four Tensix tiles.
@@ -366,6 +362,7 @@ fn the_mlp_trains_on_a_reduced_dataset() {
 fn the_mlp_trains_on_four_tiles_matching_the_golden() {
     reduced_run_matches_the_golden(Config {
         tiles: Some(burn_tt::TileChoice::Count(4)),
+        exact: true,
         ..Config::default()
     });
 }

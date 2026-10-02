@@ -100,8 +100,26 @@ pub const PROGRAM_ADDR: u64 = MAILBOX_BASE + 0x40;
 /// instructions the first frontend FIFO holds (`PushTensixInstruction.md:15`).
 pub const SIM_PUSH_WINDOW: u32 = 16;
 
+/// Non-zero: before pushing, the runner releases every Tensix semaphore a
+/// thread may be blocked on, from the RISC-V side
+/// (`crate::tensix::SEMAPHORE_ACCESS`): posting each that reads zero, round
+/// after round. A thread left in `SEMWAIT` by a failed kernel survives the
+/// backend reset (divergence row 65), and a reset program pushed behind it
+/// would queue forever; a semaphore post by the RISC-V core does not queue
+/// behind anything. Set by the host's tile reset on silicon only.
+pub const UNWEDGE: u64 = MAILBOX_BASE + 0x44;
+
+/// Non-zero: [`MOP_CFG`] holds this role's MOP Expander configuration, which
+/// the runner loads before pushing (`crate::frontend::mop`). Zero: the
+/// expander is left as it is.
+pub const MOP_CFG_VALID: u64 = MAILBOX_BASE + 0x48;
+
+/// The nine `MopCfg` words ([`crate::frontend::mop::MopConfig::config_words`]),
+/// written to the thread's `TENSIX_MOP_CFG_BASE` once its expander is idle.
+pub const MOP_CFG: u64 = MAILBOX_BASE + 0x4C;
+
 /// Total size the firmware may assume is its own.
-pub const MAILBOX_SIZE: u64 = 0x44;
+pub const MAILBOX_SIZE: u64 = 0x70;
 
 /// Where the host points the timestamper's event buffer: after the program
 /// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
@@ -234,6 +252,8 @@ const _: () = assert!(TRACE + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PUSH_WINDOW + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(ACK + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PROGRAM_ADDR + 4 <= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(UNWEDGE + 4 <= MOP_CFG_VALID);
+const _: () = assert!(MOP_CFG + 9 * 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
 
@@ -283,6 +303,17 @@ pub mod role {
         }
         pub const fn panic_code(self) -> u64 {
             self.base + (super::PANIC_CODE - super::MAILBOX_BASE)
+        }
+        pub const fn unwedge(self) -> u64 {
+            self.base + (super::UNWEDGE - super::MAILBOX_BASE)
+        }
+        pub const fn mop_cfg_valid(self) -> u64 {
+            self.base + (super::MOP_CFG_VALID - super::MAILBOX_BASE)
+        }
+        /// Word `k` (0..9) of [`super::MOP_CFG`].
+        pub const fn mop_cfg(self, k: u32) -> u64 {
+            assert!(k < 9, "MopCfg is nine words");
+            self.base + (super::MOP_CFG - super::MAILBOX_BASE) + 4 * k as u64
         }
         pub const fn thread_index(self) -> u64 {
             self.base + (super::THREAD_INDEX - super::MAILBOX_BASE)
@@ -354,11 +385,24 @@ pub struct Descriptor {
     pub push_window: u32,
     /// Zero: the fixed slot ([`PROGRAM_ADDR`]).
     pub program_addr: u32,
+    /// [`UNWEDGE`].
+    pub unwedge: u32,
+    /// [`MOP_CFG`], if this run loads a MOP Expander configuration.
+    pub mop_cfg: Option<[u32; 9]>,
 }
 
+/// Words a [`Descriptor`] writes.
+pub const DESCRIPTOR_WORDS: usize = 19;
+
 impl Descriptor {
-    /// `(address, value)` for every field, in `mb`.
-    pub const fn writes(&self, mb: role::Mailbox) -> [(u64, u32); 8] {
+    /// `(address, value)` for every field, in `mb`. The MOP words are written
+    /// whether or not the run loads them, so two descriptors compare word by
+    /// word (a queued kernel's configuration must not change under it).
+    pub const fn writes(&self, mb: role::Mailbox) -> [(u64, u32); DESCRIPTOR_WORDS] {
+        let (valid, cfg) = match self.mop_cfg {
+            Some(c) => (1, c),
+            None => (0, [0; 9]),
+        };
         [
             (mb.thread_index(), self.thread_index),
             (mb.dst_access_fmt(), self.dst_access_fmt),
@@ -368,6 +412,17 @@ impl Descriptor {
             (mb.trace(), self.trace),
             (mb.push_window(), self.push_window),
             (mb.program_addr(), self.program_addr),
+            (mb.unwedge(), self.unwedge),
+            (mb.mop_cfg_valid(), valid),
+            (mb.mop_cfg(0), cfg[0]),
+            (mb.mop_cfg(1), cfg[1]),
+            (mb.mop_cfg(2), cfg[2]),
+            (mb.mop_cfg(3), cfg[3]),
+            (mb.mop_cfg(4), cfg[4]),
+            (mb.mop_cfg(5), cfg[5]),
+            (mb.mop_cfg(6), cfg[6]),
+            (mb.mop_cfg(7), cfg[7]),
+            (mb.mop_cfg(8), cfg[8]),
         ]
     }
 }
@@ -435,7 +490,8 @@ mod tests {
     }
 
     /// A descriptor names every word the runner reads before pushing: the
-    /// ones from [`THREAD_INDEX`] to [`PUSH_WINDOW`], and [`PROGRAM_ADDR`].
+    /// ones from [`THREAD_INDEX`] to [`PUSH_WINDOW`], [`PROGRAM_ADDR`],
+    /// [`UNWEDGE`] and the MOP configuration.
     #[test]
     fn a_descriptor_writes_every_word_the_runner_reads() {
         let mb = role::Mailbox::single_core();
@@ -450,6 +506,17 @@ mod tests {
             TRACE,
             PUSH_WINDOW,
             PROGRAM_ADDR,
+            UNWEDGE,
+            MOP_CFG_VALID,
+            MOP_CFG,
+            MOP_CFG + 4,
+            MOP_CFG + 8,
+            MOP_CFG + 12,
+            MOP_CFG + 16,
+            MOP_CFG + 20,
+            MOP_CFG + 24,
+            MOP_CFG + 28,
+            MOP_CFG + 32,
         ];
         want.sort_unstable();
         assert_eq!(at, want);

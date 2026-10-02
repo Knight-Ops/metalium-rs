@@ -9,12 +9,17 @@
 #![no_main]
 
 use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, record, Descriptor, Entry};
+use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(2) {
+    Some(t) => t,
+    None => panic!(),
+};
+/// The barrier's own requests, apart from the moves'.
+const BARRIER_TXN: TxnId = match TxnId::new(3) {
     Some(t) => t,
     None => panic!(),
 };
@@ -36,6 +41,7 @@ fn wr(addr: u64, v: u32) {
 /// waiting for them. Every request's range is a sub-range of the checked
 /// descriptor, so it is inside the channel and inside L1, with the congruence
 /// preserved.
+#[link_section = ".text.hot"]
 fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     let len = d.range.len() as u32;
     let mut done = 0u32;
@@ -61,6 +67,7 @@ fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 /// Transpose the tile in the scratch slot into the slot at `dst`: header
 /// copied, datum `(r, c)` from `(c, r)`, both in face order -- face `(fr, fc)`
 /// of the result is face `(fc, fr)` of the source, transposed.
+#[inline(never)]
 fn transpose_from_scratch(dst: u64) {
     for w in 0..(dm::TILE_DATA / 4) {
         wr(dst + w * 4, rd(dm::SCRATCH + w * 4));
@@ -83,7 +90,25 @@ fn transpose_from_scratch(dst: u64) {
     }
 }
 
+/// The tile in the scratch slot into the slot at `dst`, its column 0 copied
+/// into every column (`dm::op::READ_BROADCAST_COL`): header copied, datum
+/// `(r, c)` from `(r, 0)`.
+#[inline(never)]
+fn broadcast_col0_from_scratch(dst: u64) {
+    for w in 0..(dm::TILE_DATA / 4) {
+        wr(dst + w * 4, rd(dm::SCRATCH + w * 4));
+    }
+    let (src, out) = (dm::SCRATCH + dm::TILE_DATA, dst + dm::TILE_DATA);
+    for r in 0..32usize {
+        let v = rd(src + dm::face_index(r, 0) as u64 * 4);
+        for c in 0..32usize {
+            wr(out + dm::face_index(r, c) as u64 * 4, v);
+        }
+    }
+}
+
 /// One compute entry over the 1024 datums of three tile slots (`dm::kind`).
+#[inline(never)]
 fn compute(kind: u32, s: u32, param: u32, dst: u64, a: u64, b: u64) {
     let (dst, a, b) = (dst + dm::TILE_DATA, a + dm::TILE_DATA, b + dm::TILE_DATA);
     // Same-shape kinds pair datum i with datum i whatever the face order, so
@@ -190,6 +215,7 @@ fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
 /// The roles' acknowledgements are stores by other cores, which do not
 /// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
 /// goes through a fence.
+#[inline(never)]
 fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
     // Each role's resident program first, if named (checked by
     // `Entry::decode`), so the generation that starts the run finds it.
@@ -231,7 +257,38 @@ fn trace(on: bool, event: u32, detail: u32) {
     }
 }
 
+/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter,
+/// then NoC reads of it until it reaches `target`. The reads land in this
+/// tile's L1, which the NoC writes without invalidating the L0 cache: every
+/// check goes through a fence (`publish`).
+#[inline(never)]
+fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
+    use tt_isa::noc::niu::Endpoint;
+    let counter = Endpoint { x, y, addr: dm::BARRIER_COUNTER as u32 };
+    noc::issue(
+        &Command::AtomicIncrement { to: counter, value: 1, ret_local: dm::BARRIER_RET as u32 },
+        me,
+        BARRIER_TXN,
+    )
+    .map_err(|_| dm::error::ALIGNMENT)?;
+    noc::wait(BARRIER_TXN);
+    loop {
+        noc::issue(
+            &Command::Read { from: counter, to_local: dm::BARRIER_POLL as u32, len: 4 },
+            me,
+            BARRIER_TXN,
+        )
+        .map_err(|_| dm::error::ALIGNMENT)?;
+        noc::wait(BARRIER_TXN);
+        publish();
+        if (rd(dm::BARRIER_POLL).wrapping_sub(target) as i32) >= 0 {
+            return Ok(());
+        }
+    }
+}
+
 /// Run one descriptor to completion.
+#[link_section = ".text.hot"]
 fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     issue(me, d)?;
     noc::wait(TXN);
@@ -241,14 +298,22 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 /// Run one list entry: plain entries are issued without waiting; a transposed
 /// read waits for its own tile before rearranging it; a kernel or a wait entry
 /// first waits for everything before it.
+#[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
-        Entry::Move { descriptor, transpose: true } => {
+        Entry::Move {
+            descriptor,
+            transform: transform @ (Transform::Transpose | Transform::BroadcastCol0),
+        } => {
             // Everything before it has landed, and the scratch is free.
             noc::wait(TXN);
             run(me, Descriptor { l1: dm::SCRATCH as u32, ..descriptor })?;
             publish();
-            transpose_from_scratch(descriptor.l1 as u64);
+            if transform == Transform::Transpose {
+                transpose_from_scratch(descriptor.l1 as u64);
+            } else {
+                broadcast_col0_from_scratch(descriptor.l1 as u64);
+            }
             // Visible in L1 before anything else reads the slot.
             publish();
         }
@@ -263,6 +328,20 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             noc::wait(TXN);
             publish();
         }
+        Entry::Barrier { target, x, y } => {
+            // Everything this unit moved before it has landed.
+            noc::wait(TXN);
+            publish();
+            barrier(me, target, x, y)?;
+        }
+        Entry::Poke { address, value } => {
+            // The roles read the word only once a later `KERNEL` posts their
+            // generation.
+            wr(address as u64, value);
+            publish();
+        }
+        // Only as a list of its own, which `run_list_at` runs.
+        Entry::Call { .. } => return Err(IS_CALL),
         Entry::Compute {
             kind,
             param,
@@ -280,9 +359,8 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     Ok(())
 }
 
-/// Read list entry `i`.
-fn entry(i: u64) -> [u32; 8] {
-    let at = dm::LIST + i * dm::ENTRY_BYTES;
+/// Read list entry `i` of the ring.
+fn entry_at(at: u64) -> [u32; 8] {
     let mut w = [0u32; 8];
     for (k, word) in w.iter_mut().enumerate() {
         *word = rd(at + k as u64 * 4);
@@ -299,15 +377,51 @@ fn entry(i: u64) -> [u32; 8] {
 /// bracketed by timestamper events (`tt_isa::mailbox::trace`); a record's
 /// expanded moves are not, so the events per list stay bounded by its length.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
-    use tt_isa::mailbox::trace as ev;
-    if count > dm::LIST_MAX {
+    run_list_at(me, usable, 0, count)
+}
+
+/// [`run_list`] of the `count` entries from ring entry `first`.
+fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), u32> {
+    if count > dm::LIST_MAX || first + count > dm::LIST_MAX {
         return Err(dm::error::LENGTH);
     }
+    let base = dm::LIST + first as u64 * dm::ENTRY_BYTES;
+    // A `CALL` is a list of its own (a replay's), run here rather than from
+    // the list loop: there it makes the loop recursive. `exec` checks it, as
+    // it does every entry -- `Entry::decode` with a second caller is no longer
+    // inlined into `exec`, which costs every entry ~0.04 us
+    // (`silicon_perf::mover_read_shapes`).
+    let head = entry_at(base);
+    let result = if count == 1 && head[0] == op::CALL {
+        match exec(me, usable, head) {
+            Err(IS_CALL) => call(me, usable, head[1], head[2], head[3], head[4], head[5]),
+            r => r,
+        }
+    } else {
+        run_entries(me, usable, base, count)
+    };
+    // One anywhere else.
+    match result {
+        Err(IS_CALL) => Err(dm::error::OP),
+        r => r,
+    }
+}
+
+/// What [`exec`] returns for a valid `CALL`, which only [`run_list_at`] runs:
+/// no `dm::error` code.
+const IS_CALL: u32 = u32::MAX;
+
+/// The `count` entries at `base` in L1, in order: a list's, or a trace chunk's
+/// ([`call`]).
+#[link_section = ".text.hot"]
+fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
+    use tt_isa::mailbox::trace as ev;
     let traced = rd(dm::TRACE) != 0;
     trace(traced, ev::LIST_BEGIN, count);
+    let at = |i: u64| entry_at(base + i * dm::ENTRY_BYTES);
     let mut i = 0u64;
     while i < count as u64 {
-        let head = entry(i);
+        let head = at(i);
         let n = record::len(head[0]) as u64;
         trace(traced, ev::ENTRY_BEGIN, head[0]);
         if n == 1 {
@@ -316,17 +430,84 @@ fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
             if i + n > count as u64 {
                 return Err(dm::error::LENGTH);
             }
-            let mut rec = [[0u32; 8]; 7];
-            for k in 0..n {
-                rec[k as usize] = entry(i + k);
-            }
-            record::expand(&rec[..n as usize], |e| exec(me, usable, e))?;
+            run_record(me, usable, base + i * dm::ENTRY_BYTES, n as usize)?;
         }
         trace(traced, ev::ENTRY_END, head[0]);
         i += n;
     }
     noc::wait(TXN);
     trace(traced, ev::LIST_END, count);
+    Ok(())
+}
+
+/// The `n`-entry op record at `at`, expanded ([`record::expand`]). Out of the
+/// list loop, as the rest of the cold paths are, so the loop and [`exec`]'s
+/// move path sit together in `.text.hot` (`sections.x`).
+#[inline(never)]
+fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
+    let mut rec = [[0u32; 8]; 7];
+    for (k, e) in rec[..n].iter_mut().enumerate() {
+        *e = entry_at(at + k as u64 * dm::ENTRY_BYTES);
+    }
+    record::expand(&rec[..n], |e| exec(me, usable, e))
+}
+
+/// [`dm::op::CALL`]: a trace's entries from GDDR, a chunk at a time into
+/// `dm::TRACE_CHUNK`, each chunk run by the list's own loop ([`run_entries`])
+/// once it has landed. What a replay supplies is patched into the chunk first:
+/// a top-level `KERNEL`'s generation plus `generation_base`, a `BARRIER`'s
+/// target plus `barrier_base`. A `CALL` in a trace is refused, as is a record
+/// the capture let cross a chunk.
+#[cold]
+#[inline(never)]
+fn call(
+    me: (u8, u8),
+    usable: u32,
+    channel: u32,
+    offset: u32,
+    count: u32,
+    generation_base: u32,
+    barrier_base: u32,
+) -> Result<(), u32> {
+    let mut done = 0u32;
+    while done < count {
+        let n = (count - done).min(dm::TRACE_CHUNK_ENTRIES);
+        let read = [
+            op::READ,
+            channel,
+            0,
+            offset + done * dm::ENTRY_BYTES as u32,
+            dm::TRACE_CHUNK as u32,
+            n * dm::ENTRY_BYTES as u32,
+            0,
+            0,
+        ];
+        exec(me, usable, read)?;
+        noc::wait(TXN);
+        // The chunk is in L1, written by the NoC past the L0 cache.
+        publish();
+        let mut i = 0u32;
+        while i < n {
+            let a = dm::TRACE_CHUNK + i as u64 * dm::ENTRY_BYTES;
+            let head = rd(a);
+            let base = match head {
+                op::KERNEL => generation_base,
+                op::BARRIER => barrier_base,
+                op::CALL => return Err(dm::error::OP),
+                _ => 0,
+            };
+            if base != 0 {
+                wr(a + 4, rd(a + 4).wrapping_add(base));
+            }
+            i += record::len(head) as u32;
+        }
+        if i != n {
+            return Err(dm::error::LENGTH);
+        }
+        publish();
+        run_entries(me, usable, dm::TRACE_CHUNK, n)?;
+        done += n;
+    }
     Ok(())
 }
 
@@ -343,6 +524,24 @@ pub extern "Rust" fn firmware_main() -> ! {
         publish();
         // Compared against DONE in L1 rather than a local copy, so the whole
         // of the mover's state is the mailbox, which the host can read and reset.
+        // The queue first: lists the host enqueued, in order, until one
+        // fails (which stops the queue until the host restarts the mover).
+        let done = rd(dm::QUEUE_DONE);
+        if done != rd(dm::QUEUE_HEAD) && rd(dm::QUEUE_ERROR) == dm::error::NONE {
+            let slot = rd(dm::QUEUE_SLOTS + (done % dm::QUEUE_LEN) as u64 * 4);
+            let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
+            // Everything the list moved has landed before it is reported.
+            publish();
+            match result {
+                Ok(()) => wr(dm::QUEUE_DONE, done.wrapping_add(1)),
+                Err(code) => {
+                    wr(dm::QUEUE_ERROR_AT, done.wrapping_add(1));
+                    wr(dm::QUEUE_ERROR, code);
+                }
+            }
+            publish();
+            continue;
+        }
         let seq = rd(dm::SEQ);
         if seq == 0 || seq == rd(dm::DONE) {
             continue;

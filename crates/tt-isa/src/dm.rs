@@ -69,6 +69,41 @@ pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
 /// off between lists. Zero on the simulator, which does not model the event
 /// stream (divergence row 54).
 pub const TRACE: u64 = MAILBOX_BASE + 0x50;
+/// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
+/// mover mailbox; zeroed by the host before the session's first barrier.
+pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
+/// Where a mover's barrier polls land in its own L1: the same offset modulo
+/// 16 as the counter, as a NoC read between L1s requires.
+pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
+/// Where the atomic increment's old value lands.
+pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
+const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
+
+/// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
+/// list into the ring of entries at [`LIST`] (never across its end), a slot
+/// `(first entry, entries)` into [`QUEUE_SLOTS`], and then bumps
+/// [`QUEUE_HEAD`]; the mover runs queued lists in order, bumping
+/// [`QUEUE_DONE`] after each. So the host enqueues and goes on, and waits only
+/// when it needs a result. A list that fails stops the queue:
+/// [`QUEUE_ERROR`] says why and [`QUEUE_ERROR_AT`] which list, and nothing
+/// more runs until the host restarts the mover.
+pub const QUEUE_HEAD: u64 = MAILBOX_BASE + 0x90;
+/// Lists run so far (wrapping).
+pub const QUEUE_DONE: u64 = MAILBOX_BASE + 0x94;
+/// The first failed list's `tt_isa::dm::error` code, or [`error::NONE`].
+pub const QUEUE_ERROR: u64 = MAILBOX_BASE + 0x98;
+/// The failed list's number: `QUEUE_DONE + 1` when it failed.
+pub const QUEUE_ERROR_AT: u64 = MAILBOX_BASE + 0x9C;
+/// The slots: list `n` is in slot `n % QUEUE_LEN`, as `first | entries << 16`.
+pub const QUEUE_SLOTS: u64 = MAILBOX_BASE + 0xA0;
+/// Slots in the queue.
+pub const QUEUE_LEN: u32 = 16;
+const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= MAILBOX_BASE + 0x100);
+
+/// A queue slot's word: a list of `entries` from ring entry `first`.
+pub const fn queue_slot(first: u32, entries: u32) -> u32 {
+    first | (entries << 16)
+}
 
 pub mod op {
     /// DRAM -> L1.
@@ -102,6 +137,34 @@ pub mod op {
     /// were separate lists, whose entries may reuse each other's L1 slots.
     /// Only in a list entry.
     pub const WAIT: u32 = 7;
+    /// As [`READ_TRANSPOSED`], but the mover writes the tile with its column
+    /// 0 copied into every column: datum `(r, c)` from `(r, 0)`. A `[rows, 1]`
+    /// tensor so read is a whole tile to broadcast across a `[rows, cols]`
+    /// one, element for element. Only in a list entry.
+    pub const READ_BROADCAST_COL: u32 = 8;
+    /// Wait until every unit of a session has reached this point:
+    /// `[BARRIER, target, x, y, 0, 0, 0, 0]`. The mover waits for its own
+    /// moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the L1
+    /// of the coordinating tile `(x, y)` by a NoC atomic increment, and polls
+    /// that counter over the NoC until it reaches `target` (compared modulo
+    /// 2^32, so the counter may wrap). With `n` units, the `k`-th barrier's
+    /// target is `k * n`. Only in a list entry.
+    pub const BARRIER: u32 = 9;
+    /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
+    /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
+    /// The mover reads the `count` entries from `offset` of `channel` in
+    /// chunks of [`super::TRACE_CHUNK_ENTRIES`] into [`super::TRACE_CHUNK`]
+    /// and runs them as a list's, except that each `KERNEL`'s generation is
+    /// offset by `generation_base` and each `BARRIER`'s target by
+    /// `barrier_base`, the values a replay's run gives them. A record never
+    /// spans a chunk (the capture pads with `WAIT`s), and a `CALL` inside a
+    /// call is refused. Only in a list entry.
+    pub const CALL: u32 = 10;
+    /// Write one word of a role's mailbox: `[POKE, address, value, 0, ...]`,
+    /// the address a word of `crate::mailbox::role`'s three mailboxes. A
+    /// trace's role descriptors, which the host writes for an ordinary list
+    /// and cannot write during a replay. Only in a list entry.
+    pub const POKE: u32 = 11;
 }
 
 /// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
@@ -174,6 +237,11 @@ pub const LIST_MAX: u32 = 512;
 pub const ENTRY_BYTES: u64 = 32;
 /// The transpose scratch slot, after the list.
 pub const SCRATCH: u64 = LIST + LIST_MAX as u64 * ENTRY_BYTES;
+/// Where an [`op::CALL`] streams its entries, a chunk at a time: in the free
+/// L1 between the scratch slot and the data arena.
+pub const TRACE_CHUNK: u64 = 0x1_9100;
+/// Entries one chunk holds.
+pub const TRACE_CHUNK_ENTRIES: u32 = 64;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
 
 /// One FP32 32x32 tile as it is stored on the device: the 16-byte header
@@ -195,11 +263,22 @@ pub const fn face_index(row: usize, col: usize) -> usize {
 
 /// A decoded list entry: a move ([`Descriptor`], possibly a transposed tile
 /// read), or element-wise compute on tiles in L1.
+/// What the mover does to a tile it reads before anything else sees it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Transform {
+    /// Nothing: the bytes land where the descriptor says.
+    None,
+    /// [`op::READ_TRANSPOSED`].
+    Transpose,
+    /// [`op::READ_BROADCAST_COL`].
+    BroadcastCol0,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
     Move {
         descriptor: Descriptor,
-        transpose: bool,
+        transform: Transform,
     },
     Compute {
         kind: u32,
@@ -220,14 +299,40 @@ pub enum Entry {
     },
     /// [`op::WAIT`].
     Wait,
+    /// [`op::BARRIER`].
+    Barrier { target: u32, x: u8, y: u8 },
+    /// [`op::CALL`]: run `count` entries from GDDR.
+    Call {
+        channel: u32,
+        offset: u32,
+        count: u32,
+        generation_base: u32,
+        barrier_base: u32,
+    },
+    /// [`op::POKE`]: one role-mailbox word.
+    Poke { address: u32, value: u32 },
 }
 
 impl Entry {
     /// Decode entry words against the `usable` mask. A transposed read must be
     /// exactly one slot into a 16-aligned L1 slot inside L1.
     pub fn decode(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
-        let transpose = w[0] == op::READ_TRANSPOSED;
-        if transpose {
+        // The hot path first: a plain read or write is most of every list
+        // (`silicon_perf::mover_read_shapes` times it per entry).
+        if w[0] == op::READ || w[0] == op::WRITE {
+            return Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(
+                |descriptor| Entry::Move {
+                    descriptor,
+                    transform: Transform::None,
+                },
+            );
+        }
+        let transform = match w[0] {
+            op::READ_TRANSPOSED => Transform::Transpose,
+            op::READ_BROADCAST_COL => Transform::BroadcastCol0,
+            _ => Transform::None,
+        };
+        if transform != Transform::None {
             if w[5] as u64 != TILE_SLOT || w[4] % 16 != 0 {
                 return Err(error::LENGTH);
             }
@@ -238,7 +343,7 @@ impl Entry {
             }
             return Ok(Entry::Move {
                 descriptor: Descriptor { l1: w[4], ..d },
-                transpose,
+                transform,
             });
         }
         if w[0] == op::LIST {
@@ -273,6 +378,49 @@ impl Entry {
         if w[0] == op::WAIT {
             return Ok(Entry::Wait);
         }
+        if w[0] == op::BARRIER {
+            if w[2] > 0x3f || w[3] > 0x3f || w[4..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Barrier {
+                target: w[1],
+                x: w[2] as u8,
+                y: w[3] as u8,
+            });
+        }
+        if w[0] == op::CALL {
+            // Entries are 32 bytes, read 32-byte aligned; a channel's offset
+            // fits the word (`crate::dram`).
+            if w[3] == 0 || w[2] % ENTRY_BYTES as u32 != 0 || w[6] != 0 || w[7] != 0 {
+                return Err(error::OP);
+            }
+            if w[1] >= crate::dram::CHANNELS as u32 || usable & (1 << w[1]) == 0 {
+                return Err(error::RANGE);
+            }
+            return Ok(Entry::Call {
+                channel: w[1],
+                offset: w[2],
+                count: w[3],
+                generation_base: w[4],
+                barrier_base: w[5],
+            });
+        }
+        if w[0] == op::POKE {
+            let base = crate::mailbox::role::BASE;
+            let end = base + 3 * crate::mailbox::role::STRIDE;
+            let ok = w[1] % 4 == 0
+                && (w[1] as u64) >= base
+                && (w[1] as u64) < end
+                && (w[1] as u64 - base) % crate::mailbox::role::STRIDE
+                    < crate::mailbox::MAILBOX_SIZE;
+            if !ok || w[3..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Poke {
+                address: w[1],
+                value: w[2],
+            });
+        }
         if w[0] == op::COMPUTE {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
             if w[1] == 0 || w[1] > kind::LAST {
@@ -303,7 +451,7 @@ impl Entry {
         Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(|descriptor| {
             Entry::Move {
                 descriptor,
-                transpose,
+                transform,
             }
         })
     }
@@ -426,12 +574,33 @@ mod tests {
         .unwrap();
         let Entry::Move {
             descriptor,
-            transpose,
+            transform,
         } = e
         else {
             panic!("{e:?}")
         };
-        assert!(transpose);
+        assert_eq!(transform, Transform::Transpose);
+        let b = Entry::decode(
+            ALL,
+            [
+                op::READ_BROADCAST_COL,
+                2,
+                0,
+                0x1040,
+                0x2_0010,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            b,
+            Entry::Move {
+                transform: Transform::BroadcastCol0,
+                ..
+            }
+        ));
         assert_eq!(
             (descriptor.l1, descriptor.range.offset()),
             (0x2_0010, 0x1040)
@@ -465,7 +634,7 @@ mod tests {
         assert!(matches!(
             w,
             Entry::Move {
-                transpose: false,
+                transform: Transform::None,
                 ..
             }
         ));

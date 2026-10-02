@@ -47,6 +47,14 @@ pub enum TensorError {
     },
     /// Shapes that do not compose, or an op this path does not support.
     Shape(String),
+    /// A trace refused (`crate::trace`).
+    Trace(crate::trace::TraceError),
+}
+
+impl From<crate::trace::TraceError> for TensorError {
+    fn from(e: crate::trace::TraceError) -> Self {
+        TensorError::Trace(e)
+    }
 }
 
 impl From<TransportError> for TensorError {
@@ -75,6 +83,7 @@ impl std::fmt::Display for TensorError {
                 write!(f, "no room in GDDR for {slots} tile slots per channel")
             }
             TensorError::Shape(s) => write!(f, "{s}"),
+            TensorError::Trace(e) => write!(f, "{e}"),
         }
     }
 }
@@ -118,6 +127,39 @@ impl Placement {
     pub fn tiles(&self) -> usize {
         self.tiles
     }
+
+    /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
+    pub(crate) fn region(&self) -> Option<DramRange> {
+        match self.channels[..] {
+            [c] => c.range(self.base[0], self.slots * TILE_SLOT),
+            _ => None,
+        }
+    }
+}
+
+/// Where a [`DramAlloc`]'s free space was at one moment: what a trace was
+/// captured against (`crate::trace`).
+#[derive(Clone, Debug)]
+pub(crate) struct FreeSnapshot {
+    channels: Vec<DramChannel>,
+    free: Vec<BTreeMap<u64, u64>>,
+}
+
+impl FreeSnapshot {
+    /// Were all of `p`'s slots free then -- so allocated since, and nothing
+    /// captured then can name them?
+    pub(crate) fn was_free(&self, p: &Placement) -> bool {
+        p.channels.iter().zip(&p.base).all(|(c, &at)| {
+            let len = p.slots * TILE_SLOT;
+            let Some(i) = self.channels.iter().position(|k| k == c) else {
+                return false;
+            };
+            self.free[i]
+                .range(..=at)
+                .next_back()
+                .is_some_and(|(&start, &l)| at + len <= start + l)
+        })
+    }
 }
 
 /// A first-fit allocator of slot regions, one free list per channel.
@@ -141,6 +183,34 @@ impl DramAlloc {
             .map(|_| BTreeMap::from([(0, usable)]))
             .collect();
         DramAlloc { channels, free }
+    }
+
+    /// `bytes` contiguous on channel `channel` (an index into the chip's
+    /// channels), in whole slots: a trace's stream (`crate::trace`).
+    pub fn alloc_on(&mut self, channel: usize, bytes: u64) -> Result<Placement> {
+        let n = self.channels.len();
+        if channel >= n {
+            return Err(TensorError::Shape(format!("channel {channel} of {n}")));
+        }
+        let slots = bytes.div_ceil(TILE_SLOT).max(1);
+        let len = slots * TILE_SLOT;
+        let Some((&at, &free)) = self.free[channel].iter().find(|(_, &l)| l >= len) else {
+            return Err(TensorError::Shape(format!(
+                "no {len} contiguous bytes left on channel {channel}"
+            )));
+        };
+        self.free[channel].remove(&at);
+        if free > len {
+            self.free[channel].insert(at + len, free - len);
+        }
+        Ok(Placement {
+            channels: vec![self.channels[channel]],
+            base: vec![at],
+            slots,
+            tiles: 1,
+            first: 0,
+            owned: true,
+        })
     }
 
     /// Room for `tiles` tile slots, interleaved.
@@ -178,9 +248,28 @@ impl DramAlloc {
         if !p.owned {
             return;
         }
-        for (i, &b) in p.base.iter().enumerate() {
+        // By channel, not position: an `alloc_on` placement has one.
+        for (c, &b) in p.channels.iter().zip(&p.base) {
+            let i = self
+                .channels
+                .iter()
+                .position(|k| k == c)
+                .expect("a placement's channel is the allocator's");
             release(&mut self.free[i], b, p.slots * TILE_SLOT);
         }
+    }
+
+    /// Where the free space is now ([`FreeSnapshot`]).
+    pub(crate) fn snapshot(&self) -> FreeSnapshot {
+        FreeSnapshot {
+            channels: self.channels.clone(),
+            free: self.free.clone(),
+        }
+    }
+
+    /// The chip's usable channels, in the allocator's order.
+    pub(crate) fn channel_count(&self) -> usize {
+        self.channels.len()
     }
 
     /// Free bytes on the fullest channel.
@@ -328,6 +417,33 @@ impl DramTensor {
             )));
         }
         let t = Self::alloc(alloc, rows, cols)?;
+        t.write(dev, w, values)?;
+        Ok(t)
+    }
+
+    /// Overwrite every datum of this tensor, in its own slots: a trace's input
+    /// between replays (`crate::trace`). The padding becomes zero, as an
+    /// upload's. A view (rows of another tensor) is refused: its slots are
+    /// someone else's.
+    pub fn write<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+        values: &[f32],
+    ) -> Result<()> {
+        let (rows, cols) = (self.rows, self.cols);
+        if values.len() != rows * cols {
+            return Err(TensorError::Shape(format!(
+                "{} values for a [{rows}, {cols}] tensor",
+                values.len()
+            )));
+        }
+        if !self.placement.owned {
+            return Err(TensorError::Shape(
+                "a view's slots are another tensor's: write that one".into(),
+            ));
+        }
+        let t = self;
         let (images, _) = matmul::tilize_f32(values, rows.max(1), cols.max(1), L1Format::Fp32);
         let img = matmul::TILE_IMAGE_BYTES;
         let per = t.placement.channels.len();
@@ -353,7 +469,7 @@ impl DramTensor {
         }
         // `tilize_f32` pads with zeros.
         t.set_pad(Pad::Zero);
-        Ok(t)
+        Ok(())
     }
 
     /// Rows `[first_row, first_row + rows)` of this tensor, all columns, as a
@@ -485,6 +601,9 @@ pub enum Step {
     Kernel {
         roles: Arc<[Vec<Instruction>; 3]>,
         init: Vec<crate::runtime::SemaphoreInit>,
+        /// Each role's MOP Expander configuration (`runtime::Kernel::mop`):
+        /// the kernels of one list share it, so a list ends where it changes.
+        mop: Box<[Option<tt_isa::frontend::mop::MopConfig>; 3]>,
     },
 }
 
@@ -552,6 +671,7 @@ pub fn matmul_dram(
     route: SrcRoute,
     fidelity: Fidelity,
     units: usize,
+    allow_mop: bool,
 ) -> Result<Work> {
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
@@ -618,9 +738,10 @@ pub fn matmul_dram(
                 rb.encode()[0],
                 rb.encode()[1],
             ];
-            let roles = matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
-                matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
-            });
+            let (roles, mop) =
+                matmul::kernel_programs(tiles, route, fidelity, sems, allow_mop, || {
+                    matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop)
+                });
             // Only the datums go back: the packer writes nothing else, and the
             // unpacker skips the header whatever it holds (`step18_dram_matmul`).
             // The outputs sit one slot apart from the first (`plan_layout_in`).
@@ -648,7 +769,11 @@ pub fn matmul_dram(
                     what: "matmul gather",
                     entries: gather.to_vec(),
                 },
-                Step::Kernel { roles, init },
+                Step::Kernel {
+                    roles,
+                    init,
+                    mop: Box::new(mop),
+                },
                 Step::List {
                     what: "matmul scatter",
                     entries: scatter.to_vec(),
@@ -682,24 +807,60 @@ pub struct Eltwise {
 /// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
 /// shape or, for `ADD_ROW`, one row as wide.
 fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
+    broadcast_of(op, a, b).map(|_| ())
+}
+
+/// What an element-wise op is once its operands' shapes are read: its kind
+/// (`ADD_ROW` is `ADD` with a row broadcast) and how `b` meets `a` -- the same
+/// shape, one row (`[1, cols]`) or one column (`[rows, 1]`), the last two only
+/// for the kinds that take one (`sfpu::ops::broadcasts`). Refuses anything
+/// else.
+pub fn broadcast_of(
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+) -> Result<(u32, crate::sfpu::ops::Broadcast)> {
+    use crate::sfpu::kernel::Operands;
+    use crate::sfpu::ops::{broadcasts, Broadcast};
     use tt_isa::dm::kind;
-    let binary = !matches!(
-        op.kind,
-        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
-    );
-    let row = op.kind == kind::ADD_ROW;
-    match (binary, b) {
-        (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),
-        (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => Err(TensorError::Shape(
-            format!("[{}, {}] + row [{}, {}]", a.rows, a.cols, b.rows, b.cols),
-        )),
-        (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
-            Err(TensorError::Shape(format!(
-                "[{}, {}] and [{}, {}] differ",
-                a.rows, a.cols, b.rows, b.cols
+    let binary = match crate::sfpu::ops::operands(op.kind) {
+        Some(o) => o != Operands::Unary,
+        None if crate::sfpu::ops::mover_has(op.kind) => !matches!(
+            op.kind,
+            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
+        ),
+        None => {
+            return Err(TensorError::Shape(format!(
+                "no element-wise op {:#x}",
+                op.kind
             )))
         }
-        _ => Ok(()),
+    };
+    let shape = |t: &DramTensor| (t.rows, t.cols);
+    match (binary, b) {
+        (false, _) => Ok((op.kind, Broadcast::None)),
+        (true, None) => Err(TensorError::Shape("a binary op needs two operands".into())),
+        (true, Some(b)) if op.kind == kind::ADD_ROW => {
+            if shape(b) == (1, a.cols) {
+                Ok((kind::ADD, Broadcast::Row))
+            } else {
+                Err(TensorError::Shape(format!(
+                    "[{}, {}] + row [{}, {}]",
+                    a.rows, a.cols, b.rows, b.cols
+                )))
+            }
+        }
+        (true, Some(b)) if shape(b) == shape(a) => Ok((op.kind, Broadcast::None)),
+        (true, Some(b)) if broadcasts(op.kind) && shape(b) == (1, a.cols) => {
+            Ok((op.kind, Broadcast::Row))
+        }
+        (true, Some(b)) if broadcasts(op.kind) && shape(b) == (a.rows, 1) => {
+            Ok((op.kind, Broadcast::Col))
+        }
+        (true, Some(b)) => Err(TensorError::Shape(format!(
+            "[{}, {}] and [{}, {}]: neither the same shape nor a row or column to broadcast",
+            a.rows, a.cols, b.rows, b.cols
+        ))),
     }
 }
 
@@ -834,12 +995,13 @@ pub fn sfpu_eltwise(
     b: Option<&DramTensor>,
     units: usize,
 ) -> Result<Option<Work>> {
-    use crate::sfpu::kernel::Operands;
-    let Some((operands, _)) = crate::sfpu::ops::program(op.kind, op.scalar) else {
+    use crate::sfpu::ops::Broadcast;
+    let (kind, bcast) = broadcast_of(op, a, b)?;
+    let op = Eltwise { kind, ..op };
+    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, op.scalar, bcast) else {
         return Ok(None);
     };
-    check_eltwise(op, a, b)?;
-    let group = sfpu_group(op, operands);
+    let group = sfpu_group(op, bcast, operands);
     let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
@@ -847,7 +1009,7 @@ pub fn sfpu_eltwise(
     let mut jobs = Vec::new();
     for run in runs(rt * ct, units, group) {
         let len = run.len();
-        let (layout, roles) = match sfpu_programs(op, operands, len) {
+        let (layout, roles) = match sfpu_programs(op, bcast, operands, len) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -862,7 +1024,7 @@ pub fn sfpu_eltwise(
                     len as u32,
                     at as u32,
                     flags,
-                    0,
+                    ct as u32,
                     0,
                     0,
                 ],
@@ -872,11 +1034,12 @@ pub fn sfpu_eltwise(
         };
         let mut gather = read(&ra, layout.a_at, 0).to_vec();
         if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
-            gather.extend(read(
-                rb,
-                b_at,
-                u32::from(operands == Operands::RowBroadcast),
-            ));
+            let flags = match bcast {
+                Broadcast::None => 0,
+                Broadcast::Row => 1,
+                Broadcast::Col => 2,
+            };
+            gather.extend(read(rb, b_at, flags));
         }
         let scatter = [
             [
@@ -900,6 +1063,7 @@ pub fn sfpu_eltwise(
             Step::Kernel {
                 roles,
                 init: layout.init.clone(),
+                mop: Box::new([None; 3]),
             },
             Step::List {
                 what: "sfpu scatter",
@@ -924,15 +1088,52 @@ pub(crate) fn sfpu_group_for_tests(
     scalar: f32,
     operands: crate::sfpu::kernel::Operands,
 ) -> usize {
-    sfpu_group(Eltwise { kind, scalar }, operands)
+    let bcast = if kind == tt_isa::dm::kind::ADD_ROW {
+        crate::sfpu::ops::Broadcast::Row
+    } else {
+        crate::sfpu::ops::Broadcast::None
+    };
+    let kind = if kind == tt_isa::dm::kind::ADD_ROW {
+        tt_isa::dm::kind::ADD
+    } else {
+        kind
+    };
+    sfpu_group(Eltwise { kind, scalar }, bcast, operands)
 }
 
-fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
+fn sfpu_group(
+    op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Measuring builds the op's role programs twice over: once per op kind,
+    // scalar and broadcast, not once per op.
+    type Memo = Mutex<HashMap<(u32, u32, crate::sfpu::ops::Broadcast), usize>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op.kind, op.scalar.to_bits(), bcast);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return g;
+    }
+    let g = measure_sfpu_group(op, bcast, operands);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, g);
+    g
+}
+
+fn measure_sfpu_group(
+    op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
+    operands: crate::sfpu::kernel::Operands,
+) -> usize {
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
         let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
-        let (_, math) =
-            crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+        let (_, math) = crate::sfpu::ops::program_for(op.kind, op.scalar, bcast)
+            .expect("checked by the caller");
         crate::sfpu::kernel::roles(&layout, operands, &math).map(|p| p.len())
     };
     let (one, two) = (lens(1), lens(2));
@@ -954,23 +1155,208 @@ fn sfpu_group(op: Eltwise, operands: crate::sfpu::kernel::Operands) -> usize {
 /// One run's layout and role programs, memoised by op, scalar and length.
 fn sfpu_programs(
     op: Eltwise,
+    bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     len: usize,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(u32, u32, usize), SfpuPrograms>>;
+    type Key = (u32, u32, crate::sfpu::ops::Broadcast, usize);
+    type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), len);
+    let key = (op.kind, op.scalar.to_bits(), bcast, len);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
     let layout = crate::sfpu::kernel::plan_layout(len, operands)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) = crate::sfpu::ops::program(op.kind, op.scalar).expect("checked by the caller");
+    let (_, math) =
+        crate::sfpu::ops::program_for(op.kind, op.scalar, bcast).expect("checked by the caller");
     let roles = Arc::new(crate::sfpu::kernel::roles(&layout, operands, &math));
     let p = (layout, roles);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, p.clone());
+    Ok(p)
+}
+
+/// `a` reduced over `axis` by `op` on the SFPU (`crate::sfpu::reduce`):
+/// `[rows, 1]` over columns, `[1, cols]` over rows. Each run of output tiles is
+/// a job: the mover gathers their lines of input tiles (column-major for a
+/// reduction over rows), the kernel accumulates and folds them, the mover
+/// writes the outputs.
+pub fn sfpu_reduce(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    units: usize,
+) -> Result<Work> {
+    use crate::sfpu::reduce::Axis;
+    let [rt, ct] = a.grid();
+    let (outs, per, valid, out) = match axis {
+        Axis::Cols => (rt, ct, a.cols % 32, DramTensor::alloc(alloc, a.rows, 1)?),
+        Axis::Rows => (ct, rt, a.rows % 32, DramTensor::alloc(alloc, 1, a.cols)?),
+    };
+    let valid = if valid == 0 { 32 } else { valid as u32 };
+    let group = match reduce_group(op, axis, per, valid) {
+        Some(g) => g,
+        None => {
+            alloc.free(&out.placement);
+            return Err(TensorError::Shape(format!(
+                "a reduction over {per} tiles does not fit one tile's L1 and program slots"
+            )));
+        }
+    };
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let mut jobs = Vec::new();
+    for run in runs(outs, units, group) {
+        let len = run.len();
+        let (layout, roles) = match reduce_programs(op, axis, len, per, valid) {
+            Ok(p) => p,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(e);
+            }
+        };
+        let (flags, grid_rt) = match axis {
+            Axis::Cols => (0, 0),
+            Axis::Rows => (4, rt as u32),
+        };
+        let gather = [
+            [
+                record::READ_RUN,
+                (run.start * per) as u32,
+                (len * per) as u32,
+                layout.in_at as u32,
+                flags,
+                ct as u32,
+                grid_rt,
+                0,
+            ],
+            ra.encode()[0],
+            ra.encode()[1],
+        ];
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![
+            Step::List {
+                what: "reduce gather",
+                entries: gather.to_vec(),
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+            },
+            Step::List {
+                what: "reduce scatter",
+                entries: scatter.to_vec(),
+            },
+        ]);
+    }
+    Ok(Work { out, jobs })
+}
+
+type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
+
+/// Most output tiles one reduce run may take, from the slots the data arena
+/// holds and the role programs' length per output tile; `None` if not even
+/// one fits.
+fn reduce_group(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    per: usize,
+    valid: u32,
+) -> Option<usize> {
+    use crate::sfpu::reduce::{Axis, ReduceOp};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32), Option<usize>>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op, axis, per, valid);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return g;
+    }
+    let g = measure_reduce_group(op, axis, per, valid);
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, g);
+    g
+}
+
+fn measure_reduce_group(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    per: usize,
+    valid: u32,
+) -> Option<usize> {
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles};
+    const GROUP: usize = 64;
+    let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    let by_slots = slots / (per + 1);
+    if by_slots == 0 {
+        return None;
+    }
+    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let lens = |n: usize| -> Option<[usize; 3]> {
+        let layout = plan_layout(n, per).ok()?;
+        Some(roles(&layout, &inputs, &fin).map(|p| p.len()))
+    };
+    let max = tt_isa::mailbox::PROGRAM_MAX as usize;
+    let one = lens(1)?;
+    if one.iter().any(|&l| l > max) {
+        return None;
+    }
+    if by_slots == 1 {
+        return Some(1);
+    }
+    let two = lens(2)?;
+    let by_program = (0..3)
+        .map(|r| {
+            let per_out = (two[r] - one[r]).max(1);
+            (max - (one[r] - per_out)) / per_out
+        })
+        .min()
+        .unwrap();
+    Some(GROUP.min(by_slots).min(by_program).max(1))
+}
+
+fn reduce_programs(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    len: usize,
+    per: usize,
+    valid: u32,
+) -> Result<ReducePrograms> {
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles, Axis, ReduceOp};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (ReduceOp, Axis, usize, usize, u32);
+    type Memo = Mutex<HashMap<Key, ReducePrograms>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let key = (op, axis, len, per, valid);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Ok(p.clone());
+    }
+    let layout = plan_layout(len, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, p.clone());
@@ -1057,6 +1443,23 @@ impl OpPadding for Eltwise {
     fn produces(&self, inputs: &[&DramTensor]) -> Pad {
         use tt_isa::dm::kind;
         let zero = |i: usize| inputs.get(i).is_some_and(|t| t.pad() == Pad::Zero);
+        // A broadcast operand goes into the padding of the dimension it is
+        // broadcast along: `0 + b` there is `b`. With no padding along it, the
+        // other dimension's padding is `0 (op) 0`, zero for `ADD` and `SUB`.
+        if let (Some(a), Some(b)) = (inputs.first(), inputs.get(1)) {
+            if (b.rows, b.cols) != (a.rows, a.cols) || self.kind == kind::ADD_ROW {
+                let along_clear = if b.rows == 1 {
+                    a.rows % 32 == 0
+                } else {
+                    a.cols % 32 == 0
+                };
+                let z = matches!(self.kind, kind::ADD | kind::SUB | kind::ADD_ROW)
+                    && zero(0)
+                    && zero(1)
+                    && along_clear;
+                return if z { Pad::Zero } else { Pad::Undefined };
+            }
+        }
         let z = match self.kind {
             // `0 (op) 0` is a zero.
             kind::ADD | kind::SUB | kind::MUL => zero(0) && zero(1),
@@ -1191,7 +1594,7 @@ mod tests {
                     }
                     after_list = true;
                 }
-                Step::Kernel { roles, init } => {
+                Step::Kernel { roles, init, .. } => {
                     let mut k: Vec<u32> = roles.iter().map(|p| p.len() as u32).collect();
                     k.extend(
                         init.iter()
@@ -1250,8 +1653,9 @@ mod tests {
                     let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[sa, sb]);
                     let route = SrcRoute::Tf32FromFp32;
                     let f = Fidelity::HiFi4;
-                    let got = super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units)
-                        .unwrap();
+                    let got =
+                        super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false)
+                            .unwrap();
                     let want =
                         reference::matmul_dram(&mut a2, &t2[0], ta, &t2[1], tb, route, f, units)
                             .unwrap();
@@ -1608,7 +2012,11 @@ mod reference {
                         what: "matmul gather",
                         entries: list,
                     },
-                    Step::Kernel { roles, init },
+                    Step::Kernel {
+                        roles,
+                        init,
+                        mop: Box::new([None; 3]),
+                    },
                     Step::List {
                         what: "matmul scatter",
                         entries: back,

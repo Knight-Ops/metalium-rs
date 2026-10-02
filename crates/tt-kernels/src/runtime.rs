@@ -88,6 +88,13 @@ pub struct Kernel<'a> {
     /// [`Resident`] then skips the setup run of the next kernel with the same
     /// set (`matmul::MatmulSemaphores` says why a matmul qualifies).
     pub restores_semaphores: bool,
+    /// Have each role release blocked semaphores before pushing
+    /// (`mailbox::UNWEDGE`): a tile reset on silicon.
+    pub unwedge: bool,
+    /// Each role's MOP Expander configuration for this run, loaded by its
+    /// runner before the program is pushed (`tt_isa::frontend::mop`,
+    /// `mailbox::MOP_CFG`). `None` leaves the expander as it is.
+    pub mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
 }
 
 impl<'a> Kernel<'a> {
@@ -103,7 +110,18 @@ impl<'a> Kernel<'a> {
             dst_fmt: DST_FMT_FP32,
             trace: false,
             restores_semaphores: false,
+            unwedge: false,
+            mop: [None; 3],
         }
+    }
+
+    /// Role `thread`'s MOP words, checked: a configuration the expander cannot
+    /// run as the page describes it is refused before anything is staged.
+    fn mop_words(&self, thread: usize) -> Result<Option<[u32; 9]>, RunError> {
+        self.mop[thread]
+            .map(|c| c.config_words())
+            .transpose()
+            .map_err(|e| RunError::Mop { thread, reason: e })
     }
 }
 
@@ -216,6 +234,23 @@ pub enum RunError {
         bytes: u64,
         limit: u64,
     },
+    /// Work queued earlier failed when the session waited for it
+    /// (`crate::session::Session::sync`).
+    Queued(String),
+    /// Role `thread`'s MOP Expander configuration was refused.
+    Mop {
+        thread: usize,
+        reason: tt_isa::frontend::mop::MopError,
+    },
+    /// The tile's reset never finished: these roles' threads take no
+    /// instruction even after the backend pulse, every semaphore released and
+    /// their `Src` banks fed (`session::unwedge_tile`). What else holds them is
+    /// unknown; a board reset clears it (`docs/hardware-coverage.md`, "Hazards
+    /// and known bugs").
+    Wedged {
+        tile: (u8, u8),
+        roles: Vec<Core>,
+    },
 }
 
 impl From<TransportError> for RunError {
@@ -239,10 +274,29 @@ impl std::fmt::Display for RunError {
                 mailbox::DUMP_MAX_ROWS
             ),
             RunError::Setup(e) => write!(f, "setup run: {e}"),
+            RunError::Queued(e) => write!(f, "{e}"),
+            RunError::Mop { thread, reason } => {
+                write!(f, "role {thread}'s MOP configuration: {reason}")
+            }
             RunError::DoesNotFit { what, bytes, limit } => write!(
                 f,
                 "{what} need {bytes} bytes of L1; the region holds {limit}"
             ),
+            RunError::Wedged {
+                tile: (x, y),
+                roles,
+            } => {
+                let names: Vec<&str> = roles.iter().map(|c| c.name()).collect();
+                write!(
+                    f,
+                    "tile ({x},{y}) is wedged: {} took no instruction after the reset \
+                     released every semaphore, nor after its `Src` banks were fed (on \
+                     silicon; ttsim cannot finish that recovery). Software could not \
+                     clear it; reset the board (`tt-smi -r`, or a power cycle), or \
+                     choose another tile",
+                    names.join(", ")
+                )
+            }
             RunError::Roles(stuck) => {
                 let parts: Vec<String> = stuck
                     .iter()
@@ -364,6 +418,8 @@ pub fn run<T: Transport, N: NocId>(
             dump_row_count: dump,
             trace: u32::from(traced),
             push_window,
+            unwedge: u32::from(kernel.unwedge),
+            mop_cfg: kernel.mop_words(thread)?,
             ..Default::default()
         };
         for (at, v) in d.writes(mb) {
@@ -511,13 +567,19 @@ pub struct Resident<N: NocId> {
     /// Each role's descriptor words as last written, but for the program's
     /// address and length (which a `KERNEL` entry rewrites on the tile): a
     /// word that already holds its value is not written again.
-    descriptors: std::cell::RefCell<[Option<[u32; 8]>; 3]>,
+    descriptors: std::cell::RefCell<[Option<[u32; mailbox::DESCRIPTOR_WORDS]>; 3]>,
     /// A [`Resident::submit`]ted kernel's phases so far, until it is
     /// [`Resident::complete`]d.
     pending: Option<Stopwatch>,
     /// Every run's roles record their progress through the timestamper, into
     /// a stream the host configured and drains itself (`crate::profile`).
     profiling: bool,
+    /// The last setup run's generation and program, until taken: a trace's
+    /// capture records it as a kernel of its own (`crate::trace`).
+    last_setup: Option<(u32, Vec<Instruction>)>,
+    /// Kernels [`Resident::reserve`]d and not yet closed, oldest first: their
+    /// lists may be queued on the mover behind one another.
+    reservations: std::collections::VecDeque<Stopwatch>,
 }
 
 impl<N: NocId> Resident<N> {
@@ -539,12 +601,14 @@ impl<N: NocId> Resident<N> {
             slots: Default::default(),
             semaphores: None,
             semaphores_after: None,
+            last_setup: None,
             descriptors: Default::default(),
             pending: None,
             profiling: false,
+            reservations: Default::default(),
         };
         for thread in 0..3 {
-            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false)?;
+            r.stage(dev, thread, &[], 0, false, DST_FMT_FP32, false, false, None)?;
             dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
         }
         dev.load_and_start_together(&r.window, tile, images)?;
@@ -588,7 +652,7 @@ impl<N: NocId> Resident<N> {
             self.submit(dev, images, kernel, budget)?;
             return self.complete(dev, images, kernel, budget);
         }
-        let mut clock = self.begin(dev, images, kernel, budget)?;
+        let mut clock = self.begin(dev, images, kernel, budget, false)?;
         // In order: each role runs to completion before the next moves,
         // exactly as `run` sequences them.
         let mut stuck = Vec::new();
@@ -625,7 +689,7 @@ impl<N: NocId> Resident<N> {
                 reason: "only a concurrent kernel can be submitted without waiting",
             }));
         }
-        let mut clock = self.begin(dev, images, kernel, budget)?;
+        let mut clock = self.begin(dev, images, kernel, budget, false)?;
         for thread in 0..3 {
             self.go(dev, thread)?;
         }
@@ -698,11 +762,124 @@ impl<N: NocId> Resident<N> {
         } else {
             kernel
         };
-        let clock = self.begin(dev, images, staged, budget)?;
+        let clock = self.begin(dev, images, staged, budget, resident_programs)?;
         let first = self.generation;
         self.generation += count - 1;
-        self.pending = Some(clock);
+        // What the tile will hold once these runs have finished, assumed now
+        // so a kernel queued behind them sees it (`reserved_done` takes it
+        // back if they fail).
+        self.semaphores = self.semaphores_after.take();
+        self.reservations.push_back(clock);
         Ok(first..first + count)
+    }
+
+    /// Would reserving `kernel` write anything the roles read while it waits
+    /// behind kernels already queued -- a setup run of its semaphores, a fixed
+    /// program slot, a descriptor word? Then the caller must let the tile
+    /// drain first: those are read by the runs in flight.
+    pub fn needs_idle<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        kernel: &Kernel<'_>,
+        resident_programs: bool,
+    ) -> bool {
+        if !resident_programs || kernel.trace || kernel.dump_rows != 0 {
+            return true;
+        }
+        if let Schedule::Concurrent(init) = kernel.schedule {
+            let holds = self
+                .semaphores
+                .as_ref()
+                .is_some_and(|k| init.iter().all(|e| k.contains(e)));
+            if !holds {
+                return true;
+            }
+        }
+        let push_window = if dev.transport().is_simulated() {
+            mailbox::SIM_PUSH_WINDOW
+        } else {
+            0
+        };
+        let descs = self.descriptors.borrow();
+        (0..3).any(|thread| {
+            let d = mailbox::Descriptor {
+                thread_index: thread as u32,
+                dst_access_fmt: kernel.dst_fmt,
+                trace: u32::from(self.profiling),
+                push_window,
+                // A MOP configuration different from the queued kernels'
+                // would be rewritten under them.
+                mop_cfg: kernel.mop_words(thread).ok().flatten(),
+                ..Default::default()
+            };
+            let mb = Mailbox::of(thread as u32);
+            let want = d.writes(mb);
+            match descs[thread] {
+                None => true,
+                Some(have) => want.iter().enumerate().any(|(k, &(at, v))| {
+                    at != mb.program_len() && at != mb.program_addr() && have[k] != v
+                }),
+            }
+        })
+    }
+
+    /// Kernels reserved and not yet closed.
+    /// `n` generations no kernel has had, for a trace's replay
+    /// (`crate::trace`): the first of them, the next kernel's after the last.
+    pub fn take_generations(&mut self, n: u32) -> u32 {
+        let first = self.generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(n);
+        first
+    }
+
+    /// The setup run [`Resident::reserve`] did last, if any since the last
+    /// call: its generation and its thread-0 program.
+    pub fn take_setup_run(&mut self) -> Option<(u32, Vec<Instruction>)> {
+        self.last_setup.take()
+    }
+
+    /// The last generation handed out.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// A replay wrote the roles' descriptors and ran its kernels without the
+    /// host (`crate::trace`): what this side remembers of the tile -- the
+    /// descriptor words, the semaphores -- is no longer known, so the next
+    /// kernel writes and sets up everything.
+    pub fn forget_tile_state(&mut self) {
+        *self.descriptors.borrow_mut() = [None; 3];
+        self.semaphores = None;
+        self.semaphores_after = None;
+    }
+
+    /// Role `thread`'s descriptor as a resident kernel runs it from a list:
+    /// what [`Resident::reserve`] writes, but for the program's address and
+    /// length, which the `KERNEL` entry writes on the tile. A trace stores it
+    /// as `POKE` entries (`crate::trace`).
+    pub fn queued_descriptor<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        kernel: &Kernel<'_>,
+        thread: usize,
+    ) -> Result<mailbox::Descriptor, RunError> {
+        let push_window = if dev.transport().is_simulated() {
+            mailbox::SIM_PUSH_WINDOW
+        } else {
+            0
+        };
+        Ok(mailbox::Descriptor {
+            thread_index: thread as u32,
+            dst_access_fmt: kernel.dst_fmt,
+            trace: u32::from(kernel.trace || self.profiling),
+            push_window,
+            mop_cfg: kernel.mop_words(thread)?,
+            ..Default::default()
+        })
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reservations.len()
     }
 
     /// The mover has run every generation [`Resident::reserve`] handed out and
@@ -712,10 +889,9 @@ impl<N: NocId> Resident<N> {
     pub fn reserved_done<T: Transport>(
         &mut self,
         dev: &mut Device<T>,
-        kernel: &Kernel<'_>,
         ran: bool,
     ) -> Result<(), RunError> {
-        let Some(mut clock) = self.pending.take() else {
+        let Some(mut clock) = self.reservations.pop_front() else {
             return Err(RunError::Transport(TransportError::Hazard {
                 address: 0,
                 reason: "no reserved kernel to close",
@@ -725,10 +901,7 @@ impl<N: NocId> Resident<N> {
         if !ran {
             self.poisoned = true;
             self.semaphores = None;
-            return Ok(());
-        }
-        if let Schedule::Concurrent(_) = kernel.schedule {
-            self.semaphores = self.semaphores_after.take();
+            self.reservations.clear();
         }
         Ok(())
     }
@@ -741,6 +914,7 @@ impl<N: NocId> Resident<N> {
         images: &RoleImages<'_>,
         kernel: &Kernel<'_>,
         budget: u64,
+        resident_programs: bool,
     ) -> Result<Stopwatch, RunError> {
         if self.poisoned {
             return Err(RunError::Transport(TransportError::Hazard {
@@ -752,6 +926,15 @@ impl<N: NocId> Resident<N> {
             return Err(RunError::Transport(TransportError::Hazard {
                 address: 0,
                 reason: "a submitted kernel has not been completed",
+            }));
+        }
+        // Anything but a reservation that `needs_idle` cleared writes what
+        // queued runs read: only on an idle tile.
+        if !self.reservations.is_empty() && !resident_programs {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: 0,
+                reason:
+                    "a host run or fixed-slot kernel behind queued kernels; drain the tile first",
             }));
         }
         let (setup, unpack) = assemble(kernel)?;
@@ -789,7 +972,8 @@ impl<N: NocId> Resident<N> {
         });
         if let (Some(setup), false) = (&setup, skip_setup) {
             self.generation += 1;
-            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true)?;
+            self.last_setup = Some((self.generation, setup.clone()));
+            self.stage(dev, 0, setup, 0, false, kernel.dst_fmt, true, false, None)?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {
                 self.poisoned = true;
@@ -825,6 +1009,8 @@ impl<N: NocId> Resident<N> {
                 kernel.trace || self.profiling,
                 kernel.dst_fmt,
                 false,
+                resident_programs,
+                kernel.mop_words(thread)?,
             )?;
         }
         clock.lap(dev, Phase::Programs);
@@ -908,6 +1094,7 @@ impl<N: NocId> Resident<N> {
     /// Write role `thread`'s descriptor and program; with `go`, also move its
     /// generation so it runs.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn stage<T: Transport>(
         &self,
         dev: &mut Device<T>,
@@ -917,6 +1104,8 @@ impl<N: NocId> Resident<N> {
         traced: bool,
         dst_fmt: u32,
         go: bool,
+        resident_programs: bool,
+        mop_cfg: Option<[u32; 9]>,
     ) -> Result<(), RunError> {
         let (w, tile) = (&self.window, self.tile);
         let mb = Mailbox::of(thread as u32);
@@ -940,6 +1129,7 @@ impl<N: NocId> Resident<N> {
             dump_row_count: dump,
             trace: u32::from(traced),
             push_window,
+            mop_cfg,
             ..Default::default()
         };
         let mut descs = self.descriptors.borrow_mut();
@@ -949,6 +1139,12 @@ impl<N: NocId> Resident<N> {
         let writes = d.writes(mb);
         for (k, &(at, v)) in writes.iter().enumerate() {
             let rewritten_on_tile = at == mb.program_len() || at == mb.program_addr();
+            // A resident kernel's program is named by its `KERNEL` entry,
+            // which the mover writes before each run: the host writing it too
+            // could land between the mover's write and the role's read.
+            if rewritten_on_tile && resident_programs {
+                continue;
+            }
             if rewritten_on_tile || last.is_none_or(|l| l[k] != v) {
                 dev.write32(w, tile, at, v)?;
             }

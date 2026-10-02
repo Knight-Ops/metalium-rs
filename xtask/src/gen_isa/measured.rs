@@ -225,6 +225,117 @@ pub const MEASURED: &[Measured] = &[
 ];
 
 /// Does `file` (relative to the workspace root) define `fn name(`?
+/// A `WormholeOnly` layout a gate ran on Blackhole and found unchanged.
+pub struct Confirmed {
+    /// The diagram key, as the specification draws it.
+    pub key: &'static str,
+    /// Every field of the diagram, each set to more than one value by the
+    /// evidence: a field the gate never moved is not confirmed, so the list
+    /// must name them all.
+    pub exercised: &'static [&'static str],
+    /// `(file, test function)` pairs: ttsim and silicon, both.
+    pub evidence: &'static [(&'static str, &'static str)],
+}
+
+pub const CONFIRMED: &[Confirmed] = &[
+    Confirmed {
+        // The register form; the six-bit immediate form (`ADDDMAREGi`) runs
+        // on silicon (`adddmareg_adds_an_immediate`) but not on ttsim
+        // (divergence row 67), so it is not confirmed here.
+        key: "ADDDMAREG",
+        exercised: &["ResultReg", "RightReg", "LeftReg"],
+        evidence: &[(
+            "crates/tt-tests/tests/step38_gpr_add.rs",
+            "adddmareg_adds_two_registers",
+        )],
+    },
+    Confirmed {
+        key: "MOP",
+        exercised: &["Template", "Count1", "MaskLo"],
+        evidence: &[(
+            "crates/tt-tests/tests/step36_mop.rs",
+            "a_mop_expands_as_the_page_models_it",
+        )],
+    },
+    Confirmed {
+        key: "MOP_CFG",
+        exercised: &["MaskHi"],
+        evidence: &[(
+            "crates/tt-tests/tests/step36_mop.rs",
+            "a_mop_expands_as_the_page_models_it",
+        )],
+    },
+];
+
+/// Mark each [`CONFIRMED`] layout so. Refused unless it is `WormholeOnly` --
+/// a confirmation never overrides documentation or a measurement, so the day
+/// upstream documents it is a build failure that says to drop the row -- and
+/// unless its gate exists and it names every field of the diagram.
+pub fn confirm(
+    table: &[Confirmed],
+    gate_exists: &dyn Fn(&str, &str) -> bool,
+    diagrams: &[Diagram],
+    provenance: &mut BTreeMap<String, (Provenance, String)>,
+) -> Result<(), String> {
+    for c in table {
+        let Some((p, page)) = provenance.get(c.key).cloned() else {
+            return Err(format!("confirmed layout `{}` is not in the table", c.key));
+        };
+        if p != Provenance::WormholeOnly {
+            return Err(format!(
+                "`{}` is {}, not WormholeOnly: a confirmation only stands in for missing \
+                 documentation; drop its row from `CONFIRMED`",
+                c.key,
+                p.variant_name()
+            ));
+        }
+        if c.evidence.is_empty() {
+            return Err(format!("confirmed layout `{}` names no gate", c.key));
+        }
+        for (file, name) in c.evidence {
+            if !gate_exists(file, name) {
+                return Err(format!(
+                    "confirmed layout `{}` cites `{file}::{name}`, which does not exist",
+                    c.key
+                ));
+            }
+        }
+        let d = diagrams
+            .iter()
+            .find(|d| d.key == c.key)
+            .ok_or_else(|| format!("confirmed layout `{}` has no diagram", c.key))?;
+        let mut fields: Vec<&str> = d
+            .fields
+            .iter()
+            .filter_map(|f| match &f.label {
+                Label::Named { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut named: Vec<&str> = c.exercised.to_vec();
+        fields.sort_unstable();
+        named.sort_unstable();
+        if fields != named {
+            return Err(format!(
+                "confirmed layout `{}` exercises {named:?}, but its fields are {fields:?}: \
+                 every field must be exercised",
+                c.key
+            ));
+        }
+        let evidence = c
+            .evidence
+            .iter()
+            .map(|(f, n)| format!("{f}::{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        provenance.insert(
+            c.key.to_string(),
+            (Provenance::Confirmed { evidence }, page),
+        );
+    }
+    Ok(())
+}
+
 pub fn gate_exists(root: &Path) -> impl Fn(&str, &str) -> bool + '_ {
     move |file, name| {
         std::fs::read_to_string(root.join(file))
@@ -796,5 +907,64 @@ local diagrams = {
         }
         let parsed = lua::parse(SOURCE).unwrap();
         assert_eq!(parsed.len(), MEASURED.len());
+    }
+
+    const CONFIRM: Confirmed = Confirmed {
+        key: "FOO",
+        exercised: &["Imm", "AddrMod"],
+        evidence: &[("some/test.rs", "measured_it")],
+    };
+
+    fn confirming(row: Confirmed, prov: Provenance) -> Result<Provenance, String> {
+        let diagrams = lua::parse(SPEC).unwrap();
+        let mut provenance = BTreeMap::from([("FOO".to_string(), (prov, "WH/FOO.md".to_string()))]);
+        let exists = |f: &str, n: &str| f == "some/test.rs" && n == "measured_it";
+        confirm(&[row], &exists, &diagrams, &mut provenance)?;
+        Ok(provenance["FOO"].0.clone())
+    }
+
+    #[test]
+    fn a_confirmation_marks_a_wormhole_only_layout_and_nothing_else() {
+        assert_eq!(
+            confirming(CONFIRM, Provenance::WormholeOnly),
+            Ok(Provenance::Confirmed {
+                evidence: "some/test.rs::measured_it".into()
+            })
+        );
+        for documented in [Provenance::Blackhole, Provenance::SharedWithWormhole] {
+            let err = confirming(CONFIRM, documented).unwrap_err();
+            assert!(err.contains("not WormholeOnly"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_confirmation_needs_its_gate_and_every_field() {
+        let err = confirming(
+            Confirmed {
+                evidence: &[("some/test.rs", "deleted")],
+                ..CONFIRM
+            },
+            Provenance::WormholeOnly,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        let err = confirming(
+            Confirmed {
+                exercised: &["Imm"],
+                ..CONFIRM
+            },
+            Provenance::WormholeOnly,
+        )
+        .unwrap_err();
+        assert!(err.contains("every field must be exercised"), "{err}");
+        let err = confirming(
+            Confirmed {
+                evidence: &[],
+                ..CONFIRM
+            },
+            Provenance::WormholeOnly,
+        )
+        .unwrap_err();
+        assert!(err.contains("names no gate"), "{err}");
     }
 }

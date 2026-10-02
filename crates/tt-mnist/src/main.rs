@@ -143,6 +143,8 @@ impl<B: Backend> Mlp<B> {
 // --- Training -----------------------------------------------------------------
 
 struct Run {
+    /// burn-tt's per-call timers once the dataset is resident.
+    calls: Vec<(&'static str, u64, Duration)>,
     losses: Vec<(usize, f32)>,
     accuracy: f64,
     preload: Duration,
@@ -184,6 +186,7 @@ fn train<B: AutodiffBackend>(
     )
     .to_device(device);
     let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
 
     let t0 = Instant::now();
     let mut losses = Vec::new();
@@ -224,12 +227,211 @@ fn train<B: AutodiffBackend>(
         right += pred.equal(y).int().sum().into_scalar().elem::<i64>() as usize;
     }
     Run {
+        calls,
         losses,
         accuracy: right as f64 / test.n as f64,
         preload,
         train: train_time,
         steps: step,
     }
+}
+
+/// What an inference run measured.
+struct Infer {
+    /// burn-tt's per-call timers once the test set is resident.
+    calls: Vec<(&'static str, u64, Duration)>,
+    /// The test images to the device, once.
+    preload: Duration,
+    /// The first batch alone: program caches and the session cold.
+    first: Duration,
+    /// Every batch after the first.
+    rest: Duration,
+    batches: usize,
+    accuracy: f64,
+}
+
+/// The forward pass alone, no autodiff: the test set uploaded once, then
+/// `passes` rounds over it in batches of `batch`, each batch's predictions
+/// downloaded (`argmax` on the host, as a caller would read them). Untrained
+/// weights unless the caller trains first; accuracy is printed only as a
+/// check that the right pictures went through.
+fn infer<B: Backend>(
+    test: &Split,
+    init: &Init,
+    batch: usize,
+    passes: usize,
+    device: &B::Device,
+) -> Infer {
+    let model = Mlp::<B>::new(init, device);
+    let t0 = Instant::now();
+    let n = test.n - test.n % batch;
+    let images: Tensor<B, 2> = Tensor::from_data(
+        TensorData::new(test.images[..n * PIXELS].to_vec(), [n, PIXELS]),
+        device,
+    )
+    .to_device(device);
+    let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
+    let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
+    let (mut batches, mut right) = (0, 0usize);
+    for _ in 0..passes {
+        for from in (0..n).step_by(batch) {
+            let t = Instant::now();
+            let x = images.clone().slice([from..from + batch, 0..PIXELS]);
+            let pred: Vec<i64> = model
+                .forward(x)
+                .argmax(1)
+                .reshape([batch])
+                .into_data()
+                .convert::<i64>()
+                .to_vec()
+                .expect("integer predictions");
+            if batches == 0 {
+                first = t.elapsed();
+            } else {
+                rest += t.elapsed();
+            }
+            batches += 1;
+            right += pred
+                .iter()
+                .zip(&test.labels[from..from + batch])
+                .filter(|(p, &l)| **p == i64::from(l))
+                .count();
+        }
+    }
+    Infer {
+        calls,
+        preload,
+        first,
+        rest,
+        batches,
+        accuracy: right as f64 / (batches * batch).max(1) as f64,
+    }
+}
+
+/// [`infer`], each batch run by a trace (`burn_tt::Trace`, X4d): the forward
+/// pass captured once on a batch-sized input, then each batch written into
+/// that input and replayed -- the logits come back, and `argmax` runs on the
+/// host. A batch is written from the host each time, as a server's inputs
+/// would be, where `infer` slices a test set already on the card.
+fn infer_traced(
+    test: &Split,
+    init: &Init,
+    batch: usize,
+    passes: usize,
+    device: &TtDevice,
+) -> Infer {
+    use burn::tensor::TensorPrimitive;
+    let prim = |t: Tensor<TtBackend, 2>| match t.into_primitive() {
+        TensorPrimitive::Float(p) => p,
+        _ => unreachable!("a float tensor"),
+    };
+    let model = Mlp::<TtBackend>::new(init, device);
+    let t0 = Instant::now();
+    let n = test.n - test.n % batch;
+    let x: Tensor<TtBackend, 2> = Tensor::from_data(
+        TensorData::new(test.images[..batch * PIXELS].to_vec(), [batch, PIXELS]),
+        device,
+    );
+    let xp = prim(x.clone());
+    let (trace, _) = burn_tt::Trace::capture(&xp, || prim(model.forward(x.clone())))
+        .unwrap_or_else(|e| panic!("capturing the forward pass: {e}"));
+    let classes = trace.output_dims()[1];
+    let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
+    let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
+    let (mut batches, mut right) = (0, 0usize);
+    for _ in 0..passes {
+        for from in (0..n).step_by(batch) {
+            let t = Instant::now();
+            let input = test.images[from * PIXELS..(from + batch) * PIXELS].to_vec();
+            let logits = trace
+                .run(input)
+                .unwrap_or_else(|e| panic!("replaying the forward pass: {e}"));
+            let pred: Vec<usize> = logits
+                .chunks_exact(classes)
+                .map(|row| {
+                    (0..classes)
+                        .max_by(|&a, &b| row[a].total_cmp(&row[b]).then(b.cmp(&a)))
+                        .expect("classes")
+                })
+                .collect();
+            if batches == 0 {
+                first = t.elapsed();
+            } else {
+                rest += t.elapsed();
+            }
+            batches += 1;
+            right += pred
+                .iter()
+                .zip(&test.labels[from..from + batch])
+                .filter(|(p, &l)| **p == usize::from(l))
+                .count();
+        }
+    }
+    Infer {
+        calls,
+        preload,
+        first,
+        rest,
+        batches,
+        accuracy: right as f64 / (batches * batch).max(1) as f64,
+    }
+}
+
+fn print_infer(r: &Infer, batch: usize) {
+    let steady = r.rest.as_secs_f64() / (r.batches.saturating_sub(1)).max(1) as f64;
+    println!(
+        "  test images uploaded once                  {:.2?}",
+        r.preload
+    );
+    println!(
+        "  first batch (cold)                         {:.2?}",
+        r.first
+    );
+    println!(
+        "  {} more batches of {batch}                   {:.2?}  ({:.3} ms/batch, {:.0} images/s)",
+        r.batches.saturating_sub(1),
+        r.rest,
+        steady * 1e3,
+        batch as f64 / steady
+    );
+    println!(
+        "  accuracy (untrained weights: a check, not a result)  {:.2}%",
+        r.accuracy * 100.0
+    );
+}
+
+/// Where the host's time went: each kind of device call burn-tt made, timed
+/// on the caller's side (the server's queue, the session's work and the wait
+/// for the card included), per `per` units of work, and what was left outside
+/// every call -- Burn itself and the host's own ops.
+fn print_calls(before: &[(&'static str, u64, Duration)], wall: Duration, per: usize, unit: &str) {
+    let now = burn_tt::device_time();
+    let mut inside = Duration::ZERO;
+    println!("  where the time went, per {unit} (caller's side):");
+    for (k, n, d) in &now {
+        let (n0, d0) = before
+            .iter()
+            .find(|(b, ..)| b == k)
+            .map_or((0, Duration::ZERO), |(_, n, d)| (*n, *d));
+        let (n, d) = (n - n0, *d - d0);
+        if n == 0 {
+            continue;
+        }
+        inside += d;
+        println!(
+            "    {k:<14} {:>6.1} calls {:>8.1} us  ({:.1} us a call)",
+            n as f64 / per as f64,
+            d.as_secs_f64() * 1e6 / per as f64,
+            d.as_secs_f64() * 1e6 / n as f64
+        );
+    }
+    println!(
+        "    {:<14} {:>15.1} us",
+        "outside calls",
+        wall.saturating_sub(inside).as_secs_f64() * 1e6 / per as f64
+    );
 }
 
 // --- The command line ---------------------------------------------------------
@@ -239,17 +441,31 @@ struct Args {
     epochs: usize,
     steps: usize,
     host: bool,
+    /// `--infer`: the forward pass alone, no training.
+    infer: bool,
+    /// `--trace`: with `--infer`, each batch a replay of a captured trace.
+    trace: bool,
+    batch: usize,
+    passes: usize,
 }
 
 const USAGE: &str = "\
 usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
+       tt-mnist --infer [--trace] [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
   --tiles T     compute on T Tensix tiles of the card, or `all` (default 1)
   --epochs E    passes over the 60 000 training images (default 1)
   --steps S     stop after S steps
-  --host        also train on the host CPU (burn-flex), for comparison";
+  --host        also train on the host CPU (burn-flex), for comparison
+  --infer       benchmark inference alone: no training, the forward pass over
+                the test set (untrained weights), so it profiles on its own
+                (`TT_PROFILE`)
+  --trace       with --infer: capture the forward pass once as a trace and
+                replay it for every batch, each batch written from the host
+  --batch B     inference batch size (default 64)
+  --passes P    rounds over the test set (default 3)";
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
@@ -257,6 +473,10 @@ fn args() -> Result<Args, String> {
         epochs: 1,
         steps: usize::MAX,
         host: false,
+        infer: false,
+        trace: false,
+        batch: BATCH,
+        passes: 3,
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -277,9 +497,18 @@ fn args() -> Result<Args, String> {
             "--epochs" => a.epochs = number(value()?)?,
             "--steps" => a.steps = number(value()?)?,
             "--host" => a.host = true,
+            "--infer" => a.infer = true,
+            "--trace" => a.trace = true,
+            "--batch" => a.batch = number(value()?)?,
+            "--passes" => a.passes = number(value()?)?,
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
+    }
+    if a.batch == 0 || a.batch > 10_000 || a.passes == 0 {
+        return Err(format!(
+            "--batch must be 1..=10000 and --passes at least 1\n\n{USAGE}"
+        ));
     }
     // After the loop, so `--tiles` applies whichever order it came in.
     if let Some(t) = tiles {
@@ -344,6 +573,36 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if a.infer {
+        println!(
+            "inference only, batch {}, {} passes over the test set:",
+            a.batch, a.passes
+        );
+        let before = burn_tt::tensor_traffic();
+        let r = if a.trace {
+            infer_traced(&test_split, &init, a.batch, a.passes, &device)
+        } else {
+            infer::<TtBackend>(&test_split, &init, a.batch, a.passes, &device)
+        };
+        let moved = burn_tt::tensor_traffic() - before;
+        drop(guard);
+        println!("\non the card:");
+        print_infer(&r, a.batch);
+        print_calls(&r.calls, r.first + r.rest, r.batches, "batch");
+        println!(
+            "  tensor data over PCIe, whole run          {:.1} MB up (incl. the test set), {:.2} MB down",
+            moved.uploaded as f64 / 1e6,
+            moved.downloaded as f64 / 1e6
+        );
+        if a.host {
+            println!("\non the host CPU (burn-flex), same model:");
+            print_infer(
+                &infer::<Flex>(&test_split, &init, a.batch, a.passes, &FlexDevice),
+                a.batch,
+            );
+        }
+        return;
+    }
     let before = burn_tt::tensor_traffic();
     let card = train::<Autodiff<TtBackend>>(
         &train_split,
@@ -371,6 +630,7 @@ fn main() {
         card.train,
         per(card.train)
     );
+    print_calls(&card.calls, card.train, card.steps.max(1), "step");
     println!(
         "  loss                                      {:.4} -> {:.4}",
         card.losses.first().map_or(f32::NAN, |l| l.1),

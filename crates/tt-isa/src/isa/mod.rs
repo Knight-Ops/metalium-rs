@@ -163,6 +163,12 @@ pub enum Provenance {
         /// Fields whose width differs from the Wormhole diagram's.
         widened: &'static [&'static str],
     },
+    /// **`CONFIRMED`, not documented.** Only a Wormhole page draws it and
+    /// Blackhole has none, but the gate(s) `evidence` names ran it on ttsim and
+    /// silicon with every field exercised, and found the Wormhole layout
+    /// unchanged. Enters the table only through `xtask/src/gen_isa/measured.rs`
+    /// (`CONFIRMED`).
+    Confirmed { evidence: &'static str },
 }
 
 impl Provenance {
@@ -498,6 +504,7 @@ mod tests {
                 Provenance::SupersededOnBlackhole { .. } => "SupersededOnBlackhole",
                 Provenance::WormholeOnly => "WormholeOnly",
                 Provenance::Measured { .. } => "Measured",
+                Provenance::Confirmed { .. } => "Confirmed",
             };
             *counts.entry(name).or_default() += 1;
         }
@@ -505,12 +512,16 @@ mod tests {
         assert_eq!(counts["SharedWithWormhole"], 24);
         assert_eq!(counts["SupersededOnBlackhole"], 24);
         assert_eq!(
-            counts["WormholeOnly"], 61,
+            counts["WormholeOnly"], 58,
             "half the instruction set is a hypothesis; that is the point of recording it"
         );
         assert_eq!(
             counts["Measured"], 13,
             "MVMUL, the six MOV*, ELWADD, ELWSUB, ELWMUL, DOTPV, SHIFTXB, ZEROACC"
+        );
+        assert_eq!(
+            counts["Confirmed"], 3,
+            "MOP, MOP_CFG (step36_mop), ADDDMAREG (step38_gpr_add)"
         );
     }
 

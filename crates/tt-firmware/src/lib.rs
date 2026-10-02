@@ -297,6 +297,40 @@ pub mod tensix {
         }
     }
 
+    /// Block until this thread's MOP Expander has no `MOP` queued or in
+    /// expansion, so its configuration may change (`ManualTTSync.md:40-55`).
+    /// The same store, load and consuming `andi` as [`wait_for_coprocessor`],
+    /// for the same two reasons.
+    #[inline]
+    pub fn wait_for_mop_expander() {
+        // SAFETY: as `wait_for_coprocessor`, on the expander's check word.
+        unsafe {
+            core::arch::asm!(
+                "sw   zero, 0({addr})",
+                "lw   {tmp}, 0({addr})",
+                "andi {tmp}, {tmp}, 0",
+                addr = in(reg) tensix::MOP_EXPANDER_DONE_CHECK as u32,
+                tmp = out(reg) _,
+                options(nostack),
+            )
+        }
+    }
+
+    /// Load this thread's `MopCfg` (`tt_isa::frontend::mop`): wait for the
+    /// expander to be idle, write the nine words, and fence so they land before
+    /// any later push reaches it.
+    pub fn load_mop_config(words: &[u32; 9]) {
+        wait_for_mop_expander();
+        for (k, &w) in words.iter().enumerate() {
+            // SAFETY: the write-only `MopCfg` window of this core's thread;
+            // the expander is idle (above).
+            unsafe {
+                core::ptr::write_volatile((tensix::MOP_CFG_BASE + 4 * k as u64) as *mut u32, w)
+            };
+        }
+        crate::publish();
+    }
+
     /// Read a 32-bit `Dst` element through the RISCV mapping.
     ///
     /// Valid only when `RISC_DEST_ACCESS_CTRL_SEC[thread].fmt` selects one of the

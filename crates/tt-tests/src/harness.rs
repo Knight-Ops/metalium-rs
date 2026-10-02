@@ -109,6 +109,8 @@ pub struct Run<'a> {
     /// Record each role's progress through the tile's timestamper; see
     /// [`Run::traced`].
     pub trace: bool,
+    /// Each role's MOP Expander configuration; see [`Run::mop`].
+    pub mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
 }
 
 pub use tt_kernels::runtime::SemaphoreInit;
@@ -150,6 +152,7 @@ impl<'a> Run<'a> {
             roles: None,
             concurrent: None,
             trace: false,
+            mop: [None; 3],
         }
     }
 
@@ -198,6 +201,13 @@ impl<'a> Run<'a> {
 
     pub fn read_back(mut self, ranges: &'a [(u64, usize)]) -> Self {
         self.read_back = ranges;
+        self
+    }
+
+    /// Load these MOP Expander configurations (unpack, math, pack) before
+    /// the roles push (`tt_isa::mailbox::MOP_CFG`).
+    pub fn mop(mut self, cfg: [Option<tt_isa::frontend::mop::MopConfig>; 3]) -> Self {
+        self.mop = cfg;
         self
     }
 }
@@ -382,6 +392,7 @@ fn run_roles(dev: &mut Dev<'_>, spec: &Run<'_>, roles: Roles<'_>) -> Outcome {
         clear_dst: spec.clear_dst,
         dst_fmt: spec.dst_fmt,
         trace: spec.trace,
+        mop: spec.mop,
         ..Kernel::new([roles.unpack, roles.math, roles.pack], schedule)
     };
     match runtime::run(dev, tile, &crate::firmware::ROLES, &kernel, BUDGET) {

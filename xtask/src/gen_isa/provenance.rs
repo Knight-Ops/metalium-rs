@@ -39,6 +39,10 @@ pub enum Provenance {
         dropped: Vec<String>,
         widened: Vec<String>,
     },
+    /// Not from the specification: a `WormholeOnly` layout run on Blackhole --
+    /// ttsim and silicon -- by `evidence`, every field exercised, and found to
+    /// be the Wormhole layout unchanged. See `super::measured::CONFIRMED`.
+    Confirmed { evidence: String },
 }
 
 impl Provenance {
@@ -49,6 +53,7 @@ impl Provenance {
             Provenance::SupersededOnBlackhole { .. } => "SupersededOnBlackhole",
             Provenance::WormholeOnly => "WormholeOnly",
             Provenance::Measured { .. } => "Measured",
+            Provenance::Confirmed { .. } => "Confirmed",
         }
     }
 }

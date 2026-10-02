@@ -254,6 +254,13 @@ pub const NCRISC_RESET_PC: u64 = 0xFFB1_2238;
 /// Bit 0 enables the override.
 pub const NCRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_223C;
 
+/// `SemaphoreAccess[i]` at `PC_BUF_BASE + 4 * PC_BUF_SEMAPHORE_BASE`, in the
+/// address space of RISC-V T0, T1 and T2 only (`SyncUnit.md`, "RISCV access to
+/// semaphores"; `BabyRISCV/README.md:128`): a load reads semaphore `i`'s value,
+/// a store of an even value posts it (`SEMPOST`), of an odd one gets it
+/// (`SEMGET`) -- atomically, and without queueing behind the Tensix thread.
+pub const SEMAPHORE_ACCESS: u64 = 0xFFE8_0020;
+
 /// The tile's debug timestamper (`TensixTile/DebugTimestamper.md`, identical to
 /// Wormhole's): a 64-bit cycle counter, and an event stream that appends
 /// `{token, counter}` records to a buffer in L1, one store per event.
@@ -511,6 +518,12 @@ pub const COPROCESSOR_DONE_CHECK: u64 = PC_BUF_BASE + 0x04;
 /// Loading from here blocks until it is safe to change this thread's MOP Expander
 /// configuration (`ManualTTSync.md`).
 pub const MOP_EXPANDER_DONE_CHECK: u64 = PC_BUF_BASE + 0x08;
+
+/// `TENSIX_MOP_CFG_BASE`: the issuing core's thread's nine `MopCfg` words
+/// (`BabyRISCV/README.md:120`, `MOPExpander.md` "Configuration"), in RISC-V
+/// T0, T1 and T2 only. **Write-only**: a load is `UndefinedBehavior`. Write
+/// only once [`MOP_EXPANDER_DONE_CHECK`] says no expansion is in progress.
+pub const MOP_CFG_BASE: u64 = 0xFFB8_0000;
 
 /// Upper bound of the range subject to the Manual TTSync load-adjacency hazard.
 ///

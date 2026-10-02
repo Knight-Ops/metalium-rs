@@ -48,6 +48,14 @@ fn send(a: &mut Dev<'_>, b: &mut Dev<'_>, x: u8, seed: u8) {
     let data = pattern(seed);
     a.write(&wa, eth(x), BUF, &data).unwrap();
     b.write(&wb, eth(x), BUF, &vec![0xEE; LEN + 64]).unwrap();
+    // Both landed before the transfer starts: the host's writes are posted,
+    // and nothing else writing the tile is ordered behind them. A read of each
+    // buffer's last word is (the same path as the writes). Without the
+    // receiver's, its sentinel landed *after* the frames now and then and
+    // overwrote the payload's tail: 3 failures in 40 runs, 6 in 60 with only
+    // the sender's read-back, 0 in 60 with both (divergence row AA).
+    let _ = a.read32(&wa, eth(x), BUF + LEN as u64 - 4).unwrap();
+    let _ = b.read32(&wb, eth(x), BUF + (LEN + 64) as u64 - 4).unwrap();
 
     for (n, o) in [
         ("SEL_SW", 0x80),
@@ -79,6 +87,26 @@ fn send(a: &mut Dev<'_>, b: &mut Dev<'_>, x: u8, seed: u8) {
     }
     let same = got[..LEN].iter().zip(&data).filter(|(g, d)| g == d).count();
     println!("MEASURE x={x}: {same}/{LEN} bytes arrived");
+    // Where the misses are, and what is there instead: a lossy link and a
+    // writer of its own on the tile look different.
+    let mut i = 0;
+    while i < LEN {
+        if got[i] != data[i] {
+            let start = i;
+            while i < LEN && got[i] != data[i] {
+                i += 1;
+            }
+            println!(
+                "MEASURE x={x}: bytes {:#x}..{:#x} differ: got {:02x?} want {:02x?}",
+                BUF as usize + start,
+                BUF as usize + i,
+                &got[start..i.min(start + 16)],
+                &data[start..i.min(start + 16)]
+            );
+        } else {
+            i += 1;
+        }
+    }
     assert_eq!(same, LEN, "the payload did not arrive intact");
     assert!(got[LEN..].iter().all(|&v| v == 0xEE), "wrote past the end");
     let cnt = a.read32(&wa, eth(x), TXQ2 + 0x30).unwrap();

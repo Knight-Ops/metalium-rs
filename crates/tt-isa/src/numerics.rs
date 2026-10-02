@@ -22,6 +22,8 @@
 //!   and the checklist both say the documented models faithfully reproduce the
 //!   hardware's bugs and must be matched rather than fixed.
 
+pub mod sfpu;
+
 /// `x * y + z` as Blackhole computes it, on FP32 bit patterns.
 ///
 /// A direct port of `fma_model_bh` (`Miscellaneous/FMA/fma.c:102`). The integer

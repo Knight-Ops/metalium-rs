@@ -31,6 +31,7 @@
 pub mod interp;
 pub mod kernel;
 pub mod ops;
+pub mod reduce;
 
 use tt_isa::frontend;
 use tt_isa::isa::generated::{defs, encode};
@@ -190,6 +191,13 @@ impl Program {
         self.ins.push(i);
     }
 
+    /// An instruction the builder has no method for -- a measurement of a
+    /// mode no op uses yet -- through the same `SFPNOP` bookkeeping. Nothing
+    /// is checked: the caller owns what it does.
+    pub fn raw(&mut self, i: Instruction) {
+        self.push(i);
+    }
+
     fn dst(d: LReg) -> u32 {
         assert!(
             d.writable(),
@@ -284,6 +292,151 @@ impl Program {
     /// `d = s` with sign bit `negative` (`SFPSETSGN_MOD1_ARG_IMM`).
     pub fn set_sign(&mut self, s: LReg, negative: bool, d: LReg) {
         self.push(encode::sfpsetsgn(u32::from(negative), s.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = s` with the sign bit of `sign` (`SFPSETSGN` taking it from `VD`,
+    /// which is why `sign` is moved into `d` first).
+    pub fn copy_sign(&mut self, s: LReg, sign: LReg, d: LReg) {
+        if sign != d {
+            self.mov(sign, d);
+        }
+        self.push(encode::sfpsetsgn(0, s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = c + d` as 32-bit two's-complement integers (`SFPIADD`), the lane
+    /// flags left alone.
+    pub fn iadd(&mut self, c: LReg, d: LReg) {
+        // `SFPIADD_MOD1_ARG_LREG_DST | SFPIADD_MOD1_CC_NONE`.
+        self.push(encode::sfpiadd(0, c.index(), Self::dst(d), 4).unwrap());
+    }
+
+    /// `d = c - d` as two's-complement integers (`SFPIADD_MOD1_ARG_2SCOMP_LREG_DST`).
+    pub fn isub_from(&mut self, c: LReg, d: LReg) {
+        self.push(encode::sfpiadd(0, c.index(), Self::dst(d), 2 | 4).unwrap());
+    }
+
+    /// `d = c + imm`, `imm` a signed twelve-bit integer (`SFPIADD_MOD1_ARG_IMM`).
+    pub fn iadd_imm(&mut self, c: LReg, imm: i32, d: LReg) {
+        assert!(
+            (-2048..2048).contains(&imm),
+            "{imm} is not a twelve-bit immediate"
+        );
+        self.push(encode::sfpiadd(imm as u32 & 0xfff, c.index(), Self::dst(d), 1 | 4).unwrap());
+    }
+
+    /// `d = s << amount` (`SFPSHFT` with an immediate, the value from `VC`).
+    pub fn shl(&mut self, s: LReg, amount: u32, d: LReg) {
+        assert!(amount < 32);
+        // `SFPSHFT_MOD1_ARG_IMM | SFPSHFT_MOD1_ARG_IMM_USE_VC`.
+        self.push(encode::sfpshft(amount, s.index(), Self::dst(d), 1 | 4).unwrap());
+    }
+
+    /// `d = s >> amount`, logical (`SFPSHFT` by `-amount` from a register
+    /// holding it: the immediate is unsigned). `amount_reg` must hold
+    /// `-amount`, `d` the value.
+    pub fn shr_by(&mut self, neg_amount: LReg, d: LReg) {
+        self.push(encode::sfpshft(0, neg_amount.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d` = the exponent field of `s` as a two's-complement integer, minus
+    /// 127 if `debias` (`SFPEXEXP`).
+    pub fn exponent(&mut self, s: LReg, debias: bool, d: LReg) {
+        self.push(encode::sfpexexp(s.index(), Self::dst(d), u32::from(!debias)).unwrap());
+    }
+
+    /// `d` = `s`'s mantissa bits with the hidden bit, `1 << 23` (`SFPEXMAN`).
+    pub fn mantissa(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpexman(s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// `d = s` with its exponent field set to `exp` (`SFPSETEXP`, immediate).
+    pub fn set_exponent(&mut self, s: LReg, exp: u32, d: LReg) {
+        assert!(exp < 256);
+        self.push(encode::sfpsetexp(exp, s.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = s * 2^k` by adding `k` to the exponent field, an infinity or NaN
+    /// unchanged, no check of the result's range (`SFPDIVP2`). `k` in 0..128:
+    /// the page has the add wrap mod 256, so `-k` would be `256 - k`, but
+    /// ttsim refuses an immediate from 128 up (divergence row 66); scale down
+    /// with a multiply.
+    pub fn scale_by_pow2(&mut self, s: LReg, k: u32, d: LReg) {
+        assert!(
+            k < 128,
+            "SFPDIVP2 by {k}: ttsim refuses an immediate from 128 (row 66)"
+        );
+        self.push(encode::sfpdivp2(k, s.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = a & b`, bitwise (`SFPAND` with `SFPAND_MOD1_USE_VB`).
+    pub fn and(&mut self, a: LReg, b: LReg, d: LReg) {
+        self.push(encode::sfpand(b.index(), a.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d = a | b`, bitwise (`SFPOR` with `SFPOR_MOD1_USE_VB`).
+    pub fn or(&mut self, a: LReg, b: LReg, d: LReg) {
+        self.push(encode::sfpor(b.index(), a.index(), Self::dst(d), 1).unwrap());
+    }
+
+    /// `d[lane] = s[lane - 1]` within each group of eight lanes -- one row of
+    /// the 4x8 lane grid -- the first lane of each taking the last's
+    /// (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`). Eight of them are the identity, so
+    /// combining after each of seven reduces a row of eight into every lane.
+    pub fn rotate_row(&mut self, s: LReg, d: LReg) {
+        self.push(encode::sfpshft2(0, s.index(), Self::dst(d), 3).unwrap());
+    }
+
+    /// Transpose each lane column's 4x4 block of `L0..L4` (and of `L4..L8`):
+    /// lane row `j` of `L[i]` swaps with lane row `i` of `L[j]` (`SFPTRANSP`).
+    /// So row `i` of a four-row group held in `L0` ends in row 0 of `L[i]`.
+    pub fn transpose4(&mut self) {
+        self.push(encode::sfptransp(0).unwrap());
+    }
+
+    /// `d = ApproxRecip(|x|)` with `x`'s sign (`SFPARECIP`, Blackhole only):
+    /// within 0.56% of `1/x` for `2^-126 <= |x| < 2^126`, infinite below and
+    /// zero above.
+    pub fn approx_recip(&mut self, x: LReg, d: LReg) {
+        let mod1 = tt_isa::numerics::sfpu::arecip_mod1::RECIP;
+        self.push(encode::sfparecip(0, x.index(), Self::dst(d), mod1).unwrap());
+    }
+
+    /// `d = 1/x`, within one ulp of the correctly rounded reciprocal for
+    /// every normal `x` whose reciprocal is normal; `1/±0 = ±inf`, `1/±inf =
+    /// ±0`, a NaN stays one; denormals in or out flush to zero, as all of the
+    /// SFPU's arithmetic does. Uses `t0`, `t1` as scratch, and needs `one`
+    /// holding `1.0` and `max` holding `f32::MAX` (loaded once, outside a
+    /// loop).
+    ///
+    /// The seed ([`Program::approx_recip`]) is within `e0 < 0.0056`; each
+    /// Newton step `y += y * (1 - x*y)` squares the error and adds at most
+    /// two roundings (`e1 <= e0^2 + 2^-23 < 3.2e-5`), and the last step's
+    /// result is `1/x * (1 - e1^2)` before its single rounding, `e1^2 < 1.1e-9`
+    /// -- so within half an ulp plus 0.02 of one of `1/x`, hence at most one
+    /// ulp from its correct rounding. (`step28_recip` holds the device to
+    /// this program bit for bit, and the program to the bound.)
+    pub fn recip(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
+        assert!(d != x && t0 != x && t1 != x && d != t0 && d != t1 && t0 != t1);
+        self.approx_recip(x, d);
+        for _ in 0..2 {
+            self.nmad(x, d, LReg::ONE, t0);
+            self.mad(t0, d, d, d);
+        }
+        // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
+        // seed's infinity met `0 * inf` in the steps.
+        self.abs(x, t1);
+        self.loadi_bits(t0, 0x0080_0000);
+        self.if_(Cond::Less(t1, t0), |p| {
+            p.loadi_bits(t0, 0x7f80_0000);
+            p.copy_sign(t0, x, d);
+        });
+        // `1/±inf`: the seed's zero met `inf * 0`.
+        self.if_(Cond::Less(max, t1), |p| {
+            p.loadi_bits(t0, 0x7f80_0001);
+            p.if_(Cond::Less(t1, t0), |p| {
+                p.copy_sign(LReg::ZERO, x, d);
+            });
+        });
     }
 
     fn push_flags(&mut self) {

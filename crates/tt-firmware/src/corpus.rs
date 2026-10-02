@@ -10,7 +10,7 @@
 //! parameters, so `PushesTo` still rules out the pairings that hang.
 
 use crate::cfg::write_config_field;
-use crate::tensix::{push_word, read_dst32, wait_for_coprocessor};
+use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor};
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::role::Mailbox;
@@ -64,6 +64,42 @@ fn trace(on: bool, thread: u32, event: u32) {
                 tt_isa::tensix::timestamper::event_128(mailbox::trace::token(thread, event)),
             )
         };
+    }
+}
+
+/// Release whatever a failed kernel left a Tensix thread blocked on
+/// (`mailbox::UNWEDGE`): post every semaphore that reads zero, in rounds, so
+/// a `SEMWAIT` the backend reset did not clear completes -- and any later one
+/// in what it had queued behind it. The reset program the runner then pushes
+/// initialises every semaphore afresh, so the posts leave nothing behind.
+fn unwedge() {
+    use tt_isa::tensix::SEMAPHORE_ACCESS;
+    // Until nothing has consumed a post for 64 rounds running: whatever the
+    // thread had queued behind its first wait has run (each later wait taking
+    // the next round's post), or it waits on something no post can release.
+    // Bounded, so a tile wedged some other way still reaches the reset.
+    let (mut quiet, mut rounds) = (0u32, 0u32);
+    while quiet < 64 && rounds < 1 << 20 {
+        rounds += 1;
+        let mut posted = false;
+        for i in 0..8u64 {
+            let at = SEMAPHORE_ACCESS + 4 * i;
+            // SAFETY: the documented semaphore window of this core; a load
+            // reads a value, an even store posts.
+            unsafe {
+                if l1_read32(at) == 0 {
+                    l1_write32(at, 0);
+                    posted = true;
+                }
+            }
+        }
+        quiet = if posted { 0 } else { quiet + 1 };
+        publish();
+        for _ in 0..256 {
+            // Not `spin_loop`: its `pause` is an encoding Blackhole lacks.
+            // SAFETY: a no-op.
+            unsafe { core::arch::asm!("nop") };
+        }
     }
 }
 
@@ -132,6 +168,10 @@ where
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
     let push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
+    // SAFETY: as above.
+    if unsafe { l1_read32(mb.unwedge()) } != 0 {
+        unwedge();
+    }
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -179,11 +219,43 @@ where
     // before pushing anything that depends on the new value.
     publish();
 
+    // This run's MOP Expander configuration (`tt_isa::frontend::mop`), loaded
+    // once the expander is idle and before anything is pushed that could use
+    // it.
+    // SAFETY: fixed mailbox words, written by the host before the generation.
+    if unsafe { l1_read32(mb.mop_cfg_valid()) } != 0 {
+        let mut cfg = [0u32; 9];
+        for (k, w) in cfg.iter_mut().enumerate() {
+            // SAFETY: as above.
+            *w = unsafe { l1_read32(mb.mop_cfg(k as u32)) };
+        }
+        load_mop_config(&cfg);
+    }
+
     trace(tracing, Thread::INDEX, mailbox::trace::START);
     let mut i = 0;
     // A countdown rather than `i % push_window`: T2 has no remainder
     // instruction, and the instruction-set gate refuses one.
     let mut until_drain = push_window;
+    // Silicon (no push window): sixteen words read, then sixteen pushed, so
+    // the loads overlap rather than each push waiting on its own load. One
+    // word at a time took ~7.6 cycles a word, eight at a time 3.5, sixteen 2.8
+    // (`silicon_perf::role_push_rate`, card 0) -- and a matmul's unpack and
+    // math roles push as fast as their runner can. Sixteen is what fits the
+    // registers.
+    if push_window == 0 {
+        while i + 16 <= program_len {
+            let at = program + (i as u64) * 4;
+            // SAFETY: eight words inside the staged program, whose length was
+            // checked above.
+            let w: [u32; 16] = core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
+            for word in w {
+                // SAFETY: as the loop below.
+                unsafe { push_word::<Riscv, Thread>(word) }
+            }
+            i += 16;
+        }
+    }
     while i < program_len {
         // SAFETY: the word is inside the staged program, whose length was checked
         // above; `Riscv` may push to `Thread`, which the type system checked; the

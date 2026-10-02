@@ -1001,7 +1001,14 @@ loops (F2, X1) and an interpreter that predicts any program bit for bit, held to
 both cards instruction by instruction (F5); the SFPU tile kernel and its dispatch (F3, F4);
 and every element-wise op on the SFPU, bit-identical to the mover and to Flex, chosen
 per op by a measured cost model (S1). MNIST: 3.8 ms/step on one tile (from 5.1), 2.4 on
-eight. Next: 10.1, softmax and cross-entropy.
+eight. Milestone 10.1 is done too: reciprocal, division, `exp` and `log` on the SFPU;
+`sum` and `max` over either dim; softmax and log-softmax on the device end to end; the
+matmul's loops replayed (the MOP Expander gated, and measured no faster on a matmul that
+is now backend-bound); the movers' queues, barriers and batching, and op-list traces that
+refuse tt-metal's corruptions instead of suffering them; wedged tiles detected at open and
+recovered in software. MNIST: 2.0 ms/step on one tile, 1.6 on four; inference 0.45 ms a
+batch of 64. Cross-entropy moved to 10.5 with D4. Next: 10.2, activation and math
+breadth.
 
 **Ordering: SFPU foundation first.** The foundation -- whole-tile `UnpackToDst` and pack, an
 SFPU program builder with typed `LReg`s and scoped conditional execution, one three-role SFPU
