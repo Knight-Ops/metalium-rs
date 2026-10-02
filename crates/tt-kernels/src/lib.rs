@@ -19,6 +19,7 @@
 pub mod code;
 pub mod datapath;
 pub mod dm;
+pub mod kind;
 pub mod l1;
 pub mod link;
 pub mod loops;

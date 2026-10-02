@@ -185,6 +185,12 @@ pub mod trace {
     pub const PUSHED: u32 = 2;
     /// The coprocessor has retired the program.
     pub const RETIRED: u32 = 3;
+    /// A resident runner saw a new generation, before reading its
+    /// descriptor. Only on a resident run after the first.
+    pub const WOKE: u32 = 4;
+    /// A resident runner acknowledged its generation (`Dst` dumped, `DONE`
+    /// about to be stored).
+    pub const ACKED: u32 = 5;
 
     /// The data mover (`crate::dm`) began a list.
     pub const LIST_BEGIN: u32 = 16;
@@ -197,6 +203,17 @@ pub mod trace {
     /// may still be in flight: only a `KERNEL`, `WAIT` or `COMPUTE` entry, and
     /// the list's end, wait for them.
     pub const ENTRY_END: u32 = 19;
+    /// The mover posted a `KERNEL`'s generation to the three roles; the
+    /// detail is the generation.
+    pub const KICK: u32 = 20;
+    /// The mover saw all three roles acknowledge the generation it last
+    /// posted.
+    pub const ROLES_DONE: u32 = 21;
+    /// Requests of the list just ended waited for room under the in-flight
+    /// cap (`crate::noc::niu::InFlight`); the detail is the cycles they
+    /// waited in all, saturated at [`DETAIL_MAX`]. One per list, after its
+    /// `LIST_END`, and only when something waited.
+    pub const THROTTLE: u32 = 22;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.

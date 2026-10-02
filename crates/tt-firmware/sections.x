@@ -47,6 +47,16 @@ SECTIONS
     __bss_end = .;
   } > L1
 
+  /* Per-core state the firmware keeps for itself (`#[link_section = ".local"]`),
+   * at the bottom of local data RAM: 2-cycle access, and the stack grows down
+   * from the top. NOLOAD -- nothing can be staged there (the NoC cannot reach
+   * it while the core is in reset) -- so it has no initialiser: the firmware
+   * writes it before use. */
+  .local (NOLOAD) : ALIGN(4)
+  {
+    *(.local .local.*)
+  } > LOCAL
+
   /* Stack in local data RAM: 2-cycle access, and the core's own accesses stall
    * automatically during the post-reset zeroing window, so setting it up in
    * _start is safe. */

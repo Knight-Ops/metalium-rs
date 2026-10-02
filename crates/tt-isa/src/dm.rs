@@ -69,6 +69,18 @@ pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
 /// off between lists. Zero on the simulator, which does not model the event
 /// stream (divergence row 54).
 pub const TRACE: u64 = MAILBOX_BASE + 0x50;
+/// Mover -> host: how many of the mover's NoC requests had to wait for room
+/// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
+/// zeroed it. Written only when one did, so the normal path never touches it.
+pub const THROTTLE_STALLS: u64 = MAILBOX_BASE + 0x54;
+/// Mover -> host: the tile-counter cycles those requests waited, in total
+/// (wrapping).
+pub const THROTTLE_CYCLES: u64 = MAILBOX_BASE + 0x58;
+/// Host -> mover: the in-flight cap to use, 0 for
+/// `crate::noc::niu::MAX_IN_FLIGHT`. Read at the start of every list. Lower
+/// caps are for the gates that force the throttle.
+pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
+const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
 pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
@@ -117,11 +129,13 @@ pub mod op {
     /// the tile on the way: the slot lands in [`super::SCRATCH`] and the mover
     /// writes its transpose to the destination. Only in a list entry.
     pub const READ_TRANSPOSED: u32 = 4;
-    /// Element-wise arithmetic on whole tiles already in L1, by the mover's
-    /// own FP32 unit: `[COMPUTE, kind, scalar, param, dst, a, b, 0]`, each
-    /// address a tile slot, `param` kind-specific (zero for most). See
-    /// [`super::kind`]. Only in a list entry.
-    pub const COMPUTE: u32 = 5;
+    /// Set a tile's padding in L1: `[FILL, value, param, dst, 0, 0, 0, 0]` --
+    /// `value` stored at every datum of the slot `dst` outside its first
+    /// `param & 0xff` rows and `param >> 8` columns (each `0` meaning 32;
+    /// [`super::fill::param`]). Stores only: the mover moves data and does no
+    /// arithmetic -- that is the SFPU's and the Matrix Unit's. Only in a list
+    /// entry.
+    pub const FILL: u32 = 5;
     /// Run the tile's resident roles once: `[KERNEL, generation, a0, l0, a1,
     /// l1, a2, l2]`. The mover waits for every move before it; then, for each
     /// role `t` whose `at` is non-zero, writes `at` and `lt` to its mailbox's
@@ -167,50 +181,13 @@ pub mod op {
     pub const POKE: u32 = 11;
 }
 
-/// What an [`op::COMPUTE`] entry computes, datum by datum over a tile's 1024
-/// (`dst`, `a`, `b` are slots; `s` is the entry's scalar, as FP32 bits).
-///
-/// Done with the baby RISC-V's `fadd.s`/`fsub.s`/`fmul.s`, which round to
-/// nearest even and flush denormals (`BabyRISCV/InstructionSet.md:18-22`) --
-/// the IEEE result for every normal operand and result. Never `fmadd.s`: its
-/// semantics are neither fused nor separate, and the firmware's instruction
-/// gate refuses it.
-pub mod kind {
-    /// `a + b`.
-    pub const ADD: u32 = 1;
-    /// `a - b`.
-    pub const SUB: u32 = 2;
-    /// `a * b`.
-    pub const MUL: u32 = 3;
-    /// `a * s`.
-    pub const MUL_SCALAR: u32 = 4;
-    /// `max(a, 0)`, as `burn-flex` has it.
-    pub const RELU: u32 = 5;
-    /// `a > 0 ? b : 0`: `a` the forward output, `b` the gradient.
-    pub const RELU_BACKWARD: u32 = 6;
-    /// `a[r, c] + b[0, c]`: `b`'s first row broadcast down the tile.
-    pub const ADD_ROW: u32 = 7;
-    /// `dst[0, c] = acc + a[0, c] + a[1, c] + ... + a[n - 1, c]`, added in
-    /// row order, where `n` is the entry's parameter (the tile's valid rows;
-    /// `0` means all 32) and `acc` is `dst[0, c]`, or `+0.0` when the scalar
-    /// is non-zero (the first tile of a column) -- in which case `dst`'s rows
-    /// 1..32 are zeroed too, so the result's padding is defined. Over a column
-    /// of tiles in order, this is `burn-flex`'s `sum_dim(0)` order exactly
-    /// (`ops/reduce.rs:959-989`: from `0.0`, rows in order), and rows past a
-    /// ragged tensor's last are never read, whatever they hold.
-    pub const COL_SUM: u32 = 8;
-    /// Write the scalar to every datum of `dst` outside the tile's valid
-    /// region: rows at or past the parameter's bits 0..8, or columns at or
-    /// past its bits 8..16 (each `0` meaning 32). The tile's padding, set
-    /// (`tt_kernels::tensor::Pad`); `a` must be `dst`.
-    pub const FILL_PAD: u32 = 9;
-    /// `a`, bit for bit: a tile copied through L1, denormals and NaN
-    /// payloads included (the FP32 unit would flush the one and canonicalise
-    /// the other).
-    pub const COPY: u32 = 10;
-    /// `a + s`. `a - s` is this with `-s`, bit for bit in IEEE arithmetic.
-    pub const ADD_SCALAR: u32 = 11;
-    pub const LAST: u32 = ADD_SCALAR;
+/// [`op::FILL`]'s parameter.
+pub mod fill {
+    /// The parameter for a tile whose first `rows` rows and `cols` columns
+    /// are data, each 1..=32.
+    pub const fn param(rows: u32, cols: u32) -> u32 {
+        (rows % 32) | (cols % 32) << 8
+    }
 
     /// The valid rows (or columns) a parameter field names: `0` is 32.
     pub const fn extent(field: u32) -> u32 {
@@ -219,11 +196,6 @@ pub mod kind {
         } else {
             field
         }
-    }
-
-    /// A [`FILL_PAD`] parameter: `rows` and `cols` valid, each 1..=32.
-    pub const fn fill_param(rows: u32, cols: u32) -> u32 {
-        (rows % 32) | (cols % 32) << 8
     }
 }
 
@@ -280,15 +252,12 @@ pub enum Entry {
         descriptor: Descriptor,
         transform: Transform,
     },
-    Compute {
-        kind: u32,
-        /// Kind-specific: [`kind::COL_SUM`]'s valid rows, [`kind::FILL_PAD`]'s
-        /// valid region; zero for every other kind.
+    /// [`op::FILL`].
+    Fill {
+        value: u32,
+        /// The valid region ([`fill::param`]).
         param: u32,
-        scalar: u32,
         dst: u32,
-        a: u32,
-        b: u32,
     },
     /// [`op::KERNEL`]: point each role at its program, if named, post
     /// `generation`, and wait for it.
@@ -425,31 +394,20 @@ impl Entry {
                 value: w[2],
             });
         }
-        if w[0] == op::COMPUTE {
+        if w[0] == op::FILL {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
-            if w[1] == 0 || w[1] > kind::LAST {
-                return Err(error::OP);
-            }
-            if !slot(w[4]) || !slot(w[5]) || !slot(w[6]) {
+            if !slot(w[3]) {
                 return Err(error::ALIGNMENT);
             }
-            // A parameter only where the kind reads one, and only in range: a
-            // valid-row count past 32 would walk past the tile.
-            let param_ok = match w[1] {
-                kind::COL_SUM => w[3] <= 32,
-                kind::FILL_PAD => w[3] & !0x1f1f == 0 && w[4] == w[5],
-                _ => w[3] == 0,
-            };
-            if !param_ok {
+            // Only the region's bits, and nothing past them: a valid-row
+            // count past 32 would walk past the tile.
+            if w[2] & !0x1f1f != 0 || w[4..].iter().any(|&v| v != 0) {
                 return Err(error::OP);
             }
-            return Ok(Entry::Compute {
-                kind: w[1],
-                param: w[3],
-                scalar: w[2],
-                dst: w[4],
-                a: w[5],
-                b: w[6],
+            return Ok(Entry::Fill {
+                value: w[1],
+                param: w[2],
+                dst: w[3],
             });
         }
         Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(|descriptor| {
@@ -642,55 +600,41 @@ mod tests {
                 ..
             }
         ));
-        // Compute: a known kind, three slots inside L1.
-        let c = [
-            op::COMPUTE,
-            kind::ADD,
-            0,
-            0,
+        // A fill: a slot inside L1 and a region, nothing else.
+        let fill = [
+            op::FILL,
+            0xff80_0000,
+            fill::param(5, 32),
             0x2_0000,
-            0x2_1040,
-            0x2_2080,
+            0,
+            0,
+            0,
             0,
         ];
-        assert!(matches!(
-            Entry::decode(ALL, c),
-            Ok(Entry::Compute {
-                kind: kind::ADD,
-                ..
-            })
-        ));
-        let mut bad = c;
-        bad[1] = kind::LAST + 1;
-        assert_eq!(Entry::decode(ALL, bad), Err(error::OP));
-        let mut bad = c;
-        bad[6] = crate::tensix::L1_SIZE as u32 - 64;
-        assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
-        // A parameter only where the kind takes one, and only in range.
-        let mut bad = c;
-        bad[3] = 5;
-        assert_eq!(Entry::decode(ALL, bad), Err(error::OP));
-        let mut sum = c;
-        (sum[1], sum[3]) = (kind::COL_SUM, 17);
-        assert!(matches!(
-            Entry::decode(ALL, sum),
-            Ok(Entry::Compute { param: 17, .. })
-        ));
-        sum[3] = 33;
-        assert_eq!(Entry::decode(ALL, sum), Err(error::OP));
-        let mut fill = c;
-        (fill[1], fill[3], fill[5]) = (kind::FILL_PAD, kind::fill_param(5, 32), c[4]);
-        assert!(Entry::decode(ALL, fill).is_ok());
-        fill[3] = 0x2000;
-        assert_eq!(Entry::decode(ALL, fill), Err(error::OP));
-        fill[3] = kind::fill_param(5, 7);
-        fill[5] = c[5];
         assert_eq!(
             Entry::decode(ALL, fill),
-            Err(error::OP),
-            "a fill is in place"
+            Ok(Entry::Fill {
+                value: 0xff80_0000,
+                param: fill::param(5, 32),
+                dst: 0x2_0000
+            })
         );
-        assert_eq!((kind::extent(0), kind::extent(7)), (32, 7));
+        let mut bad = fill;
+        bad[2] = 0x2000;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::OP), "a region past 32");
+        let mut bad = fill;
+        bad[3] = crate::tensix::L1_SIZE as u32 - 64;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::ALIGNMENT));
+        let mut bad = fill;
+        bad[5] = 1;
+        assert_eq!(Entry::decode(ALL, bad), Err(error::OP), "a stray word");
+        // No arithmetic: what was `COMPUTE`'s add is a fill's shape now,
+        // and the old kinds' words are refused as one.
+        assert_eq!(
+            Entry::decode(ALL, [op::FILL, 1, 0, 0x2_0000, 0x2_1040, 0x2_2080, 0, 0]),
+            Err(error::OP)
+        );
+        assert_eq!((fill::extent(0), fill::extent(7)), (32, 7));
         // A kernel entry names a non-zero generation; a wait takes nothing.
         assert_eq!(
             Entry::decode(ALL, [op::KERNEL, 7, 0, 0, 0, 0, 0, 0]),

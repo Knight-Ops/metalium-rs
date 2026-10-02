@@ -42,7 +42,7 @@ use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
 
 use crate::datapath;
-use crate::dm::DataMover;
+use crate::dm::{DataMover, Throttle};
 use crate::matmul::{self, Fidelity, SrcRoute};
 use crate::program_cache::ProgramCache;
 use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
@@ -325,8 +325,6 @@ pub struct Session<T: Transport> {
     /// Each unit's timestamper stream so far, between
     /// [`Session::profile_start`] and [`Session::profile_stop`].
     profiling: Option<Vec<crate::profile::UnitProfile>>,
-    /// Which unit element-wise ops run on ([`Session::set_eltwise_unit`]).
-    eltwise_unit: tensor::EltwiseUnit,
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
@@ -370,7 +368,15 @@ struct Unit {
     /// Lists enqueued on this tile's mover and not yet retired, oldest first
     /// ([`Session::sync`]).
     queued: std::collections::VecDeque<QueuedList>,
+    /// `lists` when the mover's throttle was last looked at, and the stalls
+    /// last reported ([`Session::check_throttle`]).
+    throttle_checked_at: u64,
+    throttle_reported: u32,
 }
+
+/// Lists between looks at a unit's throttle counters: one PCIe read per this
+/// many host round trips.
+const THROTTLE_CHECK_LISTS: u64 = 1024;
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
 /// close when it is retired), and what it was, for an error.
@@ -698,7 +704,6 @@ impl<T: Transport> Session<T> {
             profile: runtime::Profile::default(),
             dram: None,
             profiling: None,
-            eltwise_unit: tensor::EltwiseUnit::default(),
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
             barriers: 0,
             pending_frees: Vec::new(),
@@ -721,6 +726,8 @@ impl<T: Transport> Session<T> {
                 lists: 0,
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
+                throttle_checked_at: 0,
+                throttle_reported: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -1113,6 +1120,9 @@ impl<T: Transport> Session<T> {
         }
         if ok {
             unit.programs.unpin_all();
+            if unit.lists >= unit.throttle_checked_at + THROTTLE_CHECK_LISTS {
+                self.check_throttle(u);
+            }
             self.drain(u)?;
             return Ok(());
         }
@@ -1809,9 +1819,9 @@ impl<T: Transport> Session<T> {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
     }
 
-    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`])
-    /// or the data movers' FP32 units ([`tensor::eltwise`]), as
-    /// [`Session::set_eltwise_unit`] says.
+    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`]).
+    /// An op with no SFPU program is refused: the data mover does no
+    /// arithmetic.
     pub fn eltwise(
         &mut self,
         op: tensor::Eltwise,
@@ -1832,40 +1842,13 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let unit = self.eltwise_unit;
         let alloc = &mut self.dram_state()?.alloc;
-        let [rt, ct] = a.grid();
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
-        use crate::sfpu::ops::Broadcast;
-        // What the mover can do: its own kinds, the same shape or `ADD_ROW`.
-        let mover_op = match (kind, bcast) {
-            (k, Broadcast::None) if crate::sfpu::ops::mover_has(k) => Some(op),
-            (tt_isa::dm::kind::ADD, Broadcast::Row) => Some(tensor::Eltwise {
-                kind: tt_isa::dm::kind::ADD_ROW,
-                ..op
-            }),
-            _ => None,
-        };
-        // Anything else goes to the SFPU whatever the setting.
-        let sfpu = mover_op.is_none()
-            || match unit {
-                tensor::EltwiseUnit::Sfpu => true,
-                tensor::EltwiseUnit::Mover => false,
-                tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(kind, rt * ct, units),
-            };
-        let work = if sfpu {
-            tensor::sfpu_eltwise(alloc, op, a, b, c, units)?
-        } else {
-            None
-        };
-        let work = match (work, mover_op) {
-            (Some(w), _) => w,
-            (None, Some(m)) => tensor::eltwise(alloc, m, a, b, units)?,
-            (None, None) => {
-                return Err(TensorError::Shape(format!(
-                    "element-wise {kind:#x} with {bcast:?}: no unit computes it"
-                )))
-            }
+        // The SFPU's, or refused: the mover only moves data.
+        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units)? else {
+            return Err(TensorError::Shape(format!(
+                "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
+            )));
         };
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()));
@@ -1899,17 +1882,18 @@ impl<T: Transport> Session<T> {
         self.eltwise(op, x, t)
     }
 
-    /// Run element-wise ops on `unit` from now on: by default whichever is
-    /// cheaper for the op's size (`tensor::sfpu_is_cheaper`), or always the
-    /// SFPU (where the op has a program), or always the data mover's FP32
-    /// unit, which stays as the reference and the fallback. Bit-identical
-    /// whichever (`step19_eltwise`).
-    pub fn set_eltwise_unit(&mut self, unit: tensor::EltwiseUnit) {
-        self.eltwise_unit = unit;
-    }
-
-    pub fn eltwise_unit(&self) -> tensor::EltwiseUnit {
-        self.eltwise_unit
+    /// `t`, bit for bit, as a tensor of its own ([`tensor::copy`]): data
+    /// movement only, any element type.
+    pub fn copy(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let work = tensor::copy(&mut self.dram_state()?.alloc, t, units)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(if t.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
     }
 
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
@@ -1924,8 +1908,8 @@ impl<T: Transport> Session<T> {
     }
 
     /// `a` reduced over `axis` by `op`: `[rows, 1]` over columns, `[1, cols]`
-    /// over rows. On the SFPU ([`tensor::sfpu_reduce`]), except a sum over
-    /// rows, which the mover does in Flex's order ([`Session::sum_rows`]).
+    /// over rows. On the SFPU ([`tensor::sfpu_reduce`]); a sum over rows in
+    /// Flex's order ([`Session::sum_rows`]).
     /// Padding is masked in the kernel, so `a`'s is never read; the output's
     /// padding holds copies of the result (over columns) or is undefined.
     pub fn reduce(
@@ -1969,15 +1953,7 @@ impl<T: Transport> Session<T> {
             t.set_pad(Pad::Zero);
             return Ok(None);
         }
-        let copy = self.eltwise(
-            tensor::Eltwise {
-                scalar2: 0.0,
-                kind: tt_isa::dm::kind::COPY,
-                scalar: 0.0,
-            },
-            t,
-            None,
-        )?;
+        let copy = self.copy(t)?;
         let jobs = tensor::fill_pad(&copy, 0.0, units)?;
         if let Err(e) = self.submit_jobs(jobs, RESET_BUDGET) {
             let _ = self.free(copy);
@@ -2401,8 +2377,56 @@ impl<T: Transport> Session<T> {
         self.sync().map_err(|e| RunError::Queued(e.to_string()))
     }
 
+    /// What the in-flight cap has cost every unit's mover since it started
+    /// (`DataMover::throttle`), summed: requests that waited for room, and
+    /// the cycles they waited. A PCIe read pair per unit.
+    pub fn throttle(&mut self) -> Result<Throttle, TensorError> {
+        let mut sum = Throttle::default();
+        for u in 0..self.units.len() {
+            let Session { dev, units, .. } = self;
+            let unit = &units[u];
+            if let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                sum = sum + m.throttle(dev, r.window())?;
+            }
+        }
+        Ok(sum)
+    }
+
+    /// Say so when unit `u`'s mover has waited for room under the in-flight
+    /// cap more than it had at the last report -- first at all, then each
+    /// doubling -- so a cap that has become a bottleneck is noticed rather
+    /// than paid for silently. Checked every [`THROTTLE_CHECK_LISTS`] lists
+    /// and when the session ends.
+    fn check_throttle(&mut self, u: usize) {
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        unit.throttle_checked_at = unit.lists;
+        let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) else {
+            return;
+        };
+        let Ok(t) = m.throttle(dev, r.window()) else {
+            return;
+        };
+        if t.stalls > unit.throttle_reported.saturating_mul(2) {
+            unit.throttle_reported = t.stalls;
+            eprintln!(
+                "session: tile ({}, {})'s mover has waited for room under the NoC in-flight cap \
+                 ({} requests) {} times, {} cycles in all; if this grows, revisit \
+                 tt_isa::noc::niu::MAX_IN_FLIGHT (docs/firmware-performance.md)",
+                unit.tile.x(),
+                unit.tile.y(),
+                tt_isa::noc::niu::MAX_IN_FLIGHT,
+                t.stalls,
+                t.cycles
+            );
+        }
+    }
+
     pub fn into_device(mut self) -> Device<T> {
         let _ = self.sync();
+        for u in 0..self.units.len() {
+            self.check_throttle(u);
+        }
         for u in &mut self.units {
             if let Some(r) = u.resident.take() {
                 let _ = r.stop(&mut self.dev, &self.images);

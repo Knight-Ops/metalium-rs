@@ -57,8 +57,8 @@ Phases 0–9 built the path to the card. The compute that actually runs on it is
 | Unit | What runs there today | Where |
 |---|---|---|
 | **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
-| **B core FP32 unit** | the column sum, small element-wise ops spread over many units, and the reference for every element-wise op; padding fills | `tt_isa::dm::kind`, `dm_b.rs::{compute, col_sum, per_datum, fill_pad}` |
-| **SFPU** | every element-wise op where it is cheaper (`Auto`): `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` | `tt_kernels::sfpu::{ops, kernel}` |
+| **B core** | no arithmetic (2026-10-02): data movement, padding fills (`dm::op::FILL`), transposed and column-broadcast reads, kernel dispatch. The firmware image gate refuses every F-extension instruction | `dm_b.rs` |
+| **SFPU** | every element-wise op: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` (`tt_kernels::kind`) and `kind_sfpu`'s; the sum over rows in Flex's order (`sfpu::reduce::accumulate_in_order`) | `tt_kernels::sfpu::{ops, kernel, reduce}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
 The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
@@ -591,13 +591,13 @@ Each names the measurement it must move. The Burn-side ones are in
       always `Zero`), upload sets `Zero`, and every op implements `OpPadding`
       (`requires(input) -> PadNeed`, `produces(inputs) -> Pad`, from the op's
       algebra: `ADD_ROW` and `MUL_SCALAR` by a non-finite scalar leave
-      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). `COL_SUM` reads
-      only a ragged tensor's valid rows (`record::SUM`'s `last_rows`, the compute
-      entry's new parameter word) and zeroes its result's padding rows, so it
-      needs nothing; the matmul needs `Zero` on both operands, which the session
+      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). The sum over
+      rows reads only a ragged tensor's valid rows (once `COL_SUM` on the mover;
+      on the SFPU since 2026-10-02, `sfpu::reduce::accumulate_in_order`) and
+      zeroes its result's padding rows, so it needs nothing; the matmul needs `Zero` on both operands, which the session
       supplies by `record::FILL_PAD` over the edge tiles only, in place on a
-      tensor that owns its slots and through a bit-exact copy (`kind::COPY`) for a
-      view, so a parent's padding -- and its views' claims -- are never changed by
+      tensor that owns its slots and through a bit-exact copy (`Session::copy`,
+      `READ_RUN` + `WRITE_RUN`; once `kind::COPY`) for a view, so a parent's padding -- and its views' claims -- are never changed by
       a view's fill. MNIST's tensors need no fill (its ragged ones are uploads and
       matmul outputs), so the golden and the 9.5 budget are unchanged. Unit tests:
       the fill touches each edge tile exactly once with the right valid region,
@@ -674,10 +674,11 @@ Each names the measurement it must move. The Burn-side ones are in
       role programs fit a slot (`ADD_ROW`'s unrolled loop gets shorter runs -- found by
       MNIST's evaluation batch on one tile, now `step19::the_longest_runs_fit_and_match_flex`,
       watched failing with code 8 without it). Adding an op is a program in
-      `sfpu::ops` and a gate. `EltwiseUnit::{Auto, Sfpu, Mover}`: `Auto`, the default,
-      picks by `tensor::sfpu_is_cheaper`, a linear cost model per op from
-      `silicon_perf::eltwise_unit_sweep` (measurement Q); `TT_ELTWISE=auto|sfpu|mover`
-      for burn-tt.
+      `sfpu::ops` and a gate. (Retired 2026-10-02: `EltwiseUnit`,
+      `tensor::sfpu_is_cheaper` and `TT_ELTWISE` chose between the SFPU and the
+      mover's FP32 unit by measurement Q's cost model; the mover does no
+      arithmetic now, so every op is the SFPU's, and one with no program is
+      refused.)
 - [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
       register nothing has established is `None`, and reading it is refused), per-lane
       `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
@@ -1255,6 +1256,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
+| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `docs/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.

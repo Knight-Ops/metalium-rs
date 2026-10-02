@@ -130,7 +130,7 @@ fn a_full_program_cache_never_evicts_what_queued_lists_run() {
 /// `@ [128, 10]` -- is the same bits queued as run op by op.
 #[test]
 fn several_lists_per_unit_queued_are_the_unbatched_bits() {
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let m = if cfg!(feature = "silicon") { 1000 } else { 200 };
     let values = |seed: u64, n: usize| -> Vec<f32> {
@@ -298,7 +298,7 @@ fn an_upload_lands_before_the_queued_op_that_reads_it() {
 #[test]
 fn barriers_count_from_zero_whatever_an_earlier_session_left() {
     use tt_device::tlb::WindowKind;
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
     with_tiles(TileChoice::Count(4), |s| {
         s.set_batching(true).unwrap();
         let coordinator = s.tile();

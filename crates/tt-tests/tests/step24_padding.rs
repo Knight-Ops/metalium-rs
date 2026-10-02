@@ -21,7 +21,7 @@
 
 use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
-use tt_isa::dm::kind;
+use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::tensor::{DramTensor, Eltwise, Pad};

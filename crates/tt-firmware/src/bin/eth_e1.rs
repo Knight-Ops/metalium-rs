@@ -8,8 +8,8 @@
 #![no_std]
 #![no_main]
 
-use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::eth::{self, mover};
+use tt_firmware::{cycles, l1_read32, l1_write32, mailbox_word, noc, publish};
+use tt_isa::eth::{self, mover, mover::event};
 use tt_isa::mailbox::offset;
 use tt_isa::noc::niu::{Command, Endpoint, TxnId, MAX_REQUEST_BYTES};
 
@@ -77,6 +77,25 @@ fn noc_copy(me: (u8, u8), tile: (u8, u8, u32), local: u64, len: u32, into_local:
     noc::wait(TXN);
 }
 
+/// Record `event` for `seq` in the trace ring, if the host asked
+/// (`mover::TRACE`) and there is room. Stamped by this core's own counter.
+fn trace(event: u32, seq: u32) {
+    if rd(mover::TRACE) == 0 {
+        return;
+    }
+    let n = rd(mover::TRACE_COUNT);
+    if n >= mover::TRACE_EVENTS {
+        return;
+    }
+    let t = cycles();
+    let at = mover::TRACE_RING + n as u64 * mover::TRACE_RECORD_BYTES;
+    wr(at, event);
+    wr(at + 4, seq);
+    wr(at + 8, t);
+    wr(at + 12, 0);
+    wr(mover::TRACE_COUNT, n + 1);
+}
+
 fn fail(code: u32) -> ! {
     wr(mover::ERROR, code);
     publish();
@@ -84,6 +103,7 @@ fn fail(code: u32) -> ! {
 }
 
 fn send(me: (u8, u8), seq: u32) {
+    trace(event::SEND_PICKUP, seq);
     let len = rd(mover::SEND_LEN);
     if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
         fail(mover::error::LENGTH);
@@ -94,8 +114,10 @@ fn send(me: (u8, u8), seq: u32) {
             fail(mover::error::ALIGNMENT);
         }
         noc_copy(me, (sx as u8, sy as u8, sa), mover::TX_STAGE, len, true);
+        trace(event::NOC_IN_DONE, seq);
     }
     tt_link(mover::TX_STAGE, mover::RX_LAND, len);
+    trace(event::DATA_SENT, seq);
     let record = [
         seq,
         len,
@@ -111,11 +133,13 @@ fn send(me: (u8, u8), seq: u32) {
     }
     publish();
     tt_link(mover::RECORD_STAGE, mover::INBOX, mover::RECORD_BYTES as u32);
+    trace(event::RECORD_SENT, seq);
     wr(mover::SENT, seq);
     publish();
 }
 
 fn receive(me: (u8, u8), seq: u32) {
+    trace(event::RECORD_SEEN, seq);
     let len = rd(mover::INBOX + 4);
     if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
         fail(mover::error::LENGTH);
@@ -133,12 +157,14 @@ fn receive(me: (u8, u8), seq: u32) {
             }
         }
     }
+    trace(event::LANDED, seq);
     let (dx, dy, da) = (rd(mover::INBOX + 8), rd(mover::INBOX + 12), rd(mover::INBOX + 16));
     if dx != mover::NO_TILE {
         if da % 16 != 0 {
             fail(mover::error::ALIGNMENT);
         }
         noc_copy(me, (dx as u8, dy as u8, da), mover::RX_LAND, len, false);
+        trace(event::NOC_OUT_DONE, seq);
     }
     wr(mover::RECEIVED, seq);
     for i in 0..4u64 {
@@ -146,6 +172,7 @@ fn receive(me: (u8, u8), seq: u32) {
     }
     publish();
     tt_link(mover::ACK_STAGE, mover::ACK, 16);
+    trace(event::ACK_SENT, seq);
 }
 
 #[no_mangle]
@@ -171,6 +198,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         }
         let ack = rd(mover::ACK);
         if ack != rd(mover::ACKED) {
+            trace(event::ACK_SEEN, ack);
             wr(mover::ACKED, ack);
         }
     }

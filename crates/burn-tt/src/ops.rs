@@ -161,12 +161,12 @@ fn device_op_ungated(
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
-    use tt_isa::dm::kind as k;
+    use tt_kernels::kind as k;
     let kind = op.kind;
     let device = a.device;
     // Any rank: each operand as the matrix it is stored as
     // (`crate::tensor::stored_dims`), of the element type the kind computes on.
-    let sig = tt_kernels::sfpu::ops::elems(kind)?;
+    let sig = tt_kernels::sfpu::ops::elems(kind);
     let fits = |t: &TtTensor, i: usize| {
         t.is_storable() && t.elem() == sig.inputs.get(i).copied() && t.device == device
     };
@@ -371,7 +371,7 @@ fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
 pub mod float {
     use super::*;
     use burn_backend::Scalar;
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
 
     macro_rules! binary {
         ($name:ident, $kind:expr) => {
@@ -668,7 +668,8 @@ pub mod float {
     }
 
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
-    /// Flex's order (`tt_isa::dm::kind::COL_SUM`). Anything else is Flex's.
+    /// Flex's order (`tt_kernels::sfpu::reduce::accumulate_in_order`).
+    /// Anything else is Flex's.
     pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         use tt_kernels::sfpu::reduce::ReduceOp;
         if let Some(t) = device_reduce(&tensor, ReduceOp::Sum, dim) {
@@ -696,16 +697,17 @@ pub mod float {
     }
 
     /// `tensor` reduced along `dim` on the device, if it is a device-resident
-    /// F32 matrix (not a transposed view): a sum over rows by the mover in
-    /// Flex's order, everything else on the SFPU (`Session::reduce`).
+    /// F32 matrix (not a transposed view), on the SFPU (`Session::reduce`): a
+    /// sum over rows in Flex's order, the rest as `sfpu::reduce` computes them.
     pub(crate) fn device_reduce(
         tensor: &TtTensor,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         dim: usize,
     ) -> Option<TtTensor> {
         use tt_kernels::sfpu::reduce::ReduceOp;
-        // Only the mover's sum over rows gives Flex's bits; the SFPU's sum is
-        // in another order, and its maximum prefers `+0` to `-0`. Those, not
+        // Only the sum over rows gives Flex's bits (it adds in Flex's order);
+        // the sum over columns is in a tree order, and the maximum prefers `+0`
+        // to `-0`. Those, not
         // in exact mode, and not on a tensor too small to pay for themselves.
         if (op, dim) != (ReduceOp::Sum, 0) && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
             return None;
@@ -1190,7 +1192,7 @@ pub mod activation {
     use super::*;
     use burn_backend::ops::ActivationOps;
     use burn_backend::Scalar;
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
 
     /// On the device where the data is, else Flex's.
     pub fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {

@@ -11,45 +11,9 @@ use std::time::{Duration, Instant};
 
 use tt_device::tlb::WindowKind;
 use tt_tests::backend::{open_card, scrub};
+use tt_tests::bench::{mbps, median, on_card, pattern, REPS};
 use tt_tests::harness::{tile, Dev};
 use tt_ttsim::fork_scope;
-
-const REPS: usize = 9;
-
-fn mbps(bytes: usize, t: Duration) -> f64 {
-    bytes as f64 / t.as_secs_f64() / 1e6
-}
-
-fn median(mut v: Vec<Duration>) -> Duration {
-    v.sort();
-    v[v.len() / 2]
-}
-
-fn pattern(len: usize, seed: u32) -> Vec<u8> {
-    let mut s = seed | 1;
-    (0..len)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            s as u8
-        })
-        .collect()
-}
-
-fn on_card(f: impl FnOnce(&mut Dev<'_>)) {
-    let card = std::env::var("TT_SILICON_DEVICE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if let Err(e) = fork_scope(|| {
-        let mut d = open_card(card);
-        f(&mut d);
-        scrub(&mut d);
-    }) {
-        panic!("{e}");
-    }
-}
 
 /// Time `write` then a read-back fence, and `read`, over `REPS`; check the data.
 fn bench(
@@ -375,7 +339,7 @@ fn many_tiles_sweep() {
                     .eltwise(
                         Eltwise {
                             scalar2: 0.0,
-                            kind: tt_isa::dm::kind::ADD,
+                            kind: tt_kernels::kind::ADD,
                             scalar: 0.0,
                         },
                         &x,
@@ -465,72 +429,6 @@ fn session_open_breakdown() {
         scrub(&mut dev);
     }) {
         panic!("{e}");
-    }
-}
-
-/// Element-wise on the SFPU against the data mover's FP32 unit: one op's wall
-/// time, by tiles per unit, on 1 and 8 units -- the measurement that decides
-/// when a run goes to the SFPU (`tt_kernels::tensor::EltwiseUnit`). Each
-/// figure the median of seven after a warm-up; also the PCIe writes per op.
-#[test]
-#[ignore = "benchmark"]
-fn eltwise_unit_sweep() {
-    use tt_isa::dm::kind;
-    use tt_kernels::session::{Session, TileChoice};
-    use tt_kernels::tensor::{Eltwise, EltwiseUnit};
-    let card = std::env::var("TT_SILICON_DEVICE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    for units in [1, 8] {
-        if let Err(e) = fork_scope(|| {
-            let mut s =
-                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(units))
-                    .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
-            for per_unit in [1, 2, 4, 8, 16, 32, 64] {
-                let tiles = per_unit * units;
-                let (r, c) = (32 * tiles, 32);
-                let x = s.upload(&pattern_f32(r * c, 3), r, c).unwrap();
-                let y = s.upload(&pattern_f32(r * c, 4), r, c).unwrap();
-                let mut line = format!("{units} units, {per_unit:>2} tiles/unit:");
-                for unit in [EltwiseUnit::Mover, EltwiseUnit::Sfpu] {
-                    s.set_eltwise_unit(unit);
-                    for (name, k) in [("add", kind::ADD), ("relu", kind::RELU)] {
-                        let op = Eltwise {
-                            scalar2: 0.0,
-                            kind: k,
-                            scalar: 0.0,
-                        };
-                        let other = (k == kind::ADD).then_some(&y);
-                        let o = s.eltwise(op, &x, other).unwrap();
-                        s.free(o).unwrap();
-                        let mut v = Vec::new();
-                        let mut writes = 0;
-                        for _ in 0..7 {
-                            let before = s.device().traffic();
-                            let t = Instant::now();
-                            let o = s.eltwise(op, &x, other).unwrap();
-                            // Queued since X4c: timed to its completion.
-                            s.sync().unwrap();
-                            v.push(t.elapsed());
-                            writes = (s.device().traffic() - before).bytes_written;
-                            s.free(o).unwrap();
-                        }
-                        let med = median(v);
-                        line += &format!(
-                            "  {unit:?} {name} {:>7.1} us ({writes} B)",
-                            med.as_secs_f64() * 1e6
-                        );
-                    }
-                }
-                println!("{line}");
-                s.free(x).unwrap();
-                s.free(y).unwrap();
-            }
-        }) {
-            panic!("{e}");
-        }
     }
 }
 
@@ -715,7 +613,7 @@ fn softmax_parts() {
             s.reduce(&x, ReduceOp::Max, Axis::Cols).unwrap()
         });
         time("sub col", &mut s, &|s| {
-            s.eltwise(e(tt_isa::dm::kind::SUB), &x, Some(&col)).unwrap()
+            s.eltwise(e(tt_kernels::kind::SUB), &x, Some(&col)).unwrap()
         });
         time("exp", &mut s, &|s| {
             s.eltwise(e(kind_sfpu::EXP), &x, None).unwrap()
@@ -727,7 +625,7 @@ fn softmax_parts() {
             s.eltwise(e(kind_sfpu::DIV), &x, Some(&col)).unwrap()
         });
         time("mul (ref)", &mut s, &|s| {
-            s.eltwise(e(tt_isa::dm::kind::MUL), &x, Some(&x)).unwrap()
+            s.eltwise(e(tt_kernels::kind::MUL), &x, Some(&x)).unwrap()
         });
     }) {
         panic!("{e}");

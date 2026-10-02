@@ -40,6 +40,7 @@ build that depends on it. `rust-toolchain.toml` requests the
 | End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole Burn training runs on ttsim, held to `crates/tt-tests/tests/golden/mnist_reduced.txt`. Run when the arithmetic changes; CI runs it on every push. |
 | Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs. |
 | Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`, which implies `e2e`). |
+| Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current baseline is [`docs/firmware-performance.md`](docs/firmware-performance.md). |
 
 `cargo xtask silicon --help` lists the options (`--device N|all`, `--filter`,
 `--keep-going`, `--timeout-secs`, `--include-ignored`, `--list`). See

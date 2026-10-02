@@ -18,7 +18,7 @@
 
 use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
-use tt_isa::dm::kind;
+use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::tensor::Eltwise;
@@ -155,11 +155,13 @@ fn eltwise_runs_share_a_list() {
     });
 }
 
-/// A column sum over 7000 rows was 878 entries -- two lists, and a host
-/// round trip each. As one op record (`tt_isa::dm::record::SUM`) it is one
-/// list of five entries, expanded on the tile, and its rows still add in order.
+/// A column sum over 7000 rows -- 219 row tiles, too many for one SFPU run --
+/// is done in chunks, each starting from the last's sums
+/// (`sfpu::reduce::ROW_CHUNK`), all one job on the tile: two host round trips,
+/// against the 878-entry pair of lists it once was, and its rows still add in
+/// Flex's order to the bit.
 #[test]
-fn a_long_column_sum_is_one_list() {
+fn a_long_column_sum_is_one_job_in_flex_order() {
     with_tiles(1, |s| {
         let (r, c) = (7000, 40);
         let av = floats(5, r * c);
@@ -174,7 +176,7 @@ fn a_long_column_sum_is_one_list() {
         let per_tile = lists(s, Session::lists_per_tile, |s| {
             out = Some(s.sum_rows(&a).unwrap_or_else(|e| panic!("{e}")));
         });
-        assert_eq!(per_tile, vec![1], "lists");
         assert_bits(&s.download(&out.unwrap()).unwrap(), &want, "sum");
+        assert!(per_tile.iter().all(|&l| l <= 2), "lists: {per_tile:?}");
     });
 }

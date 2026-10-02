@@ -1095,6 +1095,11 @@ GDDR6; the dataset and weights are loaded into it once at startup, and a
 steady-state training step should move almost nothing over PCIe. The headline
 metric is therefore **PCIe bytes per step** (`Device::traffic`), next to ms/step.
 
+**Baseline (2026-10-02):** [`firmware-performance.md`](firmware-performance.md) has the
+firmware's device-timed numbers from `cargo xtask bench`: GDDR6 through the
+mover, the B -> T0/T1/T2 path hop by hop, and both Ethernet links, each held
+against the spec's peak. It also ranks where the overhead is.
+
 **Rules for every slice.** ttsim is the correctness gate (bit for bit against the
 golden and `burn-flex`), because pipelined kernels are where correctness is hardest;
 every performance number comes from silicon, since ttsim is not cycle-accurate; and

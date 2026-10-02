@@ -65,6 +65,16 @@ impl std::error::Error for LinkError {}
 
 pub type Result<T> = std::result::Result<T, LinkError>;
 
+/// One step an E1 mover recorded ([`mover::event`]), for send or record
+/// `seq`, at `cycles` of that E1's own 32-bit counter -- which wraps, so
+/// spans are `b.cycles.wrapping_sub(a.cycles)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EthEvent {
+    pub event: u32,
+    pub seq: u32,
+    pub cycles: u32,
+}
+
 /// A cabled pair: `a` is a tile of the first chip, `b` of the second.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Link {
@@ -249,6 +259,35 @@ impl Mover {
         dst: Dest,
         len: u32,
     ) -> Result<()> {
+        let seq = self.post(d, w, dir, src, dst, len)?;
+        self.wait(d, w, dir, seq)
+    }
+
+    /// [`Mover::wait`] for `seq`, the last [`Mover::post`] in `dir`.
+    pub fn wait<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        dir: Dir,
+        seq: u32,
+    ) -> Result<()> {
+        self.wait_acked(d, w, self.end(dir).0, seq)
+    }
+
+    /// The first half of [`Mover::send`]: hand the sender its descriptor and
+    /// return the sequence number to [`Mover::wait`] for, without waiting.
+    /// The sender takes one transfer at a time: wait for this one before the
+    /// next post in the same direction. Between the two, the host is free to
+    /// post on another link, or the other direction.
+    pub fn post<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        dir: Dir,
+        src: Source,
+        dst: Dest,
+        len: u32,
+    ) -> Result<u32> {
         if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
             return Err(LinkError::Invalid(
                 "length must be a nonzero multiple of 16, at most MAX_LEN",
@@ -283,7 +322,65 @@ impl Mover {
         ] {
             d.write32(w, c, addr, v)?;
         }
-        self.wait_acked(d, w, tile, seq)
+        Ok(seq)
+    }
+
+    /// Start or stop recording at `end` ([`mover::TRACE`]), emptying its
+    /// ring. Only between sends: the mover appends while it works.
+    ///
+    /// Refused on the simulator, which does not model the cycle counter the
+    /// mover stamps events with (divergence row 71).
+    pub fn set_trace<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        end: EthTile,
+        on: bool,
+    ) -> Result<()> {
+        if on && d.transport().is_simulated() {
+            return Err(LinkError::Invalid(
+                "ttsim does not model E1's cycle counter (divergence row 71): tracing is silicon-only",
+            ));
+        }
+        let c = end.coord();
+        d.write32(w, c, mover::TRACE_COUNT, 0)?;
+        d.write32(w, c, mover::TRACE, u32::from(on))?;
+        // Posted: read back so the next send finds the ring empty.
+        let _ = d.read32(w, c, mover::TRACE)?;
+        Ok(())
+    }
+
+    /// What `end` recorded since [`Mover::set_trace`] or the last take, in
+    /// order, and empty its ring. Refuses a ring that filled, rather than
+    /// returning the part that fitted as all of it.
+    pub fn take_trace<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        end: EthTile,
+    ) -> Result<Vec<EthEvent>> {
+        let c = end.coord();
+        let n = d.read32(w, c, mover::TRACE_COUNT)?;
+        if n >= mover::TRACE_EVENTS {
+            return Err(LinkError::Invalid(
+                "the E1 trace ring filled; events were dropped",
+            ));
+        }
+        let mut bytes = vec![0u8; n as usize * mover::TRACE_RECORD_BYTES as usize];
+        d.eth_read(w, end, mover::TRACE_RING, &mut bytes)?;
+        d.write32(w, c, mover::TRACE_COUNT, 0)?;
+        let _ = d.read32(w, c, mover::TRACE_COUNT)?;
+        Ok(bytes
+            .chunks_exact(mover::TRACE_RECORD_BYTES as usize)
+            .map(|r| {
+                let word = |i: usize| u32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]);
+                EthEvent {
+                    event: word(0),
+                    seq: word(4),
+                    cycles: word(8),
+                }
+            })
+            .collect())
     }
 
     fn wait_acked<T: Transport>(

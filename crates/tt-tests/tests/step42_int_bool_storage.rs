@@ -123,7 +123,7 @@ fn ops_that_compute_in_fp32_refuse_integers_and_booleans() {
             Err(e) => panic!("{what}: refused, but not by type: {e}"),
             Ok(_) => panic!("{what}: computed on integers"),
         };
-        for kind in [tt_isa::dm::kind::ADD, tt_isa::dm::kind::MUL, kind_sfpu::DIV] {
+        for kind in [tt_kernels::kind::ADD, tt_kernels::kind::MUL, kind_sfpu::DIV] {
             let op = Eltwise {
                 scalar2: 0.0,
                 kind,
@@ -132,7 +132,7 @@ fn ops_that_compute_in_fp32_refuse_integers_and_booleans() {
             refused(s.eltwise(op, &i, Some(&i)).map(|_| ()), "an integer add");
             refused(s.eltwise(op, &f, Some(&b)).map(|_| ()), "FP32 with a Bool");
         }
-        for kind in [tt_isa::dm::kind::RELU, kind_sfpu::EXP] {
+        for kind in [tt_kernels::kind::RELU, kind_sfpu::EXP] {
             refused(
                 s.eltwise(
                     Eltwise {
@@ -174,13 +174,8 @@ fn ops_that_compute_in_fp32_refuse_integers_and_booleans() {
             Err(TensorError::Shape(m)) => assert!(m.contains("not 0 or 1"), "{m}"),
             r => panic!("a Bool of 2: {r:?}"),
         }
-        // `COPY` moves datums: an integer comes through it whole.
-        let copy = Eltwise {
-            scalar2: 0.0,
-            kind: tt_isa::dm::kind::COPY,
-            scalar: 0.0,
-        };
-        let c = s.eltwise(copy, &i, None).unwrap();
+        // A copy moves datums: an integer comes through it whole.
+        let c = s.copy(&i).unwrap();
         assert_eq!(c.elem, Elem::I32);
         assert_eq!(s.download_bits(&c).unwrap(), s.download_bits(&i).unwrap());
     });

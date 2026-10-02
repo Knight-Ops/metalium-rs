@@ -1,18 +1,17 @@
 //! Phase 9 gate: element-wise ops on tensors in GDDR, against `burn-flex`.
 //!
-//! Since Phase 10 (S1) they run on the SFPU (`tt_kernels::sfpu::ops`), and the
-//! data mover's FP32 unit (`tt_isa::dm::kind`) stays as the reference: every
-//! kind is checked on both. The claim is Flex's result bit for bit, which is what
-//! keeps a training run's loss curve on the golden: `fadd.s`/`fsub.s`/`fmul.s`
-//! round to nearest even, so they differ from IEEE only where an operand or
-//! result is denormal, which the operands here avoid -- and one test records
-//! that difference rather than pretending it away.
+//! They run on the SFPU (`tt_kernels::sfpu::ops`, the ops `tt_kernels::kind`
+//! names); the data mover does no arithmetic. The claim is Flex's result bit for
+//! bit, which is what keeps a training run's loss curve on the golden: the
+//! SFPU's adds and multiplies round to nearest even, so they differ from IEEE
+//! only where an operand or result is denormal, which the operands here avoid --
+//! and one test records that difference rather than pretending it away.
 
 use burn::tensor::{activation, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
-use tt_isa::dm::kind;
+use tt_kernels::kind;
 use tt_kernels::session::{Session, TileChoice};
-use tt_kernels::tensor::{Eltwise, EltwiseUnit};
+use tt_kernels::tensor::Eltwise;
 use tt_tests::backend::GATE_TILE;
 use tt_ttsim::fork_scope;
 
@@ -119,10 +118,7 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
 #[test]
 fn every_kind_matches_flex_bit_for_bit() {
     with_session(|s| {
-        // On the SFPU (the default) and on the mover's FP32 unit, which stays
-        // as the reference: the same bits from both.
-        for unit in [EltwiseUnit::Sfpu, EltwiseUnit::Mover] {
-            s.set_eltwise_unit(unit);
+        {
             // Ragged, more tiles than one mover list holds, and MNIST's own.
             for [r, c] in [[37, 70], [64, 128], [784, 128]] {
                 let (av, bv) = (edgy(r as u64, r * c), edgy(c as u64 + 99, r * c));
@@ -200,7 +196,7 @@ fn every_kind_matches_flex_bit_for_bit() {
                         .eltwise(op, &a, other)
                         .unwrap_or_else(|e| panic!("{label}: {e}"));
                     let got = s.download(&out).unwrap();
-                    assert_same(&got, &want, &format!("{unit:?} [{r}, {c}] {label}"));
+                    assert_same(&got, &want, &format!("[{r}, {c}] {label}"));
                     s.free(out).unwrap();
                 }
                 for t in [a, b, bias] {
@@ -231,7 +227,7 @@ fn a_denormal_result_is_flushed() {
 }
 
 /// The sum over rows, against Flex's `sum_dim(0)` bit for bit: the order of
-/// the additions is the point (`tt_isa::dm::kind::COL_SUM`). A column taller
+/// the additions is the point (`tt_kernels::kind::COL_SUM`). A column taller
 /// than one mover list (MNIST's 60 000 rows are 1875 tiles) is included.
 #[test]
 fn the_sum_over_rows_matches_flex_bit_for_bit() {

@@ -68,6 +68,7 @@ extern "Rust" {
 /// Called exactly once, from `_start`, with a valid stack.
 #[no_mangle]
 unsafe extern "C" fn main_trampoline() -> ! {
+    noc::reset();
     set_status(status::RUNNING);
     unsafe { firmware_main() }
 }
@@ -143,6 +144,22 @@ pub fn fail(code: u32) -> ! {
     }
     publish();
     spin()
+}
+
+/// The low 32 bits of this core's own cycle counter (`mcycle`,
+/// `TensixTile/BabyRISCV/CSRs.md:23`; every baby core has it, Ethernet's
+/// included, `EthernetTile/BabyRISCV/README.md:18`).
+/// For a core with no timestamper -- an Ethernet tile has none -- this is its
+/// only clock. 32 bits wrap every ~3.2 s at 1.35 GHz, far longer than anything
+/// it times: take differences with `wrapping_sub`. ttsim models none of the
+/// counter CSRs and treats a read as fatal (divergence row 71), so only call
+/// this where the host has said it is on silicon.
+pub fn cycles() -> u32 {
+    let lo: u32;
+    // SAFETY: a CSR read, no side effects. By number, so the assembler needs
+    // no Zicntr feature to accept it.
+    unsafe { core::arch::asm!("csrr {lo}, 0xb00", lo = out(reg) lo, options(nomem, nostack)) };
+    lo
 }
 
 /// Halt without halting the core.
@@ -438,7 +455,7 @@ pub mod cfg {
 /// Issuing NoC requests from this core, through NIU #0's request initiator 0.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{self, initiator, Command, RequestError, TxnId};
+    use tt_isa::noc::niu::{self, initiator, Command, InFlight, RequestError, TxnId};
 
     const INIT: u64 = niu::NOC0_BASE;
 
@@ -446,14 +463,99 @@ pub mod noc {
         (INIT + off) as *mut u32
     }
 
+    /// Each transaction ID's requests in flight, kept under its cap so the
+    /// 8-bit counter `wait` reads cannot wrap (`tt_isa::noc::niu::InFlight`),
+    /// and what the cap has cost. In local data RAM (`sections.x`, `.local`):
+    /// touched on every issue and every wait, and a load there is 2 cycles
+    /// (`BabyRISCV/README.md:147`). Written by `reset` before `firmware_main`,
+    /// since ttsim does not zero the RAM on reset release (divergence row 25).
+    #[link_section = ".local"]
+    static mut IN_FLIGHT: [InFlight; 16] = [InFlight::new(); 16];
+    #[link_section = ".local"]
+    static mut STALLS: Stalls = Stalls { count: 0, cycles: 0, clock: None };
+
+    /// Requests that waited for room under their ID's cap, and the cycles
+    /// they waited by the image's clock (`set_clock`; 0 without one).
+    #[derive(Copy, Clone, Debug)]
+    pub struct Stalls {
+        pub count: u32,
+        pub cycles: u32,
+        clock: Option<fn() -> u32>,
+    }
+
+    fn in_flight(txn: TxnId) -> &'static mut InFlight {
+        // SAFETY: one core runs this firmware, with no interrupts, and every
+        // reference made here is dropped before the next is made; the index is
+        // `< 16` by `TxnId`'s construction.
+        unsafe { &mut *core::ptr::addr_of_mut!(IN_FLIGHT[txn.index()]) }
+    }
+
+    fn stalls_mut() -> &'static mut Stalls {
+        // SAFETY: as `in_flight`.
+        unsafe { &mut *core::ptr::addr_of_mut!(STALLS) }
+    }
+
+    /// Every ID at no requests in flight and the default cap; no stalls, no
+    /// clock. Called once, before `firmware_main`.
+    pub(crate) fn reset() {
+        // SAFETY: as `in_flight`; nothing else runs yet.
+        unsafe { core::ptr::addr_of_mut!(IN_FLIGHT).write([InFlight::new(); 16]) };
+        *stalls_mut() = Stalls { count: 0, cycles: 0, clock: None };
+    }
+
+    /// Time waits for room with `clock` from now on: a core with a usable
+    /// counter (RISCV B: the tile's `WALL_CLOCK_L`). Without one, waits are
+    /// counted but not timed.
+    pub fn set_clock(clock: fn() -> u32) {
+        stalls_mut().clock = Some(clock);
+    }
+
+    /// What the in-flight caps have cost since `reset`, over every ID.
+    pub fn stalls() -> Stalls {
+        *stalls_mut()
+    }
+
+    fn outstanding(txn: TxnId) -> u8 {
+        // SAFETY: a read-only NIU counter.
+        unsafe { read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) as u8 }
+    }
+
+    /// Use in-flight cap `cap` for `txn` from now on: 0 for
+    /// `niu::MAX_IN_FLIGHT`, otherwise clamped to `1..=MAX_IN_FLIGHT`.
+    pub fn set_cap(txn: TxnId, cap: u32) {
+        in_flight(txn).set_cap(cap);
+    }
+
+    /// `issue` at `txn`'s cap: poll its counter until there is room, and
+    /// count the wait if there was one. Out of line, so the issue path RISCV
+    /// B's 2 KiB instruction cache holds is only the compare that decides to
+    /// come here.
+    #[cold]
+    #[inline(never)]
+    fn make_room(txn: TxnId) {
+        let st = stalls_mut();
+        let t0 = st.clock.map_or(0, |c| c());
+        if in_flight(txn).before_issue(|| outstanding(txn)) != 0 {
+            st.count = st.count.wrapping_add(1);
+            if let Some(c) = st.clock {
+                st.cycles = st.cycles.wrapping_add(c().wrapping_sub(t0));
+            }
+        }
+    }
+
     /// Issue `cmd` from this tile, at raw coordinate `me`, under `txn`.
     ///
-    /// Waits for the initiator to be free first (`MemoryMap.md`, `NOC_CMD_CTRL`:
-    /// software must not touch it while the low bit reads 1), and reads
-    /// `CMD_CTRL` back afterwards so a later counter read cannot overtake the
-    /// issue (`Counters.md:42-43`).
+    /// First makes room under `txn`'s in-flight cap: below it, nothing is
+    /// read; at it, the counter is polled until a request completes (counted
+    /// in `stalls`). Then waits for the initiator to be free (`MemoryMap.md`,
+    /// `NOC_CMD_CTRL`: software must not touch it while the low bit reads 1),
+    /// and reads `CMD_CTRL` back afterwards so a later counter read cannot
+    /// overtake the issue (`Counters.md:42-43`).
     pub fn issue(cmd: &Command, me: (u8, u8), txn: TxnId) -> Result<(), RequestError> {
         let regs = cmd.registers(me, txn)?;
+        if in_flight(txn).at_cap() {
+            make_room(txn);
+        }
         // SAFETY: NIU #0's initiator registers are MMIO in every Tensix and
         // Ethernet tile, and these offsets are inside initiator 0.
         unsafe {
@@ -464,152 +566,17 @@ pub mod noc {
             write_volatile(reg(initiator::CMD_CTRL), 1);
             let _ = read_volatile(reg(initiator::CMD_CTRL));
         }
+        in_flight(txn).after_issue();
         Ok(())
     }
 
     /// Wait until every response-marked request issued under `txn` has
-    /// completed.
+    /// completed. Exact, because `issue` never lets more than the cap be in
+    /// flight. It leaves the ID's room as it was: too small now, which costs
+    /// the next issue at the cap one counter read, and keeps this loop the
+    /// same as before there was a cap.
     pub fn wait(txn: TxnId) {
         // SAFETY: a read-only NIU counter.
         unsafe { while read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) & 0xFF != 0 {} }
-    }
-}
-
-/// FP32 arithmetic on the baby RISC-V's own floating-point unit, on bit
-/// patterns.
-///
-/// The firmware is built for `riscv32im`, so the compiler emits no floating
-/// point at all; these reach `fadd.s`/`fsub.s`/`fmul.s` through inline assembly
-/// that enables `F` for its own few instructions. The compiler neither
-/// allocates nor saves `f` registers, so the `ft0`/`ft1` these use are free.
-/// Round to nearest even always, denormals flushed
-/// (`BabyRISCV/InstructionSet.md:18-22`): the IEEE result wherever operands
-/// and result are normal. `fmadd.s` and its family are deliberately absent, and
-/// the instruction gate in `tt-firmware-images/build.rs` refuses them.
-pub mod float {
-    macro_rules! binary {
-        ($name:ident, $insn:literal) => {
-            #[inline(always)]
-            pub fn $name(a: u32, b: u32) -> u32 {
-                let out: u32;
-                // SAFETY: register-to-register moves and one arithmetic
-                // instruction on the two scratch `f` registers; no memory.
-                unsafe {
-                    core::arch::asm!(
-                        ".option push",
-                        ".option arch, +f",
-                        "fmv.w.x ft0, {a}",
-                        "fmv.w.x ft1, {b}",
-                        concat!($insn, " ft0, ft0, ft1"),
-                        "fmv.x.w {out}, ft0",
-                        ".option pop",
-                        a = in(reg) a,
-                        b = in(reg) b,
-                        out = lateout(reg) out,
-                        options(nomem, nostack, pure),
-                    );
-                }
-                out
-            }
-        };
-    }
-    binary!(add, "fadd.s");
-    binary!(sub, "fsub.s");
-    binary!(mul, "fmul.s");
-
-    macro_rules! over {
-        ($name:ident, $insn:literal) => {
-            /// `dst[i] = a[i] (op) b[i]` for `n` words, four at a time, straight
-            /// through the `f` registers.
-            ///
-            /// # Safety
-            /// `dst`, `a`, `b` are word-aligned and valid for `n` words; `n` is
-            /// a multiple of four. `dst` may equal `a` or `b`.
-            #[inline(never)]
-            pub unsafe fn $name(dst: *mut u32, a: *const u32, b: *const u32, n: usize) {
-                // SAFETY: the caller's contract; every access is inside the
-                // three ranges, and only the scratch `f` registers are used.
-                unsafe {
-                    core::arch::asm!(
-                        ".option push",
-                        ".option arch, +f",
-                        "2:",
-                        "beqz {n}, 3f",
-                        "flw ft0, 0({a})",
-                        "flw ft1, 0({b})",
-                        "flw ft2, 4({a})",
-                        "flw ft3, 4({b})",
-                        "flw ft4, 8({a})",
-                        "flw ft5, 8({b})",
-                        "flw ft6, 12({a})",
-                        "flw ft7, 12({b})",
-                        concat!($insn, " ft0, ft0, ft1"),
-                        concat!($insn, " ft2, ft2, ft3"),
-                        concat!($insn, " ft4, ft4, ft5"),
-                        concat!($insn, " ft6, ft6, ft7"),
-                        "fsw ft0, 0({d})",
-                        "fsw ft2, 4({d})",
-                        "fsw ft4, 8({d})",
-                        "fsw ft6, 12({d})",
-                        "addi {a}, {a}, 16",
-                        "addi {b}, {b}, 16",
-                        "addi {d}, {d}, 16",
-                        "addi {n}, {n}, -4",
-                        "j 2b",
-                        "3:",
-                        ".option pop",
-                        a = inout(reg) a => _,
-                        b = inout(reg) b => _,
-                        d = inout(reg) dst => _,
-                        n = inout(reg) n => _,
-                        options(nostack),
-                    );
-                }
-            }
-        };
-    }
-    over!(add_n, "fadd.s");
-    over!(sub_n, "fsub.s");
-    over!(mul_n, "fmul.s");
-
-    /// `dst[i] = a[i] * s` for `n` words, four at a time.
-    ///
-    /// # Safety
-    /// As [`add_n`].
-    #[inline(never)]
-    pub unsafe fn mul_scalar_n(dst: *mut u32, a: *const u32, s: u32, n: usize) {
-        // SAFETY: as `add_n`.
-        unsafe {
-            core::arch::asm!(
-                ".option push",
-                ".option arch, +f",
-                "fmv.w.x ft7, {s}",
-                "2:",
-                "beqz {n}, 3f",
-                "flw ft0, 0({a})",
-                "flw ft1, 4({a})",
-                "flw ft2, 8({a})",
-                "flw ft3, 12({a})",
-                "fmul.s ft0, ft0, ft7",
-                "fmul.s ft1, ft1, ft7",
-                "fmul.s ft2, ft2, ft7",
-                "fmul.s ft3, ft3, ft7",
-                "fsw ft0, 0({d})",
-                "fsw ft1, 4({d})",
-                "fsw ft2, 8({d})",
-                "fsw ft3, 12({d})",
-                "addi {a}, {a}, 16",
-                "addi {d}, {d}, 16",
-                "addi {n}, {n}, -4",
-                "j 2b",
-                "3:",
-                ".option pop",
-                a = inout(reg) a => _,
-                d = inout(reg) dst => _,
-                n = inout(reg) n => _,
-                s = in(reg) s,
-                options(nostack),
-            );
-        }
     }
 }

@@ -52,7 +52,7 @@ fn profiling_is_refused_on_the_simulator_and_the_session_carries_on() {
         let a = s.upload(&v, 64, 64).unwrap();
         let k = Eltwise {
             scalar2: 0.0,
-            kind: tt_isa::dm::kind::MUL_SCALAR,
+            kind: tt_kernels::kind::MUL_SCALAR,
             scalar: 2.0,
         };
         let b = s.eltwise(k, &a, None).unwrap();
@@ -91,7 +91,7 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
         s.profile_start().unwrap();
         let add = Eltwise {
             scalar2: 0.0,
-            kind: tt_isa::dm::kind::ADD,
+            kind: tt_kernels::kind::ADD,
             scalar: 0.0,
         };
         let sum = s.eltwise(add, &a, Some(&a)).unwrap();
@@ -128,7 +128,12 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
             for k in spans.iter().filter(|s| s.name == "kernel") {
                 kernels += 1;
                 for t in ["T0", "T1", "T2"] {
-                    let runs: Vec<_> = spans.iter().filter(|s| s.track == t && in_(k, s)).collect();
+                    // A program span per run; a resident role's wake and
+                    // acknowledgement spans sit either side of it.
+                    let runs: Vec<_> = spans
+                        .iter()
+                        .filter(|s| s.track == t && s.name == "program" && in_(k, s))
+                        .collect();
                     assert_eq!(runs.len(), 1, "{t}: one run inside each KERNEL entry");
                 }
             }
@@ -142,7 +147,10 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
                     e.name
                 );
             }
-            let roles = spans.iter().filter(|s| s.track != "mover").count();
+            let roles = spans
+                .iter()
+                .filter(|s| s.track != "mover" && s.name == "program")
+                .count();
             let ks = spans.iter().filter(|s| s.name == "kernel").count();
             assert_eq!(roles, 3 * ks, "every role run belongs to a KERNEL entry");
         }
@@ -174,7 +182,7 @@ fn a_profile_outlives_the_event_buffer() {
         let a = s.upload(&floats(3, 64 * 64), 64, 64).unwrap();
         let relu = Eltwise {
             scalar2: 0.0,
-            kind: tt_isa::dm::kind::RELU,
+            kind: tt_kernels::kind::RELU,
             scalar: 0.0,
         };
         s.profile_start().unwrap();

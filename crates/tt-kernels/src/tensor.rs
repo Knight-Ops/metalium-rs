@@ -910,22 +910,15 @@ fn staging(name: &'static str, slots: usize) -> Result<u64> {
     Ok(plan.addr(b))
 }
 
-/// What [`eltwise`] computes: a `tt_isa::dm::kind`, its scalar where it takes
-/// one, and whether `b` is a single row broadcast down `a`.
+/// What an element-wise op ([`sfpu_eltwise`]) computes: a `crate::kind` or
+/// `sfpu::ops::kind_sfpu` op, and its scalar where it takes one.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Eltwise {
     pub kind: u32,
     pub scalar: f32,
     /// A second immediate, for the kinds that take two (`CLAMP`'s bounds,
-    /// `HARD_SIGMOID`'s slope and offset); `0.0` for the rest. SFPU only: the
-    /// mover's record carries one.
+    /// `HARD_SIGMOID`'s slope and offset); `0.0` for the rest.
     pub scalar2: f32,
-}
-
-/// The shapes an element-wise op accepts: `B` where the kind takes one, `A`'s
-/// shape or, for `ADD_ROW`, one row as wide.
-fn check_eltwise(op: Eltwise, a: &DramTensor, b: Option<&DramTensor>) -> Result<()> {
-    broadcast_of(op, a, b).map(|_| ())
 }
 
 /// What an element-wise op is once its operands' shapes are read: its kind
@@ -938,23 +931,17 @@ pub fn broadcast_of(
     a: &DramTensor,
     b: Option<&DramTensor>,
 ) -> Result<(u32, crate::sfpu::ops::Broadcast)> {
+    use crate::kind;
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::{broadcasts, Broadcast};
-    use tt_isa::dm::kind;
     let name = || format!("element-wise op {:#x}", op.kind);
-    // `None`: a kind that moves datums, whatever they are.
-    if let Some(sig) = crate::sfpu::ops::elems(op.kind) {
-        a.expect(&name(), sig.inputs[0])?;
-        if let (Some(b), Some(&want)) = (b, sig.inputs.get(1)) {
-            b.expect(&name(), want)?;
-        }
+    let sig = crate::sfpu::ops::elems(op.kind);
+    a.expect(&name(), sig.inputs[0])?;
+    if let (Some(b), Some(&want)) = (b, sig.inputs.get(1)) {
+        b.expect(&name(), want)?;
     }
     let binary = match crate::sfpu::ops::operands(op.kind) {
         Some(o) => o != Operands::Unary,
-        None if crate::sfpu::ops::mover_has(op.kind) => !matches!(
-            op.kind,
-            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
-        ),
         None => {
             return Err(TensorError::Shape(format!(
                 "no element-wise op {:#x}",
@@ -990,128 +977,13 @@ pub fn broadcast_of(
     }
 }
 
-/// The element type `kind`'s output has, given its first operand.
-fn output_elem(kind: u32, a: &DramTensor) -> Elem {
-    crate::sfpu::ops::elems(kind).map_or(a.elem, |sig| sig.out)
+/// The element type `kind`'s output has.
+fn output_elem(kind: u32) -> Elem {
+    crate::sfpu::ops::elems(kind).out
 }
 
-/// Element-wise `a (op) b` -- or `a (op) scalar` -- with everything in GDDR,
-/// computed tile by tile by the data mover's FP32 unit in L1
-/// (`tt_isa::dm::kind`). For `ADD_ROW`, `b` is `[1, cols]` and its row is
-/// added to every row of `a`; otherwise `b`, where the kind takes one, has
-/// `a`'s shape.
-///
-/// Tiles are independent, so they are dealt out in contiguous runs, one
-/// [`Job`] each, as many runs as there are `units` (but never more tiles per
-/// list than the staging area holds).
-pub fn eltwise(
-    alloc: &mut DramAlloc,
-    op: Eltwise,
-    a: &DramTensor,
-    b: Option<&DramTensor>,
-    units: usize,
-) -> Result<Work> {
-    use tt_isa::dm::kind;
-    check_eltwise(op, a, b)?;
-    let binary = !matches!(
-        op.kind,
-        kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
-    );
-    let row = op.kind == kind::ADD_ROW;
-    match (binary, b) {
-        (false, _) => {}
-        (true, None) => return Err(TensorError::Shape("a binary op needs two operands".into())),
-        (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => {
-            return Err(TensorError::Shape(format!(
-                "[{}, {}] + row [{}, {}]",
-                a.rows, a.cols, b.rows, b.cols
-            )))
-        }
-        (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
-            return Err(TensorError::Shape(format!(
-                "[{}, {}] and [{}, {}] differ",
-                a.rows, a.cols, b.rows, b.cols
-            )))
-        }
-        _ => {}
-    }
-    // Two slots per tile of a run in flight, as one buffer the mover owns.
-    const GROUP: usize = 96;
-    let stage = staging("eltwise slots", 2 * GROUP)?;
-    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind, a))?;
-    let [rt, ct] = a.grid();
-    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
-    let rb = b
-        .filter(|_| binary)
-        .map_or(TensorRef::default(), DramTensor::tensor_ref);
-    let flags = u32::from(binary) | u32::from(row) << 1;
-    let mut jobs = Vec::new();
-    for run in runs(rt * ct, units, GROUP) {
-        let record = [
-            [
-                record::ELTWISE,
-                op.kind,
-                op.scalar.to_bits(),
-                run.start as u32,
-                run.len() as u32,
-                flags,
-                stage as u32,
-                0,
-            ],
-            ra.encode()[0],
-            ra.encode()[1],
-            rb.encode()[0],
-            rb.encode()[1],
-            ro.encode()[0],
-            ro.encode()[1],
-        ];
-        jobs.push(vec![Step::List {
-            what: "eltwise list",
-            entries: record.to_vec(),
-        }]);
-    }
-    Ok(Work { out, jobs })
-}
-
-/// Which unit computes an element-wise op. Both give the same bits
-/// (`step19_eltwise`); they differ in cost.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub enum EltwiseUnit {
-    /// The data mover's FP32 unit, datum by datum (`tt_isa::dm::kind`).
-    Mover,
-    /// The SFPU, through `crate::sfpu::kernel` -- where the op has a program
-    /// (`crate::sfpu::ops`); the mover otherwise.
-    Sfpu,
-    /// Whichever [`sfpu_is_cheaper`] predicts is faster for the op's size.
-    #[default]
-    Auto,
-}
-
-/// Does the SFPU finish `kind` over `tiles` tiles on `units` units sooner than
-/// the mover? A linear model of each, per op: a fixed cost growing with the
-/// units (the host's per-unit submission; the SFPU's kernel reservation costs
-/// more than a list), plus a cost per tile of the largest share. The
-/// constants are `silicon_perf::eltwise_unit_sweep`'s, on card 0 (divergence
-/// measurement Q): the mover takes ~8 us a tile for the `fadd.s`-shaped kinds
-/// and ~22 us for the per-datum ones (`RELU`, `RELU_BACKWARD`, `ADD_ROW`), the
-/// SFPU ~2-4 us; a list costs ~9 us plus ~2 us a unit, a kernel ~26 us plus
-/// ~4.4 us a unit. So a small op spread thin stays on the mover and anything
-/// with a few tiles a unit goes to the SFPU.
-pub fn sfpu_is_cheaper(kind: u32, tiles: usize, units: usize) -> bool {
-    use tt_isa::dm::kind as k;
-    let per_unit = tiles.div_ceil(units.max(1)).max(1) as f64;
-    let u = units.max(1) as f64 - 1.0;
-    let (mover_tile, sfpu_tile) = match kind {
-        k::RELU | k::RELU_BACKWARD | k::ADD_ROW => (22.4, 2.4),
-        k::MUL_SCALAR | k::ADD_SCALAR => (7.9, 2.4),
-        _ => (7.9, 3.0),
-    };
-    let mover = 9.5 + 2.0 * u + per_unit * mover_tile;
-    let sfpu = 26.0 + 4.4 * u + per_unit * sfpu_tile;
-    sfpu < mover
-}
-
-/// [`eltwise`] on the SFPU: each run of tiles a job of three steps -- the
+/// Element-wise `a (op) b` -- or `a (op) scalar`, or a ternary op's `c` --
+/// with everything in GDDR, on the SFPU: each run of tiles a job of three steps -- the
 /// mover gathers the run's operands into L1 (`record::READ_RUN`), the
 /// resident roles run the SFPU kernel over them (`crate::sfpu::kernel`), the
 /// mover scatters the outputs (`record::WRITE_RUN`). `None` when the op has no
@@ -1144,7 +1016,7 @@ pub fn sfpu_eltwise(
                     c.rows, c.cols, a.rows, a.cols
                 )));
             }
-            if let Some(&want) = crate::sfpu::ops::elems(kind).and_then(|s| s.inputs.get(2)) {
+            if let Some(&want) = crate::sfpu::ops::elems(kind).inputs.get(2) {
                 c.expect(&format!("element-wise op {kind:#x}"), want)?;
             }
             Some(c.tensor_ref())
@@ -1162,7 +1034,7 @@ pub fn sfpu_eltwise(
         _ => None,
     };
     let group = sfpu_group(op, bcast, operands);
-    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind, a))?;
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b.map(DramTensor::tensor_ref);
@@ -1256,13 +1128,13 @@ pub(crate) fn sfpu_group_for_tests(
     scalar: f32,
     operands: crate::sfpu::kernel::Operands,
 ) -> usize {
-    let bcast = if kind == tt_isa::dm::kind::ADD_ROW {
+    let bcast = if kind == crate::kind::ADD_ROW {
         crate::sfpu::ops::Broadcast::Row
     } else {
         crate::sfpu::ops::Broadcast::None
     };
-    let kind = if kind == tt_isa::dm::kind::ADD_ROW {
-        tt_isa::dm::kind::ADD
+    let kind = if kind == crate::kind::ADD_ROW {
+        crate::kind::ADD
     } else {
         kind
     };
@@ -1550,42 +1422,138 @@ fn reduce_programs(
 }
 
 /// The sum over rows of `a`, as a `[1, cols]` tensor, in `burn-flex`'s order:
-/// from `+0.0`, adding rows in order (`tt_isa::dm::kind::COL_SUM`).
+/// from `+0.0`, adding rows in order, on the SFPU
+/// (`sfpu::reduce::accumulate_in_order`).
 ///
-/// Columns are independent; each keeps its rows in order on one tile. They
-/// are dealt out in contiguous runs, one [`Job`] per run, as many as `units`.
+/// One run per group of output tiles when a column of `a`'s tiles fits one
+/// ([`sfpu_reduce`]); otherwise in chunks of `ROW_CHUNK` row tiles, each
+/// starting from the last's sums, all of a group's chunks one job on one unit.
 pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
-    a.expect("a column sum", Elem::F32)?;
-    // The schedule -- an accumulator per column, slots for its rows, where a
-    // list's worth of slots runs out -- is `tt_isa::dm::record::SUM`'s.
-    let stage = staging("column-sum slots", record::SUM_SLOTS)?;
-    let out = DramTensor::alloc(alloc, 1, a.cols)?;
+    use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, Axis, ReduceOp, ROW_CHUNK};
+    a.expect("a sum over rows", Elem::F32)?;
     let [rt, ct] = a.grid();
+    let valid = match (a.rows % 32) as u32 {
+        0 => 32,
+        v => v,
+    };
+    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid).is_some() {
+        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units);
+    }
+    let group = chunk_group().ok_or_else(|| {
+        TensorError::Shape("a chunk of a sum over rows does not fit one tile".into())
+    })?;
+    let out = DramTensor::alloc(alloc, 1, a.cols)?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let mut jobs = Vec::new();
-    for columns in runs(ct, units, ct.max(1)) {
-        let record = [
-            [
-                record::SUM,
-                columns.start as u32,
-                columns.len() as u32,
-                rt as u32,
-                stage as u32,
-                (a.rows % 32) as u32,
-                0,
-                0,
-            ],
-            ra.encode()[0],
-            ra.encode()[1],
-            ro.encode()[0],
-            ro.encode()[1],
-        ];
-        jobs.push(vec![Step::List {
-            what: "sum list",
-            entries: record.to_vec(),
-        }]);
+    for run in runs(ct, units, group) {
+        let len = run.len();
+        let c = match plan_chunk_layout(len) {
+            Ok(c) => c,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(TensorError::Shape(e.to_string()));
+            }
+        };
+        let mut steps = Vec::new();
+        for (i, r0) in (0..rt).step_by(ROW_CHUNK).enumerate() {
+            let tiles = ROW_CHUNK.min(rt - r0);
+            let last_valid = if r0 + tiles == rt { valid } else { 32 };
+            let mut gather = Vec::new();
+            if i > 0 {
+                // The last chunk's sums, read back from the output.
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        run.start as u32,
+                        len as u32,
+                        c.prior_at as u32,
+                        0,
+                        ct as u32,
+                        0,
+                        0,
+                    ],
+                    ro.encode()[0],
+                    ro.encode()[1],
+                ]);
+            }
+            for k in 0..len {
+                let at = c.layout.in_at + (k * ROW_CHUNK) as u64 * TILE_SLOT;
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        ((run.start + k) * rt + r0) as u32,
+                        tiles as u32,
+                        at as u32,
+                        4,
+                        ct as u32,
+                        rt as u32,
+                        0,
+                    ],
+                    ra.encode()[0],
+                    ra.encode()[1],
+                ]);
+            }
+            steps.push(Step::List {
+                what: "sum gather",
+                entries: gather,
+            });
+            steps.push(Step::Kernel {
+                roles: Arc::new(chunk_roles(&c, i > 0, tiles, last_valid)),
+                init: c.layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+            });
+            steps.push(Step::List {
+                what: "sum scatter",
+                entries: vec![
+                    [
+                        record::WRITE_RUN,
+                        run.start as u32,
+                        len as u32,
+                        c.layout.out_at as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    ro.encode()[0],
+                    ro.encode()[1],
+                ],
+            });
+        }
+        jobs.push(steps);
     }
     Ok(Work { out, jobs })
+}
+
+/// Most output tiles one chunk of a long sum over rows may take: by the
+/// arena's slots (a prior, `ROW_CHUNK` inputs and an output each) and by the
+/// role programs' length; `None` if not even one fits.
+fn chunk_group() -> Option<usize> {
+    use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, ROW_CHUNK};
+    static MEMO: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MEMO.get_or_init(|| {
+        let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+        let by_slots = slots / (ROW_CHUNK + 2);
+        let lens = |n: usize| -> Option<[usize; 3]> {
+            let c = plan_chunk_layout(n).ok()?;
+            Some(chunk_roles(&c, true, ROW_CHUNK, 32).map(|p| p.len()))
+        };
+        let max = tt_isa::mailbox::PROGRAM_MAX as usize;
+        let one = lens(1)?;
+        if by_slots == 0 || one.iter().any(|&l| l > max) {
+            return None;
+        }
+        let two = lens(2)?;
+        let by_program = (0..3)
+            .map(|r| {
+                let per_out = (two[r] - one[r]).max(1);
+                (max - (one[r] - per_out)) / per_out
+            })
+            .min()
+            .unwrap();
+        Some(64.min(by_slots).min(by_program).max(1))
+    })
 }
 
 /// [`sum_rows`]'s padding rules. It reads only a ragged tensor's valid rows
@@ -1664,7 +1632,7 @@ impl OpPadding for Eltwise {
         PadNeed::Any
     }
     fn produces(&self, inputs: &[&DramTensor]) -> Pad {
-        use tt_isa::dm::kind;
+        use crate::kind;
         let zero = |i: usize| inputs.get(i).is_some_and(|t| t.pad() == Pad::Zero);
         // A broadcast operand goes into the padding of the dimension it is
         // broadcast along: `0 + b` there is `b`. With no padding along it, the
@@ -1704,7 +1672,6 @@ impl OpPadding for Eltwise {
             // `0 + s` is a zero only if `s` is.
             kind::ADD_SCALAR => zero(0) && self.scalar == 0.0,
             kind::RELU => zero(0),
-            kind::COPY => zero(0),
             // `a > 0 ? g : 0`: zero where either is.
             kind::RELU_BACKWARD => zero(0) || zero(1),
             // The row goes into every row, padding rows included; a tensor
@@ -1724,6 +1691,47 @@ impl OpPadding for Eltwise {
             Pad::Undefined
         }
     }
+}
+
+/// `t`, bit for bit, into a tensor of its own: every tile read whole into L1
+/// and its datums written out (`record::READ_RUN`, `record::WRITE_RUN`). Data
+/// movement only, so any element type, denormals and NaN payloads included.
+/// What a view needs before it can be refilled without touching its parent.
+/// Its padding is the source tiles' -- the parent's data, for a view -- so
+/// undefined unless `t`'s is zero.
+pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
+    const GROUP: usize = 128;
+    let stage = staging("copy slots", GROUP)?;
+    let out = DramTensor::alloc_elem(alloc, t.rows, t.cols, t.elem)?;
+    let [rt, ct] = t.grid();
+    let (rs, ro) = (t.tensor_ref(), out.tensor_ref());
+    let jobs = runs(rt * ct, units, GROUP)
+        .into_iter()
+        .map(|run| {
+            let (first, count) = (run.start as u32, run.len() as u32);
+            vec![Step::List {
+                what: "copy list",
+                entries: vec![
+                    [
+                        record::READ_RUN,
+                        first,
+                        count,
+                        stage as u32,
+                        0,
+                        ct as u32,
+                        0,
+                        0,
+                    ],
+                    rs.encode()[0],
+                    rs.encode()[1],
+                    [record::WRITE_RUN, first, count, stage as u32, 0, 0, 0, 0],
+                    ro.encode()[0],
+                    ro.encode()[1],
+                ],
+            }]
+        })
+        .collect();
+    Ok(Work { out, jobs })
 }
 
 /// Set `t`'s padding to `value` in place: a [`record::FILL_PAD`] over its edge
@@ -1804,8 +1812,9 @@ mod tests {
         blocks, reference, runs, DramAlloc, DramTensor, Eltwise, Job, MatmulPadding, OpPadding,
         Pad, PadNeed, Step, SumRows,
     };
+    use crate::kind;
     use tt_isa::dm::TILE_DATA;
-    use tt_isa::dm::{kind, op, record};
+    use tt_isa::dm::{fill, op, record};
     use tt_isa::dram::Dram;
 
     /// Every padding claim of an SFPU kind (`Eltwise::zero_at_zero`) holds
@@ -1827,7 +1836,7 @@ mod tests {
                 Operands::Ternary => 3,
                 _ => 2,
             };
-            let sig = elems(kind).unwrap();
+            let sig = elems(kind);
             let others = |i: usize| -> Vec<f32> {
                 match sig.inputs.get(i) {
                     Some(Elem::F32) | None => floats.to_vec(),
@@ -1975,42 +1984,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn eltwise_records_expand_to_the_old_lists() {
-        for mask in DRAMS {
-            let dram = Dram::from_usable_mask(mask);
-            for [r, c] in [[37, 70], [320, 320], [784, 128], [1, 1]] {
-                for (k, scalar, b) in [
-                    (kind::ADD, 0.0, Some(false)),
-                    (kind::ADD_ROW, 0.0, Some(true)),
-                    (kind::RELU, 0.0, None),
-                    (kind::MUL_SCALAR, 0.5, None),
-                ] {
-                    for units in [1, 3, 8] {
-                        let shapes = [[r, c], [if b == Some(true) { 1 } else { r }, c]];
-                        let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &shapes);
-                        let op = Eltwise {
-                            scalar2: 0.0,
-                            kind: k,
-                            scalar,
-                        };
-                        let got =
-                            super::eltwise(&mut a1, op, &t1[0], b.map(|_| &t1[1]), units).unwrap();
-                        let want =
-                            reference::eltwise(&mut a2, op, &t2[0], b.map(|_| &t2[1]), units)
-                                .unwrap();
-                        assert_eq!(got.out, want.out);
-                        same_jobs(
-                            &got.jobs,
-                            &want.jobs,
-                            &format!("kind {k} [{r}, {c}] {mask:#x} {units}"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// A fill touches exactly the edge tiles, each once, with the valid region
     /// of the tile it is: the corner both edges', the rest one edge's.
     #[test]
@@ -2033,7 +2006,7 @@ mod tests {
                                 let key = (s.channel().index() as u32, s.offset() as u32);
                                 want.insert(
                                     key,
-                                    kind::fill_param(
+                                    fill::param(
                                         if vr == 0 { 32 } else { vr as u32 },
                                         if vc == 0 { 32 } else { vc as u32 },
                                     ),
@@ -2047,12 +2020,11 @@ mod tests {
                         let e: Vec<_> = stream(job).into_iter().map(Result::unwrap).collect();
                         for w in e.chunks(3) {
                             let (rd, cp, wr) = (w[0], w[1], w[2]);
-                            assert_eq!((rd[0], cp[0], wr[0]), (op::READ, op::COMPUTE, op::WRITE));
-                            assert_eq!(cp[1], kind::FILL_PAD);
-                            assert_eq!(cp[2], f32::NEG_INFINITY.to_bits());
-                            assert_eq!((cp[4], cp[5]), (rd[4], rd[4]), "in place, in its slot");
+                            assert_eq!((rd[0], cp[0], wr[0]), (op::READ, op::FILL, op::WRITE));
+                            assert_eq!(cp[1], f32::NEG_INFINITY.to_bits());
+                            assert_eq!(cp[3], rd[4], "in its slot");
                             assert_eq!((wr[1], wr[3]), (rd[1], rd[3] + TILE_DATA as u32));
-                            assert!(got.insert((rd[1], rd[3]), cp[3]).is_none(), "twice");
+                            assert!(got.insert((rd[1], rd[3]), cp[2]).is_none(), "twice");
                         }
                     }
                     assert_eq!(got, want, "[{r}, {c}] {mask:#x} {units}");
@@ -2095,7 +2067,6 @@ mod tests {
         assert_eq!(p(e(kind::MUL_SCALAR, f32::NAN), &[&zero]), Pad::Undefined);
         assert_eq!(p(e(kind::RELU_BACKWARD, 0.0), &[&undef, &zero]), Pad::Zero);
         assert_eq!(p(e(kind::ADD_ROW, 0.0), &[&zero, &row]), Pad::Undefined);
-        assert_eq!(p(e(kind::COPY, 0.0), &[&zero]), Pad::Zero);
         assert_eq!(SumRows.produces(&[&undef]), Pad::Undefined);
         assert_eq!(SumRows.produces(&[&zero]), Pad::Zero);
         assert_eq!(SumRows.requires(0), PadNeed::Any);
@@ -2103,52 +2074,8 @@ mod tests {
         assert_eq!(super::fill_pad(&whole, 0.0, 4).unwrap().len(), 0);
     }
 
-    #[test]
-    fn sum_records_expand_to_the_old_lists() {
-        for mask in DRAMS {
-            let dram = Dram::from_usable_mask(mask);
-            for [r, c] in [[37, 70], [7000, 40], [96, 600], [6400, 33]] {
-                for units in [1, 3, 8] {
-                    let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[[r, c]]);
-                    let got = super::sum_rows(&mut a1, &t1[0], units).unwrap();
-                    let want = reference::sum_rows(&mut a2, &t2[0], units).unwrap();
-                    assert_eq!(got.out, want.out);
-                    same_jobs(
-                        &got.jobs,
-                        &want.jobs,
-                        &format!("sum [{r}, {c}] {mask:#x} {units}"),
-                    );
-                }
-            }
-        }
-    }
-
     /// A row view's records name its first tile, so they expand as the
     /// view's own lists did.
-    #[test]
-    fn records_of_a_row_view_expand_to_the_old_lists() {
-        let dram = Dram::FULL;
-        let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[[512, 96], [512, 96]]);
-        let (v1, w1) = (
-            t1[0].rows_view(64, 128).unwrap(),
-            t1[1].rows_view(64, 128).unwrap(),
-        );
-        let (v2, w2) = (
-            t2[0].rows_view(64, 128).unwrap(),
-            t2[1].rows_view(64, 128).unwrap(),
-        );
-        let op = Eltwise {
-            scalar2: 0.0,
-            kind: kind::MUL,
-            scalar: 0.0,
-        };
-        let got = super::eltwise(&mut a1, op, &v1, Some(&w1), 3).unwrap();
-        let want = reference::eltwise(&mut a2, op, &v2, Some(&w2), 3).unwrap();
-        same_jobs(&got.jobs, &want.jobs, "view");
-        let got = super::sum_rows(&mut a1, &v1, 2).unwrap();
-        let want = reference::sum_rows(&mut a2, &v2, 2).unwrap();
-        same_jobs(&got.jobs, &want.jobs, "view sum");
-    }
 
     #[test]
     fn runs_cover_every_item_once_evenly_and_within_the_limit() {
@@ -2202,7 +2129,6 @@ mod reference {
     //! wherever one of their lists ended inside a job.
     use super::*;
     use tt_isa::dm;
-    use tt_isa::dram::DramRange;
 
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_dram(
@@ -2340,196 +2266,5 @@ mod reference {
             }
         }
         Ok(Work { out: c, jobs })
-    }
-
-    pub fn eltwise(
-        alloc: &mut DramAlloc,
-        op: Eltwise,
-        a: &DramTensor,
-        b: Option<&DramTensor>,
-        units: usize,
-    ) -> Result<Work> {
-        use tt_isa::dm::kind;
-        let binary = !matches!(
-            op.kind,
-            kind::MUL_SCALAR | kind::ADD_SCALAR | kind::RELU | kind::COPY
-        );
-        let row = op.kind == kind::ADD_ROW;
-        match (binary, b) {
-            (false, _) => {}
-            (true, None) => {
-                return Err(TensorError::Shape("a binary op needs two operands".into()))
-            }
-            (true, Some(b)) if row && (b.rows != 1 || b.cols != a.cols) => {
-                return Err(TensorError::Shape(format!(
-                    "[{}, {}] + row [{}, {}]",
-                    a.rows, a.cols, b.rows, b.cols
-                )))
-            }
-            (true, Some(b)) if !row && (b.rows, b.cols) != (a.rows, a.cols) => {
-                return Err(TensorError::Shape(format!(
-                    "[{}, {}] and [{}, {}] differ",
-                    a.rows, a.cols, b.rows, b.cols
-                )))
-            }
-            _ => {}
-        }
-        let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
-        let [rt, ct] = a.grid();
-        // Two slots per tile in flight, inside the matmul staging area.
-        const GROUP: usize = 96;
-        let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
-        const _: () = assert!(
-            matmul::MATMUL_STAGE + 2 * GROUP as u64 * TILE_SLOT <= tt_isa::mailbox::MAILBOX_BASE
-        );
-        let read = |x: DramRange, to: u64, port: usize| {
-            [
-                dm::op::READ,
-                x.channel().index() as u32,
-                (port % tt_isa::dram::PORTS as usize) as u32,
-                x.offset() as u32,
-                to as u32,
-                TILE_SLOT as u32,
-                0,
-                0,
-            ]
-        };
-        let tiles: Vec<(usize, usize)> =
-            (0..rt).flat_map(|i| (0..ct).map(move |j| (i, j))).collect();
-        let mut jobs = Vec::new();
-        for run in runs(tiles.len(), units, GROUP) {
-            let group = &tiles[run];
-            let mut list = Vec::new();
-            for (n, &(i, j)) in group.iter().enumerate() {
-                list.push(read(a.tile(i, j), slot(2 * n), n));
-                if let Some(b) = b.filter(|_| binary) {
-                    let from = if row { b.tile(0, j) } else { b.tile(i, j) };
-                    list.push(read(from, slot(2 * n + 1), n + 1));
-                }
-                list.push([
-                    dm::op::COMPUTE,
-                    op.kind,
-                    op.scalar.to_bits(),
-                    0,
-                    slot(2 * n) as u32,
-                    slot(2 * n) as u32,
-                    slot(2 * n + 1) as u32,
-                    0,
-                ]);
-                let o = out.tile(i, j);
-                let data = o
-                    .channel()
-                    .range(o.offset() + TILE_DATA, 4096)
-                    .expect("inside the slot");
-                list.push([
-                    dm::op::WRITE,
-                    data.channel().index() as u32,
-                    (n % tt_isa::dram::PORTS as usize) as u32,
-                    data.offset() as u32,
-                    (slot(2 * n) + TILE_DATA) as u32,
-                    4096,
-                    0,
-                    0,
-                ]);
-            }
-            jobs.push(vec![Step::List {
-                what: "eltwise list",
-                entries: list,
-            }]);
-        }
-        Ok(Work { out, jobs })
-    }
-
-    pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
-        let out = DramTensor::alloc(alloc, 1, a.cols)?;
-        let [rt, ct] = a.grid();
-        let slot = |i: usize| matmul::MATMUL_STAGE + i as u64 * TILE_SLOT;
-        // Slots in the staging area; each column takes one accumulator and one
-        // per tile. Whole columns are packed into one mover list while they fit;
-        // a column taller than that spans several lists, accumulating in place.
-        const SLOTS: usize = 200;
-        let read = |from: DramRange, to: u64, i: usize| {
-            [
-                dm::op::READ,
-                from.channel().index() as u32,
-                (i % tt_isa::dram::PORTS as usize) as u32,
-                from.offset() as u32,
-                to as u32,
-                TILE_SLOT as u32,
-                0,
-                0,
-            ]
-        };
-        // Of the last tile row, only the tensor's valid rows (`0`: all 32).
-        let last_rows = (a.rows % 32) as u32;
-        let sum = |acc: u64, tile: u64, first: bool, last: bool| {
-            [
-                dm::op::COMPUTE,
-                dm::kind::COL_SUM,
-                u32::from(first),
-                if last { last_rows } else { 0 },
-                acc as u32,
-                tile as u32,
-                acc as u32,
-                0,
-            ]
-        };
-        let write = |j: usize, acc: u64| {
-            let o = out.tile(0, j);
-            let data = o
-                .channel()
-                .range(o.offset() + TILE_DATA, 4096)
-                .expect("in the slot");
-            [
-                dm::op::WRITE,
-                data.channel().index() as u32,
-                0,
-                data.offset() as u32,
-                (acc + TILE_DATA) as u32,
-                4096,
-                0,
-                0,
-            ]
-        };
-        let mut jobs = Vec::new();
-        for columns in runs(ct, units, ct.max(1)) {
-            let mut job = Vec::new();
-            let mut list = Vec::new();
-            let mut flush = |list: &mut Vec<[u32; 8]>| {
-                job.push(Step::List {
-                    what: "sum list",
-                    entries: std::mem::take(list),
-                })
-            };
-            let mut used = 0;
-            for j in columns {
-                if used + 1 + rt.min(SLOTS - 1) > SLOTS {
-                    flush(&mut list);
-                    used = 0;
-                }
-                let acc = slot(used);
-                used += 1;
-                for i0 in (0..rt).step_by(SLOTS - 1) {
-                    let rows = (rt - i0).min(SLOTS - 1);
-                    if used + rows > SLOTS {
-                        // Only a column taller than a list reaches here: run what
-                        // is queued, keeping the accumulator slot where it is.
-                        flush(&mut list);
-                        used = 1 + (acc - matmul::MATMUL_STAGE) as usize / TILE_SLOT as usize;
-                    }
-                    for i in i0..i0 + rows {
-                        list.push(read(a.tile(i, j), slot(used + i - i0), i));
-                    }
-                    for i in i0..i0 + rows {
-                        list.push(sum(acc, slot(used + i - i0), i == 0, i == rt - 1));
-                    }
-                    used += rows;
-                }
-                list.push(write(j, acc));
-            }
-            flush(&mut list);
-            jobs.push(job);
-        }
-        Ok(Work { out, jobs })
     }
 }

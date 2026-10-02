@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use tt_firmware::{float, l1_read32, l1_write32, mailbox_word, noc, publish};
+use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
@@ -64,6 +64,36 @@ fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     Ok(())
 }
 
+/// The tile counter's low word, which ttsim models (divergence row 54). The
+/// clock `noc` times waits for room under the in-flight cap with: read only
+/// when a request has to wait.
+fn wall_clock() -> u32 {
+    rd(tt_isa::tensix::timestamper::WALL_CLOCK_L)
+}
+
+/// After a list: if any of its requests waited for room under the in-flight
+/// cap, add them where the host reads them (`dm::THROTTLE_STALLS`,
+/// `THROTTLE_CYCLES`) and, in a traced list, record one `THROTTLE` event with
+/// the cycles. `seen` is what was published last. One compare per list when
+/// nothing waited.
+fn publish_stalls(seen: &mut noc::Stalls, traced: bool) {
+    let now = noc::stalls();
+    if now.count != seen.count {
+        stalled(*seen, now, traced);
+        *seen = now;
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stalled(seen: noc::Stalls, now: noc::Stalls, traced: bool) {
+    use tt_isa::mailbox::trace as ev;
+    let cycles = now.cycles.wrapping_sub(seen.cycles);
+    wr(dm::THROTTLE_STALLS, rd(dm::THROTTLE_STALLS).wrapping_add(now.count.wrapping_sub(seen.count)));
+    wr(dm::THROTTLE_CYCLES, rd(dm::THROTTLE_CYCLES).wrapping_add(cycles));
+    trace(traced, ev::THROTTLE, cycles.min(ev::DETAIL_MAX));
+}
+
 /// Transpose the tile in the scratch slot into the slot at `dst`: header
 /// copied, datum `(r, c)` from `(c, r)`, both in face order -- face `(fr, fc)`
 /// of the result is face `(fc, fr)` of the source, transposed.
@@ -107,64 +137,14 @@ fn broadcast_col0_from_scratch(dst: u64) {
     }
 }
 
-/// One compute entry over the 1024 datums of three tile slots (`dm::kind`).
+/// `dm::op::FILL`: `v` at every datum of the tile slot `dst` outside its
+/// first `param & 0xff` rows and `param >> 8` columns (`0` meaning 32).
+/// Stores only: the mover moves data and does no arithmetic.
 #[inline(never)]
-fn compute(kind: u32, s: u32, param: u32, dst: u64, a: u64, b: u64) {
-    let (dst, a, b) = (dst + dm::TILE_DATA, a + dm::TILE_DATA, b + dm::TILE_DATA);
-    // Same-shape kinds pair datum i with datum i whatever the face order, so
-    // they walk the tile straight through (`tt_firmware::float`'s loops).
-    let (pd, pa, pb) = (dst as *mut u32, a as *const u32, b as *const u32);
-    // SAFETY: three tile slots `Entry::decode` placed inside L1, 1024 words
-    // of datums each.
-    unsafe {
-        match kind {
-            dm::kind::ADD => float::add_n(pd, pa, pb, 1024),
-            dm::kind::SUB => float::sub_n(pd, pa, pb, 1024),
-            dm::kind::MUL => float::mul_n(pd, pa, pb, 1024),
-            dm::kind::MUL_SCALAR => float::mul_scalar_n(pd, pa, s, 1024),
-            dm::kind::COL_SUM => col_sum(s != 0, dm::kind::extent(param) as usize, dst, a),
-            dm::kind::FILL_PAD => fill_pad(s, param, dst),
-            dm::kind::ADD_SCALAR => {
-                for i in 0..1024 {
-                    *pd.add(i) = float::add(*pa.add(i), s);
-                }
-            }
-            dm::kind::COPY => {
-                for i in 0..1024 {
-                    *pd.add(i) = *pa.add(i);
-                }
-            }
-            _ => per_datum(kind, dst, a, b),
-        }
-    }
-    // The stores must reach L1 before the mover's next NoC write reads it.
-    publish();
-}
-
-/// `dm::kind::COL_SUM`: row 0 of `dst` accumulates each column of `a`'s
-/// first `rows` rows, in order; the first tile of a column also zeroes `dst`'s
-/// other rows. The addresses are the datums' (past the header).
-fn col_sum(first: bool, rows: usize, dst: u64, a: u64) {
-    for c in 0..32usize {
-        let at = dst + dm::face_index(0, c) as u64 * 4;
-        let mut acc = if first { 0 } else { rd(at) };
-        for r in 0..rows {
-            acc = float::add(acc, rd(a + dm::face_index(r, c) as u64 * 4));
-        }
-        wr(at, acc);
-        if first {
-            for r in 1..32usize {
-                wr(dst + dm::face_index(r, c) as u64 * 4, 0);
-            }
-        }
-    }
-}
-
-/// `dm::kind::FILL_PAD`: `v` at every datum of `dst` outside its first
-/// `param & 0xff` rows and `param >> 8` columns (`0` meaning 32).
-fn fill_pad(v: u32, param: u32, dst: u64) {
-    let rows = dm::kind::extent(param & 0xff) as usize;
-    let cols = dm::kind::extent(param >> 8) as usize;
+fn fill(v: u32, param: u32, dst: u64) {
+    let dst = dst + dm::TILE_DATA;
+    let rows = dm::fill::extent(param & 0xff) as usize;
+    let cols = dm::fill::extent(param >> 8) as usize;
     for r in 0..32usize {
         for c in 0..32usize {
             if r >= rows || c >= cols {
@@ -172,40 +152,8 @@ fn fill_pad(v: u32, param: u32, dst: u64) {
             }
         }
     }
-}
-
-/// The kinds that need a datum's position, or integer tests: one at a time.
-fn per_datum(kind: u32, dst: u64, a: u64, b: u64) {
-    for r in 0..32usize {
-        for c in 0..32usize {
-            let i = dm::face_index(r, c) as u64 * 4;
-            let x = rd(a + i);
-            let v = match kind {
-                // `max(x, 0)`: x itself if positive (as a signed integer, which
-                // excludes both zeros, negatives and negative NaNs), +0 for
-                // every negative and zero; a positive NaN is `max`'s other
-                // argument, +0, too.
-                dm::kind::RELU => {
-                    if (x as i32) > 0 && x <= 0x7F80_0000 {
-                        x
-                    } else {
-                        0
-                    }
-                }
-                // `out > 0 ? g : 0` in IEEE terms: positive, not zero, not NaN.
-                dm::kind::RELU_BACKWARD => {
-                    if (x as i32) > 0 && x <= 0x7F80_0000 {
-                        rd(b + i)
-                    } else {
-                        0
-                    }
-                }
-                dm::kind::ADD_ROW => float::add(x, rd(b + dm::face_index(0, c) as u64 * 4)),
-                _ => x,
-            };
-            wr(dst + i, v);
-        }
-    }
+    // The stores must reach L1 before the mover's next NoC write reads it.
+    publish();
 }
 
 /// Post `generation` to the three resident roles and wait for each to
@@ -231,6 +179,8 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
         wr(Mailbox::of(t).generation(), generation);
     }
     publish();
+    let traced = rd(dm::TRACE) != 0;
+    trace(traced, tt_isa::mailbox::trace::KICK, generation);
     for t in 0..3 {
         let mb = Mailbox::of(t);
         loop {
@@ -243,6 +193,7 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
             }
         }
     }
+    trace(traced, tt_isa::mailbox::trace::ROLES_DONE, generation);
     Ok(())
 }
 
@@ -342,18 +293,11 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
         // Only as a list of its own, which `run_list_at` runs.
         Entry::Call { .. } => return Err(IS_CALL),
-        Entry::Compute {
-            kind,
-            param,
-            scalar,
-            dst,
-            a,
-            b,
-        } => {
-            // Its operands may still be arriving.
+        Entry::Fill { value, param, dst } => {
+            // The tile it fills may still be arriving.
             noc::wait(TXN);
             publish();
-            compute(kind, scalar, param, dst as u64, a as u64, b as u64);
+            fill(value, param, dst as u64);
         }
     }
     Ok(())
@@ -516,6 +460,8 @@ pub extern "Rust" fn firmware_main() -> ! {
     let me = (rd(dm::MY_X) as u8, rd(dm::MY_Y) as u8);
     let usable = rd(dm::USABLE);
     let mut beat: u32 = 0;
+    noc::set_clock(wall_clock);
+    let mut stalls = noc::stalls();
     loop {
         beat = beat.wrapping_add(1);
         wr(mailbox_word(offset::HEARTBEAT), beat);
@@ -528,8 +474,10 @@ pub extern "Rust" fn firmware_main() -> ! {
         // fails (which stops the queue until the host restarts the mover).
         let done = rd(dm::QUEUE_DONE);
         if done != rd(dm::QUEUE_HEAD) && rd(dm::QUEUE_ERROR) == dm::error::NONE {
+            noc::set_cap(TXN, rd(dm::IN_FLIGHT_CAP));
             let slot = rd(dm::QUEUE_SLOTS + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
+            publish_stalls(&mut stalls, rd(dm::TRACE) != 0);
             // Everything the list moved has landed before it is reported.
             publish();
             match result {
@@ -546,6 +494,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         if seq == 0 || seq == rd(dm::DONE) {
             continue;
         }
+        noc::set_cap(TXN, rd(dm::IN_FLIGHT_CAP));
         let result = if rd(dm::OP) == op::LIST {
             run_list(me, usable, rd(dm::LEN))
         } else {
@@ -560,6 +509,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             )
             .and_then(|d| run(me, d))
         };
+        publish_stalls(&mut stalls, rd(dm::TRACE) != 0);
         wr(dm::ERROR, result.err().unwrap_or(dm::error::NONE));
         // The data is in L1 (a read) or acknowledged by the DRAM tile (a write,
         // response-marked) before DONE is published.

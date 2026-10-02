@@ -54,15 +54,25 @@ pub enum Event {
     /// The data mover began or ended a list entry or op record whose first
     /// word is `op` (`tt_isa::dm::op` or `tt_isa::dm::record`).
     Entry { begin: bool, op: u32 },
+    /// The data mover posted `generation` to the roles (`kick`), or saw all
+    /// three acknowledge it.
+    Kick { done: bool, generation: u32 },
+    /// The list just ended had requests wait `cycles` in all for room under
+    /// the in-flight cap.
+    Throttle { cycles: u32 },
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RoleEvent {
+    /// A resident runner saw a new generation.
+    Woke,
     Start,
     Pushed,
     Retired,
+    /// A resident runner acknowledged its generation.
+    Acked,
 }
 
 impl Event {
@@ -81,6 +91,19 @@ impl Event {
             (0..=2, ev::RETIRED) => Event::Role {
                 thread: source,
                 what: RoleEvent::Retired,
+            },
+            (0..=2, ev::WOKE) => Event::Role {
+                thread: source,
+                what: RoleEvent::Woke,
+            },
+            (0..=2, ev::ACKED) => Event::Role {
+                thread: source,
+                what: RoleEvent::Acked,
+            },
+            (ev::MOVER, ev::THROTTLE) => Event::Throttle { cycles: detail },
+            (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
+                done: event == ev::ROLES_DONE,
+                generation: detail,
             },
             (ev::MOVER, ev::LIST_BEGIN | ev::LIST_END) => Event::List {
                 begin: event == ev::LIST_BEGIN,
@@ -102,13 +125,11 @@ pub fn op_name(op: u32) -> &'static str {
         op::READ => "read",
         op::WRITE => "write",
         op::READ_TRANSPOSED => "read transposed",
-        op::COMPUTE => "compute",
+        op::FILL => "fill",
         op::KERNEL => "kernel",
         op::WAIT => "wait",
         record::GATHER => "gather",
         record::SCATTER => "scatter",
-        record::ELTWISE => "eltwise",
-        record::SUM => "sum",
         record::FILL_PAD => "fill pad",
         record::READ_RUN => "read run",
         record::WRITE_RUN => "write run",
@@ -152,8 +173,13 @@ pub struct Span {
 }
 
 impl UnitProfile {
-    /// Pair each unit's begins with their ends: lists, entries and role runs
-    /// (`START` to `RETIRED`). Refuses a stream that does not nest.
+    /// Pair each unit's begins with their ends: lists, entries, a kernel's
+    /// kick (`KICK` to `ROLES_DONE`, on the mover's track) and role runs
+    /// (`START` to `RETIRED`, `"program"`), with a resident role's wake
+    /// (`WOKE` to `START`) and acknowledgement (`RETIRED` to `ACKED`) either
+    /// side of it; and a list's waits for room under the in-flight cap
+    /// (`"throttle"`, on the mover's track: their total, drawn as ending where
+    /// the list did). Refuses a stream that does not nest.
     pub fn spans(&self) -> Result<Vec<Span>, Unbalanced> {
         let bad = |at: usize, what: String| Unbalanced {
             tile: self.tile,
@@ -164,6 +190,9 @@ impl UnitProfile {
         let mut list: Option<u64> = None;
         let mut entry: Option<(u32, u64)> = None;
         let mut role: [Option<(u64, bool)>; 3] = [None; 3];
+        let mut kick: Option<(u32, u64)> = None;
+        let mut woke: [Option<u64>; 3] = [None; 3];
+        let mut retired: [Option<u64>; 3] = [None; 3];
         for (i, e) in self.events.iter().enumerate() {
             match Event::decode(e.token) {
                 Event::List { begin: true, .. } => {
@@ -199,13 +228,80 @@ impl UnitProfile {
                     }),
                     _ => return Err(bad(i, format!("entry {op:#x} ended without beginning"))),
                 },
+                Event::Kick {
+                    done: false,
+                    generation,
+                } => {
+                    if kick.replace((generation, e.cycles)).is_some() {
+                        return Err(bad(i, "a kick inside a kick".into()));
+                    }
+                }
+                Event::Kick {
+                    done: true,
+                    generation,
+                } => match kick.take() {
+                    Some((g, b)) if g == generation => out.push(Span {
+                        name: "kick",
+                        track: "mover",
+                        begin: b,
+                        end: e.cycles,
+                    }),
+                    _ => {
+                        return Err(bad(
+                            i,
+                            format!("generation {generation} done without a kick"),
+                        ))
+                    }
+                },
+                Event::Throttle { cycles } => out.push(Span {
+                    name: "throttle",
+                    track: "mover",
+                    begin: e.cycles.saturating_sub(cycles as u64),
+                    end: e.cycles,
+                }),
+                Event::Role {
+                    thread,
+                    what: RoleEvent::Woke,
+                } => {
+                    let t = thread as usize;
+                    if role[t].is_some() || woke[t].replace(e.cycles).is_some() {
+                        return Err(bad(i, format!("T{thread} woke mid-run")));
+                    }
+                }
+                Event::Role {
+                    thread,
+                    what: RoleEvent::Acked,
+                } => {
+                    let t = thread as usize;
+                    let b = retired[t].take().ok_or_else(|| {
+                        bad(i, format!("T{thread} acknowledged without retiring"))
+                    })?;
+                    out.push(Span {
+                        name: "ack",
+                        track: ["T0", "T1", "T2"][t],
+                        begin: b,
+                        end: e.cycles,
+                    });
+                }
                 Event::Role { thread, what } => {
-                    let r = &mut role[thread as usize];
+                    let t = thread as usize;
+                    let r = &mut role[t];
                     match (what, *r) {
-                        (RoleEvent::Start, None) => *r = Some((e.cycles, false)),
+                        (RoleEvent::Start, None) => {
+                            if let Some(w) = woke[t].take() {
+                                out.push(Span {
+                                    name: "wake",
+                                    track: ["T0", "T1", "T2"][t],
+                                    begin: w,
+                                    end: e.cycles,
+                                });
+                            }
+                            *r = Some((e.cycles, false));
+                        }
                         (RoleEvent::Pushed, Some((b, false))) => *r = Some((b, true)),
                         (RoleEvent::Retired, Some((b, true))) => {
                             *r = None;
+                            retired[t] = Some(e.cycles);
                             out.push(Span {
                                 name: "program",
                                 track: ["T0", "T1", "T2"][thread as usize],
@@ -219,7 +315,12 @@ impl UnitProfile {
                 Event::Unknown(t) => return Err(bad(i, format!("unknown token {t:#x}"))),
             }
         }
-        if list.is_some() || entry.is_some() || role.iter().any(Option::is_some) {
+        if list.is_some()
+            || entry.is_some()
+            || kick.is_some()
+            || role.iter().any(Option::is_some)
+            || woke.iter().any(Option::is_some)
+        {
             return Err(bad(self.events.len(), "the stream ends mid-span".into()));
         }
         Ok(out)
@@ -353,6 +454,62 @@ mod tests {
         assert_eq!(spans.last().unwrap().name, "list");
         let k = spans.iter().find(|s| s.name == "kernel").unwrap();
         assert_eq!((k.begin, k.end), (21, 60));
+    }
+
+    /// A resident kernel's whole hand-off: the mover's kick, each role
+    /// waking, running and acknowledging, the mover seeing the last ack.
+    #[test]
+    fn a_resident_kernel_pairs_its_hand_offs() {
+        let m = ev::MOVER;
+        let mut v = vec![
+            e(m, ev::LIST_BEGIN, 1, 10),
+            e(m, ev::ENTRY_BEGIN, op::KERNEL, 11),
+            e(m, ev::KICK, 7, 12),
+        ];
+        for t in 0..3 {
+            v.push(e(t, ev::WOKE, 0, 20 + t as u64));
+            v.push(e(t, ev::START, 0, 30 + t as u64));
+            v.push(e(t, ev::PUSHED, 0, 40 + t as u64));
+            v.push(e(t, ev::RETIRED, 0, 50 + t as u64));
+            v.push(e(t, ev::ACKED, 0, 55 + t as u64));
+        }
+        v.extend([
+            e(m, ev::ROLES_DONE, 7, 60),
+            e(m, ev::ENTRY_END, op::KERNEL, 61),
+            e(m, ev::LIST_END, 1, 62),
+        ]);
+        let spans = unit(v).spans().unwrap();
+        let find = |track, name| {
+            spans
+                .iter()
+                .find(|s| s.track == track && s.name == name)
+                .unwrap()
+        };
+        assert_eq!(
+            (find("mover", "kick").begin, find("mover", "kick").end),
+            (12, 60)
+        );
+        assert_eq!((find("T1", "wake").begin, find("T1", "wake").end), (21, 31));
+        assert_eq!(
+            (find("T2", "program").begin, find("T2", "program").end),
+            (32, 52)
+        );
+        assert_eq!((find("T0", "ack").begin, find("T0", "ack").end), (50, 55));
+    }
+
+    #[test]
+    fn a_lists_throttle_is_a_span_ending_where_it_was_stamped() {
+        let m = ev::MOVER;
+        let v = vec![
+            e(m, ev::LIST_BEGIN, 1, 10),
+            e(m, ev::ENTRY_BEGIN, op::READ, 11),
+            e(m, ev::ENTRY_END, op::READ, 95),
+            e(m, ev::LIST_END, 1, 100),
+            e(m, ev::THROTTLE, 40, 101),
+        ];
+        let spans = unit(v).spans().unwrap();
+        let t = spans.iter().find(|s| s.name == "throttle").unwrap();
+        assert_eq!((t.track, t.begin, t.end), ("mover", 61, 101));
     }
 
     #[test]

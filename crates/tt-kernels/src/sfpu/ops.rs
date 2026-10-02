@@ -1,15 +1,14 @@
-//! Element-wise ops as SFPU programs (`hardware-coverage.md` S1): today's
-//! data-mover kinds (`tt_isa::dm::kind`), bit for bit what the mover's FP32
-//! unit computes.
+//! Element-wise ops as SFPU programs (`hardware-coverage.md` S1): the
+//! `crate::kind` ops, bit for bit `burn-flex`'s, and `kind_sfpu`'s beyond them.
 //!
 //! Each program reads its operands from the kernel's rows
-//! (`super::kernel::A_ROW`, `B_ROW`) and writes `OUT_ROW`. The mover's
-//! `fadd.s`/`fsub.s`/`fmul.s` round to nearest even and flush denormals, and
-//! so does `SFPMAD` (`fma_bh`, which `fma_oracle` holds to `fma.c`); the
+//! (`super::kernel::A_ROW`, `B_ROW`) and writes `OUT_ROW`. `SFPMAD` rounds to
+//! nearest even and flushes denormals, as Flex's `f32` does but for those
+//! (`fma_bh`, which `fma_oracle` holds to `fma.c`); the
 //! integer tests of `RELU` are the same predicate in `SFPGT`'s total order.
-//! `step19_eltwise` runs both units over the same operands against `burn-flex`.
+//! `step19_eltwise` holds every kind to `burn-flex`.
 
-use tt_isa::dm::kind;
+use crate::kind;
 use tt_isa::isa::Instruction;
 
 use super::kernel::{bias_row, Operands, A_ROW, B_ROW, OUT_ROW};
@@ -19,9 +18,7 @@ use crate::tensor::Elem;
 /// `+inf`'s bits plus one: the first positive NaN.
 const FIRST_NAN: u32 = 0x7f80_0001;
 
-/// Ops only the SFPU has: numbered above the mover's kinds
-/// (`tt_isa::dm::kind::LAST`), so the session sends them to the SFPU whatever
-/// unit it is set to.
+/// The element-wise ops beyond `crate::kind`'s, numbered above them.
 pub mod kind_sfpu {
     /// `1 / a`, within one ulp of the correctly rounded reciprocal
     /// (`Program::recip`).
@@ -194,15 +191,12 @@ pub struct Sig {
     pub out: Elem,
 }
 
-/// What `kind` computes on and what it produces (`crate::tensor::Elem`); `None`
-/// for a kind that moves datums whatever they are (`COPY`), whose output is
-/// its input's. The session refuses any other operand
-/// (`TensorError::Elem`) before choosing a unit.
-pub fn elems(kind: u32) -> Option<Sig> {
+/// What `kind` computes on and what it produces (`crate::tensor::Elem`). The
+/// session refuses any other operand (`TensorError::Elem`).
+pub fn elems(kind: u32) -> Sig {
     use Elem::{Bool, F32};
-    let sig = |inputs, out| Some(Sig { inputs, out });
+    let sig = |inputs, out| Sig { inputs, out };
     match kind {
-        kind::COPY => None,
         kind_sfpu::BOOL_NOT => sig(&[Bool], Bool),
         kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => sig(&[Bool, Bool], Bool),
         kind_sfpu::EQ..=kind_sfpu::LE => sig(&[F32, F32], Bool),
@@ -2215,11 +2209,6 @@ pub fn pow_fix(p: &mut Program) {
         p.if_(Cond::LessEq(R::ONE, x), |p| p.mov(R::ONE, res))
     });
     p.if_(Cond::Eq0(ay), |p| p.mov(R::ONE, res));
-}
-
-/// Does the data mover implement `kind`?
-pub fn mover_has(kind: u32) -> bool {
-    (1..=kind::LAST).contains(&kind)
 }
 
 /// What operands `kind` takes, if the SFPU has it.

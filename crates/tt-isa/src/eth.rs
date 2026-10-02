@@ -385,6 +385,13 @@ pub mod mover {
     /// forwarding. Set by the host on silicon; zero on ttsim, which commits RX
     /// writes synchronously and does not decode the counter (row 62).
     pub const LANDING_WAIT: u64 = M + 0x18;
+    /// Nonzero: record each step of a send and a receive in [`TRACE_RING`],
+    /// stamped by E1's own cycle counter (an Ethernet tile has no
+    /// timestamper). Zeroed at start with the rest of the mailbox.
+    pub const TRACE: u64 = M + 0x1C;
+    /// Events recorded so far. The host zeroes it to empty the ring; the
+    /// mover stops recording when the ring is full rather than wrapping.
+    pub const TRACE_COUNT: u64 = M + 0x20;
 
     /// Send descriptor. `SEND_SEQ` is written last and is nonzero.
     pub const SEND_SEQ: u64 = M + 0x40;
@@ -434,6 +441,40 @@ pub mod mover {
     /// is what the host-driven gates measured, and nothing documents a limit.
     pub const TT_LINK_CHUNK: u32 = 0x4000;
 
+    /// The trace ring: [`TRACE_EVENTS`] records of [`TRACE_RECORD_BYTES`],
+    /// each `[event, seq, cycles, 0]`: E1's 32-bit
+    /// `cycle`, which wraps (every ~3.2 s), so compare with `wrapping_sub`. In the transfer buffers,
+    /// past `RX_LAND`.
+    pub const TRACE_RING: u64 = 0x6_0000;
+    pub const TRACE_EVENTS: u32 = 1024;
+    pub const TRACE_RECORD_BYTES: u64 = 16;
+
+    /// What the mover records ([`TRACE`]), in the order a send and its
+    /// receive pass through them.
+    pub mod event {
+        /// The sender saw a new send descriptor.
+        pub const SEND_PICKUP: u32 = 1;
+        /// The sender's NoC read of the Tensix source into `TX_STAGE` landed
+        /// (only for a Tensix source).
+        pub const NOC_IN_DONE: u32 = 2;
+        /// The data's TT-link commands have all been latched by the TX queue.
+        pub const DATA_SENT: u32 = 3;
+        /// The record's TT-link command has been latched; `SENT` follows.
+        pub const RECORD_SENT: u32 = 4;
+        /// The receiver saw a whole new record.
+        pub const RECORD_SEEN: u32 = 5;
+        /// The receiver's RX queue had no writes outstanding: the data is in
+        /// its L1.
+        pub const LANDED: u32 = 6;
+        /// The receiver's NoC write into the Tensix destination completed
+        /// (only for a Tensix destination).
+        pub const NOC_OUT_DONE: u32 = 7;
+        /// The receiver's acknowledgement has been latched by its TX queue.
+        pub const ACK_SENT: u32 = 8;
+        /// The sender saw the acknowledgement arrive.
+        pub const ACK_SEEN: u32 = 9;
+    }
+
     /// `ERROR` codes.
     pub mod error {
         /// A descriptor with a length that is zero, not a multiple of 16, or
@@ -452,6 +493,9 @@ pub mod mover {
         assert!(ACK_STAGE + 16 <= super::BUFFERS.start);
         assert!(RX_LAND + MAX_LEN as u64 <= super::BUFFERS.end);
         assert!(TX_STAGE + MAX_LEN as u64 <= RX_LAND);
+        assert!(RX_LAND + MAX_LEN as u64 <= TRACE_RING);
+        assert!(TRACE_RING + TRACE_EVENTS as u64 * TRACE_RECORD_BYTES <= super::BUFFERS.end);
+        assert!(TRACE_COUNT + 4 <= SEND_SEQ);
         assert!(INBOX % 16 == 0 && ACK % 16 == 0 && RECORD_STAGE % 16 == 0);
         assert!(ACK_STAGE % 16 == 0 && TX_STAGE % 16 == 0 && RX_LAND % 16 == 0);
     };

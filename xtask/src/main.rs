@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
         Some("gen-burn-delegate") => gen_burn::generate(args.any(|a| a == "--check")),
         Some("silicon") => silicon::run(args),
+        Some("bench") => silicon::bench(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -70,4 +71,7 @@ tasks:
                           without generating anything
   check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs
   silicon [options]       run the silicon suite one test per process, with an
-                          fsync'd log; `cargo xtask silicon --help` for options";
+                          fsync'd log; `cargo xtask silicon --help` for options
+  bench [options]         the firmware benchmarks on silicon (release, ignored
+                          tests included), collected into target/silicon/bench/;
+                          `cargo xtask bench --help`";

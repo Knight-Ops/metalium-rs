@@ -11,7 +11,7 @@ by hand.
 | Binary | Core | Link script | Purpose |
 |---|---|---|---|
 | `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link.x`, `link_t1.x`, `link_t2.x` | The unpack / math / pack role runners. Each at its core's default reset PC, so all three sit in one tile's L1. Resident in a `Session`. |
-| `dm_b` | B | `link_b.x` | The data mover (`tt_isa::dm`): GDDR to and from L1, list entries, op records expanded on the tile, `COMPUTE` on its FP32 unit, `KERNEL` entries that point the resident roles at their programs and run them. |
+| `dm_b` | B | `link_b.x` | The data mover (`tt_isa::dm`): GDDR to and from L1, list entries, op records expanded on the tile, padding fills, `KERNEL` entries that point the resident roles at their programs and run them. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
 | `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::eth::mover`). |
 | `corpus` / `corpus_t0` | T1 / T0 | `link.x` | Generic single-thread program runner (T1 for ttsim, T0 for silicon). |
 

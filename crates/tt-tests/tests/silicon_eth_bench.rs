@@ -9,45 +9,11 @@ use std::time::{Duration, Instant};
 use tt_device::tlb::WindowKind;
 use tt_isa::eth;
 use tt_kernels::link::{discover, Dest, Dir, Mover, Source};
-use tt_tests::backend::{open_card, scrub};
+use tt_tests::bench::{mbps, median, pattern, with_cards};
 use tt_tests::harness::{tile, Dev};
-use tt_ttsim::fork_scope;
 
 const SIZES: [usize; 5] = [4 << 10, 16 << 10, 32 << 10, 64 << 10, 128 << 10];
 const REPS: usize = 20;
-
-fn mbps(bytes: usize, t: Duration) -> f64 {
-    bytes as f64 / t.as_secs_f64() / 1e6
-}
-
-fn median(mut v: Vec<Duration>) -> Duration {
-    v.sort();
-    v[v.len() / 2]
-}
-
-fn pattern(len: usize, seed: u32) -> Vec<u8> {
-    let mut s = seed | 1;
-    (0..len)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            s as u8
-        })
-        .collect()
-}
-
-fn with_cards(f: impl FnOnce(&mut Dev<'_>, &mut Dev<'_>)) {
-    if let Err(e) = fork_scope(|| {
-        let mut a = open_card(0);
-        let mut b = open_card(1);
-        f(&mut a, &mut b);
-        scrub(&mut a);
-        scrub(&mut b);
-    }) {
-        panic!("{e}");
-    }
-}
 
 /// Host-driven TT-link, Ethernet L1 to Ethernet L1, no firmware: the link and
 /// the TX queue alone, plus one PCIe poll loop on the receiver.

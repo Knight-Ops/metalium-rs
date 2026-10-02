@@ -131,6 +131,9 @@ where
         // generation, and the poll goes through a fence, since nothing the NoC
         // writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
         // SAFETY: fixed aligned mailbox locations inside L1.
+        let tracing = || unsafe { l1_read32(mb.trace()) } != 0;
+        trace(tracing(), Thread::INDEX, mailbox::trace::ACKED);
+        // SAFETY: fixed aligned mailbox locations inside L1.
         unsafe {
             l1_write32(mb.status(), status::DONE);
             l1_write32(mb.ack(), generation);
@@ -145,6 +148,7 @@ where
                 break;
             }
         }
+        trace(tracing(), Thread::INDEX, mailbox::trace::WOKE);
         // SAFETY: as above.
         unsafe { l1_write32(mb.status(), status::RUNNING) };
         publish();
