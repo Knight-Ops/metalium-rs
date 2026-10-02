@@ -37,6 +37,12 @@ use crate::runtime::SemaphoreInit;
 pub const A_ROW: u32 = 0;
 pub const B_ROW: u32 = 64;
 pub const OUT_ROW: u32 = 128;
+/// A ternary op's third operand (`Operands::Ternary`): inside 32-bit `Dst`'s
+/// 512 rows (`Dst.md`).
+pub const C_ROW: u32 = 192;
+/// Rows a program may spill registers to (`log1p`, `pow`): no unpacker writes
+/// them, no packer reads them.
+pub const SPILL_ROW: u32 = 256;
 
 /// What a tile's second operand is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +61,8 @@ pub enum Operands {
     /// makes `B`'s tile so (`tt_isa::dm::op::READ_BROADCAST_COL`), and the
     /// kernel unpacks it as [`Operands::Binary`] does.
     ColBroadcast,
+    /// `A`, `B` and `C`, the same shape: `C` to rows `C_ROW..C_ROW + 64`.
+    Ternary,
 }
 
 /// The `Dst` row of the broadcast row's group for row group `g` of a tile:
@@ -84,6 +92,8 @@ pub struct Layout {
     pub a_at: u64,
     /// The second operand's, unless unary.
     pub b_at: Option<u64>,
+    /// The third operand's, for a ternary op.
+    pub c_at: Option<u64>,
     /// The packer's output slots: datums at `TILE_DATA` past each slot's start.
     pub out_at: u64,
     pub sems: SfpuSemaphores,
@@ -98,6 +108,8 @@ pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError
     let align = tt_isa::dram::ALIGN;
     let a = req.scratch("sfpu A slots", bytes, align, 0..1);
     let b = (operands != Operands::Unary).then(|| req.scratch("sfpu B slots", bytes, align, 0..1));
+    let c =
+        (operands == Operands::Ternary).then(|| req.scratch("sfpu C slots", bytes, align, 0..1));
     let out = req.scratch("sfpu output slots", bytes, align, 0..1);
     // Declared in this order so the planner numbers them as a matmul's are --
     // the first starting at zero, the second at one -- and a tile that ran
@@ -110,6 +122,7 @@ pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError
         tiles,
         a_at: plan.addr(a),
         b_at: b.map(|b| plan.addr(b)),
+        c_at: c.map(|c| plan.addr(c)),
         out_at: plan.addr(out),
         sems: SfpuSemaphores {
             unpacked: plan.semaphore(unpacked),
@@ -120,9 +133,14 @@ pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError
     })
 }
 
-/// Most tiles a run may have: three slots each in the data arena.
+/// Most tiles a run may have: a slot per operand and one for the output, each,
+/// in the data arena.
 pub fn max_tiles(operands: Operands) -> usize {
-    let per = if operands == Operands::Unary { 2 } else { 3 };
+    let per = match operands {
+        Operands::Unary => 2,
+        Operands::Ternary => 4,
+        _ => 3,
+    };
     (tt_isa::l1::DATA.len() / (per * TILE_SLOT)) as usize
 }
 
@@ -130,6 +148,26 @@ pub fn max_tiles(operands: Operands) -> usize {
 /// tile's SFPU program, reading `A_ROW` (and `B_ROW`) and writing `OUT_ROW`
 /// -- run once per tile.
 pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<Instruction>; 3] {
+    let (code, loops) = roles_code(layout, operands, &crate::code::Code::plain(math.to_vec()));
+    std::array::from_fn(|t| {
+        crate::code::Code {
+            ins: code[t].clone(),
+            loops: loops[t].clone(),
+        }
+        .expand()
+    })
+}
+
+/// [`roles`] as the role slots hold them, with each role's block repeats
+/// (`crate::code`): the math role's per-tile block -- the same for every tile
+/// -- stored once and repeated once per tile, and `math`'s own row loops
+/// inside it, so a run's math program is one tile's whatever its length.
+pub fn roles_code(
+    layout: &Layout,
+    operands: Operands,
+    math: &crate::code::Code,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    use crate::code::Loop;
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
 
@@ -143,6 +181,7 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
     tile_unpack_config(&mut words, layout.a_at);
     unpack.extend(config_program(&words));
     let mut m = vec![state_id()];
+    let mut math_loops = Vec::new();
     let mut pack = vec![state_id()];
     for n in 0..layout.tiles {
         unpack.extend(sync::take(s.free, Before::UNPACKER));
@@ -150,6 +189,11 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
         match (operands, layout.b_at) {
             (Operands::Binary | Operands::ColBroadcast, Some(b)) => {
                 unpack.extend(unpack_tile_to_dst(slot(b, n), B_ROW));
+            }
+            (Operands::Ternary, Some(b)) => {
+                unpack.extend(unpack_tile_to_dst(slot(b, n), B_ROW));
+                let c = layout.c_at.expect("a ternary layout has C slots");
+                unpack.extend(unpack_tile_to_dst(slot(c, n), C_ROW));
             }
             (Operands::RowBroadcast, Some(b)) => {
                 // Row 0 of faces 0 and 1: datums 0..16 and 256..272.
@@ -169,9 +213,24 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
         }
         unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
 
-        m.extend(sync::take(s.unpacked, Before::SFPU));
-        m.extend_from_slice(math);
-        m.extend(sync::post_after(Unit::Sfpu, s.computed));
+        if n == 0 {
+            let block = m.len() as u32;
+            m.extend(sync::take(s.unpacked, Before::SFPU));
+            let at = m.len() as u32;
+            m.extend_from_slice(&math.ins);
+            m.extend(sync::post_after(Unit::Sfpu, s.computed));
+            if layout.tiles > 1 {
+                math_loops.push(Loop {
+                    start: block,
+                    len: m.len() as u32 - block,
+                    count: layout.tiles as u32,
+                });
+            }
+            math_loops.extend(math.loops.iter().map(|l| Loop {
+                start: l.start + at,
+                ..*l
+            }));
+        }
 
         pack.extend(sync::take(s.computed, Before::PACKER));
         pack.extend(pack_tile_from_dst(
@@ -182,7 +241,7 @@ pub fn roles(layout: &Layout, operands: Operands, math: &[Instruction]) -> [Vec<
     }
     unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
     pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
-    [unpack, m, pack]
+    ([unpack, m, pack], [Vec::new(), math_loops, Vec::new()])
 }
 
 #[cfg(test)]
@@ -199,6 +258,7 @@ mod tests {
             Operands::Binary,
             Operands::RowBroadcast,
             Operands::ColBroadcast,
+            Operands::Ternary,
         ] {
             let sfpu = plan_layout(8, operands).unwrap().init;
             for m in &matmul {

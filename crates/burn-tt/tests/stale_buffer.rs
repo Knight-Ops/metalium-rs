@@ -16,7 +16,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use burn_tensor::{Tensor, TensorData};
 use burn_tt::{attach, AttachGuard, BufferId, Engine, EngineError, TtBackend, TtDevice};
-use tt_isa::dm::kind;
+use tt_kernels::kind;
 
 /// Keeps tensors on the host, numbered from 1 per engine as `DramBuffers`
 /// numbers them; only `MUL_SCALAR` computes.

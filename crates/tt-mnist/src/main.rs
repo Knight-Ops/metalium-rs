@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 use burn::backend::Autodiff;
 use burn::module::{AutodiffModule, Module, Param};
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::nn::{Linear, Relu};
+use burn::nn::Linear;
 use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+use burn::tensor::activation;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
@@ -90,13 +91,58 @@ fn mnist() -> (Split, Split) {
 struct Mlp<B: Backend> {
     l1: Linear<B>,
     l2: Linear<B>,
-    relu: Relu,
+    #[module(skip)]
+    act: Act,
 }
 
-/// The initial weights, drawn once so the card and the host start the same.
+/// The hidden layer's activation (`--activation`): Burn's own functions, so
+/// the example exercises whatever burn-tt runs of them on the card -- and
+/// shows in its timings what still falls back to the host.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Act {
+    Relu,
+    LeakyRelu,
+    Gelu,
+    Tanh,
+    Sigmoid,
+    Silu,
+    HardSigmoid,
+}
+
+impl Act {
+    const ALL: [(&'static str, Act); 7] = [
+        ("relu", Act::Relu),
+        ("leaky-relu", Act::LeakyRelu),
+        ("gelu", Act::Gelu),
+        ("tanh", Act::Tanh),
+        ("sigmoid", Act::Sigmoid),
+        ("silu", Act::Silu),
+        ("hard-sigmoid", Act::HardSigmoid),
+    ];
+
+    fn name(self) -> &'static str {
+        Act::ALL.iter().find(|(_, a)| *a == self).unwrap().0
+    }
+
+    fn apply<B: Backend>(self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        match self {
+            Act::Relu => activation::relu(x),
+            Act::LeakyRelu => activation::leaky_relu(x, 0.01),
+            Act::Gelu => activation::gelu(x),
+            Act::Tanh => activation::tanh(x),
+            Act::Sigmoid => activation::sigmoid(x),
+            Act::Silu => activation::silu(x),
+            Act::HardSigmoid => activation::hard_sigmoid(x, 0.2, 0.5),
+        }
+    }
+}
+
+/// The initial weights, drawn once so the card and the host start the same,
+/// and the activation between the layers.
 struct Init {
     l1: (TensorData, TensorData),
     l2: (TensorData, TensorData),
+    act: Act,
 }
 
 fn init() -> Init {
@@ -119,6 +165,7 @@ fn init() -> Init {
     Init {
         l1: layer(PIXELS, HIDDEN),
         l2: layer(HIDDEN, CLASSES),
+        act: Act::Relu,
     }
 }
 
@@ -131,12 +178,12 @@ impl<B: Backend> Mlp<B> {
         Mlp {
             l1: linear(&init.l1),
             l2: linear(&init.l2),
-            relu: Relu::new(),
+            act: init.act,
         }
     }
 
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.l2.forward(self.relu.forward(self.l1.forward(x)))
+        self.l2.forward(self.act.apply(self.l1.forward(x)))
     }
 }
 
@@ -447,10 +494,11 @@ struct Args {
     trace: bool,
     batch: usize,
     passes: usize,
+    activation: Act,
 }
 
 const USAGE: &str = "\
-usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
+usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host] [--activation A]
        tt-mnist --infer [--trace] [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
 
   --card N      train on /dev/tenstorrent/N (default 0)
@@ -465,7 +513,9 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
   --trace       with --infer: capture the forward pass once as a trace and
                 replay it for every batch, each batch written from the host
   --batch B     inference batch size (default 64)
-  --passes P    rounds over the test set (default 3)";
+  --passes P    rounds over the test set (default 3)
+  --activation A  the hidden layer's activation: relu (default), leaky-relu,
+                gelu, tanh, sigmoid, silu, hard-sigmoid";
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
@@ -477,6 +527,7 @@ fn args() -> Result<Args, String> {
         trace: false,
         batch: BATCH,
         passes: 3,
+        activation: Act::Relu,
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -501,6 +552,16 @@ fn args() -> Result<Args, String> {
             "--trace" => a.trace = true,
             "--batch" => a.batch = number(value()?)?,
             "--passes" => a.passes = number(value()?)?,
+            "--activation" => {
+                let v = value()?;
+                a.activation = Act::ALL
+                    .iter()
+                    .find(|(n, _)| *n == v)
+                    .map(|(_, act)| *act)
+                    .ok_or(format!(
+                        "--activation {v}: not one of the choices\n\n{USAGE}"
+                    ))?;
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
@@ -545,7 +606,10 @@ fn main() {
     };
     println!("tt-mnist: a {PIXELS}-{HIDDEN}-{CLASSES} network learning MNIST, in Rust, on Tenstorrent Blackhole");
     println!("  device   {cards}");
-    println!("  model    Burn nn::Linear x2 + ReLU, cross-entropy, SGD lr {LR}, batch {BATCH}");
+    println!(
+        "  model    Burn nn::Linear x2 + {}, cross-entropy, SGD lr {LR}, batch {BATCH}",
+        a.activation.name()
+    );
 
     let t0 = Instant::now();
     let (train_split, test_split) = mnist();
@@ -555,7 +619,10 @@ fn main() {
         test_split.n,
         t0.elapsed()
     );
-    let init = init();
+    let init = Init {
+        act: a.activation,
+        ..init()
+    };
 
     let device = TtDevice::new(0);
     let guard = match attach_topology(

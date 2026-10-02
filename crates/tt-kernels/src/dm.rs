@@ -96,6 +96,25 @@ fn ring_room(
     }
 }
 
+/// What a mover's in-flight cap cost it ([`DataMover::throttle`]).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Throttle {
+    /// Requests that waited for room under the cap.
+    pub stalls: u32,
+    /// Tile-counter cycles they waited, in total (wrapping).
+    pub cycles: u32,
+}
+
+impl std::ops::Add for Throttle {
+    type Output = Throttle;
+    fn add(self, o: Throttle) -> Throttle {
+        Throttle {
+            stalls: self.stalls.wrapping_add(o.stalls),
+            cycles: self.cycles.wrapping_add(o.cycles),
+        }
+    }
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
@@ -137,6 +156,9 @@ impl<N: NocId> DataMover<N> {
             dm::DONE,
             dm::ERROR,
             dm::TRACE,
+            dm::THROTTLE_STALLS,
+            dm::THROTTLE_CYCLES,
+            dm::IN_FLIGHT_CAP,
             dm::QUEUE_HEAD,
             dm::QUEUE_DONE,
             dm::QUEUE_ERROR,
@@ -169,6 +191,29 @@ impl<N: NocId> DataMover<N> {
 
     pub fn tile(&self) -> NocCoord<N> {
         self.tile
+    }
+
+    /// What the in-flight cap (`tt_isa::noc::niu::InFlight`) has cost this
+    /// mover since it started: the requests that waited for room, and the tile
+    /// cycles they waited. Two PCIe reads; not on any hot path.
+    pub fn throttle<T: Transport>(&self, d: &mut Device<T>, w: &Window) -> Result<Throttle> {
+        Ok(Throttle {
+            stalls: d.read32(w, self.tile, dm::THROTTLE_STALLS)?,
+            cycles: d.read32(w, self.tile, dm::THROTTLE_CYCLES)?,
+        })
+    }
+
+    /// Cap this mover's requests in flight at `cap` from its next list: 0 for
+    /// `tt_isa::noc::niu::MAX_IN_FLIGHT`, otherwise clamped to
+    /// `1..=MAX_IN_FLIGHT`. For the gates that force the throttle.
+    pub fn set_in_flight_cap<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        cap: u32,
+    ) -> Result<()> {
+        d.write32(w, self.tile, dm::IN_FLIGHT_CAP, cap)?;
+        Ok(())
     }
 
     /// Copy all of `from` into this tile's L1 at `to_l1`, through the channel's

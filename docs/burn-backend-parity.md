@@ -336,7 +336,7 @@ once-per-key warning, **(3)** typed early error.
 | 13 | Slice not on whole tile rows | full download of the parent (`ops.rs:331`) -- for a preloaded dataset, the whole dataset | partial download of the rows the slice reaches (small downloads already read only what they touch, checklist 9.4b) then upload; D4 does it on device | 2 |
 | 14 | Broadcasts other than `[1,n]` (`[m,1]`, scalars as tensors, rank-N) | host (`ops.rs:80-87`) | report; kernels in S1/D4 | 2 |
 | 15 | `sum_dim(1)`, mean, max, softmax, ... | host | report; R1/R2 | 2 |
-| 16 | Int/bool ops (labels, masks, argmax) | host, by design until D3/S5 | report under `Reason::NoDeviceKernel`; *not* warned when operands are host-resident (no cost) | 2 |
+| 16 | Int/bool ops (labels, masks, argmax) | storage, views and the logic ops on the device since D3 (`hardware-coverage.md` 10.2b); arithmetic host until S5 | report under `Reason::NoDeviceKernel`; *not* warned when operands are host-resident (no cost) | 2 |
 | 17 | Mesh topology | all host-staged, no GDDR (`server.rs:630-643`; 233 vs 5.8 ms/step, checklist 9.4b) | warn at attach with the measured cost until 9.11 | 2 |
 | 18 | Device error mid-model (timeout, run error) | panic in the op (`server.rs:405-512`) | sticky error -> `ExecutionError` at `sync`/`try_into_data`; strict = immediate typed panic | 3 |
 | 19 | Engine panics on the server thread | thread dies; every later op panics "server thread has stopped" without the cause (`server.rs:391-393`) | `catch_unwind` around each job; device moves to `Failed(cause)` | 3 |
@@ -428,9 +428,12 @@ with teeth.
 
 Some device ops are approximations held to derived bounds rather than to Flex's bits
 (`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
-`log`, sums over columns (tree order), softmax. `burn_tt::set_exact(true)` or
+`log` and the rest of S4's transcendentals (10.2d-f, trigonometry included), sums over
+columns (tree order), softmax. `burn_tt::set_exact(true)` or
 `TT_EXACT=1` keeps on the device only what gives Flex's bits exactly; a run that must
-reproduce a host golden sets it (the MNIST golden does). Below eight tiles the
+reproduce a host golden sets it (the MNIST golden does). Which ops are which is data:
+`tt_kernels::sfpu::ops::accuracy` -- S2's compare, select and sign ops are exact and run
+on the device in exact mode and at any size (`hardware-coverage.md` 10.2c). Below eight tiles the
 approximate ops run on the host whatever the mode (`APPROX_MIN_TILES`, measured: their
 fixed cost outweighs a download) -- a placement heuristic B16 should replace.
 

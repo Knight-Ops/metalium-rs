@@ -42,7 +42,7 @@ use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
 
 use crate::datapath;
-use crate::dm::DataMover;
+use crate::dm::{DataMover, Throttle};
 use crate::matmul::{self, Fidelity, SrcRoute};
 use crate::program_cache::ProgramCache;
 use crate::runtime::{self, Kernel, Resident, RoleImages, RunError, Schedule};
@@ -325,8 +325,6 @@ pub struct Session<T: Transport> {
     /// Each unit's timestamper stream so far, between
     /// [`Session::profile_start`] and [`Session::profile_stop`].
     profiling: Option<Vec<crate::profile::UnitProfile>>,
-    /// Which unit element-wise ops run on ([`Session::set_eltwise_unit`]).
-    eltwise_unit: tensor::EltwiseUnit,
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
@@ -370,7 +368,15 @@ struct Unit {
     /// Lists enqueued on this tile's mover and not yet retired, oldest first
     /// ([`Session::sync`]).
     queued: std::collections::VecDeque<QueuedList>,
+    /// `lists` when the mover's throttle was last looked at, and the stalls
+    /// last reported ([`Session::check_throttle`]).
+    throttle_checked_at: u64,
+    throttle_reported: u32,
 }
+
+/// Lists between looks at a unit's throttle counters: one PCIe read per this
+/// many host round trips.
+const THROTTLE_CHECK_LISTS: u64 = 1024;
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
 /// close when it is retired), and what it was, for an error.
@@ -401,6 +407,9 @@ struct Segment {
     kernels: Vec<usize>,
     /// The programs of each `KERNEL` entry, in order.
     kernel_roles: Vec<Arc<[Vec<Instruction>; 3]>>,
+    /// Each kernel's block repeats, beside its roles: stored with its
+    /// programs (`crate::code::Code::stored`).
+    kernel_loops: Vec<Arc<[Vec<crate::code::Loop>; 3]>>,
     /// Do its kernels run resident programs (`crate::program_cache`), each
     /// entry naming its own? Otherwise they all run the one program set the
     /// host stages in the fixed slots, `roles`.
@@ -414,6 +423,9 @@ struct Segment {
     /// Its kernels' MOP configurations: one descriptor serves the list, so
     /// every kernel in it has the same (`tensor::Step::Kernel::mop`).
     mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    /// The block repeats of the programs a list of fixed-slot kernels shares
+    /// (resident lists' kernels each carry their own, `kernel_loops`).
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
 }
@@ -449,7 +461,13 @@ fn place_programs<T: Transport>(
                 if program.is_empty() {
                     continue;
                 }
-                let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
+                let code = crate::code::Code {
+                    ins: program.clone(),
+                    loops: seg.kernel_loops[k][t].clone(),
+                };
+                let (words, len_word) = code
+                    .stored()
+                    .map_err(|e| PlaceError::Failed(TensorError::Shape(e.to_string())))?;
                 let at = match cache.place(&words) {
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
@@ -468,7 +486,7 @@ fn place_programs<T: Transport>(
                         break 'kernels;
                     }
                 };
-                p[t] = (at as u32, words.len() as u32);
+                p[t] = (at as u32, len_word);
             }
             placed.push(p);
         }
@@ -564,7 +582,12 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 cur.steps += 1;
                 after_list = true;
             }
-            Step::Kernel { roles, init, mop } => {
+            Step::Kernel {
+                roles,
+                init,
+                mop,
+                loops,
+            } => {
                 let resident = roles
                     .iter()
                     .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
@@ -585,15 +608,25 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                         })
                 };
                 let same_mop = cur.kernels.is_empty() || cur.mop == *mop;
-                if !same_init || !same_mop || !fits || cur.entries.len() == LIST_MAX as usize {
+                // Resident programs carry their loops; fixed-slot kernels
+                // share one program, so one table.
+                let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
+                if !same_init
+                    || !same_mop
+                    || !same_loops
+                    || !fits
+                    || cur.entries.len() == LIST_MAX as usize
+                {
                     close(&mut cur, &mut out);
                 }
                 cur.mop = *mop;
+                cur.loops = loops.clone();
                 cur.resident = resident;
                 if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
                     cur.resident_bytes += bytes;
                 }
                 cur.kernel_roles.push(roles.clone());
+                cur.kernel_loops.push(loops.clone());
                 if cur.what.is_empty() {
                     cur.what = "matmul";
                 }
@@ -671,7 +704,6 @@ impl<T: Transport> Session<T> {
             profile: runtime::Profile::default(),
             dram: None,
             profiling: None,
-            eltwise_unit: tensor::EltwiseUnit::default(),
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
             barriers: 0,
             pending_frees: Vec::new(),
@@ -694,6 +726,8 @@ impl<T: Transport> Session<T> {
                 lists: 0,
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
+                throttle_checked_at: 0,
+                throttle_reported: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -933,6 +967,33 @@ impl<T: Transport> Session<T> {
         DramTensor::upload(dev, &d.w4, &mut d.alloc, values, rows, cols)
     }
 
+    /// Upload a row-major `[rows, cols]` matrix of `elem` datums, as their
+    /// bits (`DramTensor::upload_bits`).
+    pub fn upload_bits(
+        &mut self,
+        values: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: crate::tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        DramTensor::upload_bits(dev, &d.w4, &mut d.alloc, values, rows, cols, elem)
+    }
+
+    /// Download a tensor of any element type to row-major datums' bits.
+    pub fn download_bits(&mut self, t: &DramTensor) -> Result<Vec<u32>, TensorError> {
+        self.refuse_while_capturing("download")?;
+        self.sync()?;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        t.download_bits(dev, &d.w4)
+    }
+
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
         self.refuse_while_capturing("download")?;
@@ -1059,6 +1120,9 @@ impl<T: Transport> Session<T> {
         }
         if ok {
             unit.programs.unpin_all();
+            if unit.lists >= unit.throttle_checked_at + THROTTLE_CHECK_LISTS {
+                self.check_throttle(u);
+            }
             self.drain(u)?;
             return Ok(());
         }
@@ -1221,6 +1285,29 @@ impl<T: Transport> Session<T> {
             return Err(TraceError::NotResident.into());
         }
         self.ensure_unit(u)?;
+        // A drain the descriptors need comes before the programs are placed:
+        // a drain unpins every program, and those placed for this list must
+        // stay pinned until it has run -- the next placement would otherwise
+        // be free to evict them under it.
+        let kernel = seg.kernel_roles.first().map(|roles| {
+            let [unpack, math, pack] = &**roles;
+            Kernel {
+                restores_semaphores: true,
+                mop: seg.mop,
+                loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
+                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
+            }
+        });
+        if let Some(kernel) = &kernel {
+            let idle = {
+                let Session { dev, units, .. } = self;
+                let r = units[u].resident.as_ref().unwrap();
+                r.needs_idle(dev, kernel, seg.resident)
+            };
+            if idle {
+                self.drain_unit(u)?;
+            }
+        }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
             let placed = {
@@ -1251,21 +1338,7 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
-        if let Some(roles) = seg.kernel_roles.first() {
-            let [unpack, math, pack] = &**roles;
-            let kernel = Kernel {
-                restores_semaphores: true,
-                mop: seg.mop,
-                ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
-            };
-            let idle = {
-                let Session { dev, units, .. } = self;
-                let r = units[u].resident.as_ref().unwrap();
-                r.needs_idle(dev, &kernel, seg.resident)
-            };
-            if idle {
-                self.drain_unit(u)?;
-            }
+        if let Some(kernel) = &kernel {
             let Session {
                 dev, units, images, ..
             } = self;
@@ -1274,7 +1347,7 @@ impl<T: Transport> Session<T> {
             let generations = r.reserve(
                 dev,
                 images,
-                &kernel,
+                kernel,
                 budget,
                 seg.kernels.len() as u32,
                 seg.resident,
@@ -1336,6 +1409,7 @@ impl<T: Transport> Session<T> {
             let kernel = Kernel {
                 restores_semaphores: true,
                 mop: seg.mop,
+                loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
                 ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
             };
             let Session { dev, units, .. } = self;
@@ -1745,68 +1819,81 @@ impl<T: Transport> Session<T> {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
     }
 
-    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`])
-    /// or the data movers' FP32 units ([`tensor::eltwise`]), as
-    /// [`Session::set_eltwise_unit`] says.
+    /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`]).
+    /// An op with no SFPU program is refused: the data mover does no
+    /// arithmetic.
     pub fn eltwise(
         &mut self,
         op: tensor::Eltwise,
         a: &DramTensor,
         b: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
+        self.eltwise3(op, a, b, None)
+    }
+
+    /// [`Session::eltwise`] with a ternary op's third operand
+    /// (`sfpu::ops::kind_sfpu::MASK_WHERE`): the SFPU's alone.
+    pub fn eltwise3(
+        &mut self,
+        op: tensor::Eltwise,
+        a: &DramTensor,
+        b: Option<&DramTensor>,
+        c: Option<&DramTensor>,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let unit = self.eltwise_unit;
         let alloc = &mut self.dram_state()?.alloc;
-        let [rt, ct] = a.grid();
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
-        use crate::sfpu::ops::Broadcast;
-        // What the mover can do: its own kinds, the same shape or `ADD_ROW`.
-        let mover_op = match (kind, bcast) {
-            (k, Broadcast::None) if crate::sfpu::ops::mover_has(k) => Some(op),
-            (tt_isa::dm::kind::ADD, Broadcast::Row) => Some(tensor::Eltwise {
-                kind: tt_isa::dm::kind::ADD_ROW,
-                ..op
-            }),
-            _ => None,
-        };
-        // Anything else goes to the SFPU whatever the setting.
-        let sfpu = mover_op.is_none()
-            || match unit {
-                tensor::EltwiseUnit::Sfpu => true,
-                tensor::EltwiseUnit::Mover => false,
-                tensor::EltwiseUnit::Auto => tensor::sfpu_is_cheaper(kind, rt * ct, units),
-            };
-        let work = if sfpu {
-            tensor::sfpu_eltwise(alloc, op, a, b, units)?
-        } else {
-            None
-        };
-        let work = match (work, mover_op) {
-            (Some(w), _) => w,
-            (None, Some(m)) => tensor::eltwise(alloc, m, a, b, units)?,
-            (None, None) => {
-                return Err(TensorError::Shape(format!(
-                    "element-wise {kind:#x} with {bcast:?}: no unit computes it"
-                )))
-            }
+        // The SFPU's, or refused: the mover only moves data.
+        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units)? else {
+            return Err(TensorError::Shape(format!(
+                "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
+            )));
         };
         let out = self.execute(work, RESET_BUDGET)?;
-        out.set_pad(op.produces(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>()));
+        out.set_pad(op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()));
         Ok(out)
     }
 
-    /// Run element-wise ops on `unit` from now on: by default whichever is
-    /// cheaper for the op's size (`tensor::sfpu_is_cheaper`), or always the
-    /// SFPU (where the op has a program), or always the data mover's FP32
-    /// unit, which stays as the reference and the fallback. Bit-identical
-    /// whichever (`step19_eltwise`).
-    pub fn set_eltwise_unit(&mut self, unit: tensor::EltwiseUnit) {
-        self.eltwise_unit = unit;
+    /// `x^y` as `powf` (S4, 10.2d): `e^(y ln|x|)` and the special values, one
+    /// SFPU op (`POW`, `POW_S`, `POW_I`); within `sfpu::ops::pow_bound`. `y`
+    /// the same shape as `x`, a scalar, or an `I32` tensor (`as f32` in the
+    /// program).
+    pub fn pow(&mut self, x: &DramTensor, y: PowExponent<'_>) -> Result<DramTensor, TensorError> {
+        use crate::sfpu::ops::kind_sfpu::*;
+        let op = |kind, scalar| tensor::Eltwise {
+            kind,
+            scalar,
+            scalar2: 0.0,
+        };
+        let (op, t) = match y {
+            PowExponent::Tensor(t) => (op(POW, 0.0), Some(t)),
+            PowExponent::Int(t) => (op(POW_I, 0.0), Some(t)),
+            PowExponent::Scalar(s) => (op(POW_S, s), None),
+        };
+        if let Some(t) = t {
+            if (t.rows, t.cols) != (x.rows, x.cols) {
+                return Err(TensorError::Shape(format!(
+                    "pow: an exponent [{}, {}] for [{}, {}]",
+                    t.rows, t.cols, x.rows, x.cols
+                )));
+            }
+        }
+        self.eltwise(op, x, t)
     }
 
-    pub fn eltwise_unit(&self) -> tensor::EltwiseUnit {
-        self.eltwise_unit
+    /// `t`, bit for bit, as a tensor of its own ([`tensor::copy`]): data
+    /// movement only, any element type.
+    pub fn copy(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let work = tensor::copy(&mut self.dram_state()?.alloc, t, units)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(if t.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
     }
 
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
@@ -1821,8 +1908,8 @@ impl<T: Transport> Session<T> {
     }
 
     /// `a` reduced over `axis` by `op`: `[rows, 1]` over columns, `[1, cols]`
-    /// over rows. On the SFPU ([`tensor::sfpu_reduce`]), except a sum over
-    /// rows, which the mover does in Flex's order ([`Session::sum_rows`]).
+    /// over rows. On the SFPU ([`tensor::sfpu_reduce`]); a sum over rows in
+    /// Flex's order ([`Session::sum_rows`]).
     /// Padding is masked in the kernel, so `a`'s is never read; the output's
     /// padding holds copies of the result (over columns) or is undefined.
     pub fn reduce(
@@ -1866,14 +1953,7 @@ impl<T: Transport> Session<T> {
             t.set_pad(Pad::Zero);
             return Ok(None);
         }
-        let copy = self.eltwise(
-            tensor::Eltwise {
-                kind: tt_isa::dm::kind::COPY,
-                scalar: 0.0,
-            },
-            t,
-            None,
-        )?;
+        let copy = self.copy(t)?;
         let jobs = tensor::fill_pad(&copy, 0.0, units)?;
         if let Err(e) = self.submit_jobs(jobs, RESET_BUDGET) {
             let _ = self.free(copy);
@@ -1897,6 +1977,9 @@ impl<T: Transport> Session<T> {
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
+        // Before any padding fill: an integer tensor is refused untouched.
+        a.expect("a matmul", tensor::Elem::F32)?;
+        b.expect("a matmul", tensor::Elem::F32)?;
         let need = tensor::MatmulPadding;
         let ca = self.meet(a, need.requires(0))?;
         let cb = match self.meet(b, need.requires(1)) {
@@ -2123,6 +2206,7 @@ impl<T: Transport> Session<T> {
                     // to back.
                     restores_semaphores: true,
                     mop: seg.mop,
+                    loops: [&seg.loops[0], &seg.loops[1], &seg.loops[2]],
                     ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
                 };
                 let generations = r.reserve(
@@ -2293,8 +2377,56 @@ impl<T: Transport> Session<T> {
         self.sync().map_err(|e| RunError::Queued(e.to_string()))
     }
 
+    /// What the in-flight cap has cost every unit's mover since it started
+    /// (`DataMover::throttle`), summed: requests that waited for room, and
+    /// the cycles they waited. A PCIe read pair per unit.
+    pub fn throttle(&mut self) -> Result<Throttle, TensorError> {
+        let mut sum = Throttle::default();
+        for u in 0..self.units.len() {
+            let Session { dev, units, .. } = self;
+            let unit = &units[u];
+            if let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                sum = sum + m.throttle(dev, r.window())?;
+            }
+        }
+        Ok(sum)
+    }
+
+    /// Say so when unit `u`'s mover has waited for room under the in-flight
+    /// cap more than it had at the last report -- first at all, then each
+    /// doubling -- so a cap that has become a bottleneck is noticed rather
+    /// than paid for silently. Checked every [`THROTTLE_CHECK_LISTS`] lists
+    /// and when the session ends.
+    fn check_throttle(&mut self, u: usize) {
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        unit.throttle_checked_at = unit.lists;
+        let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) else {
+            return;
+        };
+        let Ok(t) = m.throttle(dev, r.window()) else {
+            return;
+        };
+        if t.stalls > unit.throttle_reported.saturating_mul(2) {
+            unit.throttle_reported = t.stalls;
+            eprintln!(
+                "session: tile ({}, {})'s mover has waited for room under the NoC in-flight cap \
+                 ({} requests) {} times, {} cycles in all; if this grows, revisit \
+                 tt_isa::noc::niu::MAX_IN_FLIGHT (docs/firmware-performance.md)",
+                unit.tile.x(),
+                unit.tile.y(),
+                tt_isa::noc::niu::MAX_IN_FLIGHT,
+                t.stalls,
+                t.cycles
+            );
+        }
+    }
+
     pub fn into_device(mut self) -> Device<T> {
         let _ = self.sync();
+        for u in 0..self.units.len() {
+            self.check_throttle(u);
+        }
         for u in &mut self.units {
             if let Some(r) = u.resident.take() {
                 let _ = r.stop(&mut self.dev, &self.images);
@@ -2372,6 +2504,7 @@ mod tests {
                     roles: roles.clone(),
                     init: init.clone(),
                     mop: Box::new([None; 3]),
+                    loops: Default::default(),
                 },
                 list(1, 2),
             ]
@@ -2405,6 +2538,7 @@ mod tests {
                 roles: roles.clone(),
                 init: init.clone(),
                 mop: Box::new([None; 3]),
+                loops: Default::default(),
             };
         let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
         assert_eq!(segs.len(), 1, "every program is resident: one list");
@@ -2428,6 +2562,7 @@ mod tests {
             roles: roles.clone(),
             init: init.clone(),
             mop: Box::new([None; 3]),
+            loops: Default::default(),
         };
         let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
@@ -2448,6 +2583,7 @@ mod tests {
                 roles: p(n),
                 init: init.clone(),
                 mop: Box::new([None; 3]),
+                loops: Default::default(),
             })
             .collect();
         let segs = segments(steps);
@@ -2517,4 +2653,15 @@ mod tests {
             "{text}"
         );
     }
+}
+
+/// What [`Session::pow`] raises to.
+#[derive(Copy, Clone, Debug)]
+pub enum PowExponent<'a> {
+    /// An `F32` tensor of the base's shape.
+    Tensor(&'a DramTensor),
+    /// One value.
+    Scalar(f32),
+    /// An `I32` tensor of the base's shape, `as f32` first.
+    Int(&'a DramTensor),
 }

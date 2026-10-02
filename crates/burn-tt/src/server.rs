@@ -23,6 +23,16 @@ use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, SessionError, TileChoice};
 
 use crate::TtDevice;
+pub use tt_kernels::tensor::Elem;
+
+/// What [`Engine::pow`] raises to: a buffer of the base's shape, a scalar, or
+/// an `I32` buffer.
+#[derive(Copy, Clone, Debug)]
+pub enum PowArg {
+    Tensor(BufferId),
+    Scalar(f32),
+    Int(BufferId),
+}
 
 /// What a device can do for the backend, on its server thread.
 pub trait Engine {
@@ -45,6 +55,22 @@ pub trait Engine {
     }
     /// Read one back, row-major.
     fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, EngineError> {
+        Err(unsupported())
+    }
+    /// Put a row-major `[rows, cols]` matrix of `elem` datums on the device, as
+    /// their bits (`hardware-coverage.md` D3): an `I32`'s two's complement, a
+    /// `Bool`'s `0` or `1`.
+    fn upload_bits(
+        &mut self,
+        _bits: &[u32],
+        _rows: usize,
+        _cols: usize,
+        _elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        Err(unsupported())
+    }
+    /// Read any buffer back as its datums' bits, row-major.
+    fn download_bits(&mut self, _id: BufferId) -> Result<Vec<u32>, EngineError> {
         Err(unsupported())
     }
     /// Forget one.
@@ -84,7 +110,7 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
-    /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_isa::dm::kind`),
+    /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_kernels::kind`),
     /// result left on the device.
     fn eltwise(
         &mut self,
@@ -93,6 +119,26 @@ pub trait Engine {
         _a: BufferId,
         _b: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// [`Engine::eltwise`] with the whole op -- both its scalars -- and a
+    /// ternary op's third operand. An engine without its own forwards what
+    /// the plain form carries.
+    fn eltwise_op(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if op.scalar2 != 0.0 || c.is_some() {
+            return Err(unsupported());
+        }
+        self.eltwise(op.kind, op.scalar, a, b)
+    }
+    /// `x^y` as `powf` (`tt_kernels::session::Session::pow`), result on the
+    /// device.
+    fn pow(&mut self, _x: BufferId, _y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
     /// Everything the engine's device has moved across its transport so far
@@ -212,6 +258,56 @@ impl DramBuffers {
         s.download(t).map_err(|e| EngineError(e.to_string()))
     }
 
+    pub fn pow<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BufferId,
+        y: PowArg,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        use tt_kernels::session::PowExponent;
+        let tx = self.get(x)?.clone();
+        let ty = match y {
+            PowArg::Tensor(b) | PowArg::Int(b) => Some(self.get(b)?.clone()),
+            PowArg::Scalar(_) => None,
+        };
+        let exp = match (y, &ty) {
+            (PowArg::Tensor(_), Some(t)) => PowExponent::Tensor(t),
+            (PowArg::Int(_), Some(t)) => PowExponent::Int(t),
+            (PowArg::Scalar(v), _) => PowExponent::Scalar(v),
+            _ => unreachable!(),
+        };
+        let c = s.pow(&tx, exp).map_err(|e| EngineError(e.to_string()))?;
+        let dims = [c.rows, c.cols];
+        self.next += 1;
+        self.live.insert(self.next, c);
+        Ok((self.next, dims))
+    }
+
+    pub fn upload_bits<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        bits: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        let t = s
+            .upload_bits(bits, rows, cols, elem)
+            .map_err(|e| EngineError(e.to_string()))?;
+        self.next += 1;
+        self.live.insert(self.next, t);
+        Ok(self.next)
+    }
+
+    pub fn download_bits<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+    ) -> Result<Vec<u32>, EngineError> {
+        let t = self.get(id)?;
+        s.download_bits(t).map_err(|e| EngineError(e.to_string()))
+    }
+
     pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
         if let Some(t) = self.live.remove(&id) {
             let _ = s.free(t);
@@ -256,11 +352,27 @@ impl DramBuffers {
         a: BufferId,
         b: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let op = tt_kernels::tensor::Eltwise {
+            scalar2: 0.0,
+            kind,
+            scalar,
+        };
+        self.eltwise_op(s, op, a, b, None)
+    }
+
+    pub fn eltwise_op<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let ta = self.get(a)?.clone();
         let tb = b.map(|b| self.get(b).cloned()).transpose()?;
-        let op = tt_kernels::tensor::Eltwise { kind, scalar };
+        let tc = c.map(|c| self.get(c).cloned()).transpose()?;
         let c = s
-            .eltwise(op, &ta, tb.as_ref())
+            .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
             .map_err(|e| EngineError(e.to_string()))?;
         let dims = [c.rows, c.cols];
         self.next += 1;
@@ -539,6 +651,30 @@ pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usiz
     .unwrap_or_else(|e| panic!("upload [{rows}, {cols}] to {device}: {e}"))
 }
 
+/// Upload datums as bits, panicking on a device error.
+pub(crate) fn upload_bits(
+    device: TtDevice,
+    bits: Vec<u32>,
+    rows: usize,
+    cols: usize,
+    elem: Elem,
+) -> BufferId {
+    crate::traffic::uploaded(rows, cols);
+    timed_run("upload", device, move |engine| {
+        engine.upload_bits(&bits, rows, cols, elem)
+    })
+    .unwrap_or_else(|e| panic!("upload {elem:?} [{rows}, {cols}] to {device}: {e}"))
+}
+
+/// Download any buffer's datums as bits, panicking on a device error.
+pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u32> {
+    let v = timed_run("download", device, move |engine| engine.download_bits(id))
+        .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
+    debug_assert_eq!(v.len(), rows * cols);
+    crate::traffic::downloaded(rows, cols);
+    v
+}
+
 /// Download, panicking on a device error.
 /// `rows` and `cols` are the buffer's, for the traffic count.
 pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<f32> {
@@ -556,18 +692,25 @@ pub(crate) fn free(device: TtDevice, id: BufferId) {
     }
 }
 
-/// Element-wise on the device, panicking on a device error.
-pub(crate) fn eltwise(
+/// Element-wise on the device -- the whole op, both scalars, and a ternary
+/// op's third operand -- panicking on a device error.
+pub(crate) fn eltwise_op(
     device: TtDevice,
-    kind: u32,
-    scalar: f32,
+    op: tt_kernels::tensor::Eltwise,
     a: BufferId,
     b: Option<BufferId>,
+    c: Option<BufferId>,
 ) -> (BufferId, [usize; 2]) {
     timed_run("eltwise", device, move |engine| {
-        engine.eltwise(kind, scalar, a, b)
+        engine.eltwise_op(op, a, b, c)
     })
-    .unwrap_or_else(|e| panic!("element-wise {kind} on {device}: {e}"))
+    .unwrap_or_else(|e| panic!("element-wise {:#x} on {device}: {e}", op.kind))
+}
+
+/// `x^y` on the device, panicking on a device error.
+pub(crate) fn pow(device: TtDevice, x: BufferId, y: PowArg) -> (BufferId, [usize; 2]) {
+    timed_run("pow", device, move |engine| engine.pow(x, y))
+        .unwrap_or_else(|e| panic!("pow on {device}: {e}"))
 }
 
 /// A reduction on the device, panicking on a device error.
@@ -639,6 +782,20 @@ impl Engine for KmdEngine {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.download(&mut self.session, id)
     }
+    fn upload_bits(
+        &mut self,
+        v: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.upload_bits(&mut self.session, v, rows, cols, elem)
+    }
+    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, EngineError> {
+        let b = self.buffers.as_mut().ok_or_else(unsupported)?;
+        b.download_bits(&mut self.session, id)
+    }
     fn free(&mut self, id: BufferId) {
         if let Some(b) = self.buffers.as_mut() {
             b.free(&mut self.session, id);
@@ -672,6 +829,20 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise(&mut self.session, kind, scalar, a, b)
+    }
+    fn eltwise_op(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_op(&mut self.session, op, a, b, c)
+    }
+    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.pow(&mut self.session, x, y)
     }
     fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -738,18 +909,13 @@ pub fn kmd_engine(
         session
             .enable_dram(tt_firmware_images::DM_B.1)
             .map_err(|e| EngineError(e.to_string()))?;
-        // `TT_ELTWISE=mover|sfpu`: element-wise ops always on one unit rather
-        // than on whichever is cheaper for their size -- bit-identical, for
-        // comparison (`tt_kernels::tensor::EltwiseUnit`).
-        match std::env::var("TT_ELTWISE").as_deref() {
-            Ok("mover") => session.set_eltwise_unit(tt_kernels::tensor::EltwiseUnit::Mover),
-            Ok("sfpu") => session.set_eltwise_unit(tt_kernels::tensor::EltwiseUnit::Sfpu),
-            Ok("auto") | Err(_) => {}
-            Ok(other) => {
-                return Err(EngineError(format!(
-                    "TT_ELTWISE={other}: expected `auto`, `sfpu` or `mover`"
-                )))
-            }
+        // `TT_ELTWISE` once chose between the SFPU and the data mover's FP32
+        // unit; the mover does no arithmetic now. Refused rather than ignored,
+        // so a script that still sets it learns why it no longer does anything.
+        if let Ok(v) = std::env::var("TT_ELTWISE") {
+            return Err(EngineError(format!(
+                "TT_ELTWISE={v}: element-wise ops always run on the SFPU now; unset it"
+            )));
         }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches

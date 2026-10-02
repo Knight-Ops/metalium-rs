@@ -99,6 +99,7 @@ pub const SMOKE: &[&str] = &[
     "step27_burn_eltwise::",
     "step32_burn_softmax::",
     "step35_burn_rank_n::",
+    "step47_burn_activations::",
     "step11_burn::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
@@ -139,6 +140,130 @@ fn all_devices() -> Result<Vec<u16>, String> {
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let o = parse(args)?;
+    let (_, results) = run_opts(&o)?;
+    if results.iter().all(|r| r.2 == Verdict::Pass) {
+        Ok(())
+    } else {
+        Err("silicon suite failed".into())
+    }
+}
+
+/// What `cargo xtask bench` runs by default, in order: device-timed memory,
+/// the core path, the Ethernet counter's own gate, then Ethernet -- which
+/// needs that gate to have passed -- and the host link last.
+pub const BENCH: &[&str] = &[
+    "silicon_bench_memory::",
+    "silicon_bench_path::",
+    "silicon_eth_clock::",
+    "silicon_bench_eth::",
+    "silicon_perf::pcie_l1",
+    "silicon_perf::pcie_dram",
+];
+
+pub const BENCH_USAGE: &str = "\
+usage: cargo xtask bench [silicon options]
+
+  Runs the firmware benchmarks (`BENCH` in xtask/src/silicon.rs, or the
+  given --filter selection) as `cargo xtask silicon --release
+  --include-ignored`, with a 900 s per-test limit unless --timeout-secs says
+  otherwise, then collects every `BENCH {json}` line the tests printed into
+
+    target/silicon/bench/<stamp>.jsonl   one record per line, with its test
+    target/silicon/bench/<stamp>.md      the same as a table
+
+  Takes every `cargo xtask silicon` option; see `cargo xtask silicon --help`.";
+
+/// `cargo xtask bench`: the benchmark preset of the silicon runner, plus the
+/// collection of what the benchmarks reported.
+pub fn bench(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Err(BENCH_USAGE.into());
+    }
+    let mut o = parse(args.iter().cloned())?;
+    o.release = true;
+    o.include_ignored = true;
+    if !args.iter().any(|a| a == "--timeout-secs") {
+        o.timeout = Duration::from_secs(900);
+    }
+    if o.filters.is_empty() {
+        o.filters.extend(BENCH.iter().map(|s| s.to_string()));
+    }
+    let (stamp, results) = run_opts(&o)?;
+    if o.list_only {
+        return Ok(());
+    }
+    let dir = workspace_root().join("target/silicon/bench");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut jsonl = String::new();
+    let mut md = String::from(
+        "| test | dev | result | timed | median | unit | p10 | p90 | GB/s | % of peak | peak |\n\
+         |---|--:|---|---|--:|---|--:|--:|--:|--:|---|\n",
+    );
+    let mut conditions = String::new();
+    for (dev, full, verdict, out) in &results {
+        let text = std::fs::read_to_string(out).unwrap_or_default();
+        for rec in text.lines().filter_map(|l| l.strip_prefix("BENCH ")) {
+            jsonl += &format!("{{\"test\":\"{full}\",\"dev\":{dev},\"verdict\":\"{verdict}\",\"record\":{rec}}}\n");
+            if rec.contains("\"kind\":\"conditions\"") {
+                if conditions.is_empty() {
+                    conditions = rec.to_string();
+                }
+                continue;
+            }
+            let f = |k: &str| json_field(rec, k).unwrap_or_default();
+            md += &format!(
+                "| {} | {dev} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                full.split("::").last().unwrap_or(full),
+                f("key"),
+                f("timed"),
+                num(&f("median")),
+                f("unit"),
+                num(&f("p10")),
+                num(&f("p90")),
+                f("gbps"),
+                f("pct_of_peak"),
+                f("peak"),
+            );
+        }
+    }
+    let jsonl_path = dir.join(format!("{stamp}.jsonl"));
+    let md_path = dir.join(format!("{stamp}.md"));
+    std::fs::write(&jsonl_path, jsonl).map_err(|e| format!("{}: {e}", jsonl_path.display()))?;
+    std::fs::write(&md_path, format!("conditions: `{conditions}`\n\n{md}"))
+        .map_err(|e| format!("{}: {e}", md_path.display()))?;
+    println!(
+        "benchmarks collected into {} and {}",
+        jsonl_path.display(),
+        md_path.display()
+    );
+    if results.iter().all(|r| r.2 == Verdict::Pass) {
+        Ok(())
+    } else {
+        Err("a benchmark failed; what the others reported was still collected".into())
+    }
+}
+
+/// A value from one flat JSON object, as its text, quotes removed.
+fn json_field(obj: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let start = obj.find(&pat)? + pat.len();
+    let rest = &obj[start..];
+    if let Some(r) = rest.strip_prefix('"') {
+        return Some(r[..r.find('"')?].to_string());
+    }
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn num(s: &str) -> String {
+    s.parse::<f64>()
+        .map_or(s.to_string(), |v| format!("{v:.3}"))
+}
+
+type Results = Vec<(u16, String, Verdict, PathBuf)>;
+
+fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     let root = workspace_root();
     let binaries = build(&root, o.release)?;
 
@@ -180,7 +305,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         for (full, _, _) in &selection {
             println!("{full}");
         }
-        return Ok(());
+        return Ok((0, Vec::new()));
     }
 
     preflight(&o.devices)?;
@@ -232,11 +357,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     for (dev, full, verdict, out) in &failures {
         println!("  dev{dev} {verdict} {full}\n    output: {}", out.display());
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err("silicon suite failed".into())
-    }
+    Ok((stamp, results))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

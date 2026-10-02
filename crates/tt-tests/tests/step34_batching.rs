@@ -72,7 +72,17 @@ fn a_full_program_cache_never_evicts_what_queued_lists_run() {
         let mut sizes = Vec::new();
         for &(kind, scalar) in &kinds {
             let before = s.program_cache_stats()[0].bytes_uploaded;
-            let out = s.eltwise(Eltwise { kind, scalar }, &a, None).unwrap();
+            let out = s
+                .eltwise(
+                    Eltwise {
+                        scalar2: 0.0,
+                        kind,
+                        scalar,
+                    },
+                    &a,
+                    None,
+                )
+                .unwrap();
             sizes.push(s.program_cache_stats()[0].bytes_uploaded - before);
             s.free(out).unwrap();
         }
@@ -84,7 +94,17 @@ fn a_full_program_cache_never_evicts_what_queued_lists_run() {
         let mut cur = a;
         for step in 0..40 {
             let (kind, scalar) = kinds[step % kinds.len()];
-            let out = s.eltwise(Eltwise { kind, scalar }, &cur, None).unwrap();
+            let out = s
+                .eltwise(
+                    Eltwise {
+                        scalar2: 0.0,
+                        kind,
+                        scalar,
+                    },
+                    &cur,
+                    None,
+                )
+                .unwrap();
             want = reference(kind, scalar, &want, None, r, c);
             s.free(cur).unwrap();
             cur = out;
@@ -110,7 +130,7 @@ fn a_full_program_cache_never_evicts_what_queued_lists_run() {
 /// `@ [128, 10]` -- is the same bits queued as run op by op.
 #[test]
 fn several_lists_per_unit_queued_are_the_unbatched_bits() {
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let m = if cfg!(feature = "silicon") { 1000 } else { 200 };
     let values = |seed: u64, n: usize| -> Vec<f32> {
@@ -156,6 +176,7 @@ fn several_lists_per_unit_queued_are_the_unbatched_bits() {
             let hb = s
                 .eltwise(
                     Eltwise {
+                        scalar2: 0.0,
                         kind: kind::ADD_ROW,
                         scalar: 0.0,
                     },
@@ -166,6 +187,7 @@ fn several_lists_per_unit_queued_are_the_unbatched_bits() {
             let r = s
                 .eltwise(
                     Eltwise {
+                        scalar2: 0.0,
                         kind: kind::RELU,
                         scalar: 0.0,
                     },
@@ -276,7 +298,7 @@ fn an_upload_lands_before_the_queued_op_that_reads_it() {
 #[test]
 fn barriers_count_from_zero_whatever_an_earlier_session_left() {
     use tt_device::tlb::WindowKind;
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
     with_tiles(TileChoice::Count(4), |s| {
         s.set_batching(true).unwrap();
         let coordinator = s.tile();
@@ -292,6 +314,7 @@ fn barriers_count_from_zero_whatever_an_earlier_session_left() {
         let y = s
             .eltwise(
                 Eltwise {
+                    scalar2: 0.0,
                     kind: kind::RELU,
                     scalar: 0.0,
                 },

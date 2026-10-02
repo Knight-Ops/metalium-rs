@@ -23,6 +23,7 @@
 use tt_isa::isa::generated::defs;
 use tt_isa::isa::Instruction;
 use tt_isa::numerics::fma_bh;
+use tt_isa::numerics::sfpu::sign_mag_is_smaller;
 
 /// `Dst` rows the model holds: the ten bits of a `Dst` row address.
 pub const DST_ROWS: usize = 1024;
@@ -188,6 +189,21 @@ impl Vector {
     fn exec(&mut self, at: usize, ins: Instruction) -> Result<(), InterpError> {
         let op = |n: &str| ins.operand(n).unwrap_or(0);
         let unmodelled = |what: String| Err(InterpError::Unmodelled { at, what });
+        // `VD >= 12` writes the instruction into an `SFPLOADMACRO` template
+        // while `LaneConfig.DISABLE_BACKDOOR_LOAD` is clear, as it is here.
+        let backdoor = |vd: u32| {
+            if vd >= 12 {
+                Err(InterpError::Unmodelled {
+                    at,
+                    what: format!(
+                        "{} with VD {vd} (a backdoor template load)",
+                        ins.def().mnemonic()
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        };
         match ins.def().mnemonic() {
             "SFPNOP" | "STALLWAIT" | "SEMWAIT" | "SEMPOST" | "SEMGET" | "NOP" => {}
             "SFPLOAD" | "SFPSTORE" => {
@@ -533,24 +549,239 @@ impl Vector {
                     std::array::from_fn(|l| tt_isa::numerics::sfpu::arecip(mod1, b[l], c[l], d[l]));
                 self.write(vd, v, false);
             }
-            "SFPGT" => {
+            "SFPGT" | "SFPLE" => {
+                let m = ins.def().mnemonic();
                 let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
                 if mod1 & 2 != 0 {
-                    return unmodelled("SFPGT mutating the flag stack".into());
+                    return unmodelled(format!("{m} mutating the flag stack"));
                 }
-                // `SignMagIsSmaller(C, D)`.
-                let key = |x: u32| (x ^ (((x as i32) >> 30) as u32 >> 1)) as i32;
+                backdoor(vd)?;
+                // `SFPGT`: `SignMagIsSmaller(C, D)`, `D > C`; `SFPLE`: its
+                // negation, `D <= C`.
+                let le = m == "SFPLE";
                 let (c, d) = (self.read(at, vc)?, self.read(at, vd)?);
-                let smaller: [bool; 32] = std::array::from_fn(|l| key(c[l]) < key(d[l]));
+                let holds: [bool; 32] =
+                    std::array::from_fn(|l| sign_mag_is_smaller(c[l], d[l]) != le);
                 if mod1 & 8 != 0 {
-                    let v = smaller.map(|s| if s { u32::MAX } else { 0 });
+                    let v = holds.map(|s| if s { u32::MAX } else { 0 });
                     self.write(vd, v, false);
                 }
                 if mod1 & 1 != 0 {
-                    for (l, &smaller) in smaller.iter().enumerate() {
+                    for (l, &h) in holds.iter().enumerate() {
                         if self.lane_enabled(l) {
-                            self.lane_flags[l] = smaller;
+                            self.lane_flags[l] = h;
                         }
+                    }
+                }
+            }
+            "SFPSWAP" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                backdoor(vd)?;
+                // `VDGetsMin`, one bit a lane; `LaneConfig` is zero here, so
+                // neither `EXCHANGE_SRCB_SRCC` nor `ENABLE_DEST_INDEX` applies.
+                let gets_min: u32 = match mod1 {
+                    1 => 0xffff_ffff,
+                    2 => 0x0000_ffff,
+                    3 => 0x00ff_00ff,
+                    4 => 0xff00_00ff,
+                    5 => 0x0000_00ff,
+                    6 => 0x0000_ff00,
+                    7 => 0x00ff_0000,
+                    8 => 0xff00_0000,
+                    _ => 0,
+                };
+                if mod1 > 9 {
+                    return unmodelled(format!(
+                        "SFPSWAP with Mod1 {mod1} (NonContractualBehavior)"
+                    ));
+                }
+                let (c, d) = (self.read(at, vc)?, self.read(at, vd)?);
+                let (mut nc, mut nd) = (c, d);
+                for l in 0..32 {
+                    if !self.lane_enabled(l) {
+                        continue;
+                    }
+                    let swap = mod1 == 0 || {
+                        let s = sign_mag_is_smaller(c[l], d[l])
+                            || (c[l] == d[l] && c[l] & 0x8000_0000 != 0);
+                        s == (gets_min >> l & 1 != 0)
+                    };
+                    if swap {
+                        nc[l] = d[l];
+                        nd[l] = c[l];
+                    }
+                }
+                if vc < 8 {
+                    self.lreg[vc as usize] = Some(nc);
+                }
+                if vd < 8 {
+                    self.lreg[vd as usize] = Some(nd);
+                }
+            }
+            "SFPMULI" | "SFPADDI" => {
+                let m = ins.def().mnemonic();
+                let (imm, vd, mod1) = (op("Imm16"), op("VD"), op("Mod1"));
+                if mod1 & 8 != 0 {
+                    return unmodelled(format!("{m} with an indirect VD"));
+                }
+                backdoor(vd)?;
+                let c = self.read(at, vd)?;
+                let v = c.map(|c| {
+                    let c = if mod1 & 2 != 0 { c ^ 0x8000_0000 } else { c };
+                    if m == "SFPMULI" {
+                        fma_bh(imm << 16, c, 0)
+                    } else {
+                        fma_bh(imm << 16, 1.0f32.to_bits(), c)
+                    }
+                });
+                self.write(vd, v, false);
+            }
+            "SFPXOR" => {
+                let (vc, vd) = (op("VC"), op("VD"));
+                let (c, b) = (self.read(at, vc)?, self.read(at, vd)?);
+                let v: [u32; 32] = std::array::from_fn(|l| b[l] ^ c[l]);
+                self.write(vd, v, false);
+            }
+            "SFPNOT" => {
+                let (vc, vd) = (op("VC"), op("VD"));
+                let v = self.read(at, vc)?.map(|c| !c);
+                self.write(vd, v, false);
+            }
+            "SFPLZ" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                if mod1 & 1 != 0 {
+                    return unmodelled("SFPLZ with its reserved Mod1 bit".into());
+                }
+                let c = self
+                    .read(at, vc)?
+                    .map(|c| if mod1 & 4 != 0 { c & 0x7fff_ffff } else { c });
+                let v = c.map(|c| c.leading_zeros());
+                let en: [bool; 32] = std::array::from_fn(|l| self.lane_enabled(l));
+                self.write(vd, v, false);
+                if vd < 8 {
+                    for l in 0..32 {
+                        if en[l] {
+                            if mod1 & 2 != 0 {
+                                self.lane_flags[l] = c[l] != 0;
+                            }
+                            if mod1 & 8 != 0 {
+                                self.lane_flags[l] = !self.lane_flags[l];
+                            }
+                        }
+                    }
+                }
+            }
+            "SFPMUL24" => {
+                let (va, vb, vc, vd, mod1) = (op("VA"), op("VB"), op("VC"), op("VD"), op("Mod1"));
+                if mod1 & 12 != 0 {
+                    return unmodelled("SFPMUL24 with indirect registers".into());
+                }
+                backdoor(vd)?;
+                if self.read(at, vc)?.iter().any(|&c| c != 0) {
+                    return unmodelled(
+                        "SFPMUL24 with a non-zero VC (its shift-add is NonContractualBehavior)"
+                            .into(),
+                    );
+                }
+                let (a, b) = (self.read(at, va)?, self.read(at, vb)?);
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    tt_isa::numerics::sfpu::mul24(a[l], b[l], mod1 & 1 != 0)
+                });
+                self.write(vd, v, false);
+            }
+            "SFPCAST" => {
+                let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));
+                // Only `SFPCAST_IntFloat` rounding to nearest; the stochastic
+                // mode draws on the PRNG, and the other two flavours are other
+                // pages (one of them the Tier 2 `IntAbs` bug).
+                if mod1 != 0 {
+                    return unmodelled(format!("SFPCAST with Mod1 {mod1}"));
+                }
+                backdoor(vd)?;
+                let v = self
+                    .read(at, vc)?
+                    .map(tt_isa::numerics::sfpu::cast_sm32_to_fp32_rne);
+                self.write(vd, v, false);
+            }
+            "SFPCONFIG" => {
+                let (imm, vd, mod1) = (op("Imm16"), op("VD"), op("Mod1"));
+                // Only the writes of `LReg[11..15]`: the `SFPLOADMACRO`
+                // templates, `Misc` and `LaneConfig` are not modelled.
+                if !(11..15).contains(&vd) {
+                    return unmodelled(format!("SFPCONFIG of target {vd}"));
+                }
+                let fixed = [0xbf80_0000u32, 0x3b00_0000, 0xbf2c_c4c7, 0xbeb0_8ff9];
+                let src = if mod1 & 1 != 0 {
+                    [fixed[vd as usize - 11]; 32]
+                } else {
+                    self.read(at, 0)?
+                };
+                let mut r = self.lreg[vd as usize].unwrap_or([0; 32]);
+                let mut all = true;
+                for (l, x) in r.iter_mut().enumerate() {
+                    // Both the lane mask and the predication are lane `l & 7`'s.
+                    let masked = mod1 & 8 != 0 && imm >> ((l & 7) * 2) & 1 == 0;
+                    let off = self.use_flags[l & 7] && !self.lane_flags[l & 7];
+                    if masked || off {
+                        all = false;
+                        continue;
+                    }
+                    *x = src[l & 7];
+                }
+                if !all && self.lreg[vd as usize].is_none() {
+                    return unmodelled(format!(
+                        "SFPCONFIG writing some lanes of LReg[{vd}], which holds nothing established"
+                    ));
+                }
+                self.lreg[vd as usize] = Some(r);
+            }
+            "SFPLUT" => {
+                let (vd, mod0) = (op("VD"), op("Mod0"));
+                if mod0 & 8 != 0 {
+                    return unmodelled("SFPLUT with an indirect VD".into());
+                }
+                backdoor(vd)?;
+                let l3 = self.read(at, 3)?;
+                let t = [self.read(at, 0)?, self.read(at, 1)?, self.read(at, 2)?];
+                let v: [u32; 32] = std::array::from_fn(|l| {
+                    let i = tt_isa::numerics::sfpu::lut_index(l3[l]);
+                    tt_isa::numerics::sfpu::lut(t[i][l], l3[l], mod0 & 4 != 0)
+                });
+                self.write(vd, v, false);
+            }
+            "SFPLUTFP32" => {
+                use tt_isa::numerics::sfpu::{lutfp32, lutfp32_mod1 as m};
+                let (vd, mod1) = (op("VD"), op("Mod1"));
+                backdoor(vd)?;
+                let fp16_3 = mod1 & m::FP16_3ENTRY_TABLE == m::FP16_3ENTRY_TABLE;
+                let mut regs = vec![0, 1, 2, 3];
+                if !fp16_3 {
+                    regs.extend([4, 5, 6]);
+                }
+                if mod1 & m::INDIRECT_VD != 0 {
+                    regs.push(7);
+                }
+                let mut l = [[0u32; 32]; 8];
+                for r in regs {
+                    l[r] = self.read(at, r as u32)?;
+                }
+                let en: [bool; 32] = std::array::from_fn(|lane| self.lane_enabled(lane));
+                for lane in 0..32 {
+                    if !en[lane] {
+                        continue;
+                    }
+                    let lanes: [u32; 8] = std::array::from_fn(|r| l[r][lane]);
+                    let d = lutfp32(mod1, &lanes);
+                    // The Tier 2 hazard, modelled: with `INDIRECT_VD` set --
+                    // and `FP16_3ENTRY_TABLE` sets it -- the result goes to
+                    // `LReg[LReg[7] & 15]`, whatever `VD` says.
+                    let to = if mod1 & m::INDIRECT_VD != 0 {
+                        lanes[7] & 15
+                    } else {
+                        vd
+                    };
+                    if to < 8 {
+                        self.lreg[to as usize].get_or_insert([0; 32])[lane] = d;
                     }
                 }
             }
@@ -726,10 +957,31 @@ mod tests {
         assert_eq!(v.tile(128), want);
     }
 
+    /// A program reading a constant another program wrote is refused: the
+    /// interpreter starts `LReg[11..15]` unknown, so each program must write
+    /// the constants it reads (concepts review G11). Written, it reads back
+    /// in every lane, `SFPCONFIG` having taken lanes 0..8's value.
+    #[test]
+    fn a_constant_is_known_only_to_the_program_that_writes_it() {
+        use tt_isa::sfpu::ConfigLReg;
+        let mut p = Program::new();
+        p.mov(ConfigLReg::L13.lreg(), LReg::L2);
+        assert_eq!(
+            Vector::new().run(&p.finish()),
+            Err(InterpError::Unknown { at: 3, lreg: 13 })
+        );
+        let mut p = Program::new();
+        p.constant(ConfigLReg::L13, 0x4049_0fdb);
+        p.mov(ConfigLReg::L13.lreg(), LReg::L2);
+        let mut v = Vector::new();
+        v.run(&p.finish()).unwrap();
+        assert_eq!(v.lreg[2], Some([0x4049_0fdb; 32]));
+    }
+
     #[test]
     fn what_has_no_model_is_refused_by_name() {
         let mut v = Vector::new();
-        let p = [tt_isa::isa::generated::encode::sfpcast(1, 2, 0).unwrap()];
+        let p = [tt_isa::isa::generated::encode::sfpcast(1, 2, 1).unwrap()];
         let e = v.run(&p).unwrap_err();
         assert!(e.to_string().contains("SFPCAST"), "{e}");
         let read8 = [tt_isa::isa::generated::encode::sfpmov(8, 0, 0).unwrap()];

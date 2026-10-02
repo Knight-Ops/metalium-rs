@@ -26,8 +26,16 @@
 //! SFPU's arithmetic makes is one) and a negative NaN below everything. A sum
 //! over columns is computed in the tree order above, not Flex's left to right:
 //! its error is the standard `(n - 1) u sum |x|` bound, stated against Flex in
-//! the gate. (A sum over rows stays on the mover, which adds in Flex's order
-//! exactly: `tensor::sum_rows`.)
+//! the gate.
+//!
+//! A **sum over rows** is Flex's exactly, so it is not a tree: each column
+//! from `+0.0`, adding its rows one at a time, top to bottom, tile after tile
+//! ([`accumulate_in_order`]). A load holds four rows of eight columns; one
+//! `SFPTRANSP` puts each of the four rows into row 0 of its own register, and
+//! they are added into the running sum in order. The sum lives in row 0 of
+//! `L4`, which is on the transpose's diagonal and so survives it. Rows past
+//! the data are not added at all -- adding `+0.0` would turn a `-0.0` sum
+//! positive -- and there is no finishing fold.
 
 use tt_isa::backend::{self, Before, ConfigWords};
 use tt_isa::dm::TILE_SLOT;
@@ -81,7 +89,11 @@ fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
 /// accumulator, otherwise it is combined in. `valid`: the input is the last
 /// along the reduced dimension and only its first `valid` columns (or rows,
 /// for [`Axis::Rows`]) are data -- the rest are replaced by the identity.
+/// A sum over rows is [`accumulate_in_order`] instead.
 pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> Vec<Instruction> {
+    if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
+        return accumulate_in_order(first, valid.unwrap_or(32));
+    }
     let masked = valid.is_some_and(|v| v < 32);
     let mut p = Program::with_policy(if masked {
         LoopPolicy::Unrolled
@@ -137,10 +149,67 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     p.finish()
 }
 
+/// The column sums of one input tile's first `valid` rows, added in order into
+/// the running sums in row 0 of the accumulator tile -- from `+0.0` for the
+/// `first` tile, which also zeroes the accumulator's other rows (as the
+/// result's padding). Flex's `sum` over `dim = 0`, bit for bit.
+pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
+    let mut p = Program::with_policy(LoopPolicy::Unrolled);
+    let acc = |r: u32| OUT_ROW + r;
+    if first {
+        p.for_each_row_group(64, |p, o| p.store(LReg::ZERO, Format::Fp32, acc(o)));
+    }
+    // Columns 0..16 are faces 0 (rows 0..16) and 2 (16..32), columns 16..32
+    // faces 1 and 3; each column half of a face is eight lanes, a load four
+    // rows of them.
+    for (top, bottom) in [(0, 32), (16, 48)] {
+        for half in [0, 2] {
+            if first {
+                p.mov(LReg::ZERO, LReg::L4);
+            } else {
+                p.load(LReg::L4, Format::Fp32, acc(top + half));
+            }
+            for g in 0..8u32 {
+                let rows = valid.saturating_sub(4 * g).min(4);
+                if rows == 0 {
+                    break;
+                }
+                let r = if g < 4 {
+                    top + 4 * g
+                } else {
+                    bottom + 4 * (g - 4)
+                };
+                p.load(LReg::L0, Format::Fp32, A_ROW + r + half);
+                // Row `i` of the four into row 0 of `L[i]`; row 0 of `L4`
+                // stays where it is.
+                p.transpose4();
+                for i in 0..rows {
+                    p.add(
+                        LReg::L4,
+                        [LReg::L0, LReg::L1, LReg::L2, LReg::L3][i as usize],
+                        LReg::L4,
+                    );
+                }
+            }
+            // Row 0 the sums, rows 1..4 zero: `L5..L8` cleared and transposed
+            // into them.
+            for l in [LReg::L5, LReg::L6, LReg::L7] {
+                p.mov(LReg::ZERO, l);
+            }
+            p.transpose4();
+            p.store(LReg::L4, Format::Fp32, acc(top + half));
+        }
+    }
+    p.finish()
+}
+
 /// The finishing program: the accumulator folded within the tile (see the
-/// module documentation).
+/// module documentation). Nothing for a sum over rows, already in row 0.
 pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
+    if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
+        return p.finish();
+    }
     let acc = |r: u32| OUT_ROW + r;
     match axis {
         Axis::Cols => {
@@ -275,6 +344,18 @@ pub fn roles(
     finish: &[Instruction],
 ) -> [Vec<Instruction>; 3] {
     assert_eq!(inputs.len(), layout.per);
+    roles_at(layout, inputs, finish, |k, n| {
+        layout.in_at + (k * layout.per + n) as u64 * TILE_SLOT
+    })
+}
+
+/// [`roles`], with output `k`'s input `n` unpacked from `input(k, n)`.
+pub fn roles_at(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+    input: impl Fn(usize, usize) -> u64,
+) -> [Vec<Instruction>; 3] {
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
     let mut unpack = thread_config();
@@ -287,10 +368,7 @@ pub fn roles(
     for k in 0..layout.outputs {
         for (n, program) in inputs.iter().enumerate() {
             unpack.extend(sync::take(s.consumed, Before::UNPACKER));
-            unpack.extend(unpack_tile_to_dst(
-                slot(layout.in_at, k * layout.per + n),
-                A_ROW,
-            ));
+            unpack.extend(unpack_tile_to_dst(input(k, n), A_ROW));
             unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
 
             math.extend(sync::take(s.unpacked, Before::SFPU));
@@ -313,6 +391,83 @@ pub fn roles(
     unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
     pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
     [unpack, math, pack]
+}
+
+/// A sum over rows too long for one run, in chunks of [`ROW_CHUNK`] row
+/// tiles: each chunk after the first starts from the last chunk's sums, read
+/// back as an input of one valid row ahead of its own tiles. Exactly Flex's
+/// order still -- from `+0.0`, rows in order -- because a running sum from
+/// `+0.0` is never `-0.0`, so `+0.0` plus it is it.
+pub const ROW_CHUNK: usize = 16;
+
+/// Where a chunk of a long sum over rows lives: the last chunk's sums, one
+/// tile per output at `prior_at`, then [`ROW_CHUNK`] input tiles per output at
+/// `in_at`, and the outputs at `out_at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkLayout {
+    pub layout: Layout,
+    pub prior_at: u64,
+}
+
+pub fn plan_chunk_layout(outputs: usize) -> Result<ChunkLayout, PlanError> {
+    let mut req = Requirements::new(1);
+    let align = tt_isa::dram::ALIGN;
+    let prior = req.scratch("sum prior", outputs as u64 * TILE_SLOT, align, 0..1);
+    let input = req.scratch(
+        "sum inputs",
+        (outputs * ROW_CHUNK) as u64 * TILE_SLOT,
+        align,
+        0..1,
+    );
+    let out = req.scratch("sum outputs", outputs as u64 * TILE_SLOT, align, 0..1);
+    let unpacked = req.semaphore("reduce unpacked", 0, 0..1);
+    let consumed = req.semaphore("reduce consumed", 1, 0..1);
+    let computed = req.semaphore("reduce computed", 0, 0..1);
+    let packed = req.semaphore("reduce packed", 1, 0..1);
+    let plan = req.plan(tt_isa::l1::DATA)?;
+    Ok(ChunkLayout {
+        layout: Layout {
+            outputs,
+            per: ROW_CHUNK,
+            in_at: plan.addr(input),
+            out_at: plan.addr(out),
+            sems: ReduceSemaphores {
+                unpacked: plan.semaphore(unpacked),
+                consumed: plan.semaphore(consumed),
+                computed: plan.semaphore(computed),
+                packed: plan.semaphore(packed),
+            },
+            init: plan.semaphore_init(),
+        },
+        prior_at: plan.addr(prior),
+    })
+}
+
+/// The role programs of one chunk of a long sum over rows: `tiles` input
+/// tiles per output (at most [`ROW_CHUNK`]), the last with `last_valid` rows,
+/// after the prior chunk's sums when `prior`.
+pub fn chunk_roles(
+    c: &ChunkLayout,
+    prior: bool,
+    tiles: usize,
+    last_valid: u32,
+) -> [Vec<Instruction>; 3] {
+    assert!((1..=ROW_CHUNK).contains(&tiles));
+    let mut inputs = Vec::new();
+    if prior {
+        inputs.push(accumulate_in_order(true, 1));
+    }
+    for n in 0..tiles {
+        let valid = if n + 1 == tiles { last_valid } else { 32 };
+        inputs.push(accumulate_in_order(!prior && n == 0, valid));
+    }
+    let fin = finish(ReduceOp::Sum, Axis::Rows);
+    let l = &c.layout;
+    roles_at(l, &inputs, &fin, |k, n| match (prior, n) {
+        (true, 0) => c.prior_at + k as u64 * TILE_SLOT,
+        (true, n) => l.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
+        (false, n) => l.in_at + (k * ROW_CHUNK + n) as u64 * TILE_SLOT,
+    })
 }
 
 /// What the device computes for a reduction of `a` (`[rows, cols]`): the
@@ -381,6 +536,39 @@ mod tests {
         (0..rows * cols)
             .map(|i| ((i * 37 + 11) % 101) as f32 - 50.0)
             .collect()
+    }
+
+    /// A sum over rows is Flex's to the bit, on values whose sums round at
+    /// every step and whose order matters: `+0.0` then each row in turn,
+    /// ragged rows left out (a `-0.0` column stays `-0.0`).
+    #[test]
+    fn a_sum_over_rows_is_flex_order_bit_for_bit() {
+        for (rows, cols) in [
+            (37, 70),
+            (32, 32),
+            (5, 3),
+            (64, 100),
+            (100, 33),
+            (1, 40),
+            (97, 1),
+        ] {
+            let mut a: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let x = ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32;
+                    (x - 0.5) * 10f32.powi((i % 7) as i32 - 3)
+                })
+                .collect();
+            // A column of negative zeros.
+            for r in 0..rows {
+                a[r * cols] = -0.0;
+            }
+            let flex: Vec<f32> = (0..cols)
+                .map(|c| (0..rows).fold(0.0f32, |s, r| s + a[r * cols + c]))
+                .collect();
+            let got = reference(ReduceOp::Sum, Axis::Rows, &a, rows, cols);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&flex), "[{rows}, {cols}]");
+        }
     }
 
     /// Small integers: every sum exact whatever the order, so the model must

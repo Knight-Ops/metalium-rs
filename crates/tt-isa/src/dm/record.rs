@@ -28,19 +28,6 @@ pub const GATHER: u32 = 0x10;
 /// rows, j0, cols, 0]` + `C`. Output `(i, j)`'s datums are at `out_at + (i *
 /// cols + j) * out_stride`.
 pub const SCATTER: u32 = 0x11;
-/// A run of element-wise tiles: `[ELTWISE, kind, scalar, first, count, flags,
-/// stage, 0]` + `A` + `B` + `OUT`. Tiles `first..first + count` of `A` in
-/// row-major order, each read into slot `2n` of the staging area at `stage`
-/// (its `B` into `2n + 1`), computed in place and written out. `flags`: bit 0
-/// the kind takes `B`, bit 1 `B` is one row broadcast down `A`. `B` is all zero
-/// when the kind takes none.
-pub const ELTWISE: u32 = 0x12;
-/// A run of column sums: `[SUM, first, count, rt, stage, last_rows, 0, 0]` +
-/// `A` + `OUT`. Columns `first..first + count` of `A`'s tile grid, `rt` tiles
-/// tall, each summed in row order into row 0 of an accumulator slot; of the
-/// last tile row only its first `last_rows` rows (`0`: all 32), so a ragged
-/// tensor's padding never reaches a sum.
-pub const SUM: u32 = 0x13;
 /// Set the padding of a run of a tensor's edge tiles: `[FILL_PAD, value,
 /// first, count, rows, cols, stage, rt]` + `A`, where `rows` and `cols` are
 /// the valid rows of the last tile row and columns of the last tile column
@@ -49,7 +36,7 @@ pub const SUM: u32 = 0x13;
 /// last tile column top to bottom (without a corner already counted) if its
 /// columns are; tiles `first..first + count` of that numbering are each read
 /// into slot `n` of the staging area at `stage`, filled with `value` outside
-/// the valid region ([`super::kind::FILL_PAD`]) and written back in place.
+/// the valid region ([`op::FILL`]) and written back in place.
 pub const FILL_PAD: u32 = 0x14;
 /// A run of whole tiles, GDDR -> L1: `[READ_RUN, first, count, at, flags, ct,
 /// 0, 0]` + `X`. Tiles `first..first + count`, row-major over a grid `ct`
@@ -68,9 +55,6 @@ pub const READ_RUN: u32 = 0x15;
 /// tile `first + n` of `X`, row-major. What a kernel's packer wrote goes back.
 pub const WRITE_RUN: u32 = 0x16;
 
-/// Slots of the staging area a column sum uses at once, accumulator included.
-pub const SUM_SLOTS: usize = 200;
-
 /// Most tiles a record may name along any one of its loops: far more than any
 /// list holds, and few enough that a corrupt record cannot keep the mover busy
 /// for long.
@@ -79,9 +63,8 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 /// Entries in the record whose header word 0 is `op`: 1 for a plain entry.
 pub const fn len(op: u32) -> usize {
     match op {
-        GATHER | SUM => 5,
+        GATHER => 5,
         SCATTER | FILL_PAD | READ_RUN | WRITE_RUN => 3,
-        ELTWISE => 7,
         _ => 1,
     }
 }
@@ -119,7 +102,7 @@ impl TensorRef {
     }
 
     /// The inverse of [`TensorRef::encode`]. `n` may be 0 only for a tensor
-    /// that is never read (`ELTWISE`'s absent `B`); whether each channel is one
+    /// that is never read (a record's absent operand); whether each channel is one
     /// the chip has is checked on every entry the tensor produces.
     pub fn decode(w: [[u32; 8]; 2]) -> Result<Self, u32> {
         let [m, base] = w;
@@ -251,89 +234,6 @@ pub fn expand(
                 }
             }
         }
-        ELTWISE => {
-            let [_, kind, scalar, first, count, flags, stage, _] = h;
-            let count = extent(count)?;
-            let (binary, row) = (flags & 1 != 0, flags & 2 != 0);
-            let (a, b, out) = (tensor(rec, 1)?, tensor(rec, 3)?, tensor(rec, 5)?);
-            if a.ct == 0 {
-                return Err(super::error::LENGTH);
-            }
-            let slot = |i: u32| stage + i * TILE_SLOT as u32;
-            // Row-major from `first`, stepped rather than divided per tile.
-            let (mut i, mut j) = div_rem(first, a.ct);
-            for n in 0..count {
-                if n > 0 {
-                    j += 1;
-                    if j == a.ct {
-                        (i, j) = (i + 1, 0);
-                    }
-                }
-                let (ch, off) = a.tile(i, j)?;
-                emit([
-                    op::READ,
-                    ch,
-                    n % PORTS,
-                    off,
-                    slot(2 * n),
-                    TILE_SLOT as u32,
-                    0,
-                    0,
-                ])?;
-                if binary {
-                    let (ch, off) = if row { b.tile(0, j)? } else { b.tile(i, j)? };
-                    emit([
-                        op::READ,
-                        ch,
-                        (n + 1) % PORTS,
-                        off,
-                        slot(2 * n + 1),
-                        TILE_SLOT as u32,
-                        0,
-                        0,
-                    ])?;
-                }
-                emit([
-                    op::COMPUTE,
-                    kind,
-                    scalar,
-                    0,
-                    slot(2 * n),
-                    slot(2 * n),
-                    slot(2 * n + 1),
-                    0,
-                ])?;
-                let (ch, off) = out.tile(i, j)?;
-                emit([
-                    op::WRITE,
-                    ch,
-                    n % PORTS,
-                    off + TILE_DATA as u32,
-                    slot(2 * n) + TILE_DATA as u32,
-                    4096,
-                    0,
-                    0,
-                ])?;
-            }
-        }
-        SUM => {
-            let [_, first, count, rt, stage, last_rows, ..] = h;
-            let (count, rt) = (extent(count)?, extent(rt)?);
-            if last_rows > 31 {
-                return Err(super::error::LENGTH);
-            }
-            let (a, out) = (tensor(rec, 1)?, tensor(rec, 3)?);
-            sum(
-                &a,
-                &out,
-                first,
-                count,
-                rt as usize,
-                stage,
-                last_rows,
-                &mut emit,
-            )?;
-        }
         READ_RUN | WRITE_RUN => {
             let [_, first, count, at, flags, grid_ct, grid_rt, _] = h;
             let count = extent(count)?;
@@ -421,16 +321,7 @@ pub fn expand(
                 emit([op::READ, ch, n % PORTS, off, at, TILE_SLOT as u32, 0, 0])?;
                 let vr = if i == rt - 1 { rows } else { 0 };
                 let vc = if j == a.ct - 1 { cols } else { 0 };
-                emit([
-                    op::COMPUTE,
-                    super::kind::FILL_PAD,
-                    value,
-                    vr | vc << 8,
-                    at,
-                    at,
-                    at,
-                    0,
-                ])?;
+                emit([op::FILL, value, vr | vc << 8, at, 0, 0, 0, 0])?;
                 emit([
                     op::WRITE,
                     ch,
@@ -444,112 +335,6 @@ pub fn expand(
             }
         }
         _ => return Err(super::error::OP),
-    }
-    Ok(())
-}
-
-/// The column sums of [`SUM`]: the schedule `tt_kernels::tensor::sum_rows`
-/// had when it built lists itself. Whole columns are packed into one list's
-/// worth of slots while they fit; a column taller than that spans several,
-/// accumulating in place. Where it started a new list, a [`op::WAIT`] stands
-/// in, since the next entries reuse the slots.
-#[allow(clippy::too_many_arguments)]
-fn sum(
-    a: &TensorRef,
-    out: &TensorRef,
-    first: u32,
-    count: u32,
-    rt: usize,
-    stage: u32,
-    last_rows: u32,
-    emit: &mut impl FnMut([u32; 8]) -> Result<(), u32>,
-) -> Result<(), u32> {
-    const SLOTS: usize = SUM_SLOTS;
-    let slot = |i: usize| stage + (i as u64 * TILE_SLOT) as u32;
-    // A list boundary of the old schedule: a wait before whatever comes next,
-    // if anything has been emitted since the last one.
-    let mut since = false;
-    let mut pending = false;
-    let mut put = |e: [u32; 8], pending: &mut bool, since: &mut bool| -> Result<(), u32> {
-        if core::mem::take(pending) {
-            emit([op::WAIT, 0, 0, 0, 0, 0, 0, 0])?;
-        }
-        *since = true;
-        emit(e)
-    };
-    let flush = |pending: &mut bool, since: &mut bool| {
-        if core::mem::take(since) {
-            *pending = true;
-        }
-    };
-    let mut used = 0usize;
-    for j in first..first + count {
-        if used + 1 + rt.min(SLOTS - 1) > SLOTS {
-            flush(&mut pending, &mut since);
-            used = 0;
-        }
-        let acc = slot(used);
-        used += 1;
-        let mut i0 = 0;
-        while i0 < rt {
-            let rows = (rt - i0).min(SLOTS - 1);
-            if used + rows > SLOTS {
-                // Only a column taller than a list reaches here: keep the
-                // accumulator slot where it is.
-                flush(&mut pending, &mut since);
-                used = 1 + ((acc - stage) as u64 / TILE_SLOT) as usize;
-            }
-            for i in i0..i0 + rows {
-                let (ch, off) = a.tile(i as u32, j)?;
-                put(
-                    [
-                        op::READ,
-                        ch,
-                        (i % PORTS as usize) as u32,
-                        off,
-                        slot(used + i - i0),
-                        TILE_SLOT as u32,
-                        0,
-                        0,
-                    ],
-                    &mut pending,
-                    &mut since,
-                )?;
-            }
-            for i in i0..i0 + rows {
-                put(
-                    [
-                        op::COMPUTE,
-                        super::kind::COL_SUM,
-                        u32::from(i == 0),
-                        if i == rt - 1 { last_rows } else { 0 },
-                        acc,
-                        slot(used + i - i0),
-                        acc,
-                        0,
-                    ],
-                    &mut pending,
-                    &mut since,
-                )?;
-            }
-            used += rows;
-            i0 += SLOTS - 1;
-        }
-        let (ch, off) = out.tile(0, j)?;
-        put(
-            [
-                op::WRITE,
-                ch,
-                0,
-                off + TILE_DATA as u32,
-                acc + TILE_DATA as u32,
-                4096,
-                0,
-                0,
-            ],
-            &mut pending,
-            &mut since,
-        )?;
     }
     Ok(())
 }

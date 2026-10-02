@@ -268,11 +268,110 @@ pub mod niu {
                 None
             }
         }
+
+        /// The ID itself, `0..16`.
+        pub const fn index(self) -> usize {
+            self.0 as usize
+        }
+    }
+
+    /// Most response-marked requests one transaction ID may have in flight.
+    ///
+    /// [`reqs_outstanding`] is 8 bits and wraps silently (`Counters.md`): with
+    /// 256 in flight it reads 0, and a wait on it would end while data is still
+    /// arriving. 128 leaves the counter half its range, and is still far past
+    /// what fills a link: ~11 requests of 16 KiB cover the NoC's bandwidth-delay
+    /// product, 128 of them are 2 MiB.
+    pub const MAX_IN_FLIGHT: u16 = 128;
+    const _: () = assert!(MAX_IN_FLIGHT >= 1 && MAX_IN_FLIGHT < 256);
+
+    /// Keeps one transaction ID's requests in flight at or under a cap, so its
+    /// 8-bit [`reqs_outstanding`] counter cannot wrap.
+    ///
+    /// `room` is how many more requests may be issued before the counter must
+    /// be read: the counter is at most `cap - room`, since completions only
+    /// take it down. While there is room an issue costs one compare and one
+    /// decrement; without, the counter is read -- and spun on until it is
+    /// under the cap -- and `room` refilled from it. Nothing needs telling of
+    /// completions: a stale `room` is only ever too small, and costs one read.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct InFlight {
+        room: u16,
+        cap: u16,
+    }
+
+    impl Default for InFlight {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl InFlight {
+        pub const fn new() -> Self {
+            InFlight {
+                room: MAX_IN_FLIGHT,
+                cap: MAX_IN_FLIGHT,
+            }
+        }
+
+        /// Use `cap` from now on: 0 for [`MAX_IN_FLIGHT`], otherwise clamped
+        /// to `1..=MAX_IN_FLIGHT`. Only with nothing in flight -- it refills
+        /// the room -- which is why the mover sets it as a list starts, after
+        /// the last one's wait. Lower caps are for gates that force the
+        /// throttle.
+        pub fn set_cap(&mut self, cap: u32) {
+            self.cap = if cap == 0 {
+                MAX_IN_FLIGHT
+            } else {
+                cap.min(MAX_IN_FLIGHT as u32) as u16
+            };
+            self.room = self.cap;
+        }
+
+        pub const fn cap(&self) -> u16 {
+            self.cap
+        }
+
+        /// Will the next [`InFlight::before_issue`] read the counter -- and so
+        /// possibly wait?
+        pub const fn at_cap(&self) -> bool {
+            self.room == 0
+        }
+
+        /// Make room for one more request. `outstanding` reads the ID's
+        /// counter (its low 8 bits); it is called only when there is no room
+        /// left. Returns how many reads found the ID still at its cap: 0 when
+        /// there was room without waiting.
+        pub fn before_issue(&mut self, mut outstanding: impl FnMut() -> u8) -> u32 {
+            if self.room != 0 {
+                return 0;
+            }
+            let mut full = 0u32;
+            loop {
+                let n = outstanding() as u16;
+                if n < self.cap {
+                    self.room = self.cap - n;
+                    return full;
+                }
+                full = full.saturating_add(1);
+            }
+        }
+
+        /// One request was issued.
+        pub fn after_issue(&mut self) {
+            self.room -= 1;
+        }
+
+        /// The counter was seen at zero: every request has completed.
+        pub fn drained(&mut self) {
+            self.room = self.cap;
+        }
     }
 
     /// Largest length one request may carry between L1 addresses. Larger ones
     /// are split by hardware, but then one request moves the 8-bit outstanding
-    /// counter by more than one, so this refuses them instead.
+    /// counter by more than one -- which [`InFlight`], counting one per request,
+    /// would not see -- so this refuses them instead.
     pub const MAX_REQUEST_BYTES: u32 = 16384;
     /// In Tensix and Ethernet tiles, L1 is below this and MMIO at or above it
     /// (WH `NoC/Alignment.md`).
@@ -495,6 +594,101 @@ pub mod niu {
             return Err(RequestError::Alignment);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod in_flight_tests {
+        use super::*;
+
+        /// A transaction ID's counter: up on each issue, down as requests
+        /// complete, here in a pseudo-random order and pace.
+        struct Niu {
+            outstanding: u32,
+            peak: u32,
+            reads: u32,
+            seed: u32,
+        }
+
+        impl Niu {
+            fn complete_some(&mut self) {
+                self.seed ^= self.seed << 13;
+                self.seed ^= self.seed >> 17;
+                self.seed ^= self.seed << 5;
+                let done = self.seed % 4;
+                self.outstanding = self.outstanding.saturating_sub(done);
+            }
+        }
+
+        #[test]
+        fn the_counter_never_passes_the_cap_and_is_never_read_under_it() {
+            for cap in [1u32, 2, 7, 128, 0] {
+                let mut f = InFlight::new();
+                f.set_cap(cap);
+                let mut niu = Niu {
+                    outstanding: 0,
+                    peak: 0,
+                    reads: 0,
+                    seed: 0x1234_5678 | cap,
+                };
+                let mut stalls = 0;
+                for i in 0..100_000u32 {
+                    let reads_before = niu.reads;
+                    let full = f.before_issue(|| {
+                        niu.reads += 1;
+                        niu.complete_some();
+                        niu.outstanding as u8
+                    });
+                    stalls += u32::from(full > 0);
+                    if niu.reads == reads_before {
+                        assert!(niu.outstanding < f.cap() as u32, "issued at the cap unread");
+                    }
+                    niu.outstanding += 1;
+                    f.after_issue();
+                    niu.peak = niu.peak.max(niu.outstanding);
+                    if i % 1000 == 999 {
+                        while niu.outstanding > 0 {
+                            niu.complete_some();
+                        }
+                        f.drained();
+                    }
+                }
+                assert!(
+                    niu.peak <= f.cap() as u32,
+                    "cap {}: peak {}",
+                    f.cap(),
+                    niu.peak
+                );
+                assert!(niu.peak < 256);
+                assert!(stalls > 0, "cap {}: the throttle never engaged", f.cap());
+            }
+        }
+
+        #[test]
+        fn under_the_cap_there_is_no_read() {
+            let mut f = InFlight::new();
+            for _ in 0..MAX_IN_FLIGHT {
+                assert_eq!(f.before_issue(|| panic!("read under the cap")), 0);
+                f.after_issue();
+            }
+            assert!(f.at_cap());
+            // At the cap the counter is read; room already there is no stall.
+            assert_eq!(f.before_issue(|| 3), 0);
+            assert!(!f.at_cap());
+            f.drained();
+            assert!(!f.at_cap());
+        }
+
+        #[test]
+        fn caps_clamp() {
+            let mut f = InFlight::new();
+            assert_eq!(f.cap(), MAX_IN_FLIGHT, "new() is the default cap");
+            f.set_cap(0);
+            assert_eq!(f.cap(), MAX_IN_FLIGHT);
+            f.set_cap(1000);
+            assert_eq!(f.cap(), MAX_IN_FLIGHT);
+            f.set_cap(1);
+            assert_eq!(f.cap(), 1);
+        }
     }
 
     #[cfg(test)]

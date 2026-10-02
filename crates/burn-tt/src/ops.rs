@@ -18,7 +18,9 @@ use burn_backend::{DType, ExecutionError, IntDType, TensorData, TensorMetadata};
 use burn_flex::{Flex, FlexTensor};
 
 use crate::convert::IntoFlex;
+use crate::server::Elem;
 use crate::{TtBackend, TtDevice, TtQTensor, TtTensor};
+use tt_kernels::sfpu::ops::kind_sfpu;
 
 /// A tensor moved to `device`. The same device: unchanged. Another: its host
 /// copy, retagged -- a device copy belongs to the chip that holds it.
@@ -31,7 +33,7 @@ fn retag(tensor: TtTensor, device: &TtDevice) -> TtTensor {
 
 /// A device result as a tensor.
 fn device_result(device: TtDevice, id: crate::server::BufferId, dims: [usize; 2]) -> TtTensor {
-    device_view(device, id, dims, None)
+    device_view(device, id, dims, None, DType::F32)
 }
 
 /// [`device_result`] for a tensor of `shape`, stored as `dims`
@@ -41,10 +43,11 @@ fn device_result_shaped(
     id: crate::server::BufferId,
     dims: [usize; 2],
     shape: burn_backend::Shape,
+    dtype: DType,
 ) -> TtTensor {
-    let t = device_result(device, id, dims);
+    let t = device_view(device, id, dims, None, dtype);
     let dram = t.dram().expect("made on the device").clone();
-    TtTensor::on_device(dram, shape, device)
+    TtTensor::on_device(dram, shape, dtype, device)
 }
 
 /// A device result that reads `parent`'s slots, keeping it alive.
@@ -53,6 +56,7 @@ fn device_view(
     id: crate::server::BufferId,
     [m, n]: [usize; 2],
     parent: Option<std::sync::Arc<crate::tensor::Buffer>>,
+    dtype: DType,
 ) -> TtTensor {
     let buffer = std::sync::Arc::new(crate::tensor::Buffer {
         id,
@@ -67,6 +71,7 @@ fn device_view(
             transposed: false,
         },
         burn_backend::Shape::from(vec![m, n]),
+        dtype,
         device,
     )
 }
@@ -108,9 +113,10 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
 }
 
 fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) -> Option<TtTensor> {
-    // The SFPU-only ops are approximations: not in exact mode, and not on a
-    // tensor too small to pay their fixed cost (`APPROX_MIN_TILES`).
-    if !tt_kernels::sfpu::ops::mover_has(kind) && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
+    // An approximation: not in exact mode, and not on a tensor too small to
+    // pay its fixed cost (`APPROX_MIN_TILES`). An exact op follows the data.
+    use tt_kernels::sfpu::ops::{accuracy, Accuracy};
+    if accuracy(kind) == Accuracy::Approximate && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
         return None;
     }
     device_eltwise_ungated(kind, scalar, a, b)
@@ -125,14 +131,52 @@ fn device_eltwise_ungated(
     a: &TtTensor,
     b: Option<&TtTensor>,
 ) -> Option<TtTensor> {
-    use tt_isa::dm::kind as k;
-    let device = a.device;
-    let all = |f: &dyn Fn(&TtTensor) -> bool| f(a) && b.is_none_or(f);
-    // Any rank: each operand as the matrix it is stored as
-    // (`crate::tensor::stored_dims`).
-    if !all(&|t: &TtTensor| t.is_stored_f32() && t.device == device) {
+    let op = tt_kernels::tensor::Eltwise {
+        kind,
+        scalar,
+        scalar2: 0.0,
+    };
+    device_op_ungated(op, a, b, None)
+}
+
+/// [`device_eltwise`] with the whole op (both scalars) and a ternary op's
+/// third operand, `a`'s shape.
+fn device_op(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+) -> Option<TtTensor> {
+    use tt_kernels::sfpu::ops::{accuracy, Accuracy};
+    if accuracy(op.kind) == Accuracy::Approximate && (crate::exact() || tiles(a) < APPROX_MIN_TILES)
+    {
         return None;
     }
+    device_op_ungated(op, a, b, c)
+}
+
+fn device_op_ungated(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+) -> Option<TtTensor> {
+    use tt_kernels::kind as k;
+    let kind = op.kind;
+    let device = a.device;
+    // Any rank: each operand as the matrix it is stored as
+    // (`crate::tensor::stored_dims`), of the element type the kind computes on.
+    let sig = tt_kernels::sfpu::ops::elems(kind);
+    let fits = |t: &TtTensor, i: usize| {
+        t.is_storable() && t.elem() == sig.inputs.get(i).copied() && t.device == device
+    };
+    if !fits(a, 0) || b.is_some_and(|b| !fits(b, 1)) || c.is_some_and(|c| !fits(c, 2)) {
+        return None;
+    }
+    if c.is_some_and(|c| c.shape() != a.shape()) {
+        return None;
+    }
+    let (input, output) = (sig.inputs[0], sig.out);
     if a.dram().is_none() && b.is_none_or(|b| b.dram().is_none()) {
         return None;
     }
@@ -176,19 +220,158 @@ fn device_eltwise_ungated(
     if !bias && b.is_some_and(|b| b.shape() != a.shape() && b.dram().is_none()) {
         return None;
     }
-    let (da, db) = (a.to_dram(), b.map(|b| b.to_dram()));
-    if da.transposed || db.is_some_and(|d| d.transposed) {
+    let (da, db, dc) = (a.to_dram(), b.map(|b| b.to_dram()), c.map(|c| c.to_dram()));
+    if da.transposed || db.is_some_and(|d| d.transposed) || dc.is_some_and(|d| d.transposed) {
         return None;
     }
-    let (id, dims) =
-        crate::server::eltwise(device, kind, scalar, da.buffer.id, db.map(|d| d.buffer.id));
-    Some(device_result_shaped(device, id, dims, a.shape()))
+    let (id, dims) = crate::server::eltwise_op(
+        device,
+        op,
+        da.buffer.id,
+        db.map(|d| d.buffer.id),
+        dc.map(|d| d.buffer.id),
+    );
+    // The input's own dtype where the element type is kept (a bool's store
+    // among them), else the output's.
+    let dtype = if output == input {
+        a.dtype()
+    } else {
+        match output {
+            Elem::F32 => DType::F32,
+            Elem::I32 => DType::I32,
+            Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
+        }
+    };
+    Some(device_result_shaped(device, id, dims, a.shape(), dtype))
+}
+
+/// What [`device_pow`] raises to.
+#[derive(Copy, Clone)]
+enum PowY<'a> {
+    Tensor(&'a TtTensor),
+    Scalar(f32),
+    Int(&'a TtTensor),
+}
+
+/// `x^y` on the device (`tt_kernels::session::Session::pow`, one op), if
+/// that is where the data is -- `x` an `F32` tensor, `y` one of its shape (or
+/// an `I32` one) or a scalar, one of them already on the device, none a
+/// transposed view; an approximation, so gated as [`device_eltwise`] gates
+/// one. `None` otherwise.
+fn device_pow(x: &TtTensor, y: PowY<'_>) -> Option<TtTensor> {
+    if crate::exact() || tiles(x) < APPROX_MIN_TILES {
+        return None;
+    }
+    let device = x.device;
+    if !x.is_storable() || x.elem() != Some(Elem::F32) || !crate::server::supports_dram(device) {
+        return None;
+    }
+    let yt = match y {
+        PowY::Tensor(t) | PowY::Int(t) => {
+            let want = if matches!(y, PowY::Int(_)) {
+                Elem::I32
+            } else {
+                Elem::F32
+            };
+            if t.elem() != Some(want) || t.shape() != x.shape() || t.device != device {
+                return None;
+            }
+            Some(t)
+        }
+        PowY::Scalar(_) => None,
+    };
+    if x.dram().is_none() && yt.is_none_or(|t| t.dram().is_none()) {
+        return None;
+    }
+    let dx = x.to_dram();
+    let dy = yt.map(|t| t.to_dram());
+    if dx.transposed || dy.is_some_and(|d| d.transposed) {
+        return None;
+    }
+    let arg = match y {
+        PowY::Tensor(_) => crate::server::PowArg::Tensor(dy?.buffer.id),
+        PowY::Int(_) => crate::server::PowArg::Int(dy?.buffer.id),
+        PowY::Scalar(v) => crate::server::PowArg::Scalar(v),
+    };
+    let (id, dims) = crate::server::pow(device, dx.buffer.id, arg);
+    Some(device_result_shaped(
+        device,
+        id,
+        dims,
+        x.shape(),
+        DType::F32,
+    ))
+}
+
+/// `t`, a device result, as `dtype` -- a comparison's requested bool store,
+/// which every store shares on the device (`Elem::Bool`).
+fn retyped(t: TtTensor, dtype: DType) -> TtTensor {
+    let d = t.dram().expect("a device result").clone();
+    TtTensor::on_device(d, t.shape(), dtype, t.device)
+}
+
+/// The two dimensions of a matrix already on the device swapped, as a view of
+/// the same buffer, whatever its element type -- the device matmul reads it
+/// transposed, and a host op downloads it transposed. `None` for anything else.
+fn swapped_view(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
+    if !(tensor.is_storable_matrix() && dim1 != dim2 && dim1 < 2 && dim2 < 2) {
+        return None;
+    }
+    let d = tensor.dram()?;
+    let d = crate::tensor::DramRef {
+        buffer: d.buffer.clone(),
+        transposed: !d.transposed,
+    };
+    let s = tensor.shape().to_vec();
+    Some(TtTensor::on_device(
+        d,
+        burn_backend::Shape::from(vec![s[1], s[0]]),
+        tensor.dtype(),
+        tensor.device,
+    ))
+}
+
+/// `tensor` reshaped, a view of the same slots when the new shape is stored as
+/// the same matrix (`crate::tensor::stored_dims`: `[1, n]` and `[n]`, `[2, 3,
+/// 4]` and `[6, 4]`), so a reshape of a device tensor costs nothing and keeps
+/// it there; else `host`'s, on the host copy -- sharing the source's
+/// device-copy slot where there is none yet, so a bias reshaped every forward
+/// pass is uploaded once.
+fn reshaped(
+    tensor: TtTensor,
+    shape: burn_backend::Shape,
+    host: impl Fn(burn_flex::FlexTensor, burn_backend::Shape) -> burn_flex::FlexTensor,
+) -> TtTensor {
+    let same =
+        tensor.stored().is_some() && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
+    if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
+        if same && tensor.is_storable() {
+            return TtTensor::on_device(d.clone(), shape, tensor.dtype(), tensor.device);
+        }
+    }
+    if same && tensor.is_storable() && tensor.dram().is_none() {
+        let h = host(tensor.host().clone(), shape.clone());
+        return tensor.reshaped_host(h, shape);
+    }
+    let device = tensor.device;
+    TtTensor::new(host(tensor.into_host(), shape), device)
+}
+
+/// On `device`, and for a tensor the device stores on an engine that keeps
+/// tensors, resident there: `Tensor::to_device` is how a caller says "this
+/// lives on the card" (a dataset, its labels, a mask).
+fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
+    let t = retag(tensor, device);
+    if t.is_storable() && crate::server::supports_dram(*device) {
+        let _ = t.to_dram();
+    }
+    t
 }
 
 pub mod float {
     use super::*;
     use burn_backend::Scalar;
-    use tt_isa::dm::kind;
+    use tt_kernels::kind;
 
     macro_rules! binary {
         ($name:ident, $kind:expr) => {
@@ -215,6 +398,35 @@ pub mod float {
     // Within one ulp of Flex's correctly rounded quotient, not bit for bit:
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
+
+    /// `atan2(lhs, rhs)` on the device where the data is, within
+    /// `ops::ATAN2_BOUND`, a denormal operand read as a zero of its sign; else
+    /// Flex's. Operands of one shape only: a broadcast is refused, not sent to
+    /// the host -- the device has no program for it (its row form would not
+    /// fit a slot, `hardware-coverage.md` 10.2f), and burn-flex is not to be
+    /// relied on.
+    pub fn float_atan2(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        assert!(
+            lhs.shape() == rhs.shape(),
+            "float_atan2 of shapes {:?} and {:?}: burn-tt computes atan2 of tensors \
+             of one shape only (no broadcast; hardware-coverage.md 10.2f) -- expand \
+             the smaller operand first",
+            lhs.shape(),
+            rhs.shape()
+        );
+        let kind = tt_kernels::sfpu::ops::kind_sfpu::ATAN2;
+        if let Some(t) = device_eltwise(kind, 0.0, &lhs, Some(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_atan2(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
 
     /// `1/x` on the device where the data is, within one ulp of Flex's
     /// (`kind_sfpu::RECIP`), else Flex's.
@@ -425,19 +637,8 @@ pub mod float {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
-        if tensor.is_matrix_f32() && dim1 != dim2 && dim1 < 2 && dim2 < 2 {
-            if let Some(d) = tensor.dram() {
-                let d = crate::tensor::DramRef {
-                    buffer: d.buffer.clone(),
-                    transposed: !d.transposed,
-                };
-                let s = tensor.shape().to_vec();
-                return TtTensor::on_device(
-                    d,
-                    burn_backend::Shape::from(vec![s[1], s[0]]),
-                    tensor.device,
-                );
-            }
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
         }
         let device = tensor.device;
         TtTensor::new(
@@ -463,29 +664,12 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
-        let same = tensor.stored().is_some()
-            && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
-        if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
-            if same && tensor.is_stored_f32() {
-                return TtTensor::on_device(d.clone(), shape, tensor.device);
-            }
-        }
-        // On the host, but sharing the source's device-copy slot: a bias
-        // reshaped every forward pass is uploaded once, not every pass.
-        if same && tensor.is_stored_f32() && tensor.dram().is_none() {
-            let host =
-                <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.host().clone(), shape.clone());
-            return tensor.reshaped_host(host, shape);
-        }
-        let device = tensor.device;
-        TtTensor::new(
-            <Flex as FloatTensorOps<Flex>>::float_reshape(tensor.into_host(), shape),
-            device,
-        )
+        reshaped(tensor, shape, <Flex as FloatTensorOps<Flex>>::float_reshape)
     }
 
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
-    /// Flex's order (`tt_isa::dm::kind::COL_SUM`). Anything else is Flex's.
+    /// Flex's order (`tt_kernels::sfpu::reduce::accumulate_in_order`).
+    /// Anything else is Flex's.
     pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         use tt_kernels::sfpu::reduce::ReduceOp;
         if let Some(t) = device_reduce(&tensor, ReduceOp::Sum, dim) {
@@ -513,16 +697,17 @@ pub mod float {
     }
 
     /// `tensor` reduced along `dim` on the device, if it is a device-resident
-    /// F32 matrix (not a transposed view): a sum over rows by the mover in
-    /// Flex's order, everything else on the SFPU (`Session::reduce`).
+    /// F32 matrix (not a transposed view), on the SFPU (`Session::reduce`): a
+    /// sum over rows in Flex's order, the rest as `sfpu::reduce` computes them.
     pub(crate) fn device_reduce(
         tensor: &TtTensor,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         dim: usize,
     ) -> Option<TtTensor> {
         use tt_kernels::sfpu::reduce::ReduceOp;
-        // Only the mover's sum over rows gives Flex's bits; the SFPU's sum is
-        // in another order, and its maximum prefers `+0` to `-0`. Those, not
+        // Only the sum over rows gives Flex's bits (it adds in Flex's order);
+        // the sum over columns is in a tree order, and the maximum prefers `+0`
+        // to `-0`. Those, not
         // in exact mode, and not on a tensor too small to pay for themselves.
         if (op, dim) != (ReduceOp::Sum, 0) && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
             return None;
@@ -564,8 +749,8 @@ pub mod float {
         )
     }
 
-    fn row_view(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
-        if !tensor.is_matrix_f32() || slices.is_empty() || slices.len() > 2 {
+    pub(crate) fn row_view(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
+        if !tensor.is_storable_matrix() || slices.is_empty() || slices.len() > 2 {
             return None;
         }
         let d = tensor.dram().filter(|d| !d.transposed)?;
@@ -589,7 +774,397 @@ pub mod float {
             return None;
         }
         let (id, dims) = crate::server::slice_rows(tensor.device, d.buffer.id, first, n);
-        Some(device_view(tensor.device, id, dims, Some(d.buffer.clone())))
+        Some(device_view(
+            tensor.device,
+            id,
+            dims,
+            Some(d.buffer.clone()),
+            tensor.dtype(),
+        ))
+    }
+
+    // S2 (10.2c): exact on the device, so wherever the data is, any size,
+    // exact mode included.
+    unary_sfpu!(
+        float_neg,
+        kind_sfpu::NEG,
+        "`-x`, the sign bit flipped (NaNs too), on the device where the data is, else Flex's."
+    );
+    unary_sfpu!(
+        float_abs,
+        kind_sfpu::ABS,
+        "`|x|`, the sign bit cleared (NaNs too), on the device where the data is, else Flex's."
+    );
+    unary_sfpu!(
+        float_sign,
+        kind_sfpu::SIGN,
+        "Flex's `sign` (a NaN itself, `+0` for a zero) on the device where the data is."
+    );
+
+    fn scalar_f32(s: Scalar) -> f32 {
+        use num_traits::ToPrimitive;
+        s.to_f32().expect("a float scalar")
+    }
+
+    fn op2(kind: u32, scalar: f32, scalar2: f32) -> tt_kernels::tensor::Eltwise {
+        tt_kernels::tensor::Eltwise {
+            kind,
+            scalar,
+            scalar2,
+        }
+    }
+
+    /// On the device where the data is, as `f32::clamp`; bounds `f32::clamp`
+    /// panics on (a NaN, or crossed) go to Flex's, which does.
+    pub fn float_clamp(
+        tensor: FloatTensor<TtBackend>,
+        min: Scalar,
+        max: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        let (lo, hi) = (scalar_f32(min), scalar_f32(max));
+        if !(lo.is_nan() || hi.is_nan() || lo > hi) {
+            if let Some(t) = device_op(op2(kind_sfpu::CLAMP, lo, hi), &tensor, None, None) {
+                return t;
+            }
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_clamp(tensor.into_host(), min, max),
+            device,
+        )
+    }
+
+    pub fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
+        let s = scalar_f32(min);
+        if let Some(t) = device_eltwise(kind_sfpu::CLAMP_MIN, s, &tensor, None) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_clamp_min(tensor.into_host(), min),
+            device,
+        )
+    }
+
+    pub fn float_clamp_max(tensor: FloatTensor<TtBackend>, max: Scalar) -> FloatTensor<TtBackend> {
+        let s = scalar_f32(max);
+        if let Some(t) = device_eltwise(kind_sfpu::CLAMP_MAX, s, &tensor, None) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_clamp_max(tensor.into_host(), max),
+            device,
+        )
+    }
+
+    macro_rules! compare {
+        ($name:ident, $kind:expr) => {
+            /// An IEEE comparison on the device where the data is (a row or
+            /// column broadcast on the right), its `Bool` resident; else Flex's.
+            pub fn $name(
+                lhs: FloatTensor<TtBackend>,
+                rhs: FloatTensor<TtBackend>,
+                out_dtype: burn_backend::BoolDType,
+            ) -> BoolTensor<TtBackend> {
+                if let Some(t) = device_eltwise($kind, 0.0, &lhs, Some(&rhs)) {
+                    return retyped(t, out_dtype.into());
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::$name(
+                        lhs.into_host(),
+                        rhs.into_host(),
+                        out_dtype,
+                    ),
+                    device,
+                )
+            }
+        };
+    }
+    compare!(float_equal, kind_sfpu::EQ);
+    compare!(float_not_equal, kind_sfpu::NE);
+    compare!(float_greater, kind_sfpu::GT);
+    compare!(float_greater_equal, kind_sfpu::GE);
+    compare!(float_lower, kind_sfpu::LT);
+    compare!(float_lower_equal, kind_sfpu::LE);
+
+    macro_rules! compare_elem {
+        ($name:ident, $kind:expr) => {
+            /// Against a scalar converted as Flex converts it (`f64`, then
+            /// `f32`), on the device where the data is; else Flex's.
+            pub fn $name(
+                lhs: FloatTensor<TtBackend>,
+                rhs: Scalar,
+                out_dtype: burn_backend::BoolDType,
+            ) -> BoolTensor<TtBackend> {
+                use num_traits::ToPrimitive;
+                let s = rhs.to_f64().expect("a float scalar") as f32;
+                if let Some(t) = device_eltwise($kind, s, &lhs, None) {
+                    return retyped(t, out_dtype.into());
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::$name(lhs.into_host(), rhs, out_dtype),
+                    device,
+                )
+            }
+        };
+    }
+    compare_elem!(float_equal_elem, kind_sfpu::EQ_S);
+    compare_elem!(float_not_equal_elem, kind_sfpu::NE_S);
+    compare_elem!(float_greater_elem, kind_sfpu::GT_S);
+    compare_elem!(float_greater_equal_elem, kind_sfpu::GE_S);
+    compare_elem!(float_lower_elem, kind_sfpu::LT_S);
+    compare_elem!(float_lower_equal_elem, kind_sfpu::LE_S);
+
+    macro_rules! predicate {
+        ($name:ident, $kind:expr) => {
+            /// On the device where the data is, its `Bool` resident; else Flex's.
+            pub fn $name(
+                tensor: FloatTensor<TtBackend>,
+                out_dtype: burn_backend::BoolDType,
+            ) -> BoolTensor<TtBackend> {
+                if let Some(t) = device_eltwise($kind, 0.0, &tensor, None) {
+                    return retyped(t, out_dtype.into());
+                }
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::$name(tensor.into_host(), out_dtype),
+                    device,
+                )
+            }
+        };
+    }
+    predicate!(float_is_nan, kind_sfpu::IS_NAN);
+    predicate!(float_is_inf, kind_sfpu::IS_INF);
+
+    /// `mask ? value : x` on the device where the data is (the mask may be a
+    /// row or column of `x`'s matrix), every bit of `x` kept; else Flex's.
+    pub fn float_mask_fill(
+        tensor: FloatTensor<TtBackend>,
+        mask: BoolTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(
+            kind_sfpu::MASK_FILL,
+            scalar_f32(value),
+            &tensor,
+            Some(&mask),
+        ) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_mask_fill(
+                tensor.into_host(),
+                mask.into_host(),
+                value,
+            ),
+            device,
+        )
+    }
+
+    /// `mask ? value : x`, all three one shape, on the device where the data is;
+    /// else Flex's.
+    pub fn float_mask_where(
+        tensor: FloatTensor<TtBackend>,
+        mask: BoolTensor<TtBackend>,
+        value: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let op = op2(kind_sfpu::MASK_WHERE, 0.0, 0.0);
+        if mask.shape() == tensor.shape() {
+            if let Some(t) = device_op(op, &tensor, Some(&mask), Some(&value)) {
+                return t;
+            }
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_mask_where(
+                tensor.into_host(),
+                mask.into_host(),
+                value.into_host(),
+            ),
+            device,
+        )
+    }
+
+    // S4 (10.2d): approximations within their derived bounds.
+    unary_sfpu!(
+        float_sqrt,
+        kind_sfpu::SQRT,
+        "`sqrt x` on the device where the data is, within one ulp of the correctly rounded root, else Flex's."
+    );
+    unary_sfpu!(
+        float_log1p,
+        kind_sfpu::LOG1P,
+        "`ln(1 + x)` on the device where the data is, within `ops::LOG1P_BOUND`, else Flex's."
+    );
+    // S4 (10.2e).
+    unary_sfpu!(
+        float_tanh,
+        kind_sfpu::TANH,
+        "`tanh x` on the device where the data is, within `ops::TANH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_erf,
+        kind_sfpu::ERF,
+        "`erf x` on the device where the data is, within `ops::ERF_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_sinh,
+        kind_sfpu::SINH,
+        "`sinh x` on the device where the data is, within `ops::SINH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_cosh,
+        kind_sfpu::COSH,
+        "`cosh x` on the device where the data is, within `ops::COSH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_asinh,
+        kind_sfpu::ASINH,
+        "`asinh x` on the device where the data is, within `ops::ASINH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_acosh,
+        kind_sfpu::ACOSH,
+        "`acosh x` on the device where the data is, within `ops::ACOSH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_atanh,
+        kind_sfpu::ATANH,
+        "`atanh x` on the device where the data is, within `ops::ATANH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_sin,
+        kind_sfpu::SIN,
+        "`sin x` on the device where the data is, within `ops::SIN_BOUND` for every finite `x`, else Flex's."
+    );
+    unary_sfpu!(
+        float_cos,
+        kind_sfpu::COS,
+        "`cos x` on the device where the data is, within `ops::COS_BOUND` for every finite `x`, else Flex's."
+    );
+    unary_sfpu!(
+        float_tan,
+        kind_sfpu::TAN,
+        "`tan x` on the device where the data is, within `ops::TAN_BOUND` for every finite `x`, else Flex's."
+    );
+    unary_sfpu!(
+        float_atan,
+        kind_sfpu::ATAN,
+        "`atan x` on the device where the data is, within `ops::ATAN_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_asin,
+        kind_sfpu::ASIN,
+        "`asin x` on the device where the data is, within `ops::ASIN_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_acos,
+        kind_sfpu::ACOS,
+        "`acos x` on the device where the data is, within `ops::ACOS_BOUND`, else Flex's."
+    );
+
+    /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
+    /// (within `ops::pow_bound`); else Flex's.
+    pub fn float_powf(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_pow(&lhs, PowY::Tensor(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powf(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
+
+    /// `x^y`, `y` an integer tensor, as Flex's `powf(x, y as f32)`.
+    pub fn float_powi(
+        lhs: FloatTensor<TtBackend>,
+        rhs: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_pow(&lhs, PowY::Int(&rhs)) {
+            return t;
+        }
+        let device = lhs.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powi(lhs.into_host(), rhs.into_host()),
+            device,
+        )
+    }
+
+    /// `x^v` for a non-integer `v`, as Flex's `float_powf_scalar_impl`.
+    pub fn float_powf_scalar_impl(
+        tensor: FloatTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let v = value.to_f64().expect("a float scalar") as f32;
+        if let Some(t) = device_pow(&tensor, PowY::Scalar(v)) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_powf_scalar_impl(tensor.into_host(), value),
+            device,
+        )
+    }
+
+    /// Flex's dispatch, on the device's ops: `0` ones, `1` the tensor, `2` a
+    /// product, `-1` and `-2` reciprocals, anything else `powf`.
+    pub fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        match rhs.to_i64().expect("an integer exponent") {
+            0 => {
+                if let Some(t) = device_eltwise(kind_sfpu::FILL, 1.0, &lhs, None) {
+                    return t;
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as FloatTensorOps<Flex>>::float_powi_scalar(lhs.into_host(), rhs),
+                    device,
+                )
+            }
+            1 => lhs,
+            2 => float_mul(lhs.clone(), lhs),
+            -1 => float_recip(lhs),
+            -2 => float_recip(float_mul(lhs.clone(), lhs)),
+            _ => float_powf_scalar_impl(lhs, rhs),
+        }
+    }
+
+    /// Flex's: an integer exponent is `powi_scalar`'s.
+    pub fn float_powf_scalar(
+        tensor: FloatTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        match value.try_as_integer() {
+            Some(exp) => float_powi_scalar(tensor, exp),
+            None => float_powf_scalar_impl(tensor, value),
+        }
+    }
+
+    /// A cast to the tensor's own dtype is the tensor -- Burn's compositions
+    /// cast to `F32` what already is (`hard_sigmoid`, forward and backward),
+    /// and a host round trip for nothing would undo residency. Other casts are
+    /// Flex's (S6).
+    pub fn float_cast(
+        tensor: FloatTensor<TtBackend>,
+        dtype: burn_backend::FloatDType,
+    ) -> FloatTensor<TtBackend> {
+        if DType::from(dtype) == tensor.dtype() {
+            return tensor;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_cast(tensor.into_host(), dtype),
+            device,
+        )
     }
 
     pub fn float_device(tensor: &FloatTensor<TtBackend>) -> Device<TtBackend> {
@@ -603,11 +1178,7 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let t = retag(tensor, device);
-        if t.is_stored_f32() && crate::server::supports_dram(*device) {
-            let _ = t.to_dram();
-        }
-        t
+        to_device_resident(tensor, device)
     }
 
     pub fn float_into_data(
@@ -620,7 +1191,8 @@ pub mod float {
 pub mod activation {
     use super::*;
     use burn_backend::ops::ActivationOps;
-    use tt_isa::dm::kind;
+    use burn_backend::Scalar;
+    use tt_kernels::kind;
 
     /// On the device where the data is, else Flex's.
     pub fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
@@ -639,7 +1211,7 @@ pub mod activation {
     /// backend's ops, so on a device-resident matrix every step runs on the
     /// device; anything else is Flex's fused softmax.
     pub fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        match device_softmax(&tensor, dim, false) {
+        match device_softmax(&tensor, dim, false, false) {
             Some(t) => t,
             None => {
                 let device = tensor.device;
@@ -654,7 +1226,7 @@ pub mod activation {
     /// Burn's own composition (`ActivationOps::log_softmax`'s default: the
     /// max-shifted log-sum-exp), on the device; else Flex's.
     pub fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        match device_softmax(&tensor, dim, true) {
+        match device_softmax(&tensor, dim, true, false) {
             Some(t) => t,
             None => {
                 let device = tensor.device;
@@ -666,16 +1238,39 @@ pub mod activation {
         }
     }
 
-    /// Softmax (or log-softmax) of a resident matrix along `dim`, every step on
-    /// the device: decided once, on the whole input, so the small per-row
-    /// statistics in the middle stay there too.
-    fn device_softmax(t: &TtTensor, dim: usize, log: bool) -> Option<TtTensor> {
+    /// Burn's own composition (`ActivationOps::softmin`'s default: the
+    /// softmax of `-x`), on the device -- the negation exact; else Flex's.
+    pub fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        match device_softmax(&tensor, dim, false, true) {
+            Some(t) => t,
+            None => {
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::softmin(tensor.into_host(), dim),
+                    device,
+                )
+            }
+        }
+    }
+
+    /// Softmax (or log-softmax) of a resident matrix along `dim` -- of its
+    /// negation where `negate` (softmin) -- every step on the device: decided
+    /// once, on the whole input, so the small per-row statistics in the middle
+    /// stay there too.
+    fn device_softmax(t: &TtTensor, dim: usize, log: bool, negate: bool) -> Option<TtTensor> {
         use super::float::device_reduce_ungated as reduce;
         use tt_kernels::sfpu::ops::kind_sfpu;
         use tt_kernels::sfpu::reduce::ReduceOp;
         if !resident_matrix(t) || dim > 1 {
             return None;
         }
+        let neg;
+        let t = if negate {
+            neg = device_eltwise_ungated(kind_sfpu::NEG, 0.0, t, None)?;
+            &neg
+        } else {
+            t
+        };
         let max = reduce(t, ReduceOp::Max, dim)?;
         let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
         let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
@@ -724,6 +1319,146 @@ pub mod activation {
             device,
         )
     }
+
+    /// Flex's `x >= 0 ? x : slope * x`, one op on the device where the data
+    /// is; else Flex's.
+    pub fn leaky_relu(
+        tensor: FloatTensor<TtBackend>,
+        negative_slope: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let ns = negative_slope.to_f32().expect("a float scalar");
+        if let Some(t) = device_eltwise(
+            tt_kernels::sfpu::ops::kind_sfpu::LEAKY_RELU,
+            ns,
+            &tensor,
+            None,
+        ) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as ActivationOps<Flex>>::leaky_relu(tensor.into_host(), negative_slope),
+            device,
+        )
+    }
+
+    /// Flex's `(alpha * x + beta).clamp(0, 1)`, one op on the device; else
+    /// Flex's.
+    pub fn hard_sigmoid(
+        tensor: FloatTensor<TtBackend>,
+        alpha: Scalar,
+        beta: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        use num_traits::ToPrimitive;
+        let (a, b) = (
+            alpha.to_f32().expect("a float"),
+            beta.to_f32().expect("a float"),
+        );
+        let op = tt_kernels::tensor::Eltwise {
+            kind: tt_kernels::sfpu::ops::kind_sfpu::HARD_SIGMOID,
+            scalar: a,
+            scalar2: b,
+        };
+        if let Some(t) = device_op(op, &tensor, None, None) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as ActivationOps<Flex>>::hard_sigmoid(tensor.into_host(), alpha, beta),
+            device,
+        )
+    }
+
+    /// Flex's `x >= 0 ? x : alpha * x`, one op on the device -- `alpha` the
+    /// same shape, or a row of per-channel slopes; else Flex's.
+    pub fn prelu(
+        tensor: FloatTensor<TtBackend>,
+        alpha: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(
+            tt_kernels::sfpu::ops::kind_sfpu::PRELU,
+            0.0,
+            &tensor,
+            Some(&alpha),
+        ) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as ActivationOps<Flex>>::prelu(tensor.into_host(), alpha.into_host()),
+            device,
+        )
+    }
+
+    // S4 (10.2e): one SFPU op each, as Flex's fused closures are.
+    macro_rules! unary {
+        ($name:ident, $kind:ident, $doc:literal) => {
+            #[doc = $doc]
+            pub fn $name(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+                use tt_kernels::sfpu::ops::kind_sfpu;
+                if let Some(t) = device_eltwise(kind_sfpu::$kind, 0.0, &tensor, None) {
+                    return t;
+                }
+                let device = tensor.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::$name(tensor.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    macro_rules! binary {
+        ($name:ident, $kind:ident, $doc:literal) => {
+            #[doc = $doc]
+            pub fn $name(
+                a: FloatTensor<TtBackend>,
+                grad: FloatTensor<TtBackend>,
+            ) -> FloatTensor<TtBackend> {
+                use tt_kernels::sfpu::ops::kind_sfpu;
+                if a.shape() == grad.shape() {
+                    if let Some(t) = device_eltwise(kind_sfpu::$kind, 0.0, &a, Some(&grad)) {
+                        return t;
+                    }
+                }
+                let device = a.device;
+                TtTensor::new(
+                    <Flex as ActivationOps<Flex>>::$name(a.into_host(), grad.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    unary!(
+        sigmoid,
+        SIGMOID,
+        "Flex's two-branch `sigmoid` on the device where the data is, within `ops::SIGMOID_BOUND`; else Flex's."
+    );
+    binary!(
+        sigmoid_backward,
+        SIGMOID_BACKWARD,
+        "Flex's `g * s * (1 - s)`, exact, on the device where the data is; else Flex's."
+    );
+    unary!(
+        gelu,
+        GELU,
+        "Flex's `0.5 x (1 + erf(x / sqrt 2))` on the device where the data is, within `ops::GELU_BOUND`; else Flex's."
+    );
+    binary!(
+        gelu_backward,
+        GELU_BACKWARD,
+        "`g (Phi(x) + x phi(x))` on the device where the data is, within `ops::gelu_backward_bound`; else Flex's."
+    );
+    unary!(
+        log_sigmoid,
+        LOG_SIGMOID,
+        "Flex's two-branch `log_sigmoid` on the device where the data is, within `ops::LOG_SIGMOID_BOUND`; else Flex's."
+    );
+    binary!(
+        log_sigmoid_backward,
+        LOG_SIGMOID_BACKWARD,
+        "Flex's `g * sigmoid(-x)` on the device where the data is, within `ops::SIGMOID_BOUND` and the product's rounding; else Flex's."
+    );
 }
 
 pub mod int {
@@ -733,11 +1468,77 @@ pub mod int {
         tensor.device
     }
 
+    /// On `device`, and an `I32` tensor resident there (D3).
     pub fn int_to_device(
         tensor: IntTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> IntTensor<TtBackend> {
-        retag(tensor, device)
+        to_device_resident(tensor, device)
+    }
+
+    /// `as f32` on the device where the data is (`kind_sfpu::I32_TO_F32`,
+    /// exact); other float dtypes, Flex's.
+    pub fn int_into_float(
+        tensor: IntTensor<TtBackend>,
+        out_dtype: burn_backend::FloatDType,
+    ) -> FloatTensor<TtBackend> {
+        if DType::from(out_dtype) == DType::F32 {
+            if let Some(t) = device_eltwise(kind_sfpu::I32_TO_F32, 0.0, &tensor, None) {
+                return t;
+            }
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_into_float(tensor.into_host(), out_dtype),
+            device,
+        )
+    }
+
+    /// A view where the stored matrix is kept, as `float_reshape`.
+    pub fn int_reshape(
+        tensor: IntTensor<TtBackend>,
+        shape: burn_backend::Shape,
+    ) -> IntTensor<TtBackend> {
+        reshaped(tensor, shape, <Flex as IntTensorOps<Flex>>::int_reshape)
+    }
+
+    /// Whole tile rows of a device matrix, a view; as `float_slice`.
+    pub fn int_slice(
+        tensor: IntTensor<TtBackend>,
+        slices: &[burn_backend::Slice],
+    ) -> IntTensor<TtBackend> {
+        if let Some(v) = super::float::row_view(&tensor, slices) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_slice(tensor.into_host(), slices),
+            device,
+        )
+    }
+
+    /// A view of a device matrix transposed; as `float_swap_dims`.
+    pub fn int_swap_dims(
+        tensor: IntTensor<TtBackend>,
+        dim1: usize,
+        dim2: usize,
+    ) -> IntTensor<TtBackend> {
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as IntTensorOps<Flex>>::int_swap_dims(tensor.into_host(), dim1, dim2),
+            device,
+        )
+    }
+
+    pub fn int_transpose(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let n = tensor.shape().num_dims();
+        if n < 2 {
+            return tensor;
+        }
+        int_swap_dims(tensor, n - 2, n - 1)
     }
 
     pub fn int_into_data(
@@ -754,12 +1555,92 @@ pub mod bool {
         tensor.device
     }
 
+    /// On `device`, and resident there as `0`/`1` (D3).
     pub fn bool_to_device(
         tensor: BoolTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> BoolTensor<TtBackend> {
-        retag(tensor, device)
+        to_device_resident(tensor, device)
     }
+
+    pub fn bool_reshape(
+        tensor: BoolTensor<TtBackend>,
+        shape: burn_backend::Shape,
+    ) -> BoolTensor<TtBackend> {
+        reshaped(tensor, shape, <Flex as BoolTensorOps<Flex>>::bool_reshape)
+    }
+
+    pub fn bool_slice(
+        tensor: BoolTensor<TtBackend>,
+        slices: &[burn_backend::Slice],
+    ) -> BoolTensor<TtBackend> {
+        if let Some(v) = super::float::row_view(&tensor, slices) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_slice(tensor.into_host(), slices),
+            device,
+        )
+    }
+
+    pub fn bool_swap_dims(
+        tensor: BoolTensor<TtBackend>,
+        dim1: usize,
+        dim2: usize,
+    ) -> BoolTensor<TtBackend> {
+        if let Some(v) = swapped_view(&tensor, dim1, dim2) {
+            return v;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_swap_dims(tensor.into_host(), dim1, dim2),
+            device,
+        )
+    }
+
+    pub fn bool_transpose(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let n = tensor.shape().num_dims();
+        if n < 2 {
+            return tensor;
+        }
+        bool_swap_dims(tensor, n - 2, n - 1)
+    }
+
+    /// `!x` on the device where the tensor is (`kind_sfpu::BOOL_NOT`).
+    pub fn bool_not(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        if let Some(t) = device_eltwise(kind_sfpu::BOOL_NOT, 0.0, &tensor, None) {
+            return t;
+        }
+        let device = tensor.device;
+        TtTensor::new(
+            <Flex as BoolTensorOps<Flex>>::bool_not(tensor.into_host()),
+            device,
+        )
+    }
+
+    macro_rules! logic {
+        ($name:ident, $kind:expr) => {
+            /// On the device where the operands are, with a row or column
+            /// broadcast; else Flex's.
+            pub fn $name(
+                lhs: BoolTensor<TtBackend>,
+                rhs: BoolTensor<TtBackend>,
+            ) -> BoolTensor<TtBackend> {
+                if let Some(t) = device_eltwise($kind, 0.0, &lhs, Some(&rhs)) {
+                    return t;
+                }
+                let device = lhs.device;
+                TtTensor::new(
+                    <Flex as BoolTensorOps<Flex>>::$name(lhs.into_host(), rhs.into_host()),
+                    device,
+                )
+            }
+        };
+    }
+    logic!(bool_and, kind_sfpu::BOOL_AND);
+    logic!(bool_or, kind_sfpu::BOOL_OR);
+    logic!(bool_xor, kind_sfpu::BOOL_XOR);
 
     pub fn bool_into_data(
         tensor: BoolTensor<TtBackend>,

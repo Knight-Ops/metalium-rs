@@ -251,20 +251,15 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
     if base.starts_with("lr.") || base.starts_with("sc.") {
         return Some("Zalrsc is not implemented; there is no load-reserved/store-conditional");
     }
-    if mnemonic.starts_with("fdiv") {
-        return Some("floating-point divide is not implemented");
-    }
-    if mnemonic.starts_with("fsqrt") {
-        return Some("floating-point square root is not implemented");
-    }
-    if ["fmadd", "fmsub", "fnmadd", "fnmsub"]
-        .iter()
-        .any(|m| mnemonic.starts_with(m))
-    {
+    // Every F-extension instruction, `fence` and `fence.i` aside (the latter
+    // refused above): the baby cores move data and push instructions, and do
+    // no floating-point arithmetic of their own. Float math is the SFPU's and
+    // the Matrix Unit's, where it is fast and held to Flex; a slow scalar copy
+    // on RISCV B is a trap someone would one day route a tensor through.
+    if mnemonic.starts_with('f') && !mnemonic.starts_with("fence") {
         return Some(
-            "fused multiply-add executes, but is neither fused nor separate \
-             (Miscellaneous/FMA/README.md); every FP32 result here must be \
-             IEEE's, so only fadd.s/fsub.s/fmul.s are used",
+            "no floating point on the baby cores: float math belongs on the SFPU \
+             or the Matrix Unit (the data mover only moves data)",
         );
     }
     if matches!(mnemonic, "div" | "divu" | "rem" | "remu") {

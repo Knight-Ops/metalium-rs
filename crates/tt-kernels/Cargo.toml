@@ -10,6 +10,7 @@ license.workspace = true
 # Shippable -- no simulator dependency (`cargo xtask check-no-sim-in-ship`).
 [dependencies]
 tt-isa.workspace = true
+libm.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
 tt-kmd.workspace = true

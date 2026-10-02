@@ -6,6 +6,7 @@
 //! the gates can share one harness.
 
 pub mod backend;
+pub mod bench;
 pub mod burn_device;
 pub mod harness;
 pub mod mnist;

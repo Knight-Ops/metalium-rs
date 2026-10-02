@@ -13,9 +13,9 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | Burn op | On the card as |
 |---|---|
 | `float_matmul` | `Session::matmul_dram` (operands may be transposed views) |
-| `float_add` / `sub` / `mul`, `float_mul_scalar` | mover `COMPUTE` kinds; `add` of a `[1, n]` row broadcasts (`ADD_ROW`) |
+| `float_add` / `sub` / `mul`, `float_mul_scalar` | SFPU element-wise (`tt_kernels::kind`); `add` of a `[1, n]` row broadcasts (`ADD_ROW`) |
 | `relu`, `relu_backward` | `RELU`, `RELU_BACKWARD` |
-| `float_sum_dim(0)` | `COL_SUM`, in Flex's summation order |
+| `float_sum_dim(0)` | SFPU sum over rows, in Flex's summation order |
 | `float_transpose` / `float_swap_dims` (2-D) | a view: same buffer, read transposed |
 | `float_slice` of whole rows on 32-row bounds | a view, no copy |
 

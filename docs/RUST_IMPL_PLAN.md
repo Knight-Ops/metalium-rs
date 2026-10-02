@@ -993,7 +993,7 @@ norm, a convolution -- falls back on its first unsupported op.
 Burn op coverage table live in [`hardware-coverage.md`](hardware-coverage.md), which is the
 progress record. Checklist items 9.9 and 9.12 moved there.
 
-**Where it stands (2026-10-01).** Milestone 10.0 is done: a device profiler through the
+**Where it stands (2026-10-02).** Milestone 10.0 is done: a device profiler through the
 timestamper (X3); padding as a typed property of every tensor (F0, which fixed the ragged
 `ADD_ROW` -> sum bug); whole tiles through `Dst` (F1); the SFPU program builder with
 typed registers, scoped conditional execution, automatic `SFPNOP`s and `REPLAY`-driven row
@@ -1007,8 +1007,14 @@ matmul's loops replayed (the MOP Expander gated, and measured no faster on a mat
 is now backend-bound); the movers' queues, barriers and batching, and op-list traces that
 refuse tt-metal's corruptions instead of suffering them; wedged tiles detected at open and
 recovered in software. MNIST: 2.0 ms/step on one tile, 1.6 on four; inference 0.45 ms a
-batch of 64. Cross-entropy moved to 10.5 with D4. Next: 10.2, activation and math
-breadth.
+batch of 64. Cross-entropy moved to 10.5 with D4. Milestone 10.2 is done (2026-10-02):
+integer and bool tensors resident on the card, with the logic ops; compare, select and
+sign, exact; and every transcendental Burn has on the SFPU, each within a derived bound
+of a few ulps -- `sqrt`, `log1p`, `pow`, the exponential family and the activations on
+it, the hyperbolics and their inverses, and trigonometry (`sin`, `cos`, `tan` for every
+finite input by an exact Payne-Hanek reduction). Every one of `tt-mnist`'s seven
+activations now moves only what ReLU's step moves. Next: 10.3, reductions over any dim,
+device transpose, norms.
 
 **Ordering: SFPU foundation first.** The foundation -- whole-tile `UnpackToDst` and pack, an
 SFPU program builder with typed `LReg`s and scoped conditional execution, one three-role SFPU

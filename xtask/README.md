@@ -18,6 +18,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `check-isa-sources` | Parse `Bits32.lua` and report, generating nothing. |
 | `check-no-sim-in-ship` | `cargo tree` over every `SHIPPABLE` crate (`src/ship.rs`) must not reach `tt-ttsim` / `tt-ttsim-sys`; every workspace member must be `SHIPPABLE` or `DEV_ONLY`. |
 | `silicon [options]` | The silicon suite, one test per process. |
+| `bench [options]` | The firmware benchmarks on silicon, collected into `target/silicon/bench/`. |
 
 `--check` fails if the committed file is stale instead of rewriting it. CI runs all
 three generators with `--check`. All pins are in `PINS.toml`.
@@ -44,3 +45,19 @@ crash, the last `START` without an `END` names the test that took it down, and a
 changed `boot_id` proves a reboot. A run stops at the first failure by default,
 because a failed gate may leave the card in a bad state.
 Background: "Silicon operating notes" in `docs/implementation-checklist.md`.
+
+## `cargo xtask bench`
+
+The benchmark preset of `cargo xtask silicon`: always `--release
+--include-ignored`, a 900 s per-test limit unless `--timeout-secs` is given, and
+by default the `BENCH` selection in `src/silicon.rs`:
+- `silicon_bench_memory`: GDDR6 through the data mover, one tile and every tile.
+- `silicon_bench_path`: B through T0/T1/T2, hop by hop, and real ops.
+- `silicon_eth_clock`: E1's cycle counter, gated alone.
+- `silicon_bench_eth`: one link, both links, both directions.
+- `silicon_perf::pcie_*`.
+
+Every other `silicon` option applies; `--filter` replaces the default selection.
+Every `BENCH {json}` line the tests print is collected into
+`target/silicon/bench/<stamp>.jsonl` (one record per line, with its test) and
+`<stamp>.md` (a table). `docs/firmware-performance.md` is built from one such run.

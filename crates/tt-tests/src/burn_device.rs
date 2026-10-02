@@ -166,6 +166,18 @@ fn attach_engine(
         fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
             self.buffers.download(&mut self.session, id)
         }
+        fn upload_bits(
+            &mut self,
+            v: &[u32],
+            r: usize,
+            c: usize,
+            elem: burn_tt::Elem,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers.upload_bits(&mut self.session, v, r, c, elem)
+        }
+        fn download_bits(&mut self, id: burn_tt::BufferId) -> Result<Vec<u32>, EngineError> {
+            self.buffers.download_bits(&mut self.session, id)
+        }
         fn free(&mut self, id: burn_tt::BufferId) {
             self.buffers.free(&mut self.session, id)
         }
@@ -196,6 +208,22 @@ fn attach_engine(
             b: Option<burn_tt::BufferId>,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
+        }
+        fn eltwise_op(
+            &mut self,
+            op: tt_kernels::tensor::Eltwise,
+            a: burn_tt::BufferId,
+            b: Option<burn_tt::BufferId>,
+            c: Option<burn_tt::BufferId>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.eltwise_op(&mut self.session, op, a, b, c)
+        }
+        fn pow(
+            &mut self,
+            x: burn_tt::BufferId,
+            y: burn_tt::PowArg,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.pow(&mut self.session, x, y)
         }
         fn sum_rows(
             &mut self,

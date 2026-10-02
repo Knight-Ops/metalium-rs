@@ -18,7 +18,33 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-01, after 10.1)
+## Where things stand (2026-10-02, 10.2 done)
+
+10.2 (branch `phase10-2-activations`) has its instructions (10.2a): every SFPU
+instruction the rest of S2-S4 needs has a typed helper, an interpreter model and a
+device gate on ttsim and both cards, and the `SFPLUTFP32` hazard is closed. D3 (int
+and bool storage) moved into 10.2, so that comparisons and masks stay on the card, and
+is done (10.2b): `I32` and `Bool` tensors are resident through Burn, with views and
+the logic ops on the card.
+`tt-mnist --activation` now trains with any of seven of Burn's activations. S2 is done
+(10.2c): compare, select, sign and three activations on the card, exact; leaky-relu and
+hard-sigmoid train at 2.9 and 2.2 ms/step (from 6.8 and 5.4) with ReLU's traffic (row
+AJ). S4's algebraic ops are on the card (10.2d: `sqrt`, `log1p`, `pow` by tensor, integer
+tensor and scalar), and 10.2d's sweeps found and fixed two of 10.1's range-end bugs:
+`recip`/`div` above `2^111` and `exp` at exactly its overflow threshold. The
+exponential family is on the card (10.2e: `expm1`, `tanh`, `erf`, `sigmoid`, `gelu`
+and both backwards, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid` and its
+backward, `softmin`), so all seven of `tt-mnist`'s activations now move only what
+ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9 (row AK). The
+runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
+Trigonometry is on the card (10.2f): `sin`, `cos` and `tan` for every finite input, by
+an exact Payne-Hanek reduction, and `atan`, `atan2`, `asin`, `acos`, each within a
+derived bound of a few ulps and through Burn's autodiff -- so S4 is done, and with it
+10.2 (closed: ttsim 635/635, silicon 494/494 on both cards, smoke 54/54, MNIST 91.96% on
+both cards at 2.0 / 1.7 ms a step, 1 / 4 tiles). Next: 10.3, reductions over any dim,
+device transpose, norms.
+
+### After 10.1
 
 10.1 added, on top of the table below: reciprocal, division, `exp` and `log` on the SFPU
 (S3, S4a), lane movement (S8), `sum` and `max` over either dim (R1a), softmax and
@@ -31,8 +57,8 @@ Phases 0–9 built the path to the card. The compute that actually runs on it is
 | Unit | What runs there today | Where |
 |---|---|---|
 | **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
-| **B core FP32 unit** | the column sum, small element-wise ops spread over many units, and the reference for every element-wise op; padding fills | `tt_isa::dm::kind`, `dm_b.rs::{compute, col_sum, per_datum, fill_pad}` |
-| **SFPU** | every element-wise op where it is cheaper (`Auto`): `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` | `tt_kernels::sfpu::{ops, kernel}` |
+| **B core** | no arithmetic (2026-10-02): data movement, padding fills (`dm::op::FILL`), transposed and column-broadcast reads, kernel dispatch. The firmware image gate refuses every F-extension instruction | `dm_b.rs` |
+| **SFPU** | every element-wise op: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` (`tt_kernels::kind`) and `kind_sfpu`'s; the sum over rows in Flex's order (`sfpu::reduce::accumulate_in_order`) | `tt_kernels::sfpu::{ops, kernel, reduce}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
 The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
@@ -54,9 +80,9 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth | rest of S2–S4 | `[ ]` |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
-| 10.4 | Formats and integers | D1, S5, S6, D3 | `[ ]` |
+| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
@@ -123,18 +149,18 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | Load / store | `SFPLOAD`, `SFPSTORE`, `SFPLOADI` | x | x (`Program`) | x | x | x | -- |
 | Multiply-add | `SFPMAD`, `SFPMUL`, `SFPADD` | x | x (`Program`) | x | x | x | -- |
-| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | `~` `SFPDIVP2` (0..128) | | `~` `SFPDIVP2` (row 66) | `~` `SFPDIVP2` | S2, S4 |
+| Immediate arithmetic | `SFPADDI`, `SFPMULI`, `SFPDIVP2` | x | x (`SFPDIVP2` 0..128) | | x (`SFPDIVP2` from 128: row 66) | x | S2, S4 |
 | Move / abs | `SFPMOV`, `SFPABS` | x | x | `~` `SFPMOV` | x | x | S2 |
 | Sign, exponent, mantissa | `SFPSETSGN`, `SFPEXEXP`, `SFPEXMAN`, `SFPSETEXP`, `SFPSETMAN` | x | x | `~` (`exp`, `log`, `recip`) | x | x | -- |
-| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | `~` `SFPSETCC`, `SFPGT` | `~` `SFPGT` (`RELU`) | `~` | `~` | S2 |
+| Compare (BH-only `GT`/`LE`) | `SFPGT`, `SFPLE`, `SFPSETCC`, `SFPLZ` | x | x (flags; `SET_VD` masks raw) | x (`RELU`; S2's IEEE comparisons, clamps, selects) | x | x | -- |
 | Conditional execution | `SFPENCC`, `SFPPUSHC`, `SFPPOPC`, `SFPCOMPC` | x | x (scopes) | x | x | x | -- |
-| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | `~` `AND`, `OR` | `~` (masks) | `~` | `~` | S5 |
-| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | `~` `SFPIADD`, `SFPSHFT`, `SFPSHFT2` (rotate) | `~` (`exp`, `log`, reductions) | `~` | `~` | S5 |
-| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | `~` `SFPARECIP` | S4 |
-| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | | | | | S6 |
+| Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | x | `~` (masks) | x | x | S5 |
+| Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | x (`SFPMUL24` with `VC` zero only; `SFPSHFT2` rotate) | `~` (`exp`, `log`, reductions) | x | x | S5 |
+| Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | x (`SFPLUTFP32`'s indirect destination designed out) | `~` `SFPARECIP` | `~` (`SFPLUTFP32` only `Mod1` 2, 6: row 70) | x | S4 |
+| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | `~` `_IntFloat` round-to-nearest | | `~` | `~` | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
-| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | `~` `SFPTRANSP` | `~` (reductions) | `~` | `~` | S2 |
-| Configuration | `SFPCONFIG` | x | | | | | F2 |
+| Lane movement | `SFPSWAP`, `SFPTRANSP` | x | x (`SFPSWAP` min/max) | `~` (reductions) | x | x | S2 |
+| Configuration | `SFPCONFIG` | x | `~` `LReg[11..15]` only (`Program::constant`) | | x | x | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
 | PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | | | | | S7 |
@@ -165,7 +191,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
 | Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
-| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[ ]` | D3 |
+| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
 
@@ -476,6 +502,33 @@ reverse index.
         reset and prevented since X4c; another cause the feeder does not release still
         ends in `Wedged` and a board reset.
 
+- [x] **X8 Block repeats in the role runner** (10.2, asked for when `pow` and `gelu`
+      had to split into several ops). An SFPU row loop longer than the 32-entry replay
+      buffer was unrolled 32 times into the 8192-word program slot -- `pow` and `gelu`
+      came to ~9200 words, so they ran as chains of 4 and 2 ops. MOP and `REPLAY`
+      cannot help: both are bounded by the replay buffer. Now a program may carry a
+      loop header (`mailbox::loops`: `LOOPED` set in its length word, then the entry
+      count, up to four `(start, len, count)` entries, then the code): metadata stored
+      with the program, not instructions and not descriptor words, so it travels
+      through the program cache and a `KERNEL` entry and kernels with different loops
+      queue back to back under one descriptor. The runner (`tt_firmware::corpus::
+      Pusher`) checks the table -- inside the code, any two disjoint or nested, at most
+      two deep -- and pushes each span with the same sixteen-word fast path, a program
+      without a header exactly as before; the mover's `KERNEL` check masks the flag.
+      Host: `crate::code::{Code, Loop}` (`Code::stored` writes the header,
+      `Code::expand` the stream every model runs); `Program::for_each_row_group`
+      stores a body too long to replay once (`LoopForm::Repeated`, the same
+      row-counter stepping as the replayed form), and the SFPU kernel's math role
+      stores its per-tile block once and repeats it per tile (`kernel::roles_code`):
+      LOG's math program for a run is 124 words whatever its length, from ~3500 a
+      tile, and every SFPU op's run reaches 64 tiles (`ops::fit`). Found on the way,
+      and fixed: a drain the descriptors needed came after a list's programs were
+      placed, and unpinned them (hazard table). Gates: `crate::code` unit tests (nested
+      expansion, every refusal), every SFPU device gate now running nested repeats
+      against the interpreter's expansion bit for bit; watched failing with the
+      runner's repeat count off by one (`step29`). ttsim (31 gates) and the full
+      silicon suite, 482/482 on both cards.
+
 ### Performance follow-ups (measured, not yet scheduled)
 
 From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` rows V-Z;
@@ -538,13 +591,13 @@ Each names the measurement it must move. The Burn-side ones are in
       always `Zero`), upload sets `Zero`, and every op implements `OpPadding`
       (`requires(input) -> PadNeed`, `produces(inputs) -> Pad`, from the op's
       algebra: `ADD_ROW` and `MUL_SCALAR` by a non-finite scalar leave
-      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). `COL_SUM` reads
-      only a ragged tensor's valid rows (`record::SUM`'s `last_rows`, the compute
-      entry's new parameter word) and zeroes its result's padding rows, so it
-      needs nothing; the matmul needs `Zero` on both operands, which the session
+      `Undefined`, `RELU_BACKWARD` is `Zero` if either input is). The sum over
+      rows reads only a ragged tensor's valid rows (once `COL_SUM` on the mover;
+      on the SFPU since 2026-10-02, `sfpu::reduce::accumulate_in_order`) and
+      zeroes its result's padding rows, so it needs nothing; the matmul needs `Zero` on both operands, which the session
       supplies by `record::FILL_PAD` over the edge tiles only, in place on a
-      tensor that owns its slots and through a bit-exact copy (`kind::COPY`) for a
-      view, so a parent's padding -- and its views' claims -- are never changed by
+      tensor that owns its slots and through a bit-exact copy (`Session::copy`,
+      `READ_RUN` + `WRITE_RUN`; once `kind::COPY`) for a view, so a parent's padding -- and its views' claims -- are never changed by
       a view's fill. MNIST's tensors need no fill (its ragged ones are uploads and
       matmul outputs), so the golden and the 9.5 budget are unchanged. Unit tests:
       the fill touches each edge tile exactly once with the right valid region,
@@ -572,7 +625,7 @@ Each names the measurement it must move. The Burn-side ones are in
       -- copying rows 0..64 to 128..192, packed back as the tile: 3072 datums bit for
       bit. Watched failing with the odd half skipped and with the second tile's row
       off by four. ttsim and both cards; no divergence.
-- [~] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
+- [x] **F2 An SFPU program builder** (`tt_kernels::sfpu::Program`; the typed
       registers in `tt_isa::sfpu`). Gate: `step26_sfpu_isa` (below, with F5).
   - [x] An `LReg` newtype (`tt_isa::sfpu::LReg`): `LReg::general(0..8)` writable,
         `ZERO`/`ONE`/`C0_8373`/`LANE_X2` read-only, `ConfigLReg` 11–14 readable only,
@@ -587,8 +640,12 @@ Each names the measurement it must move. The Burn-side ones are in
         refused; only the plain push and pop are ever emitted, so the Tier 2
         `SFPPOPC` case cannot arise (and `SFPPOPC.md` contradicts itself on whether
         Blackhole still has it).
-  - [ ] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue -- with its first
-        user (S4's polynomial constants).
+  - [x] `SFPCONFIG` constants (`LReg` 11–14) as a named prologue
+        (`Program::constant`, 10.2a): loads `L0` and writes the register, refused
+        inside a scope (`SFPCONFIG` takes its value and its predication from lanes
+        0..8 alone). The interpreter starts the four unknown, so a program that
+        reads one it did not write -- one an earlier program left (G11) -- is
+        refused there (`a_constant_is_known_only_to_the_program_that_writes_it`).
   - [x] An `SFPNOP` exactly where `stalls_automatically_after_mad` says stalling
         misses -- after any MAD-sub-unit instruction (`SFPMAD`, `SFPMUL`, `SFPADD`,
         `SFPMULI`, `SFPADDI`, `SFPMUL24`, `SFPLUT`, `SFPLUTFP32`) -- including across
@@ -617,10 +674,11 @@ Each names the measurement it must move. The Burn-side ones are in
       role programs fit a slot (`ADD_ROW`'s unrolled loop gets shorter runs -- found by
       MNIST's evaluation batch on one tile, now `step19::the_longest_runs_fit_and_match_flex`,
       watched failing with code 8 without it). Adding an op is a program in
-      `sfpu::ops` and a gate. `EltwiseUnit::{Auto, Sfpu, Mover}`: `Auto`, the default,
-      picks by `tensor::sfpu_is_cheaper`, a linear cost model per op from
-      `silicon_perf::eltwise_unit_sweep` (measurement Q); `TT_ELTWISE=auto|sfpu|mover`
-      for burn-tt.
+      `sfpu::ops` and a gate. (Retired 2026-10-02: `EltwiseUnit`,
+      `tensor::sfpu_is_cheaper` and `TT_ELTWISE` chose between the SFPU and the
+      mover's FP32 unit by measurement Q's cost model; the mover does no
+      arithmetic now, so every op is the SFPU's, and one with no program is
+      refused.)
 - [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
       register nothing has established is `None`, and reading it is refused), per-lane
       `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
@@ -630,7 +688,12 @@ Each names the measurement it must move. The Burn-side ones are in
       (FP32, INT32), `SFPLOADI` (every mode), `SFPMAD`/`SFPMUL`/`SFPADD` (through
       `fma_bh`), `SFPMOV`, `SFPABS`, `SFPSETSGN`, `SFPSETCC`, `SFPENCC`,
       `SFPPUSHC`/`SFPPOPC` (plain), `SFPCOMPC`, `SFPGT` (flags, `VD`), `SFPARECIP`, `SFPNOP`, and the `SETRWC`/`SETC16`
-      forms the builder emits. **Plan change:** each S item adds the models it
+      forms the builder emits; since 10.2a also `SFPLE`, `SFPSWAP` (every
+      contractual mode), `SFPMULI`, `SFPADDI`, `SFPXOR`, `SFPNOT`, `SFPLZ`,
+      `SFPMUL24` (`VC` zero), `SFPCAST` (`_IntFloat`, round to nearest),
+      `SFPCONFIG` (`LReg[11..15]`), `SFPLUT` and `SFPLUTFP32` (every table, its
+      indirect destination included), and the backdoor-load rule (`VD >= 12`
+      refused by name). **Plan change:** each S item adds the models it
       needs, and where a page defines a self-contained C function (`ApproxRecip`,
       `ApproxExp`, the LUT and rounding helpers), the port is differential-tested
       against that C extracted from the pinned page and compiled as `fma.c` is;
@@ -664,12 +727,45 @@ Each names the measurement it must move. The Burn-side ones are in
       tile against the mover's ~9 us + 8-22 us a tile, so small ops spread over many
       units stay on the mover; full MNIST 5.1 -> 3.8 ms/step on one tile, 2.5 -> 2.4 on
       eight, 2.3 on 32, accuracy 91.96%.
-- [ ] **S2 Compare, select, sign.** `SFPGT`/`SFPLE`/`SFPSETCC` writing 1.0/0.0, `SFPSWAP`'s
-      min/max mode, `SFPABS`, `SFPSETSGN`. Burn: `float_{equal,not_equal,greater,
-      greater_equal,lower,lower_equal}{,_elem}`, `float_mask_where`, `float_mask_fill`,
-      `float_clamp{,_min,_max}`, `float_abs`, `float_neg`, `float_sign`, `leaky_relu`,
-      `hard_sigmoid`, `prelu`. Needs bool tensors on the device (`BoolTensorOps` storage,
-      D3).
+- [x] **S2 Compare, select, sign** (10.2c). Twenty-six exact kinds
+      (`kind_sfpu::{NEG..PRELU}`), each a program of bit and flag operations on raw
+      bits (`Format::Int32` loads and stores), so NaN payloads, both zeros and
+      denormals come out as the host has them -- only the products (`LEAKY_RELU`'s
+      and `PRELU`'s negative side, `HARD_SIGMOID`) go through `SFPMAD`, two
+      roundings as Flex's `alpha * x + beta`. **IEEE comparisons from a
+      sign-magnitude order**: `SFPGT`/`SFPLE` rank `-0 < +0` and order NaNs, so
+      each operand is first made canonical (a zero `+0`) and a lane with a NaN
+      takes the unordered answer (`compare_body`); a scalar's NaN and zero sign
+      are settled on the host when the program is built. Flex's choices matched,
+      measured where Rust leaves them open: `clamp_min`/`clamp_max` give the
+      scalar on equal values (`±0`) and the other side of a NaN at every length;
+      `sign` keeps a NaN and gives `+0` for a zero; `clamp` refuses NaN or crossed
+      bounds (`f32::clamp` panics; burn-tt hands those to Flex). Two scalars per op
+      (`Eltwise::scalar2`, in the memo keys), a ternary operand shape (`MASK_WHERE`:
+      `Dst` rows 192..256, `Operands::Ternary`, a third `READ_RUN`;
+      `Session::eltwise3`), per-operand element types (`sfpu::ops::Sig`: a mask is
+      `Bool`, the comparisons' output too), and padding rules from each op's
+      algebra at zero (`Eltwise::zero_at_zero`). `SFPSWAP`'s min/max is gated
+      (10.2a) but not used: its order is not IEEE's. Oracle: `sfpu::ops::s2`, the
+      programs in the interpreter against the host's semantics over every pairing
+      of sixteen specials, a product's denormal operands flushed first (numerics
+      row D). Gates: `step43_compare_select` -- each kind against `burn-flex`'s own
+      op bit for bit at `[37, 70]` and `[64, 128]` with specials on both sides, row
+      and column broadcasts for the comparisons and `mask_fill`, the device equal
+      to its program, padding claims against raw tiles; a product's lanes with a
+      denormal input are the oracle's (the device decides the branch on the raw
+      value and computes on the flushed one, which no Flex run states). Watched
+      failing with the zero canonicalisation removed (`-0 == +0` false). ttsim and
+      both cards. Burn: `float_{neg, abs, sign, clamp, clamp_min, clamp_max}`, the
+      twelve comparisons, `float_is_{nan, inf}`, `float_mask_{fill, where}`,
+      `leaky_relu`, `hard_sigmoid`, `prelu` (a row of per-channel slopes; one
+      weight falls back), and `float_cast` to the dtype a tensor has (a no-op: Burn's
+      `hard_sigmoid` casts to `F32` what is, which downloaded it every step) --
+      exact, so on the device whatever the size, exact mode included;
+      `step47_burn_activations::compare_select_and_sign_stay_on_the_card` (in
+      `SMOKE`; watched failing with `float_sign` routed to `ABS`). MNIST (row AJ):
+      leaky-relu 6.8 -> 2.9 ms/step, hard-sigmoid 5.4 -> 2.2, both at ReLU's 3.0 KB
+      a step and inference at ReLU's.
 - [x] **S3 Reciprocal and division** (`float_remainder{,_scalar}` moves to S6, which
       brings `floor`). `tt_isa::numerics::sfpu::{approx_recip, approx_exp, arecip}` port
       `SFPARECIP.md`'s functional model, the tables copied out of the page by script and
@@ -688,10 +784,48 @@ Each names the measurement it must move. The Burn-side ones are in
       the program within one ulp of Flex, at `[37, 70]` and `[96, 128]` with every
       special; `step27_burn_eltwise::division_through_burn_is_within_one_ulp_and_stays_resident`.
       ttsim and both cards. Burn: `float_recip`, `float_div`, `float_div_scalar`.
-- [~] **S4 Transcendentals.** Done: `exp`, `log` (10.1). Range reduction by
-      `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`, `SFPSHFT`),
-      polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding of `x log2
-      e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
+      **Fixed in 10.2d** (found by its `log1p` sweep): from `|x| > 2^111` the Newton
+      step's product `y (1 - x y)` fell below `2^-126` and flushed, so the reciprocal
+      was the seed alone (0.56% off), and from `2^126` the seed itself is zero; a
+      division by such a `b` was wrong the same way. Where `|x| > 2^100` the
+      reciprocal is now of `x 2^-64`, scaled back by an exact multiply, and a division
+      scales both operands by `2^-64` (`scale_large_divisor`; on the host for
+      `DIV_SCALAR`'s scalar). Held by `ops::transcendental::{recip_is_within_one_ulp_
+      in_every_binade, division_is_within_one_ulp_down_to_the_smallest_quotients}`
+      (worst 0.72 and 0.81 ulps) and on the device by
+      `step44_algebraic::recip_and_division_hold_in_every_binade` (watched failing
+      with the scaling disabled, at `1/7.4e33`).
+- [x] **10.2a The instructions the rest of S2-S4 needs** (`tt_isa::numerics::sfpu`,
+      `tt_kernels::sfpu::{Program, interp}`). Helpers: `Cond::LessEq` (`SFPLE`),
+      `min_max` (`SFPSWAP`), `muli`/`addi` (BF16 immediates, refused otherwise),
+      `xor`, `not`, `leading_zeros`, `mul24` (`VC` the zero constant: anything
+      else adds the page's non-contractual shift-add), `sm32_to_float`,
+      `constant` (F2), `lut`, `lut_fp32` with `LutTable`. **The `SFPLUTFP32`
+      hazard designed out**: `FP16_3ENTRY_TABLE` is `Mod1 = 10`, which includes
+      `INDIRECT_VD`, so the helper loads `VD`'s index into `L7` first (clobbering
+      it) and sets `Mod1Mirror`'s `INDIRECT_VD` to match -- automatic stalling
+      reads the mirror, and with it clear it would assume `L7` unread and miss
+      the `L7` just written. Oracles: `SignMagIsSmaller`, `Lut8ToFp32`,
+      `Lut16ToFp32` held to the pages' own C (now compiled as C++20, since
+      `Lut16ToFp32` uses `std::bit_cast`; every LUT code, and pairs across every
+      sign and exponent class; watched failing with the FP16 bias off by one);
+      `SFPCAST`'s conversion against the host's rounding (400k integers). Gate:
+      `step26_sfpu_isa::every_new_instruction_matches_the_interpreter`, 21 cases
+      over the specials tiles, replayed and unrolled, device equal to the
+      interpreter bit for bit -- among them an `INT32` load and store passing
+      denormals and NaN payloads, both tables of `SFPCONFIG` constants, and the
+      Tier 2 bug measured: `SFPLUTFP32` at `Mod1 = 10` with `L7 = 5` writes `L5`
+      and leaves `VD`. `STEP26_CASE=<name>` runs one case alone, as each new
+      instruction was first run on silicon. Watched failing with `SFPMUL24`'s high
+      half shifted by 22. ttsim runs 17 of the 21 (row 70: `SFPLUTFP32` only at
+      `Mod1` 2 and 6, and no `Mod1Mirror`); silicon all 21, both cards. No program
+      depends on `SFPLUTFP32`: polynomials are `SFPMAD`'s, which ttsim runs.
+      Simulator line `[-]` for those four (row 70), as the definition of done
+      allows; ticked at 10.2's close.
+- [x] **S4 Transcendentals.** `exp`, `log` (10.1); the rest in 10.2d-f below. Range
+      reduction by `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`,
+      `SFPSHFT`), polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding
+      of `x log2 e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
       bound `ops::EXP_BOUND = 1.3e-7` relative, derived on `exp_program`. `log`: `x =
       2^e m`, `m` in `[sqrt(2)/2, sqrt(2))`, `2 atanh(f/(2+f))` through the corrected
       division, `e ln2` in two parts; bound `ops::LOG_BOUND = 7.12 * 2^-24` relative,
@@ -706,9 +840,158 @@ Each names the measurement it must move. The Burn-side ones are in
       fallback on operands with host copies moves no bytes, so the traffic check
       alone was vacuous; watched failing with `float_exp` forced to the host). ttsim
       and both cards; ttsim refuses `SFPDIVP2` by 128 or more (row 66), so the
-      builder does not emit it. Burn: `float_exp`, `float_log`. Remaining: `sqrt`/
-      `rsqrt`, `log1p`, `powf`, `tanh`, `erf`, `sin`/`cos` and the rest (10.2), with
-      F2's `SFPCONFIG` prologue for their constants.
+      builder does not emit it. Burn: `float_exp`, `float_log`. **`exp` fixed in
+      10.2d**: its overflow test was `z > 88.72284`, but that float (`0x42b17218`) is
+      the first above `ln f32::MAX`, so at exactly it `n = 128` carried into the
+      exponent field and gave `0x7f800002`, a NaN -- met by `pow(f32::MAX, 1)`, whose
+      `ln` rounds to it. Now `z >= 88.72284`; the boundary floats on both ends are in
+      the sweep (watched failing on the old test).
+  - [x] **10.2d `sqrt`, `1/sqrt`, `log1p`, `pow`, and the integer cast.**
+        `sqrt_program`: the bit-trick seed, three Newton steps for `1/sqrt` (within
+        `RSQRT_BOUND = 4.1u`), the root `x y` and one fma correction (within one ulp
+        of the correct rounding; worst 1.44 ulps of the exact root over 85k inputs);
+        a negative denormal is NaN as on the host, a positive one flushes.
+        `log1p_program`: Kahan's `ln(u) x/(u - 1)`, `x` itself where `fl(1 + x) = 1`
+        (bits and all, denormals included), `ln u` alone from `2^24`; within
+        `LOG1P_BOUND = 11.12u`, worst 3.0 ulps. `x` is spilled to `Dst` rows 256..
+        (`kernel::SPILL_ROW`) across `log_program`, which takes every register.
+        **`pow` is one op** (`Session::pow`: `POW`, `POW_S` for a scalar exponent,
+        `POW_I` for an `I32` one): `log|x|`, a multiply, `exp`, then `powf`'s special
+        values (`pow_program`). First landed as a chain of four ops, since one
+        program unrolled to 9187 words, past a role's 8192-word slot; folded back
+        once the runner repeats blocks (X8). Within `pow_bound(x, y) = |y ln x| (LOG_BOUND + 2^-24) 1.01 +
+        EXP_BOUND`, derived (worst 0.46 of it); every pairing of 22 special bases and
+        22 special exponents equal to `powf`'s, signs of zeros and infinities
+        included; the integer and odd tests on `y` by the magic-number round. An
+        `I32` exponent is converted in the program (`as f32`, exact; `i32::MIN` by
+        name; `I32_TO_F32` the same alone); `FILL` writes a constant (Flex's `ones` for `x^0`). Gate
+        `step44_algebraic`: each kind bit for bit to their programs,
+        the programs within their bounds of Flex, the cast equal to Flex's
+        `int_into_float`; ttsim and both cards. Burn: `float_sqrt`, `float_log1p`,
+        `float_powf`, `float_powi`, `float_powf_scalar{,_impl}` and
+        `float_powi_scalar` with Flex's own dispatch (`0` ones, `1` the tensor, `2`
+        a product, `-1`/`-2` reciprocals, else `powf`), `int_into_float` to F32
+        (exact); `step47_burn_activations::algebraic_ops_stay_on_the_card_within_
+        their_bounds`. `RSQRT` has no Burn method; it waits for R3's norms.
+  - [x] **10.2e The exponential family and the activations on it.**
+        `expm1_program`: `exp`'s reduction, `p = e^r - 1 = r + r^2 q(r)`, then
+        `2 (h p + (h - 1/2))`, `h = 2^(n-1)` -- no cancellation near zero, no
+        overflow at `n = 128`; within `EXPM1_BOUND = 4.5u`. `sigmoid_program`:
+        Flex's two branches over one `e = e^-|x|`, within `SIGMOID_BOUND = EXP_BOUND
+        + 4u`. `tanh_program`: `sign(x) t/(t + 2)`, `t = expm1(2|x|)`, `x` itself
+        below `2^-12` and `±1` from 9.01; within `TANH_BOUND = 7.5u`. `erf_program`:
+        the Taylor series below `1/2`, then `1 - erfc` with `erfc = e^(-a^2)
+        erfcx(a)`, `a^2` split exactly (Dekker) and `erfcx` a Chebyshev fit computed
+        in the builder from `libm::erfc` (`ERFC_MID`, deg 16 to 3.92), evaluated by
+        Clenshaw; within `ERF_BOUND = 10.5u`, the fit and its evaluation measured
+        over every float of the interval. `gelu_program`: `2 Phi` by the branch
+        that does not cancel -- on the far negative side `erfc` itself (a second fit,
+        `ERFC_TAIL`, to 9.3), so it is relatively accurate where Flex's own `1 +
+        erf` is not; within `GELU_BOUND = 12.5u`; `gelu_backward` within
+        `gelu_backward_bound(x, g)` (absolute: the derivative crosses zero).
+        `sigmoid_backward` is exact, Flex's order of roundings. Found here: `SFPMAD`
+        is not fused and drops a denormal-range product (numerics rows E, F), so
+        the error-free transforms are Dekker's with 12-bit halves; and `exp`'s NaN
+        and overflow edge (10.2d). Gates: `step45_exp_family` (each kind bit for bit
+        to its program, the programs within their bounds of Flex), ttsim and both
+        cards. Burn: `float_tanh`, `float_erf`, `sigmoid{,_backward}`,
+        `gelu{,_backward}` -- `silu` follows, Burn's `x * sigmoid(x)` --
+        `step47_burn_activations::exp_family_activations_stay_on_the_card_within_
+        their_bounds`, which also takes Burn's autodiff through both backward
+        kinds. `sinh_cosh_program`: one `expm1` of `a = |x|`, then `(t + t/e)/2`
+        or `(e + 1/e)/2`, `e = t + 1` (no cancellation); from `a = 88` the
+        argument halved and the result `w (w/2)`, so nothing overflows before
+        the result does (89.4159); `sinh` is `x` itself below `2^-12`. Within
+        `SINH_BOUND = COSH_BOUND = 12.5u` (the large side's two `expm1`s;
+        worst measured 2.2 ulps). Burn: `float_sinh`, `float_cosh`;
+        `step47_burn_activations::hyperbolics_and_log_sigmoid_stay_on_the_card_
+        within_their_bounds`, with Burn's autodiff of `sinh` (`g cosh
+        x`); watched failing with `float_cosh` routed to `SINH`, and `step45`
+        with `sinh`'s sign dropped. `asinh_acosh_program`, `atanh_program`: one
+        `log1p` each, of an argument that does not cancel -- `a + a^2/(1 +
+        sqrt(1 + a^2))`, `t + sqrt(t (t + 2))` (`t = x - 1`, exact), `2a/(1 - a)`
+        -- and from `a = 2^12` `log1p(a - 1) + ln 2`, so `2a` never overflows.
+        Within `ASINH_BOUND = ACOSH_BOUND = 16.2u`, `ATANH_BOUND = 14.2u`; worst
+        measured 3.1, 3.6, 3.3 ulps. `atanh` beyond 1 is NaN by name: from `|x| ~
+        2^126` the reciprocal of `1 - a` flushes and the quotient said `0`
+        (found by its sweep). Flex's `atanh` is std's, which loses up to `42x`
+        its roundings near `-1` (numerics row G); the gates add that error,
+        derived. Burn: `float_{asinh, acosh, atanh}`; `step45` watched failing
+        with `ln 2` dropped. `log_sigmoid_program`: Flex's two branches as one,
+        `min(x, 0) - log1p(e^-|x|)` (one `exp`, one `log1p`, no cancellation),
+        within `LOG_SIGMOID_BOUND = EXP_BOUND + LOG1P_BOUND + u` (14.3u; worst
+        measured 3.2 ulps); `log_sigmoid_backward` is Flex's `g sigmoid(-x)` on
+        the device's sigmoid, within `SIGMOID_BOUND` and the product -- a
+        denormal sigmoid flushes there (numerics row D), where Flex's times `g`
+        can be normal. Burn: `log_sigmoid{,_backward}`, with Burn's autodiff
+        through it (its `sum` is R1b's, on the host); `step45` watched failing
+        with the backward's negation dropped. `softmin` is R2's composition
+        on the device's exact `NEG` (Burn's default, the softmax of `-x`), within
+        the softmax's bound (`step32_burn_softmax`, both dims, three shapes, and
+        on the host below eight tiles; watched failing with the negation
+        off). Next: `sin`/`cos` and the rest (10.2f).
+  - [x] **10.2f Trigonometry.** `trig_reduce`: Payne and Hanek's reduction
+        by `pi/2` in exact fixed point, for every finite `x` -- a 92-bit window
+        of `2/pi` cut per lane at the exponent (23-bit limbs, five conditional
+        shifts and a funnel by register shifts, `Program::shl_by`), `M W mod
+        2^92` from `SFPMUL24`'s halves with integer carries, `q mod 4` and a
+        67-bit fraction, converted exactly and multiplied by `pi/2` in Dekker's
+        12-bit halves. A double-float sum of float chunks, the first design,
+        keeps 48 bits, and the float nearest a multiple of `pi/2` (`16367173
+        2^72`, `|g| = 2^-29.86`; every float scanned,
+        `transcendental::no_float_reduces_closer_than_the_hardest`) needs
+        about 56: so the reduction is integer. `r` within `2^-34`; the table is
+        fdlibm's `ipio2` (watched failing at `1.2e35` with bit 145 flipped).
+        `sin_cos_program`: both Taylor cores on `|r| <= pi/4` (`r_lo` carried),
+        the quadrant as sign bits; within `SIN_BOUND = COS_BOUND = 2.2u`
+        (worst measured 0.97 ulps over every binade, a few periods and the
+        twelve hardest reductions with their neighbours); `sin` is `x` itself
+        below `2^-12`. Gates: `step46_trig` (device bit for bit to the program,
+        the program within its bound of Flex, every binade and the hardest
+        reductions, the zero-padding claim on the raw tiles; watched failing
+        with the quadrant's sign bit taken from bit 0), ttsim and both cards.
+        Burn: `float_sin`, `float_cos`;
+        `step47_burn_activations::trig_stays_on_the_card_within_their_bounds`,
+        with Burn's autodiff through both (each the other's kind); watched
+        failing with `float_cos` routed to `SIN`. Cost (row AL): 23 us a tile
+        against `exp`'s 9.2 and `gelu`'s 29.5. `tan_program`: the same
+        reduction and cores, `S/C` or `-C/S` by `q`'s parity (`recip`,
+        `divide`), within `TAN_BOUND = 5.8u` -- relative next to the poles
+        too, as `r` is (worst measured 2.15 ulps); `x` itself below `2^-12`.
+        Burn: `float_tan`, with Burn's autodiff (`g (tan^2 + 1)`, `tan`
+        recomputed); `step46` watched failing with the odd quadrants'
+        negation dropped. `atan_program`: `t G(t^2)` on `[0, 1]`, `G =
+        atan(sqrt s)/sqrt s` a Chebyshev fit (`ATAN_FIT`, degree 13; fit
+        0.11u, evaluation 1.33u over every 64th float of `[0, 1)`), and `pi/2
+        - atan(1/a)` beyond; within `ATAN_BOUND = 6.2u` (worst measured 1.82
+        ulps). `Piece` now carries its function (`Fit`), so every fit is
+        computed in the builder from `libm`, and the erfc pieces are unchanged
+        (`every_fit_and_its_evaluation_are_within_their_parts`).
+        `atan2_program`: the core of `min/max` of the magnitudes (both scaled
+        by `2^-64` above `2^100`, as `DIV`), then `pi/2 - v`, `pi - v` and
+        `y`'s sign; IEEE's special values over every pairing of 22 signed
+        specials; within `ATAN2_BOUND = 6.2u` (worst measured 2.75u over 60k
+        pairs). A denormal operand is a zero of its sign (numerics row D), so
+        `atan2` of two denormals is a zero's where the host's is their ratio's.
+        Same-shape operands only: a row broadcast is an unrolled program, and
+        `atan2`'s body 32 times over would not fit a slot -- and burn-tt
+        refuses a broadcast `atan2` (it panics, naming the shapes) rather than
+        sending it to Flex, which is to go
+        (`step47::trig_stays_on_the_card_within_their_bounds`, watched failing
+        with the refusal removed). Burn: `float_atan`, `float_atan2`, with
+        Burn's autodiff of both (compositions on ops already on the card);
+        `step46` watched failing with `atan`'s `pi/2 - v` dropped.
+        `asin_acos_program`: one core of `a` up to 0.7, else of `z =
+        sqrt((1 - a)/2)` (`1 - a` exact), as `asin t = t + t^3 K(t^2)` --
+        `K` a Chebyshev fit of the correction (`ASIN_FIT`, degree 16: fitting
+        `asin t/t` itself cost an ulp of the binade above 1, 0.83u that no
+        degree removed) -- then `pi/2 - 2v`, `2v`, `pi - 2v` by branch and
+        sign. The switch at 0.7, not 1/2, keeps `2v` below the result it is
+        taken from. Within `ASIN_BOUND = 6.8u`, `ACOS_BOUND = 4.7u` (worst
+        measured 1.39 and 1.13 ulps); beyond 1 NaN by name. Burn:
+        `float_asin`, `float_acos`, with Burn's autodiff (`g/sqrt(1 - x^2)`);
+        `step46` watched failing with `acos`'s `pi - 2v` dropped. Cost per
+        tile (row AL): `atan` 15.0 us, `asin` 17.8, `acos` 17.0, `tan` 28.0.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -725,6 +1008,24 @@ Each names the measurement it must move. The Burn-side ones are in
       for lane masks; interpreter models of all four held to silicon in
       `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
       transpose then add). First user: R1's in-tile folds.
+- [ ] **S10 A fast, approximate mode for the transcendentals** (asked for during 10.2e;
+      concepts review G10's `math_approx_mode`). Today every S3/S4 op is built for a
+      derived bound of a few ulps (`EXP_BOUND`, `ERF_BOUND`, ...), and that costs
+      instructions on the device -- degree-16 Chebyshev fits evaluated by Clenshaw,
+      two Newton steps, exactness fix-ups, every special-value scope (`pow`'s seven).
+      (The fits' coefficients are computed once per process and baked in as
+      immediates, so the cost is device time, not host time.) Most training does not
+      need that. Add `MathMode::{Precise, Approx}` -- named apart from exact mode
+      (`burn_tt::set_exact`, Flex's bits), which is a different question -- carried
+      in `Eltwise` and the program memo keys, chosen per op or per session
+      (`TT_MATH=approx`), `Precise` the default. `Approx` programs: hard-coded
+      low-degree minimax polynomials or `SFPLUT`/`SFPLUTFP32` tables (10.2a gated
+      them), one Newton step or none (`SFPARECIP`'s seed is 0.56%), a coarser range
+      reduction, special values only where an ML input meets them (NaN, ±inf, ±0).
+      Each still gets a derived bound (looser, stated: e.g. `exp` to 2^-11
+      relative), a sweep and a device gate, and `silicon_perf` measures what each
+      saves per tile against `Precise`. Burn: the mode on `TtDevice`/config;
+      `accuracy()` gains the mode so exact mode still refuses both.
 - [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
       else here works without it.
 
@@ -777,7 +1078,8 @@ Each names the measurement it must move. The Burn-side ones are in
 - [~] **R2 Softmax, log-softmax on the device**; cross-entropy waits on D4. `softmax`
       and `log_softmax` (either dim of a resident matrix) run Burn's own composition
       -- max, broadcast subtract, `exp`, sum, broadcast divide or `log` and subtract --
-      on the device end to end, decided once on the whole input. Against Flex's fused
+      on the device end to end, decided once on the whole input; `softmin`
+      (10.2e) the same on an exact `NEG`. Against Flex's fused
       softmax: a bound derived from the parts' (`EXP_BOUND` twice, the sum's order, the
       division's ulp, Flex's own counterparts); measured worst `1.0e-6` relative.
       Burn's `CrossEntropyLoss` gathers the target column with an integer index
@@ -807,8 +1109,41 @@ Each names the measurement it must move. The Burn-side ones are in
       half the bytes for every op. `DramTensor` grows a format.
 - [ ] **D2 Block float (BFP8/BFP4).** Measure the codes as divergence rows G and H did,
       then exponent sharing and `CLREXPHIST`. Prerequisite for `QTensorOps` on the device.
-- [ ] **D3 Integer and bool storage** (INT32, INT8, bool as a format) for `IntTensorOps`,
-      `BoolTensorOps`, `QTensorOps`.
+- [x] **D3 Integer and bool storage** (10.2b; was INT32, INT8, bool as a format).
+      `tensor::Elem::{F32, I32, Bool}` on every `DramTensor`. The device moves
+      every 32-bit pattern unchanged -- the FP32-coded unpack to `Dst` and pack back
+      (`step26`'s `INT32` pass-through case) -- so no unpacker or packer is
+      reconfigured: the tag says what an op may compute on. `I32` is the host's
+      two's complement as bits (the unpacker's `INT32` is sign-magnitude, but
+      nothing converts between formats, `SFPIADD` is two's complement, and
+      `i32::MIN` survives); `Bool` is `0`/`1` as an integer, never `1.0`, and an
+      upload of anything else is refused. `Session::{upload_bits,
+      download_bits}`; an FP32 `download` or `write` of another type is refused.
+      Every op computing in FP32 refuses another type by `TensorError::Elem`
+      before choosing a unit or filling padding (`sfpu::ops::elems`, in
+      `broadcast_of`; the matmul, the sums, the reductions); `COPY` moves any.
+      `sfpu::ops::accuracy` (`Exact` / `Approximate`) replaces burn-tt's "not a
+      mover kind is an approximation". Logic ops pulled forward from S5:
+      `kind_sfpu::BOOL_{NOT, AND, OR, XOR}` on raw bits (`Format::Int32` loads and
+      stores, since an FP32 store flushes the denormal `1`), with row and column
+      broadcasts and padding rules (`false && b` is false). Gates:
+      `step42_int_bool_storage` -- round trips at ragged shapes and through a view
+      (every sign, the extremes, bits that are FP32 denormals and NaNs), every
+      refusal, the logic ops against the truth tables and their programs with
+      every broadcast, padding claims against raw tiles; watched failing with
+      `BOOL_NOT` storing as FP32. ttsim and both cards. Burn: `TtTensor`'s cell
+      carries its dtype onto the device (`tensor::device_elem`: `F32`, `I32` --
+      Burn's `IntElem` here -- and a bool of any store); `{int,bool}_{to_device,
+      reshape, slice, swap_dims, transpose}` keep a device copy as `float_`'s do
+      (shared helpers `reshaped`, `swapped_view`, `row_view`), `bool_{not, and,
+      or, xor}` run on it; other int dtypes stay on the host.
+      `step47_burn_activations::integers_and_booleans_stay_on_the_card` against
+      Flex, nothing downloaded, `computed_on_device` (watched failing with
+      `bool_and` routed to the host); in `SMOKE`. MNIST unchanged (labels stay
+      host values). Element-wise ops still do not read a transposed view (M3).
+  - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
+        format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
+        measured beside the block-float ones `QTensorOps` needs.
 - [ ] **D4 Indexing on the B mover.** General `slice` (not only whole tile rows),
       `slice_assign`, `cat`, `gather`, `scatter_add`, `select`, `select_add`, `repeat_dim`,
       `expand`, `flip`, `embedding` and its backward. The mover moves; the SFPU is not
@@ -838,11 +1173,14 @@ path today, `~` when only some shapes do.
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |
-| `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | | S2 |
-| comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | | S2 |
+| `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
+| comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
+| `float_cast` | `~` to the tensor's own dtype (a no-op); others S6 | S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
-| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*`, `float_erf` | | S4 |
-| `float_sin`, `float_cos`, `float_tan`, `float_tanh`, hyperbolic and inverse trig, `float_atan2` | | S4 |
+| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
+| `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
+| `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
+| `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |
@@ -857,10 +1195,11 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
-| `leaky_relu`, `prelu`, `hard_sigmoid` | | S2 |
-| `sigmoid{,_backward}`, `gelu{,_backward}`, `log_sigmoid{,_backward}` | | S4 |
+| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
+| `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
+| `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
-| `softmin` | | R2 |
+| `softmin` | x (device composition, derived bound; from 8 tiles) | R2 |
 
 ### `ModuleOps`
 
@@ -878,11 +1217,14 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| storage on the device | | D3 |
+| storage on the device | x `I32`, `Bool` (any store); other int dtypes host | D3 |
+| `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul,div,remainder}{,_scalar}`, `int_neg`, `int_abs`, comparisons, `bitwise_*` | | S5 |
-| `int_into_float`, `int_cast`, `bool_into_float`, `bool_into_int` | | S6 |
+| `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
+| `int_cast`, `bool_into_float`, `bool_into_int` | | S6 |
 | `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
-| `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_mask_*` | | S5 |
+| `bool_and`, `bool_or`, `bool_xor`, `bool_not` | x (SFPU, exact) | D3 |
+| `bool_mask_*` | | S5 |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
 | `QTensorOps` | | D2 (stays Flex's until then) |
 
@@ -897,7 +1239,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 |---|---|---|
 | `SFPMAD` automatic stalling misses seven cases | `SFPMAD.md:72,75-76`; `stalls_automatically_after_mad` | F2 -- closed: the builder inserts the NOP |
 | `SFPPOPC` complex modes with a full flag stack | Tier 2 | F2 -- closed: never emitted |
-| `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 |
+| `SFPLUTFP32` writes `LReg[LReg[7] & 15]`, not `LReg[VD]` | `SFPLUTFP32.md:15` | S4 -- closed (10.2a): `Program::lut_fp32` points `L7` at `VD` and sets `Mod1Mirror`; measured on both cards (`step26`) |
 | `SFPSTOCHRND` biased; round-toward-zero sometimes rounds away | Tier 2 | S6 |
 | `SFPCAST_IntAbs` computes absolute value | Tier 2 | S5, S6 |
 | `SFPMUL` with `Mod1 > 1` refused by ttsim; `SFPMAD` spelling used | divergence row 17 | S1 |
@@ -912,7 +1254,9 @@ the item that must handle each. An item is not done while its hazard here is ope
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
 | A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
+| A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
+| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `docs/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
