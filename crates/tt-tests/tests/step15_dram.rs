@@ -13,6 +13,7 @@
 
 use tt_device::tlb::WindowKind;
 use tt_isa::dram::{Dram, CHANNEL_BYTES, PORTS};
+use tt_isa::noc::niu::Niu;
 use tt_tests::harness::{in_device, Dev};
 
 fn grid(dev: &mut Dev<'_>) -> Dram {
@@ -87,8 +88,10 @@ fn b_patterns_round_trip_in_every_channel() {
     });
 }
 
-/// Step 3: the three endpoints of a channel are one memory
-/// (`BlackholeA0/README.md:5`), and those of different channels are not.
+/// Step 3: the endpoints of a channel are one memory
+/// (`BlackholeA0/README.md:5`), and those of different channels are not --
+/// through the endpoints the host's NoC #0 owns (`DramChannel::owns`; port 1
+/// is NoC #1's, and a host on NoC #0 there is half of the SYS-1419 hang).
 #[test]
 fn c_the_three_endpoints_of_a_channel_alias() {
     in_device(|dev| {
@@ -97,14 +100,19 @@ fn c_the_three_endpoints_of_a_channel_alias() {
         const AT: u64 = 0x4000;
         for ch in d.channels() {
             for p in 0..PORTS {
-                let e = ch.endpoint(p).unwrap();
+                let Some(e) = ch.endpoint(Niu::Noc0, p) else {
+                    continue;
+                };
                 let tag = 0xA11A_0000 | (ch.index() as u32) << 8 | p as u32;
                 dev.write32(&w, e, AT, tag).unwrap();
                 // Every other channel's last value is untouched, and every port
                 // of this one sees the write.
                 for other in d.channels() {
                     for q in 0..PORTS {
-                        let v = dev.read32(&w, other.endpoint(q).unwrap(), AT).unwrap();
+                        let Some(via) = other.endpoint(Niu::Noc0, q) else {
+                            continue;
+                        };
+                        let v = dev.read32(&w, via, AT).unwrap();
                         if other == ch {
                             assert_eq!(v, tag, "ch{} port {q} after a write via {p}", ch.index());
                         } else if other.index() < ch.index() {

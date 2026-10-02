@@ -80,6 +80,13 @@ pub const THROTTLE_CYCLES: u64 = MAILBOX_BASE + 0x58;
 /// `crate::noc::niu::MAX_IN_FLIGHT`. Read at the start of every list. Lower
 /// caps are for the gates that force the throttle.
 pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
+/// The in-flight cap a tile's mover starts with (`tt_kernels::dm::DataMover::
+/// start`), against `MAX_IN_FLIGHT` (128) for 0: with every tile reading, eight
+/// requests in flight each spread the NoC's service evenly between tiles, and
+/// the card's reads rise from 425 to 467 GB/s at 64 KiB entries and to 496 at
+/// 16 KiB, against 3-4% off one tile's small reads
+/// (`docs/firmware-performance.md`, "What holds card reads").
+pub const TILE_IN_FLIGHT_CAP: u32 = 8;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -110,7 +117,33 @@ pub const QUEUE_ERROR_AT: u64 = MAILBOX_BASE + 0x9C;
 pub const QUEUE_SLOTS: u64 = MAILBOX_BASE + 0xA0;
 /// Slots in the queue.
 pub const QUEUE_LEN: u32 = 16;
-const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= MAILBOX_BASE + 0x100);
+const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
+
+/// Host -> mover: which NIU the mover's GDDR writes go out on, [`write_noc`].
+/// Read at the start of every list. Reads always go out on NoC #0: on NoC #1
+/// their data climbs the DRAM columns and shares one row's link, a single
+/// link's bandwidth for the whole row (`silicon_bench_memory::
+/// gddr_aggregate_nocs`, 4 tiles: 86 GB/s against 320). Barriers stay on
+/// NoC #0. Each request's port is the entry's mapped onto the ports its NIU
+/// owns (`crate::dram::DramChannel::port_for`), so no endpoint ever sees both
+/// NoCs.
+pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
+const _: () = assert!(WRITE_NOC + 4 <= MAILBOX_BASE + 0x100);
+
+/// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
+pub mod write_noc {
+    /// Writes through NoC #0's NIU, with the reads: what the mover always did.
+    pub const NOC0: u32 = 0;
+    /// Writes through NoC #1's NIU, on GDDR port 1 of every channel. Both
+    /// NIUs translate coordinates the same way (`NoC/Coordinates.md`,
+    /// "Coordinate Translation"), so the entries are unchanged.
+    pub const NOC1: u32 = 1;
+    /// Write entries alternate between the two NIUs, NoC #0 first in each
+    /// list, each through a port its NIU owns. The two NoCs' write paths into
+    /// GDDR share no links -- NoC #0's run down the two DRAM columns, NoC
+    /// #1's along port 1's rows into them -- so their bandwidths can add.
+    pub const ALTERNATE: u32 = 2;
+}
 
 /// A queue slot's word: a list of `entries` from ring entry `first`.
 pub const fn queue_slot(first: u32, entries: u32) -> u32 {

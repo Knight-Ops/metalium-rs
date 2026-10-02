@@ -30,16 +30,17 @@ the Scoreboard rows it moved, and add a line to the Change log.
 
 ## Scoreboard
 
-The single-tile mover and the Ethernet wire are near their ceilings. The card-wide
-GDDR6 total is not, and neither is 800G.
+The single-tile mover and the Ethernet wire are near their ceilings. Card-wide
+GDDR6 reads reach 84% of the card since the NoC ownership rules (change log,
+2026-10-02); card-wide writes and 800G are still far off.
 
 | Target | Now | Of ceiling | Goal |
 |---|--:|--:|---|
 | GDDR6, one tile, 64 KiB entries | 81.6 GB/s | 94% NoC link | hold |
-| GDDR6, one tile, 4 KiB entries | 17.4 GB/s | 27% channel | cut per-entry cost |
-| GDDR6, card, best (4 tiles) | 318 GB/s | 62% | 512 GB/s |
-| GDDR6, card, 120 tiles | 127 GB/s | 25% | 512 GB/s |
-| GDDR6 writes, card | ≤ 84 GB/s | 16% | 512 GB/s |
+| GDDR6, one tile, 4 KiB entries | 16.3 GB/s | 26% channel | cut per-entry cost |
+| GDDR6 reads, card, 120 tiles | 429 GB/s | 84% | 512 GB/s |
+| GDDR6 writes, card, 120 tiles (writes on NoC #1) | 266 GB/s | 52% | 512 GB/s |
+| GDDR6 reads + writes, card, 120 tiles (writes on NoC #1) | 343 GB/s | 67% | 512 GB/s |
 | Ethernet wire, one link (per-byte slope) | 48–51 GB/s | ~97% | hold |
 | 800G, both links streaming | 25.8 GB/s | 26% | 100 GB/s |
 | Empty kernel, B → T0–T2 → B (device) | 566 cycles (0.42 µs) | — | lower |
@@ -50,26 +51,128 @@ GDDR6 total is not, and neither is 800G.
 
 | One tile, entry size | Read, 1 ch | Read, all ch | Write, all ch |
 |--:|--:|--:|--:|
-| 4 KiB | 17.4 GB/s | 17.4 | 17.3 |
-| 16 KiB | 62.0 (97% ch) | 67.5 | 67.3 |
-| 64 KiB | 62.0 | 81.6 (94% link) | 73.7 |
-| 128 KiB | 62.0 | 80.9 | 27.5 |
+| 4 KiB | 16.3 GB/s | 16.3 | 14.6 |
+| 16 KiB | 62.0 (97% ch) | 63.5 | 57.2 |
+| 64 KiB | 62.0 | 81.4 (94% link) | 74.1 |
+| 128 KiB | 62.0 | 80.7 | 68.0 |
 
-- **Below 16 KiB the rate is set by the cost per entry, about 317 cycles** (333
-  since the in-flight cap; see the change log). Every list of 240 entries takes
-  56.3 µs, whatever the size. A `WAIT` entry alone costs 116 cycles (now 120).
-- **Writes through one DRAM port stop at about 28.5 GB/s;** across a channel's three
-  ports they reach 63.
+- **Below 16 KiB the rate is set by the cost per entry, about 339 cycles** (317 at
+  the baseline; see the change log). A `WAIT` entry alone costs 136 cycles.
+- **One DRAM port now carries a whole channel of writes** (62.9 GB/s at 64 KiB).
+  Before static VC 1 one port stopped at about 28.5 GB/s and 128 KiB entries
+  fell to 27.5.
+- Run 1790971715 (reads) and 1790970443 (writes).
 
 | Tiles at once | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 120 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| Reads, card GB/s | 85 | 168 | **318** | 244 | 170 | 161 | 146 | 127 |
-| Writes, card GB/s | 73 | 84 | 83 | 61 | 61 | 72 | 66 | 52 |
-| All tiles on one channel, GB/s | 63 | 64 | 64 | 64 | 64 | 64 | 64 | 47 |
+| Reads, card GB/s | 85 | 164 | 296 | 370 | 397 | 404 | 404 | **429** |
+| Writes on NoC #0, card GB/s | 76 | 78 | 79 | 83 | 102 | 136 | 150 | 161 |
+| Writes on NoC #1, card GB/s | 76 | | 251 | | 293 | | 273 | 266 |
+| Reads + writes (NoC #1), card GB/s | 97 | | 322 | | 341 | | 346 | 343 |
+| All tiles on one channel, GB/s | 63 | 64 | 64 | 64 | 64 | 64 | 64 | 64 |
+| *Before (reads, run 1790950685)* | *85* | *168* | *318* | *244* | *170* | *161* | *146* | *127* |
 
-**One channel holds full rate up to 64 tiles, so the GDDR controllers aren't what
-collapses.** All this traffic runs on NoC 0, and NC (the core that could use NoC 1)
-is held in reset. Look at the NoC first.
+Runs 1790970443 and 1790971715.
+
+- **The reads no longer collapse past 4 tiles.** Two changes landed together, and
+  they haven't been separated:
+  - every request now goes out on static VC 1;
+  - port 1 of each channel is now NoC #1's, so NoC #0 traffic that asked for port 1
+    goes to CMFW's endpoint instead.
+- **Reads belong on NoC #0.** With every tile reading on NoC #1, the card stayed
+  at one link's rate: 4 tiles 86 GB/s, 120 tiles 58 (run 1790959226).
+  - NoC #1's read data climbs the DRAM column, then runs left along the readers'
+    shared row.
+- **Writes scale on NoC #1 and not on NoC #0.**
+- **Each GDDR endpoint belongs to one NoC** (`tt_isa::dram::DramChannel::owns`):
+  - NoC #1 gets port 1; NoC #0 gets ports 0 and 2, including CMFW's.
+  - Both NoCs on one endpoint is SYS-1419, which hung card 0 (`ttsim-divergence.md`
+    row 73).
+
+### What holds card reads at ~430 GB/s: unfair service, not distance
+
+From `gddr_aggregate_affinity` (runs 1790975421 onward), 120 tiles reading,
+each tile's share fixed:
+
+| Placement | Card GB/s |
+|---|--:|
+| Cycle: every tile rotates over all 8 channels (today) | **429** |
+| Column: its half's 4 channels, so no data wraps the torus | 417 |
+| Nearest: one channel whose endpoint is at or just above the tile, 15 tiles per channel | 315 |
+| Nearest, alternating NoC #0's two endpoints | 216 |
+
+- **Distance doesn't explain the gap.** Nearest scored the same 315 GB/s with two
+  different row assignments.
+- **The finish times do.** Every tile starts within 27 µs of the others, but the
+  last finishes up to 966 µs after the first, in a 1102 µs run. The NoC serves
+  tiles unevenly, so the card total is set by the slowest tiles. Session splits
+  ops evenly across tiles, so its ops wait on the slowest tile the same way.
+- **A lower in-flight cap evens out the service:**
+
+  | Reads, tiles | 1 | 4 | 16 | 120 |
+  |---|--:|--:|--:|--:|
+  | Default cap (`MAX_IN_FLIGHT` 128) | 84.7 | 294 | 397 | 420 |
+  | Cap 32 | | | | 452 |
+  | Cap 16 | | | | 460 |
+  | **Cap 8** | 84.6 | **323** | **472** | **471** (92%) |
+  | Cap 4 | 72.4 | 254 | 471 | 464 |
+
+- Under cap 8, write mixes stay within noise of the default, except one tile mixing
+  reads and writes, about 5% slower.
+- **The default since 2026-10-02:** `dm::TILE_IN_FLIGHT_CAP`, set by
+  `DataMover::start`. E1 keeps `MAX_IN_FLIGHT`.
+
+**Cap 8 against the default, by entry size** (reads, card-wide GB/s; `AGG_LEN`,
+`AGG_CAP`):
+
+| Entry | 1 tile | 16 tiles | 120 tiles |
+|--:|--:|--:|--:|
+| 4 KiB | 16.3 → 15.7 | 255 → 245 | 452 → **480** |
+| 16 KiB | 64.9 → 62.1 | 420 → **473** | 464 → **496** (97%) |
+| 64 KiB | 84.7 → 84.7 | 396 → **471** | 425 → **467** |
+| 128 KiB | 84.5 → 84.3 | 370 → **419** | 398 → **437** |
+
+- **Many tiles: cap 8 wins at every size.** 16 KiB entries, one NoC request
+  each, come within 3% of the card.
+- **One tile: cap 8 loses 3–4% at 4 and 16 KiB.** Eight requests in flight no
+  longer quite cover a small read's latency. From 64 KiB up there's no
+  difference.
+- **Writes: within noise at every size and tile count.**
+
+### Why card-wide writes stop at about 160 (NoC #0) and 270 (NoC #1) GB/s
+
+**One channel absorbs a full channel of writes from 120 tiles, on either NoC:**
+63.9 GB/s, 99.9% (`gddr_aggregate_nocs`, `Mix::OneChannelWrite`). So neither the
+GDDR nor one channel's path is the limit. It appears only when all eight channels
+are written at once, which points to links the channels share. Inferred from
+dimension-order routing (`NoC/RoutingPaths.md`):
+
+- **NoC #0 (X then Y, east then down):**
+  - Write data runs east along the writer's row to a DRAM column (raw X 0 or 9),
+    then down that column to the endpoint.
+  - Channels 0–3 share column 0's downward links and 4–7 share column 9's: about
+    2 × 86 GB/s.
+  - Four writers in one row also share that row's link: 79 GB/s.
+- **NoC #1 (Y then X, up then left):**
+  - Write data climbs the writer's own column, then runs left along the endpoint's
+    row.
+  - NoC #1 owns port 1 only, and port 1 of channel k and channel k+4 sit in the same
+    raw row, so eight channels arrive over four rows.
+- **Reads are the mirror image:**
+  - Their data leaves each DRAM column along its endpoint rows, then fans out down
+    the readers' columns.
+  - That is why reads scale and writes don't.
+
+| Card writes (64 KiB, cap 8), tiles | 1 | 4 | 16 | 64 | 120 |
+|---|--:|--:|--:|--:|--:|
+| NoC #0 | 76 | 79 | 102 | 149 | 161 |
+| NoC #1 | 77 | 257 | 296 | 273 | 268 |
+| Alternating per entry (`write_noc::ALTERNATE`) | 85 | 146 | 182 | 250 | 263 |
+
+**Alternating is not additive.** One core issues every request in order, so when
+NoC #0's path backs up B stalls on its initiator and stops feeding NoC #1 too. An
+independent NoC #1 issuer, NC, would not stall that way. The mode stays available,
+but it is not the default.
 
 ## Core path: B → T0/T1/T2
 
@@ -129,12 +232,13 @@ difference is the host polling for the ack and posting the next send over PCIe.
 
 1. **The host is in every op and every transfer.** About 100 µs of host work per
    matmul, and about 3 µs per Ethernet send.
-2. **GDDR6 across the card collapses beyond 4 movers.** All of it is on NoC 0, with
-   NC unused.
-3. **317 cycles per mover entry (now 333), 116 of them before the NIU is touched.**
-   The hot loop already overflows B's 2 KiB instruction cache: the committed code
-   was about 3.0 KB. That makes per-entry cost depend on code layout, not just
-   instruction count.
+2. **Card-wide writes reach half the card.** Card-wide reads are at 84% (fixed
+   2026-10-02). NC, still held in reset, is the planned NoC #1 writer.
+3. **339 cycles per mover entry (317 at the baseline), about 116 of them before
+   the NIU is touched.** The read path's hot code is about 3.0 KB.
+   - B's instruction cache is 2 KiB on Wormhole; the Blackhole size is not
+     documented (`riscv-guide-review.md`).
+   - So per-entry cost depends on code layout, not just instruction count.
 4. **Nothing overlaps within an op:** gather, compute and scatter run in sequence.
 5. **E1 stores and forwards through one staging buffer,** plus a 0.75 µs round trip
    per transfer.
@@ -158,12 +262,13 @@ difference is the host polling for the ack and posting the next send over PCIe.
   - Tests: `step49_in_flight` (500 requests in one list), and
     `silicon_bench_memory::gddr_in_flight` (300 requests per tile × 120 tiles on
     one channel, which must stay ≤ the channel's ceiling).
-- [ ] **Single-port writes are unexplained.**
-  - 128 KiB write entries collapse to 27–33 GB/s.
-  - 16 KiB writes through one DRAM port vary from run to run with no change to
-    that path: 806, 351 and 521 cycles per entry in runs 1790950685, 1790953809
-    and 1790956433. Through three ports they hold steady at 351.
-  - Not yet explained.
+- [x] **Single-port writes (fixed by static VC 1).**
+  - Before: 128 KiB write entries collapsed to 27–33 GB/s, and 16 KiB single-port
+    writes varied from run to run.
+  - After every request went to static VC 1, one port holds 62.9 GB/s at 64 KiB
+    and 128 KiB (run 1790970443).
+  - The single-port write path changed in nothing else: port hint 0 maps to port
+    0 on NoC #0.
 - [ ] **Not yet measured:**
   - tile-to-tile L1 over the NoC (the mover has no op for it)
   - card 1 (`cargo xtask bench --device all`)
@@ -174,6 +279,9 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-02 | — | Tile movers default to an in-flight cap of 8 (`dm::TILE_IN_FLIGHT_CAP`); `write_noc::ALTERNATE` added | **Card reads:** 120 tiles 425 → 467 GB/s at 64 KiB, 496 at 16 KiB.<br>**One tile:** 3–4% off small reads.<br>**Writes:** unchanged.<br>**Alternating writes:** no gain at 120 tiles (263 against 268 on NoC #1).<br>**Stress (cap 8, all write modes):** 60 s clean. |
+| 2026-10-02 | 1790971715 | NoC ownership.<br>• Each GDDR endpoint is one NoC's (NoC #1 port 1; NoC #0 ports 0 and 2), refused otherwise.<br>• Every request on static VC 1.<br>• Writes may go out on NoC #1 (`dm::WRITE_NOC`); reads stay on NoC #0.<br>• The host fences through NoC #0's ports only. | **Card reads:** 120 tiles 127 → 429 GB/s, no collapse past 4.<br>**Card writes:** 52 → 266 GB/s on NoC #1, 161 on NoC #0.<br>**Card reads + writes:** 343.<br>**One port's writes:** 28.5 → 62.9 GB/s.<br>**Per entry:** 4 KiB reads 328 → 339 cycles, `WAIT` 115 → 136 (NIU chosen per request; issue specialised per NIU).<br>**Stress:** 10 min, 120 tiles, both NoCs, 133 GiB, clean. |
+| 2026-10-02 | 1790959226 | Experiment: every tile reading on NoC #1, and tiles split across NoCs | NoC #1 reads stuck at one link (4 tiles 86 GB/s, 120 tiles 58). Splitting tiles across NoCs on shared ports hung card 0 (SYS-1419). Replaced by the row above |
 | 2026-10-02 | 1790956433 | No arithmetic on B (firmware benchmarks) | Per entry: 4 KiB reads 333 → 328 cycles (baseline 317), `WAIT` 120 → 115 (back to the baseline's 116), 16 KiB unchanged. Card totals, core path, matmul and SFPU device times, Ethernet: within 1%. New: sum over rows on the SFPU, 1 tile 4.7 µs, 64 tiles 87 µs on the device |
 | 2026-10-02 | tt-mnist, card 0 | No arithmetic on B: element-wise and the sum over rows on the SFPU only (in-order sum, chunked past 16 row tiles); image gate refuses F instructions | MNIST 1 tile 2.0 → 1.7 ms/step; 8 tiles 1.9–2.0 → 2.2 ms/step (small ops spread thin pay the SFPU kernel's launch, which the old cost model avoided). Golden unchanged |
 | 2026-10-02 | 1790953809 | Cap mover NoC requests in flight at 128 per transaction ID (fixes the 8-bit counter wrap); waits counted and reported | Per entry: 4 KiB 317 → 333 cycles, 16 KiB unchanged (357), `WAIT` 116 → 120. Card totals unchanged (reads 319 GB/s at 4 tiles, 129 at 120). The cap binds only under contention (120-tile reads: 2023 waits per run; one channel: 4235) without lowering throughput. 120 tiles × 300 requests on one channel completes exactly: 48 GB/s, 8762 waits per run |

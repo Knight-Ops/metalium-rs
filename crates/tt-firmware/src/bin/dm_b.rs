@@ -12,7 +12,7 @@ use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
-use tt_isa::noc::niu::{Command, TxnId, MAX_REQUEST_BYTES};
+use tt_isa::noc::niu::{Command, Niu, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(2) {
     Some(t) => t,
@@ -37,12 +37,63 @@ fn wr(addr: u64, v: u32) {
     unsafe { l1_write32(addr, v) }
 }
 
+/// Where writes go out, and this tile's coordinate as NoC #1 names it: set
+/// per list by [`list_settings`], read per write. With `alternate`, `niu`
+/// flips after each write entry (`dm::write_noc::ALTERNATE`). In local data
+/// RAM, as the `noc` module's state is.
+#[derive(Copy, Clone)]
+struct Writes {
+    niu: Niu,
+    alternate: bool,
+    me1: (u8, u8),
+}
+
+#[link_section = ".local"]
+static mut WRITES: Writes = Writes {
+    niu: Niu::Noc0,
+    alternate: false,
+    me1: (0, 0),
+};
+
+fn writes() -> &'static mut Writes {
+    // SAFETY: one core, no interrupts, and no reference outlives its use.
+    unsafe { &mut *core::ptr::addr_of_mut!(WRITES) }
+}
+
 /// Issue one descriptor's bytes as NIU requests of at most 16 KiB, without
 /// waiting for them. Every request's range is a sub-range of the checked
 /// descriptor, so it is inside the channel and inside L1, with the congruence
-/// preserved.
+/// preserved. Reads go out on NoC #0, writes on the NIU the host chose
+/// (`dm::WRITE_NOC`), each through the port of its channel that NIU owns
+/// nearest the one asked for (`DramChannel::port_for`).
 #[link_section = ".text.hot"]
 fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
+    if d.op == op::READ {
+        let port = d.range.channel().port_for(Niu::Noc0, d.port);
+        return issue_via::<false>(me, d, port);
+    }
+    issue_write(me, d)
+}
+
+/// [`issue`]'s writes: through the NIU the host chose, out of the read path
+/// (`.text.warm`: after the hot code and both NIUs' issue, `sections.x`).
+#[link_section = ".text.warm"]
+#[inline(never)]
+fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
+    let w = *writes();
+    if w.alternate {
+        writes().niu = if w.niu == Niu::Noc0 { Niu::Noc1 } else { Niu::Noc0 };
+    }
+    if w.niu == Niu::Noc1 {
+        issue_via::<true>(w.me1, d, d.range.channel().port_for(Niu::Noc1, d.port))
+    } else {
+        issue_via::<false>(me, d, d.range.channel().port_for(Niu::Noc0, d.port))
+    }
+}
+
+/// One descriptor's requests through NoC #1 (`NOC1`) or NoC #0, on `port`.
+#[inline(always)]
+fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<(), u32> {
     let len = d.range.len() as u32;
     let mut done = 0u32;
     while done < len {
@@ -54,14 +105,32 @@ fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
             .ok_or(dm::error::RANGE)?;
         let l1 = d.l1 + done;
         let cmd = if d.op == op::READ {
-            Command::ReadDram { from: part, port: d.port, to_local: l1 }
+            Command::ReadDram {
+                from: part,
+                port,
+                to_local: l1,
+            }
         } else {
-            Command::WriteDram { from_local: l1, to: part, port: d.port }
+            Command::WriteDram {
+                from_local: l1,
+                to: part,
+                port,
+            }
         };
-        noc::issue(&cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)?;
+        noc::issue_on::<NOC1>(&cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)?;
         done += n;
     }
     Ok(())
+}
+
+/// What the host may change between lists: the in-flight cap and the NIU the
+/// writes go out on.
+fn list_settings() {
+    noc::set_cap(TXN, rd(dm::IN_FLIGHT_CAP));
+    let mode = rd(dm::WRITE_NOC);
+    let w = writes();
+    w.niu = if mode == dm::write_noc::NOC1 { Niu::Noc1 } else { Niu::Noc0 };
+    w.alternate = mode == dm::write_noc::ALTERNATE;
 }
 
 /// The tile counter's low word, which ttsim models (divergence row 54). The
@@ -217,6 +286,7 @@ fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
     use tt_isa::noc::niu::Endpoint;
     let counter = Endpoint { x, y, addr: dm::BARRIER_COUNTER as u32 };
     noc::issue(
+        Niu::Noc0,
         &Command::AtomicIncrement { to: counter, value: 1, ret_local: dm::BARRIER_RET as u32 },
         me,
         BARRIER_TXN,
@@ -225,6 +295,7 @@ fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
     noc::wait(BARRIER_TXN);
     loop {
         noc::issue(
+            Niu::Noc0,
             &Command::Read { from: counter, to_local: dm::BARRIER_POLL as u32, len: 4 },
             me,
             BARRIER_TXN,
@@ -458,6 +529,11 @@ fn call(
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
     let me = (rd(dm::MY_X) as u8, rd(dm::MY_Y) as u8);
+    *writes() = Writes {
+        niu: Niu::Noc0,
+        alternate: false,
+        me1: noc::me(Niu::Noc1),
+    };
     let usable = rd(dm::USABLE);
     let mut beat: u32 = 0;
     noc::set_clock(wall_clock);
@@ -474,7 +550,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         // fails (which stops the queue until the host restarts the mover).
         let done = rd(dm::QUEUE_DONE);
         if done != rd(dm::QUEUE_HEAD) && rd(dm::QUEUE_ERROR) == dm::error::NONE {
-            noc::set_cap(TXN, rd(dm::IN_FLIGHT_CAP));
+            list_settings();
             let slot = rd(dm::QUEUE_SLOTS + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
             publish_stalls(&mut stalls, rd(dm::TRACE) != 0);
@@ -494,7 +570,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         if seq == 0 || seq == rd(dm::DONE) {
             continue;
         }
-        noc::set_cap(TXN, rd(dm::IN_FLIGHT_CAP));
+        list_settings();
         let result = if rd(dm::OP) == op::LIST {
             run_list(me, usable, rd(dm::LEN))
         } else {

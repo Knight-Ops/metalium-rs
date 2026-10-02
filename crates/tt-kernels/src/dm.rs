@@ -12,6 +12,7 @@ use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dm::{self, op, record, Descriptor, Entry};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
+use tt_isa::noc::niu::Niu;
 use tt_isa::noc::{NocCoord, NocId};
 
 /// Why a data-mover operation did not complete.
@@ -115,6 +116,25 @@ impl std::ops::Add for Throttle {
     }
 }
 
+/// Which NIU a mover's GDDR writes go out on ([`DataMover::set_write_noc`],
+/// `tt_isa::dm::write_noc`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WriteNoc {
+    Noc0,
+    Noc1,
+    /// Write entries take turns, NoC #0 first in each list.
+    Alternate,
+}
+
+impl From<Niu> for WriteNoc {
+    fn from(n: Niu) -> Self {
+        match n {
+            Niu::Noc0 => WriteNoc::Noc0,
+            Niu::Noc1 => WriteNoc::Noc1,
+        }
+    }
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
@@ -158,7 +178,7 @@ impl<N: NocId> DataMover<N> {
             dm::TRACE,
             dm::THROTTLE_STALLS,
             dm::THROTTLE_CYCLES,
-            dm::IN_FLIGHT_CAP,
+            dm::WRITE_NOC,
             dm::QUEUE_HEAD,
             dm::QUEUE_DONE,
             dm::QUEUE_ERROR,
@@ -166,6 +186,7 @@ impl<N: NocId> DataMover<N> {
         ] {
             d.write32(w, tile, word, 0)?;
         }
+        d.write32(w, tile, dm::IN_FLIGHT_CAP, dm::TILE_IN_FLIGHT_CAP)?;
         let status_at = dm::MAILBOX_BASE + offset::STATUS;
         d.write32(w, tile, status_at, 0)?;
         d.load_and_start(w, tile, tt_isa::tensix::Core::B, image, dm::IMAGE_BASE)?;
@@ -205,7 +226,9 @@ impl<N: NocId> DataMover<N> {
 
     /// Cap this mover's requests in flight at `cap` from its next list: 0 for
     /// `tt_isa::noc::niu::MAX_IN_FLIGHT`, otherwise clamped to
-    /// `1..=MAX_IN_FLIGHT`. For the gates that force the throttle.
+    /// `1..=MAX_IN_FLIGHT`. A mover starts at `dm::TILE_IN_FLIGHT_CAP`; this is
+    /// for the gates that force the throttle and the benchmarks that compare
+    /// caps.
     pub fn set_in_flight_cap<T: Transport>(
         &self,
         d: &mut Device<T>,
@@ -213,6 +236,24 @@ impl<N: NocId> DataMover<N> {
         cap: u32,
     ) -> Result<()> {
         d.write32(w, self.tile, dm::IN_FLIGHT_CAP, cap)?;
+        Ok(())
+    }
+
+    /// Send this mover's GDDR writes out through `noc` from its next list
+    /// (`tt_isa::dm::WRITE_NOC`): NoC #0 with the reads, NoC #1 on port 1 of
+    /// every channel, or each in turn. Reads and barriers stay on NoC #0.
+    pub fn set_write_noc<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        noc: impl Into<WriteNoc>,
+    ) -> Result<()> {
+        let word = match noc.into() {
+            WriteNoc::Noc0 => dm::write_noc::NOC0,
+            WriteNoc::Noc1 => dm::write_noc::NOC1,
+            WriteNoc::Alternate => dm::write_noc::ALTERNATE,
+        };
+        d.write32(w, self.tile, dm::WRITE_NOC, word)?;
         Ok(())
     }
 

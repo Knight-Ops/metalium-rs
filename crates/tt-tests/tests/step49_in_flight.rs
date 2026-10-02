@@ -83,7 +83,11 @@ fn more_requests_than_the_counter_holds_all_land_with_and_without_waiting() {
             }
         };
         let zero = vec![0u8; (ENTRIES * LEN) as usize];
-        for (cap, what) in [(0u32, "the default cap"), (1, "a cap of one")] {
+        for (cap, what) in [
+            (0u32, "the maximum cap"),
+            (tt_isa::dm::TILE_IN_FLIGHT_CAP, "the tile movers' cap"),
+            (1, "a cap of one"),
+        ] {
             d.write(&w, t, L1_AT as u64, &zero).unwrap();
             m.set_in_flight_cap(d, &w, cap).unwrap();
             let before = m.throttle(d, &w).unwrap();
@@ -106,7 +110,8 @@ fn more_requests_than_the_counter_holds_all_land_with_and_without_waiting() {
                 );
             }
         }
-        m.set_in_flight_cap(d, &w, 0).unwrap();
+        m.set_in_flight_cap(d, &w, tt_isa::dm::TILE_IN_FLIGHT_CAP)
+            .unwrap();
         m.stop(d, &w).unwrap();
     });
 }

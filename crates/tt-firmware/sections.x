@@ -13,11 +13,15 @@ SECTIONS
     KEEP(*(.text.start))
     /* A mover's per-entry path (`#[link_section = ".text.hot"]` in dm_b.rs),
      * together and first, then the NoC issue it calls (by its v0-mangled
-     * function section): RISCV B's instruction cache is 2 KiB, and with the
-     * cold paths out of line this takes a WAIT entry from 0.31 to 0.29 us
-     * (`silicon_perf::mover_read_shapes`). */
+     * function section; one copy per NIU, `noc::issue_on`): RISCV B's
+     * instruction cache is small (2 KiB on Wormhole; Blackhole's is not
+     * documented), and with the cold paths out of line this takes a WAIT
+     * entry from 0.31 to 0.29 us (`silicon_perf::mover_read_shapes`). */
     *(.text.hot .text.hot.*)
-    *(.text.*11tt_firmware3noc5issue)
+    *(.text.*11tt_firmware3noc8issue_on*)
+    /* The write path's NIU choice (`dm_b::issue_write`): taken by every
+     * write, kept off the reads' stretch above. */
+    *(.text.warm .text.warm.*)
     *(.text .text.*)
   } > L1
 
