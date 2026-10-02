@@ -249,24 +249,82 @@ pub const TRACE_CHUNK: u64 = 0x1_9100;
 pub const TRACE_CHUNK_ENTRIES: u32 = 64;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
 
+/// One tile's data mover, by core: where its image, mailbox, list ring,
+/// scratch and trace chunk live. B's are this module's constants; NC's are
+/// [`nc`]'s. Both speak the same protocol, so NC's mailbox is B's layout
+/// moved ([`Mover::at`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Mover {
+    pub core: crate::tensix::Core,
+    pub image_base: u64,
+    pub image_max: u64,
+    pub mailbox: u64,
+    pub list: u64,
+    pub scratch: u64,
+    pub trace_chunk: u64,
+}
+
+impl Mover {
+    /// RISCV B's mover: the image at its hardwired reset PC.
+    pub const B: Mover = Mover {
+        core: crate::tensix::Core::B,
+        image_base: IMAGE_BASE,
+        image_max: IMAGE_MAX,
+        mailbox: MAILBOX_BASE,
+        list: LIST,
+        scratch: SCRATCH,
+        trace_chunk: TRACE_CHUNK,
+    };
+    /// RISCV NC's mover: the image at the top of L1, reached by the stub at
+    /// NC's reset PC ([`nc::stub`]).
+    pub const NC: Mover = Mover {
+        core: crate::tensix::Core::NC,
+        image_base: nc::IMAGE_BASE,
+        image_max: nc::IMAGE_MAX,
+        mailbox: nc::MAILBOX_BASE,
+        list: nc::LIST,
+        scratch: nc::SCRATCH,
+        trace_chunk: nc::TRACE_CHUNK,
+    };
+
+    /// This mover's copy of mailbox word `b_word`, given as B's (one of
+    /// [`SEQ`], [`DONE`], [`QUEUE_HEAD`], ...).
+    pub const fn at(self, b_word: u64) -> u64 {
+        b_word - MAILBOX_BASE + self.mailbox
+    }
+}
+
 /// RISCV NC's mover: where its image, list ring, scratch and mailbox live.
 ///
 /// NC's own slot, from its default reset PC (`0x1_2000`) to the mover's list
 /// (`0x1_4000`), is 8 KiB, and the mover image is twice that. So the image
-/// lives in [`crate::l1::NC_MOVER`] at the top of L1, and NC's reset PC holds
-/// a two-instruction jump to it ([`nc::stub`]). Its reset PC is never moved:
+/// lives in the free L1 between B's mover area and the data arena
+/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk in the
+/// mailbox region's free stretch below the role mailboxes -- the program
+/// cache keeps all of the top of L1, which a long column sum needs
+/// (`step21_one_launch`) -- and NC's reset PC holds a two-instruction jump to
+/// the image ([`nc::stub`]). Its reset PC is never moved:
 /// ttsim refuses NC's reset-PC override (divergence row 43), and the default
 /// is the same on silicon. NC fetches only from L1 on Blackhole -- no
 /// instruction RAM (`BabyRISCV/README.md:39`) -- so the image runs in place.
 pub mod nc {
     /// Where NC starts on leaving reset: the stub.
     pub const STUB_AT: u64 = crate::tensix::Core::NC.default_reset_pc() as u64;
-    /// Where the image is linked and loaded: the start of
-    /// [`crate::l1::NC_MOVER`].
-    pub const IMAGE_BASE: u64 = 0x17_0000;
-    pub const IMAGE_MAX: u64 = 0x8000;
-    /// NC's list ring, as [`super::LIST`] is B's.
-    pub const LIST: u64 = IMAGE_BASE + IMAGE_MAX;
+    /// Where the image is linked and loaded: the first 4 KiB boundary past
+    /// B's mover area (the stub's jump needs one), up to the data arena.
+    pub const IMAGE_BASE: u64 = 0x1_A000;
+    pub const IMAGE_MAX: u64 = 0x2_0000 - IMAGE_BASE;
+    const _: () = assert!(
+        IMAGE_BASE >= super::TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES
+    );
+    /// NC's list ring, as [`super::LIST`] is B's: in the mailbox region, past
+    /// the single-core mailbox's `Dst` dump (`crate::mailbox::DUMP`) and
+    /// before the role mailboxes (`crate::mailbox::role::BASE`).
+    pub const LIST: u64 = crate::mailbox::MAILBOX_BASE + 0x4000;
+    const _: () = assert!(
+        LIST >= crate::mailbox::DUMP
+            + (crate::mailbox::DUMP_MAX_ROWS * crate::mailbox::DUMP_ROW_WORDS * 4) as u64
+    );
     /// NC's transpose scratch slot, as [`super::SCRATCH`] is B's.
     pub const SCRATCH: u64 = LIST + super::LIST_MAX as u64 * super::ENTRY_BYTES;
     /// Where NC's `CALL`s stream their entries, as [`super::TRACE_CHUNK`].
@@ -277,7 +335,7 @@ pub mod nc {
     /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
     pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
     const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
-    const _: () = assert!(END <= crate::tensix::L1_SIZE);
+    const _: () = assert!(END <= crate::mailbox::role::BASE);
     const _: () = assert!(STUB_AT + 8 <= super::LIST);
 
     /// The two instructions at [`STUB_AT`]: `lui t0, %hi(target)` and
@@ -576,7 +634,8 @@ mod tests {
     #[test]
     fn the_nc_stub_jumps_to_the_image() {
         // `lui t0, 0x170` and `jr t0`, as llvm-objdump decodes these words.
-        assert_eq!(nc::stub(nc::IMAGE_BASE), [0x0017_02B7, 0x0002_8067]);
+        assert_eq!(nc::stub(0x17_0000), [0x0017_02B7, 0x0002_8067]);
+        assert_eq!(nc::stub(nc::IMAGE_BASE), [0x0001_A2B7, 0x0002_8067]);
     }
 
     use super::*;

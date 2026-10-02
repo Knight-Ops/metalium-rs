@@ -59,7 +59,8 @@ pub const DATA: Region = Region {
     end: mailbox::MAILBOX_BASE,
 };
 
-/// The single-core, role and mover mailboxes, with the `Dst` dump.
+/// The single-core, role and mover mailboxes, with the `Dst` dump, and RISCV
+/// NC's mover list ring, scratch and trace chunk (`dm::nc::LIST..END`).
 pub const MAILBOXES: Region = Region {
     name: "mailboxes",
     base: mailbox::MAILBOX_BASE,
@@ -80,34 +81,32 @@ pub const TRACE: Region = Region {
     end: mailbox::TRACE_BUFFER + mailbox::TRACE_BUFFER_BYTES,
 };
 
-/// The rest of L1 below [`NC_MOVER`], kept for resident kernel programs
-/// (Phase 9.7c).
+/// The rest of L1, kept for resident kernel programs (Phase 9.7c).
 pub const PROGRAM_CACHE: Region = Region {
     name: "program cache",
     base: mailbox::TRACE_BUFFER + mailbox::TRACE_BUFFER_BYTES,
-    end: dm::nc::IMAGE_BASE,
-};
-
-/// RISCV NC's mover: its image, list ring, scratch and trace chunk
-/// (`dm::nc`), at the top of L1.
-pub const NC_MOVER: Region = Region {
-    name: "NC mover image, list, scratch and trace chunk",
-    base: dm::nc::IMAGE_BASE,
     end: tensix::L1_SIZE,
 };
-const _: () = assert!(dm::nc::END <= tensix::L1_SIZE);
 
-/// Every region, in address order. The gap between [`MOVER`] and [`DATA`] is
-/// unused.
+/// RISCV NC's mover image (`dm::nc`), in what was the free L1 between B's
+/// mover area and the data arena.
+pub const NC_IMAGE: Region = Region {
+    name: "NC mover image",
+    base: dm::nc::IMAGE_BASE,
+    end: dm::nc::IMAGE_BASE + dm::nc::IMAGE_MAX,
+};
+
+/// Every region, in address order. The sliver between [`MOVER`] and
+/// [`NC_IMAGE`] is unused.
 pub const REGIONS: [Region; 8] = [
     IMAGES,
     MOVER,
+    NC_IMAGE,
     DATA,
     MAILBOXES,
     PROGRAMS,
     TRACE,
     PROGRAM_CACHE,
-    NC_MOVER,
 ];
 
 const fn ordered(r: &[Region]) -> bool {
