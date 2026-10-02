@@ -1015,6 +1015,11 @@ pub mod float {
         kind_sfpu::COS,
         "`cos x` on the device where the data is, within `ops::COS_BOUND` for every finite `x`, else Flex's."
     );
+    unary_sfpu!(
+        float_tan,
+        kind_sfpu::TAN,
+        "`tan x` on the device where the data is, within `ops::TAN_BOUND` for every finite `x`, else Flex's."
+    );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
     /// (within `ops::pow_bound`); else Flex's.

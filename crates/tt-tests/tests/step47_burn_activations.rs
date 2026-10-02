@@ -824,7 +824,7 @@ fn hyperbolics_and_log_sigmoid_stay_on_the_card_within_their_bounds() {
 #[test]
 fn trig_stays_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
-    use tt_kernels::sfpu::ops::{COS_BOUND, SIN_BOUND};
+    use tt_kernels::sfpu::ops::{COS_BOUND, SIN_BOUND, TAN_BOUND};
     let u = 1.0 / 16_777_216.0;
     with_device(Config::default(), |d| {
         let [r, c] = [64, 128];
@@ -869,6 +869,8 @@ fn trig_stays_on_the_card_within_their_bounds() {
         check(&got, &host(fx.clone().sin()), SIN_BOUND, "sin");
         let got = vals(resident("cos", || x.clone().cos()), "cos");
         check(&got, &host(fx.clone().cos()), COS_BOUND, "cos");
+        let got = vals(resident("tan", || x.clone().tan()), "tan");
+        check(&got, &host(fx.clone().tan()), TAN_BOUND, "tan");
 
         // Autodiff: `d/dx sum(sin(x) g) = g cos x`, `d/dx sum(cos(x) g) = -g
         // sin x` -- each the other's kind, then a product (one rounding on each
@@ -890,5 +892,18 @@ fn trig_stays_on_the_card_within_their_bounds() {
             let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
             check(&got, &want, SIN_BOUND + 2.0 * u, what);
         }
+        // Burn's `tan` backward: `g (tan(x)^2 + 1)`, `tan` recomputed --
+        // `TAN_BOUND` twice in the square, then the add and the product.
+        let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+        let gs = (xa.clone().tan() * Tensor::<Ad, 2>::from_inner(g.clone()))
+            .sum()
+            .backward();
+        let got = xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        let fa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+        let gs = (fa.clone().tan() * Tensor::<Fd, 2>::from_inner(fg.clone()))
+            .sum()
+            .backward();
+        let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        check(&got, &want, 2.0 * TAN_BOUND + 4.0 * u, "autodiff tan");
     });
 }

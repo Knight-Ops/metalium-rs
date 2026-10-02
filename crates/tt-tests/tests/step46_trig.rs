@@ -2,7 +2,7 @@
 //!
 //! As `step45_exp_family`: the device **bit for bit** to its programs
 //! (`tt_kernels::sfpu::ops::reference_op`), and the programs to `burn-flex`
-//! within the bounds derived on them (`SIN_BOUND`, `COS_BOUND`) plus Flex's
+//! within the bounds derived on them (`SIN_BOUND`, `COS_BOUND`, `TAN_BOUND`) plus Flex's
 //! own ulp -- for every finite input, the largest and the floats nearest a
 //! multiple of `pi/2` included (`trig_reduce`'s exact Payne-Hanek reduction).
 //! A zero-padding claim is held to the raw tiles.
@@ -10,7 +10,9 @@
 use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use tt_kernels::session::{Session, TileChoice};
-use tt_kernels::sfpu::ops::{kind_sfpu::*, reference_op, Broadcast, COS_BOUND, SIN_BOUND};
+use tt_kernels::sfpu::ops::{
+    kind_sfpu::*, reference_op, Broadcast, COS_BOUND, SIN_BOUND, TAN_BOUND,
+};
 use tt_kernels::tensor::{DramTensor, Eltwise, Pad};
 use tt_tests::backend::GATE_TILE;
 use tt_ttsim::fork_scope;
@@ -182,7 +184,7 @@ fn run<T: tt_device::Transport>(
 }
 
 #[test]
-fn sin_and_cos_are_their_programs_within_their_bounds() {
+fn sin_cos_and_tan_are_their_programs_within_their_bounds() {
     with_session(|s| {
         for (r, c) in [(37, 70), (64, 128)] {
             let av = values(1, r * c);
@@ -191,6 +193,7 @@ fn sin_and_cos_are_their_programs_within_their_bounds() {
             for (kind, want, rel, what) in [
                 (SIN, host(fa.clone().sin()), SIN_BOUND, "sin"),
                 (COS, host(fa.clone().cos()), COS_BOUND, "cos"),
+                (TAN, host(fa.clone().tan()), TAN_BOUND, "tan"),
             ] {
                 let model = run(s, kind, &[&a], &[&av], Broadcast::None, (r, c), what);
                 for i in 0..r * c {

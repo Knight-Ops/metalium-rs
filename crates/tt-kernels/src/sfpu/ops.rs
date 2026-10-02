@@ -141,8 +141,11 @@ pub mod kind_sfpu {
     pub const SIN: u32 = 0x138;
     /// `cos a`, within [`super::COS_BOUND`].
     pub const COS: u32 = 0x139;
+    /// `tan a`, within [`super::TAN_BOUND`] for every finite `a`
+    /// (`super::tan_program`).
+    pub const TAN: u32 = 0x13a;
     /// The last SFPU kind: the tests that run every kind go to it.
-    pub const LAST: u32 = COS;
+    pub const LAST: u32 = TAN;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -230,8 +233,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD
-        | kind_sfpu::SIN
-        | kind_sfpu::COS => Accuracy::Approximate,
+        | kind_sfpu::SIN..=kind_sfpu::TAN => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -1219,6 +1221,62 @@ pub fn sin_cos_program(p: &mut Program, spill: u32, cos: bool) {
     p.if_(Cond::LessEq(k, t), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
 }
 
+/// [`tan_program`]'s derived bound, relative.
+pub const TAN_BOUND: f64 = 5.8 / 16_777_216.0;
+
+/// `tan x` of `x` (in `L0`, raw bits) into `L7`, for every finite `x`:
+/// [`trig_reduce`], both of [`sin_cos_cores`], then `S/C` for even `q` and
+/// `-C/S` for odd -- `S = sin r` with `g`'s sign, `C = cos r` -- and `x`'s
+/// sign (`tan` is odd). Spills at `spill..spill + 192`.
+///
+/// Error, relative, in `u = 2^-24`: the cores' `1.61u` and `2.10u`
+/// ([`sin_cos_cores`]), the quotient `2u` (`divide`, an ulp): under
+/// [`TAN_BOUND`] `= 5.8u`, `r`'s `0.001u` included. Relative everywhere, the
+/// poles' neighbours too: `r` is relative-accurate there (`|g| >= 2^-29.86`),
+/// so `S` is, and `C/S` stays below `2^31`. `x` itself below `|x| = 2^-12`
+/// (`x^2/3 < 2^-25`), bits and all; `±inf` and NaNs give NaN.
+pub fn tan_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    trig_reduce(p, spill);
+    sin_cos_cores(p, spill);
+    let (num, den, odd) = (R::L1, R::L2, R::L5);
+    p.load(R::L0, Format::Int32, spill + 64);
+    p.load(R::L3, Format::Int32, spill + 128);
+    p.loadi_bits(R::L4, 0x8000_0000);
+    p.and(R::L0, R::L4, R::L7);
+    p.xor(R::L7, R::L3);
+    p.loadi_bits(R::L4, 1);
+    p.and(R::L0, R::L4, odd);
+    p.mov(R::L3, num);
+    p.mov(R::L6, den);
+    p.if_(Cond::Ne0(odd), |p| {
+        p.mov(R::L6, num);
+        p.mov(R::L3, den);
+    });
+    let (y, q) = (R::L4, R::L7);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(den, y, R::L0, R::L3, R::L6);
+    p.loadi_bits(R::L6, 0x7f80_0000);
+    divide(p, num, den, y, q, R::L3, R::L0, R::L6);
+    // The sign: odd `q`'s negation and `x`'s.
+    let (x, t, k) = (R::L0, R::L1, R::L2);
+    p.load(x, Format::Int32, spill);
+    p.load(t, Format::Int32, spill + 64);
+    p.loadi_bits(k, 1);
+    p.and(t, k, t);
+    p.shl(t, 31, t);
+    p.loadi_bits(k, 0x8000_0000);
+    p.and(x, k, k);
+    p.xor(k, t);
+    p.xor(t, q);
+    p.loadi_bits(k, 0x7fff_ffff);
+    p.and(x, k, t);
+    p.loadi_bits(k, 0x3980_0000); // 2^-12
+    p.if_(Cond::Less(t, k), |p| p.mov(x, q));
+    p.loadi_bits(k, 0x7f80_0000);
+    p.if_(Cond::LessEq(k, t), |p| p.loadi_bits(q, 0x7fc0_0000));
+}
+
 /// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
 /// `deg`: its error over every float of the interval is measured by
 /// `transcendental::the_erfcx_fit_and_its_evaluation_are_within_their_parts`.
@@ -1909,8 +1967,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID
-        | kind_sfpu::SIN
-        | kind_sfpu::COS => Operands::Unary,
+        | kind_sfpu::SIN..=kind_sfpu::TAN => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2625,6 +2682,14 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 } else {
                     asinh_acosh_program(p, spill, kind == kind_sfpu::ACOSH);
                 }
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::TAN => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                tan_program(p, super::kernel::SPILL_ROW + o);
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
@@ -3777,6 +3842,11 @@ mod transcendental {
     #[test]
     fn cos_is_within_its_derived_bound() {
         sweep(kind_sfpu::COS, trig_inputs(), libm::cos, COS_BOUND);
+    }
+
+    #[test]
+    fn tan_is_within_its_derived_bound() {
+        sweep(kind_sfpu::TAN, trig_inputs(), libm::tan, TAN_BOUND);
     }
 
     /// A NaN of either sign and any payload comes out a NaN from every
