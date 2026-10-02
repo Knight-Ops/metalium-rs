@@ -990,6 +990,21 @@ pub mod float {
         kind_sfpu::COSH,
         "`cosh x` on the device where the data is, within `ops::COSH_BOUND`, else Flex's."
     );
+    unary_sfpu!(
+        float_asinh,
+        kind_sfpu::ASINH,
+        "`asinh x` on the device where the data is, within `ops::ASINH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_acosh,
+        kind_sfpu::ACOSH,
+        "`acosh x` on the device where the data is, within `ops::ACOSH_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_atanh,
+        kind_sfpu::ATANH,
+        "`atanh x` on the device where the data is, within `ops::ATANH_BOUND`, else Flex's."
+    );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
     /// (within `ops::pow_bound`); else Flex's.

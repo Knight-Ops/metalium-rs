@@ -5,8 +5,8 @@
 //! programs (`tt_kernels::sfpu::ops::reference_op`, `gelu_reference`), and the
 //! programs to `burn-flex` within
 //! the bounds derived on them (`EXPM1_BOUND`, `SIGMOID_BOUND`, `TANH_BOUND`,
-//! `ERF_BOUND`, `GELU_BOUND`, `gelu_backward_bound`, `SINH_BOUND`, `COSH_BOUND`)
-//! plus Flex's own error --
+//! `ERF_BOUND`, `GELU_BOUND`, `gelu_backward_bound`, `SINH_BOUND`, `COSH_BOUND`,
+//! `ASINH_BOUND`, `ACOSH_BOUND`, `ATANH_BOUND`) plus Flex's own error --
 //! an ulp, and for `gelu` the cancellation of Flex's own `1 + erf` on the
 //! negative side (`|x| 2^-24` absolute), which the device's `erfc` does not
 //! suffer (`ops::transcendental` holds the device to the exact value there).
@@ -17,8 +17,9 @@ use burn::tensor::{activation, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::ops::{
-    gelu_backward_bound, gelu_reference, kind_sfpu::*, reference_op, Broadcast, COSH_BOUND,
-    ERF_BOUND, EXPM1_BOUND, GELU_BOUND, SIGMOID_BOUND, SINH_BOUND, TANH_BOUND,
+    gelu_backward_bound, gelu_reference, kind_sfpu::*, reference_op, Broadcast, ACOSH_BOUND,
+    ASINH_BOUND, ATANH_BOUND, COSH_BOUND, ERF_BOUND, EXPM1_BOUND, GELU_BOUND, SIGMOID_BOUND,
+    SINH_BOUND, TANH_BOUND,
 };
 use tt_kernels::tensor::{DramTensor, Eltwise};
 use tt_tests::backend::GATE_TILE;
@@ -81,6 +82,10 @@ fn values(seed: u64, n: usize) -> Vec<f32> {
         -89.41,
         89.42,
         2.44e-4,
+        0.999_999_94,
+        -1.000_000_1,
+        4096.0,
+        f32::MAX,
     ];
     let mut s = seed | 1;
     (0..n)
@@ -140,6 +145,19 @@ fn close(got: f32, want: f32, rel: f64, abs: f64, what: &str) {
     );
 }
 
+/// Flex's own error in `atanh x`, relative: std's `0.5 * log1p(2x/(1 - x))`
+/// on the *signed* `x`, so for `x < 0` the argument nears `-1`, where `log1p`
+/// amplifies its two roundings (`1 - x`, the quotient) by `k = |w/((1 + w)
+/// ln(1 + w))|` -- 42 at `x = -0.99` -- and adds its own ulp. The device works
+/// on `|x|` (odd symmetry), where `k <= 1`.
+fn flex_atanh_error(x: f32) -> f64 {
+    let x = x as f64;
+    let w = 2.0 * x / (1.0 - x);
+    let k = (w / ((1.0 + w) * w.ln_1p())).abs();
+    let k = if k.is_finite() { k } else { 1.0 };
+    (2.0 * k + 2.0) / 16_777_216.0
+}
+
 fn op(kind: u32) -> Eltwise {
     Eltwise {
         kind,
@@ -173,6 +191,9 @@ fn the_unary_kinds_are_their_programs_within_their_bounds() {
                 (ERF, host(fa.clone().erf()), ERF_BOUND, "erf"),
                 (SINH, host(fa.clone().sinh()), SINH_BOUND, "sinh"),
                 (COSH, host(fa.clone().cosh()), COSH_BOUND, "cosh"),
+                (ASINH, host(fa.clone().asinh()), ASINH_BOUND, "asinh"),
+                (ACOSH, host(fa.clone().acosh()), ACOSH_BOUND, "acosh"),
+                (ATANH, host(fa.clone().atanh()), ATANH_BOUND, "atanh"),
             ] {
                 let out = run(s, kind, &[&a]);
                 let got = s.download(&out).unwrap();
@@ -182,7 +203,11 @@ fn the_unary_kinds_are_their_programs_within_their_bounds() {
                 for i in 0..r * c {
                     // Flex's `exp(x) - 1` cancels near zero (the device's does
                     // not): its error there is an ulp of 1.
-                    let abs = if kind == EXPM1 { 1.2e-7 } else { 0.0 };
+                    let abs = match kind {
+                        EXPM1 => 1.2e-7,
+                        ATANH => flex_atanh_error(av[i]) * (want[i] as f64).abs(),
+                        _ => 0.0,
+                    };
                     close(
                         model[i],
                         want[i],

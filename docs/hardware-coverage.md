@@ -898,9 +898,18 @@ Each names the measurement it must move. The Burn-side ones are in
         `step47_burn_activations::hyperbolics_log_sigmoid_and_softmin_stay_on_
         the_card_within_their_bounds`, with Burn's autodiff of `sinh` (`g cosh
         x`); watched failing with `float_cosh` routed to `SINH`, and `step45`
-        with `sinh`'s sign dropped. Remaining: `asinh`, `acosh`, `atanh`,
-        `log_sigmoid{,_backward}`, `softmin`; then `sin`/`cos` and the rest
-        (10.2f).
+        with `sinh`'s sign dropped. `asinh_acosh_program`, `atanh_program`: one
+        `log1p` each, of an argument that does not cancel -- `a + a^2/(1 +
+        sqrt(1 + a^2))`, `t + sqrt(t (t + 2))` (`t = x - 1`, exact), `2a/(1 - a)`
+        -- and from `a = 2^12` `log1p(a - 1) + ln 2`, so `2a` never overflows.
+        Within `ASINH_BOUND = ACOSH_BOUND = 16.2u`, `ATANH_BOUND = 14.2u`; worst
+        measured 3.1, 3.6, 3.3 ulps. `atanh` beyond 1 is NaN by name: from `|x| ~
+        2^126` the reciprocal of `1 - a` flushes and the quotient said `0`
+        (found by its sweep). Flex's `atanh` is std's, which loses up to `42x`
+        its roundings near `-1` (numerics row G); the gates add that error,
+        derived. Burn: `float_{asinh, acosh, atanh}`; `step45` watched failing
+        with `ln 2` dropped. Remaining: `log_sigmoid{,_backward}`, `softmin`;
+        then `sin`/`cos` and the rest (10.2f).
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1086,8 +1095,7 @@ path today, `~` when only some shapes do.
 | `float_cast` | `~` to the tensor's own dtype (a no-op); others S6 | S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
-| `float_erf`, `float_tanh`, `float_sinh`, `float_cosh` | x (SFPU, derived bounds) | S4 |
-| `float_asinh`, `float_acosh`, `float_atanh` | | S4 (10.2e) |
+| `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
 | `float_sin`, `float_cos`, `float_tan`, inverse trig, `float_atan2` | | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |

@@ -123,6 +123,12 @@ pub mod kind_sfpu {
     pub const SINH: u32 = 0x131;
     /// `cosh a`, within [`super::COSH_BOUND`].
     pub const COSH: u32 = 0x132;
+    /// `asinh a`, within [`super::ASINH_BOUND`] (`super::asinh_acosh_program`).
+    pub const ASINH: u32 = 0x133;
+    /// `acosh a`, within [`super::ACOSH_BOUND`].
+    pub const ACOSH: u32 = 0x134;
+    /// `atanh a`, within [`super::ATANH_BOUND`] (`super::atanh_program`).
+    pub const ATANH: u32 = 0x135;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -209,8 +215,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
-        | kind_sfpu::SINH
-        | kind_sfpu::COSH => Accuracy::Approximate,
+        | kind_sfpu::SINH..=kind_sfpu::ATANH => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -722,6 +727,135 @@ pub fn sinh_cosh_program(p: &mut Program, spill: u32, cosh: bool) {
     }
     p.loadi_bits(R::L5, 0x7f80_0000);
     p.if_(Cond::Less(R::L5, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+}
+
+/// [`asinh_acosh_program`]'s derived bound for `asinh`, relative.
+pub const ASINH_BOUND: f64 = 16.2 / 16_777_216.0;
+/// The same for `acosh`.
+pub const ACOSH_BOUND: f64 = ASINH_BOUND;
+
+/// `asinh x` (or `acosh x` where `acosh`) of `x` (in `L0`, raw bits) into
+/// `L7`, as one [`log1p_program`] of an argument `w` chosen per lane, `a =
+/// |x|`: `asinh a = log1p(a + a^2/(1 + sqrt(1 + a^2)))` and, with `t = a - 1`
+/// (exact below `2^24`), `acosh a = log1p(t + sqrt(t (t + 2)))` -- neither
+/// cancels; from `a = 2^12` both are `ln(2a)` to within `1/(4a^2) < 2^-26`,
+/// computed as `log1p(a - 1) + ln 2` so that `2a` never overflows. Spills at
+/// `spill..spill + 192` (`log1p`'s own at `spill`).
+///
+/// Error, relative, in `u = 2^-24`; `log1p` carries its argument's relative
+/// error scaled by `w/((1 + w) ln(1 + w)) <= 1`, and adds [`LOG1P_BOUND`] `=
+/// 11.12u`; `sqrt` is within `3u` (an ulp and a half of the exact root, at
+/// worst). `asinh`: `1 + a^2` within `2u`, its root `u + 3u`, `1 + root`
+/// `5u`, the quotient `a^2/(..)` `u + 5u + 2u` (`divide`), weighed in `w` by
+/// at most `1/2` (the quotient is below `a`), and `w`'s rounding: `5u`.
+/// `acosh`: `t (t + 2)` within `2u`, its root `4u`, `w` `5u`. So `16.12u`
+/// below `2^12`; above, `ln a` within `11.12u`, `ln 2`'s rounding and the
+/// sum's: under `12.2u`. Under [`ASINH_BOUND`] `= 16.2u`. `asinh` is `x`
+/// itself below `2^-12` (`x^2/6 < 2^-26`), odd, `±inf` for `±inf`; `acosh(1) =
+/// +0`, below `1` NaN, `+inf` for `+inf`; a NaN stays one.
+pub fn asinh_acosh_program(p: &mut Program, spill: u32, acosh: bool) {
+    use LReg as R;
+    let (x, a) = (R::L0, R::L1);
+    let (sx, sv) = (spill + 64, spill + 128);
+    p.store(x, Format::Int32, sx);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    if acosh {
+        // `t = a - 1`; `w = t + sqrt(t (t + 2))`.
+        p.sub(a, R::ONE, a);
+        p.store(a, Format::Int32, sv);
+        p.loadi(R::L5, 2.0);
+        p.add(a, R::L5, R::L2);
+        p.mul(R::L2, a, R::L2);
+        sqrt_program(p, R::L2, R::L3, false);
+        p.load(R::L1, Format::Int32, sv);
+        p.add(R::L1, R::L3, R::L0);
+    } else {
+        // `m = a^2`; `w = a + m/(1 + sqrt(1 + m))`.
+        p.mul(a, a, R::L2);
+        p.store(R::L2, Format::Int32, sv);
+        p.add(R::L2, R::ONE, R::L2);
+        sqrt_program(p, R::L2, R::L3, false);
+        let (m, den, y, q) = (R::L1, R::L2, R::L3, R::L4);
+        p.add(R::L3, R::ONE, den);
+        p.load(m, Format::Int32, sv);
+        p.loadi_bits(R::L6, f32::MAX.to_bits());
+        p.recip(den, y, R::L0, R::L5, R::L6);
+        p.loadi_bits(R::L6, 0x7f80_0000);
+        divide(p, m, den, y, q, R::L5, R::L0, R::L6);
+        p.load(x, Format::Int32, sx);
+        p.loadi_bits(R::L5, 0x7fff_ffff);
+        p.and(x, R::L5, a);
+        p.add(a, q, R::L0);
+    }
+    // From `a = 2^12`: `w = a - 1`, so that `log1p(w)` is `ln a`.
+    p.load(R::L2, Format::Int32, sx);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(R::L2, R::L5, a);
+    p.loadi_bits(R::L5, 0x4580_0000); // 2^12
+    p.if_(Cond::LessEq(R::L5, a), |p| p.sub(a, R::ONE, R::L0));
+    log1p_program(p, R::L0, R::L7, spill);
+    p.load(x, Format::Int32, sx);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    p.loadi_bits(R::L5, 0x4580_0000);
+    p.if_(Cond::LessEq(R::L5, a), |p| {
+        p.loadi(R::L5, std::f32::consts::LN_2);
+        p.add(R::L7, R::L5, R::L7);
+    });
+    if acosh {
+        // Below `1` in the total order: everything negative too.
+        p.if_(Cond::Less(x, R::ONE), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+    } else {
+        p.mov(R::L7, R::L4);
+        p.copy_sign(R::L4, x, R::L7);
+        p.loadi_bits(R::L5, 0x3980_0000); // 2^-12
+        p.if_(Cond::Less(a, R::L5), |p| p.mov(x, R::L7));
+    }
+    p.loadi_bits(R::L5, 0x7f80_0000);
+    p.if_(Cond::Less(R::L5, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+}
+
+/// [`atanh_program`]'s derived bound, relative.
+pub const ATANH_BOUND: f64 = 14.2 / 16_777_216.0;
+
+/// `atanh x` of `x` (in `L0`, raw bits) into `L7`: `sign(x) log1p(2a/(1 -
+/// a))/2`, `a = |x|` -- one [`log1p_program`], no cancellation (`1 - a` exact
+/// from `a = 1/2`, Sterbenz). Spills at `spill..spill + 128`.
+///
+/// Error, relative, in `u = 2^-24`: `1 - a` within `u`, `2a` exact, the
+/// quotient `2u` (`divide`): `w` within `3u`, which `log1p` carries scaled by
+/// at most 1, adding [`LOG1P_BOUND`] `= 11.12u`; the halving is exact: under
+/// [`ATANH_BOUND`] `= 14.2u`. `x` itself below `|x| = 2^-12` (`x^2/3 <
+/// 2^-25`), bits and all; `±1` give `±inf` (`1/(+0)` is `+inf`, and so is
+/// `log1p(+inf)`); beyond `1` NaN, by name; a NaN stays one.
+pub fn atanh_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let (x, a) = (R::L0, R::L1);
+    let sx = spill + 64;
+    p.store(x, Format::Int32, sx);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    let (den, y, q) = (R::L2, R::L3, R::L4);
+    p.sub(R::ONE, a, den);
+    p.add(a, a, a);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(den, y, R::L0, R::L5, R::L6);
+    p.loadi_bits(R::L6, 0x7f80_0000);
+    divide(p, a, den, y, q, R::L5, R::L0, R::L6);
+    p.mov(q, R::L0);
+    log1p_program(p, R::L0, R::L7, spill);
+    p.loadi(R::L5, 0.5);
+    p.mul(R::L7, R::L5, R::L4);
+    p.load(x, Format::Int32, sx);
+    p.copy_sign(R::L4, x, R::L7);
+    p.loadi_bits(R::L5, 0x7fff_ffff);
+    p.and(x, R::L5, a);
+    p.loadi_bits(R::L5, 0x3980_0000); // 2^-12
+    p.if_(Cond::Less(a, R::L5), |p| p.mov(x, R::L7));
+    // Beyond `1`, NaNs and `±inf` included: NaN. The quotient alone does not
+    // say so from `|x| ~ 2^126`, where `1/(1 - a)` flushes to a zero.
+    p.if_(Cond::Less(R::ONE, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
 }
 
 /// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
@@ -1412,8 +1546,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
-        | kind_sfpu::SINH
-        | kind_sfpu::COSH => Operands::Unary,
+        | kind_sfpu::SINH..=kind_sfpu::ATANH => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2115,6 +2248,19 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             p.for_each_row_group(64, |p, o| {
                 p.load(LReg::L0, Format::Int32, A_ROW + o);
                 sinh_cosh_program(p, super::kernel::SPILL_ROW + o, kind == kind_sfpu::COSH);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::ASINH | kind_sfpu::ACOSH | kind_sfpu::ATANH => {
+            p.for_each_row_group(64, |p, o| {
+                let spill = super::kernel::SPILL_ROW + o;
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                if kind == kind_sfpu::ATANH {
+                    atanh_program(p, spill);
+                } else {
+                    asinh_acosh_program(p, spill, kind == kind_sfpu::ACOSH);
+                }
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
@@ -3021,6 +3167,67 @@ mod transcendental {
     #[test]
     fn cosh_is_within_its_derived_bound() {
         sweep(kind_sfpu::COSH, hyperbolic_inputs(), f64::cosh, COSH_BOUND);
+    }
+
+    /// The switches to `x` itself (`2^-12`) and to `ln(2a)` (`2^12`), every
+    /// binade to `f32::MAX`, the edges of `acosh`'s and `atanh`'s domains.
+    fn inverse_hyperbolic_inputs() -> impl Iterator<Item = f32> {
+        let one = 1.0f32.to_bits();
+        let specials = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x397f_ffff),
+            f32::from_bits(0x3980_0000),
+            0.5,
+            f32::from_bits(one - 1),
+            1.0,
+            f32::from_bits(one + 1),
+            2.0,
+            f32::from_bits(0x457f_ffff),
+            4096.0,
+            f32::from_bits(0x4580_0001),
+            16_777_216.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        grid(-4.0, 4.0, 40_000)
+            .chain(grid(0.99, 1.01, 10_000))
+            .chain(grid(-1.0, 1.0, 20_000))
+            .chain(binades(32))
+            .chain(specials)
+            .flat_map(|x| [x, -x])
+    }
+
+    #[test]
+    fn asinh_is_within_its_derived_bound() {
+        sweep(
+            kind_sfpu::ASINH,
+            inverse_hyperbolic_inputs(),
+            f64::asinh,
+            ASINH_BOUND,
+        );
+    }
+
+    #[test]
+    fn acosh_is_within_its_derived_bound() {
+        sweep(
+            kind_sfpu::ACOSH,
+            inverse_hyperbolic_inputs(),
+            f64::acosh,
+            ACOSH_BOUND,
+        );
+    }
+
+    #[test]
+    fn atanh_is_within_its_derived_bound() {
+        sweep(
+            kind_sfpu::ATANH,
+            inverse_hyperbolic_inputs(),
+            f64::atanh,
+            ATANH_BOUND,
+        );
     }
 
     /// A NaN of either sign and any payload comes out a NaN from every

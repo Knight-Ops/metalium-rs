@@ -677,6 +677,19 @@ fn exp_family_activations_stay_on_the_card_within_their_bounds() {
     });
 }
 
+/// Flex's own error in `atanh x`, relative: std's `0.5 * log1p(2x/(1 - x))`
+/// on the *signed* `x`, so for `x < 0` the argument nears `-1`, where `log1p`
+/// amplifies its two roundings (`1 - x`, the quotient) by `k = |w/((1 + w)
+/// ln(1 + w))|` -- 42 at `x = -0.99` -- and adds its own ulp. The device works
+/// on `|x|` (odd symmetry), where `k <= 1`.
+fn flex_atanh_error(x: f32) -> f64 {
+    let x = x as f64;
+    let w = 2.0 * x / (1.0 - x);
+    let k = (w / ((1.0 + w) * w.ln_1p())).abs();
+    let k = if k.is_finite() { k } else { 1.0 };
+    (2.0 * k + 2.0) / 16_777_216.0
+}
+
 /// The rest of 10.2e through Burn: each op on resident tensors against Flex
 /// within its bound, nothing moved, computed on the device -- and Burn's
 /// autodiff through them, whose backwards are this backend's ops too
@@ -684,7 +697,7 @@ fn exp_family_activations_stay_on_the_card_within_their_bounds() {
 #[test]
 fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
-    use tt_kernels::sfpu::ops::{COSH_BOUND, SINH_BOUND};
+    use tt_kernels::sfpu::ops::{ACOSH_BOUND, ASINH_BOUND, ATANH_BOUND, COSH_BOUND, SINH_BOUND};
     let u = 1.0 / 16_777_216.0;
     with_device(Config::default(), |d| {
         let [r, c] = [64, 128];
@@ -724,6 +737,33 @@ fn hyperbolics_log_sigmoid_and_softmin_stay_on_the_card_within_their_bounds() {
         check(&got, &host(fx.clone().sinh()), SINH_BOUND, "sinh");
         let got = vals(resident("cosh", || x.clone().cosh()), "cosh");
         check(&got, &host(fx.clone().cosh()), COSH_BOUND, "cosh");
+        let got = vals(resident("asinh", || x.clone().asinh()), "asinh");
+        check(&got, &host(fx.clone().asinh()), ASINH_BOUND, "asinh");
+        let got = vals(resident("acosh", || x.clone().acosh()), "acosh");
+        check(&got, &host(fx.clone().acosh()), ACOSH_BOUND, "acosh");
+        // `atanh`'s domain: `x` scaled into `(-1, 1)`, its edges included.
+        let wv: Vec<f32> = xv
+            .iter()
+            .map(|v| {
+                if v.is_finite() {
+                    (v / 24.0).clamp(-1.0, 1.0)
+                } else {
+                    *v
+                }
+            })
+            .collect();
+        let w = tt(&wv);
+        let got = vals(resident("atanh", || w.clone().atanh()), "atanh");
+        let want = host(fl(&wv).atanh());
+        for i in 0..r * c {
+            close(
+                got[i],
+                want[i],
+                ATANH_BOUND,
+                flex_atanh_error(wv[i]) * (want[i] as f64).abs(),
+                &format!("atanh({:e})", wv[i]),
+            );
+        }
 
         // Autodiff: `d/dx sum(sinh(x) g) = g cosh x`, the product one rounding
         // on each side.
