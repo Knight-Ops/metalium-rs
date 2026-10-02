@@ -820,3 +820,75 @@ fn hyperbolics_and_log_sigmoid_stay_on_the_card_within_their_bounds() {
         }
     });
 }
+
+#[test]
+fn trig_stays_on_the_card_within_their_bounds() {
+    use burn::backend::Autodiff;
+    use tt_kernels::sfpu::ops::{COS_BOUND, SIN_BOUND};
+    let u = 1.0 / 16_777_216.0;
+    with_device(Config::default(), |d| {
+        let [r, c] = [64, 128];
+        // A few periods, and every fourth value scaled far out: the
+        // reduction is exact for every finite input.
+        let xv: Vec<f32> = floats(13, r * c)
+            .iter()
+            .enumerate()
+            .map(|(i, x)| if i % 4 == 1 { x * 3.0e30 } else { x * 4.0 })
+            .collect();
+        let gv: Vec<f32> = floats(14, r * c)
+            .iter()
+            .map(|g| {
+                if g.is_finite() {
+                    g.clamp(-3.0, 3.0)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let tt = |v: &[f32]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &d).to_device(&d)
+        };
+        let fl = |v: &[f32]| {
+            Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+        };
+        let (x, g, fx, fg) = (tt(&xv), tt(&gv), fl(&xv), fl(&gv));
+        let vals = |t: Tensor<TtBackend, 2>, what: &str| {
+            assert!(
+                on_device(&t.clone().into_primitive().tensor()),
+                "{what}: not on the device"
+            );
+            t.into_data().to_vec::<f32>().unwrap()
+        };
+        let host = |t: Tensor<Flex, 2>| t.into_data().to_vec::<f32>().unwrap();
+        let check = |got: &[f32], want: &[f32], rel: f64, what| {
+            for i in 0..r * c {
+                close(got[i], want[i], rel, 0.0, &format!("{what}({:e})", xv[i]));
+            }
+        };
+        let got = vals(resident("sin", || x.clone().sin()), "sin");
+        check(&got, &host(fx.clone().sin()), SIN_BOUND, "sin");
+        let got = vals(resident("cos", || x.clone().cos()), "cos");
+        check(&got, &host(fx.clone().cos()), COS_BOUND, "cos");
+
+        // Autodiff: `d/dx sum(sin(x) g) = g cos x`, `d/dx sum(cos(x) g) = -g
+        // sin x` -- each the other's kind, then a product (one rounding on each
+        // side). The `sum` is R1b's (on the host): only the values are held.
+        type Ad = Autodiff<TtBackend>;
+        type Fd = Autodiff<Flex>;
+        for (cos, what) in [(false, "autodiff sin"), (true, "autodiff cos")] {
+            let f = |t: Tensor<Ad, 2>| if cos { t.cos() } else { t.sin() };
+            let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+            let gs = (f(xa.clone()) * Tensor::<Ad, 2>::from_inner(g.clone()))
+                .sum()
+                .backward();
+            let got = xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+            let ff = |t: Tensor<Fd, 2>| if cos { t.cos() } else { t.sin() };
+            let fa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+            let gs = (ff(fa.clone()) * Tensor::<Fd, 2>::from_inner(fg.clone()))
+                .sum()
+                .backward();
+            let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+            check(&got, &want, SIN_BOUND + 2.0 * u, what);
+        }
+    });
+}

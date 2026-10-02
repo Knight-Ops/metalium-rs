@@ -136,6 +136,13 @@ pub mod kind_sfpu {
     /// `log_sigmoid_backward`, within [`super::SIGMOID_BOUND`] and the
     /// product's rounding.
     pub const LOG_SIGMOID_BACKWARD: u32 = 0x137;
+    /// `sin a`, within [`super::SIN_BOUND`] for every finite `a`
+    /// (`super::sin_cos_program`; 10.2f).
+    pub const SIN: u32 = 0x138;
+    /// `cos a`, within [`super::COS_BOUND`].
+    pub const COS: u32 = 0x139;
+    /// The last SFPU kind: the tests that run every kind go to it.
+    pub const LAST: u32 = COS;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -222,7 +229,9 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
-        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD => Accuracy::Approximate,
+        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD
+        | kind_sfpu::SIN
+        | kind_sfpu::COS => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -901,6 +910,313 @@ pub fn log_sigmoid_program(p: &mut Program, spill: u32) {
     p.if_(Cond::Less(R::L5, R::L1), |p| {
         p.loadi_bits(R::L7, 0x7fc0_0000)
     });
+}
+
+/// `2/pi`'s bits after the point, 24 to an entry: fdlibm's `ipio2`, as
+/// `libm`'s `rem_pio2_large` has them. 216 bits; [`trig_reduce`] reads to bit
+/// 204. A wrong bit `k` moves `g` by up to `2^(E - 126 - k)`, so one to about
+/// `k = 150` shows in `transcendental::sin_is_within_its_derived_bound`
+/// (watched failing at `1.2e35` with bit 145 flipped); the later ones are
+/// below `2^-40` in `g`, which no `f32` result can see.
+const TWO_OVER_PI: [u32; 9] = [
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C, 0x439041, 0xFE5163,
+];
+
+/// Limb `n` of [`trig_reduce`]'s table: bits `23n..23n + 23` of `2/pi`'s
+/// expansion preceded by 25 zeros, so that limb 0 begins at bit `k = -24`
+/// (`b_k` of `2/pi = sum b_k 2^-k`, `b_k = 0` for `k <= 0`).
+fn two_over_pi_limb(n: u32) -> u32 {
+    (23 * n..23 * n + 23).fold(0, |v, t| {
+        let k = t as i64 - 25;
+        let b = if k < 1 {
+            0
+        } else {
+            let i = (k - 1) as usize;
+            (TWO_OVER_PI[i / 24] >> (23 - i % 24)) & 1
+        };
+        (v << 1) | b
+    })
+}
+
+/// [`sin_cos_program`]'s derived bound for `sin`, relative.
+pub const SIN_BOUND: f64 = 2.2 / 16_777_216.0;
+/// The same for `cos`.
+pub const COS_BOUND: f64 = SIN_BOUND;
+
+/// The reduction of `x` (in `L0`, raw bits; spilled at `spill`) by `pi/2`:
+/// `|x| = (q + g) pi/2`, `q` an integer, `|g| <= 1/2`, into `r = |g| pi/2`
+/// as `r_hi` (`L5`) + `r_lo` (`L4`), `|r_lo| <= ulp(r_hi)/2`, and `q mod 4`
+/// with `g`'s sign in bit 31 into `spill + 64`. Every register scratch.
+///
+/// Payne and Hanek's, in exact fixed point, for every finite `a = |x| =
+/// M 2^(E-150)` from `pi/4` (`M` the 24-bit mantissa, `E` the biased
+/// exponent): `a (2/pi) = sum_k M b_k 2^(E-150-k)`, and the terms with `k <=
+/// E - 152` are multiples of 4, so only the window `W` of 92 bits from `k =
+/// E - 151` matters: `a (2/pi) = M W 2^-90 (mod 4)`, less the bits past the
+/// window, under `M 2^-90 < 2^-66`. `W` is four 23-bit limbs `W3..W0` cut
+/// from the table ([`two_over_pi_limb`]) at bit `t0 = E - 126` (`0..129`):
+/// whole limbs `j = t0 div 23` by five conditional shifts, then the shift
+/// within, `sh = t0 mod 23`, by funnelling neighbours. `M W mod 2^92`, as four
+/// limbs, is `2^23 W + M' W` (`M = 2^23 + M'`): each `M' W_i` from
+/// `SFPMUL24`'s two halves, then the carries; the lowest limb only adds below
+/// `2^-67`, so it is left out. The top two bits are `q mod 4`, the 67 below
+/// the fraction; from one half up `q + 1` and the fraction's complement (`1 -
+/// F`, less `2^-67`), with the sign set.
+///
+/// Error: the window and the dropped limb, under `2^-65` in `g` together.
+/// The closest float to a multiple of `pi/2` is `16367173 2^72`, `|g| =
+/// 2^-29.86` (every float scanned; `transcendental::the_hardest_reductions_
+/// are_within_their_bounds` holds it), so `g` is within `2^-35` of itself,
+/// relative. Then `g` to `f32`s: three exact limb conversions, an exact
+/// two-sum of the top two, the third added with one rounding (relative
+/// `2^-47`), and `pi/2` as two `f32`s, the product Dekker's (12-bit halves:
+/// `SFPMAD` is not fused, numerics row E) and the cross terms rounded once
+/// each: `r` within `2^-34` of itself, relative -- `6e-11`, `0.001u`.
+/// Below `pi/4`, `r = a` exactly and `q = 0`. Infinities and NaNs give a
+/// value the caller replaces.
+pub fn trig_reduce(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let (sx, sq) = (spill, spill + 64);
+    let mask23 = 0x7f_ffff;
+    p.store(R::L0, Format::Int32, sx);
+    // `M'` waits where `q` will go; `sh = t0` in `L5`.
+    p.loadi_bits(R::L7, mask23);
+    p.and(R::L0, R::L7, R::L1);
+    p.store(R::L1, Format::Int32, sq);
+    p.exponent(R::L0, false, R::L5);
+    p.iadd_imm(R::L5, -126, R::L5);
+    // `L0..L4`: limbs `j..j + 5` of the table, `j` from 0, shifted down
+    // while `sh >= 23`.
+    let a = [R::L0, R::L1, R::L2, R::L3, R::L4];
+    for (n, r) in a.iter().enumerate() {
+        p.loadi_bits(*r, two_over_pi_limb(n as u32));
+    }
+    p.loadi_bits(R::L6, 23);
+    for j in 1..=5 {
+        p.if_(Cond::LessEq(R::L6, R::L5), |p| {
+            for i in 0..4 {
+                p.mov(a[i + 1], a[i]);
+            }
+            p.loadi_bits(R::L4, two_over_pi_limb(j + 4));
+            p.iadd_imm(R::L5, -23, R::L5);
+        });
+    }
+    // `W_i = (A_i << sh | A_(i+1) >> (23 - sh)) mod 2^23`, in `A_i`: `W3`
+    // in `L0` .. `W0` in `L3`. Bits pushed past 32 are above the 23 kept.
+    p.iadd_imm(R::L5, -23, R::L7);
+    for i in 0..4 {
+        p.mov(a[i + 1], R::L6);
+        p.shr_by(R::L7, R::L6);
+        p.shl_by(R::L5, a[i]);
+        p.or(a[i], R::L6, a[i]);
+    }
+    // `W3` only meets `SFPMUL24`, which reads its operands' low 23 bits.
+    p.loadi_bits(R::L7, mask23);
+    for r in [R::L1, R::L2, R::L3] {
+        p.and(r, R::L7, r);
+    }
+    // Limbs 1..3 of `M W mod 2^92`, in `L3`, `L2`, `L1`: limb `i` is `W_(i-1)
+    // + hi(M' W_(i-1)) + lo(M' W_i)`.
+    p.load(R::L4, Format::Int32, sq);
+    for (hi_of, lo_of, into) in [
+        (R::L3, R::L2, R::L3),
+        (R::L2, R::L1, R::L2),
+        (R::L1, R::L0, R::L1),
+    ] {
+        p.mul24(R::L4, hi_of, true, R::L5);
+        p.iadd(R::L5, into);
+        p.mul24(R::L4, lo_of, false, R::L5);
+        p.iadd(R::L5, into);
+    }
+    // The carries (each limb below `3 * 2^23 + 2`), limb 3 kept to 23 bits.
+    p.loadi_bits(R::L6, (-23i32) as u32);
+    for (from, into) in [(R::L3, R::L2), (R::L2, R::L1)] {
+        p.mov(from, R::L5);
+        p.shr_by(R::L6, R::L5);
+        p.and(from, R::L7, from);
+        p.iadd(R::L5, into);
+    }
+    p.and(R::L1, R::L7, R::L1);
+    // `q` (`L0`), the half bit (`L5`), the fraction's top 21 bits (`L1`).
+    p.mov(R::L1, R::L0);
+    p.loadi_bits(R::L6, (-21i32) as u32);
+    p.shr_by(R::L6, R::L0);
+    p.loadi_bits(R::L6, 0x10_0000);
+    p.and(R::L1, R::L6, R::L5);
+    p.loadi_bits(R::L6, 0x1f_ffff);
+    p.and(R::L1, R::L6, R::L1);
+    p.if_(Cond::Ne0(R::L5), |p| {
+        p.iadd_imm(R::L0, 1, R::L0);
+        p.xor(R::L6, R::L1);
+        p.xor(R::L7, R::L2);
+        p.xor(R::L7, R::L3);
+    });
+    p.shl(R::L5, 11, R::L5);
+    p.or(R::L0, R::L5, R::L0);
+    p.store(R::L0, Format::Int32, sq);
+    // `|g| = f3 + f2 + f1`, the limbs at `2^-21`, `2^-44`, `2^-67`.
+    for (r, scale) in [
+        (R::L1, 0x3500_0000),
+        (R::L2, 0x2980_0000),
+        (R::L3, 0x1e00_0000),
+    ] {
+        p.sm32_to_float(r, r);
+        p.loadi_bits(R::L6, scale);
+        p.mul(r, R::L6, r);
+    }
+    // `hi = f3 + f2`, `lo` its exact error (`f3 = 0` or `f3 > f2`), plus `f1`.
+    let (hi, lo) = (R::L4, R::L5);
+    p.add(R::L1, R::L2, hi);
+    p.sub(hi, R::L1, lo);
+    p.sub(R::L2, lo, lo);
+    p.add(lo, R::L3, lo);
+    // `r = (hi + lo) (ph + pl)`: `ph hi` exactly as `r_hi + e` (Dekker,
+    // negated: `L6 = r_hi - hi ph`), then `lo ph + hi pl - L6`.
+    let ph = std::f32::consts::FRAC_PI_2;
+    let pl = (std::f64::consts::FRAC_PI_2 - ph as f64) as f32;
+    let (phh, phl) = split12_host(ph);
+    p.loadi(R::L7, 4097.0);
+    split12(p, hi, R::L1, R::L2, R::L7);
+    p.loadi(R::L7, ph);
+    p.mul(hi, R::L7, R::L3);
+    p.loadi(R::L7, phh);
+    p.nmad(R::L1, R::L7, R::L3, R::L6);
+    p.loadi(R::L7, phl);
+    p.nmad(R::L1, R::L7, R::L6, R::L6);
+    p.loadi(R::L7, phh);
+    p.nmad(R::L2, R::L7, R::L6, R::L6);
+    p.loadi(R::L7, phl);
+    p.nmad(R::L2, R::L7, R::L6, R::L6);
+    p.loadi(R::L7, ph);
+    p.mul(lo, R::L7, R::L1);
+    p.loadi(R::L7, pl);
+    p.mad(hi, R::L7, R::L1, R::L1);
+    p.sub(R::L1, R::L6, R::L1);
+    // Renormalised: `r_hi` the rounded sum (`L5`), `r_lo` its error (`L4`).
+    p.add(R::L3, R::L1, R::L5);
+    p.sub(R::L5, R::L3, R::L2);
+    p.sub(R::L1, R::L2, R::L4);
+    // Below `pi/4`: `r = a`, `q = 0`.
+    p.load(R::L0, Format::Int32, sx);
+    p.loadi_bits(R::L7, 0x7fff_ffff);
+    p.and(R::L0, R::L7, R::L0);
+    p.load(R::L6, Format::Int32, sq);
+    p.loadi(R::L7, std::f32::consts::FRAC_PI_4);
+    p.if_(Cond::Less(R::L0, R::L7), |p| {
+        p.mov(R::L0, R::L5);
+        p.mov(R::ZERO, R::L4);
+        p.mov(R::ZERO, R::L6);
+    });
+    p.store(R::L6, Format::Int32, sq);
+}
+
+/// `sin r` into `spill + 128` and `cos r` into `L6`, of `r = r_hi + r_lo`
+/// ([`trig_reduce`]'s `L5`, `L4`; `|r| <= pi/4`). Every register scratch.
+///
+/// `sin r = r_hi + (r_hi^3 P(z) + r_lo (1 - z/2))`, `z = r_hi^2`, `P` the
+/// Taylor series to `z^4` (`r^11`; the next term below `1e-11` of the sum);
+/// `cos r = 1 - (z/2 - (z^2 Q(z) - r_lo r_hi))`, `Q` to `z^4` (`r^12`; the
+/// next below `5e-13`). Neither cancels: `cos r >= 0.707`.
+///
+/// Error, relative, in `u = 2^-24` (one rounding): `sin`: `z` within `u`,
+/// `r_hi^3` within `2u`, Horner's `P` within `2.1u` (its last step and `-1/6`'s
+/// rounding; `z/20` damps the rest), the multiply-add `u`: the correction
+/// within `5.1u` of itself, and it is at most `0.103 r`, where `sin r >=
+/// 0.900 r`: `0.59u`; `r_lo (1 - z/2)` misses `r_lo cos r` by `r_lo r^4/24`,
+/// `0.02u`; the last add `u`: `1.61u`. `cos`: `z/2`'s error `0.31u`
+/// absolute, the tail's (`<= 0.016`, its own `7u`, and `r_lo r_hi` for `r_lo
+/// sin r_hi`, `0.064u`) `0.18u`, the inner difference's rounding `0.29u` (it
+/// is below `0.293`): `0.78u` over `cos r >= 0.707` is `1.10u`, and the last
+/// rounding `u`: `2.10u`. Both under [`SIN_BOUND`] `= COS_BOUND = 2.2u` --
+/// `sin x` is `cos r` in odd quadrants -- `r`'s own `0.001u` included.
+fn sin_cos_cores(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let (r_hi, r_lo, z, half) = (R::L5, R::L4, R::L3, R::L0);
+    let mut fact = 1.0f64;
+    let taylor: Vec<f32> = (0..=12)
+        .map(|n| {
+            if n > 0 {
+                fact *= n as f64;
+            }
+            let sign = if (n / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            (sign / fact) as f32
+        })
+        .collect();
+    p.mul(r_hi, r_hi, z);
+    p.loadi(R::L2, taylor[11]);
+    for n in [9, 7, 5, 3] {
+        p.loadi(R::L1, taylor[n]);
+        p.mad(R::L2, z, R::L1, R::L2);
+    }
+    p.mul(r_hi, z, R::L1);
+    p.loadi(half, 0.5);
+    p.mul(z, half, half);
+    p.nmad(r_lo, half, r_lo, R::L6);
+    p.mad(R::L1, R::L2, R::L6, R::L6);
+    p.add(r_hi, R::L6, R::L7);
+    p.store(R::L7, Format::Int32, spill + 128);
+    p.loadi(R::L2, taylor[12]);
+    for n in [10, 8, 6, 4] {
+        p.loadi(R::L1, taylor[n]);
+        p.mad(R::L2, z, R::L1, R::L2);
+    }
+    p.mul(z, z, R::L1);
+    p.mul(R::L1, R::L2, R::L1);
+    p.nmad(r_lo, r_hi, R::L1, R::L1);
+    p.sub(half, R::L1, R::L1);
+    p.sub(R::ONE, R::L1, R::L6);
+}
+
+/// `sin x` or `cos x` of `x` (in `L0`, raw bits) into `L7`, for every finite
+/// `x`: [`trig_reduce`], both of [`sin_cos_cores`], and the quadrant -- `sin
+/// x = sign(x) [S, C, -S, -C][q]`, `cos x = [C, -S, -C, S][q]`, `S = sin r`
+/// with `g`'s sign, `C = cos r` -- as sign bits. Spills at `spill..spill +
+/// 192`.
+///
+/// Within [`SIN_BOUND`], [`COS_BOUND`] ([`sin_cos_cores`]); the quadrant is
+/// exact. `sin` is `x` itself below `|x| = 2^-12` (`x^2/6 < 2^-26`), bits and
+/// all; `cos` of a zero is `1`; `±inf` and NaNs give NaN.
+pub fn sin_cos_program(p: &mut Program, spill: u32, cos: bool) {
+    use LReg as R;
+    trig_reduce(p, spill);
+    sin_cos_cores(p, spill);
+    let (x, qn, s, c, t, k) = (R::L0, R::L1, R::L2, R::L6, R::L3, R::L4);
+    p.load(x, Format::Int32, spill);
+    p.load(qn, Format::Int32, spill + 64);
+    p.load(s, Format::Int32, spill + 128);
+    p.loadi_bits(k, 0x8000_0000);
+    p.and(qn, k, t);
+    p.xor(t, s);
+    // `q` odd takes the other core.
+    p.loadi_bits(k, 1);
+    p.and(qn, k, t);
+    let (first, other) = if cos { (c, s) } else { (s, c) };
+    p.mov(first, R::L7);
+    p.if_(Cond::Ne0(t), |p| p.mov(other, R::L7));
+    // The sign: `sin`'s from bit 1 of `q` and `x`'s; `cos`'s from bit 1 of
+    // `q + 1` (set for `q` 1 and 2).
+    if cos {
+        p.iadd_imm(qn, 1, t);
+    } else {
+        p.mov(qn, t);
+    }
+    p.loadi_bits(k, 2);
+    p.and(t, k, t);
+    p.shl(t, 30, t);
+    if !cos {
+        p.loadi_bits(k, 0x8000_0000);
+        p.and(x, k, k);
+        p.xor(k, t);
+    }
+    p.xor(t, R::L7);
+    p.loadi_bits(k, 0x7fff_ffff);
+    p.and(x, k, t);
+    if !cos {
+        p.loadi_bits(k, 0x3980_0000); // 2^-12
+        p.if_(Cond::Less(t, k), |p| p.mov(x, R::L7));
+    }
+    p.loadi_bits(k, 0x7f80_0000);
+    p.if_(Cond::LessEq(k, t), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
 }
 
 /// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
@@ -1592,7 +1908,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
-        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID => Operands::Unary,
+        | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID
+        | kind_sfpu::SIN
+        | kind_sfpu::COS => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2307,6 +2625,14 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 } else {
                     asinh_acosh_program(p, spill, kind == kind_sfpu::ACOSH);
                 }
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::SIN | kind_sfpu::COS => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                sin_cos_program(p, super::kernel::SPILL_ROW + o, kind == kind_sfpu::COS);
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
@@ -3338,6 +3664,121 @@ mod transcendental {
         );
     }
 
+    /// The floats nearest a multiple of `pi/2`, in order (`|g|` from
+    /// `2^-29.86`): the [`trig_reduce`] inputs whose `r` cancels most.
+    const HARDEST_REDUCTIONS: [u32; 12] = [
+        0x6f79_be45,
+        0x50a3_e87f,
+        0x6ff9_be45,
+        0x5123_e87f,
+        0x437c_e5f1,
+        0x7079_be45,
+        0x6a19_76f1,
+        0x53b1_46a6,
+        0x6589_8498,
+        0x51a3_e87f,
+        0x43fc_e5f1,
+        0x7758_4625,
+    ];
+
+    /// The 100-bit window of `2/pi` from bit `E - 151`: `|g|` of `a = M
+    /// 2^(E-150)` (`a (2/pi) = q + g`) is [`reduction_distance`]'s, exactly
+    /// but for the bits past the window (below `2^-74`).
+    fn reduction_window(e: i64) -> u128 {
+        let bit = |k: i64| -> u128 {
+            if k < 1 {
+                0
+            } else {
+                let i = (k - 1) as usize;
+                ((TWO_OVER_PI[i / 24] >> (23 - i % 24)) & 1) as u128
+            }
+        };
+        (0..100).fold(0u128, |w, i| (w << 1) | bit(e - 151 + i))
+    }
+
+    fn reduction_distance(w: u128, bits: u32) -> f64 {
+        let m = (bits & 0x7f_ffff | 0x80_0000) as u128;
+        let one = 1u128 << 98;
+        let fr = (m * w) & (one - 1);
+        (fr.min(one - fr)) as f64 / one as f64
+    }
+
+    /// The premise of [`trig_reduce`]'s bound: no float from `pi/4` is nearer
+    /// a multiple of `pi/2` than `16367173 2^72`, `|g| = 2^-29.86` -- every
+    /// float scanned in a release build, every 1024th mantissa in a debug one
+    /// (where the twelve hardest are checked by name).
+    #[test]
+    fn no_float_reduces_closer_than_the_hardest() {
+        let step = if cfg!(debug_assertions) { 1024 } else { 1 };
+        let start = std::f32::consts::FRAC_PI_4.to_bits();
+        let mut worst = (f64::MAX, 0u32);
+        for e in 126..255u32 {
+            let w = reduction_window(e as i64);
+            let named = HARDEST_REDUCTIONS.into_iter().filter(|b| b >> 23 == e);
+            for bits in ((e << 23)..((e + 1) << 23)).step_by(step).chain(named) {
+                if bits < start {
+                    continue;
+                }
+                let g = reduction_distance(w, bits);
+                if g < worst.0 {
+                    worst = (g, bits);
+                }
+            }
+        }
+        assert_eq!(worst.1, HARDEST_REDUCTIONS[0], "{worst:?}");
+        assert!(worst.0 > f64::powf(2.0, -29.87), "{worst:?}");
+        let gs: Vec<f64> = HARDEST_REDUCTIONS
+            .iter()
+            .map(|b| reduction_distance(reduction_window((b >> 23) as i64), *b))
+            .collect();
+        assert!(gs.windows(2).all(|w| w[0] <= w[1]), "{gs:?}");
+    }
+
+    /// The switch to `x` itself (`2^-12`) and to the reduction (`pi/4`), the
+    /// first windows, every binade to `f32::MAX`, and the hardest reductions
+    /// with their neighbours.
+    fn trig_inputs() -> impl Iterator<Item = f32> {
+        let q = std::f32::consts::FRAC_PI_4.to_bits();
+        let specials = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x397f_ffff),
+            f32::from_bits(0x3980_0000),
+            f32::from_bits(q - 1),
+            f32::from_bits(q),
+            f32::from_bits(q + 1),
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            std::f32::consts::TAU,
+            1.0e5,
+            1.0e10,
+            16_777_216.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let hardest = HARDEST_REDUCTIONS
+            .into_iter()
+            .flat_map(|b| (b - 8..=b + 8).map(f32::from_bits));
+        grid(-12.6, 12.6, 60_000)
+            .chain(grid(-1.0e4, 1.0e4, 20_000))
+            .chain(binades(64))
+            .chain(specials)
+            .chain(hardest)
+            .flat_map(|x| [x, -x])
+    }
+
+    #[test]
+    fn sin_is_within_its_derived_bound() {
+        sweep(kind_sfpu::SIN, trig_inputs(), libm::sin, SIN_BOUND);
+    }
+
+    #[test]
+    fn cos_is_within_its_derived_bound() {
+        sweep(kind_sfpu::COS, trig_inputs(), libm::cos, COS_BOUND);
+    }
+
     /// A NaN of either sign and any payload comes out a NaN from every
     /// approximation: `SFPABS` leaves a negative NaN negative, which made
     /// `exp(-NaN)` `0` and `recip(-NaN)` `-inf` until 10.2e masked the sign.
@@ -3354,7 +3795,7 @@ mod transcendental {
         let a: Vec<f32> = (0..1024)
             .map(|i| f32::from_bits(nans[i % nans.len()]))
             .collect();
-        for kind in (0x100..0x140).filter(|&k| {
+        for kind in (0x100..=kind_sfpu::LAST).filter(|&k| {
             accuracy(k) == Accuracy::Approximate && operands(k) == Some(Operands::Unary)
         }) {
             let got = reference(kind, 0.5, &a, None, 32, 32);
@@ -3635,7 +4076,7 @@ mod arity {
     /// shape check and the kernel cannot disagree.
     #[test]
     fn operands_agrees_with_program() {
-        for k in (1..=kind::LAST).chain(0x100..0x140) {
+        for k in (1..=kind::LAST).chain(0x100..=kind_sfpu::LAST) {
             // Scalars any kind takes: `CLAMP`'s bounds uncrossed.
             let got = program2(k, [-0.5, 0.5]).map(|(o, _)| o);
             assert_eq!(operands(k), got, "kind {k:#x}");

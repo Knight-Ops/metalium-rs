@@ -37,7 +37,8 @@ and both backwards, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid` and
 backward, `softmin`), so all seven of `tt-mnist`'s activations now move only what
 ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9 (row AK). The
 runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
-Next: trig (10.2f).
+Trig is under way (10.2f): `sin` and `cos` are on the card for every finite input,
+by an exact Payne-Hanek reduction. Next: `tan`, the inverses, `atan2`.
 
 ### After 10.1
 
@@ -75,7 +76,7 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`) |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f in progress (trig: `sin`, `cos`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
@@ -922,6 +923,32 @@ Each names the measurement it must move. The Burn-side ones are in
         the softmax's bound (`step32_burn_softmax`, both dims, three shapes, and
         on the host below eight tiles; watched failing with the negation
         off). Next: `sin`/`cos` and the rest (10.2f).
+  - [~] **10.2f Trigonometry.** `trig_reduce`: Payne and Hanek's reduction
+        by `pi/2` in exact fixed point, for every finite `x` -- a 92-bit window
+        of `2/pi` cut per lane at the exponent (23-bit limbs, five conditional
+        shifts and a funnel by register shifts, `Program::shl_by`), `M W mod
+        2^92` from `SFPMUL24`'s halves with integer carries, `q mod 4` and a
+        67-bit fraction, converted exactly and multiplied by `pi/2` in Dekker's
+        12-bit halves. A double-float sum of float chunks, the first design,
+        keeps 48 bits, and the float nearest a multiple of `pi/2` (`16367173
+        2^72`, `|g| = 2^-29.86`; every float scanned,
+        `transcendental::no_float_reduces_closer_than_the_hardest`) needs
+        about 56: so the reduction is integer. `r` within `2^-34`; the table is
+        fdlibm's `ipio2` (watched failing at `1.2e35` with bit 145 flipped).
+        `sin_cos_program`: both Taylor cores on `|r| <= pi/4` (`r_lo` carried),
+        the quadrant as sign bits; within `SIN_BOUND = COS_BOUND = 2.2u`
+        (worst measured 0.97 ulps over every binade, a few periods and the
+        twelve hardest reductions with their neighbours); `sin` is `x` itself
+        below `2^-12`. Gates: `step46_trig` (device bit for bit to the program,
+        the program within its bound of Flex, every binade and the hardest
+        reductions, the zero-padding claim on the raw tiles; watched failing
+        with the quadrant's sign bit taken from bit 0), ttsim and both cards.
+        Burn: `float_sin`, `float_cos`;
+        `step47_burn_activations::trig_stays_on_the_card_within_their_bounds`,
+        with Burn's autodiff through both (each the other's kind); watched
+        failing with `float_cos` routed to `SIN`. Cost (row AL): 23 us a tile
+        against `exp`'s 9.2 and `gelu`'s 29.5. Next: `tan`, the inverses,
+        `atan2`.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1109,7 +1136,8 @@ path today, `~` when only some shapes do.
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
 | `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
-| `float_sin`, `float_cos`, `float_tan`, inverse trig, `float_atan2` | | S4 (10.2f) |
+| `float_sin`, `float_cos` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
+| `float_tan`, inverse trig, `float_atan2` | | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |

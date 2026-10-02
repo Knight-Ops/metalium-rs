@@ -349,6 +349,13 @@ impl Program {
         self.push(encode::sfpshft(0, neg_amount.index(), Self::dst(d), 0).unwrap());
     }
 
+    /// `d = d << amount`, `amount` a register holding `0..32` (the same
+    /// `SFPSHFT` as [`Program::shr_by`]: the register's sign picks the
+    /// direction).
+    pub fn shl_by(&mut self, amount: LReg, d: LReg) {
+        self.push(encode::sfpshft(0, amount.index(), Self::dst(d), 0).unwrap());
+    }
+
     /// `d` = the exponent field of `s` as a two's-complement integer, minus
     /// 127 if `debias` (`SFPEXEXP`).
     pub fn exponent(&mut self, s: LReg, debias: bool, d: LReg) {

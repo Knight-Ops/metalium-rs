@@ -626,18 +626,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_abs(tensor)
     }
     fn float_cos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_cos(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_cos(tensor)
     }
     fn float_sin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_sin(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_sin(tensor)
     }
     fn float_tan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);

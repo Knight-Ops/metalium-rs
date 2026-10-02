@@ -511,6 +511,8 @@ fn eltwise_unit_sweep() {
                             let before = s.device().traffic();
                             let t = Instant::now();
                             let o = s.eltwise(op, &x, other).unwrap();
+                            // Queued since X4c: timed to its completion.
+                            s.sync().unwrap();
                             v.push(t.elapsed());
                             writes = (s.device().traffic() - before).bytes_written;
                             s.free(o).unwrap();
@@ -529,6 +531,70 @@ fn eltwise_unit_sweep() {
         }) {
             panic!("{e}");
         }
+    }
+}
+
+/// The SFPU's transcendentals by cost: one op's wall time on one unit, by
+/// tiles, and the slope -- what a tile of each program costs on the card
+/// (10.2f: the trig reduction against `exp`). Each figure the median of
+/// seven after a warm-up.
+#[test]
+#[ignore = "benchmark"]
+fn sfpu_transcendental_cost() {
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::sfpu::ops::kind_sfpu::*;
+    use tt_kernels::tensor::Eltwise;
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let kinds = [
+        ("exp", EXP),
+        ("tanh", TANH),
+        ("gelu", GELU),
+        ("sin", SIN),
+        ("cos", COS),
+    ];
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        for (name, kind) in kinds {
+            let op = Eltwise {
+                kind,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            let mut at = Vec::new();
+            for tiles in [1usize, 2, 4, 8, 16, 32, 64] {
+                let (r, c) = (32 * tiles, 32);
+                let x = s.upload(&pattern_f32(r * c, 3), r, c).unwrap();
+                let o = s.eltwise(op, &x, None).unwrap();
+                s.sync().unwrap();
+                s.free(o).unwrap();
+                let mut v = Vec::new();
+                let mut writes = 0;
+                for _ in 0..7 {
+                    let before = s.device().traffic();
+                    let t = Instant::now();
+                    let o = s.eltwise(op, &x, None).unwrap();
+                    // The op is queued (X4): its time is to its completion.
+                    s.sync().unwrap();
+                    v.push(t.elapsed());
+                    writes = (s.device().traffic() - before).bytes_written;
+                    s.free(o).unwrap();
+                }
+                s.free(x).unwrap();
+                at.push((tiles, median(v).as_secs_f64() * 1e6, writes));
+            }
+            let line: Vec<String> = at
+                .iter()
+                .map(|(t, us, w)| format!("{t}: {us:.1} us ({w} B)"))
+                .collect();
+            println!("MEASURE sfpu {name:>5}: {}", line.join(", "));
+        }
+    }) {
+        panic!("{e}");
     }
 }
 
