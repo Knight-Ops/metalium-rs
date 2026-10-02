@@ -130,6 +130,12 @@ const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
 pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
 const _: () = assert!(WRITE_NOC + 4 <= MAILBOX_BASE + 0x100);
 
+/// Mover -> the tile's other mover: how many [`op::SIGNAL`]s this mover has
+/// run (wrapping), each after everything before it landed. Zeroed by the host
+/// before the mover starts; read by the peer's [`op::WAIT_PEER`].
+pub const PROGRESS: u64 = MAILBOX_BASE + 0xE4;
+const _: () = assert!(PROGRESS + 4 <= MAILBOX_BASE + 0x100);
+
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {
     /// Writes through NoC #0's NIU, with the reads: what the mover always did.
@@ -212,6 +218,18 @@ pub mod op {
     /// trace's role descriptors, which the host writes for an ordinary list
     /// and cannot write during a replay. Only in a list entry.
     pub const POKE: u32 = 11;
+    /// Count this mover's progress: `[SIGNAL, 0, ...]`. The mover waits for
+    /// every move before it to land, then adds one to its
+    /// [`super::PROGRESS`] word, which the other mover on the tile reads with
+    /// [`WAIT_PEER`]. Only in a list entry.
+    pub const SIGNAL: u32 = 12;
+    /// Wait for the tile's other mover: `[WAIT_PEER, peer, target, 0, ...]`,
+    /// `peer` 0 for B's and 1 for NC's ([`super::Mover`]). The mover spins on
+    /// the peer's [`super::PROGRESS`] until it reaches `target` (compared
+    /// modulo 2^32), and reports [`super::error::PEER`] instead if the peer's
+    /// queue has stopped on an error -- so a failed peer never leaves this one
+    /// spinning. Only in a list entry.
+    pub const WAIT_PEER: u32 = 13;
 }
 
 /// [`op::FILL`]'s parameter.
@@ -413,6 +431,10 @@ pub enum Entry {
     },
     /// [`op::POKE`]: one role-mailbox word.
     Poke { address: u32, value: u32 },
+    /// [`op::SIGNAL`].
+    Signal,
+    /// [`op::WAIT_PEER`]: the peer mover, and the progress count to wait for.
+    WaitPeer { peer: Mover, target: u32 },
 }
 
 impl Entry {
@@ -429,6 +451,14 @@ impl Entry {
                 },
             );
         }
+        Self::decode_other(usable, w)
+    }
+
+    /// [`Entry::decode`] for everything but a plain read or write: out of
+    /// line, so the mover's per-entry path, which inlines `decode`, carries
+    /// only the move's decode (`sections.x`, `.text.hot`).
+    #[inline(never)]
+    fn decode_other(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
         let transform = match w[0] {
             op::READ_TRANSPOSED => Transform::Transpose,
             op::READ_BROADCAST_COL => Transform::BroadcastCol0,
@@ -527,6 +557,23 @@ impl Entry {
                 value: w[2],
             });
         }
+        if w[0] == op::SIGNAL {
+            if w[1..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Signal);
+        }
+        if w[0] == op::WAIT_PEER {
+            let peer = match w[1] {
+                0 => Mover::B,
+                1 => Mover::NC,
+                _ => return Err(error::OP),
+            };
+            if w[3..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::WaitPeer { peer, target: w[2] });
+        }
         if w[0] == op::FILL {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
             if !slot(w[3]) {
@@ -572,6 +619,8 @@ pub mod error {
     /// A [`super::op::KERNEL`] entry naming a program outside the program
     /// cache, misaligned, or longer than a program may be.
     pub const PROGRAM: u32 = 8;
+    /// A [`super::op::WAIT_PEER`] whose peer's queue had stopped on an error.
+    pub const PEER: u32 = 9;
 }
 
 /// A descriptor, as both sides see it.

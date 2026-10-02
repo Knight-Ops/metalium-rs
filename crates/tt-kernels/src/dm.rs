@@ -199,6 +199,7 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::THROTTLE_STALLS),
             mover.at(dm::THROTTLE_CYCLES),
             mover.at(dm::WRITE_NOC),
+            mover.at(dm::PROGRESS),
             mover.at(dm::QUEUE_HEAD),
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),

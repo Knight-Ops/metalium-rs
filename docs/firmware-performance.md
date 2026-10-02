@@ -139,6 +139,23 @@ each tile's share fixed:
   difference.
 - **Writes: within noise at every size and tile count.**
 
+### RISCV NC's mover costs what B's does
+
+NC runs the same mover image (`dm_nc`). One tile, per entry, `BENCH_MOVER=nc`:
+
+| Entry | B | NC |
+|---|--:|--:|
+| 4 KiB read | 351.6 cycles | 351.6 |
+| 16 KiB read | 363.5 | 363.6 |
+| 4 KiB write | 397.4 | 397.3 |
+| `WAIT` (256 in a list) | 136.2 | 136.2 |
+
+- **No sign of a smaller NC instruction cache on Blackhole.** On Wormhole NC's
+  was a quarter of B's (`riscv-guide-review.md`), but here NC is as fast as B
+  at every size.
+- **NC can take any share of the moves.**
+- **The 4 KiB read is up from 339 cycles** (the cap-8 default; see above).
+
 ### Why card-wide writes stop at about 160 (NoC #0) and 270 (NoC #1) GB/s
 
 **One channel absorbs a full channel of writes from 120 tiles, on either NoC:**

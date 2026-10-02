@@ -92,6 +92,16 @@ struct One<'a> {
     c: Conditions,
 }
 
+/// `BENCH_MOVER=nc`: the single-tile benchmarks run RISCV NC's mover
+/// (`dm::Mover::NC`) instead of B's -- the same mover code, on a core whose
+/// instruction cache may be smaller.
+fn bench_mover() -> (dm::Mover, &'static [u8]) {
+    match std::env::var("BENCH_MOVER").as_deref() {
+        Ok("nc") => (dm::Mover::NC, tt_firmware_images::DM_NC.1),
+        _ => (dm::Mover::B, tt_firmware_images::DM_B.1),
+    }
+}
+
 /// The gate tile's mover, traced, with each channel's first MiB at [`BASE`]
 /// holding a known pattern.
 fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
@@ -101,8 +111,10 @@ fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
     let t = tensix_tile();
     let c = Conditions::measure(d, device_index(), t);
     c.print();
-    let m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
-    d.write32(&w, t, dm::TRACE, 1).unwrap();
+    let (mover, image) = bench_mover();
+    println!("MEASURE mover: {:?}", mover.core);
+    let m = DataMover::start_on(d, &w, t, &dram, mover, image).unwrap();
+    d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
     let mut one = One {
         d,
         w,
@@ -113,7 +125,7 @@ fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
     };
     f(&mut one);
     let One { d, w, m, .. } = one;
-    d.write32(&w, t, dm::TRACE, 0).unwrap();
+    d.write32(&w, t, m.mover().at(dm::TRACE), 0).unwrap();
     m.stop(d, &w).unwrap();
 }
 
@@ -346,7 +358,9 @@ fn mover_overhead() {
                 .collect();
             let t = one.m.tile();
             for (label, on) in [("traced", 1), ("untraced", 0)] {
-                one.d.write32(&one.w, t, dm::TRACE, on).unwrap();
+                one.d
+                    .write32(&one.w, t, one.m.mover().at(dm::TRACE), on)
+                    .unwrap();
                 one.d
                     .configure_trace(&one.w, t, TRACE_BUFFER, TRACE_BUFFER_BYTES)
                     .unwrap();
@@ -367,7 +381,9 @@ fn mover_overhead() {
                     Stats::of_durations(v.into_iter().skip(1)),
                 );
             }
-            one.d.write32(&one.w, t, dm::TRACE, 1).unwrap();
+            one.d
+                .write32(&one.w, t, one.m.mover().at(dm::TRACE), 1)
+                .unwrap();
         });
     });
 }

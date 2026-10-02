@@ -359,6 +359,8 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
         // Only as a list of its own, which `run_list_at` runs.
         Entry::Call { .. } => return Err(IS_CALL),
+        Entry::Signal => signal(),
+        Entry::WaitPeer { peer, target } => wait_peer(peer, target)?,
         Entry::Fill { value, param, dst } => {
             // The tile it fills may still be arriving.
             noc::wait(TXN);
@@ -367,6 +369,33 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
     }
     Ok(())
+}
+
+/// `dm::op::SIGNAL`: once everything before it has landed, one more on this
+/// mover's progress word, where the tile's other mover reads it.
+#[inline(never)]
+fn signal() {
+    noc::wait(TXN);
+    publish();
+    wr(M.at(dm::PROGRESS), rd(M.at(dm::PROGRESS)).wrapping_add(1));
+    publish();
+}
+
+/// `dm::op::WAIT_PEER`: spin until `peer`'s progress reaches `target`, or
+/// fail with `dm::error::PEER` if `peer`'s queue has stopped on an error.
+/// Every read through a fence: the peer's stores do not invalidate this core's
+/// L0 data cache.
+#[inline(never)]
+fn wait_peer(peer: dm::Mover, target: u32) -> Result<(), u32> {
+    loop {
+        publish();
+        if (rd(peer.at(dm::PROGRESS)).wrapping_sub(target) as i32) >= 0 {
+            return Ok(());
+        }
+        if rd(peer.at(dm::QUEUE_ERROR)) != dm::error::NONE {
+            return Err(dm::error::PEER);
+        }
+    }
 }
 
 /// Read list entry `i` of the ring.
