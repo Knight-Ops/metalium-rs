@@ -333,6 +333,15 @@ difference is the host polling for the ack and posting the next send over PCIe.
     and 128 KiB (run 1790970443).
   - The single-port write path changed in nothing else: port hint 0 maps to port
     0 on NoC #0.
+- [ ] **Per-request cost** (checklist 9.14).
+  - ~350 cycles per entry at any size up to 4 KiB.
+  - Each request rebuilds and writes ten NIU registers.
+  - GATHER records expand into one ~4 KiB read per tile.
+- [ ] **B stalls for a whole kernel** (checklist 9.15).
+  - `KERNEL` drains the moves and waits for all three roles, so nothing moves
+    while they compute.
+- [ ] **Ethernet moves one transfer at a time** per direction, store and forward
+  through one buffer each way (checklist, Ethernet pipelining).
 - [ ] **Not yet measured:**
   - tile-to-tile L1 over the NoC (the mover has no op for it)
   - card 1 (`cargo xtask bench --device all`)

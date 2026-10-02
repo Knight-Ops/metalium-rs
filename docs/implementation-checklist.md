@@ -41,7 +41,7 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles). Next: 9.8 overlap, with the circular-buffer runtime |
+| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles); 9.12a NoC ownership, NC mover, card reads 469 GB/s and NoC #1 writes 378. Next: 9.13 role trace, 9.14 per-request cost, 9.15 overlap |
 | 10 — Hardware coverage | `[ ]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** Only `MVMUL` runs on the Tensix today; element-wise is on the B core, the SFPU runs no tensor op. Next: 10.0, the SFPU foundation, with today's element-wise ops moved onto it |
 
 ---
@@ -1439,10 +1439,58 @@ tiles, done in turn. The slices from there:
     descriptor write and a list per tile, which is the next floor.
   - The validation tier grew from 36 to 59 s, about 20 of it
     `step22_program_cache`.
+- [x] **9.12a NoC ownership, NC, option C** (branch `noc-ownership-nc`,
+      2026-10-02).
+  - Each GDDR endpoint belongs to one NoC (SYS-1419), per channel: NoC #1 port 1
+    on channels 0-3 and port 0 on 4-7.
+  - Every request goes out on static VC 1, and tile movers start with an
+    in-flight cap of 8.
+  - RISCV NC runs the same mover (`dm_nc`), and `SIGNAL` / `WAIT_PEER` let the
+    two movers wait for each other.
+  - Card reads 127 -> 469 GB/s, NoC #1 writes 52 -> 378.
+  - Details in `firmware-performance.md`.
+- [ ] **Next, in order** (from an independent review, 2026-10-02, checked
+      against the measurements above):
+  - [ ] **9.13 Role `START` traced before the role's setup.**
+    - Today the descriptor and config work happens before `START`, so the push
+      timings in `firmware-performance.md` leave part of the launch out.
+  - [ ] **9.14 Per-request cost.**
+    - A mover entry costs ~350 cycles whatever its size (`firmware-performance.md`,
+      "GDDR6 through the data mover"), and a GATHER record expands into one
+      ~4 KiB read per tile, so gathers live in that regime.
+    - First, show that the NIU's initiator registers keep their values between
+      requests: ttsim, then an isolated silicon gate.
+    - Then write only the registers that change (tt-metal's stateful transfer
+      API does the same).
+    - Execute GATHER / SCATTER records directly, not as re-decoded entries.
+    - Merge contiguous tiles into one request.
+    - Measure per entry and on matmul and element-wise gathers.
+  - [ ] **9.15 Overlap on B, then split.**
+    - `KERNEL` drains the moves and blocks B until all three roles acknowledge.
+    - Separate launch and wait entries, with explicit ownership of each L1
+      staging buffer, let B gather the next block and scatter the previous one
+      while the roles compute: 9.8's double buffering.
+    - On top of that, a `Session` policy that puts the scatters on NC
+      (`SIGNAL` / `WAIT_PEER`), B-only by default.
+    - `copy_pipeline` found B's own pipelining within 3-5% of B+NC at large
+      entries and NC 1.6x faster at 4 KiB, so both are measured.
+  - [ ] **9.16 Role program streaming, measured first.**
+    - Every launch streams its program words through RISC-V stores.
+    - Measure the instruction-heavy kernels (SFPU `exp`: roles 87% busy) before
+      rewriting the push loop.
+  - [ ] **Ethernet pipelining, a separate track.**
+    - E1 gathers, sends, lands and forwards one transfer at a time, with one
+      staging and one landing buffer, and the host blocks on each ack (800G at
+      26%).
+    - Queued descriptors, several buffer slots, credits, and a non-blocking E1
+      loop.
+  - Smaller: transposed and broadcast reads drain the moves and rearrange
+    through B's one scratch slot; each role launch rereads its descriptor and
+    rewrites config.
 - [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
       next chunk while the roles compute this one, and scatters the previous
       one (the `Src`/`Dst` double buffering and the hazards-as-data wait
-      planner from the plan belong here).
+      planner from the plan belong here). Now 9.15.
 - [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10, and done there (S1, milestone 10.0).
 - [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
       host tilizing: tilize in parallel, or upload row-major and let the movers
