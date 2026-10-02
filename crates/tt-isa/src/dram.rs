@@ -177,31 +177,51 @@ impl DramChannel {
         }
     }
 
-    /// Whether requests through `niu` may use endpoint `port`.
+    /// The one endpoint NoC #1 owns on this channel: port 1 on channels 0-3,
+    /// port 0 on channels 4-7.
+    ///
+    /// The two DRAM columns mirror each other: port `p` of channel `k` and of
+    /// channel `k + 4` sit in the same raw row (tt-metal
+    /// `soc_descriptors/blackhole_140_arch.yaml:11-21`). NoC #1 carries write
+    /// data along the endpoint's row last (Y then X), so with port 1 on every
+    /// channel eight channels' writes shared four rows' links. Port 0 of
+    /// channels 4-7 is in four other rows, and is never CMFW's there (CMFW's
+    /// is port 2), so each channel gets a row of its own. tt-metal uses port 1
+    /// on every channel; this departs from it, safely by the rule in
+    /// [`DramChannel::owns`].
+    pub const fn noc1_port(self) -> u8 {
+        if self.index < 4 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Whether requests through `niu` may use this channel's endpoint `port`.
     ///
     /// Each endpoint belongs to one NoC. Blackhole's DRAM endpoint arbiter
     /// drops requests from one NoC when both NoCs issue back to back to the
     /// same endpoint (tt-metal SYS-1419): on card 0 it hung the chip
     /// (`silicon_bench_memory::gddr_aggregate_nocs`, 2026-10-02, tiles on
-    /// both NoCs sharing ports). NoC #1 owns port 1, tt-metal's NoC #1
-    /// subchannel on every channel; NoC #0 owns 0 and 2, which include
-    /// [`DramChannel::cmfw_port`] -- so CMFW's endpoint never sees NoC #1.
-    pub const fn owns(niu: Niu, port: u8) -> bool {
+    /// both NoCs sharing ports). NoC #1 owns [`DramChannel::noc1_port`]; NoC
+    /// #0 owns the other two, which include [`DramChannel::cmfw_port`] -- so
+    /// CMFW's endpoint never sees NoC #1.
+    pub const fn owns(self, niu: Niu, port: u8) -> bool {
         match niu {
-            Niu::Noc1 => port == 1,
-            Niu::Noc0 => port == 0 || port == 2,
+            Niu::Noc1 => port == self.noc1_port(),
+            Niu::Noc0 => port < PORTS && port != self.noc1_port(),
         }
     }
 
     /// The endpoint `niu` uses when asked for `port` (0..3), which spreads a
-    /// caller's rotation over the endpoints `niu` owns: NoC #1 always port 1;
-    /// NoC #0 the port itself, or for port 1 -- NoC #1's -- CMFW's endpoint,
-    /// which NoC #0 shares with CMFW. Callers name ports as before; the rule
-    /// in [`DramChannel::owns`] is applied here, not by them.
+    /// caller's rotation over the endpoints `niu` owns: NoC #1 always its own;
+    /// NoC #0 the port itself, or for NoC #1's port, CMFW's endpoint, which
+    /// NoC #0 shares with CMFW. Callers name ports as before; the rule in
+    /// [`DramChannel::owns`] is applied here, not by them.
     pub const fn port_for(self, niu: Niu, port: u8) -> u8 {
         match niu {
-            Niu::Noc1 => 1,
-            Niu::Noc0 if port == 1 => self.cmfw_port(),
+            Niu::Noc1 => self.noc1_port(),
+            Niu::Noc0 if port == self.noc1_port() => self.cmfw_port(),
             Niu::Noc0 => port,
         }
     }
@@ -220,7 +240,7 @@ impl DramChannel {
     /// Only for the NIU that owns the port ([`DramChannel::owns`]): `None` for
     /// any other, as for a port past the three.
     pub fn endpoint(self, niu: Niu, port: u8) -> Option<NocCoord<Noc0>> {
-        if port >= PORTS || !Self::owns(niu, port) {
+        if port >= PORTS || !self.owns(niu, port) {
             return None;
         }
         let x = 17 + self.index / 4;
@@ -313,7 +333,11 @@ mod tests {
     fn endpoints_are_umd_translated_coordinates() {
         let d = Dram::FULL;
         let e = |c: u8, p: u8| {
-            let n = d.channel(c).unwrap().endpoint(Niu::Noc0, p).unwrap();
+            let ch = d.channel(c).unwrap();
+            let n = ch
+                .endpoint(Niu::Noc0, p)
+                .or(ch.endpoint(Niu::Noc1, p))
+                .unwrap();
             (n.x(), n.y())
         };
         assert_eq!(e(0, 0), (17, 12));
@@ -324,28 +348,36 @@ mod tests {
         assert!(ch0.endpoint(Niu::Noc0, 3).is_none());
         let n = ch0.endpoint(Niu::Noc1, 1).unwrap();
         assert_eq!((n.x(), n.y()), (17, 13));
+        let n = d.channel(4).unwrap().endpoint(Niu::Noc1, 0).unwrap();
+        assert_eq!((n.x(), n.y()), (18, 12));
     }
 
     #[test]
     fn each_endpoint_belongs_to_one_noc_and_noc1_never_reaches_cmfw() {
+        // And NoC #1's eight endpoints sit in eight different raw rows
+        // (`DramChannel::noc1_port`): tt-metal's `dram` table, row by port.
+        let rows: [[u8; 3]; 4] = [[0, 1, 11], [2, 10, 3], [9, 4, 8], [5, 7, 6]];
+        let mut seen = [false; 12];
+        for c in Dram::FULL.channels() {
+            let row = rows[(c.index() % 4) as usize][c.noc1_port() as usize] as usize;
+            assert!(
+                !seen[row],
+                "channel {} shares NoC #1's row {row}",
+                c.index()
+            );
+            seen[row] = true;
+        }
         for c in Dram::FULL.channels() {
             for p in 0..PORTS {
-                assert!(
-                    DramChannel::owns(Niu::Noc0, p) != DramChannel::owns(Niu::Noc1, p),
-                    "port {p}"
-                );
-                assert_eq!(c.endpoint(Niu::Noc1, p).is_some(), p == 1);
+                assert!(c.owns(Niu::Noc0, p) != c.owns(Niu::Noc1, p), "port {p}");
+                assert_eq!(c.endpoint(Niu::Noc1, p).is_some(), p == c.noc1_port());
                 for niu in [Niu::Noc0, Niu::Noc1] {
                     let q = c.port_for(niu, p);
-                    assert!(
-                        DramChannel::owns(niu, q),
-                        "ch {} {niu:?} {p} -> {q}",
-                        c.index()
-                    );
+                    assert!(c.owns(niu, q), "ch {} {niu:?} {p} -> {q}", c.index());
                 }
             }
-            assert!(DramChannel::owns(Niu::Noc0, c.cmfw_port()));
-            assert!(!DramChannel::owns(Niu::Noc1, c.cmfw_port()));
+            assert!(c.owns(Niu::Noc0, c.cmfw_port()));
+            assert!(!c.owns(Niu::Noc1, c.cmfw_port()));
         }
     }
 

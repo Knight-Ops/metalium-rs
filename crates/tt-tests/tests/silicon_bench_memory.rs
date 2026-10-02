@@ -539,10 +539,13 @@ const DRAM_MID_X: u8 = 9;
 /// channel nearest above it: NoC #0 moves data down (`RoutingPaths.md`), so
 /// that is the shortest Y leg, wrapping at the bottom.
 fn nearest(f: &Fleet, n: usize) -> Vec<(u8, u8)> {
-    // The endpoints NoC #0 may use: the same ports on every channel.
-    let owned: Vec<u8> = (0..tt_isa::dram::PORTS)
-        .filter(|&p| tt_isa::dram::DramChannel::owns(Niu::Noc0, p))
-        .collect();
+    // The endpoints NoC #0 may use, by channel.
+    let owned = |c: u8| -> Vec<u8> {
+        let ch = f.dram.channel(c).unwrap();
+        (0..tt_isa::dram::PORTS)
+            .filter(|&p| ch.owns(Niu::Noc0, p))
+            .collect()
+    };
     // Rows count down from a tile's own: a row at or above it is that far.
     let gap = |tile_y: u8, row: u8| (tile_y as i32 - row as i32).rem_euclid(12) as u8;
     let mut out = vec![(0u8, 0u8); n];
@@ -556,7 +559,7 @@ fn nearest(f: &Fleet, n: usize) -> Vec<(u8, u8)> {
         // band of tile rows gets the channel whose endpoints are in it.
         let mut chans: Vec<u8> = (half..half + 4).collect();
         chans.sort_by_key(|&c| {
-            owned
+            owned(c)
                 .iter()
                 .map(|&p| {
                     let row = DRAM_RAW_Y[(c % 4) as usize][p as usize];
@@ -570,7 +573,7 @@ fn nearest(f: &Fleet, n: usize) -> Vec<(u8, u8)> {
         });
         for (k, &t) in tiles.iter().enumerate() {
             let ch = chans[k * 4 / tiles.len().max(1)];
-            let port = *owned
+            let port = *owned(ch)
                 .iter()
                 .min_by_key(|&&p| gap(f.raw[t].1, DRAM_RAW_Y[(ch % 4) as usize][p as usize]))
                 .unwrap();

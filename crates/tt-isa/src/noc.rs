@@ -799,7 +799,7 @@ pub mod niu {
 
         #[test]
         fn a_dram_read_targets_the_translated_endpoint_and_needs_c64() {
-            let ch = crate::dram::Dram::FULL.channel(5).unwrap();
+            let ch = crate::dram::Dram::FULL.channel(1).unwrap();
             let rd = |off: u64, to: u32| Command::ReadDram {
                 from: ch.range(off, 2048).unwrap(),
                 port: 1,
@@ -808,8 +808,8 @@ pub mod niu {
             let r = rd(0x10_0060, 0x3_0020)
                 .registers((3, 4), T, Niu::Noc1)
                 .unwrap();
-            // Channel 5, port 1: translated (18, 12 + 3 + 1).
-            assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 18 | (16 << 6));
+            // Channel 1, port 1 (NoC #1's): translated (17, 12 + 3 + 1).
+            assert_eq!(reg(&r, initiator::TARG_ADDR_HI), 17 | (16 << 6));
             assert_eq!(reg(&r, initiator::TARG_ADDR_LO), 0x10_0060);
             assert_eq!(reg(&r, initiator::TARG_ADDR_MID), 0);
             assert_eq!(reg(&r, initiator::RET_ADDR_LO), 0x3_0020);

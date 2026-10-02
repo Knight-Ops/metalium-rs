@@ -69,10 +69,10 @@ impl<T: Transport> Device<T> {
     /// MNIST's test batches read part stale images (divergence row T).
     pub fn dram_write(&mut self, window: &Window, range: DramRange, data: &[u8]) -> Result<()> {
         check_len(range, data.len())?;
-        let at = range
-            .channel()
-            .endpoint(Niu::Noc0, 0)
-            .expect("port 0 is NoC #0's");
+        let ch = range.channel();
+        let at = ch
+            .endpoint(Niu::Noc0, ch.cmfw_port())
+            .expect("CMFW's endpoint is NoC #0's");
         // GDDR is memory by construction: the bulk path.
         self.write_memory(window, at, range.offset(), data)?;
         if data.len() >= 4 {
@@ -87,13 +87,14 @@ impl<T: Transport> Device<T> {
         Ok(())
     }
 
-    /// Read `range` into `out`, through the channel's first endpoint.
+    /// Read `range` into `out`, through the channel's CMFW endpoint, which is
+    /// always NoC #0's (`DramChannel::owns`).
     pub fn dram_read(&mut self, window: &Window, range: DramRange, out: &mut [u8]) -> Result<()> {
         check_len(range, out.len())?;
-        let at = range
-            .channel()
-            .endpoint(Niu::Noc0, 0)
-            .expect("port 0 is NoC #0's");
+        let ch = range.channel();
+        let at = ch
+            .endpoint(Niu::Noc0, ch.cmfw_port())
+            .expect("CMFW's endpoint is NoC #0's");
         self.read_memory(window, at, range.offset(), out)
     }
 }

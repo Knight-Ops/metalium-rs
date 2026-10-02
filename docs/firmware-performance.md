@@ -217,6 +217,22 @@ dimension-order routing (`NoC/RoutingPaths.md`):
 | NoC #1 | 77 | 257 | 296 | 273 | 268 |
 | Alternating per entry (`write_noc::ALTERNATE`) | 85 | 146 | 182 | 250 | 263 |
 
+**Port option C: NoC #1 on port 0 for channels 4–7 (`DramChannel::noc1_port`).**
+Under tt-metal's assignment (port 1 on every channel) eight channels' NoC #1
+writes arrived over four rows. Port 0 of channels 4–7 sits in four other rows and
+is never CMFW's endpoint, so now each channel gets its own row:
+
+| Card writes on NoC #1 (64 KiB, cap 8), tiles | 4 | 16 | 64 | 120 |
+|---|--:|--:|--:|--:|
+| Port 1 everywhere (tt-metal) | 257 | 296 | 273 | 268 |
+| **Option C** | **299** | **421** | **382** | **378** |
+| Reads on NoC #0 + writes on NoC #1, option C | 312 | 427 | 384 | 396 |
+
+- **Card reads are unchanged:** 469 GB/s at 120 tiles.
+- **Every endpoint is still owned by one NoC,** and CMFW's endpoint never sees
+  NoC #1. The host reads and writes GDDR through CMFW's endpoint.
+- **Stress:** 60 s, then a 10-minute soak (1440 rounds, 127 GiB), on 120 tiles clean.
+
 **Alternating is not additive.** One core issues every request in order, so when
 NoC #0's path backs up B stalls on its initiator and stops feeding NoC #1 too. An
 independent NoC #1 issuer, NC, would not stall that way. The mode stays available,
@@ -327,6 +343,8 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-02 | — | Option C: NoC #1 owns port 0 on channels 4–7 (port 1 on 0–3), so its writes use eight rows instead of four. The host uses CMFW's endpoint | **Card writes on NoC #1, 120 tiles:** 268 → 378 GB/s.<br>**16 tiles:** 296 → 421.<br>**Reads + writes:** 344 → 396.<br>**Reads:** unchanged (469). |
+| 2026-10-02 | — | NC mover (`dm_nc`), `SIGNAL` / `WAIT_PEER`, `copy_pipeline` | NC costs what B does per entry. Split copies run 1.6× at 4 KiB entries on 1–16 tiles and converge at 120 |
 | 2026-10-02 | — | Tile movers default to an in-flight cap of 8 (`dm::TILE_IN_FLIGHT_CAP`); `write_noc::ALTERNATE` added | **Card reads:** 120 tiles 425 → 467 GB/s at 64 KiB, 496 at 16 KiB.<br>**One tile:** 3–4% off small reads.<br>**Writes:** unchanged.<br>**Alternating writes:** no gain at 120 tiles (263 against 268 on NoC #1).<br>**Stress (cap 8, all write modes):** 60 s clean. |
 | 2026-10-02 | 1790971715 | NoC ownership.<br>• Each GDDR endpoint is one NoC's (NoC #1 port 1; NoC #0 ports 0 and 2), refused otherwise.<br>• Every request on static VC 1.<br>• Writes may go out on NoC #1 (`dm::WRITE_NOC`); reads stay on NoC #0.<br>• The host fences through NoC #0's ports only. | **Card reads:** 120 tiles 127 → 429 GB/s, no collapse past 4.<br>**Card writes:** 52 → 266 GB/s on NoC #1, 161 on NoC #0.<br>**Card reads + writes:** 343.<br>**One port's writes:** 28.5 → 62.9 GB/s.<br>**Per entry:** 4 KiB reads 328 → 339 cycles, `WAIT` 115 → 136 (NIU chosen per request; issue specialised per NIU).<br>**Stress:** 10 min, 120 tiles, both NoCs, 133 GiB, clean. |
 | 2026-10-02 | 1790959226 | Experiment: every tile reading on NoC #1, and tiles split across NoCs | NoC #1 reads stuck at one link (4 tiles 86 GB/s, 120 tiles 58). Splitting tiles across NoCs on shared ports hung card 0 (SYS-1419). Replaced by the row above |
