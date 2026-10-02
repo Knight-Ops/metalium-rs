@@ -2,16 +2,19 @@
 //!
 //! As `step45_exp_family`: the device **bit for bit** to its programs
 //! (`tt_kernels::sfpu::ops::reference_op`), and the programs to `burn-flex`
-//! within the bounds derived on them (`SIN_BOUND`, `COS_BOUND`, `TAN_BOUND`) plus Flex's
+//! within the bounds derived on them (`SIN_BOUND`, `COS_BOUND`, `TAN_BOUND`,
+//! `ATAN_BOUND`, `ATAN2_BOUND`) plus Flex's
 //! own ulp -- for every finite input, the largest and the floats nearest a
 //! multiple of `pi/2` included (`trig_reduce`'s exact Payne-Hanek reduction).
-//! A zero-padding claim is held to the raw tiles.
+//! A zero-padding claim is held to the raw tiles. `atan2` reads a denormal
+//! operand as a zero of its sign (numerics row D), so those lanes are held to
+//! `f32::atan2` of the flushed pair.
 
 use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::ops::{
-    kind_sfpu::*, reference_op, Broadcast, COS_BOUND, SIN_BOUND, TAN_BOUND,
+    kind_sfpu::*, reference_op, Broadcast, ATAN2_BOUND, ATAN_BOUND, COS_BOUND, SIN_BOUND, TAN_BOUND,
 };
 use tt_kernels::tensor::{DramTensor, Eltwise, Pad};
 use tt_tests::backend::GATE_TILE;
@@ -209,6 +212,60 @@ fn sin_cos_and_tan_are_their_programs_within_their_bounds() {
                 }
             }
             s.free(a).unwrap();
+        }
+    });
+}
+
+#[test]
+fn atan_and_atan2_are_their_programs_within_their_bounds() {
+    let ftz = |x: f32| {
+        if x != 0.0 && x.abs() < f32::MIN_POSITIVE {
+            f32::from_bits(x.to_bits() & 0x8000_0000)
+        } else {
+            x
+        }
+    };
+    with_session(|s| {
+        for (r, c) in [(37, 70), (64, 128)] {
+            let (yv, xv) = (values(2, r * c), values(3, r * c));
+            let (y, x) = (s.upload(&yv, r, c).unwrap(), s.upload(&xv, r, c).unwrap());
+            let (fy, fx) = (flex(&yv, r, c), flex(&xv, r, c));
+            let want = host(fy.clone().atan());
+            let model = run(s, ATAN, &[&y], &[&yv], Broadcast::None, (r, c), "atan");
+            for i in 0..r * c {
+                close(
+                    model[i],
+                    want[i],
+                    ATAN_BOUND,
+                    0.0,
+                    &format!("atan({:e}) [{r}, {c}]", yv[i]),
+                );
+            }
+            let want = host(fy.atan2(fx));
+            let model = run(
+                s,
+                ATAN2,
+                &[&y, &x],
+                &[&yv, &xv],
+                Broadcast::None,
+                (r, c),
+                "atan2",
+            );
+            for i in 0..r * c {
+                let (a, b) = (yv[i], xv[i]);
+                let w = if ftz(a) != a || ftz(b) != b {
+                    ftz(a).atan2(ftz(b))
+                } else {
+                    want[i]
+                };
+                let what = format!("atan2({a:e}, {b:e}) [{r}, {c}]");
+                if w == 0.0 {
+                    assert_eq!(model[i].to_bits(), w.to_bits(), "{what}");
+                }
+                close(model[i], w, ATAN2_BOUND, 0.0, &what);
+            }
+            s.free(y).unwrap();
+            s.free(x).unwrap();
         }
     });
 }

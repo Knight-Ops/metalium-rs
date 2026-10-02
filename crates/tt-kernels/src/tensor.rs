@@ -1643,11 +1643,13 @@ impl Eltwise {
             MASK_FILL => b_zero || is_zero(s),
             MASK_WHERE => b_zero || c_zero,
             // 10.2d-f: `f(±0) = ±0`.
-            SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN => true,
+            SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN | ATAN => true,
             // `0^s = 0` for `s > 0`.
             POW_S => s > 0.0,
             // `g (1/2)` and `g 0 1`: zero with the gradient's padding.
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
+            // `atan2(+0, +0) = +0`.
+            ATAN2 => b_zero,
             _ => false,
         }
     }

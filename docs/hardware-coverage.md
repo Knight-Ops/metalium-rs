@@ -38,7 +38,7 @@ backward, `softmin`), so all seven of `tt-mnist`'s activations now move only wha
 ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9 (row AK). The
 runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
 Trig is under way (10.2f): `sin`, `cos` and `tan` are on the card for every finite
-input, by an exact Payne-Hanek reduction. Next: the inverses, `atan2`.
+input, by an exact Payne-Hanek reduction, and `atan`, `atan2`. Next: `asin`, `acos`.
 
 ### After 10.1
 
@@ -76,7 +76,7 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f in progress (trig: `sin`, `cos`, `tan`) |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f in progress (trig: `sin`, `cos`, `tan`, `atan`, `atan2`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
@@ -953,7 +953,25 @@ Each names the measurement it must move. The Burn-side ones are in
         too, as `r` is (worst measured 2.15 ulps); `x` itself below `2^-12`.
         Burn: `float_tan`, with Burn's autodiff (`g (tan^2 + 1)`, `tan`
         recomputed); `step46` watched failing with the odd quadrants'
-        negation dropped. Next: the inverses, `atan2`.
+        negation dropped. `atan_program`: `t G(t^2)` on `[0, 1]`, `G =
+        atan(sqrt s)/sqrt s` a Chebyshev fit (`ATAN_FIT`, degree 13; fit
+        0.11u, evaluation 1.33u over every 64th float of `[0, 1)`), and `pi/2
+        - atan(1/a)` beyond; within `ATAN_BOUND = 6.2u` (worst measured 1.82
+        ulps). `Piece` now carries its function (`Fit`), so every fit is
+        computed in the builder from `libm`, and the erfc pieces are unchanged
+        (`every_fit_and_its_evaluation_are_within_their_parts`).
+        `atan2_program`: the core of `min/max` of the magnitudes (both scaled
+        by `2^-64` above `2^100`, as `DIV`), then `pi/2 - v`, `pi - v` and
+        `y`'s sign; IEEE's special values over every pairing of 22 signed
+        specials; within `ATAN2_BOUND = 6.2u` (worst measured 2.75u over 60k
+        pairs). A denormal operand is a zero of its sign (numerics row D), so
+        `atan2` of two denormals is a zero's where the host's is their ratio's.
+        Same-shape operands only: a row broadcast is an unrolled program, and
+        `atan2`'s body 32 times over would not fit a slot -- burn-tt sends a
+        broadcast `atan2` to Flex. Burn: `float_atan`, `float_atan2`, with
+        Burn's autodiff of both (compositions on ops already on the card);
+        `step46` watched failing with `atan`'s `pi/2 - v` dropped. Next:
+        `asin`, `acos`.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1142,7 +1160,8 @@ path today, `~` when only some shapes do.
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
 | `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
-| inverse trig, `float_atan2` | | S4 (10.2f) |
+| `float_atan`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands, a broadcast Flex's) | S4 (10.2f) |
+| `float_asin`, `float_acos` | | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |

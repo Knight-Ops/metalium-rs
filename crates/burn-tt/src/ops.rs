@@ -398,6 +398,10 @@ pub mod float {
     // Within one ulp of Flex's correctly rounded quotient, not bit for bit:
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
+    // `atan2(lhs, rhs)` within `ops::ATAN2_BOUND`, a denormal operand read as
+    // a zero; tensors of one shape (a broadcast's row program would not fit
+    // a slot), others Flex's.
+    binary!(float_atan2, tt_kernels::sfpu::ops::kind_sfpu::ATAN2);
 
     /// `1/x` on the device where the data is, within one ulp of Flex's
     /// (`kind_sfpu::RECIP`), else Flex's.
@@ -1019,6 +1023,11 @@ pub mod float {
         float_tan,
         kind_sfpu::TAN,
         "`tan x` on the device where the data is, within `ops::TAN_BOUND` for every finite `x`, else Flex's."
+    );
+    unary_sfpu!(
+        float_atan,
+        kind_sfpu::ATAN,
+        "`atan x` on the device where the data is, within `ops::ATAN_BOUND`, else Flex's."
     );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is

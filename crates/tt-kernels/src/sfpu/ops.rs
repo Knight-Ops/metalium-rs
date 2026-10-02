@@ -144,8 +144,13 @@ pub mod kind_sfpu {
     /// `tan a`, within [`super::TAN_BOUND`] for every finite `a`
     /// (`super::tan_program`).
     pub const TAN: u32 = 0x13a;
+    /// `atan a`, within [`super::ATAN_BOUND`] (`super::atan_program`).
+    pub const ATAN: u32 = 0x13b;
+    /// `atan2(a, b)` as `f32::atan2` (`a` the `y`), within
+    /// [`super::ATAN2_BOUND`] (`super::atan2_program`).
+    pub const ATAN2: u32 = 0x13c;
     /// The last SFPU kind: the tests that run every kind go to it.
-    pub const LAST: u32 = TAN;
+    pub const LAST: u32 = ATAN2;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -233,7 +238,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD
-        | kind_sfpu::SIN..=kind_sfpu::TAN => Accuracy::Approximate,
+        | kind_sfpu::SIN..=kind_sfpu::ATAN2 => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -1277,14 +1282,170 @@ pub fn tan_program(p: &mut Program, spill: u32) {
     p.if_(Cond::LessEq(k, t), |p| p.loadi_bits(q, 0x7fc0_0000));
 }
 
-/// A Chebyshev fit of `erfcx(a) = e^(a^2) erfc(a)` over `[lo, hi)`, of degree
-/// `deg`: its error over every float of the interval is measured by
-/// `transcendental::the_erfcx_fit_and_its_evaluation_are_within_their_parts`.
+/// [`ATAN_FIT`]'s fit and evaluation together, relative, measured over every
+/// 64th float of `[0, 1)` (0.11u and 1.41u).
+pub const ATAN_FIT_BOUND: f64 = 1.6 / 16_777_216.0;
+/// [`atan_program`]'s and [`atan2_program`]'s derived bound, relative.
+pub const ATAN_BOUND: f64 = 6.2 / 16_777_216.0;
+/// The same for `atan2`.
+pub const ATAN2_BOUND: f64 = ATAN_BOUND;
+
+/// `atan t` for `t` in `[0, 1]` (in `L0`, raw bits; spilled at `spill`)
+/// into `L7`: `t G(t^2)`, `G` [`ATAN_FIT`] by Clenshaw. Every register
+/// scratch.
+fn atan_core(p: &mut Program, spill: u32) {
+    use LReg as R;
+    p.store(R::L0, Format::Int32, spill);
+    p.mul(R::L0, R::L0, R::L0);
+    clenshaw(p, ATAN_FIT, R::L6);
+    p.load(R::L1, Format::Int32, spill);
+    p.mul(R::L1, R::L6, R::L7);
+}
+
+/// `v` (in `L7`) to `hi + lo - v`, `hi + lo` a constant split in two
+/// (`pi/2`, `pi`): one rounding each. `L5` scratch.
+fn from_constant(p: &mut Program, c: f64) {
+    use LReg as R;
+    let hi = c as f32;
+    let lo = (c - hi as f64) as f32;
+    p.loadi(R::L5, hi);
+    p.sub(R::L5, R::L7, R::L7);
+    p.loadi(R::L5, lo);
+    p.add(R::L7, R::L5, R::L7);
+}
+
+/// `atan x` of `x` (in `L0`, raw bits) into `L7`: on `a = |x|`, [`atan_core`]
+/// of `a` up to 1 and `pi/2 - atan(1/a)` beyond, then `x`'s sign. Spills at
+/// `spill..spill + 128`.
+///
+/// Error, relative, in `u = 2^-24`: up to 1, `t = a` exact, `t^2` within
+/// `u`, which `G` carries scaled by `|s G'/G| <= 0.18`, `G` within
+/// [`ATAN_FIT_BOUND`] `= 1.6u`, the product `u`: `2.8u`. Beyond: `1/a` within
+/// `2u` (`recip`), which `atan` carries as `t/((1 + t^2) atan t)` and the
+/// result as `t/((1 + t^2) (pi/2 - atan t)) <= 0.64`: `1.27u`; the core's own
+/// `2.8u` weighed by `atan t/(pi/2 - atan t) <= 1`; the subtraction and the
+/// low part's add `2u` (the result is at least `pi/4`): under [`ATAN_BOUND`]
+/// `= 6.2u`. `x` itself below `|x| = 2^-12` (`x^2/3 < 2^-25`), bits and all;
+/// `±inf` give `±pi/2` (`1/inf = 0`), and so does every `|x|` from `2^126`,
+/// where `1/a` flushes; a NaN stays one.
+pub fn atan_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let sx = spill + 64;
+    p.store(R::L0, Format::Int32, sx);
+    p.loadi_bits(R::L7, 0x7fff_ffff);
+    p.and(R::L0, R::L7, R::L1);
+    p.if_(Cond::Less(R::ONE, R::L1), |p| {
+        p.loadi_bits(R::L6, f32::MAX.to_bits());
+        p.recip(R::L1, R::L0, R::L3, R::L4, R::L6);
+    });
+    p.if_(Cond::LessEq(R::L1, R::ONE), |p| p.mov(R::L1, R::L0));
+    atan_core(p, spill);
+    p.load(R::L0, Format::Int32, sx);
+    p.loadi_bits(R::L4, 0x7fff_ffff);
+    p.and(R::L0, R::L4, R::L1);
+    p.if_(Cond::Less(R::ONE, R::L1), |p| {
+        from_constant(p, std::f64::consts::FRAC_PI_2)
+    });
+    p.copy_sign(R::L7, R::L0, R::L4);
+    p.mov(R::L4, R::L7);
+    p.loadi_bits(R::L5, 0x3980_0000); // 2^-12
+    p.if_(Cond::Less(R::L1, R::L5), |p| p.mov(R::L0, R::L7));
+    p.loadi_bits(R::L5, 0x7f80_0000);
+    p.if_(Cond::Less(R::L5, R::L1), |p| {
+        p.loadi_bits(R::L7, 0x7fc0_0000)
+    });
+}
+
+/// `atan2(y, x)` of `y` (in `L0`) and `x` (in `L1`), raw bits, into `L7`, as
+/// `f32::atan2`: [`atan_core`] of `t = min/max` of the magnitudes, `pi/2 - v`
+/// where `|y| > |x|`, `pi - v` where `x`'s sign is set (`-0` included), then
+/// `y`'s sign. Spills at `spill..spill + 192`.
+///
+/// Error, relative, in `u = 2^-24`: `t` within `2u` (`divide`, both operands
+/// scaled by `2^-64` above `2^100`, exactly, as `DIV`'s), carried as
+/// in [`atan_program`]'s large branch, so each of the three forms is within
+/// its `6.2u`; `pi - w` with `w` within that adds its two roundings and
+/// weighs `w`'s error by `w/(pi - w) <= 1` against a result above `pi/2`:
+/// under [`ATAN2_BOUND`] `= 6.2u`. Special values as IEEE's: a zero `y`
+/// gives `±0` or `±pi` by `x`'s sign; a zero `x`, `±pi/2`; infinities `±pi/4`
+/// or `±3pi/4` together, an infinite `y` `±pi/2`, an infinite `x` `±0` or
+/// `±pi`; a NaN in either NaN. A denormal operand is a zero of its sign, as
+/// `SFPMAD` would read it (numerics row D): `atan2` of two denormals is a
+/// zero's, where the host's is that of their ratio.
+pub fn atan2_program(p: &mut Program, spill: u32) {
+    use LReg as R;
+    let (sy, sx) = (spill + 64, spill + 128);
+    p.store(R::L0, Format::Int32, sy);
+    p.store(R::L1, Format::Int32, sx);
+    // The magnitudes, a denormal as a zero.
+    let mags = |p: &mut Program, ay: LReg, ax: LReg| {
+        p.load(R::L0, Format::Int32, sy);
+        p.load(R::L1, Format::Int32, sx);
+        p.loadi_bits(R::L6, 0x7fff_ffff);
+        p.and(R::L0, R::L6, ay);
+        p.and(R::L1, R::L6, ax);
+        p.loadi_bits(R::L6, 0x0080_0000);
+        p.if_(Cond::Less(ay, R::L6), |p| p.mov(R::ZERO, ay));
+        p.if_(Cond::Less(ax, R::L6), |p| p.mov(R::ZERO, ax));
+    };
+    let (ay, ax, num, den) = (R::L2, R::L3, R::L4, R::L5);
+    mags(p, ay, ax);
+    p.mov(ay, num);
+    p.mov(ax, den);
+    p.if_(Cond::Less(ax, ay), |p| {
+        p.mov(ax, num);
+        p.mov(ay, den);
+    });
+    // Both by `2^-64` above `2^100`: `1/den` would be denormal and flush.
+    scale_large_divisor(p, num, den, R::L6, R::L7);
+    p.loadi_bits(R::L6, f32::MAX.to_bits());
+    p.recip(den, R::L7, R::L0, R::L1, R::L6);
+    p.loadi_bits(R::L6, 0x7f80_0000);
+    divide(p, num, den, R::L7, R::L0, R::L1, R::L2, R::L6);
+    // `0/0` (and `0/x`) is `0`; `inf/inf`, `1`.
+    p.if_(Cond::Eq0(num), |p| p.mov(R::ZERO, R::L0));
+    p.if_(Cond::LessEq(R::L6, num), |p| p.mov(R::ONE, R::L0));
+    atan_core(p, spill);
+    mags(p, ay, ax);
+    p.if_(Cond::Less(ax, ay), |p| {
+        from_constant(p, std::f64::consts::FRAC_PI_2)
+    });
+    p.if_(Cond::Lt0(R::L1), |p| from_constant(p, std::f64::consts::PI));
+    p.copy_sign(R::L7, R::L0, R::L4);
+    p.mov(R::L4, R::L7);
+    p.loadi_bits(R::L6, 0x7f80_0000);
+    p.if_(Cond::Less(R::L6, ay), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+    p.if_(Cond::Less(R::L6, ax), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+}
+
+/// The function a [`Piece`] fits, in `f64`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// `erfcx(a) = e^(a^2) erfc(a)` ([`erfcx64`]).
+    Erfcx,
+    /// `atan(sqrt s) / sqrt s`, `1` at `s = 0` (10.2f): `atan t = t G(t^2)`.
+    AtanSqrt,
+}
+
+impl Fit {
+    pub fn eval(self, x: f64) -> f64 {
+        match self {
+            Fit::Erfcx => erfcx64(x),
+            Fit::AtanSqrt if x == 0.0 => 1.0,
+            Fit::AtanSqrt => libm::atan(x.sqrt()) / x.sqrt(),
+        }
+    }
+}
+
+/// A Chebyshev fit of `fit` over `[lo, hi)`, of degree `deg`: its error over
+/// every float of the interval is measured by
+/// `transcendental::every_fit_and_its_evaluation_are_within_their_parts`.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Piece {
     pub lo: f64,
     pub hi: f64,
     pub deg: usize,
+    pub fit: Fit,
 }
 
 /// The fit [`erfc_mid`] uses: where `erf` is `1 - erfc` without loss.
@@ -1292,6 +1453,7 @@ pub const ERFC_MID: Piece = Piece {
     lo: 0.5,
     hi: 3.92,
     deg: 16,
+    fit: Fit::Erfcx,
 };
 /// The fit beyond it, for `erfc` itself (the normal CDF's far tail, `gelu`):
 /// to 9.3, past which `erfc` is below `2^-126` relative to anything it
@@ -1300,7 +1462,19 @@ pub const ERFC_TAIL: Piece = Piece {
     lo: 3.92,
     hi: 9.3,
     deg: 12,
+    fit: Fit::Erfcx,
 };
+/// `atan`'s core on `[0, 1]` ([`atan_program`]): `atan(sqrt s)/sqrt s` is
+/// analytic but for the branch point at `s = -1`, so the series falls as
+/// `(3 + sqrt 8)^-k`.
+pub const ATAN_FIT: Piece = Piece {
+    lo: 0.0,
+    hi: 1.0,
+    deg: 13,
+    fit: Fit::AtanSqrt,
+};
+/// Every piece a program uses, each fitted once.
+pub const PIECES: [Piece; 3] = [ERFC_MID, ERFC_TAIL, ATAN_FIT];
 pub const ERFC_LO: f64 = ERFC_MID.lo;
 pub const ERFC_HI: f64 = ERFC_MID.hi;
 pub const ERFC_DEG: usize = ERFC_MID.deg;
@@ -1310,33 +1484,32 @@ pub fn erfcx64(x: f64) -> f64 {
     libm::erfc(x) * (x * x).exp()
 }
 
-/// The Chebyshev coefficients of `erfcx` on `[ERFC_LO, ERFC_HI]`, `c_0`
-/// halved (`f = c_0 + sum c_k T_k(t)`), as `f32`, computed once from
-/// [`erfcx64`] at 64 Chebyshev nodes -- in the builder, so no coefficient is
-/// transcribed from anywhere. `erfcx` is entire and smooth here, so the
-/// series converges fast; the truncation and the rounding of each
-/// coefficient to `f32` are both inside the measured fit error.
+/// The Chebyshev coefficients of `erfcx` on `[ERFC_LO, ERFC_HI]` ([`piece_cheb`]
+/// of [`ERFC_MID`]).
 pub fn erfcx_cheb() -> &'static [f32] {
     piece_cheb(ERFC_MID)
 }
 
-/// [`erfcx_cheb`] for any [`Piece`] of the two.
+/// The Chebyshev coefficients of `piece`'s function on its interval, `c_0`
+/// halved (`f = c_0 + sum c_k T_k(t)`), as `f32`, computed once from
+/// [`Fit::eval`] at 64 Chebyshev nodes -- in the builder, so no coefficient
+/// is transcribed from anywhere. Each function is smooth on its interval, so
+/// the series converges fast; the truncation and the rounding of each
+/// coefficient to `f32` are both inside the measured fit error.
 pub fn piece_cheb(piece: Piece) -> &'static [f32] {
-    static MID: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-    static TAIL: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-    let cell = if piece == ERFC_MID {
-        &MID
-    } else {
-        assert_eq!(piece, ERFC_TAIL);
-        &TAIL
-    };
-    cell.get_or_init(|| {
+    static CELLS: [std::sync::OnceLock<Vec<f32>>; PIECES.len()] =
+        [const { std::sync::OnceLock::new() }; PIECES.len()];
+    let i = PIECES
+        .iter()
+        .position(|q| *q == piece)
+        .expect("a piece of `PIECES`");
+    CELLS[i].get_or_init(|| {
         let m = 64usize;
         let (mid, half) = ((piece.hi + piece.lo) / 2.0, (piece.hi - piece.lo) / 2.0);
         let f: Vec<f64> = (0..m)
             .map(|j| {
                 let th = std::f64::consts::PI * (j as f64 + 0.5) / m as f64;
-                erfcx64(mid + half * th.cos())
+                piece.fit.eval(mid + half * th.cos())
             })
             .collect();
         (0..=piece.deg)
@@ -1381,7 +1554,7 @@ pub fn piece_clenshaw_f32(piece: Piece, a: f32) -> f32 {
     g(fma_bh(f(t), f(b1), f(tmp)))
 }
 
-/// `t = s1 a + s0` maps `[ERFC_LO, ERFC_HI]` to `[-1, 1]`.
+/// `t = s1 a + s0` maps `piece`'s interval to `[-1, 1]`.
 fn clenshaw_map(piece: Piece) -> (f32, f32) {
     let s1 = 2.0 / (piece.hi - piece.lo);
     let s0 = -(piece.hi + piece.lo) / (piece.hi - piece.lo);
@@ -1532,7 +1705,7 @@ pub const ERFC_BOUND: f64 = 10.5 / 16_777_216.0;
 /// exponential of an exact argument), `u` (`lo`'s first-order correction drops
 /// `lo^2/2 < 2^-46`), the Clenshaw sum's measured error (under 5u, mostly the
 /// interval map `t = s1 a + s0` rounded) and the fit's (under 0.25u; both over
-/// every float, `the_erfcx_fit_and_its_evaluation_are_within_their_parts`), and
+/// every float, `every_fit_and_its_evaluation_are_within_their_parts`), and
 /// two roundings, `2u` -- [`ERFC_BOUND`] `= 10.5u` -- of which `erf` takes at
 /// most `0.92`, plus the subtraction's `u`: under [`ERF_BOUND`] `= 10.5u` in
 /// all. A denormal flushes
@@ -1946,7 +2119,8 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::POW_I
         | kind_sfpu::SIGMOID_BACKWARD
         | kind_sfpu::GELU_BACKWARD
-        | kind_sfpu::LOG_SIGMOID_BACKWARD => Operands::Binary,
+        | kind_sfpu::LOG_SIGMOID_BACKWARD
+        | kind_sfpu::ATAN2 => Operands::Binary,
         kind_sfpu::MASK_WHERE => Operands::Ternary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
@@ -1967,7 +2141,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID
-        | kind_sfpu::SIN..=kind_sfpu::TAN => Operands::Unary,
+        | kind_sfpu::SIN..=kind_sfpu::ATAN => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2685,6 +2859,23 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
+        }
+        kind_sfpu::ATAN => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                atan_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::ATAN2 => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                p.load(LReg::L1, Format::Int32, B_ROW + o);
+                atan2_program(p, super::kernel::SPILL_ROW + o);
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Binary
         }
         kind_sfpu::TAN => {
             p.for_each_row_group(64, |p, o| {
@@ -3849,6 +4040,120 @@ mod transcendental {
         sweep(kind_sfpu::TAN, trig_inputs(), libm::tan, TAN_BOUND);
     }
 
+    #[test]
+    fn atan_is_within_its_derived_bound() {
+        let specials = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x397f_ffff),
+            f32::from_bits(0x3980_0000),
+            f32::from_bits(0x3f7f_ffff),
+            1.0,
+            f32::from_bits(0x3f80_0001),
+            16_777_216.0,
+            f32::from_bits(0x7e7f_ffff),
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        sweep(
+            kind_sfpu::ATAN,
+            grid(-50.0, 50.0, 40_000)
+                .chain(grid(-1.0, 1.0, 40_000))
+                .chain(grid(0.98, 1.02, 10_000))
+                .chain(binades(64))
+                .chain(specials)
+                .flat_map(|x| [x, -x]),
+            libm::atan,
+            ATAN_BOUND,
+        );
+    }
+
+    /// `atan2` over every pairing of signed specials -- as `f32::atan2` but for
+    /// a denormal operand, which the device reads as a zero of its sign (and
+    /// `f32::atan2` of the flushed pair is the answer) -- and over pairs across
+    /// every binade and the four quadrants, within [`ATAN2_BOUND`] of
+    /// `libm::atan2` in `f64`.
+    #[test]
+    fn atan2_has_ieee_s_special_values_and_is_within_its_bound() {
+        let ftz = |x: f32| {
+            if x != 0.0 && x.abs() < f32::MIN_POSITIVE {
+                f32::from_bits(x.to_bits() & 0x8000_0000)
+            } else {
+                x
+            }
+        };
+        let mags = [
+            0.0f32,
+            1.0e-40,
+            f32::MIN_POSITIVE,
+            1.0e-30,
+            0.5,
+            1.0,
+            2.0,
+            1.0e30,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let signed: Vec<f32> = mags.iter().flat_map(|m| [*m, -*m]).collect();
+        let mut pairs: Vec<(f32, f32)> = signed
+            .iter()
+            .flat_map(|&y| signed.iter().map(move |&x| (y, x)))
+            .collect();
+        let mut st = 0x2545_f491u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for _ in 0..60_000 {
+            let (a, b) = (rnd(), rnd());
+            // Any finite normal, or within a few binades of each other.
+            let y = f32::from_bits(a % 0x7f00_0000 + 0x0080_0000);
+            let x = if b % 2 == 0 {
+                f32::from_bits(b % 0x7f00_0000 + 0x0080_0000)
+            } else {
+                y * (1.0 + (b >> 8) as f32 / 16_777_216.0 * 8.0)
+            };
+            let (sy, sx) = (rnd() % 2 == 0, rnd() % 2 == 0);
+            pairs.push((if sy { -y } else { y }, if sx { -x } else { x }));
+        }
+        let u = 1.0 / 16_777_216.0;
+        let mut worst = 0.0f64;
+        for chunk in pairs.chunks(1024) {
+            let mut y: Vec<f32> = chunk.iter().map(|p| p.0).collect();
+            let mut x: Vec<f32> = chunk.iter().map(|p| p.1).collect();
+            y.resize(1024, 1.0);
+            x.resize(1024, 1.0);
+            let got = reference(kind_sfpu::ATAN2, 0.0, &y, Some(&x), 32, 32);
+            for (i, &(y, x)) in chunk.iter().enumerate() {
+                let (fy, fx) = (ftz(y), ftz(x));
+                let g = got[i];
+                let want = fy.atan2(fx);
+                let what = format!("atan2({y:e}, {x:e}) = {g:e}, f32::atan2 {want:e}");
+                if want.is_nan() {
+                    assert!(g.is_nan(), "{what}");
+                    continue;
+                }
+                let w = libm::atan2(fy as f64, fx as f64);
+                if w == 0.0 || w.abs() < f32::MIN_POSITIVE as f64 {
+                    // The zeros' signs, and a quotient below the normals
+                    // flushed to one.
+                    assert_eq!(g.to_bits() & 0x7fff_ffff, 0, "{what}");
+                    assert_eq!(g.is_sign_negative(), want.is_sign_negative(), "{what}");
+                    continue;
+                }
+                let rel = (g as f64 - w).abs() / w.abs();
+                worst = worst.max(rel);
+                assert!(rel <= ATAN2_BOUND, "{what}: {:.2}u", rel / u);
+            }
+        }
+        println!("atan2: worst {:.3}u over {} pairs", worst / u, pairs.len());
+    }
+
     /// A NaN of either sign and any payload comes out a NaN from every
     /// approximation: `SFPABS` leaves a negative NaN negative, which made
     /// `exp(-NaN)` `0` and `recip(-NaN)` `-inf` until 10.2e masked the sign.
@@ -3879,13 +4184,15 @@ mod transcendental {
         }
     }
 
-    /// The two measured parts of [`ERF_BOUND`], over every float of
-    /// `[ERFC_LO, ERFC_HI)` (every 64th in a debug build): the fit -- the
-    /// `f32` coefficients' series, summed exactly, against `erfcx` -- and its
-    /// evaluation -- the SFPU's Clenshaw sum (`fma_bh`) against that exact sum.
+    /// The two measured parts of each fit's error, over every float of its
+    /// interval (every 64th in a debug build): the fit -- the `f32`
+    /// coefficients' series, summed exactly, against the function -- and its
+    /// evaluation -- the SFPU's Clenshaw sum (`fma_bh`) against that exact
+    /// sum. [`ERF_BOUND`] allows the erfc pieces 5.25u together,
+    /// [`ATAN_BOUND`] the atan piece [`ATAN_FIT_BOUND`].
     #[test]
-    fn the_erfcx_fit_and_its_evaluation_are_within_their_parts() {
-        for piece in [ERFC_MID, ERFC_TAIL] {
+    fn every_fit_and_its_evaluation_are_within_their_parts() {
+        for piece in PIECES {
             let c = piece_cheb(piece);
             let (mid, half) = ((piece.hi + piece.lo) / 2.0, (piece.hi - piece.lo) / 2.0);
             let exact_sum = |a: f64| {
@@ -3898,26 +4205,36 @@ mod transcendental {
                 }
                 c[0] as f64 + t * b1 - b2
             };
-            let stride = if cfg!(debug_assertions) { 64 } else { 1 };
+            // `[0, 1)` holds 2^30 floats: every 64th of them.
+            let stride = match (piece.fit, cfg!(debug_assertions)) {
+                (Fit::Erfcx, false) => 1,
+                (Fit::Erfcx, true) => 64,
+                (_, false) => 64,
+                (_, true) => 4096,
+            };
             let (lo, hi) = ((piece.lo as f32).to_bits(), (piece.hi as f32).to_bits());
             let (mut fit, mut eval) = (0.0f64, 0.0f64);
             for b in (lo..hi).step_by(stride) {
                 let a = f32::from_bits(b);
                 let s = exact_sum(a as f64);
-                fit = fit.max((s - erfcx64(a as f64)).abs() / erfcx64(a as f64));
+                let f = piece.fit.eval(a as f64);
+                fit = fit.max((s - f).abs() / f);
                 eval = eval.max((piece_clenshaw_f32(piece, a) as f64 - s).abs() / s);
             }
             let u = 1.0 / 16_777_216.0;
             println!(
-                "erfcx on {piece:?}: fit {:.3}u, evaluation {:.3}u",
+                "{piece:?}: fit {:.3}u, evaluation {:.3}u",
                 fit / u,
                 eval / u
             );
-            // `ERFC_BOUND` allows the two together 5.25u: the evaluation's
-            // map rounding dominates the first piece, the coefficients'
-            // rounding to `f32` the second's fit.
+            // The erfc pieces: the evaluation's map rounding dominates the
+            // first, the coefficients' rounding to `f32` the second's fit.
+            let budget = match piece.fit {
+                Fit::Erfcx => 5.25 * u,
+                Fit::AtanSqrt => ATAN_FIT_BOUND,
+            };
             assert!(
-                fit + eval < 5.25 * u,
+                fit + eval < budget,
                 "{piece:?}: fit {fit:e}, evaluation {eval:e}"
             );
         }

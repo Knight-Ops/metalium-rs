@@ -129,6 +129,8 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_sin",
             "float_cos",
             "float_tan",
+            "float_atan",
+            "float_atan2",
         ],
     ),
     (

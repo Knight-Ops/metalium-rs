@@ -664,11 +664,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_asinh(tensor)
     }
     fn float_atan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_atan(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_atan(tensor)
     }
     fn float_atanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_atanh(tensor)
@@ -677,11 +673,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&lhs);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_atan2(lhs.into_flex(), rhs.into_flex()),
-            device,
-        )
+        crate::ops::float::float_atan2(lhs, rhs)
     }
     fn float_round(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let device = HasDevice::tt_device(&tensor);

@@ -824,7 +824,7 @@ fn hyperbolics_and_log_sigmoid_stay_on_the_card_within_their_bounds() {
 #[test]
 fn trig_stays_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
-    use tt_kernels::sfpu::ops::{COS_BOUND, SIN_BOUND, TAN_BOUND};
+    use tt_kernels::sfpu::ops::{ATAN2_BOUND, ATAN_BOUND, COS_BOUND, SIN_BOUND, TAN_BOUND};
     let u = 1.0 / 16_777_216.0;
     with_device(Config::default(), |d| {
         let [r, c] = [64, 128];
@@ -871,6 +871,16 @@ fn trig_stays_on_the_card_within_their_bounds() {
         check(&got, &host(fx.clone().cos()), COS_BOUND, "cos");
         let got = vals(resident("tan", || x.clone().tan()), "tan");
         check(&got, &host(fx.clone().tan()), TAN_BOUND, "tan");
+        let got = vals(resident("atan", || x.clone().atan()), "atan");
+        check(&got, &host(fx.clone().atan()), ATAN_BOUND, "atan");
+        // `floats` has no denormals, which `atan2` reads as zeros.
+        let got = vals(resident("atan2", || x.clone().atan2(g.clone())), "atan2");
+        check(
+            &got,
+            &host(fx.clone().atan2(fg.clone())),
+            ATAN2_BOUND,
+            "atan2",
+        );
 
         // Autodiff: `d/dx sum(sin(x) g) = g cos x`, `d/dx sum(cos(x) g) = -g
         // sin x` -- each the other's kind, then a product (one rounding on each
@@ -905,5 +915,38 @@ fn trig_stays_on_the_card_within_their_bounds() {
             .backward();
         let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
         check(&got, &want, 2.0 * TAN_BOUND + 4.0 * u, "autodiff tan");
+        // `atan`: `g / (x^2 + 1)`; `atan2(y, x)`: `g x / (x^2 + y^2)` and `-g y
+        // / (x^2 + y^2)` -- Burn's compositions on ops already on the card,
+        // the host's roundings but the reciprocal's or the quotient's (an ulp,
+        // `2u`), which the products after it carry: within `6u` and `8u`.
+        let xa = Tensor::<Ad, 2>::from_inner(x.clone()).require_grad();
+        let gs = (xa.clone().atan() * Tensor::<Ad, 2>::from_inner(g.clone()))
+            .sum()
+            .backward();
+        let got = xa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        let fa = Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad();
+        let gs = (fa.clone().atan() * Tensor::<Fd, 2>::from_inner(fg.clone()))
+            .sum()
+            .backward();
+        let want = fa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        check(&got, &want, 6.0 * u, "autodiff atan");
+        let (ya, xb) = (
+            Tensor::<Ad, 2>::from_inner(x.clone()).require_grad(),
+            Tensor::<Ad, 2>::from_inner(g.clone()).require_grad(),
+        );
+        let gs = ya.clone().atan2(xb.clone()).sum().backward();
+        let (got_y, got_x) = (
+            ya.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap(),
+            xb.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap(),
+        );
+        let (fya, fxb) = (
+            Tensor::<Fd, 2>::from_inner(fx.clone()).require_grad(),
+            Tensor::<Fd, 2>::from_inner(fg.clone()).require_grad(),
+        );
+        let gs = fya.clone().atan2(fxb.clone()).sum().backward();
+        let want_y = fya.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        let want_x = fxb.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+        check(&got_y, &want_y, 8.0 * u, "autodiff atan2 dy");
+        check(&got_x, &want_x, 8.0 * u, "autodiff atan2 dx");
     });
 }
