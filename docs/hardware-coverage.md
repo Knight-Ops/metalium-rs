@@ -37,8 +37,10 @@ and both backwards, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `log_sigmoid` and
 backward, `softmin`), so all seven of `tt-mnist`'s activations now move only what
 ReLU's step moves -- gelu trains at 2.4 / 1.5 ms/step, from 5.6 / 4.9 (row AK). The
 runner repeats blocks (X8), so long programs (`pow`, `gelu`) are one op.
-Trig is under way (10.2f): `sin`, `cos` and `tan` are on the card for every finite
-input, by an exact Payne-Hanek reduction, and `atan`, `atan2`. Next: `asin`, `acos`.
+Trigonometry is on the card (10.2f): `sin`, `cos` and `tan` for every finite input, by
+an exact Payne-Hanek reduction, and `atan`, `atan2`, `asin`, `acos`, each within a
+derived bound of a few ulps and through Burn's autodiff -- so S4 is done. 10.2 is
+open only for 10.2a's `[~]`: its gate runs 17 of 21 cases on ttsim (row 70).
 
 ### After 10.1
 
@@ -76,7 +78,7 @@ only a feature list.
 |--:|---|---|---|
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
-| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f in progress (trig: `sin`, `cos`, `tan`, `atan`, `atan2`) |
+| 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[~]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
@@ -815,10 +817,10 @@ Each names the measurement it must move. The Burn-side ones are in
       half shifted by 22. ttsim runs 17 of the 21 (row 70: `SFPLUTFP32` only at
       `Mod1` 2 and 6, and no `Mod1Mirror`); silicon all 21, both cards. No program
       depends on `SFPLUTFP32`: polynomials are `SFPMAD`'s, which ttsim runs.
-- [~] **S4 Transcendentals.** Done: `exp`, `log` (10.1). Range reduction by
-      `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`, `SFPSHFT`),
-      polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding of `x log2
-      e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
+- [x] **S4 Transcendentals.** `exp`, `log` (10.1); the rest in 10.2d-f below. Range
+      reduction by `SFPEXEXP`/`SFPSETEXP` and integer exponent arithmetic (`SFPIADD`,
+      `SFPSHFT`), polynomials in Horner form by `SFPMAD`. `exp`: magic-number rounding
+      of `x log2 e`, Cody-Waite reduction, degree-7 Taylor, `2^n` added to the exponent field;
       bound `ops::EXP_BOUND = 1.3e-7` relative, derived on `exp_program`. `log`: `x =
       2^e m`, `m` in `[sqrt(2)/2, sqrt(2))`, `2 atanh(f/(2+f))` through the corrected
       division, `e ln2` in two parts; bound `ops::LOG_BOUND = 7.12 * 2^-24` relative,
@@ -923,7 +925,7 @@ Each names the measurement it must move. The Burn-side ones are in
         the softmax's bound (`step32_burn_softmax`, both dims, three shapes, and
         on the host below eight tiles; watched failing with the negation
         off). Next: `sin`/`cos` and the rest (10.2f).
-  - [~] **10.2f Trigonometry.** `trig_reduce`: Payne and Hanek's reduction
+  - [x] **10.2f Trigonometry.** `trig_reduce`: Payne and Hanek's reduction
         by `pi/2` in exact fixed point, for every finite `x` -- a 92-bit window
         of `2/pi` cut per lane at the exponent (23-bit limbs, five conditional
         shifts and a funnel by register shifts, `Program::shl_by`), `M W mod
@@ -970,8 +972,18 @@ Each names the measurement it must move. The Burn-side ones are in
         `atan2`'s body 32 times over would not fit a slot -- burn-tt sends a
         broadcast `atan2` to Flex. Burn: `float_atan`, `float_atan2`, with
         Burn's autodiff of both (compositions on ops already on the card);
-        `step46` watched failing with `atan`'s `pi/2 - v` dropped. Next:
-        `asin`, `acos`.
+        `step46` watched failing with `atan`'s `pi/2 - v` dropped.
+        `asin_acos_program`: one core of `a` up to 0.7, else of `z =
+        sqrt((1 - a)/2)` (`1 - a` exact), as `asin t = t + t^3 K(t^2)` --
+        `K` a Chebyshev fit of the correction (`ASIN_FIT`, degree 16: fitting
+        `asin t/t` itself cost an ulp of the binade above 1, 0.83u that no
+        degree removed) -- then `pi/2 - 2v`, `2v`, `pi - 2v` by branch and
+        sign. The switch at 0.7, not 1/2, keeps `2v` below the result it is
+        taken from. Within `ASIN_BOUND = 6.8u`, `ACOS_BOUND = 4.7u` (worst
+        measured 1.39 and 1.13 ulps); beyond 1 NaN by name. Burn:
+        `float_asin`, `float_acos`, with Burn's autodiff (`g/sqrt(1 - x^2)`);
+        `step46` watched failing with `acos`'s `pi - 2v` dropped. Cost per
+        tile (row AL): `atan` 15.0 us, `asin` 17.8, `acos` 17.0, `tan` 28.0.
 - [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
@@ -1160,8 +1172,7 @@ path today, `~` when only some shapes do.
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
 | `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
-| `float_atan`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands, a broadcast Flex's) | S4 (10.2f) |
-| `float_asin`, `float_acos` | | S4 (10.2f) |
+| `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands, a broadcast Flex's) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | x (SFPU, exact value) | R1 |

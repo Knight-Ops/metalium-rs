@@ -554,6 +554,10 @@ fn sfpu_transcendental_cost() {
         ("gelu", GELU),
         ("sin", SIN),
         ("cos", COS),
+        ("tan", TAN),
+        ("atan", ATAN),
+        ("asin", ASIN),
+        ("acos", ACOS),
     ];
     if let Err(e) = fork_scope(|| {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1))

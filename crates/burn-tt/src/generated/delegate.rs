@@ -644,21 +644,13 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_tanh(tensor)
     }
     fn float_acos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_acos(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_acos(tensor)
     }
     fn float_acosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_acosh(tensor)
     }
     fn float_asin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_asin(tensor.into_flex()),
-            device,
-        )
+        crate::ops::float::float_asin(tensor)
     }
     fn float_asinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         crate::ops::float::float_asinh(tensor)

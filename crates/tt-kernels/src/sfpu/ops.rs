@@ -149,8 +149,12 @@ pub mod kind_sfpu {
     /// `atan2(a, b)` as `f32::atan2` (`a` the `y`), within
     /// [`super::ATAN2_BOUND`] (`super::atan2_program`).
     pub const ATAN2: u32 = 0x13c;
+    /// `asin a`, within [`super::ASIN_BOUND`] (`super::asin_acos_program`).
+    pub const ASIN: u32 = 0x13d;
+    /// `acos a`, within [`super::ACOS_BOUND`].
+    pub const ACOS: u32 = 0x13e;
     /// The last SFPU kind: the tests that run every kind go to it.
-    pub const LAST: u32 = ATAN2;
+    pub const LAST: u32 = ACOS;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -238,7 +242,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::GELU
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID_BACKWARD
-        | kind_sfpu::SIN..=kind_sfpu::ATAN2 => Accuracy::Approximate,
+        | kind_sfpu::SIN..=kind_sfpu::ACOS => Accuracy::Approximate,
         _ => Accuracy::Exact,
     }
 }
@@ -1290,16 +1294,29 @@ pub const ATAN_BOUND: f64 = 6.2 / 16_777_216.0;
 /// The same for `atan2`.
 pub const ATAN2_BOUND: f64 = ATAN_BOUND;
 
-/// `atan t` for `t` in `[0, 1]` (in `L0`, raw bits; spilled at `spill`)
-/// into `L7`: `t G(t^2)`, `G` [`ATAN_FIT`] by Clenshaw. Every register
-/// scratch.
-fn atan_core(p: &mut Program, spill: u32) {
+/// `t G(t^2)` for `t` in `[0, sqrt piece.hi]` (in `L0`, raw bits; spilled at
+/// `spill`) into `L7`, `G` `piece`'s fit by Clenshaw: `atan t` for
+/// [`ATAN_FIT`], `asin t` for [`ASIN_FIT`]. Every register scratch.
+fn odd_core(p: &mut Program, spill: u32, piece: Piece) {
     use LReg as R;
     p.store(R::L0, Format::Int32, spill);
     p.mul(R::L0, R::L0, R::L0);
-    clenshaw(p, ATAN_FIT, R::L6);
+    clenshaw(p, piece, R::L6);
     p.load(R::L1, Format::Int32, spill);
     p.mul(R::L1, R::L6, R::L7);
+}
+
+/// `asin t` for `t` in `[0, 0.7]` (in `L0`, raw bits; spilled at `spill`)
+/// into `L7`: `t + t^3 K(t^2)`, `K` [`ASIN_FIT`] by Clenshaw, the last step
+/// one multiply-add. Every register scratch.
+fn asin_core(p: &mut Program, spill: u32) {
+    use LReg as R;
+    p.store(R::L0, Format::Int32, spill);
+    p.mul(R::L0, R::L0, R::L0);
+    clenshaw(p, ASIN_FIT, R::L6);
+    p.load(R::L1, Format::Int32, spill);
+    p.mul(R::L1, R::L0, R::L2);
+    p.mad(R::L2, R::L6, R::L1, R::L7);
 }
 
 /// `v` (in `L7`) to `hi + lo - v`, `hi + lo` a constant split in two
@@ -1314,7 +1331,7 @@ fn from_constant(p: &mut Program, c: f64) {
     p.add(R::L7, R::L5, R::L7);
 }
 
-/// `atan x` of `x` (in `L0`, raw bits) into `L7`: on `a = |x|`, [`atan_core`]
+/// `atan x` of `x` (in `L0`, raw bits) into `L7`: on `a = |x|`, [`odd_core`]
 /// of `a` up to 1 and `pi/2 - atan(1/a)` beyond, then `x`'s sign. Spills at
 /// `spill..spill + 128`.
 ///
@@ -1339,7 +1356,7 @@ pub fn atan_program(p: &mut Program, spill: u32) {
         p.recip(R::L1, R::L0, R::L3, R::L4, R::L6);
     });
     p.if_(Cond::LessEq(R::L1, R::ONE), |p| p.mov(R::L1, R::L0));
-    atan_core(p, spill);
+    odd_core(p, spill, ATAN_FIT);
     p.load(R::L0, Format::Int32, sx);
     p.loadi_bits(R::L4, 0x7fff_ffff);
     p.and(R::L0, R::L4, R::L1);
@@ -1357,7 +1374,7 @@ pub fn atan_program(p: &mut Program, spill: u32) {
 }
 
 /// `atan2(y, x)` of `y` (in `L0`) and `x` (in `L1`), raw bits, into `L7`, as
-/// `f32::atan2`: [`atan_core`] of `t = min/max` of the magnitudes, `pi/2 - v`
+/// `f32::atan2`: [`odd_core`] of `t = min/max` of the magnitudes, `pi/2 - v`
 /// where `|y| > |x|`, `pi - v` where `x`'s sign is set (`-0` included), then
 /// `y`'s sign. Spills at `spill..spill + 192`.
 ///
@@ -1405,7 +1422,7 @@ pub fn atan2_program(p: &mut Program, spill: u32) {
     // `0/0` (and `0/x`) is `0`; `inf/inf`, `1`.
     p.if_(Cond::Eq0(num), |p| p.mov(R::ZERO, R::L0));
     p.if_(Cond::LessEq(R::L6, num), |p| p.mov(R::ONE, R::L0));
-    atan_core(p, spill);
+    odd_core(p, spill, ATAN_FIT);
     mags(p, ay, ax);
     p.if_(Cond::Less(ax, ay), |p| {
         from_constant(p, std::f64::consts::FRAC_PI_2)
@@ -1418,6 +1435,84 @@ pub fn atan2_program(p: &mut Program, spill: u32) {
     p.if_(Cond::Less(R::L6, ax), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
 }
 
+/// [`ASIN_FIT`]'s fit and evaluation together, relative to `K`, measured over
+/// every 64th float of `[0, 0.49)` (0.41u and 1.72u).
+pub const ASIN_FIT_BOUND: f64 = 2.2 / 16_777_216.0;
+/// [`asin_acos_program`]'s derived bound for `asin`, relative.
+pub const ASIN_BOUND: f64 = 6.8 / 16_777_216.0;
+/// The same for `acos`.
+pub const ACOS_BOUND: f64 = 4.7 / 16_777_216.0;
+
+/// `asin x` or `acos x` of `x` (in `L0`, raw bits) into `L7`, on `a = |x|`
+/// and `z = sqrt((1 - a)/2)` -- `1 - a` exact from `a = 1/2` (Sterbenz), the
+/// halving too -- through one [`asin_core`]: up to `a = 0.7` of `a` itself,
+/// `asin x = sign(x) v` and `acos x = pi/2 - sign(x) v`; beyond, of `z`,
+/// `asin x = sign(x) (pi/2 - 2v)`, and `acos x = 2v` or `pi - 2v` by `x`'s
+/// sign. The switch at 0.7 rather than 1/2 keeps `2v` below the result it is
+/// taken from (`2 asin(0.387) = 0.80 < pi/2 - 0.80`). Spills at `spill..spill
+/// + 128`.
+///
+/// Error, relative, in `u = 2^-24`: the core of `t` exact: `t^3` within `2u`
+/// (`t^2` and the product), `K` within [`ASIN_FIT_BOUND`] `= 2.2u`, the
+/// multiply-add's product a further `u`: the correction within `5.2u` of
+/// itself and at most `0.105` of the result, `0.55u`, and the last rounding
+/// `u`: `1.55u`. `z` is within `3u` (`sqrt_program`, 1.5 ulps), which
+/// `asin` carries by `z/(sqrt(1 - z^2) asin z) <= 1.03`: the core of `z`
+/// within `4.64u`. `asin`: up to 0.7, `1.55u`; beyond, `2v`'s `4.64u` weighed
+/// by `2v/(pi/2 - 2v) <= 1.03`, and two roundings: `6.78u`. `acos`: up to
+/// 0.7, `v`'s `1.55u` weighed by `v/(pi/2 - |v|) <= 0.98`, and two roundings:
+/// `3.52u`; beyond, `2v` itself (`4.64u`) or `pi - 2v` (weight `0.34`, two
+/// roundings: `3.58u`). Under [`ASIN_BOUND`] `= 6.8u`, [`ACOS_BOUND`] `=
+/// 4.7u`. `asin` is `x` itself below `|x| = 2^-12` (`x^2/6 < 2^-25`), bits
+/// and all; beyond 1, `±inf` included, NaN by name; a NaN stays one.
+pub fn asin_acos_program(p: &mut Program, spill: u32, acos: bool) {
+    use LReg as R;
+    let sx = spill + 64;
+    let switch = 0.7f32;
+    p.store(R::L0, Format::Int32, sx);
+    p.loadi_bits(R::L7, 0x7fff_ffff);
+    p.and(R::L0, R::L7, R::L1);
+    p.sub(R::ONE, R::L1, R::L2);
+    p.loadi(R::L3, 0.5);
+    p.mul(R::L2, R::L3, R::L2);
+    sqrt_program(p, R::L2, R::L0, false);
+    p.load(R::L3, Format::Int32, sx);
+    p.loadi_bits(R::L7, 0x7fff_ffff);
+    p.and(R::L3, R::L7, R::L1);
+    p.loadi(R::L7, switch);
+    p.if_(Cond::LessEq(R::L1, R::L7), |p| p.mov(R::L1, R::L0));
+    asin_core(p, spill);
+    let (x, a, k) = (R::L0, R::L1, R::L2);
+    p.load(x, Format::Int32, sx);
+    p.loadi_bits(k, 0x7fff_ffff);
+    p.and(x, k, a);
+    p.loadi(k, switch);
+    if acos {
+        p.if_else(
+            Cond::LessEq(a, k),
+            |p| {
+                // `pi/2 - sign(x) v`.
+                p.if_(Cond::Lt0(x), |p| p.neg(R::L7, R::L7));
+                from_constant(p, std::f64::consts::FRAC_PI_2);
+            },
+            |p| {
+                p.add(R::L7, R::L7, R::L7);
+                p.if_(Cond::Lt0(x), |p| from_constant(p, std::f64::consts::PI));
+            },
+        );
+    } else {
+        p.if_(Cond::Less(k, a), |p| {
+            p.add(R::L7, R::L7, R::L7);
+            from_constant(p, std::f64::consts::FRAC_PI_2);
+        });
+        p.copy_sign(R::L7, x, R::L4);
+        p.mov(R::L4, R::L7);
+        p.loadi_bits(k, 0x3980_0000); // 2^-12
+        p.if_(Cond::Less(a, k), |p| p.mov(x, R::L7));
+    }
+    p.if_(Cond::Less(R::ONE, a), |p| p.loadi_bits(R::L7, 0x7fc0_0000));
+}
+
 /// The function a [`Piece`] fits, in `f64`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Fit {
@@ -1425,6 +1520,10 @@ pub enum Fit {
     Erfcx,
     /// `atan(sqrt s) / sqrt s`, `1` at `s = 0` (10.2f): `atan t = t G(t^2)`.
     AtanSqrt,
+    /// `(asin(sqrt s)/sqrt s - 1)/s`, `1/6` at `s = 0`: `asin t = t + t^3
+    /// K(t^2)`, the fit's roundings only in the correction (`asin t/t` near
+    /// 1.05 would cost an ulp of a binade it barely enters).
+    AsinSqrt,
 }
 
 impl Fit {
@@ -1433,6 +1532,20 @@ impl Fit {
             Fit::Erfcx => erfcx64(x),
             Fit::AtanSqrt if x == 0.0 => 1.0,
             Fit::AtanSqrt => libm::atan(x.sqrt()) / x.sqrt(),
+            // The series below `1e-3`, where the difference would cancel:
+            // `asin y / y = sum (2n)!/(4^n n!^2 (2n + 1)) y^2n`, to `n = 6`.
+            Fit::AsinSqrt if x < 1.0e-3 => [
+                1.0 / 6.0,
+                3.0 / 40.0,
+                5.0 / 112.0,
+                35.0 / 1152.0,
+                63.0 / 2816.0,
+                231.0 / 13312.0,
+            ]
+            .iter()
+            .rev()
+            .fold(0.0, |acc, c| acc * x + c),
+            Fit::AsinSqrt => (libm::asin(x.sqrt()) / x.sqrt() - 1.0) / x,
         }
     }
 }
@@ -1473,8 +1586,16 @@ pub const ATAN_FIT: Piece = Piece {
     deg: 13,
     fit: Fit::AtanSqrt,
 };
+/// `asin`'s core on `[0, 0.49]` ([`asin_acos_program`]): [`Fit::AsinSqrt`],
+/// its branch point at `s = 1`.
+pub const ASIN_FIT: Piece = Piece {
+    lo: 0.0,
+    hi: 0.49,
+    deg: 16,
+    fit: Fit::AsinSqrt,
+};
 /// Every piece a program uses, each fitted once.
-pub const PIECES: [Piece; 3] = [ERFC_MID, ERFC_TAIL, ATAN_FIT];
+pub const PIECES: [Piece; 4] = [ERFC_MID, ERFC_TAIL, ATAN_FIT, ASIN_FIT];
 pub const ERFC_LO: f64 = ERFC_MID.lo;
 pub const ERFC_HI: f64 = ERFC_MID.hi;
 pub const ERFC_DEG: usize = ERFC_MID.deg;
@@ -2141,7 +2262,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::ERF
         | kind_sfpu::GELU
         | kind_sfpu::SINH..=kind_sfpu::LOG_SIGMOID
-        | kind_sfpu::SIN..=kind_sfpu::ATAN => Operands::Unary,
+        | kind_sfpu::SIN..=kind_sfpu::ATAN
+        | kind_sfpu::ASIN
+        | kind_sfpu::ACOS => Operands::Unary,
         kind::ADD_ROW => Operands::RowBroadcast,
         _ => return None,
     })
@@ -2856,6 +2979,14 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 } else {
                     asinh_acosh_program(p, spill, kind == kind_sfpu::ACOSH);
                 }
+                p.store(LReg::L7, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::ASIN | kind_sfpu::ACOS => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                asin_acos_program(p, super::kernel::SPILL_ROW + o, kind == kind_sfpu::ACOS);
                 p.store(LReg::L7, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
@@ -4070,6 +4201,47 @@ mod transcendental {
         );
     }
 
+    /// The switches to `x` itself (`2^-12`) and to the root (0.7), the ends
+    /// of the domain and beyond.
+    fn arc_inputs() -> impl Iterator<Item = f32> {
+        let (sw, one) = (0.7f32.to_bits(), 1.0f32.to_bits());
+        let specials = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x397f_ffff),
+            f32::from_bits(0x3980_0000),
+            0.5,
+            f32::from_bits(sw - 1),
+            f32::from_bits(sw),
+            f32::from_bits(sw + 1),
+            f32::from_bits(one - 2),
+            f32::from_bits(one - 1),
+            1.0,
+            f32::from_bits(one + 1),
+            2.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        grid(-1.0, 1.0, 80_000)
+            .chain(grid(0.999, 1.0, 10_000))
+            .chain(grid(0.69, 0.71, 10_000))
+            .chain(binades(64).filter(|x| *x < 1.0))
+            .chain(specials)
+            .flat_map(|x| [x, -x])
+    }
+
+    #[test]
+    fn asin_is_within_its_derived_bound() {
+        sweep(kind_sfpu::ASIN, arc_inputs(), libm::asin, ASIN_BOUND);
+    }
+
+    #[test]
+    fn acos_is_within_its_derived_bound() {
+        sweep(kind_sfpu::ACOS, arc_inputs(), libm::acos, ACOS_BOUND);
+    }
+
     /// `atan2` over every pairing of signed specials -- as `f32::atan2` but for
     /// a denormal operand, which the device reads as a zero of its sign (and
     /// `f32::atan2` of the flushed pair is the answer) -- and over pairs across
@@ -4232,6 +4404,7 @@ mod transcendental {
             let budget = match piece.fit {
                 Fit::Erfcx => 5.25 * u,
                 Fit::AtanSqrt => ATAN_FIT_BOUND,
+                Fit::AsinSqrt => ASIN_FIT_BOUND,
             };
             assert!(
                 fit + eval < budget,

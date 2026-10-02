@@ -1029,6 +1029,16 @@ pub mod float {
         kind_sfpu::ATAN,
         "`atan x` on the device where the data is, within `ops::ATAN_BOUND`, else Flex's."
     );
+    unary_sfpu!(
+        float_asin,
+        kind_sfpu::ASIN,
+        "`asin x` on the device where the data is, within `ops::ASIN_BOUND`, else Flex's."
+    );
+    unary_sfpu!(
+        float_acos,
+        kind_sfpu::ACOS,
+        "`acos x` on the device where the data is, within `ops::ACOS_BOUND`, else Flex's."
+    );
 
     /// `x^y`, `y` a tensor of `x`'s shape, on the device where the data is
     /// (within `ops::pow_bound`); else Flex's.

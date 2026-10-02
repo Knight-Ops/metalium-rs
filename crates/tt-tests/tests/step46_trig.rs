@@ -3,7 +3,7 @@
 //! As `step45_exp_family`: the device **bit for bit** to its programs
 //! (`tt_kernels::sfpu::ops::reference_op`), and the programs to `burn-flex`
 //! within the bounds derived on them (`SIN_BOUND`, `COS_BOUND`, `TAN_BOUND`,
-//! `ATAN_BOUND`, `ATAN2_BOUND`) plus Flex's
+//! `ATAN_BOUND`, `ATAN2_BOUND`, `ASIN_BOUND`, `ACOS_BOUND`) plus Flex's
 //! own ulp -- for every finite input, the largest and the floats nearest a
 //! multiple of `pi/2` included (`trig_reduce`'s exact Payne-Hanek reduction).
 //! A zero-padding claim is held to the raw tiles. `atan2` reads a denormal
@@ -14,7 +14,8 @@ use burn::tensor::{Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::ops::{
-    kind_sfpu::*, reference_op, Broadcast, ATAN2_BOUND, ATAN_BOUND, COS_BOUND, SIN_BOUND, TAN_BOUND,
+    kind_sfpu::*, reference_op, Broadcast, ACOS_BOUND, ASIN_BOUND, ATAN2_BOUND, ATAN_BOUND,
+    COS_BOUND, SIN_BOUND, TAN_BOUND,
 };
 use tt_kernels::tensor::{DramTensor, Eltwise, Pad};
 use tt_tests::backend::GATE_TILE;
@@ -266,6 +267,45 @@ fn atan_and_atan2_are_their_programs_within_their_bounds() {
             }
             s.free(y).unwrap();
             s.free(x).unwrap();
+        }
+    });
+}
+
+#[test]
+fn asin_and_acos_are_their_programs_within_their_bounds() {
+    with_session(|s| {
+        for (r, c) in [(37, 70), (64, 128)] {
+            // `values` folded into the domain, but for its specials and every
+            // tenth value, which stay beyond it.
+            let av: Vec<f32> = values(4, r * c)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if !v.is_finite() || i % 10 == 0 {
+                        *v
+                    } else {
+                        (v / 12.6).clamp(-1.0, 1.0)
+                    }
+                })
+                .collect();
+            let a = s.upload(&av, r, c).unwrap();
+            let fa = flex(&av, r, c);
+            for (kind, want, rel, what) in [
+                (ASIN, host(fa.clone().asin()), ASIN_BOUND, "asin"),
+                (ACOS, host(fa.clone().acos()), ACOS_BOUND, "acos"),
+            ] {
+                let model = run(s, kind, &[&a], &[&av], Broadcast::None, (r, c), what);
+                for i in 0..r * c {
+                    close(
+                        model[i],
+                        want[i],
+                        rel,
+                        0.0,
+                        &format!("{what}({:e}) [{r}, {c}]", av[i]),
+                    );
+                }
+            }
+            s.free(a).unwrap();
         }
     });
 }

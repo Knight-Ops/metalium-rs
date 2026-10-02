@@ -824,7 +824,9 @@ fn hyperbolics_and_log_sigmoid_stay_on_the_card_within_their_bounds() {
 #[test]
 fn trig_stays_on_the_card_within_their_bounds() {
     use burn::backend::Autodiff;
-    use tt_kernels::sfpu::ops::{ATAN2_BOUND, ATAN_BOUND, COS_BOUND, SIN_BOUND, TAN_BOUND};
+    use tt_kernels::sfpu::ops::{
+        ACOS_BOUND, ASIN_BOUND, ATAN2_BOUND, ATAN_BOUND, COS_BOUND, SIN_BOUND, TAN_BOUND,
+    };
     let u = 1.0 / 16_777_216.0;
     with_device(Config::default(), |d| {
         let [r, c] = [64, 128];
@@ -881,6 +883,29 @@ fn trig_stays_on_the_card_within_their_bounds() {
             ATAN2_BOUND,
             "atan2",
         );
+
+        // `asin`, `acos` on `x` folded into `[-1, 1]`, its edges included.
+        let wv: Vec<f32> = xv
+            .iter()
+            .map(|v| {
+                if v.is_finite() {
+                    (v / 12.0).clamp(-1.0, 1.0)
+                } else {
+                    *v
+                }
+            })
+            .collect();
+        let w = tt(&wv);
+        let fw = fl(&wv);
+        let checkw = |got: &[f32], want: &[f32], rel: f64, what| {
+            for i in 0..r * c {
+                close(got[i], want[i], rel, 0.0, &format!("{what}({:e})", wv[i]));
+            }
+        };
+        let got = vals(resident("asin", || w.clone().asin()), "asin");
+        checkw(&got, &host(fw.clone().asin()), ASIN_BOUND, "asin");
+        let got = vals(resident("acos", || w.clone().acos()), "acos");
+        checkw(&got, &host(fw.clone().acos()), ACOS_BOUND, "acos");
 
         // Autodiff: `d/dx sum(sin(x) g) = g cos x`, `d/dx sum(cos(x) g) = -g
         // sin x` -- each the other's kind, then a product (one rounding on each
@@ -948,5 +973,23 @@ fn trig_stays_on_the_card_within_their_bounds() {
         let want_x = fxb.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
         check(&got_y, &want_y, 8.0 * u, "autodiff atan2 dy");
         check(&got_x, &want_x, 8.0 * u, "autodiff atan2 dx");
+        // `asin`: `g / sqrt(1 - x^2)`, `acos` its negation -- the host's
+        // roundings but the root's and the reciprocal's (an ulp each), which
+        // the product carries: within `8u`.
+        for (acos, what) in [(false, "autodiff asin"), (true, "autodiff acos")] {
+            let f = |t: Tensor<Ad, 2>| if acos { t.acos() } else { t.asin() };
+            let wa = Tensor::<Ad, 2>::from_inner(w.clone()).require_grad();
+            let gs = (f(wa.clone()) * Tensor::<Ad, 2>::from_inner(g.clone()))
+                .sum()
+                .backward();
+            let got = wa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+            let ff = |t: Tensor<Fd, 2>| if acos { t.acos() } else { t.asin() };
+            let fwa = Tensor::<Fd, 2>::from_inner(fw.clone()).require_grad();
+            let gs = (ff(fwa.clone()) * Tensor::<Fd, 2>::from_inner(fg.clone()))
+                .sum()
+                .backward();
+            let want = fwa.grad(&gs).unwrap().into_data().to_vec::<f32>().unwrap();
+            checkw(&got, &want, 8.0 * u, what);
+        }
     });
 }

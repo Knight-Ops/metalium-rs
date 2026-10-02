@@ -428,7 +428,8 @@ with teeth.
 
 Some device ops are approximations held to derived bounds rather than to Flex's bits
 (`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
-`log`, sums over columns (tree order), softmax. `burn_tt::set_exact(true)` or
+`log` and the rest of S4's transcendentals (10.2d-f, trigonometry included), sums over
+columns (tree order), softmax. `burn_tt::set_exact(true)` or
 `TT_EXACT=1` keeps on the device only what gives Flex's bits exactly; a run that must
 reproduce a host golden sets it (the MNIST golden does). Which ops are which is data:
 `tt_kernels::sfpu::ops::accuracy` -- S2's compare, select and sign ops are exact and run
