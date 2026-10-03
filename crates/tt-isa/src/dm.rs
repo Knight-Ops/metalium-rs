@@ -255,11 +255,24 @@ pub mod op {
     /// L1 -> host memory: `[HOST_WRITE, host_lo, host_hi, 0, l1, len, 0, 0]`,
     /// as [`HOST_READ`].
     pub const HOST_WRITE: u32 = 0x21;
+    /// A row-major block into a tile slot, in L1: `[TILIZE, src, stride,
+    /// dst, valid, 0, 0, 0]`, `stride` at least the valid columns' bytes. Datum `(r, c)` of the 32x32 block whose first
+    /// datum is at `src`, its rows `stride` bytes apart, goes to its place in
+    /// the tile's faces at `dst` (a slot's datums, past its header); datums
+    /// outside the block's first `valid & 0xff` rows and `valid >> 8` columns
+    /// ([`super::fill::param`], `0` meaning 32) are zero, as a host tilize
+    /// pads. Waits for every move before it. Only in a list entry.
+    pub const TILIZE: u32 = 0x22;
+    /// A tile slot's datums into a row-major block, in L1: `[UNTILIZE, src,
+    /// stride, dst, valid, 0, 0, 0]`, [`TILIZE`]'s inverse -- only the valid
+    /// rows and columns are written, so a band of blocks side by side keeps
+    /// its neighbours'. Waits for every move before it. Only in a list entry.
+    pub const UNTILIZE: u32 = 0x23;
 }
 
 // Entry ops and record ops (`record`, from 0x10) share one numbering.
 const _: () = {
-    let ops = [op::HOST_READ, op::HOST_WRITE];
+    let ops = [op::HOST_READ, op::HOST_WRITE, op::TILIZE, op::UNTILIZE];
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
@@ -517,6 +530,15 @@ pub enum Entry {
         l1: u32,
         len: u32,
     },
+    /// [`op::TILIZE`] (`tilize`) and [`op::UNTILIZE`]: `block` is the
+    /// row-major side, `slot` the tile's datums.
+    Tilize {
+        tilize: bool,
+        block: u32,
+        stride: u32,
+        slot: u32,
+        valid: u32,
+    },
 }
 
 impl Entry {
@@ -675,6 +697,35 @@ impl Entry {
                 host_hi: w[2],
                 l1,
                 len,
+            });
+        }
+        if w[0] == op::TILIZE || w[0] == op::UNTILIZE {
+            let (block, stride, slot, valid) = (w[1], w[2], w[3], w[4]);
+            if valid & !0x1f1f != 0 || w[5..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            let l1 = crate::tensix::L1_SIZE;
+            // What it touches of the block: its valid rows' valid columns.
+            let (rows, cols) = (
+                fill::extent(valid & 0xff) as u64,
+                fill::extent(valid >> 8) as u64,
+            );
+            let block_end = block as u64 + (rows - 1) * stride as u64 + 4 * cols;
+            if block % 4 != 0
+                || stride % 4 != 0
+                || (stride as u64) < 4 * cols
+                || slot % 16 != 0
+                || block_end > l1
+                || slot as u64 + 4096 > l1
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Tilize {
+                tilize: w[0] == op::TILIZE,
+                block,
+                stride,
+                slot,
+                valid,
             });
         }
         if w[0] == op::WAIT_PEER {

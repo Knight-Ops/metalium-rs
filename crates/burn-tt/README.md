@@ -54,7 +54,7 @@ gated in `tt-tests` (`step11_burn`, `step19_eltwise`, `step20_many_tiles`,
 ## Environment variables
 
 Every variable the workspace reads, by who reads it. burn-tt's own switches
-(`TT_PIPELINE`, `TT_SCATTER`, `TT_HOST_DMA`, `TT_TOPOLOGY`, `TT_TILES`) refuse a
+(`TT_PIPELINE`, `TT_SCATTER`, `TT_HOST_DMA`, `TT_TILIZE`, `TT_TOPOLOGY`, `TT_TILES`) refuse a
 value they do not accept, with an error naming it; `TT_BATCH` treats anything but
 `0` as on, `TT_EXACT` anything but `1` as off, and `TT_SILICON_DEVICE` an
 unparsable value as `0`.
@@ -66,6 +66,7 @@ unparsable value as `0`.
 | `TT_PIPELINE` | `1`, `0` | Ops overlap a tile's data moves with its compute where that pays (`Session::set_pipeline`): GDDR matmuls, element-wise ops and reductions. `0` runs every block one after another. Same bits either way. |
 | `TT_SCATTER` | `b`, `nc` | Where pipelined ops write their outputs out from: each tile's RISCV B (with its gathers), or RISCV NC, writing on NoC 1 while B gathers (`Session::set_scatter_mover`). `nc` pays for write-heavy ops on one or two tiles and costs host time on many. |
 | `TT_HOST_DMA` | `1`, `0` | Tensors cross PCIe by the card's own DMA through a pinned 1 GiB hugepage (`Session::set_host_dma`), or with `0` by the host's stores and loads through a BAR -- uncached under VM passthrough, ~100x slower. Without a free 1 GiB hugepage the session uses the BAR and says so once. |
+| `TT_TILIZE` | `host`, `card` | Where tensors take the tile layout on their way to the card's GDDR and lose it on the way back (`Session::set_tilize`): the host's cores, or each tile's data mover. Burn sees row-major data either way, with the same bits. `host` is faster at every size measured: the host copies the rows into pinned memory either way, at about the cost of tilizing them, and a mover tilizes ~2.6 us a tile. |
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
 | `TT_EXACT` | unset, `1` | `1`: only ops that reproduce `burn-flex`'s bits exactly run on the card; the approximations held to derived bounds (division, `exp`, `log`, sums over columns, softmax) run on the host. For runs checked against a host golden. |
 | `TT_PROFILE` | unset, a path | Records a device-side profile of everything an attachment runs and writes it as Chrome trace JSON on detach (`{chip}` in the path becomes the card). Silicon only. |

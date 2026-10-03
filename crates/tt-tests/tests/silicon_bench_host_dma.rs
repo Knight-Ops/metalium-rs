@@ -149,21 +149,28 @@ fn host_dma_bandwidth() {
 #[test]
 #[ignore = "benchmark"]
 fn session_transfers() {
-    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::session::{Session, TileChoice, Tilize};
     let card = tt_tests::backend::device_index();
-    for tiles in [1usize, 8] {
+    for tiles in [1usize, 8, 32] {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
             .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
         for (rows, cols) in [(64usize, 10usize), (64, 784), (1024, 1024), (8192, 1024)] {
             let v: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
-            for dma in [true, false] {
+            for (how, dma, at) in [
+                ("card", true, Tilize::Card),
+                ("host", true, Tilize::Host),
+                ("bar", false, Tilize::Host),
+            ] {
                 s.set_host_dma(dma);
+                s.set_tilize(at);
                 let t = s.upload(&v, rows, cols).unwrap();
                 s.free(t).unwrap();
+                // An upload is queued: timed to its end on the card.
                 let up = Stats::of((0..REPS).map(|_| {
                     let t0 = Instant::now();
                     let t = s.upload(&v, rows, cols).unwrap();
+                    s.sync().unwrap();
                     let us = t0.elapsed().as_secs_f64() * 1e6;
                     s.free(t).unwrap();
                     us
@@ -173,11 +180,10 @@ fn session_transfers() {
                     let t0 = Instant::now();
                     let back = s.download(&t).unwrap();
                     let us = t0.elapsed().as_secs_f64() * 1e6;
-                    assert!(back == v);
+                    assert!(back == v, "{how}: {rows}x{cols} did not round-trip");
                     us
                 }));
                 s.free(t).unwrap();
-                let how = if dma { "dma" } else { "bar" };
                 let bytes = (rows * cols * 4) as f64;
                 report_rate(
                     &format!("session upload {rows}x{cols} {tiles} tiles {how}"),
@@ -194,6 +200,8 @@ fn session_transfers() {
                     None,
                 );
             }
+            s.set_host_dma(true);
+            s.set_tilize(Tilize::Host);
         }
     }
 }

@@ -1512,7 +1512,10 @@ tiles, done in turn. The slices from there:
       ring, a barrier), and the host's tilize on up to 16 threads, with run
       records and one host move a batch on the card (8192x1024 on 8 tiles:
       11 GB/s up and down). Left: a step's small upload is still mostly the
-      host's tilize (~1 us a tile); tilizing on the card would remove it.
+      host's tilize (~1 us a tile). Tilizing on the card's movers is built
+      and gated (`Session::set_tilize`) but slower at every size: the host
+      copies the rows into pinned memory anyway. Worth it only as a Tensix
+      unpacker tilize, or with the card reading the caller's memory directly.
       The BAR mapping itself is still the hypervisor's to fix.
     - Then consider what replay cannot cover: one list multicast to every
       unit, or a unit expanding its share from one record.

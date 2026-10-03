@@ -336,6 +336,8 @@ pub struct Session<T: Transport> {
     /// While set, queued work takes no barrier: a host DMA transfer, which
     /// the session syncs on at once, so nothing can run past it.
     unbarriered: bool,
+    /// Where tensors take and lose the tile layout ([`Session::set_tilize`]).
+    tilize: Tilize,
     /// The next free byte of `staging`, used as a ring by queued uploads;
     /// and whether anything queued may still read what is behind it.
     staging_at: usize,
@@ -444,6 +446,53 @@ fn huge_zeroed(n: usize) -> Vec<f32> {
     v
 }
 
+/// Where a tensor takes the tile layout ([`Session::set_tilize`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Tilize {
+    /// On the host, before the card's DMA: the host's cores convert, and
+    /// tiles cross PCIe (`tensor::host_dma_jobs`).
+    Host,
+    /// On the card: rows cross PCIe and each unit's mover tilizes them in L1
+    /// (`tt_isa::dm::op::TILIZE`, `tensor::row_major_dma_jobs`). The tile
+    /// layout never leaves the card.
+    Card,
+}
+
+/// `rows` rows of `row` bytes from `src` (rows `src.len() / rows` apart) to
+/// `dst` (rows `dst_stride` apart) -- or the other way, as strides say: the
+/// host's whole share of a row-major transfer, split over threads when large.
+fn copy_rows(src: &[u8], rows: usize, src_stride: usize, dst: &mut [u8], dst_stride: usize) {
+    let row = src_stride.min(dst_stride);
+    if rows == 0 {
+        return;
+    }
+    let one = |src: &[u8], dst: &mut [u8], n: usize| {
+        if src_stride == dst_stride {
+            dst[..n * row].copy_from_slice(&src[..n * row]);
+        } else {
+            for r in 0..n {
+                dst[r * dst_stride..][..row].copy_from_slice(&src[r * src_stride..][..row]);
+            }
+        }
+    };
+    let bytes = rows * row;
+    let threads = if bytes >= 4 << 20 { 8 } else { 1 };
+    if threads == 1 {
+        return one(src, dst, rows);
+    }
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (k, d) in dst[..rows * dst_stride]
+            .chunks_mut(per * dst_stride)
+            .enumerate()
+        {
+            let n = per.min(rows - k * per);
+            let sr = &src[k * per * src_stride..];
+            scope.spawn(move || one(sr, d, n));
+        }
+    });
+}
+
 /// What an upload or write takes: FP32 values, or any element's datums as
 /// their bits -- tilized from either without converting the other.
 #[derive(Copy, Clone)]
@@ -457,6 +506,17 @@ impl Src<'_> {
         match self {
             Src::F32(v) => v.len(),
             Src::Bits(v) => v.len(),
+        }
+    }
+
+    /// Its datums' bytes, little-endian as the card takes them.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: plain 4-byte values; x86's and RISC-V's byte order alike.
+        unsafe {
+            match *self {
+                Src::F32(v) => std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
+                Src::Bits(v) => std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
+            }
         }
     }
 
@@ -1278,6 +1338,7 @@ impl<T: Transport> Session<T> {
             unbarriered: false,
             staging_at: 0,
             staging_busy: false,
+            tilize: Tilize::Host,
             pipelined: 0,
             profile_roles: true,
             drains: 0,
@@ -1652,6 +1713,20 @@ impl<T: Transport> Session<T> {
         self.host_dma = on;
     }
 
+    /// Where tensors take the tile layout on their way to the card, and lose
+    /// it on the way back: [`Tilize::Host`] (the default) or
+    /// [`Tilize::Card`]. Either way the session's callers -- Burn among them
+    /// -- see row-major data only, and the bits are the same. The host is
+    /// the default because it is faster everywhere card 0 measured
+    /// (`silicon_bench_host_dma::session_transfers`): the host copies the
+    /// rows into pinned memory either way, at about the cost of tilizing
+    /// them, and a mover tilizes at ~2.6 us a tile (1024² up, 32 tiles: card
+    /// 0.98 ms, host 0.55). Applies to the card's DMA
+    /// ([`Session::set_host_dma`]); the BAR path always tilizes on the host.
+    pub fn set_tilize(&mut self, at: Tilize) {
+        self.tilize = at;
+    }
+
     /// The pinned staging buffer, pinned on first use; `None` (said once) if
     /// it cannot be, or host DMA is off.
     fn staging(&mut self) -> Option<&mut Box<dyn tt_device::HostMemory>> {
@@ -1691,6 +1766,26 @@ impl<T: Transport> Session<T> {
     ) -> Result<Option<()>, TensorError> {
         if self.staging().is_none() {
             return Ok(None);
+        }
+        let stride = tensor::row_major_stride(t.cols);
+        if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
+            // Row-major into the pinned memory; the card makes the tiles.
+            let at = self.staging_region(t.rows * stride)?;
+            let host = self.staging().expect("checked above");
+            host.with_bytes(&mut |buf| {
+                copy_rows(values.bytes(), t.rows, t.cols * 4, &mut buf[at..], stride)
+            });
+            let base = host.noc_address() + at as u64;
+            let jobs = tensor::row_major_dma_jobs(
+                t.tensor_ref(),
+                [t.rows, t.cols],
+                true,
+                base,
+                self.units.len(),
+            );
+            self.staging_busy = true;
+            self.submit_jobs(jobs, RESET_BUDGET)?;
+            return Ok(Some(()));
         }
         let slot = tt_isa::dm::TILE_SLOT as usize;
         let per = HOST_DMA_STAGING / slot;
@@ -1747,8 +1842,29 @@ impl<T: Transport> Session<T> {
         }
         let [rt, ct] = t.grid();
         let tiles = rt * ct;
-        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
         let mut out = huge_zeroed(t.rows * t.cols);
+        let stride = tensor::row_major_stride(t.cols);
+        if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
+            // The card untilizes; the rows come back as they are.
+            let base = self.staging().expect("checked above").noc_address();
+            let jobs = tensor::row_major_dma_jobs(
+                t.tensor_ref(),
+                [t.rows, t.cols],
+                false,
+                base,
+                self.units.len(),
+            );
+            self.submit_dma(jobs)?;
+            let host = self.staging().expect("checked above");
+            // SAFETY: `out` is `rows * cols` plain f32s, whose bytes any
+            // pattern is.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
+            };
+            host.with_bytes(&mut |buf| copy_rows(buf, t.rows, stride, bytes, t.cols * 4));
+            return Ok(Some(out));
+        }
+        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
         for first in (0..tiles).step_by(per) {
             let n = (tiles - first).min(per);
             let base = self.staging().expect("checked above").noc_address();

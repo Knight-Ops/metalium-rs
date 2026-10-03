@@ -429,6 +429,20 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             l1,
             len,
         } => host_move(me, write, host_lo, host_hi, l1, len),
+        Entry::Tilize {
+            tilize,
+            block,
+            stride,
+            slot,
+            valid,
+        } => {
+            // The side it reads may still be arriving.
+            noc::wait(TXN);
+            publish();
+            tile_layout(tilize, block as u64, stride as usize, slot as u64, valid);
+            // Visible in L1 before anything else reads it.
+            publish();
+        }
         Entry::Signal => signal(),
         Entry::WaitPeer { peer, target } => wait_peer(peer, target)?,
         Entry::Fill { value, param, dst } => {
@@ -439,6 +453,80 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
     }
     Ok(())
+}
+
+/// 16 words from `src` to `dst`: all the loads, then all the stores, so the
+/// loads overlap (a call to `memcpy` cost more than the copy).
+#[inline(always)]
+unsafe fn copy16(src: *const u32, dst: *mut u32) {
+    let w: [u32; 16] = [
+        core::ptr::read_volatile(src),
+        core::ptr::read_volatile(src.add(1)),
+        core::ptr::read_volatile(src.add(2)),
+        core::ptr::read_volatile(src.add(3)),
+        core::ptr::read_volatile(src.add(4)),
+        core::ptr::read_volatile(src.add(5)),
+        core::ptr::read_volatile(src.add(6)),
+        core::ptr::read_volatile(src.add(7)),
+        core::ptr::read_volatile(src.add(8)),
+        core::ptr::read_volatile(src.add(9)),
+        core::ptr::read_volatile(src.add(10)),
+        core::ptr::read_volatile(src.add(11)),
+        core::ptr::read_volatile(src.add(12)),
+        core::ptr::read_volatile(src.add(13)),
+        core::ptr::read_volatile(src.add(14)),
+        core::ptr::read_volatile(src.add(15)),
+    ];
+    for (i, v) in w.into_iter().enumerate() {
+        core::ptr::write_volatile(dst.add(i), v);
+    }
+}
+
+/// `dm::op::TILIZE` (`tilize`) or `UNTILIZE`: datum `(r, c)` of the
+/// row-major block at `block` (rows `stride` bytes apart) and its place in the
+/// tile's faces at `slot`, for the valid rows and columns; a tilize zeroes
+/// the rest of the tile, an untilize leaves the rest of the block alone.
+#[cold]
+#[inline(never)]
+fn tile_layout(tilize: bool, block: u64, stride: usize, slot: u64, valid: u32) {
+    let rows = dm::fill::extent(valid & 0xff) as usize;
+    let cols = dm::fill::extent(valid >> 8) as usize;
+    let tile = slot as *mut u32;
+    for face in 0..4usize {
+        let (fr, fc) = (face / 2, face % 2);
+        let n = cols.saturating_sub(16 * fc).min(16);
+        for r in 0..16usize {
+            let row = 16 * fr + r;
+            let rm = (block as usize + row * stride + 64 * fc) as *mut u32;
+            let at = face * 256 + r * 16;
+            // SAFETY: the block and the slot are inside L1 (`Entry::decode`),
+            // and every index stays inside one block row's 32 datums or the
+            // tile's 1024. Plain accesses: the moves that filled the source
+            // were fenced before this, and the caller fences these stores.
+            unsafe {
+                let live = if row < rows { n } else { 0 };
+                let t = tile.add(at);
+                match (tilize, live) {
+                    // A whole face row, the common case: 16 words, unrolled.
+                    (true, 16) => copy16(rm, t),
+                    (false, 16) => copy16(t, rm),
+                    (true, _) => {
+                        for c in 0..live {
+                            *t.add(c) = *rm.add(c);
+                        }
+                        for c in live..16 {
+                            *t.add(c) = 0;
+                        }
+                    }
+                    (false, _) => {
+                        for c in 0..live {
+                            *rm.add(c) = *t.add(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `dm::op::HOST_READ` / `HOST_WRITE`: the move's requests to the PCIe tile,

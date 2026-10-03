@@ -858,6 +858,149 @@ pub fn host_dma_jobs(
         .collect()
 }
 
+/// Bytes between rows of a row-major tensor in host memory for
+/// [`row_major_dma_jobs`]: its row's bytes, rounded up to 64 so every row
+/// starts congruent with L1 as the card's DMA requires.
+pub fn row_major_stride(cols: usize) -> usize {
+    (cols * 4).next_multiple_of(64)
+}
+
+/// Moves between a row-major `[rows, cols]` matrix in host memory (rows
+/// [`row_major_stride`] bytes apart from `host`) and the tensor `x`'s tiles
+/// in GDDR, the tile layout made on the card: one job a unit. The matrix goes
+/// in chunks -- a tile row's 32 rows, across up to [`TILIZE_CHUNK`] tile
+/// columns -- dealt out to the units in turn, so a short wide tensor still
+/// uses them all. An upload brings a chunk's rows into L1 (one host move for
+/// a whole band, else one a row), `TILIZE`s each tile into a slot, and
+/// `WRITE_RUN`s the slots' datums to GDDR; a download `READ_RUN`s the slots,
+/// `UNTILIZE`s them into rows, and sends the rows to the host. Rows and
+/// columns past the matrix are zeros going up and never written coming back.
+/// The data arena must be free of other work, as for [`host_dma_jobs`].
+pub fn row_major_dma_jobs(
+    x: TensorRef,
+    [rows, cols]: [usize; 2],
+    upload: bool,
+    host: u64,
+    units: usize,
+) -> Vec<Job> {
+    use tt_isa::dm::{fill, op};
+    let (rt, ct) = (rows.div_ceil(32).max(1), cols.div_ceil(32).max(1));
+    let stride = row_major_stride(cols) as u64;
+    let row_bytes = (cols * 4) as u64;
+    // Chunks small enough to spread over the units, and to fit the arena.
+    let per_unit = (rt * ct).div_ceil(units.max(1));
+    let width = TILIZE_CHUNK.min(ct).min(per_unit.max(1));
+    let chunks: Vec<(usize, usize, usize)> = (0..rt)
+        .flat_map(|i| {
+            (0..ct)
+                .step_by(width)
+                .map(move |j0| (i, j0, width.min(ct - j0)))
+        })
+        .collect();
+    let units = units.max(1).min(chunks.len());
+    let slots = tt_isa::l1::DATA.base;
+    let band = slots + (TILIZE_CHUNK as u64) * TILE_SLOT;
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    (0..units)
+        .map(|u| {
+            let mut entries = Vec::new();
+            for &(i, j0, n) in chunks.iter().skip(u).step_by(units) {
+                let valid_rows = (rows - 32 * i).min(32);
+                // A whole band is one host move, its L1 rows `stride` apart;
+                // part of one is a move a row, its L1 rows the chunk's width.
+                let whole = j0 == 0 && n == ct;
+                let l1_stride = if whole { stride } else { n as u64 * 128 };
+                let seg = if whole {
+                    stride
+                } else {
+                    // The last chunk ends at the row's end (past it, the next
+                    // row's columns, which a download must not overwrite).
+                    (n as u64 * 128).min((row_bytes - j0 as u64 * 128).next_multiple_of(64))
+                };
+                let host_at = |r: usize| host + (32 * i + r) as u64 * stride + j0 as u64 * 128;
+                let host_moves = |entries: &mut Vec<[u32; 8]>| {
+                    let kind = if upload {
+                        op::HOST_READ
+                    } else {
+                        op::HOST_WRITE
+                    };
+                    let mv = |h: u64, l1: u64, len: u64| {
+                        [
+                            kind,
+                            h as u32,
+                            (h >> 32) as u32,
+                            0,
+                            l1 as u32,
+                            len as u32,
+                            0,
+                            0,
+                        ]
+                    };
+                    if whole {
+                        entries.push(mv(host_at(0), band, valid_rows as u64 * stride));
+                    } else {
+                        for r in 0..valid_rows {
+                            entries.push(mv(host_at(r), band + r as u64 * l1_stride, seg));
+                        }
+                    }
+                };
+                let first = (i * ct + j0) as u32;
+                let run = |kind: u32| {
+                    [
+                        [kind, first, n as u32, slots as u32, 0, 0, 0, 0],
+                        x.encode()[0],
+                        x.encode()[1],
+                    ]
+                };
+                let layout = |kind: u32, entries: &mut Vec<[u32; 8]>| {
+                    for k in 0..n {
+                        let j = j0 + k;
+                        let valid_cols = (cols - 32 * j).min(32);
+                        entries.push([
+                            kind,
+                            (band + k as u64 * 128) as u32,
+                            l1_stride as u32,
+                            (slots + k as u64 * TILE_SLOT + TILE_DATA) as u32,
+                            fill::param(valid_rows as u32, valid_cols as u32),
+                            0,
+                            0,
+                            0,
+                        ]);
+                    }
+                };
+                // Each `TILIZE` / `UNTILIZE` waits for every move before it,
+                // so the next chunk's moves into the band and the slots
+                // never overtake this one's out of them.
+                if upload {
+                    host_moves(&mut entries);
+                    layout(op::TILIZE, &mut entries);
+                    entries.extend(run(record::WRITE_RUN));
+                } else {
+                    entries.extend(run(record::READ_RUN));
+                    layout(op::UNTILIZE, &mut entries);
+                    host_moves(&mut entries);
+                }
+            }
+            entries.push(wait);
+            vec![Step::List {
+                what: if upload {
+                    "host dma upload, tilized on the card"
+                } else {
+                    "host dma download, untilized on the card"
+                },
+                entries,
+            }]
+        })
+        .collect()
+}
+
+/// Most tile columns a [`row_major_dma_jobs`] chunk spans: its slots and its
+/// band of rows (32 of them, 128 bytes a tile column) inside the data arena,
+/// for any matrix whose padded row fits the band (a wider one goes a chunk
+/// at a time, a move a row).
+pub const TILIZE_CHUNK: usize = 96;
+const _: () = assert!(TILIZE_CHUNK as u64 * (TILE_SLOT + 32 * 128) <= tt_isa::l1::DATA.len());
+
 /// One step of a [`Job`], run on one tile.
 #[derive(Clone, Debug)]
 pub enum Step {

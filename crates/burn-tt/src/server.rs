@@ -959,6 +959,14 @@ pub fn kmd_engine(
             Ok("0") => session.set_host_dma(false),
             Ok(v) => return Err(EngineError(format!("TT_HOST_DMA={v}: expected 0 or 1"))),
         }
+        // `TT_TILIZE=card`: tensors take the tile layout on the card's movers
+        // rather than the host's cores (`Session::set_tilize`); `host`, the
+        // default, is faster on every size card 0 measured.
+        match std::env::var("TT_TILIZE").as_deref() {
+            Err(_) | Ok("host") => {}
+            Ok("card") => session.set_tilize(tt_kernels::session::Tilize::Card),
+            Ok(v) => return Err(EngineError(format!("TT_TILIZE={v}: expected host or card"))),
+        }
         // `TT_SCATTER=nc`: pipelined ops write their outputs out from each
         // tile's RISCV NC while B gathers (`Session::set_scatter_mover`);
         // `b`, the default, keeps every move on B.
