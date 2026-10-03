@@ -356,6 +356,13 @@ difference is the host polling for the ack and posting the next send over PCIe.
     - Every register reads back as written (`step51_nc_probe`, card 0).
     - But comparing against a copy cost more than the writes it saved: +21
       cycles per entry.
+  - **The fixes so far:**
+    - Moves are checked once per descriptor and issued from registers
+      (`DramMove`, `issue_dram_on`): −40 cycles per entry.
+    - **Records walk rows with a cursor.** A software division per gathered
+      tile (`record::div_rem`, 32 steps; the firmware is built without the
+      divide instruction) was more than half of a gathered tile's cost.
+      Removing it halved matmul gathers.
   - **Entry size matters.** Carrying a whole `dm::Mover` in an `Entry` variant
     made every decode about 100 cycles slower, as did decoding rare kinds out
     of line. Both were fixed by a one-byte `dm::Peer` and inline decode.
@@ -377,6 +384,7 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-03 | — | Records walk rows with a cursor (one division per row, not per tile); GDDR moves checked once per descriptor and issued from registers (`DramMove`, `issue_dram_on`) | **matmul 512³, one tile:** gather 1061 → 493 µs, scatter 162 → 91, op 2176 → 1537.<br>**matmul 128³:** 46.4 → 33.5.<br>**add, 64 tiles:** 139 → 73.5.<br>**exp, 64 tiles:** 579 → 535.<br>**Per entry:** 4 KiB read 354 → 314 cycles, write 397 → 355 |
 | 2026-10-02 | — | Option C: NoC #1 owns port 0 on channels 4–7 (port 1 on 0–3), so its writes use eight rows instead of four. The host uses CMFW's endpoint | **Card writes on NoC #1, 120 tiles:** 268 → 378 GB/s.<br>**16 tiles:** 296 → 421.<br>**Reads + writes:** 344 → 396.<br>**Reads:** unchanged (469). |
 | 2026-10-02 | — | NC mover (`dm_nc`), `SIGNAL` / `WAIT_PEER`, `copy_pipeline` | NC costs what B does per entry. Split copies run 1.6× at 4 KiB entries on 1–16 tiles and converge at 120 |
 | 2026-10-02 | — | Tile movers default to an in-flight cap of 8 (`dm::TILE_IN_FLIGHT_CAP`); `write_noc::ALTERNATE` added | **Card reads:** 120 tiles 425 → 467 GB/s at 64 KiB, 496 at 16 KiB.<br>**One tile:** 3–4% off small reads.<br>**Writes:** unchanged.<br>**Alternating writes:** no gain at 120 tiles (263 against 268 on NoC #1).<br>**Stress (cap 8, all write modes):** 60 s clean. |

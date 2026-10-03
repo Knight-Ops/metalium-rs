@@ -135,6 +135,46 @@ impl TensorRef {
     }
 }
 
+/// [`TensorRef::tile`] for consecutive tiles of a row, from `(i, j)` on:
+/// one division to find the first, then each next is the next channel, its
+/// slot advancing when the channels wrap. The mover's gathers and scatters
+/// walk rows, and a software division per tile ([`div_rem`]) was most of
+/// what a record cost per tile beyond the read itself (checklist 9.14).
+struct Cursor<'a> {
+    x: &'a TensorRef,
+    slot: u32,
+    c: u32,
+}
+
+impl TensorRef {
+    fn cursor(&self, i: u32, j: u32) -> Result<Cursor<'_>, u32> {
+        if self.n == 0 {
+            return Err(super::error::RANGE);
+        }
+        let t = self.first + i * self.ct + j;
+        let (slot, c) = div_rem(t, self.n as u32);
+        Ok(Cursor { x: self, slot, c })
+    }
+}
+
+impl Cursor<'_> {
+    /// The tile [`TensorRef::tile`] would give for this position, and on to
+    /// the next.
+    #[inline(always)]
+    fn next(&mut self) -> Result<(u32, u32), u32> {
+        let c = self.c as usize;
+        let offset = (self.x.base[c] as u64) + self.slot as u64 * TILE_SLOT;
+        let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
+        let at = (self.x.channels[c] as u32, offset);
+        self.c += 1;
+        if self.c == self.x.n as u32 {
+            self.c = 0;
+            self.slot += 1;
+        }
+        Ok(at)
+    }
+}
+
 const PORTS: u32 = crate::dram::PORTS as u32;
 
 /// `(a / b, a % b)` by shift and subtract, for a `b` known only at run time.
@@ -200,16 +240,42 @@ pub fn expand(
                     };
                     Ok([op, ch, (i + j) % PORTS, off, to, TILE_SLOT as u32, 0, 0])
                 };
+            // An untransposed operand's row is consecutive tiles: a cursor
+            // steps along it. A transposed one is read down a column.
+            let read = |(ch, off): (u32, u32), i: u32, j: u32, to: u32| {
+                [
+                    op::READ,
+                    ch,
+                    (i + j) % PORTS,
+                    off,
+                    to,
+                    TILE_SLOT as u32,
+                    0,
+                    0,
+                ]
+            };
             for i in 0..rows {
+                let mut row = if a_t {
+                    None
+                } else {
+                    Some(a.cursor(i0 + i, 0)?)
+                };
                 for kk in 0..kt {
                     let to = a_at + (i * kt + kk) * TILE_SLOT as u32;
-                    emit(fetch(&a, a_t, i0 + i, kk, to)?)?;
+                    emit(match row.as_mut() {
+                        Some(r) => read(r.next()?, i0 + i, kk, to),
+                        None => fetch(&a, a_t, i0 + i, kk, to)?,
+                    })?;
                 }
             }
             for kk in 0..kt {
+                let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
                 for j in 0..cols {
                     let to = b_at + (kk * cols + j) * TILE_SLOT as u32;
-                    emit(fetch(&b, b_t, kk, j0 + j, to)?)?;
+                    emit(match row.as_mut() {
+                        Some(r) => read(r.next()?, kk, j0 + j, to),
+                        None => fetch(&b, b_t, kk, j0 + j, to)?,
+                    })?;
                 }
             }
         }
@@ -218,8 +284,9 @@ pub fn expand(
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let c = tensor(rec, 1)?;
             for i in 0..rows {
+                let mut row = c.cursor(i0 + i, j0)?;
                 for j in 0..cols {
-                    let (ch, off) = c.tile(i0 + i, j0 + j)?;
+                    let (ch, off) = row.next()?;
                     let out = out_at + (i * cols + j) * stride;
                     emit([
                         op::WRITE,
@@ -257,6 +324,12 @@ pub fn expand(
             } else {
                 div_rem(first, ct)
             };
+            // A plain run over the tensor's own grid is consecutive tiles.
+            let mut run = if !row && !col && !column_major && ct == x.ct {
+                Some(x.cursor(i, j)?)
+            } else {
+                None
+            };
             for n in 0..count {
                 if n > 0 && column_major {
                     i += 1;
@@ -270,7 +343,10 @@ pub fn expand(
                     }
                 }
                 let slot = at + n * TILE_SLOT as u32;
-                let (ch, off) = x.tile(if row { 0 } else { i }, if col { 0 } else { j })?;
+                let (ch, off) = match run.as_mut() {
+                    Some(r) => r.next()?,
+                    None => x.tile(if row { 0 } else { i }, if col { 0 } else { j })?,
+                };
                 let op = if col {
                     op::READ_BROADCAST_COL
                 } else {
@@ -341,7 +417,85 @@ pub fn expand(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::vec::Vec;
+
+    /// Every tile a record names is the one `TensorRef::tile` gives: the
+    /// cursor that steps along rows agrees with dividing per tile, across a
+    /// channel wrap mid-row and a tensor that starts mid-grid.
+    #[test]
+    fn records_walk_rows_to_the_same_tiles_as_dividing_per_tile() {
+        let mut a = t(3, 5);
+        a.first = 2;
+        let mut b = t(3, 7);
+        b.first = 4;
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        let (i0, rows, j0, cols, kt) = (1u32, 2u32, 2u32, 3u32, 4u32);
+        for flags in [0u32, 1, 2, 3] {
+            let head = [
+                GATHER,
+                flags | (kt << 8),
+                0x2_0000,
+                0x6_0000,
+                i0,
+                rows,
+                j0,
+                cols,
+            ];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1, b0, b1], |e| {
+                got.push((e[1], e[3]));
+                Ok(())
+            })
+            .unwrap();
+            let mut want = Vec::new();
+            for i in 0..rows {
+                for kk in 0..kt {
+                    let (r, c) = if flags & 1 != 0 {
+                        (kk, i0 + i)
+                    } else {
+                        (i0 + i, kk)
+                    };
+                    want.push(a.tile(r, c).unwrap());
+                }
+            }
+            for kk in 0..kt {
+                for j in 0..cols {
+                    let (r, c) = if flags & 2 != 0 {
+                        (j0 + j, kk)
+                    } else {
+                        (kk, j0 + j)
+                    };
+                    want.push(b.tile(r, c).unwrap());
+                }
+            }
+            assert_eq!(got, want, "flags {flags}");
+        }
+        // A scatter, and a plain run from mid-row.
+        let head = [SCATTER, 0x2_0000, TILE_SLOT as u32, i0, rows, j0, cols, 0];
+        let mut got = Vec::new();
+        expand(&[head, b0, b1], |e| {
+            got.push((e[1], e[3] - TILE_DATA as u32));
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<_> = (0..rows)
+            .flat_map(|i| (0..cols).map(move |j| (i0 + i, j0 + j)))
+            .map(|(i, j)| b.tile(i, j).unwrap())
+            .collect();
+        assert_eq!(got, want, "scatter");
+        let head = [READ_RUN, 6, 11, 0x2_0000, 0, 0, 0, 0];
+        let mut got = Vec::new();
+        expand(&[head, a0, a1], |e| {
+            got.push((e[1], e[3]));
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<_> = (6..17).map(|n| a.tile(n / 5, n % 5).unwrap()).collect();
+        assert_eq!(got, want, "run");
+    }
 
     fn t(n: u8, ct: u32) -> TensorRef {
         let mut r = TensorRef {
