@@ -1466,6 +1466,10 @@ tiles, done in turn. The slices from there:
     - Merge contiguous tiles into one request.
     - Measure per entry and on matmul and element-wise gathers.
   - [ ] **9.15 Overlap on B, then split.**
+    - [x] GDDR matmuls: `LAUNCH` / `KERNEL_WAIT`, blocks in two halves of the
+      arena, on by default where `tensor::pipelining_pays` (`step54_pipeline`,
+      `stress_pipeline`).
+    - [ ] Element-wise and reductions.
     - `KERNEL` drains the moves and blocks B until all three roles acknowledge.
     - Separate launch and wait entries, with explicit ownership of each L1
       staging buffer, let B gather the next block and scatter the previous one

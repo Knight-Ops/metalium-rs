@@ -480,3 +480,148 @@ fn queue_steady_state() {
         panic!("{e}");
     }
 }
+
+/// Whether pipelined matmuls (`Session::set_pipeline`) are ever slower:
+/// shapes from MNIST's up to 1024s, on 1, 8 and 32 tiles, each with
+/// pipelining off and on, device time from the mover's events alone in both
+/// (the same measurement either way). A pipelined block fits half the arena,
+/// so an op may gather the same operand tiles more often; this is where that
+/// would show. `SWEEP_TILES` picks the tile counts.
+#[test]
+#[ignore = "benchmark"]
+fn matmul_pipeline_sweep() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    let shapes: [[usize; 3]; 9] = [
+        [64, 784, 128],
+        [64, 128, 10],
+        [128, 128, 128],
+        [256, 256, 256],
+        [256, 1024, 256],
+        [512, 512, 512],
+        [1024, 256, 1024],
+        [64, 2048, 512],
+        [1024, 1024, 1024],
+    ];
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.set_profile_roles(false);
+            let t = s.tile();
+            let c = Conditions::measure(s.device(), card, t);
+            let f = |n: usize, seed: u32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) % 17) as f32 / 8.0
+                            - 1.0
+                    })
+                    .collect()
+            };
+            for [m, k, n] in shapes {
+                let a = s.upload(&f(m * k, 1), m, k).unwrap();
+                let b = s.upload(&f(k * n, 2), k, n).unwrap();
+                let mut median = [0f64; 2];
+                let mut overlapped = 0;
+                let mut bits: [Vec<f32>; 2] = Default::default();
+                for (on, slot) in [(false, 0usize), (true, 1)] {
+                    s.set_pipeline(on);
+                    let run = |s: &mut Session<tt_kmd::Kmd>| {
+                        let o = s
+                            .matmul_dram(
+                                &a,
+                                false,
+                                &b,
+                                false,
+                                SrcRoute::Tf32FromFp32,
+                                Fidelity::HiFi4,
+                                BUDGET,
+                            )
+                            .unwrap_or_else(|e| panic!("{e}"));
+                        s.sync().unwrap();
+                        o
+                    };
+                    let lists_before: u64 = s.lists_per_tile().iter().sum();
+                    let drains_before = s.drains();
+                    let o = run(&mut s);
+                    let lists = s.lists_per_tile().iter().sum::<u64>() - lists_before;
+                    let drains = s.drains() - drains_before;
+                    println!(
+                        "MEASURE sweep {m}x{k}x{n} on {tiles} tiles, pipeline {on}: {lists} lists, {drains} drains"
+                    );
+                    bits[slot] = s.download(&o).unwrap();
+                    s.free(o).unwrap();
+                    let before = s.pipelined_blocks();
+                    // Device time from the profile; for an op whose events
+                    // overflow the timestamper's buffer, the host's time from
+                    // the op to its sync instead (marked `host`).
+                    let mut device = Vec::new();
+                    let mut host = Vec::new();
+                    let mut overflowed = false;
+                    // Past ~2^29 multiply-adds a profile's events overflow
+                    // the buffer (and the op's sync reports it): time those
+                    // from the host.
+                    let profiled = m * k * n < 1 << 29;
+                    overflowed |= !profiled;
+                    for _ in 0..REPS {
+                        if profiled {
+                            s.profile_start().unwrap();
+                        }
+                        let h0 = Instant::now();
+                        let o = run(&mut s);
+                        host.push(h0.elapsed().as_secs_f64() * 1e6);
+                        if profiled {
+                            match s.profile_stop() {
+                                Ok(p) => device.push(split(&p).device),
+                                Err(_) => overflowed = true,
+                            }
+                        }
+                        s.free(o).unwrap();
+                    }
+                    if on {
+                        overlapped = (s.pipelined_blocks() - before) / REPS as u64;
+                    }
+                    let (st, timed) = if overflowed {
+                        (Stats::of(host.iter().copied()), "host")
+                    } else {
+                        (
+                            Stats::of(device.iter().copied()).map(|x| c.cycles_to_us(x)),
+                            "device",
+                        )
+                    };
+                    report(
+                        &format!(
+                            "matmul {m}x{k}x{n} on {tiles} tiles, pipeline {}",
+                            if on { "on " } else { "off" }
+                        ),
+                        "us",
+                        timed,
+                        st,
+                    );
+                    median[slot] = st.median;
+                }
+                assert!(
+                    bits[0]
+                        .iter()
+                        .zip(&bits[1])
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{m}x{k}x{n} on {tiles} tiles: pipelining changed the bits"
+                );
+                println!(
+                    "MEASURE sweep {m}x{k}x{n} on {tiles} tiles: on/off {:.3} ({overlapped} blocks overlapped per op)",
+                    median[1] / median[0]
+                );
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}

@@ -928,8 +928,7 @@ pub fn plan_layout_in(
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
     match staging {
-        Staging::Slots => return plan_slots([mt, kt, nt], in_fmt, tt_isa::l1::DATA),
-        Staging::SlotsHalf => return plan_slots([mt, kt, nt], in_fmt, half_arena()),
+        Staging::Slots | Staging::SlotsHalf => return planned_slots([mt, kt, nt], in_fmt, staging),
         Staging::Host => {}
     }
     let (img, align, out_stride, out_skip) = match staging {
@@ -1041,6 +1040,33 @@ pub struct MatmulBuffers {
     pub out: crate::l1::Buf,
     /// `Dst` ready and free ([`MatmulSemaphores`]).
     pub sems: (crate::l1::Sem, crate::l1::Sem),
+}
+
+/// [`plan_slots`] for a slot staging, planned once per process for each
+/// shape: an op of many same-shaped blocks plans each of them, and the L1
+/// planner was most of the host's time for a pipelined 1024^3 matmul's 512
+/// blocks.
+fn planned_slots(
+    tiles: [usize; 3],
+    in_fmt: L1Format,
+    staging: Staging,
+) -> Result<Layout, crate::runtime::RunError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = ([usize; 3], L1Format, Staging);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Layout>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (tiles, in_fmt, staging);
+    if let Some(l) = cache.lock().unwrap().get(&key) {
+        return Ok(l.clone());
+    }
+    let arena = match staging {
+        Staging::SlotsHalf => half_arena(),
+        _ => tt_isa::l1::DATA,
+    };
+    let l = plan_slots(tiles, in_fmt, arena)?;
+    cache.lock().unwrap().insert(key, l.clone());
+    Ok(l)
 }
 
 fn plan_slots(

@@ -7,8 +7,9 @@
 //!
 //! * the results are the plain path's bits, on one tile and on three, with
 //!   either operand transposed;
-//! * the overlapped path ran (`Session::pipelined_blocks`), so the bits are
-//!   not the plain path's by default.
+//! * the overlapped path ran exactly where `tensor::pipelining_pays` says it
+//!   pays (`Session::pipelined_blocks`), and on each tile count for at least
+//!   one case, so the bits are not the plain path's by default.
 //!
 //! The plain path's own accuracy is `step18_dram_matmul`'s.
 
@@ -68,15 +69,17 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
 
 #[test]
 fn pipelined_matmuls_are_the_plain_paths_bits() {
-    // [m, k, n] and the transposes: each takes several blocks in half the
-    // arena, so a unit has a run to overlap.
+    // [m, k, n] and the transposes: each takes at least two blocks a unit in
+    // half the arena, on one tile and on three, so pipelining pays
+    // (`tensor::pipelining_pays`) and a unit has a run to overlap.
     let cases: [([usize; 3], bool, bool); 3] = [
-        ([256, 256, 256], false, false),
-        ([192, 320, 224], true, false),
-        ([160, 256, 576], false, true),
+        ([512, 512, 512], false, false),
+        ([384, 512, 384], true, false),
+        ([512, 512, 512], false, true),
     ];
     for n in [1usize, 3] {
         with_tiles(n, |s| {
+            let mut piped_any = false;
             for (k, ([m, kk, nn], ta, tb)) in cases.into_iter().enumerate() {
                 let av = floats(k as u64 * 2 + 1, m * kk);
                 let bv = floats(k as u64 * 2 + 2, kk * nn);
@@ -98,7 +101,14 @@ fn pipelined_matmuls_are_the_plain_paths_bits() {
                 let before = s.pipelined_blocks();
                 let piped = run(s, true);
                 let overlapped = s.pipelined_blocks() - before;
-                assert!(overlapped > 0, "{n} tiles, case {k}: nothing overlapped");
+                let pays =
+                    tt_kernels::tensor::pipelining_pays([m, kk, nn], ROUTE, Fidelity::HiFi4, n);
+                assert_eq!(
+                    overlapped > 0,
+                    pays,
+                    "{n} tiles, case {k}: overlapped {overlapped} blocks, but pipelining pays: {pays}"
+                );
+                piped_any |= overlapped > 0;
                 assert_eq!(plain.len(), piped.len());
                 for (i, (p, q)) in plain.iter().zip(&piped).enumerate() {
                     assert_eq!(
@@ -111,6 +121,7 @@ fn pipelined_matmuls_are_the_plain_paths_bits() {
                 s.free(a).unwrap();
                 s.free(b).unwrap();
             }
+            assert!(piped_any, "{n} tiles: no case pipelined");
         });
     }
 }

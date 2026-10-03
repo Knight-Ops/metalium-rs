@@ -50,6 +50,10 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         )
         .unwrap();
         s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        // These gates count programs and bytes for the plain path's block
+        // shapes; a pipelined matmul (the default) stages each shape twice,
+        // once per half (`step54_pipeline`).
+        s.set_pipeline(false);
         f(&mut s);
     }) {
         panic!("{e}");
@@ -66,6 +70,10 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        // These gates count programs and bytes for the plain path's block
+        // shapes; a pipelined matmul (the default) stages each shape twice,
+        // once per half (`step54_pipeline`).
+        s.set_pipeline(false);
         f(&mut s);
     }) {
         panic!("{e}");

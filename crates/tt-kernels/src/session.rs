@@ -320,12 +320,15 @@ pub struct Session<T: Transport> {
     images: RoleImages<'static>,
     /// Every run's phases since the last [`Session::take_profile`].
     /// Whether GDDR matmuls double-buffer their blocks so a unit's moves
-    /// overlap its kernels (`Session::set_pipeline`, checklist 9.15).
+    /// overlap its kernels (`Session::set_pipeline`, checklist 9.15). On by
+    /// default.
     pipeline: bool,
     /// [`Session::pipelined_blocks`].
     pipelined: u64,
     /// [`Session::set_profile_roles`].
     profile_roles: bool,
+    /// [`Session::drains`].
+    drains: u64,
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
@@ -952,9 +955,10 @@ impl<T: Transport> Session<T> {
             grid,
             images,
             profile: runtime::Profile::default(),
-            pipeline: false,
+            pipeline: true,
             pipelined: 0,
             profile_roles: true,
+            drains: 0,
             dram: None,
             profiling: None,
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
@@ -1357,6 +1361,7 @@ impl<T: Transport> Session<T> {
         if self.units[u].queued.is_empty() {
             return Ok(());
         }
+        self.drains += 1;
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (Some(r), Some(m)) = (unit.resident.as_mut(), unit.mover.as_mut()) else {
@@ -1484,12 +1489,24 @@ impl<T: Transport> Session<T> {
                 self.ensure_unit(u)?;
             }
         }
-        for (u, steps) in queues.into_iter().enumerate() {
-            for seg in segments(steps) {
-                if what.is_empty() {
-                    *what = seg.what;
+        // In rounds: every unit's first list, then every unit's second, and
+        // so on. A unit whose share is more than its ring holds makes the
+        // host wait for room; enqueued unit by unit, that wait came before
+        // the other units had anything to do, and they ran one after another
+        // (a pipelined 1024^3 matmul on 8 tiles: 9 ms in the call, against
+        // 0.4).
+        let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
+            .into_iter()
+            .map(|steps| segments(steps).into())
+            .collect();
+        while per_unit.iter().any(|q| !q.is_empty()) {
+            for (u, q) in per_unit.iter_mut().enumerate() {
+                if let Some(seg) = q.pop_front() {
+                    if what.is_empty() {
+                        *what = seg.what;
+                    }
+                    self.enqueue_segment(u, &seg, budget)?;
                 }
-                self.enqueue_segment(u, &seg, budget)?;
             }
         }
         if n > 1 {
@@ -2586,12 +2603,14 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.tile).collect()
     }
 
-    /// Double-buffer GDDR matmuls from the next op on (checklist 9.15): each
-    /// block staged in half the data arena, a unit's consecutive blocks in
-    /// alternate halves, so its mover gathers the next block and scatters the
-    /// last while the roles compute one (`tt_isa::dm::op::LAUNCH`,
-    /// `KERNEL_WAIT`). The blocks are smaller, so the op moves more; the bits
-    /// are the same. Not while a trace is being captured.
+    /// Double-buffer GDDR matmuls from the next op on (checklist 9.15; on by
+    /// default): each block staged in half the data arena, a unit's
+    /// consecutive blocks in alternate halves, so its mover gathers the next
+    /// block and scatters the last while the roles compute one
+    /// (`tt_isa::dm::op::LAUNCH`, `KERNEL_WAIT`). Only where it pays
+    /// (`tensor::pipelining_pays`): two blocks a unit or more, and at most
+    /// twice the operand tiles gathered. The bits are the same. Not while a
+    /// trace is being captured.
     pub fn set_pipeline(&mut self, on: bool) {
         self.pipeline = on;
     }
@@ -2600,6 +2619,14 @@ impl<T: Transport> Session<T> {
     /// (`Session::set_pipeline`), since the session opened.
     pub fn pipelined_blocks(&self) -> u64 {
         self.pipelined
+    }
+
+    /// How many times the host has waited for a unit's queued lists to finish
+    /// before it could go on enqueueing -- for programs to place, or role
+    /// configuration to change -- since the session opened. Each one stops
+    /// that unit's work overlapping the host's.
+    pub fn drains(&self) -> u64 {
+        self.drains
     }
 
     /// Whether a profile records the roles' events as well as the mover's

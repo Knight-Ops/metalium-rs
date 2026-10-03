@@ -917,6 +917,14 @@ pub fn kmd_engine(
                 "TT_ELTWISE={v}: element-wise ops always run on the SFPU now; unset it"
             )));
         }
+        // `TT_PIPELINE=0`: matmuls run their blocks one after another rather
+        // than overlapping one block's moves with the next one's compute
+        // (`Session::set_pipeline`); the bits are the same either way.
+        match std::env::var("TT_PIPELINE").as_deref() {
+            Err(_) | Ok("1") => {}
+            Ok("0") => session.set_pipeline(false),
+            Ok(v) => return Err(EngineError(format!("TT_PIPELINE={v}: expected 0 or 1"))),
+        }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.

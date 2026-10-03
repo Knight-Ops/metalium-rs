@@ -767,6 +767,44 @@ pub fn blocks([mt, nt]: [usize; 2], [mc, nc]: [usize; 2], units: usize) -> [usiz
     [mc, nc]
 }
 
+/// Whether a GDDR matmul gains by pipelining (`Staging::SlotsHalf`): `K`
+/// still whole in half the arena, at least two blocks a unit to overlap, and
+/// no more than twice the operand tiles gathered. Half-arena blocks are
+/// smaller, so each output block re-gathers its operands more often; past
+/// twice, card 0 found the gathers outweigh the overlap (1024^3 on 8 tiles:
+/// 1x2-tile blocks, x2.18 the tiles, 1.3x slower), and below two blocks a
+/// unit there is nothing to overlap.
+pub fn pipelining_pays(
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+) -> bool {
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // Tiles gathered over the whole op, and blocks, for a staging.
+    let gathered = |st: Staging| -> Option<(usize, usize)> {
+        let s = matmul::plan_in([m, k, n], route, fidelity, st)?;
+        if s.tiles[1] < kt {
+            return None;
+        }
+        let [mc, nc] = blocks([mt, nt], [s.tiles[0], s.tiles[2]], units);
+        let (mut tiles, mut count) = (0, 0);
+        for i0 in (0..mt).step_by(mc) {
+            for j0 in (0..nt).step_by(nc) {
+                tiles += (mc.min(mt - i0) + nc.min(nt - j0)) * kt;
+                count += 1;
+            }
+        }
+        Some((tiles, count))
+    };
+    let (Some((full, _)), Some((half, count))) =
+        (gathered(Staging::Slots), gathered(Staging::SlotsHalf))
+    else {
+        return false;
+    };
+    count >= 2 * units.max(1) && half <= 2 * full
+}
+
 /// `op(A) @ op(B)`, where `op` is a transpose when asked, all in GDDR: the
 /// data mover gathers each block's tiles into L1 (transposing where needed),
 /// the resident roles compute it, and the mover writes the output tiles back.
@@ -814,10 +852,7 @@ pub fn matmul_dram(
     // blocks of a unit alternating halves, so the session can move the next
     // block in and the last one out while one computes -- if `K` still fits
     // whole in half the arena.
-    let staging = if pipeline
-        && matmul::plan_in([m, k, n], route, fidelity, Staging::SlotsHalf)
-            .is_some_and(|s| s.tiles[1] >= kt)
-    {
+    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
         Staging::SlotsHalf
     } else {
         Staging::Slots
