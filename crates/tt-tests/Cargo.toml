@@ -62,3 +62,5 @@ tt-kmd.workspace = true
 burn-flex.workspace = true
 burn-tensor.workspace = true
 burn.workspace = true
+# The general-model gate trains the model `tt-mnist --model transformer` times.
+tt-mnist = { path = "../tt-mnist" }

@@ -319,6 +319,35 @@ pub struct Session<T: Transport> {
     grid: Tensix,
     images: RoleImages<'static>,
     /// Every run's phases since the last [`Session::take_profile`].
+    /// Whether GDDR matmuls double-buffer their blocks so a unit's moves
+    /// overlap its kernels (`Session::set_pipeline`, checklist 9.15). On by
+    /// default.
+    pipeline: bool,
+    /// NC's mover image, when pipelined groups' scatters go to NC
+    /// ([`Session::set_scatter_mover`]); `None` keeps every move on B.
+    scatter_on_nc: Option<&'static [u8]>,
+    /// [`Session::host_times`].
+    host: HostTimes,
+    /// Host memory the card moves tensors through ([`Session::host_dma`]),
+    /// pinned on first use; `Err` once it could not be, with why.
+    staging: Option<Result<Box<dyn tt_device::HostMemory>, String>>,
+    /// Whether tensor transfers go through `staging` where they can.
+    host_dma: bool,
+    /// While set, queued work takes no barrier: a host DMA transfer, which
+    /// the session syncs on at once, so nothing can run past it.
+    unbarriered: bool,
+    /// Where tensors take and lose the tile layout ([`Session::set_tilize`]).
+    tilize: Tilize,
+    /// The next free byte of `staging`, used as a ring by queued uploads;
+    /// and whether anything queued may still read what is behind it.
+    staging_at: usize,
+    staging_busy: bool,
+    /// [`Session::pipelined_blocks`].
+    pipelined: u64,
+    /// [`Session::set_profile_roles`].
+    profile_roles: bool,
+    /// [`Session::drains`].
+    drains: u64,
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
@@ -368,15 +397,16 @@ struct Unit {
     /// Lists enqueued on this tile's mover and not yet retired, oldest first
     /// ([`Session::sync`]).
     queued: std::collections::VecDeque<QueuedList>,
-    /// `lists` when the mover's throttle was last looked at, and the stalls
-    /// last reported ([`Session::check_throttle`]).
-    throttle_checked_at: u64,
-    throttle_reported: u32,
+    /// The data mover on this tile's RISCV NC, writing out pipelined groups'
+    /// scatters ([`Session::set_scatter_mover`]); started when first needed,
+    /// and again whenever B's is. B's lists wait for it, so a unit is idle
+    /// once B's are done.
+    nc: Option<DataMover<Noc0>>,
+    /// `SIGNAL`s queued on B's and NC's movers since each started: the base
+    /// a segment's relative `WAIT_PEER` targets count from.
+    b_signals: u32,
+    nc_signals: u32,
 }
-
-/// Lists between looks at a unit's throttle counters: one PCIe read per this
-/// many host round trips.
-const THROTTLE_CHECK_LISTS: u64 = 1024;
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
 /// close when it is retired), and what it was, for an error.
@@ -384,6 +414,217 @@ struct QueuedList {
     number: u32,
     kernels: bool,
     what: &'static str,
+}
+
+/// The host memory a session pins for the card's DMA of tensors: one 1 GiB
+/// hugepage on silicon (`tt_kmd::host`); a transfer larger moves in parts.
+const HOST_DMA_STAGING: usize = 1 << 30;
+
+/// Fewest tiles an upload or write takes by the card's DMA: every one. Queued,
+/// a 50-tile upload costs the host ~19 us, a 2-tile one through the BAR 66.
+const HOST_DMA_MIN_UPLOAD: usize = 1;
+
+/// `n` zeros, in memory the kernel backs with 2 MiB pages where it can
+/// (`MADV_HUGEPAGE`, before anything touches it): a download's output is
+/// written once, all of it, and in this VM every 4 KiB page's first touch is
+/// a fault that cost a 32 MB download more than the card's DMA of it.
+fn huge_zeroed(n: usize) -> Vec<f32> {
+    let v = vec![0f32; n];
+    let bytes = n * 4;
+    const HUGE: usize = 2 << 20;
+    if bytes >= 2 * HUGE {
+        let start = (v.as_ptr() as usize).next_multiple_of(HUGE);
+        let end = (v.as_ptr() as usize + bytes) / HUGE * HUGE;
+        if end > start {
+            // SAFETY: advice only, on whole pages inside `v`'s allocation,
+            // which `vec!` zeroed without touching (a fresh mapping).
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+            }
+        }
+    }
+    v
+}
+
+/// Where a tensor takes the tile layout ([`Session::set_tilize`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Tilize {
+    /// On the host, before the card's DMA: the host's cores convert, and
+    /// tiles cross PCIe (`tensor::host_dma_jobs`).
+    Host,
+    /// On the card: rows cross PCIe and each unit's mover tilizes them in L1
+    /// (`tt_isa::dm::op::TILIZE`, `tensor::row_major_dma_jobs`). The tile
+    /// layout never leaves the card.
+    Card,
+}
+
+/// `rows` rows of `row` bytes from `src` (rows `src.len() / rows` apart) to
+/// `dst` (rows `dst_stride` apart) -- or the other way, as strides say: the
+/// host's whole share of a row-major transfer, split over threads when large.
+fn copy_rows(src: &[u8], rows: usize, src_stride: usize, dst: &mut [u8], dst_stride: usize) {
+    let row = src_stride.min(dst_stride);
+    if rows == 0 {
+        return;
+    }
+    let one = |src: &[u8], dst: &mut [u8], n: usize| {
+        if src_stride == dst_stride {
+            dst[..n * row].copy_from_slice(&src[..n * row]);
+        } else {
+            for r in 0..n {
+                dst[r * dst_stride..][..row].copy_from_slice(&src[r * src_stride..][..row]);
+            }
+        }
+    };
+    let bytes = rows * row;
+    let threads = if bytes >= 4 << 20 { 8 } else { 1 };
+    if threads == 1 {
+        return one(src, dst, rows);
+    }
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (k, d) in dst[..rows * dst_stride]
+            .chunks_mut(per * dst_stride)
+            .enumerate()
+        {
+            let n = per.min(rows - k * per);
+            let sr = &src[k * per * src_stride..];
+            scope.spawn(move || one(sr, d, n));
+        }
+    });
+}
+
+/// What an upload or write takes: FP32 values, or any element's datums as
+/// their bits -- tilized from either without converting the other.
+#[derive(Copy, Clone)]
+enum Src<'a> {
+    F32(&'a [f32]),
+    Bits(&'a [u32]),
+}
+
+impl Src<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Src::F32(v) => v.len(),
+            Src::Bits(v) => v.len(),
+        }
+    }
+
+    /// Its datums' bytes, little-endian as the card takes them.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: plain 4-byte values; x86's and RISC-V's byte order alike.
+        unsafe {
+            match *self {
+                Src::F32(v) => std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
+                Src::Bits(v) => std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
+            }
+        }
+    }
+
+    fn bits(&self) -> Option<&[u32]> {
+        match self {
+            Src::F32(_) => None,
+            Src::Bits(v) => Some(v),
+        }
+    }
+
+    /// `t`'s tiles `tiles` into `out`, one every `stride` bytes.
+    fn tilize(&self, t: &DramTensor, tiles: std::ops::Range<usize>, out: &mut [u8], stride: usize) {
+        use crate::matmul::tilize_into;
+        match *self {
+            Src::F32(v) => tilize_into(|i| v[i].to_bits(), t.rows, t.cols, tiles, out, stride),
+            Src::Bits(v) => tilize_into(|i| v[i], t.rows, t.cols, tiles, out, stride),
+        }
+    }
+}
+
+/// Where the host's time goes queueing ops ([`Session::host_times`],
+/// checklist 9.17): each stage's wall time, PCIe traffic and how often it ran,
+/// summed since the session opened or [`Session::reset_host_times`].
+#[derive(Clone, Debug, Default)]
+pub struct HostTimes {
+    pub stages: [(HostStage, HostStageTotal); HostStage::ALL.len()],
+    /// Ops queued (`Session::execute` with batching).
+    pub ops: u64,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum HostStage {
+    /// The whole of queueing an op: everything below, and what is between.
+    #[default]
+    Enqueue,
+    /// Steps into mover lists (`segments`).
+    Segments,
+    /// A unit's roles and mover checked, started if they are not.
+    Ensure,
+    /// A kernel's descriptors checked against what queued lists read.
+    IdleCheck,
+    /// Programs looked up in the cache, uploaded if missing.
+    Place,
+    /// Kernel generations reserved (`Resident::reserve`).
+    Reserve,
+    /// NC's list, with the scatters on NC.
+    NcList,
+    /// The list written to the mover's ring and its doorbell rung.
+    List,
+    /// Every unit's barrier entry, on a multi-unit op.
+    Barrier,
+    /// Waiting for a unit to drain, for programs or descriptors.
+    Drain,
+}
+
+impl HostStage {
+    pub const ALL: [HostStage; 10] = [
+        HostStage::Enqueue,
+        HostStage::Segments,
+        HostStage::Ensure,
+        HostStage::IdleCheck,
+        HostStage::Place,
+        HostStage::Reserve,
+        HostStage::NcList,
+        HostStage::List,
+        HostStage::Barrier,
+        HostStage::Drain,
+    ];
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HostStageTotal {
+    pub time: std::time::Duration,
+    pub traffic: tt_device::Traffic,
+    pub count: u64,
+}
+
+impl HostTimes {
+    fn new() -> Self {
+        let mut t = HostTimes::default();
+        for (i, s) in HostStage::ALL.into_iter().enumerate() {
+            t.stages[i].0 = s;
+        }
+        t
+    }
+
+    fn add(
+        &mut self,
+        stage: HostStage,
+        since: (std::time::Instant, tt_device::Traffic),
+        now: tt_device::Traffic,
+    ) {
+        let i = HostStage::ALL.iter().position(|&s| s == stage).unwrap();
+        let t = &mut self.stages[i].1;
+        t.time += since.0.elapsed();
+        t.traffic = t.traffic + diff(now, since.1);
+        t.count += 1;
+    }
+}
+
+fn diff(a: tt_device::Traffic, b: tt_device::Traffic) -> tt_device::Traffic {
+    tt_device::Traffic {
+        bytes_written: a.bytes_written - b.bytes_written,
+        bytes_read: a.bytes_read - b.bytes_read,
+        write_calls: a.write_calls - b.write_calls,
+        read_calls: a.read_calls - b.read_calls,
+        retargets: a.retargets - b.retargets,
+    }
 }
 
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
@@ -403,8 +644,11 @@ struct Segment {
     /// What it is, for [`tensor::stats`]: its first step's.
     what: &'static str,
     entries: Vec<[u32; 8]>,
-    /// Indices into `entries` of the `KERNEL` entries.
+    /// Indices into `entries` of the `KERNEL` (or `LAUNCH`) entries.
     kernels: Vec<usize>,
+    /// `KERNEL_WAIT` entries: each one's index into `entries`, and the index
+    /// into `kernels` of the launch it waits for (in the same list).
+    waits: Vec<(usize, usize)>,
     /// The programs of each `KERNEL` entry, in order.
     kernel_roles: Vec<Arc<[Vec<Instruction>; 3]>>,
     /// Each kernel's block repeats, beside its roles: stored with its
@@ -428,6 +672,17 @@ struct Segment {
     loops: Arc<[Vec<crate::code::Loop>; 3]>,
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
+    /// With the scatters on NC ([`Session::set_scatter_mover`]): NC's list,
+    /// queued beside this one.
+    nc_entries: Vec<[u32; 8]>,
+    /// `WAIT_PEER` entries in `entries` (on NC) and in `nc_entries` (on B):
+    /// each one's index, and the peer's `SIGNAL`s it waits for, counted from
+    /// the peer's last before this segment. Made absolute when queued.
+    b_waits_on_nc: Vec<(usize, u32)>,
+    nc_waits_on_b: Vec<(usize, u32)>,
+    /// `SIGNAL`s in `entries` and `nc_entries`.
+    b_signals: u32,
+    nc_signals: u32,
 }
 
 /// Make every program `seg`'s kernels name resident on the tile, uploading
@@ -436,6 +691,61 @@ struct Segment {
 /// has finished. If fragmentation leaves no room beside what is pinned, the
 /// cache starts again from empty: `segments` keeps a list's programs within
 /// the region, so they always fit a fresh one.
+/// Role `t`'s program of a kernel as the cache stores it (`Code::stored`),
+/// with its [`program_cache::hash`]: worked out once per program, not once
+/// per kernel enqueued -- on 8 tiles, re-encoding and rehashing every
+/// program on every list cost the host more than the device spent on the op.
+/// Keyed by the programs' allocations, which the memo keeps alive, so a key
+/// is never reused; cleared when it grows past `MEMO_MAX`, since some ops
+/// build fresh programs every call.
+fn stored_program(
+    roles: &Arc<[Vec<Instruction>; 3]>,
+    loops: &Arc<[Vec<crate::code::Loop>; 3]>,
+    t: usize,
+) -> Result<(Arc<[u32]>, u32, u64), TensorError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Stored = (Arc<[u32]>, u32, u64);
+    type Entry = (
+        Arc<[Vec<Instruction>; 3]>,
+        Arc<[Vec<crate::code::Loop>; 3]>,
+        [Option<Stored>; 3],
+    );
+    const MEMO_MAX: usize = 4096;
+    static MEMO: OnceLock<Mutex<HashMap<(usize, usize), Entry>>> = OnceLock::new();
+    // No loops is one key, whichever allocation carries it: matmuls and
+    // reductions build a fresh empty table for every kernel.
+    let loops_key = if loops.iter().all(Vec::is_empty) {
+        0
+    } else {
+        Arc::as_ptr(loops) as usize
+    };
+    let key = (Arc::as_ptr(roles) as usize, loops_key);
+    let mut memo = MEMO
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = memo.get(&key).and_then(|e| e.2[t].clone()) {
+        return Ok(s);
+    }
+    let code = crate::code::Code {
+        ins: roles[t].clone(),
+        loops: loops[t].clone(),
+    };
+    let (words, len_word) = code
+        .stored()
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let h = crate::program_cache::hash(&words);
+    let stored: Stored = (Arc::from(words), len_word, h);
+    if memo.len() >= MEMO_MAX && !memo.contains_key(&key) {
+        memo.clear();
+    }
+    memo.entry(key)
+        .or_insert_with(|| (roles.clone(), loops.clone(), [None, None, None]))
+        .2[t] = Some(stored.clone());
+    Ok(stored)
+}
+
 fn place_programs<T: Transport>(
     dev: &mut Device<T>,
     window: &tt_device::Window,
@@ -461,14 +771,9 @@ fn place_programs<T: Transport>(
                 if program.is_empty() {
                     continue;
                 }
-                let code = crate::code::Code {
-                    ins: program.clone(),
-                    loops: seg.kernel_loops[k][t].clone(),
-                };
-                let (words, len_word) = code
-                    .stored()
-                    .map_err(|e| PlaceError::Failed(TensorError::Shape(e.to_string())))?;
-                let at = match cache.place(&words) {
+                let (words, len_word, h) =
+                    stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
+                let at = match cache.place_hashed(&words, h) {
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -538,109 +843,432 @@ impl From<PlaceError> for TensorError {
 /// were separate lists are separated by a `WAIT` entry, since their entries
 /// may reuse each other's L1 slots; a `KERNEL` entry waits by itself.
 fn segments(steps: Vec<Step>) -> Vec<Segment> {
-    use tt_isa::dm::{op, LIST_MAX};
+    segments_split(steps, false)
+}
+
+/// [`segments`], with each pipelined group's scatters on NC if `split`.
+fn segments_split(steps: Vec<Step>, split: bool) -> Vec<Segment> {
+    use tt_isa::dm::op;
     let mut out = Vec::new();
     let mut cur = Segment::default();
-    let close = |cur: &mut Segment, out: &mut Vec<Segment>| {
-        if !cur.entries.is_empty() {
-            out.push(std::mem::take(cur));
-        }
-    };
-    // One entry, or one whole op record (`tt_isa::dm::record`), which a list
-    // never splits.
-    let push = |cur: &mut Segment, out: &mut Vec<Segment>, e: &[[u32; 8]]| {
-        // A full list ends here; the mover waits for all of it before it
-        // reports done, so the next list starts from a clean boundary.
-        if cur.entries.len() + e.len() > LIST_MAX as usize {
-            close(cur, out);
-        }
-        cur.entries.extend_from_slice(e);
-    };
     let mut after_list = false;
-    for step in steps {
-        match step {
-            Step::List { what, entries } => {
+    for item in pipeline_groups(steps) {
+        match item {
+            Item::Step(Step::List { what, entries }) => {
                 if entries.is_empty() {
                     continue;
                 }
-                if cur.what.is_empty() {
-                    cur.what = what;
-                }
-                if after_list && !cur.entries.is_empty() {
-                    push(&mut cur, &mut out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
-                }
-                let mut i = 0;
-                while i < entries.len() {
-                    let n = tt_isa::dm::record::len(entries[i][0]).min(entries.len() - i);
-                    push(&mut cur, &mut out, &entries[i..i + n]);
-                    i += n;
-                    if cur.what.is_empty() {
-                        // A list that spilled into a new segment.
-                        cur.what = what;
-                    }
-                }
-                cur.steps += 1;
+                add_list(&mut cur, &mut out, what, &entries, after_list);
                 after_list = true;
             }
-            Step::Kernel {
+            Item::Step(Step::Kernel {
                 roles,
                 init,
                 mop,
                 loops,
-            } => {
-                let resident = roles
-                    .iter()
-                    .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
-                let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
-                let seen = cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles));
-                let same_init = cur.init.is_empty() || cur.init == init;
-                let fits = if resident {
-                    (cur.kernels.is_empty() || cur.resident)
-                        && (seen || cur.resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
-                } else {
-                    (cur.kernels.is_empty() || !cur.resident)
-                        && cur.roles.as_ref().is_none_or(|r| {
-                            Arc::ptr_eq(r, &roles)
-                                || r.iter().zip(roles.iter()).all(|(a, b)| {
-                                    a.len() == b.len()
-                                        && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
-                                })
-                        })
-                };
-                let same_mop = cur.kernels.is_empty() || cur.mop == *mop;
-                // Resident programs carry their loops; fixed-slot kernels
-                // share one program, so one table.
-                let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
-                if !same_init
-                    || !same_mop
-                    || !same_loops
-                    || !fits
-                    || cur.entries.len() == LIST_MAX as usize
-                {
-                    close(&mut cur, &mut out);
-                }
-                cur.mop = *mop;
-                cur.loops = loops.clone();
-                cur.resident = resident;
-                if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
-                    cur.resident_bytes += bytes;
-                }
-                cur.kernel_roles.push(roles.clone());
-                cur.kernel_loops.push(loops.clone());
-                if cur.what.is_empty() {
-                    cur.what = "matmul";
-                }
-                cur.roles = Some(roles);
-                cur.init = init;
-                cur.kernels.push(cur.entries.len());
-                cur.entries.push([op::KERNEL, 0, 0, 0, 0, 0, 0, 0]);
-                cur.steps += 1;
+                half: _,
+            }) => {
+                add_kernel(&mut cur, &mut out, roles, init, *mop, loops, op::KERNEL);
                 after_list = false;
+            }
+            Item::Group(blocks) => {
+                // A group stays in one list from its first launch to its last
+                // wait, so nothing the host does between lists (a drain, a
+                // role reconfiguration) can fall between a launch and its
+                // wait. It starts a list of its own; `pipeline_groups` kept
+                // it under `LIST_MAX` entries and its programs in the cache.
+                if !cur.entries.is_empty() {
+                    if after_list {
+                        // Its first gather may reuse the slots the list
+                        // before wrote out of.
+                        push_entries(&mut cur, &mut out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
+                    }
+                    close_segment(&mut cur, &mut out);
+                }
+                let before = out.len();
+                // `G0, L0`, then for each next block `Gk, W(k-1), Lk,
+                // S(k-1)`, then `W(last), S(last)`: block k+1 moves in, and
+                // block k-1 out, while block k computes. Every hazard is
+                // ordered: a launch waits for every move before it (its
+                // gather, and the scatter that emptied its half's outputs);
+                // a gather refills a half only after the kernel that read it
+                // was waited for; a scatter reads only waited-for outputs.
+                // The scatter and gather that sit next to each other touch
+                // different slots (outputs, inputs), so no `WAIT` between.
+                if split {
+                    add_split_group(&mut cur, &mut out, blocks);
+                } else {
+                    add_group(&mut cur, &mut out, blocks);
+                }
+                assert_eq!(out.len(), before, "a pipelined group split across lists");
+                after_list = true;
             }
         }
     }
-    close(&mut cur, &mut out);
+    close_segment(&mut cur, &mut out);
     out
+}
+
+/// A pipelined group into the current list, every move on B: `G0, L0`, then
+/// for each next block `Gk, W(k-1), Lk, S(k-1)`, then `W(last), S(last)`.
+fn add_group(cur: &mut Segment, out: &mut Vec<Segment>, blocks: Vec<Block>) {
+    use tt_isa::dm::op;
+    let mut launched = Vec::with_capacity(blocks.len());
+    let mut scatters = Vec::with_capacity(blocks.len());
+    for (k, block) in blocks.into_iter().enumerate() {
+        let Block {
+            gather,
+            roles,
+            init,
+            mop,
+            loops,
+            scatter,
+        } = block;
+        add_list(cur, out, gather.0, &gather.1, false);
+        if k > 0 {
+            let w = launched[k - 1];
+            cur.waits.push((cur.entries.len(), w));
+            cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            cur.steps += 1;
+        }
+        launched.push(cur.kernels.len());
+        add_kernel(cur, out, roles, init, mop, loops, op::LAUNCH);
+        if k > 0 {
+            let (what, entries): (&'static str, Vec<[u32; 8]>) =
+                std::mem::take(&mut scatters[k - 1]);
+            add_list(cur, out, what, &entries, false);
+        }
+        scatters.push(scatter);
+    }
+    let last = launched.len() - 1;
+    cur.waits.push((cur.entries.len(), launched[last]));
+    cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
+    let (what, entries) = std::mem::take(&mut scatters[last]);
+    add_list(cur, out, what, &entries, false);
+}
+
+/// A `WAIT_PEER` entry's word naming the mover it waits for
+/// (`tt_isa::dm::Peer`).
+const PEER_B: u32 = 0;
+const PEER_NC: u32 = 1;
+
+/// A pipelined group with its scatters on NC (`Session::set_scatter_mover`).
+/// B gathers and launches as [`add_group`] does, and after each kernel's wait
+/// signals NC, which writes that block out and signals back:
+///
+/// ```text
+/// B:  G0 L0 | G1 W0 s L1 | G2 [NC>=1] W1 s L2 | ... | W(n-1) s [NC>=n]
+/// NC: [B>=1] S0 s | [B>=2] S1 s | ... | [B>=n] S(n-1) s
+/// ```
+///
+/// Block k's launch waits for NC to have written out block k-2, whose
+/// outputs share its half; B's list ends waiting for NC's last, so the next
+/// list's gathers (another op's slots) cannot land under a scatter, and B's
+/// list done means the unit is idle. A `SIGNAL` counts only once the
+/// signaller's writes have landed.
+fn add_split_group(cur: &mut Segment, out: &mut Vec<Segment>, blocks: Vec<Block>) {
+    use tt_isa::dm::op;
+    let n = blocks.len();
+    let mut launched = Vec::with_capacity(n);
+    for (k, block) in blocks.into_iter().enumerate() {
+        let Block {
+            gather,
+            roles,
+            init,
+            mop,
+            loops,
+            scatter,
+        } = block;
+        add_list(cur, out, gather.0, &gather.1, false);
+        if k > 0 {
+            cur.waits.push((cur.entries.len(), launched[k - 1]));
+            cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            cur.entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+            cur.b_signals += 1;
+            cur.steps += 1;
+        }
+        if k > 1 {
+            cur.b_waits_on_nc.push((cur.entries.len(), (k - 1) as u32));
+            cur.entries.push([op::WAIT_PEER, PEER_NC, 0, 0, 0, 0, 0, 0]);
+        }
+        launched.push(cur.kernels.len());
+        add_kernel(cur, out, roles, init, mop, loops, op::LAUNCH);
+        cur.nc_waits_on_b
+            .push((cur.nc_entries.len(), (k + 1) as u32));
+        cur.nc_entries
+            .push([op::WAIT_PEER, PEER_B, 0, 0, 0, 0, 0, 0]);
+        cur.nc_entries.extend_from_slice(&scatter.1);
+        cur.nc_entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+        cur.nc_signals += 1;
+        cur.steps += 1;
+    }
+    cur.waits.push((cur.entries.len(), launched[n - 1]));
+    cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+    cur.entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+    cur.b_signals += 1;
+    cur.b_waits_on_nc.push((cur.entries.len(), n as u32));
+    cur.entries.push([op::WAIT_PEER, PEER_NC, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
+}
+
+/// Each `KERNEL` (or `LAUNCH`) entry of `seg` its generation, in order, and
+/// each `KERNEL_WAIT` the generation of the launch it waits for.
+fn fill_generations(
+    entries: &mut [[u32; 8]],
+    seg: &Segment,
+    generations: impl IntoIterator<Item = u32>,
+) {
+    let gens: Vec<u32> = generations.into_iter().collect();
+    for (&at, &g) in seg.kernels.iter().zip(&gens) {
+        entries[at][1] = g;
+    }
+    for &(at, k) in &seg.waits {
+        entries[at][1] = gens[k];
+    }
+}
+
+fn close_segment(cur: &mut Segment, out: &mut Vec<Segment>) {
+    if !cur.entries.is_empty() {
+        out.push(std::mem::take(cur));
+    }
+}
+
+/// One entry, or one whole op record (`tt_isa::dm::record`), which a list
+/// never splits. A full list ends here; the mover waits for all of it before
+/// it reports done, so the next list starts from a clean boundary.
+fn push_entries(cur: &mut Segment, out: &mut Vec<Segment>, e: &[[u32; 8]]) {
+    if cur.entries.len() + e.len() > tt_isa::dm::LIST_MAX as usize {
+        close_segment(cur, out);
+    }
+    cur.entries.extend_from_slice(e);
+}
+
+/// A list step's entries into the current list, after a `WAIT` if
+/// `wait_before` (the step before was a list too, whose slots these may reuse).
+fn add_list(
+    cur: &mut Segment,
+    out: &mut Vec<Segment>,
+    what: &'static str,
+    entries: &[[u32; 8]],
+    wait_before: bool,
+) {
+    use tt_isa::dm::op;
+    if cur.what.is_empty() {
+        cur.what = what;
+    }
+    if wait_before && !cur.entries.is_empty() {
+        push_entries(cur, out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        let n = tt_isa::dm::record::len(entries[i][0]).min(entries.len() - i);
+        push_entries(cur, out, &entries[i..i + n]);
+        i += n;
+        if cur.what.is_empty() {
+            // A list that spilled into a new segment.
+            cur.what = what;
+        }
+    }
+    cur.steps += 1;
+}
+
+/// A kernel step as a `KERNEL` (or `LAUNCH`) placeholder in the current list,
+/// closing it first if the kernel cannot join: one whose semaphores start
+/// differently (a list's kernels share one setup), and -- since the fixed
+/// slots hold one kernel at a time -- one whose programs differ from the
+/// list's, unless every program involved is resident (`crate::program_cache`)
+/// and together they fit the cache.
+fn add_kernel(
+    cur: &mut Segment,
+    out: &mut Vec<Segment>,
+    roles: Arc<[Vec<Instruction>; 3]>,
+    init: Vec<runtime::SemaphoreInit>,
+    mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
+    op_code: u32,
+) {
+    use tt_isa::dm::LIST_MAX;
+    let resident = roles
+        .iter()
+        .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
+    let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
+    let seen = cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles));
+    let same_init = cur.init.is_empty() || cur.init == init;
+    let fits = if resident {
+        (cur.kernels.is_empty() || cur.resident)
+            && (seen || cur.resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+    } else {
+        (cur.kernels.is_empty() || !cur.resident)
+            && cur.roles.as_ref().is_none_or(|r| {
+                Arc::ptr_eq(r, &roles)
+                    || r.iter().zip(roles.iter()).all(|(a, b)| {
+                        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
+                    })
+            })
+    };
+    let same_mop = cur.kernels.is_empty() || cur.mop == mop;
+    // Resident programs carry their loops; fixed-slot kernels share one
+    // program, so one table.
+    let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
+    if !same_init || !same_mop || !same_loops || !fits || cur.entries.len() == LIST_MAX as usize {
+        close_segment(cur, out);
+    }
+    cur.mop = mop;
+    cur.loops = loops.clone();
+    cur.resident = resident;
+    if resident && !seen {
+        cur.resident_bytes += bytes;
+    }
+    cur.kernel_roles.push(roles.clone());
+    cur.kernel_loops.push(loops);
+    if cur.what.is_empty() {
+        cur.what = "matmul";
+    }
+    cur.roles = Some(roles);
+    cur.init = init;
+    cur.kernels.push(cur.entries.len());
+    cur.entries.push([op_code, 0, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
+}
+
+/// One double-buffered block: its gather, its kernel, its scatter.
+struct Block {
+    gather: (&'static str, Vec<[u32; 8]>),
+    roles: Arc<[Vec<Instruction>; 3]>,
+    init: Vec<runtime::SemaphoreInit>,
+    mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
+    scatter: (&'static str, Vec<[u32; 8]>),
+}
+
+/// A unit's steps, as [`segments`] lays them out.
+enum Item {
+    Step(Step),
+    /// Consecutive double-buffered blocks to overlap.
+    Group(Vec<Block>),
+}
+
+/// Blocks per group at most: a group is one list, and a block is a gather
+/// record, a launch, a wait and a scatter record.
+const GROUP_MAX: usize = 40;
+
+/// A unit's steps with its runs of double-buffered blocks gathered into
+/// groups: `[gather, kernel (staged in a half), scatter]` jobs, one after
+/// another, in alternating halves, whose programs are resident and fit the
+/// cache together. Anything else is left as it is; so is a lone block.
+fn pipeline_groups(steps: Vec<Step>) -> Vec<Item> {
+    use tt_isa::dm::LIST_MAX;
+    let mut items: Vec<Item> = Vec::new();
+    let mut run: Vec<Block> = Vec::new();
+    let mut run_entries = 0usize;
+    let flush = |run: &mut Vec<Block>, items: &mut Vec<Item>| match run.len() {
+        0 => {}
+        1 => {
+            let b = run.pop().unwrap();
+            items.push(Item::Step(Step::List {
+                what: b.gather.0,
+                entries: b.gather.1,
+            }));
+            items.push(Item::Step(Step::Kernel {
+                roles: b.roles,
+                init: b.init,
+                mop: Box::new(b.mop),
+                loops: b.loops,
+                half: None,
+            }));
+            items.push(Item::Step(Step::List {
+                what: b.scatter.0,
+                entries: b.scatter.1,
+            }));
+        }
+        _ => items.push(Item::Group(std::mem::take(run))),
+    };
+    let mut steps = steps.into_iter().peekable();
+    let mut last_half: Option<u8> = None;
+    let mut resident_bytes = 0u64;
+    let mut seen: Vec<Arc<[Vec<Instruction>; 3]>> = Vec::new();
+    while let Some(step) = steps.next() {
+        // A block: this list, then a kernel staged in a half, then a list.
+        let is_block = matches!(step, Step::List { .. })
+            && matches!(steps.peek(), Some(Step::Kernel { half: Some(_), roles, .. })
+                if roles.iter().all(|p| p.is_empty() || crate::program_cache::admitted(p.len())));
+        if !is_block {
+            flush(&mut run, &mut items);
+            last_half = None;
+            items.push(Item::Step(step));
+            continue;
+        }
+        let Step::List { what, entries } = step else {
+            unreachable!()
+        };
+        let Some(Step::Kernel {
+            roles,
+            init,
+            mop,
+            loops,
+            half,
+        }) = steps.next()
+        else {
+            unreachable!()
+        };
+        let scatter = match steps.next() {
+            Some(Step::List { what, entries }) => (what, entries),
+            other => {
+                // Not a block after all: put it back as plain steps.
+                flush(&mut run, &mut items);
+                last_half = None;
+                items.push(Item::Step(Step::List { what, entries }));
+                items.push(Item::Step(Step::Kernel {
+                    roles,
+                    init,
+                    mop,
+                    loops,
+                    half: None,
+                }));
+                if let Some(o) = other {
+                    items.push(Item::Step(o));
+                }
+                continue;
+            }
+        };
+        let block_entries = entries.len() + scatter.1.len() + 2;
+        let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
+        let new = !seen.iter().any(|r| Arc::ptr_eq(r, &roles));
+        let joins = !run.is_empty()
+            && half != last_half
+            && run.len() < GROUP_MAX
+            && run_entries + block_entries + 1 < LIST_MAX as usize
+            && (!new || resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+            // Not the loops: a group's programs are all resident, and a
+            // resident program carries its own (`add_kernel`) -- an
+            // element-wise run's repeat its tile count.
+            && run
+                .last()
+                .is_some_and(|b| b.init == init && b.mop == *mop);
+        if !joins {
+            flush(&mut run, &mut items);
+            run_entries = 0;
+            resident_bytes = 0;
+            seen.clear();
+        }
+        if !seen.iter().any(|r| Arc::ptr_eq(r, &roles)) {
+            resident_bytes += bytes;
+            seen.push(roles.clone());
+        }
+        run_entries += block_entries;
+        last_half = half;
+        run.push(Block {
+            gather: (what, entries),
+            roles,
+            init,
+            mop: *mop,
+            loops,
+            scatter,
+        });
+    }
+    flush(&mut run, &mut items);
+    items
 }
 
 impl<T: Transport> Session<T> {
@@ -702,6 +1330,18 @@ impl<T: Transport> Session<T> {
             grid,
             images,
             profile: runtime::Profile::default(),
+            pipeline: true,
+            scatter_on_nc: None,
+            host: HostTimes::new(),
+            staging: None,
+            host_dma: true,
+            unbarriered: false,
+            staging_at: 0,
+            staging_busy: false,
+            tilize: Tilize::Host,
+            pipelined: 0,
+            profile_roles: true,
+            drains: 0,
             dram: None,
             profiling: None,
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
@@ -726,8 +1366,9 @@ impl<T: Transport> Session<T> {
                 lists: 0,
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
-                throttle_checked_at: 0,
-                throttle_reported: 0,
+                nc: None,
+                b_signals: 0,
+                nc_signals: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -761,6 +1402,7 @@ impl<T: Transport> Session<T> {
     }
 
     fn prepare_unit(&mut self, u: usize) -> Result<(), RunError> {
+        let profile_roles = self.profile_roles;
         let Session {
             dev,
             units,
@@ -773,6 +1415,7 @@ impl<T: Transport> Session<T> {
         // not, and what L1 holds is no longer the host's to vouch for.
         *epoch += 1;
         unit.mover = None;
+        unit.nc = None;
         unit.programs.clear();
         if let Some(r) = unit.resident.take() {
             r.stop(dev, images)?;
@@ -805,6 +1448,7 @@ impl<T: Transport> Session<T> {
             // What the stream held since the last drain belonged to the run
             // that failed; the profile goes on from an empty one.
             r.set_profiling(true);
+            r.set_profile_roles(profile_roles);
             dev.configure_trace(
                 r.window(),
                 unit.tile,
@@ -840,6 +1484,7 @@ impl<T: Transport> Session<T> {
             if self.units[u].resident.is_none() {
                 self.prepare_unit(u)?;
             }
+            let profile_roles = self.profile_roles;
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let r = unit.resident.as_mut().expect("prepared above");
@@ -850,6 +1495,7 @@ impl<T: Transport> Session<T> {
                 tt_isa::mailbox::TRACE_BUFFER_BYTES,
             )?;
             r.set_profiling(true);
+            r.set_profile_roles(profile_roles);
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
             }
@@ -960,11 +1606,7 @@ impl<T: Transport> Session<T> {
         rows: usize,
         cols: usize,
     ) -> Result<DramTensor, TensorError> {
-        let Session { dev, dram, .. } = self;
-        let d = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        DramTensor::upload(dev, &d.w4, &mut d.alloc, values, rows, cols)
+        self.upload_src(Src::F32(values), rows, cols, crate::tensor::Elem::F32)
     }
 
     /// Upload a row-major `[rows, cols]` matrix of `elem` datums, as their
@@ -976,17 +1618,68 @@ impl<T: Transport> Session<T> {
         cols: usize,
         elem: crate::tensor::Elem,
     ) -> Result<DramTensor, TensorError> {
+        self.upload_src(Src::Bits(values), rows, cols, elem)
+    }
+
+    fn upload_src(
+        &mut self,
+        values: Src<'_>,
+        rows: usize,
+        cols: usize,
+        elem: crate::tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        if values.len() != rows * cols {
+            return Err(TensorError::Shape(format!(
+                "{} values for a [{rows}, {cols}] tensor",
+                values.len()
+            )));
+        }
+        let t = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)?;
+        if let Err(e) = self.write_src(&t, values, true) {
+            let _ = self.free(t);
+            return Err(e);
+        }
+        Ok(t)
+    }
+
+    /// `values` into `t`'s slots: by the card from pinned host memory where
+    /// it can ([`Session::set_host_dma`]), queued behind what is queued, else
+    /// through the BAR -- which, for slots that are not `fresh`, waits for
+    /// queued work first, since it may still read them.
+    fn write_src(
+        &mut self,
+        t: &DramTensor,
+        values: Src<'_>,
+        fresh: bool,
+    ) -> Result<(), TensorError> {
+        t.check_write(values.len(), values.bits())?;
+        let [rt, ct] = t.grid();
+        let tiles = rt * ct;
+        if tiles >= HOST_DMA_MIN_UPLOAD && self.capture.is_none() {
+            if let Some(()) = self.dma_upload(t, values, tiles)? {
+                t.set_pad(tensor::Pad::Zero);
+                return Ok(());
+            }
+        }
+        if !fresh {
+            self.sync()?;
+        }
+        let mut images = vec![0u8; tiles * crate::matmul::TILE_IMAGE_BYTES];
+        values.tilize(t, 0..tiles, &mut images, crate::matmul::TILE_IMAGE_BYTES);
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        DramTensor::upload_bits(dev, &d.w4, &mut d.alloc, values, rows, cols, elem)
+        t.write_images(dev, &d.w4, &images)
     }
 
     /// Download a tensor of any element type to row-major datums' bits.
     pub fn download_bits(&mut self, t: &DramTensor) -> Result<Vec<u32>, TensorError> {
         self.refuse_while_capturing("download")?;
         self.sync()?;
+        if let Some(v) = self.dma_download(t)? {
+            return Ok(v.iter().map(|v| v.to_bits()).collect());
+        }
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
@@ -996,13 +1689,208 @@ impl<T: Transport> Session<T> {
 
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        t.expect("a download as FP32 values", tensor::Elem::F32)?;
         self.refuse_while_capturing("download")?;
         self.sync()?;
+        if let Some(v) = self.dma_download(t)? {
+            return Ok(v);
+        }
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
         t.download(dev, &d.w4)
+    }
+
+    /// Move tensors between the host and GDDR by the card's own DMA, through
+    /// pinned host memory (`Transport::host_memory`, one 1 GiB hugepage on
+    /// silicon), rather than the host's stores and loads through a BAR: on
+    /// card 0, ~20 GB/s up and ~27 down against 0.15 and 0.04 through this
+    /// VM's uncached BAR (`silicon_bench_host_dma`). On by default; where no
+    /// host memory can be pinned, transfers take the BAR and the reason is
+    /// said once.
+    pub fn set_host_dma(&mut self, on: bool) {
+        self.host_dma = on;
+    }
+
+    /// Where tensors take the tile layout on their way to the card, and lose
+    /// it on the way back: [`Tilize::Host`] (the default) or
+    /// [`Tilize::Card`]. Either way the session's callers -- Burn among them
+    /// -- see row-major data only, and the bits are the same. The host is
+    /// the default because it is faster everywhere card 0 measured
+    /// (`silicon_bench_host_dma::session_transfers`): the host copies the
+    /// rows into pinned memory either way, at about the cost of tilizing
+    /// them, and a mover tilizes at ~2.6 us a tile (1024² up, 32 tiles: card
+    /// 0.98 ms, host 0.55). Applies to the card's DMA
+    /// ([`Session::set_host_dma`]); the BAR path always tilizes on the host.
+    pub fn set_tilize(&mut self, at: Tilize) {
+        self.tilize = at;
+    }
+
+    /// The pinned staging buffer, pinned on first use; `None` (said once) if
+    /// it cannot be, or host DMA is off.
+    fn staging(&mut self) -> Option<&mut Box<dyn tt_device::HostMemory>> {
+        if !self.host_dma {
+            return None;
+        }
+        if self.staging.is_none() {
+            let got = self
+                .dev
+                .transport()
+                .host_memory(HOST_DMA_STAGING)
+                .map_err(|e| e.to_string());
+            if let Err(e) = &got {
+                eprintln!(
+                    "session: tensor transfers go through the BAR, not the card's DMA: \
+                     no host memory for it ({e})"
+                );
+            }
+            self.staging = Some(got);
+        }
+        self.staging.as_mut().and_then(|s| s.as_mut().ok())
+    }
+
+    /// [`Session::write_src`] by the card: tilized into the next free part of
+    /// the staging ring, then each unit's share queued like an op's -- behind
+    /// what is queued on it (whose lists end with their kernels done, so the
+    /// L1 it stages through is free), with a barrier after, as an op has (so
+    /// no later op on another unit reads a tile before it lands, and no write
+    /// overtakes an earlier op still reading). Nothing waits: the ring syncs
+    /// only when it wraps onto memory a queued transfer may still read.
+    /// `None` if there is no host memory.
+    fn dma_upload(
+        &mut self,
+        t: &DramTensor,
+        values: Src<'_>,
+        tiles: usize,
+    ) -> Result<Option<()>, TensorError> {
+        if self.staging().is_none() {
+            return Ok(None);
+        }
+        let stride = tensor::row_major_stride(t.cols);
+        if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
+            // Row-major into the pinned memory; the card makes the tiles.
+            let at = self.staging_region(t.rows * stride)?;
+            let host = self.staging().expect("checked above");
+            host.with_bytes(&mut |buf| {
+                copy_rows(values.bytes(), t.rows, t.cols * 4, &mut buf[at..], stride)
+            });
+            let base = host.noc_address() + at as u64;
+            let jobs = tensor::row_major_dma_jobs(
+                t.tensor_ref(),
+                [t.rows, t.cols],
+                true,
+                base,
+                self.units.len(),
+            );
+            self.staging_busy = true;
+            self.submit_jobs(jobs, RESET_BUDGET)?;
+            return Ok(Some(()));
+        }
+        let slot = tt_isa::dm::TILE_SLOT as usize;
+        let per = HOST_DMA_STAGING / slot;
+        for first in (0..tiles).step_by(per) {
+            let n = (tiles - first).min(per);
+            let at = self.staging_region(n * slot)?;
+            let host = self.staging().expect("checked above");
+            // Tilized straight into the pinned memory the card reads.
+            host.with_bytes(&mut |buf| values.tilize(t, first..first + n, &mut buf[at..], slot));
+            let base = host.noc_address() + at as u64;
+            let jobs = tensor::host_dma_jobs(
+                t.tensor_ref(),
+                first..first + n,
+                true,
+                base,
+                self.units.len(),
+            );
+            self.staging_busy = true;
+            self.submit_jobs(jobs, RESET_BUDGET)?;
+        }
+        Ok(Some(()))
+    }
+
+    /// `bytes` of the staging ring from its next free byte, syncing first if
+    /// they would wrap onto memory a queued upload may still read.
+    fn staging_region(&mut self, bytes: usize) -> Result<usize, TensorError> {
+        if self.staging_at + bytes > HOST_DMA_STAGING {
+            if self.staging_busy {
+                self.sync()?;
+            }
+            self.staging_at = 0;
+        }
+        let at = self.staging_at;
+        self.staging_at += bytes;
+        Ok(at)
+    }
+
+    /// Run a transfer's jobs to their end, without a barrier (nothing is
+    /// queued behind them before the sync).
+    fn submit_dma(&mut self, jobs: Vec<tensor::Job>) -> Result<(), TensorError> {
+        self.unbarriered = true;
+        let r = self.submit_jobs(jobs, RESET_BUDGET);
+        self.unbarriered = false;
+        r?;
+        self.sync()
+    }
+
+    /// A download by the card: each unit moves its share of `t`'s tiles' datums
+    /// to host memory. `None` if there is no host memory (or a capture is on).
+    /// The caller has synced.
+    fn dma_download(&mut self, t: &DramTensor) -> Result<Option<Vec<f32>>, TensorError> {
+        if self.capture.is_some() || self.staging().is_none() {
+            return Ok(None);
+        }
+        let [rt, ct] = t.grid();
+        let tiles = rt * ct;
+        let mut out = huge_zeroed(t.rows * t.cols);
+        let stride = tensor::row_major_stride(t.cols);
+        if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
+            // The card untilizes; the rows come back as they are.
+            let base = self.staging().expect("checked above").noc_address();
+            let jobs = tensor::row_major_dma_jobs(
+                t.tensor_ref(),
+                [t.rows, t.cols],
+                false,
+                base,
+                self.units.len(),
+            );
+            self.submit_dma(jobs)?;
+            let host = self.staging().expect("checked above");
+            // SAFETY: `out` is `rows * cols` plain f32s, whose bytes any
+            // pattern is.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
+            };
+            host.with_bytes(&mut |buf| copy_rows(buf, t.rows, stride, bytes, t.cols * 4));
+            return Ok(Some(out));
+        }
+        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
+        for first in (0..tiles).step_by(per) {
+            let n = (tiles - first).min(per);
+            let base = self.staging().expect("checked above").noc_address();
+            let jobs = tensor::host_dma_jobs(
+                t.tensor_ref(),
+                first..first + n,
+                false,
+                base,
+                self.units.len(),
+            );
+            self.submit_dma(jobs)?;
+            let host = self.staging().expect("checked above");
+            // Detilized straight out of the pinned memory the card wrote.
+            host.with_bytes(&mut |buf| {
+                crate::matmul::detilize_from(
+                    buf,
+                    tt_isa::dm::TILE_SLOT as usize,
+                    tt_isa::dm::TILE_DATA as usize,
+                    t.rows,
+                    t.cols,
+                    first..first + n,
+                    &mut out,
+                )
+            });
+        }
+        Ok(Some(out))
     }
 
     /// Every datum of every tile of `t`, padding included, row-major
@@ -1079,9 +1967,14 @@ impl<T: Transport> Session<T> {
                 let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
             }
             self.apply_pending_frees();
+            self.staging_at = 0;
+            self.staging_busy = false;
             return Err(e);
         }
         self.apply_pending_frees();
+        // Nothing queued reads host memory any more.
+        self.staging_at = 0;
+        self.staging_busy = false;
         Ok(())
     }
 
@@ -1100,6 +1993,7 @@ impl<T: Transport> Session<T> {
         if self.units[u].queued.is_empty() {
             return Ok(());
         }
+        self.drains += 1;
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (Some(r), Some(m)) = (unit.resident.as_mut(), unit.mover.as_mut()) else {
@@ -1120,9 +2014,6 @@ impl<T: Transport> Session<T> {
         }
         if ok {
             unit.programs.unpin_all();
-            if unit.lists >= unit.throttle_checked_at + THROTTLE_CHECK_LISTS {
-                self.check_throttle(u);
-            }
             self.drain(u)?;
             return Ok(());
         }
@@ -1159,6 +2050,13 @@ impl<T: Transport> Session<T> {
             // The barrier counter starts again below, and nothing the mover
             // was running survives: traces captured before are stale.
             *epoch += 1;
+            // B's progress word starts again from zero, so NC -- which may
+            // be waiting on it -- starts again too, when next needed.
+            if let Some(nc) = unit.nc.take() {
+                nc.stop(dev, r.window())?;
+            }
+            unit.b_signals = 0;
+            unit.nc_signals = 0;
             unit.mover = Some(DataMover::start(
                 dev,
                 r.window(),
@@ -1193,7 +2091,10 @@ impl<T: Transport> Session<T> {
             .as_ref()
             .map(|c| c.units.iter().map(|u| u.stream.len()).collect());
         let mut what = "";
+        let start = self.mark();
         let result = self.enqueue_work_inner(jobs, budget, &mut what);
+        self.host.ops += 1;
+        self.stage(HostStage::Enqueue, start);
         if let (Some(c), Some(starts)) = (self.capture.as_mut(), starts) {
             // Part of an op captured is no op a replay could run.
             c.failed |= result.is_err();
@@ -1227,19 +2128,30 @@ impl<T: Transport> Session<T> {
                 self.ensure_unit(u)?;
             }
         }
-        for (u, steps) in queues.into_iter().enumerate() {
-            for seg in segments(steps) {
-                if what.is_empty() {
-                    *what = seg.what;
-                }
-                self.enqueue_segment(u, &seg, budget)?;
-            }
-        }
-        if n > 1 {
+        // In rounds: every unit's first list, then every unit's second, and
+        // so on. A unit whose share is more than its ring holds makes the
+        // host wait for room; enqueued unit by unit, that wait came before
+        // the other units had anything to do, and they ran one after another
+        // (a pipelined 1024^3 matmul on 8 tiles: 9 ms in the call, against
+        // 0.4).
+        let split = self.scatter_on_nc.is_some() && self.capture.is_none();
+        let start = self.mark();
+        let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
+            .into_iter()
+            .map(|steps| segments_split(steps, split).into())
+            .collect();
+        self.stage(HostStage::Segments, start);
+        // With more than one unit, a barrier on every unit after its share,
+        // since the next op may read what any unit wrote. It rides at the
+        // end of the unit's last list where there is room -- a list of its
+        // own was a second enqueue a unit an op, half the host's time on
+        // many tiles (checklist 9.17) -- except while capturing, whose
+        // streams take it as an entry of its own.
+        let barrier = (n > 1 && !self.unbarriered).then(|| {
             self.barriers = self.barriers.wrapping_add(1);
             let target = self.barriers.wrapping_mul(n as u32);
             let c = self.units[0].tile;
-            let entry = [
+            [
                 tt_isa::dm::op::BARRIER,
                 target,
                 c.x() as u32,
@@ -1248,17 +2160,38 @@ impl<T: Transport> Session<T> {
                 0,
                 0,
                 0,
-            ];
+            ]
+        });
+        let fold = barrier.filter(|_| self.capture.is_none());
+        let mut folded = vec![false; n];
+        while per_unit.iter().any(|q| !q.is_empty()) {
+            for (u, q) in per_unit.iter_mut().enumerate() {
+                if let Some(mut seg) = q.pop_front() {
+                    if what.is_empty() {
+                        *what = seg.what;
+                    }
+                    if let Some(entry) = fold {
+                        if q.is_empty() && seg.entries.len() < tt_isa::dm::LIST_MAX as usize {
+                            seg.entries.push(entry);
+                            folded[u] = true;
+                        }
+                    }
+                    self.enqueue_segment(u, &seg, budget)?;
+                }
+            }
+        }
+        if let Some(entry) = barrier {
+            let start = self.mark();
             if let Some(c) = self.capture.as_mut() {
                 // Relative to the capture's first: a replay adds its own.
-                let rel = target.wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
+                let rel = entry[1].wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
                 c.barriers += 1;
                 for uc in &mut c.units {
                     uc.stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
-            for u in 0..n {
+            for u in (0..n).filter(|&u| !folded[u]) {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let (r, m) = (
@@ -1272,8 +2205,27 @@ impl<T: Transport> Session<T> {
                     what: "barrier",
                 });
             }
+            self.stage(HostStage::Barrier, start);
         }
         Ok(())
+    }
+
+    fn mark(&self) -> (std::time::Instant, tt_device::Traffic) {
+        (std::time::Instant::now(), self.dev.traffic())
+    }
+
+    fn stage(&mut self, stage: HostStage, since: (std::time::Instant, tt_device::Traffic)) {
+        let now = self.dev.traffic();
+        self.host.add(stage, since, now);
+    }
+
+    /// Where the host's time went queueing ops (checklist 9.17).
+    pub fn host_times(&self) -> &HostTimes {
+        &self.host
+    }
+
+    pub fn reset_host_times(&mut self) {
+        self.host = HostTimes::new();
     }
 
     /// Queue one segment on unit `u`: its programs placed (and pinned until
@@ -1284,7 +2236,9 @@ impl<T: Transport> Session<T> {
         if self.capture.is_some() && !seg.kernel_roles.is_empty() && !seg.resident {
             return Err(TraceError::NotResident.into());
         }
+        let start = self.mark();
         self.ensure_unit(u)?;
+        self.stage(HostStage::Ensure, start);
         // A drain the descriptors need comes before the programs are placed:
         // a drain unpins every program, and those placed for this list must
         // stay pinned until it has run -- the next placement would otherwise
@@ -1298,6 +2252,7 @@ impl<T: Transport> Session<T> {
                 ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
             }
         });
+        let start = self.mark();
         if let Some(kernel) = &kernel {
             let idle = {
                 let Session { dev, units, .. } = self;
@@ -1305,8 +2260,17 @@ impl<T: Transport> Session<T> {
                 r.needs_idle(dev, kernel, seg.resident)
             };
             if idle {
+                self.stage(HostStage::IdleCheck, start);
+                let start = self.mark();
                 self.drain_unit(u)?;
+                self.stage(HostStage::Drain, start);
+            } else {
+                self.stage(HostStage::IdleCheck, start);
             }
+        }
+        let start = self.mark();
+        if !seg.waits.is_empty() {
+            self.pipelined += seg.waits.len() as u64;
         }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
@@ -1324,7 +2288,9 @@ impl<T: Transport> Session<T> {
             let placed = match placed {
                 Ok(p) => p,
                 Err(()) => {
+                    let d0 = self.mark();
                     self.drain_unit(u)?;
+                    self.stage(HostStage::Drain, d0);
                     let Session { dev, units, .. } = self;
                     let unit = &mut units[u];
                     let w = unit.resident.as_ref().unwrap().window();
@@ -1338,6 +2304,8 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+        self.stage(HostStage::Place, start);
+        let start = self.mark();
         if let Some(kernel) = &kernel {
             let Session {
                 dev, units, images, ..
@@ -1352,9 +2320,7 @@ impl<T: Transport> Session<T> {
                 seg.kernels.len() as u32,
                 seg.resident,
             )?;
-            for (&at, g) in seg.kernels.iter().zip(generations) {
-                entries[at][1] = g;
-            }
+            fill_generations(&mut entries, seg, generations);
         }
         if self.capture.is_some() {
             if let Err(e) = self.capture_segment(u, seg, &entries) {
@@ -1365,13 +2331,32 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         }
+        self.stage(HostStage::Reserve, start);
+        if !seg.nc_entries.is_empty() {
+            let start = self.mark();
+            let r = self.enqueue_nc(u, seg, &mut entries);
+            self.stage(HostStage::NcList, start);
+            if let Err(e) = r {
+                let r = self.units[u].resident.as_mut().unwrap();
+                if !seg.kernel_roles.is_empty() {
+                    let _ = r.reserved_done(&mut self.dev, false);
+                }
+                return Err(e);
+            }
+        }
+        let start = self.mark();
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
             unit.resident.as_mut().unwrap(),
             unit.mover.as_mut().unwrap(),
         );
-        let number = match m.enqueue(dev, r.window(), &entries) {
+        let enqueued = m.enqueue(dev, r.window(), &entries);
+        self.stage(HostStage::List, start);
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let r = unit.resident.as_mut().unwrap();
+        let number = match enqueued {
             Ok(n) => n,
             Err(e) => {
                 if !seg.kernel_roles.is_empty() {
@@ -1387,6 +2372,49 @@ impl<T: Transport> Session<T> {
         });
         unit.lists += 1;
         unit.steps += seg.steps;
+        unit.b_signals = unit.b_signals.wrapping_add(seg.b_signals);
+        Ok(())
+    }
+
+    /// Queue `seg`'s NC list on unit `u`, starting NC's mover if it is not
+    /// running, and make both lists' `WAIT_PEER` targets absolute (B's in
+    /// `entries`). NC's lists are not waited on: B's list ends waiting for
+    /// NC, so B's done means NC's is, and an NC failure fails B's wait.
+    fn enqueue_nc(
+        &mut self,
+        u: usize,
+        seg: &Segment,
+        entries: &mut [[u32; 8]],
+    ) -> Result<(), TensorError> {
+        let image = self
+            .scatter_on_nc
+            .expect("an NC list only with the scatters on NC");
+        let Session {
+            dev, units, dram, ..
+        } = self;
+        let d = dram
+            .as_ref()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        let unit = &mut units[u];
+        let w = unit.resident.as_ref().unwrap().window();
+        if unit.nc.is_none() {
+            let nc = DataMover::start_on(dev, w, unit.tile, &d.dram, tt_isa::dm::Mover::NC, image)?;
+            // Writes on NoC #1, reads on NoC #0: each GDDR endpoint stays
+            // with one NoC (`DramChannel::owns`), and the two movers' traffic
+            // goes out on different NoCs.
+            nc.set_write_noc(dev, w, crate::dm::WriteNoc::Noc1)?;
+            unit.nc = Some(nc);
+            unit.nc_signals = 0;
+        }
+        for &(at, rel) in &seg.b_waits_on_nc {
+            entries[at][2] = unit.nc_signals.wrapping_add(rel);
+        }
+        let mut nc_entries = seg.nc_entries.clone();
+        for &(at, rel) in &seg.nc_waits_on_b {
+            nc_entries[at][2] = unit.b_signals.wrapping_add(rel);
+        }
+        unit.nc.as_mut().unwrap().enqueue(dev, w, &nc_entries)?;
+        unit.nc_signals = unit.nc_signals.wrapping_add(seg.nc_signals);
         Ok(())
     }
 
@@ -1803,15 +2831,12 @@ impl<T: Transport> Session<T> {
     }
 
     /// Overwrite `t`'s values in place (`DramTensor::write`): a trace's input
-    /// between replays. Waits for what is queued, which may read it.
+    /// between replays. Queued behind what is queued, which may read it
+    /// (`Session::dma_upload`); through the BAR, it waits for that instead.
     pub fn write(&mut self, t: &DramTensor, values: &[f32]) -> Result<(), TensorError> {
         self.refuse_while_capturing("write")?;
-        self.sync()?;
-        let Session { dev, dram, .. } = self;
-        let d = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        t.write(dev, &d.w4, values)
+        t.expect("a write of FP32 values", tensor::Elem::F32)?;
+        self.write_src(t, Src::F32(values), false)
     }
 
     /// Free GDDR bytes on the fullest channel.
@@ -1842,10 +2867,11 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
+        let pipeline = self.pipeline && self.capture.is_none();
         let alloc = &mut self.dram_state()?.alloc;
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
         // The SFPU's, or refused: the mover only moves data.
-        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units)? else {
+        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units, pipeline)? else {
             return Err(TensorError::Shape(format!(
                 "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
             )));
@@ -1901,7 +2927,8 @@ impl<T: Transport> Session<T> {
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units)?;
+        let pipeline = self.pipeline && self.capture.is_none();
+        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units, pipeline)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::SumRows.produces(&[a]));
         Ok(out)
@@ -1923,7 +2950,9 @@ impl<T: Transport> Session<T> {
             return self.sum_rows(a);
         }
         let units = self.units.len();
-        let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units)?;
+        let pipeline = self.pipeline && self.capture.is_none();
+        let work =
+            tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, pipeline)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
@@ -1998,6 +3027,7 @@ impl<T: Transport> Session<T> {
         // default would be a path only silicon runs. `step36_mop` and
         // `step37_loops` keep the expander gated.
         let allow_mop = false;
+        let pipeline = self.pipeline && self.capture.is_none();
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -2011,6 +3041,7 @@ impl<T: Transport> Session<T> {
                     fidelity,
                     units,
                     allow_mop,
+                    pipeline,
                 )
             })
             .and_then(|work| self.execute(work, budget));
@@ -2160,6 +3191,7 @@ impl<T: Transport> Session<T> {
         if self.units[u].resident.is_none() {
             self.prepare_unit(u)?;
         }
+        self.pipelined += seg.waits.len() as u64;
         let Session {
             dev,
             units,
@@ -2217,9 +3249,7 @@ impl<T: Transport> Session<T> {
                     seg.kernels.len() as u32,
                     seg.resident,
                 )?;
-                for (&at, g) in seg.kernels.iter().zip(generations) {
-                    entries[at][1] = g;
-                }
+                fill_generations(&mut entries, seg, generations);
                 Some(kernel)
             }
         };
@@ -2327,6 +3357,49 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.tile).collect()
     }
 
+    /// Double-buffer GDDR matmuls from the next op on (checklist 9.15; on by
+    /// default): each block staged in half the data arena, a unit's
+    /// consecutive blocks in alternate halves, so its mover gathers the next
+    /// block and scatters the last while the roles compute one
+    /// (`tt_isa::dm::op::LAUNCH`, `KERNEL_WAIT`). Only where it pays
+    /// (`tensor::pipelining_pays`): two blocks a unit or more, and at most
+    /// twice the operand tiles gathered. The bits are the same. Not while a
+    /// trace is being captured.
+    pub fn set_pipeline(&mut self, on: bool) {
+        self.pipeline = on;
+    }
+
+    /// Write pipelined groups' outputs out from each tile's RISCV NC rather
+    /// than B (checklist 9.15, the reader / writer split), from the next op
+    /// on: `Some(image)` with `tt_firmware_images::DM_NC`'s bytes, `None`
+    /// (the default) for every move on B. B gathers and runs the kernels;
+    /// NC scatters each block once B signals its kernel done, writing on
+    /// NoC #1. The bits are the same. Not while a trace is being captured.
+    pub fn set_scatter_mover(&mut self, nc_image: Option<&'static [u8]>) {
+        self.scatter_on_nc = nc_image;
+    }
+
+    /// How many blocks have run overlapped with their neighbours' moves
+    /// (`Session::set_pipeline`), since the session opened.
+    pub fn pipelined_blocks(&self) -> u64 {
+        self.pipelined
+    }
+
+    /// How many times the host has waited for a unit's queued lists to finish
+    /// before it could go on enqueueing -- for programs to place, or role
+    /// configuration to change -- since the session opened. Each one stops
+    /// that unit's work overlapping the host's.
+    pub fn drains(&self) -> u64 {
+        self.drains
+    }
+
+    /// Whether a profile records the roles' events as well as the mover's
+    /// (the default; `Resident::set_profile_roles`). A profile of pipelined
+    /// work wants the mover's alone.
+    pub fn set_profile_roles(&mut self, on: bool) {
+        self.profile_roles = on;
+    }
+
     /// Steps of GDDR ops completed on each unit so far, in unit order.
     pub fn steps_per_tile(&self) -> Vec<u64> {
         self.units.iter().map(|u| u.steps).collect()
@@ -2379,7 +3452,10 @@ impl<T: Transport> Session<T> {
 
     /// What the in-flight cap has cost every unit's mover since it started
     /// (`DataMover::throttle`), summed: requests that waited for room, and
-    /// the cycles they waited. A PCIe read pair per unit.
+    /// the cycles they waited. A PCIe read pair per unit. Not reported
+    /// otherwise: the tile cap (`dm::TILE_IN_FLIGHT_CAP`) is chosen for
+    /// fairness between tiles, so any large move waits under it by design --
+    /// a host DMA's 266 KB batches always do -- and a warning for it was noise.
     pub fn throttle(&mut self) -> Result<Throttle, TensorError> {
         let mut sum = Throttle::default();
         for u in 0..self.units.len() {
@@ -2392,41 +3468,8 @@ impl<T: Transport> Session<T> {
         Ok(sum)
     }
 
-    /// Say so when unit `u`'s mover has waited for room under the in-flight
-    /// cap more than it had at the last report -- first at all, then each
-    /// doubling -- so a cap that has become a bottleneck is noticed rather
-    /// than paid for silently. Checked every [`THROTTLE_CHECK_LISTS`] lists
-    /// and when the session ends.
-    fn check_throttle(&mut self, u: usize) {
-        let Session { dev, units, .. } = self;
-        let unit = &mut units[u];
-        unit.throttle_checked_at = unit.lists;
-        let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) else {
-            return;
-        };
-        let Ok(t) = m.throttle(dev, r.window()) else {
-            return;
-        };
-        if t.stalls > unit.throttle_reported.saturating_mul(2) {
-            unit.throttle_reported = t.stalls;
-            eprintln!(
-                "session: tile ({}, {})'s mover has waited for room under the NoC in-flight cap \
-                 ({} requests) {} times, {} cycles in all; if this grows, revisit \
-                 tt_isa::noc::niu::MAX_IN_FLIGHT (docs/firmware-performance.md)",
-                unit.tile.x(),
-                unit.tile.y(),
-                tt_isa::noc::niu::MAX_IN_FLIGHT,
-                t.stalls,
-                t.cycles
-            );
-        }
-    }
-
     pub fn into_device(mut self) -> Device<T> {
         let _ = self.sync();
-        for u in 0..self.units.len() {
-            self.check_throttle(u);
-        }
         for u in &mut self.units {
             if let Some(r) = u.resident.take() {
                 let _ = r.stop(&mut self.dev, &self.images);
@@ -2505,6 +3548,7 @@ mod tests {
                     init: init.clone(),
                     mop: Box::new([None; 3]),
                     loops: Default::default(),
+                    half: None,
                 },
                 list(1, 2),
             ]
@@ -2539,6 +3583,7 @@ mod tests {
                 init: init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             };
         let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
         assert_eq!(segs.len(), 1, "every program is resident: one list");
@@ -2563,6 +3608,7 @@ mod tests {
             init: init.clone(),
             mop: Box::new([None; 3]),
             loops: Default::default(),
+            half: None,
         };
         let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
@@ -2584,6 +3630,7 @@ mod tests {
                 init: init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             })
             .collect();
         let segs = segments(steps);

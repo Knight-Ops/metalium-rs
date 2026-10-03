@@ -262,7 +262,7 @@ fn attach_engine(
             input: burn_tt::BufferId,
             values: &[f32],
             output: burn_tt::BufferId,
-        ) -> Result<Vec<f32>, EngineError> {
+        ) -> Result<burn_tt::TraceRun, EngineError> {
             self.buffers
                 .run_trace(&mut self.session, trace, input, values, output)
         }

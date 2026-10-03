@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
-use tt_isa::dm::{self, op, record, Descriptor, Entry};
+use tt_isa::dm::{self, op, record, Descriptor, Entry, Mover};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
+use tt_isa::noc::niu::Niu;
 use tt_isa::noc::{NocCoord, NocId};
 
 /// Why a data-mover operation did not complete.
@@ -115,9 +116,29 @@ impl std::ops::Add for Throttle {
     }
 }
 
+/// Which NIU a mover's GDDR writes go out on ([`DataMover::set_write_noc`],
+/// `tt_isa::dm::write_noc`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WriteNoc {
+    Noc0,
+    Noc1,
+    /// Write entries take turns, NoC #0 first in each list.
+    Alternate,
+}
+
+impl From<Niu> for WriteNoc {
+    fn from(n: Niu) -> Self {
+        match n {
+            Niu::Noc0 => WriteNoc::Noc0,
+            Niu::Noc1 => WriteNoc::Noc1,
+        }
+    }
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
+    mover: Mover,
     usable: u8,
     seq: u32,
     /// Lists enqueued so far (`tt_isa::dm::QUEUE_HEAD`).
@@ -146,40 +167,65 @@ impl<N: NocId> DataMover<N> {
         dram: &Dram,
         image: &[u8],
     ) -> Result<Self> {
-        d.write32(w, tile, dm::MY_X, tile.x() as u32)?;
-        d.write32(w, tile, dm::MY_Y, tile.y() as u32)?;
-        d.write32(w, tile, dm::USABLE, dram.usable_mask() as u32)?;
+        Self::start_on(d, w, tile, dram, Mover::B, image)
+    }
+
+    /// [`DataMover::start`] on `mover`'s core: RISCV B, or RISCV NC with
+    /// `tt_firmware_images::DM_NC`'s bytes, loaded at the top of L1 and
+    /// reached through the stub at NC's reset PC
+    /// (`Device::load_and_start_nc`). Each mover has its own mailbox, ring and
+    /// scratch (`tt_isa::dm::Mover`), so B's and NC's run side by side.
+    pub fn start_on<T: Transport>(
+        d: &mut Device<T>,
+        w: &Window,
+        tile: NocCoord<N>,
+        dram: &Dram,
+        mover: Mover,
+        image: &[u8],
+    ) -> Result<Self> {
+        if image.len() as u64 > mover.image_max {
+            return Err(DmError::NotStarted);
+        }
+        d.write32(w, tile, mover.at(dm::MY_X), tile.x() as u32)?;
+        d.write32(w, tile, mover.at(dm::MY_Y), tile.y() as u32)?;
+        d.write32(w, tile, mover.at(dm::USABLE), dram.usable_mask() as u32)?;
         // L1 survives between processes: a stale `TRACE` from a profiled run
         // would have the mover store to a timestamper ttsim does not model.
         for word in [
-            dm::SEQ,
-            dm::DONE,
-            dm::ERROR,
-            dm::TRACE,
-            dm::THROTTLE_STALLS,
-            dm::THROTTLE_CYCLES,
-            dm::IN_FLIGHT_CAP,
-            dm::QUEUE_HEAD,
-            dm::QUEUE_DONE,
-            dm::QUEUE_ERROR,
-            dm::QUEUE_ERROR_AT,
+            mover.at(dm::SEQ),
+            mover.at(dm::DONE),
+            mover.at(dm::ERROR),
+            mover.at(dm::TRACE),
+            mover.at(dm::THROTTLE_STALLS),
+            mover.at(dm::THROTTLE_CYCLES),
+            mover.at(dm::WRITE_NOC),
+            mover.at(dm::PROGRESS),
+            mover.at(dm::QUEUE_HEAD),
+            mover.at(dm::QUEUE_DONE),
+            mover.at(dm::QUEUE_ERROR),
+            mover.at(dm::QUEUE_ERROR_AT),
         ] {
             d.write32(w, tile, word, 0)?;
         }
-        let status_at = dm::MAILBOX_BASE + offset::STATUS;
+        d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
+        let status_at = mover.mailbox + offset::STATUS;
         d.write32(w, tile, status_at, 0)?;
-        d.load_and_start(w, tile, tt_isa::tensix::Core::B, image, dm::IMAGE_BASE)?;
+        match mover.core {
+            tt_isa::tensix::Core::NC => d.load_and_start_nc(w, tile, image, mover.image_base)?,
+            core => d.load_and_start(w, tile, core, image, mover.image_base)?,
+        }
         let started = d.wait_for_mailbox(
             w,
             tile,
             status_at,
-            dm::MAILBOX_BASE + offset::PANIC_CODE,
+            mover.mailbox + offset::PANIC_CODE,
             1_000_000,
             |s| s == status::RUNNING,
         )?;
         started.map_err(|_| DmError::NotStarted)?;
         Ok(DataMover {
             tile,
+            mover,
             usable: dram.usable_mask(),
             seq: 0,
             head: 0,
@@ -193,26 +239,51 @@ impl<N: NocId> DataMover<N> {
         self.tile
     }
 
+    /// Which core's mover this is, and where its mailbox and ring are.
+    pub fn mover(&self) -> Mover {
+        self.mover
+    }
+
     /// What the in-flight cap (`tt_isa::noc::niu::InFlight`) has cost this
     /// mover since it started: the requests that waited for room, and the tile
     /// cycles they waited. Two PCIe reads; not on any hot path.
     pub fn throttle<T: Transport>(&self, d: &mut Device<T>, w: &Window) -> Result<Throttle> {
         Ok(Throttle {
-            stalls: d.read32(w, self.tile, dm::THROTTLE_STALLS)?,
-            cycles: d.read32(w, self.tile, dm::THROTTLE_CYCLES)?,
+            stalls: d.read32(w, self.tile, self.mover.at(dm::THROTTLE_STALLS))?,
+            cycles: d.read32(w, self.tile, self.mover.at(dm::THROTTLE_CYCLES))?,
         })
     }
 
     /// Cap this mover's requests in flight at `cap` from its next list: 0 for
     /// `tt_isa::noc::niu::MAX_IN_FLIGHT`, otherwise clamped to
-    /// `1..=MAX_IN_FLIGHT`. For the gates that force the throttle.
+    /// `1..=MAX_IN_FLIGHT`. A mover starts at `dm::TILE_IN_FLIGHT_CAP`; this is
+    /// for the gates that force the throttle and the benchmarks that compare
+    /// caps.
     pub fn set_in_flight_cap<T: Transport>(
         &self,
         d: &mut Device<T>,
         w: &Window,
         cap: u32,
     ) -> Result<()> {
-        d.write32(w, self.tile, dm::IN_FLIGHT_CAP, cap)?;
+        d.write32(w, self.tile, self.mover.at(dm::IN_FLIGHT_CAP), cap)?;
+        Ok(())
+    }
+
+    /// Send this mover's GDDR writes out through `noc` from its next list
+    /// (`tt_isa::self.mover.at(dm::WRITE_NOC)`): NoC #0 with the reads, NoC #1 on port 1 of
+    /// every channel, or each in turn. Reads and barriers stay on NoC #0.
+    pub fn set_write_noc<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        noc: impl Into<WriteNoc>,
+    ) -> Result<()> {
+        let word = match noc.into() {
+            WriteNoc::Noc0 => dm::write_noc::NOC0,
+            WriteNoc::Noc1 => dm::write_noc::NOC1,
+            WriteNoc::Alternate => dm::write_noc::ALTERNATE,
+        };
+        d.write32(w, self.tile, self.mover.at(dm::WRITE_NOC), word)?;
         Ok(())
     }
 
@@ -297,11 +368,11 @@ impl<N: NocId> DataMover<N> {
             .flatten()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        d.l1_write(w, self.tile, dm::LIST, &bytes)?;
-        d.write32(w, self.tile, dm::OP, op::LIST)?;
-        d.write32(w, self.tile, dm::LEN, entries.len() as u32)?;
+        d.l1_write(w, self.tile, self.mover.list, &bytes)?;
+        d.write32(w, self.tile, self.mover.at(dm::OP), op::LIST)?;
+        d.write32(w, self.tile, self.mover.at(dm::LEN), entries.len() as u32)?;
         self.seq = self.seq.wrapping_add(1).max(1);
-        d.write32(w, self.tile, dm::SEQ, self.seq)?;
+        d.write32(w, self.tile, self.mover.at(dm::SEQ), self.seq)?;
         Ok(())
     }
 
@@ -315,12 +386,12 @@ impl<N: NocId> DataMover<N> {
         l1: u32,
     ) -> Result<()> {
         let words = [
-            (dm::OP, op),
-            (dm::CHANNEL, range.channel().index() as u32),
-            (dm::PORT, port as u32),
-            (dm::DRAM_OFFSET, range.offset() as u32),
-            (dm::L1_ADDR, l1),
-            (dm::LEN, range.len() as u32),
+            (self.mover.at(dm::OP), op),
+            (self.mover.at(dm::CHANNEL), range.channel().index() as u32),
+            (self.mover.at(dm::PORT), port as u32),
+            (self.mover.at(dm::DRAM_OFFSET), range.offset() as u32),
+            (self.mover.at(dm::L1_ADDR), l1),
+            (self.mover.at(dm::LEN), range.len() as u32),
         ];
         // The mover's own check, run first, so a bad descriptor costs no PCIe.
         let [(_, o), (_, c), (_, p), (_, off), (_, a), (_, n)] = words;
@@ -329,7 +400,7 @@ impl<N: NocId> DataMover<N> {
             d.write32(w, self.tile, at, v)?;
         }
         self.seq = self.seq.wrapping_add(1).max(1);
-        d.write32(w, self.tile, dm::SEQ, self.seq)?;
+        d.write32(w, self.tile, self.mover.at(dm::SEQ), self.seq)?;
         self.wait(d, w)
     }
 
@@ -357,7 +428,7 @@ impl<N: NocId> DataMover<N> {
         Ok(())
     }
 
-    /// Queue a list (`tt_isa::dm::QUEUE_HEAD`) and return its number, without
+    /// Queue a list (`tt_isa::self.mover.at(dm::QUEUE_HEAD)`) and return its number, without
     /// waiting for it -- only, if the ring or the slots are full, for the
     /// oldest lists to finish. [`DataMover::wait_for`] waits for a number.
     /// The single-descriptor path ([`DataMover::submit_list`]) must not be in
@@ -370,12 +441,23 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<u32> {
         self.check(entries)?;
         let n = entries.len() as u32;
+        let mut refreshed = false;
         let first = loop {
-            self.refresh(d, w)?;
+            // The host's own record of what is in flight is conservative --
+            // a list it has not seen finish holds its slot -- so it only
+            // reads the queue's progress (two uncached PCIe reads, most of an
+            // enqueue's cost on many tiles, checklist 9.17) when that record
+            // says the ring or the slots are full. A failed list is reported
+            // at the next wait or sync instead.
             if let Some(at) = self.room(n) {
                 if self.in_flight.len() < dm::QUEUE_LEN as usize {
                     break at;
                 }
+            }
+            if !refreshed {
+                self.refresh(d, w)?;
+                refreshed = true;
+                continue;
             }
             // Full: wait for the oldest list, which frees its slot and entries.
             let oldest = self
@@ -393,13 +475,13 @@ impl<N: NocId> DataMover<N> {
         d.l1_write(
             w,
             self.tile,
-            dm::LIST + first as u64 * dm::ENTRY_BYTES,
+            self.mover.list + first as u64 * dm::ENTRY_BYTES,
             &bytes,
         )?;
-        let slot = dm::QUEUE_SLOTS + (self.head % dm::QUEUE_LEN) as u64 * 4;
+        let slot = self.mover.at(dm::QUEUE_SLOTS) + (self.head % dm::QUEUE_LEN) as u64 * 4;
         d.write32(w, self.tile, slot, dm::queue_slot(first, n))?;
         self.head = self.head.wrapping_add(1);
-        d.write32(w, self.tile, dm::QUEUE_HEAD, self.head)?;
+        d.write32(w, self.tile, self.mover.at(dm::QUEUE_HEAD), self.head)?;
         self.in_flight.push_back((self.head, first, n));
         self.write_at = first + n;
         Ok(self.head)
@@ -415,15 +497,15 @@ impl<N: NocId> DataMover<N> {
         if self.in_flight.is_empty() {
             return Ok(self.head);
         }
-        let error = d.read32(w, self.tile, dm::QUEUE_ERROR)?;
+        let error = d.read32(w, self.tile, self.mover.at(dm::QUEUE_ERROR))?;
         if error != dm::error::NONE {
-            let at = d.read32(w, self.tile, dm::QUEUE_ERROR_AT)?;
+            let at = d.read32(w, self.tile, self.mover.at(dm::QUEUE_ERROR_AT))?;
             return Err(DmError::Queued {
                 list: at,
                 code: error,
             });
         }
-        let done = d.read32(w, self.tile, dm::QUEUE_DONE)?;
+        let done = d.read32(w, self.tile, self.mover.at(dm::QUEUE_DONE))?;
         while let Some(&(number, _, _)) = self.in_flight.front() {
             if (done.wrapping_sub(number) as i32) >= 0 {
                 self.in_flight.pop_front();
@@ -483,9 +565,9 @@ impl<N: NocId> DataMover<N> {
         let simulated = d.transport().is_simulated();
         let mut ticks = 0u64;
         loop {
-            let done = d.read32(w, self.tile, dm::DONE)?;
+            let done = d.read32(w, self.tile, self.mover.at(dm::DONE))?;
             if done == self.seq {
-                return match d.read32(w, self.tile, dm::ERROR)? {
+                return match d.read32(w, self.tile, self.mover.at(dm::ERROR))? {
                     dm::error::NONE => Ok(()),
                     code => Err(DmError::Mover(code)),
                 };
@@ -506,9 +588,9 @@ impl<N: NocId> DataMover<N> {
         }
     }
 
-    /// Hold B in reset again.
+    /// Hold the mover's core in reset again.
     pub fn stop<T: Transport>(self, d: &mut Device<T>, w: &Window) -> Result<()> {
-        d.set_core_reset(w, self.tile, tt_isa::tensix::Core::B, true)?;
+        d.set_core_reset(w, self.tile, self.mover.core, true)?;
         Ok(())
     }
 }

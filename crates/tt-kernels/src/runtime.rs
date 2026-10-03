@@ -621,6 +621,9 @@ pub struct Resident<N: NocId> {
     /// Every run's roles record their progress through the timestamper, into
     /// a stream the host configured and drains itself (`crate::profile`).
     profiling: bool,
+    /// Whether a profile records the roles' events too, or the mover's
+    /// alone (`Resident::set_profile_roles`).
+    profile_roles: bool,
     /// The last setup run's generation and program, until taken: a trace's
     /// capture records it as a kernel of its own (`crate::trace`).
     last_setup: Option<(u32, Vec<Instruction>)>,
@@ -652,6 +655,7 @@ impl<N: NocId> Resident<N> {
             descriptors: Default::default(),
             pending: None,
             profiling: false,
+            profile_roles: true,
             reservations: Default::default(),
         };
         for thread in 0..3 {
@@ -687,6 +691,18 @@ impl<N: NocId> Resident<N> {
     /// (`Kernel::trace`) reconfigures the stream, so it is refused meanwhile.
     pub fn set_profiling(&mut self, on: bool) {
         self.profiling = on;
+    }
+
+    /// Whether a profile's runs record the roles' events as well as the
+    /// mover's (the default). Off, a profile is the mover's alone: with the
+    /// mover moving while the roles compute (checklist 9.15) the two store to
+    /// the timestamper at once, and on card 0 such streams lost events.
+    pub fn set_profile_roles(&mut self, on: bool) {
+        self.profile_roles = on;
+    }
+
+    fn roles_traced(&self) -> bool {
+        self.profiling && self.profile_roles
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on
@@ -862,7 +878,7 @@ impl<N: NocId> Resident<N> {
             let d = mailbox::Descriptor {
                 thread_index: thread as u32,
                 dst_access_fmt: kernel.dst_fmt,
-                trace: u32::from(self.profiling),
+                trace: u32::from(self.roles_traced()),
                 push_window,
                 // A MOP configuration different from the queued kernels'
                 // would be rewritten under them.
@@ -928,7 +944,7 @@ impl<N: NocId> Resident<N> {
         Ok(mailbox::Descriptor {
             thread_index: thread as u32,
             dst_access_fmt: kernel.dst_fmt,
-            trace: u32::from(kernel.trace || self.profiling),
+            trace: u32::from(kernel.trace || self.roles_traced()),
             push_window,
             mop_cfg: kernel.mop_words(thread)?,
             ..Default::default()
@@ -1068,7 +1084,7 @@ impl<N: NocId> Resident<N> {
                 dev,
                 thread,
                 dump,
-                kernel.trace || self.profiling,
+                kernel.trace || self.roles_traced(),
                 kernel.dst_fmt,
                 false,
                 resident_programs,

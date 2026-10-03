@@ -33,7 +33,7 @@ impl Region {
 }
 
 /// The five baby RISC-V images, from B's hardwired reset PC 0 to the end of
-/// NC's slot (NC is not used, and its slot is kept clear).
+/// NC's slot (which holds only the jump to NC's mover image, `dm::nc::stub`).
 pub const IMAGES: Region = Region {
     name: "firmware images",
     base: 0,
@@ -59,7 +59,8 @@ pub const DATA: Region = Region {
     end: mailbox::MAILBOX_BASE,
 };
 
-/// The single-core, role and mover mailboxes, with the `Dst` dump.
+/// The single-core, role and mover mailboxes, with the `Dst` dump, and RISCV
+/// NC's mover list ring, scratch and trace chunk (`dm::nc::LIST..END`).
 pub const MAILBOXES: Region = Region {
     name: "mailboxes",
     base: mailbox::MAILBOX_BASE,
@@ -87,11 +88,20 @@ pub const PROGRAM_CACHE: Region = Region {
     end: tensix::L1_SIZE,
 };
 
-/// Every region, in address order. The gap between [`MOVER`] and [`DATA`] is
-/// unused.
-pub const REGIONS: [Region; 7] = [
+/// RISCV NC's mover image (`dm::nc`), in what was the free L1 between B's
+/// mover area and the data arena.
+pub const NC_IMAGE: Region = Region {
+    name: "NC mover image",
+    base: dm::nc::IMAGE_BASE,
+    end: dm::nc::IMAGE_BASE + dm::nc::IMAGE_MAX,
+};
+
+/// Every region, in address order. The sliver between [`MOVER`] and
+/// [`NC_IMAGE`] is unused.
+pub const REGIONS: [Region; 8] = [
     IMAGES,
     MOVER,
+    NC_IMAGE,
     DATA,
     MAILBOXES,
     PROGRAMS,

@@ -193,6 +193,47 @@ impl<T: Transport> Device<T> {
         self.set_core_reset(window, tile, core, false)
     }
 
+    /// Load `image` at `load_address` and start RISCV NC on it through a
+    /// jump at NC's default reset PC (`tt_isa::dm::nc::stub`), leaving the
+    /// reset-PC override off.
+    ///
+    /// Not [`Device::load_and_start`], which points the override at the image:
+    /// ttsim refuses NC's override register outright (divergence row 43), so a
+    /// path that works on both targets cannot use it. On silicon the override
+    /// is cleared rather than trusted -- `silicon_local_ram` parks NC through
+    /// it, and it survives the process -- so NC starts at its default PC, where
+    /// the stub is. As there, everything is written while NC is held.
+    pub fn load_and_start_nc<N: NocId>(
+        &mut self,
+        window: &Window,
+        tile: NocCoord<N>,
+        image: &[u8],
+        load_address: u64,
+    ) -> Result<()> {
+        let core = Core::NC;
+        let stub_at = core.default_reset_pc() as u64;
+        if load_address + image.len() as u64 > tensix::L1_SIZE || load_address < tt_isa::dm::LIST {
+            return Err(TransportError::OutOfBounds {
+                bar: crate::Bar::Bar0,
+                offset: load_address,
+                len: image.len() as u64,
+            });
+        }
+        self.set_core_reset(window, tile, core, true)?;
+        self.write(window, tile, load_address, image)?;
+        let stub = tt_isa::dm::nc::stub(load_address);
+        self.write32(window, tile, stub_at, stub[0])?;
+        self.write32(window, tile, stub_at + 4, stub[1])?;
+        if !self.transport().is_simulated() {
+            let (override_reg, bit) = core.reset_pc_override().expect("NC has an override");
+            let current = self.read32(window, tile, override_reg)?;
+            if current & bit != 0 {
+                self.write32(window, tile, override_reg, current & !bit)?;
+            }
+        }
+        self.set_core_reset(window, tile, core, false)
+    }
+
     /// [`Device::load_and_start`] for several cores, released by **one** write
     /// to `SOFT_RESET_0` once every image is in place.
     ///

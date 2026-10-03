@@ -295,6 +295,17 @@ struct Infer {
     rest: Duration,
     batches: usize,
     accuracy: f64,
+    /// With `--trace`, every batch after the first: the input's write from
+    /// the host, the replay, and the logits' read, summed -- PCIe's time and
+    /// the card's, reported apart.
+    traced: Option<TraceParts>,
+}
+
+#[derive(Default)]
+struct TraceParts {
+    write: Duration,
+    replay: Duration,
+    read: Duration,
 }
 
 /// The forward pass alone, no autodiff: the test set uploaded once, then
@@ -353,6 +364,7 @@ fn infer<B: Backend>(
         rest,
         batches,
         accuracy: right as f64 / (batches * batch).max(1) as f64,
+        traced: None,
     }
 }
 
@@ -388,13 +400,20 @@ fn infer_traced(
     let calls = burn_tt::device_time();
     let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
     let (mut batches, mut right) = (0, 0usize);
+    let mut parts = TraceParts::default();
     for _ in 0..passes {
         for from in (0..n).step_by(batch) {
             let t = Instant::now();
             let input = test.images[from * PIXELS..(from + batch) * PIXELS].to_vec();
-            let logits = trace
-                .run(input)
+            let run = trace
+                .run_timed(input)
                 .unwrap_or_else(|e| panic!("replaying the forward pass: {e}"));
+            if batches > 0 {
+                parts.write += run.write;
+                parts.replay += run.replay;
+                parts.read += run.read;
+            }
+            let logits = run.output;
             let pred: Vec<usize> = logits
                 .chunks_exact(classes)
                 .map(|row| {
@@ -423,6 +442,7 @@ fn infer_traced(
         rest,
         batches,
         accuracy: right as f64 / (batches * batch).max(1) as f64,
+        traced: Some(parts),
     }
 }
 
@@ -443,6 +463,26 @@ fn print_infer(r: &Infer, batch: usize) {
         steady * 1e3,
         batch as f64 / steady
     );
+    if let Some(p) = &r.traced {
+        let per = |d: Duration| d.as_secs_f64() * 1e3 / (r.batches.saturating_sub(1)).max(1) as f64;
+        let replay = per(p.replay);
+        println!(
+            "    input written from the host            {:.3} ms/batch  (PCIe)",
+            per(p.write)
+        );
+        println!(
+            "    replay, to its end                     {replay:.3} ms/batch  ({:.0} images/s on the card alone)",
+            batch as f64 / (replay / 1e3)
+        );
+        println!(
+            "    logits read back                       {:.3} ms/batch  (PCIe)",
+            per(p.read)
+        );
+        println!(
+            "    the rest (argmax, server round trip)   {:.3} ms/batch",
+            steady * 1e3 - per(p.write) - replay - per(p.read)
+        );
+    }
     println!(
         "  accuracy (untrained weights: a check, not a result)  {:.2}%",
         r.accuracy * 100.0
@@ -495,11 +535,14 @@ struct Args {
     batch: usize,
     passes: usize,
     activation: Act,
+    /// `--model transformer`: the general-model benchmark instead of MNIST.
+    transformer: bool,
 }
 
 const USAGE: &str = "\
 usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host] [--activation A]
        tt-mnist --infer [--trace] [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
+       tt-mnist --model transformer [--steps S] [--card N] [--tiles T]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
@@ -515,7 +558,11 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
   --batch B     inference batch size (default 64)
   --passes P    rounds over the test set (default 3)
   --activation A  the hidden layer's activation: relu (default), leaky-relu,
-                gelu, tanh, sigmoid, silu, hard-sigmoid";
+                gelu, tanh, sigmoid, silu, hard-sigmoid
+  --model M     mnist (default), or transformer: a small Burn transformer
+                (embedding, pre-norm encoder layer, Linear head) trained S
+                steps (default 50) on the card and on burn-flex, with the
+                time per step of each and burn-tt's per-op report";
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
@@ -528,6 +575,7 @@ fn args() -> Result<Args, String> {
         batch: BATCH,
         passes: 3,
         activation: Act::Relu,
+        transformer: false,
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -562,6 +610,13 @@ fn args() -> Result<Args, String> {
                         "--activation {v}: not one of the choices\n\n{USAGE}"
                     ))?;
             }
+            "--model" => {
+                a.transformer = match value()?.as_str() {
+                    "mnist" => false,
+                    "transformer" => true,
+                    v => return Err(format!("--model {v}: not mnist or transformer\n\n{USAGE}")),
+                }
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
@@ -586,6 +641,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if a.transformer {
+        return transformer_benchmark(&a);
+    }
     let cards = match &a.topology {
         Topology::Single { card, tile } => {
             let tiles = match tile {
@@ -745,4 +803,75 @@ fn main() {
             card.losses.len().min(host.losses.len())
         );
     }
+}
+
+/// `--model transformer`: the same steps on the card and on burn-flex, from
+/// the same weights, and what burn-tt ran where.
+fn transformer_benchmark(a: &Args) {
+    use tt_mnist::transformer as tf;
+    let steps = if a.steps == usize::MAX {
+        50
+    } else {
+        a.steps.max(2)
+    };
+    println!(
+        "tt-mnist --model transformer: vocab {}, d_model {}, d_ff {}, {} heads, {} layer, \
+         batch {} x seq {}, SGD lr {}",
+        tf::VOCAB,
+        tf::D_MODEL,
+        tf::D_FF,
+        tf::HEADS,
+        tf::LAYERS,
+        tf::BATCH,
+        tf::SEQ,
+        tf::LR
+    );
+    let weights = tf::init(59);
+    let device = TtDevice::new(0);
+    let guard = match attach_topology(
+        device,
+        a.topology.clone(),
+        SrcRoute::Tf32FromFp32,
+        Fidelity::HiFi4,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("could not open the card: {e}");
+            std::process::exit(1);
+        }
+    };
+    let before = burn_tt::tensor_traffic();
+    let (card, report) =
+        burn_tt::with_report(|| tf::train::<Autodiff<TtBackend>>(&weights, steps, &device));
+    let moved = burn_tt::tensor_traffic() - before;
+    drop(guard);
+    let host = tf::train::<Autodiff<Flex>>(&weights, steps, &FlexDevice);
+
+    let ms = |d: Option<Duration>| d.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);
+    let (c, h) = (ms(card.steady()), ms(host.steady()));
+    println!("\n{steps} training steps, time per step after the first:");
+    println!(
+        "  burn-tt (card)     {c:8.2} ms/step   first step {:.2} ms",
+        ms(card.times.first().copied())
+    );
+    println!(
+        "  burn-flex (host)   {h:8.2} ms/step   first step {:.2} ms",
+        ms(host.times.first().copied())
+    );
+    println!("  card / host        {:8.2}x", c / h);
+    println!(
+        "  loss               card {:.4} -> {:.4}, host {:.4} -> {:.4}",
+        card.losses[0],
+        card.losses[steps - 1],
+        host.losses[0],
+        host.losses[steps - 1]
+    );
+    println!(
+        "  tensor data over PCIe   {:.2} MB up, {:.2} MB down ({:.1} KB a step)",
+        moved.uploaded as f64 / 1e6,
+        moved.downloaded as f64 / 1e6,
+        (moved.uploaded + moved.downloaded) as f64 / 1e3 / steps as f64
+    );
+    println!("\nburn-tt per op, whole run (tt: hand-written, device path for some inputs; flex: host only):");
+    print!("{report}");
 }

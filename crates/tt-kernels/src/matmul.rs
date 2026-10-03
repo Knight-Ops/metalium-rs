@@ -776,10 +776,209 @@ pub fn tilize_f32(
 /// 1024 datums.
 pub const TILE_IMAGE_BYTES: usize = 16 + 1024 * 4;
 
+/// [`tilize_f32`] for FP32 tiles, as one copy pattern: each 32x32 tile, in
+/// row-major tile order, its 16-byte header then four 16x16 faces (top left,
+/// top right, bottom left, bottom right), each row-major; zeros past `rows`
+/// and `cols`. `tt_layout`'s tilizer handles every format element by element,
+/// ~18 us a tile on the host -- more than the card's DMA takes to move it
+/// (`silicon_bench_host_dma::session_transfers`). Checked against it
+/// (`fast_tilize_is_tt_layouts`).
+pub fn tilize_f32_fp32(values: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(values.len(), rows * cols);
+    let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+    let mut out = vec![0u8; tiles * TILE_IMAGE_BYTES];
+    tilize_into(
+        |i| values[i].to_bits(),
+        rows,
+        cols,
+        0..tiles,
+        &mut out,
+        TILE_IMAGE_BYTES,
+    );
+    out
+}
+
+/// Tiles `tiles` of a row-major `[rows, cols]` matrix of 32-bit datums
+/// (`get(i)` is datum `i`'s bits), as [`tilize_f32_fp32`] lays each out, into
+/// `out` one every `stride` bytes from its start: straight into the pinned
+/// buffer a DMA upload sends from, with no copy of its own.
+pub fn tilize_into(
+    get: impl Fn(usize) -> u32 + Sync,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [u8],
+    stride: usize,
+) {
+    let n = tiles.len();
+    let threads = host_threads(n);
+    if threads <= 1 {
+        return tilize_serial(&get, rows, cols, tiles, out, stride);
+    }
+    // Contiguous runs of tiles, each thread its own run of `out`.
+    let per = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let get = &get;
+        for (k, chunk) in out[..n * stride].chunks_mut(per * stride).enumerate() {
+            let first = tiles.start + k * per;
+            let run = first..(first + per).min(tiles.end);
+            scope.spawn(move || tilize_serial(get, rows, cols, run, chunk, stride));
+        }
+    });
+}
+
+/// Threads to split `tiles` tiles of host tile conversion over: one per
+/// [`HOST_TILES_PER_THREAD`], up to the host's cores. A tile is ~0.5 us of
+/// conversion, a thread ~20 to spawn: on card 0's host, 64 tiles a thread
+/// left a 1024-tile upload's tilize at 0.51 ms, 256 took it to 0.28.
+fn host_threads(tiles: usize) -> usize {
+    if tiles < 2 * HOST_TILES_PER_THREAD {
+        return 1;
+    }
+    // Asked once: `available_parallelism` reads the cgroup's CPU quota
+    // files on every call, ~40 us -- more than a small transfer's DMA.
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    (tiles / HOST_TILES_PER_THREAD).clamp(1, cores.min(16))
+}
+
+/// Fewest tiles a thread of host tile conversion is given.
+const HOST_TILES_PER_THREAD: usize = 256;
+
+fn tilize_serial(
+    get: &impl Fn(usize) -> u32,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [u8],
+    stride: usize,
+) {
+    let ct = cols.div_ceil(32).max(1);
+    let header = fp32_tile_header();
+    for (n, t) in tiles.enumerate() {
+        let image = &mut out[n * stride..][..TILE_IMAGE_BYTES];
+        let (i, j) = (t / ct, t % ct);
+        image[..16].copy_from_slice(&header);
+        for face in 0..4 {
+            let (fr, fc) = (face / 2, face % 2);
+            let col0 = 32 * j + 16 * fc;
+            let n = cols.saturating_sub(col0).min(16);
+            for r in 0..16 {
+                let row = 32 * i + 16 * fr + r;
+                let at = 16 + (face * 256 + r * 16) * 4;
+                let dst = &mut image[at..at + 64];
+                if row >= rows || n == 0 {
+                    dst.fill(0);
+                    continue;
+                }
+                let base = row * cols + col0;
+                for k in 0..16 {
+                    let v = if k < n { get(base + k) } else { 0 };
+                    dst[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// The header `tt_layout` gives every FP32 tile.
+fn fp32_tile_header() -> [u8; 16] {
+    use std::sync::OnceLock;
+    static HEADER: OnceLock<[u8; 16]> = OnceLock::new();
+    *HEADER.get_or_init(|| {
+        let (image, _) = tilize_f32(&[0.0; 1024], 32, 32, L1Format::Fp32);
+        image[..16].try_into().unwrap()
+    })
+}
+
 /// Row-major `[rows, cols]` FP32 values from packed output tiles: each tile's
 /// 1024 datums as [`tile_roles`] packs them, with no header, one after another
-/// in the layout's tile order.
+/// in row-major tile order -- [`tilize_f32_fp32`]'s faces, read back.
 pub fn detilize_packed(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+    assert!(packed.len() >= tiles * 4096, "not enough packed tiles");
+    let mut out = vec![0f32; rows * cols];
+    detilize_from(packed, 4096, 0, rows, cols, 0..tiles, &mut out);
+    out
+}
+
+/// Tiles `tiles` of a `[rows, cols]` matrix into row-major `out`, from
+/// `src`: tile `first + n`'s 1024 datums at `n * stride + skip` -- straight
+/// out of the pinned buffer a DMA download lands in.
+pub fn detilize_from(
+    src: &[u8],
+    stride: usize,
+    skip: usize,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [f32],
+) {
+    let ct = cols.div_ceil(32).max(1);
+    let threads = host_threads(tiles.len());
+    // Split by whole tile rows, so each thread writes its own rows of `out`.
+    let whole_rows = tiles.start % ct == 0 && tiles.end % ct == 0;
+    if threads <= 1 || !whole_rows {
+        return detilize_rows(src, stride, skip, rows, cols, tiles, out, 0);
+    }
+    let (r0, r1) = (tiles.start / ct, tiles.end / ct);
+    let per = (r1 - r0).div_ceil(threads);
+    let mine = &mut out[(32 * r0).min(rows) * cols..(32 * r1).min(rows) * cols];
+    std::thread::scope(|scope| {
+        for (k, chunk) in mine.chunks_mut(32 * per * cols).enumerate() {
+            let (a, b) = (r0 + k * per, (r0 + (k + 1) * per).min(r1));
+            let run = a * ct..b * ct;
+            let src = &src[(run.start - tiles.start) * stride..];
+            scope.spawn(move || detilize_rows(src, stride, skip, rows, cols, run, chunk, 32 * a));
+        }
+    });
+}
+
+/// [`detilize_from`] on one thread, into `out` holding rows from `row0`.
+#[allow(clippy::too_many_arguments)]
+fn detilize_rows(
+    src: &[u8],
+    stride: usize,
+    skip: usize,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [f32],
+    row0: usize,
+) {
+    let ct = cols.div_ceil(32).max(1);
+    for (n, t) in tiles.enumerate() {
+        let (i, j) = (t / ct, t % ct);
+        let tile = &src[n * stride + skip..][..4096];
+        for face in 0..4 {
+            let (fr, fc) = (face / 2, face % 2);
+            let col0 = 32 * j + 16 * fc;
+            if col0 >= cols {
+                continue;
+            }
+            let m = (cols - col0).min(16);
+            for r in 0..16 {
+                let row = 32 * i + 16 * fr + r;
+                if row >= rows {
+                    break;
+                }
+                let at = (face * 256 + r * 16) * 4;
+                for (k, v) in out[(row - row0) * cols + col0..][..m]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let b = &tile[at + 4 * k..at + 4 * k + 4];
+                    *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+            }
+        }
+    }
+}
+
+/// [`detilize_packed`] through `tt_layout`'s detilizer: the oracle the fast
+/// one is checked against.
+#[cfg(test)]
+fn detilize_packed_generic(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     use tt_layout::{detilize, HostDtype, Layout, TensorViewMut};
     let layout = Layout::tt_metal_32x32(L1Format::Fp32, HostDtype::F32, [1, rows, cols]).unwrap();
     let mut images = Vec::with_capacity(layout.total_bytes());
@@ -842,13 +1041,39 @@ pub fn tile_image_bytes(format: L1Format) -> u64 {
 /// it hands `Dst` over with.
 #[derive(Clone, Debug)]
 pub struct Layout {
-    /// `B`'s first byte (`A`'s is the first of the run's staging).
+    /// `A`'s first byte.
+    pub a_at: u64,
+    /// `B`'s first byte.
     pub b_at: u64,
     /// One per output tile, row-major.
     pub outputs: Vec<OutputTile>,
     pub sems: MatmulSemaphores,
     /// What a concurrent run of it initialises: every semaphore of its plan.
     pub init: Vec<crate::runtime::SemaphoreInit>,
+}
+
+impl Layout {
+    /// The same run with its operands and outputs `by` bytes further on and
+    /// its semaphores where they were: the other half of a double-buffered
+    /// pair ([`Staging::SlotsHalf`], [`HALF`]). Two runs that share
+    /// semaphores never overlap -- the second starts once the first has
+    /// finished, and each leaves its semaphores as it found them.
+    pub fn shifted(&self, by: u64) -> Layout {
+        Layout {
+            a_at: self.a_at + by,
+            b_at: self.b_at + by,
+            outputs: self
+                .outputs
+                .iter()
+                .map(|o| OutputTile {
+                    pairs: o.pairs.iter().map(|&(a, b)| (a + by, b + by)).collect(),
+                    out: o.out + by,
+                })
+                .collect(),
+            sems: self.sems,
+            init: self.init.clone(),
+        }
+    }
 }
 
 /// Where a `[mt, kt] @ [kt, nt]`-tile matmul's operands and outputs go in L1,
@@ -875,6 +1100,23 @@ pub enum Staging {
     /// can copy any tile between GDDR and L1 under the C64 rule, and an output
     /// slot is an operand slot. FP32 in L1 only.
     Slots,
+    /// [`Staging::Slots`] in the first half of the data arena, so that a
+    /// second block can be staged in the other half ([`Layout::shifted`] by
+    /// [`HALF`]) while this one computes (checklist 9.15).
+    SlotsHalf,
+}
+
+/// How far the second half of the data arena is from the first, for
+/// [`Staging::SlotsHalf`]: half the arena, on a slot-friendly boundary.
+pub const HALF: u64 = (tt_isa::l1::DATA.len() / 2) / 4096 * 4096;
+
+/// The first half of the data arena ([`Staging::SlotsHalf`]).
+pub(crate) fn half_arena() -> tt_isa::l1::Region {
+    tt_isa::l1::Region {
+        name: "first half of the data arena",
+        base: tt_isa::l1::DATA.base,
+        end: tt_isa::l1::DATA.base + HALF,
+    }
 }
 
 /// [`plan_layout`] for either [`Staging`].
@@ -884,12 +1126,13 @@ pub fn plan_layout_in(
     staging: Staging,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
-    if staging == Staging::Slots {
-        return plan_slots([mt, kt, nt], in_fmt);
+    match staging {
+        Staging::Slots | Staging::SlotsHalf => return planned_slots([mt, kt, nt], in_fmt, staging),
+        Staging::Host => {}
     }
     let (img, align, out_stride, out_skip) = match staging {
         Staging::Host => (tile_image_bytes(in_fmt), 16, 1024 * 4, 0),
-        Staging::Slots => unreachable!("planned by plan_slots"),
+        Staging::Slots | Staging::SlotsHalf => unreachable!("planned by plan_slots"),
     };
     let a_bytes = (mt * kt) as u64 * img;
     let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(align);
@@ -928,6 +1171,7 @@ pub fn plan_layout_in(
     }
     let (sems, init) = MatmulSemaphores::alone();
     Ok(Layout {
+        a_at: MATMUL_STAGE,
         b_at,
         outputs,
         sems,
@@ -997,9 +1241,37 @@ pub struct MatmulBuffers {
     pub sems: (crate::l1::Sem, crate::l1::Sem),
 }
 
+/// [`plan_slots`] for a slot staging, planned once per process for each
+/// shape: an op of many same-shaped blocks plans each of them, and the L1
+/// planner was most of the host's time for a pipelined 1024^3 matmul's 512
+/// blocks.
+fn planned_slots(
+    tiles: [usize; 3],
+    in_fmt: L1Format,
+    staging: Staging,
+) -> Result<Layout, crate::runtime::RunError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = ([usize; 3], L1Format, Staging);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Layout>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (tiles, in_fmt, staging);
+    if let Some(l) = cache.lock().unwrap().get(&key) {
+        return Ok(l.clone());
+    }
+    let arena = match staging {
+        Staging::SlotsHalf => half_arena(),
+        _ => tt_isa::l1::DATA,
+    };
+    let l = plan_slots(tiles, in_fmt, arena)?;
+    cache.lock().unwrap().insert(key, l.clone());
+    Ok(l)
+}
+
 fn plan_slots(
     [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
+    arena: tt_isa::l1::Region,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::l1::PlanError;
     use crate::runtime::RunError;
@@ -1010,7 +1282,7 @@ fn plan_slots(
         "slot staging holds FP32 tiles"
     );
     let m = matmul_requirements([mt, kt, nt]);
-    let plan = m.req.plan(tt_isa::l1::DATA).map_err(|e| match e {
+    let plan = m.req.plan(arena).map_err(|e| match e {
         PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
             what: name,
             bytes,
@@ -1037,6 +1309,7 @@ fn plan_slots(
         }
     }
     Ok(Layout {
+        a_at,
         b_at,
         outputs,
         sems: MatmulSemaphores::planned(&plan, m.sems),
@@ -1061,6 +1334,7 @@ pub fn stage_matmul(
     let Layout {
         b_at,
         outputs,
+        a_at: _,
         sems,
         init,
     } = plan_layout(tiles, in_fmt)?;
@@ -1192,7 +1466,7 @@ pub fn chunk_fits_in(
     staging: Staging,
 ) -> bool {
     let (in_fmt, out_fmt) = route.formats();
-    if staging == Staging::Slots && in_fmt != L1Format::Fp32 {
+    if staging != Staging::Host && in_fmt != L1Format::Fp32 {
         return false;
     }
     let Ok(layout) = plan_layout_in(tiles, in_fmt, staging) else {
@@ -1240,6 +1514,7 @@ pub(crate) fn programs(
 /// configurations, built once per process.
 pub(crate) fn kernel_programs(
     tiles: [usize; 3],
+    half: u8,
     route: SrcRoute,
     fidelity: Fidelity,
     sems: MatmulSemaphores,
@@ -1251,11 +1526,13 @@ pub(crate) fn kernel_programs(
 ) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    type Key = ([usize; 3], SrcRoute, Fidelity, MatmulSemaphores, bool);
+    // `half`: the half of a double-buffered pair (`Staging::SlotsHalf`), whose
+    // programs name addresses `HALF` apart under the same semaphores.
+    type Key = ([usize; 3], u8, SrcRoute, Fidelity, MatmulSemaphores, bool);
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity, sems, allow_mop);
+    let key = (tiles, half, route, fidelity, sems, allow_mop);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -1587,6 +1864,73 @@ mod loop_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_layout {
+    use super::*;
+
+    fn values(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32) * 0.5 - 7.25).collect()
+    }
+
+    #[test]
+    fn fast_tilize_is_tt_layouts() {
+        for (rows, cols) in [
+            (1usize, 1usize),
+            (32, 32),
+            (64, 784),
+            (33, 17),
+            (100, 70),
+            (7, 129),
+            // Enough tiles to split over threads, with ragged edges.
+            (1000, 1000),
+            (4096, 600),
+        ] {
+            let v = values(rows * cols);
+            let (want, _) = tilize_f32(&v, rows, cols, L1Format::Fp32);
+            assert!(tilize_f32_fp32(&v, rows, cols) == want, "[{rows}, {cols}]");
+        }
+    }
+
+    /// `cargo test --release -p tt-kernels --lib tilize_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn tilize_speed() {
+        let (rows, cols) = (1024, 1024);
+        let v = values(rows * cols);
+        let t = std::time::Instant::now();
+        let bits: Vec<u32> = v.iter().map(|x| x.to_bits()).collect();
+        let back: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+        println!("to_bits and back {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let img = tilize_f32_fp32(&back, rows, cols);
+        println!("tilize {:?} ({} B)", t.elapsed(), img.len());
+    }
+
+    #[test]
+    fn fast_detilize_is_tt_layouts() {
+        for (rows, cols) in [
+            (1usize, 1usize),
+            (32, 32),
+            (64, 784),
+            (33, 17),
+            (100, 70),
+            (7, 129),
+            // Enough tiles to split over threads, with ragged edges.
+            (1000, 1000),
+            (4096, 600),
+        ] {
+            let (rt, ct) = (rows.div_ceil(32), cols.div_ceil(32));
+            let packed: Vec<u8> = (0..rt * ct * 4096).map(|i| (i * 31 % 251) as u8).collect();
+            let a = detilize_packed(&packed, rows, cols);
+            let b = detilize_packed_generic(&packed, rows, cols);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "[{rows}, {cols}]"
+            );
         }
     }
 }

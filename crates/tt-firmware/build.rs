@@ -26,12 +26,24 @@ fn main() {
     }
     link("eth_e1", "link_e1.x", tt_isa::eth::MAILBOX_BASE);
     link("dm_b", "link_b.x", tt_isa::dm::MAILBOX_BASE);
+    link("nc_probe", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    link("dm_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    link("icache_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
+    link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    for (bin, script, t) in [
+        ("icache_t0", "link.x", 0),
+        ("icache_t1", "link_t1.x", 1),
+        ("icache_t2", "link_t2.x", 2),
+    ] {
+        link(bin, script, tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE);
+    }
     for f in [
         "link.x",
         "link_t1.x",
         "link_t2.x",
         "link_e1.x",
         "link_b.x",
+        "link_nc.x",
         "sections.x",
     ] {
         println!("cargo:rerun-if-changed={f}");

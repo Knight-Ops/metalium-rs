@@ -98,6 +98,8 @@ fn tensors_round_trip_through_gddr() {
         let t = s.upload(&floats(9, 64 * 64), 64, 64).unwrap();
         assert!(s.dram_free_bytes() < before);
         s.free(t).unwrap();
+        // The upload is queued, so the free waits for the next sync.
+        s.sync().unwrap();
         assert_eq!(s.dram_free_bytes(), before);
     });
 }

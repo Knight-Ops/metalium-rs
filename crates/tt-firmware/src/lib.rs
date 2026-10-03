@@ -452,27 +452,37 @@ pub mod cfg {
     }
 }
 
-/// Issuing NoC requests from this core, through NIU #0's request initiator 0.
+/// Issuing NoC requests from this core, through request initiator 0 of either
+/// NIU: NoC #0's or NoC #1's, named per request.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{self, initiator, Command, InFlight, RequestError, TxnId};
+    use tt_isa::noc::niu::{self, initiator, Command, InFlight, Niu, RequestError, TxnId};
 
-    const INIT: u64 = niu::NOC0_BASE;
+    const _: () = assert!(niu::NOC1_BASE <= u32::MAX as u64 && niu::NOC0_BASE < niu::NOC1_BASE);
 
-    fn reg(off: u64) -> *mut u32 {
-        (INIT + off) as *mut u32
+    fn reg(niu: Niu, off: u64) -> *mut u32 {
+        (niu.base() + off) as *mut u32
     }
 
-    /// Each transaction ID's requests in flight, kept under its cap so the
-    /// 8-bit counter `wait` reads cannot wrap (`tt_isa::noc::niu::InFlight`),
-    /// and what the cap has cost. In local data RAM (`sections.x`, `.local`):
+    /// Each NIU's and transaction ID's requests in flight, kept under its cap
+    /// so the 8-bit counter `wait` reads cannot wrap
+    /// (`tt_isa::noc::niu::InFlight`), and what the cap has cost. Each NIU
+    /// counts its own requests. In local data RAM (`sections.x`, `.local`):
     /// touched on every issue and every wait, and a load there is 2 cycles
     /// (`BabyRISCV/README.md:147`). Written by `reset` before `firmware_main`,
     /// since ttsim does not zero the RAM on reset release (divergence row 25).
     #[link_section = ".local"]
-    static mut IN_FLIGHT: [InFlight; 16] = [InFlight::new(); 16];
+    static mut IN_FLIGHT: [[InFlight; 16]; 2] = [[InFlight::new(); 16]; 2];
     #[link_section = ".local"]
-    static mut STALLS: Stalls = Stalls { count: 0, cycles: 0, clock: None };
+    static mut STALLS: Stalls = Stalls {
+        count: 0,
+        cycles: 0,
+        clock: None,
+    };
+    /// Whether anything has been issued through NoC #1, so `wait` reads its
+    /// counters too.
+    #[link_section = ".local"]
+    static mut NOC1_USED: bool = false;
 
     /// Requests that waited for room under their ID's cap, and the cycles
     /// they waited by the image's clock (`set_clock`; 0 without one).
@@ -483,11 +493,11 @@ pub mod noc {
         clock: Option<fn() -> u32>,
     }
 
-    fn in_flight(txn: TxnId) -> &'static mut InFlight {
+    fn in_flight(niu: Niu, txn: TxnId) -> &'static mut InFlight {
         // SAFETY: one core runs this firmware, with no interrupts, and every
-        // reference made here is dropped before the next is made; the index is
-        // `< 16` by `TxnId`'s construction.
-        unsafe { &mut *core::ptr::addr_of_mut!(IN_FLIGHT[txn.index()]) }
+        // reference made here is dropped before the next is made; the indices
+        // are `< 2` by `Niu` and `< 16` by `TxnId`'s construction.
+        unsafe { &mut *core::ptr::addr_of_mut!(IN_FLIGHT[niu.index()][txn.index()]) }
     }
 
     fn stalls_mut() -> &'static mut Stalls {
@@ -495,12 +505,31 @@ pub mod noc {
         unsafe { &mut *core::ptr::addr_of_mut!(STALLS) }
     }
 
-    /// Every ID at no requests in flight and the default cap; no stalls, no
-    /// clock. Called once, before `firmware_main`.
+    fn noc1_used() -> &'static mut bool {
+        // SAFETY: as `in_flight`.
+        unsafe { &mut *core::ptr::addr_of_mut!(NOC1_USED) }
+    }
+
+    /// Every ID at no requests in flight and the default cap; nothing issued
+    /// on NoC #1; no stalls, no clock. Called once, before `firmware_main`.
     pub(crate) fn reset() {
         // SAFETY: as `in_flight`; nothing else runs yet.
-        unsafe { core::ptr::addr_of_mut!(IN_FLIGHT).write([InFlight::new(); 16]) };
-        *stalls_mut() = Stalls { count: 0, cycles: 0, clock: None };
+        unsafe { core::ptr::addr_of_mut!(IN_FLIGHT).write([[InFlight::new(); 16]; 2]) };
+        *stalls_mut() = Stalls {
+            count: 0,
+            cycles: 0,
+            clock: None,
+        };
+        *noc1_used() = false;
+    }
+
+    /// This tile's own coordinate as `niu` names it (`NOC_ID_LOGICAL`,
+    /// `x | y << 6`): the return address of a read through it, as tt-metal
+    /// reads it per NoC.
+    pub fn me(niu: Niu) -> (u8, u8) {
+        // SAFETY: a read-only NIU register.
+        let v = unsafe { read_volatile(reg(niu, niu::NOC_ID_LOGICAL)) };
+        ((v & 0x3F) as u8, ((v >> 6) & 0x3F) as u8)
     }
 
     /// Time waits for room with `clock` from now on: a core with a usable
@@ -515,27 +544,28 @@ pub mod noc {
         *stalls_mut()
     }
 
-    fn outstanding(txn: TxnId) -> u8 {
+    fn outstanding(niu: Niu, txn: TxnId) -> u8 {
         // SAFETY: a read-only NIU counter.
-        unsafe { read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) as u8 }
+        unsafe { read_volatile(reg(niu, niu::reqs_outstanding(txn))) as u8 }
     }
 
-    /// Use in-flight cap `cap` for `txn` from now on: 0 for
+    /// Use in-flight cap `cap` for `txn` on both NIUs from now on: 0 for
     /// `niu::MAX_IN_FLIGHT`, otherwise clamped to `1..=MAX_IN_FLIGHT`.
     pub fn set_cap(txn: TxnId, cap: u32) {
-        in_flight(txn).set_cap(cap);
+        in_flight(Niu::Noc0, txn).set_cap(cap);
+        in_flight(Niu::Noc1, txn).set_cap(cap);
     }
 
-    /// `issue` at `txn`'s cap: poll its counter until there is room, and
-    /// count the wait if there was one. Out of line, so the issue path RISCV
-    /// B's 2 KiB instruction cache holds is only the compare that decides to
-    /// come here.
+    /// `issue` at `txn`'s cap on `niu`: poll its counter until there is
+    /// room, and count the wait if there was one. Out of line, so the issue
+    /// path RISCV B's instruction cache (~4 KiB, `probe_icache`) holds is only the compare that decides
+    /// to come here.
     #[cold]
     #[inline(never)]
-    fn make_room(txn: TxnId) {
+    fn make_room(niu: Niu, txn: TxnId) {
         let st = stalls_mut();
         let t0 = st.clock.map_or(0, |c| c());
-        if in_flight(txn).before_issue(|| outstanding(txn)) != 0 {
+        if in_flight(niu, txn).before_issue(|| outstanding(niu, txn)) != 0 {
             st.count = st.count.wrapping_add(1);
             if let Some(c) = st.clock {
                 st.cycles = st.cycles.wrapping_add(c().wrapping_sub(t0));
@@ -543,40 +573,163 @@ pub mod noc {
         }
     }
 
-    /// Issue `cmd` from this tile, at raw coordinate `me`, under `txn`.
+    /// Issue `cmd` from this tile, at coordinate `me`, under `txn`, through
+    /// `niu`. A GDDR request on a port `niu` does not own is refused
+    /// (`Command::registers`: both NoCs on one endpoint is the SYS-1419 hang).
     ///
-    /// First makes room under `txn`'s in-flight cap: below it, nothing is
-    /// read; at it, the counter is polled until a request completes (counted
-    /// in `stalls`). Then waits for the initiator to be free (`MemoryMap.md`,
-    /// `NOC_CMD_CTRL`: software must not touch it while the low bit reads 1),
-    /// and reads `CMD_CTRL` back afterwards so a later counter read cannot
-    /// overtake the issue (`Counters.md:42-43`).
-    pub fn issue(cmd: &Command, me: (u8, u8), txn: TxnId) -> Result<(), RequestError> {
-        let regs = cmd.registers(me, txn)?;
-        if in_flight(txn).at_cap() {
-            make_room(txn);
+    /// First makes room under `txn`'s in-flight cap on `niu`: below it,
+    /// nothing is read; at it, the counter is polled until a request completes
+    /// (counted in `stalls`). Then waits for the initiator to be free
+    /// (`MemoryMap.md`, `NOC_CMD_CTRL`: software must not touch it while the
+    /// low bit reads 1), and reads `CMD_CTRL` back afterwards so a later
+    /// counter read cannot overtake the issue (`Counters.md:42-43`).
+    #[inline(always)]
+    pub fn issue(niu: Niu, cmd: &Command, me: (u8, u8), txn: TxnId) -> Result<(), RequestError> {
+        let regs = cmd.registers(me, txn, niu)?;
+        match niu {
+            Niu::Noc0 => issue_on::<false>(&regs, txn),
+            Niu::Noc1 => issue_on::<true>(&regs, txn),
         }
-        // SAFETY: NIU #0's initiator registers are MMIO in every Tensix and
-        // Ethernet tile, and these offsets are inside initiator 0.
-        unsafe {
-            while read_volatile(reg(initiator::CMD_CTRL)) & 1 != 0 {}
-            for (off, value) in regs {
-                write_volatile(reg(off), value);
-            }
-            write_volatile(reg(initiator::CMD_CTRL), 1);
-            let _ = read_volatile(reg(initiator::CMD_CTRL));
-        }
-        in_flight(txn).after_issue();
         Ok(())
     }
 
+    /// [`issue_on`] for one request of a `tt_isa::noc::niu::DramMove`, its
+    /// values as arguments -- registers, on RISC-V -- written straight to the
+    /// initiator: no register array built and read back per request. The two
+    /// address-middle words and `AT_DATA` are written zero, as
+    /// `Command::registers` lays them out.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_dram_on<const NOC1: bool>(
+        targ: u32,
+        targ_hi: u32,
+        ret: u32,
+        ret_hi: u32,
+        tag: u32,
+        ctrl: u32,
+        len: u32,
+        txn: TxnId,
+    ) {
+        use initiator::*;
+        let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
+        if NOC1 {
+            *noc1_used() = true;
+        }
+        if in_flight(niu, txn).at_cap() {
+            make_room(niu, txn);
+        }
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(niu, CMD_CTRL)) & 1 != 0 {}
+            write_volatile(reg(niu, TARG_ADDR_LO), targ);
+            write_volatile(reg(niu, TARG_ADDR_MID), 0);
+            write_volatile(reg(niu, TARG_ADDR_HI), targ_hi);
+            write_volatile(reg(niu, RET_ADDR_LO), ret);
+            write_volatile(reg(niu, RET_ADDR_MID), 0);
+            write_volatile(reg(niu, RET_ADDR_HI), ret_hi);
+            write_volatile(reg(niu, PACKET_TAG), tag);
+            write_volatile(reg(niu, CTRL), ctrl);
+            write_volatile(reg(niu, AT_LEN_BE), len);
+            write_volatile(reg(niu, AT_DATA), 0);
+            write_volatile(reg(niu, CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
+    /// One request of a `tt_isa::noc::niu::HostMove` through NoC #0, under
+    /// `txn`: [`issue_dram_on`] with the high address words a host address
+    /// needs. Cold: host moves are not the per-tile path.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_host(r: tt_isa::noc::niu::HostRequest, txn: TxnId) {
+        use initiator::*;
+        let niu = Niu::Noc0;
+        if in_flight(niu, txn).at_cap() {
+            make_room(niu, txn);
+        }
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(niu, CMD_CTRL)) & 1 != 0 {}
+            write_volatile(reg(niu, TARG_ADDR_LO), r.targ);
+            write_volatile(reg(niu, TARG_ADDR_MID), r.targ_mid);
+            write_volatile(reg(niu, TARG_ADDR_HI), r.targ_hi);
+            write_volatile(reg(niu, RET_ADDR_LO), r.ret);
+            write_volatile(reg(niu, RET_ADDR_MID), r.ret_mid);
+            write_volatile(reg(niu, RET_ADDR_HI), r.ret_hi);
+            write_volatile(reg(niu, PACKET_TAG), r.tag);
+            write_volatile(reg(niu, CTRL), r.ctrl);
+            write_volatile(reg(niu, AT_LEN_BE), r.len);
+            write_volatile(reg(niu, AT_DATA), 0);
+            write_volatile(reg(niu, CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
+    /// Issue one request already encoded -- by `Command::registers`, or by a
+    /// `tt_isa::noc::niu::DramMove`, which checks a whole move once (the
+    /// mover's per-entry path) -- under `txn`, through NoC #1 (`NOC1`) or
+    /// NoC #0, fixed at compile time: the move path's copy for NoC #0 has a
+    /// constant base and in-flight slot and none of NoC #1's bookkeeping.
+    /// `sections.x` places both copies after `.text.hot`.
+    ///
+    /// First makes room under `txn`'s in-flight cap on the NIU: below it,
+    /// nothing is read; at it, the counter is polled until a request completes
+    /// (counted in `stalls`). Then waits for the initiator to be free
+    /// (`MemoryMap.md`, `NOC_CMD_CTRL`: software must not touch it while the
+    /// low bit reads 1), and reads `CMD_CTRL` back afterwards so a later
+    /// counter read cannot overtake the issue (`Counters.md:42-43`).
+    #[inline(never)]
+    pub fn issue_on<const NOC1: bool>(regs: &[(u64, u32); 10], txn: TxnId) {
+        let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
+        if NOC1 {
+            *noc1_used() = true;
+        }
+        if in_flight(niu, txn).at_cap() {
+            make_room(niu, txn);
+        }
+        // SAFETY: both NIUs' initiator registers are MMIO in every Tensix and
+        // Ethernet tile, and these offsets are inside initiator 0.
+        unsafe {
+            while read_volatile(reg(niu, initiator::CMD_CTRL)) & 1 != 0 {}
+            for &(off, value) in regs {
+                write_volatile(reg(niu, off), value);
+            }
+            write_volatile(reg(niu, initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
     /// Wait until every response-marked request issued under `txn` has
-    /// completed. Exact, because `issue` never lets more than the cap be in
-    /// flight. It leaves the ID's room as it was: too small now, which costs
+    /// completed, on NoC #0 and, once anything has gone out on it, NoC #1.
+    /// Exact, because `issue` never lets more than the cap be in flight on
+    /// either. It leaves each ID's room as it was: too small now, which costs
     /// the next issue at the cap one counter read, and keeps this loop the
     /// same as before there was a cap.
+    ///
+    /// One copy, in `.text.hot` beside the move path that calls it from every
+    /// waiting entry kind, rather than inlined at each.
+    #[inline(never)]
+    #[link_section = ".text.hot"]
     pub fn wait(txn: TxnId) {
+        drain(Niu::Noc0, txn);
+        if *noc1_used() {
+            drain_noc1(txn);
+        }
+    }
+
+    /// NoC #1's half of [`wait`], out of line: the inlined wait stays one
+    /// load and one branch longer than NoC #0's loop alone.
+    #[inline(never)]
+    fn drain_noc1(txn: TxnId) {
+        drain(Niu::Noc1, txn);
+    }
+
+    #[inline(always)]
+    fn drain(niu: Niu, txn: TxnId) {
         // SAFETY: a read-only NIU counter.
-        unsafe { while read_volatile((INIT + niu::reqs_outstanding(txn)) as *const u32) & 0xFF != 0 {} }
+        unsafe { while read_volatile(reg(niu, niu::reqs_outstanding(txn))) & 0xFF != 0 {} }
     }
 }

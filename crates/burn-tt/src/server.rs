@@ -163,11 +163,23 @@ pub trait Engine {
         _input: BufferId,
         _values: &[f32],
         _output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
         Err(no_traces())
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
+}
+
+/// One [`crate::Trace::run`]: the output, and where its time went on the
+/// device's side -- the input written from the host, the replay to its end,
+/// and the output read back -- each a different cost (the first and last are
+/// PCIe's, the middle the card's).
+#[derive(Clone, Debug, Default)]
+pub struct TraceRun {
+    pub output: Vec<f32>,
+    pub write: std::time::Duration,
+    pub replay: std::time::Duration,
+    pub read: std::time::Duration,
 }
 
 fn no_traces() -> EngineError {
@@ -217,15 +229,29 @@ impl DramBuffers {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
+        use std::time::Instant;
         let id = *self
             .traces
             .get(&trace)
             .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
         let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        // The write waits for what was queued first: that wait is not the
+        // write's.
+        s.sync().map_err(e)?;
+        let t0 = Instant::now();
         s.write(self.get(input)?, values).map_err(e)?;
+        let t1 = Instant::now();
         s.replay(id).map_err(e)?;
-        s.download(self.get(output)?).map_err(e)
+        s.sync().map_err(e)?;
+        let t2 = Instant::now();
+        let output = s.download(self.get(output)?).map_err(e)?;
+        Ok(TraceRun {
+            output,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
     }
 
     pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
@@ -608,6 +634,7 @@ fn timed_run<R: Send + 'static>(
 
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
+    crate::report::staged(mkn);
     let (a, b) = (a.to_vec(), b.to_vec());
     timed_run("matmul_host", device, move |engine| {
         engine.matmul(&a, &b, mkn)
@@ -645,6 +672,7 @@ pub fn device_traffic(device: TtDevice) -> Option<tt_device::Traffic> {
 /// Upload, panicking on a device error.
 pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
     crate::traffic::uploaded(rows, cols);
+    crate::report::uploaded(rows, cols);
     timed_run("upload", device, move |engine| {
         engine.upload(&values, rows, cols)
     })
@@ -660,6 +688,7 @@ pub(crate) fn upload_bits(
     elem: Elem,
 ) -> BufferId {
     crate::traffic::uploaded(rows, cols);
+    crate::report::uploaded(rows, cols);
     timed_run("upload", device, move |engine| {
         engine.upload_bits(&bits, rows, cols, elem)
     })
@@ -672,6 +701,7 @@ pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: u
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
     debug_assert_eq!(v.len(), rows * cols);
     crate::traffic::downloaded(rows, cols);
+    crate::report::downloaded(rows, cols);
     v
 }
 
@@ -682,6 +712,7 @@ pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize)
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
     debug_assert_eq!(v.len(), rows * cols);
     crate::traffic::downloaded(rows, cols);
+    crate::report::downloaded(rows, cols);
     v
 }
 
@@ -883,7 +914,7 @@ impl Engine for KmdEngine {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.run_trace(&mut self.session, trace, input, values, output)
     }
@@ -916,6 +947,38 @@ pub fn kmd_engine(
             return Err(EngineError(format!(
                 "TT_ELTWISE={v}: element-wise ops always run on the SFPU now; unset it"
             )));
+        }
+        // `TT_PIPELINE=0`: matmuls run their blocks one after another rather
+        // than overlapping one block's moves with the next one's compute
+        // (`Session::set_pipeline`); the bits are the same either way.
+        match std::env::var("TT_PIPELINE").as_deref() {
+            Err(_) | Ok("1") => {}
+            Ok("0") => session.set_pipeline(false),
+            Ok(v) => return Err(EngineError(format!("TT_PIPELINE={v}: expected 0 or 1"))),
+        }
+        // `TT_HOST_DMA=0`: tensors cross PCIe by the host's own stores and
+        // loads through a BAR, not the card's DMA through pinned host memory
+        // (`Session::set_host_dma`).
+        match std::env::var("TT_HOST_DMA").as_deref() {
+            Err(_) | Ok("1") => {}
+            Ok("0") => session.set_host_dma(false),
+            Ok(v) => return Err(EngineError(format!("TT_HOST_DMA={v}: expected 0 or 1"))),
+        }
+        // `TT_TILIZE=card`: tensors take the tile layout on the card's movers
+        // rather than the host's cores (`Session::set_tilize`); `host`, the
+        // default, is faster on every size card 0 measured.
+        match std::env::var("TT_TILIZE").as_deref() {
+            Err(_) | Ok("host") => {}
+            Ok("card") => session.set_tilize(tt_kernels::session::Tilize::Card),
+            Ok(v) => return Err(EngineError(format!("TT_TILIZE={v}: expected host or card"))),
+        }
+        // `TT_SCATTER=nc`: pipelined ops write their outputs out from each
+        // tile's RISCV NC while B gathers (`Session::set_scatter_mover`);
+        // `b`, the default, keeps every move on B.
+        match std::env::var("TT_SCATTER").as_deref() {
+            Err(_) | Ok("b") => {}
+            Ok("nc") => session.set_scatter_mover(Some(tt_firmware_images::DM_NC.1)),
+            Ok(v) => return Err(EngineError(format!("TT_SCATTER={v}: expected b or nc"))),
         }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches

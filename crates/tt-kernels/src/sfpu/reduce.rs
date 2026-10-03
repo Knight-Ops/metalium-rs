@@ -290,7 +290,29 @@ pub struct Layout {
     pub init: Vec<SemaphoreInit>,
 }
 
+impl Layout {
+    /// This layout with its slots `by` bytes on, its semaphores where they
+    /// were: the second half of a double-buffered pair.
+    pub fn shifted(&self, by: u64) -> Layout {
+        Layout {
+            in_at: self.in_at + by,
+            out_at: self.out_at + by,
+            ..self.clone()
+        }
+    }
+}
+
 pub fn plan_layout(outputs: usize, per: usize) -> Result<Layout, PlanError> {
+    plan_layout_in(outputs, per, tt_isa::l1::DATA)
+}
+
+/// [`plan_layout`] in `arena`: half the data arena, for a run double-buffered
+/// with the next (`crate::matmul::half_arena`, then [`Layout::shifted`]).
+pub fn plan_layout_in(
+    outputs: usize,
+    per: usize,
+    arena: tt_isa::l1::Region,
+) -> Result<Layout, PlanError> {
     let mut req = Requirements::new(1);
     let align = tt_isa::dram::ALIGN;
     let input = req.scratch(
@@ -304,7 +326,7 @@ pub fn plan_layout(outputs: usize, per: usize) -> Result<Layout, PlanError> {
     let consumed = req.semaphore("reduce consumed", 1, 0..1);
     let computed = req.semaphore("reduce computed", 0, 0..1);
     let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA)?;
+    let plan = req.plan(arena)?;
     Ok(Layout {
         outputs,
         per,

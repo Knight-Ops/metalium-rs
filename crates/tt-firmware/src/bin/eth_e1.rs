@@ -11,7 +11,7 @@
 use tt_firmware::{cycles, l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::eth::{self, mover, mover::event};
 use tt_isa::mailbox::offset;
-use tt_isa::noc::niu::{Command, Endpoint, TxnId, MAX_REQUEST_BYTES};
+use tt_isa::noc::niu::{Command, Endpoint, Niu, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(1) {
     Some(t) => t,
@@ -69,7 +69,7 @@ fn noc_copy(me: (u8, u8), tile: (u8, u8, u32), local: u64, len: u32, into_local:
         } else {
             Command::Write { from_local: l, to: remote, len: n }
         };
-        if noc::issue(&cmd, me, TXN).is_err() {
+        if noc::issue(Niu::Noc0, &cmd, me, TXN).is_err() {
             fail(mover::error::ALIGNMENT);
         }
         done += n;

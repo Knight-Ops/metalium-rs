@@ -29,7 +29,6 @@ use tt_isa::dm::record::{self, TensorRef};
 use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
 use tt_isa::isa::Instruction;
-use tt_isa::tile::L1Format;
 
 use crate::dm::DmError;
 use crate::matmul::{self, Fidelity, SrcRoute, Staging};
@@ -512,7 +511,33 @@ impl DramTensor {
         w: &Window,
         values: &[u32],
     ) -> Result<()> {
-        if self.elem == Elem::Bool {
+        let images = self.tile_images(values)?;
+        self.write_images(dev, w, &images)
+    }
+
+    /// What [`DramTensor::write_bits`] writes: each tile's image
+    /// ([`matmul::TILE_IMAGE_BYTES`], header and datums), in tile order,
+    /// after every check a write makes.
+    pub fn tile_images(&self, values: &[u32]) -> Result<Vec<u8>> {
+        self.check_write(values.len(), Some(values))?;
+        let tiles = self.placement.tiles;
+        let mut out = vec![0u8; tiles * matmul::TILE_IMAGE_BYTES];
+        // The tilizer moves bits: every pattern is kept, NaN payloads included.
+        matmul::tilize_into(
+            |i| values[i],
+            self.rows,
+            self.cols,
+            0..tiles,
+            &mut out,
+            matmul::TILE_IMAGE_BYTES,
+        );
+        Ok(out)
+    }
+
+    /// The checks every write makes: `len` datums for this tensor, its own
+    /// slots (not a view's), and a `Bool` tensor's `bits` only `0` and `1`.
+    pub fn check_write(&self, len: usize, bits: Option<&[u32]>) -> Result<()> {
+        if let (Elem::Bool, Some(values)) = (self.elem, bits) {
             if let Some(i) = values.iter().position(|&v| v > 1) {
                 return Err(TensorError::Shape(format!(
                     "a Bool tensor's datum {i} is {:#x}, not 0 or 1",
@@ -520,15 +545,10 @@ impl DramTensor {
                 )));
             }
         }
-        // The tilizer is FP32's, which moves bits: `from_bits` keeps every
-        // pattern, NaN payloads included.
-        let values: Vec<f32> = values.iter().map(|&b| f32::from_bits(b)).collect();
-        let values = &values[..];
         let (rows, cols) = (self.rows, self.cols);
-        if values.len() != rows * cols {
+        if len != rows * cols {
             return Err(TensorError::Shape(format!(
-                "{} values for a [{rows}, {cols}] tensor",
-                values.len()
+                "{len} values for a [{rows}, {cols}] tensor"
             )));
         }
         if !self.placement.owned {
@@ -536,8 +556,18 @@ impl DramTensor {
                 "a view's slots are another tensor's: write that one".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Write [`DramTensor::tile_images`]'s images to their slots from the
+    /// host, through the BAR.
+    pub fn write_images<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+        images: &[u8],
+    ) -> Result<()> {
         let t = self;
-        let (images, _) = matmul::tilize_f32(values, rows.max(1), cols.max(1), L1Format::Fp32);
         let img = matmul::TILE_IMAGE_BYTES;
         let per = t.placement.channels.len();
         let mut regions = vec![vec![0u8; (t.placement.slots * TILE_SLOT) as usize]; per];
@@ -598,6 +628,17 @@ impl DramTensor {
         // rows, only its padding columns: no better known than the parent's.
         v.set_pad(self.pad());
         Ok(v)
+    }
+
+    /// Tile `k`'s slot, in tile order (row-major over the grid).
+    pub fn slot(&self, k: usize) -> DramRange {
+        self.placement.slot(k)
+    }
+
+    /// Row-major values from tiles' datums packed in tile order, 4 KiB each
+    /// (what [`host_dma_jobs`]'s downloads leave in host memory).
+    pub fn from_packed(&self, packed: &[u8]) -> Vec<f32> {
+        matmul::detilize_packed(packed, self.rows, self.cols)
     }
 
     /// Download to row-major values: one bulk read per channel, or, for a
@@ -689,6 +730,277 @@ impl DramTensor {
     }
 }
 
+/// Tile slots a unit stages a [`host_dma_jobs`] batch in: two halves of
+/// this many, a batch moving in or out of one while the other's moves go on.
+pub const HOST_DMA_BATCH: usize = 64;
+const _: () = assert!(2 * HOST_DMA_BATCH as u64 * TILE_SLOT <= tt_isa::l1::DATA.len());
+
+/// Moves between host memory and tiles `tiles` of the tensor `x`, by the
+/// card (`tt_isa::dm::op::HOST_READ` / `HOST_WRITE`), one job a unit, each
+/// unit a contiguous run of the tiles. In host memory tile `k` is at
+/// `host + (k - tiles.start) * TILE_SLOT`, its datums `TILE_DATA` in -- the
+/// same stride and offset as tile slots in L1, so a batch is one host move of
+/// its consecutive slots and one record (`record::READ_RUN` /
+/// `record::WRITE_RUN`) for its tiles in GDDR. An upload writes the datums
+/// (a slot's header is the unpacker's to skip, as a kernel's outputs'); a
+/// download brings whole slots.
+///
+/// Each unit's tiles go in batches of [`HOST_DMA_BATCH`], alternating
+/// halves of its staging: batch `b + 1` comes in while batch `b` goes out,
+/// a `WAIT` between (the half batch `b + 2` refills was emptied before it).
+/// The data arena must be free of other work: the lists run behind
+/// everything queued before them on the unit, whose lists end with their
+/// kernels done.
+pub fn host_dma_jobs(
+    x: TensorRef,
+    tiles: std::ops::Range<usize>,
+    upload: bool,
+    host: u64,
+    units: usize,
+) -> Vec<Job> {
+    use tt_isa::dm::op;
+    let len = tiles.len();
+    let units = units.max(1).min(len.max(1));
+    let base = tt_isa::l1::DATA.base;
+    let at = |b: usize| base + ((b % 2) * HOST_DMA_BATCH) as u64 * TILE_SLOT;
+    let host_move = |first: usize, n: usize, l1: u64| {
+        let h = host + (first - tiles.start) as u64 * TILE_SLOT;
+        let kind = if upload {
+            op::HOST_READ
+        } else {
+            op::HOST_WRITE
+        };
+        [
+            kind,
+            h as u32,
+            (h >> 32) as u32,
+            0,
+            l1 as u32,
+            (n as u64 * TILE_SLOT) as u32,
+            0,
+            0,
+        ]
+    };
+    let dram_run = |first: usize, n: usize, l1: u64| -> [[u32; 8]; 3] {
+        let head = if upload {
+            [
+                record::WRITE_RUN,
+                first as u32,
+                n as u32,
+                l1 as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        } else {
+            [
+                record::READ_RUN,
+                first as u32,
+                n as u32,
+                l1 as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
+        [head, x.encode()[0], x.encode()[1]]
+    };
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    (0..units)
+        .map(|u| {
+            let run = tiles.start + u * len / units..tiles.start + (u + 1) * len / units;
+            let batches: Vec<(usize, usize)> = run
+                .clone()
+                .step_by(HOST_DMA_BATCH)
+                .map(|f| (f, HOST_DMA_BATCH.min(run.end - f)))
+                .collect();
+            // An upload brings a batch in from the host and writes it to
+            // GDDR; a download reads it from GDDR and sends it to the host.
+            let bring = |b: usize, entries: &mut Vec<[u32; 8]>| {
+                let (f, n) = batches[b];
+                if upload {
+                    entries.push(host_move(f, n, at(b)));
+                } else {
+                    entries.extend(dram_run(f, n, at(b)));
+                }
+            };
+            let send = |b: usize, entries: &mut Vec<[u32; 8]>| {
+                let (f, n) = batches[b];
+                if upload {
+                    entries.extend(dram_run(f, n, at(b)));
+                } else {
+                    entries.push(host_move(f, n, at(b)));
+                }
+            };
+            let mut entries = Vec::new();
+            for b in 0..batches.len() {
+                if b == 0 {
+                    bring(b, &mut entries);
+                }
+                entries.push(wait);
+                send(b, &mut entries);
+                if b + 1 < batches.len() {
+                    bring(b + 1, &mut entries);
+                }
+            }
+            entries.push(wait);
+            vec![Step::List {
+                what: if upload {
+                    "host dma upload"
+                } else {
+                    "host dma download"
+                },
+                entries,
+            }]
+        })
+        .collect()
+}
+
+/// Bytes between rows of a row-major tensor in host memory for
+/// [`row_major_dma_jobs`]: its row's bytes, rounded up to 64 so every row
+/// starts congruent with L1 as the card's DMA requires.
+pub fn row_major_stride(cols: usize) -> usize {
+    (cols * 4).next_multiple_of(64)
+}
+
+/// Moves between a row-major `[rows, cols]` matrix in host memory (rows
+/// [`row_major_stride`] bytes apart from `host`) and the tensor `x`'s tiles
+/// in GDDR, the tile layout made on the card: one job a unit. The matrix goes
+/// in chunks -- a tile row's 32 rows, across up to [`TILIZE_CHUNK`] tile
+/// columns -- dealt out to the units in turn, so a short wide tensor still
+/// uses them all. An upload brings a chunk's rows into L1 (one host move for
+/// a whole band, else one a row), `TILIZE`s each tile into a slot, and
+/// `WRITE_RUN`s the slots' datums to GDDR; a download `READ_RUN`s the slots,
+/// `UNTILIZE`s them into rows, and sends the rows to the host. Rows and
+/// columns past the matrix are zeros going up and never written coming back.
+/// The data arena must be free of other work, as for [`host_dma_jobs`].
+pub fn row_major_dma_jobs(
+    x: TensorRef,
+    [rows, cols]: [usize; 2],
+    upload: bool,
+    host: u64,
+    units: usize,
+) -> Vec<Job> {
+    use tt_isa::dm::{fill, op};
+    let (rt, ct) = (rows.div_ceil(32).max(1), cols.div_ceil(32).max(1));
+    let stride = row_major_stride(cols) as u64;
+    let row_bytes = (cols * 4) as u64;
+    // Chunks small enough to spread over the units, and to fit the arena.
+    let per_unit = (rt * ct).div_ceil(units.max(1));
+    let width = TILIZE_CHUNK.min(ct).min(per_unit.max(1));
+    let chunks: Vec<(usize, usize, usize)> = (0..rt)
+        .flat_map(|i| {
+            (0..ct)
+                .step_by(width)
+                .map(move |j0| (i, j0, width.min(ct - j0)))
+        })
+        .collect();
+    let units = units.max(1).min(chunks.len());
+    let slots = tt_isa::l1::DATA.base;
+    let band = slots + (TILIZE_CHUNK as u64) * TILE_SLOT;
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    (0..units)
+        .map(|u| {
+            let mut entries = Vec::new();
+            for &(i, j0, n) in chunks.iter().skip(u).step_by(units) {
+                let valid_rows = (rows - 32 * i).min(32);
+                // A whole band is one host move, its L1 rows `stride` apart;
+                // part of one is a move a row, its L1 rows the chunk's width.
+                let whole = j0 == 0 && n == ct;
+                let l1_stride = if whole { stride } else { n as u64 * 128 };
+                let seg = if whole {
+                    stride
+                } else {
+                    // The last chunk ends at the row's end (past it, the next
+                    // row's columns, which a download must not overwrite).
+                    (n as u64 * 128).min((row_bytes - j0 as u64 * 128).next_multiple_of(64))
+                };
+                let host_at = |r: usize| host + (32 * i + r) as u64 * stride + j0 as u64 * 128;
+                let host_moves = |entries: &mut Vec<[u32; 8]>| {
+                    let kind = if upload {
+                        op::HOST_READ
+                    } else {
+                        op::HOST_WRITE
+                    };
+                    let mv = |h: u64, l1: u64, len: u64| {
+                        [
+                            kind,
+                            h as u32,
+                            (h >> 32) as u32,
+                            0,
+                            l1 as u32,
+                            len as u32,
+                            0,
+                            0,
+                        ]
+                    };
+                    if whole {
+                        entries.push(mv(host_at(0), band, valid_rows as u64 * stride));
+                    } else {
+                        for r in 0..valid_rows {
+                            entries.push(mv(host_at(r), band + r as u64 * l1_stride, seg));
+                        }
+                    }
+                };
+                let first = (i * ct + j0) as u32;
+                let run = |kind: u32| {
+                    [
+                        [kind, first, n as u32, slots as u32, 0, 0, 0, 0],
+                        x.encode()[0],
+                        x.encode()[1],
+                    ]
+                };
+                let layout = |kind: u32, entries: &mut Vec<[u32; 8]>| {
+                    for k in 0..n {
+                        let j = j0 + k;
+                        let valid_cols = (cols - 32 * j).min(32);
+                        entries.push([
+                            kind,
+                            (band + k as u64 * 128) as u32,
+                            l1_stride as u32,
+                            (slots + k as u64 * TILE_SLOT + TILE_DATA) as u32,
+                            fill::param(valid_rows as u32, valid_cols as u32),
+                            0,
+                            0,
+                            0,
+                        ]);
+                    }
+                };
+                // Each `TILIZE` / `UNTILIZE` waits for every move before it,
+                // so the next chunk's moves into the band and the slots
+                // never overtake this one's out of them.
+                if upload {
+                    host_moves(&mut entries);
+                    layout(op::TILIZE, &mut entries);
+                    entries.extend(run(record::WRITE_RUN));
+                } else {
+                    entries.extend(run(record::READ_RUN));
+                    layout(op::UNTILIZE, &mut entries);
+                    host_moves(&mut entries);
+                }
+            }
+            entries.push(wait);
+            vec![Step::List {
+                what: if upload {
+                    "host dma upload, tilized on the card"
+                } else {
+                    "host dma download, untilized on the card"
+                },
+                entries,
+            }]
+        })
+        .collect()
+}
+
+/// Most tile columns a [`row_major_dma_jobs`] chunk spans: its slots and its
+/// band of rows (32 of them, 128 bytes a tile column) inside the data arena,
+/// for any matrix whose padded row fits the band (a wider one goes a chunk
+/// at a time, a move a row).
+pub const TILIZE_CHUNK: usize = 96;
+const _: () = assert!(TILIZE_CHUNK as u64 * (TILE_SLOT + 32 * 128) <= tt_isa::l1::DATA.len());
+
 /// One step of a [`Job`], run on one tile.
 #[derive(Clone, Debug)]
 pub enum Step {
@@ -715,6 +1027,11 @@ pub enum Step {
         /// Each role's block repeats (`runtime::Kernel::loops`): shared by a
         /// list's kernels as `mop` is, since the table is a descriptor word.
         loops: Arc<[Vec<crate::code::Loop>; 3]>,
+        /// Which half of a double-buffered pair this kernel's block is staged
+        /// in (`matmul::Staging::SlotsHalf`), if it is: the session may then
+        /// overlap the moves of a unit's next and last blocks with it
+        /// (checklist 9.15). `None` runs it as one `KERNEL`.
+        half: Option<u8>,
     },
 }
 
@@ -762,6 +1079,44 @@ pub fn blocks([mt, nt]: [usize; 2], [mc, nc]: [usize; 2], units: usize) -> [usiz
     [mc, nc]
 }
 
+/// Whether a GDDR matmul gains by pipelining (`Staging::SlotsHalf`): `K`
+/// still whole in half the arena, at least two blocks a unit to overlap, and
+/// no more than twice the operand tiles gathered. Half-arena blocks are
+/// smaller, so each output block re-gathers its operands more often; past
+/// twice, card 0 found the gathers outweigh the overlap (1024^3 on 8 tiles:
+/// 1x2-tile blocks, x2.18 the tiles, 1.3x slower), and below two blocks a
+/// unit there is nothing to overlap.
+pub fn pipelining_pays(
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+) -> bool {
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // Tiles gathered over the whole op, and blocks, for a staging.
+    let gathered = |st: Staging| -> Option<(usize, usize)> {
+        let s = matmul::plan_in([m, k, n], route, fidelity, st)?;
+        if s.tiles[1] < kt {
+            return None;
+        }
+        let [mc, nc] = blocks([mt, nt], [s.tiles[0], s.tiles[2]], units);
+        let (mut tiles, mut count) = (0, 0);
+        for i0 in (0..mt).step_by(mc) {
+            for j0 in (0..nt).step_by(nc) {
+                tiles += (mc.min(mt - i0) + nc.min(nt - j0)) * kt;
+                count += 1;
+            }
+        }
+        Some((tiles, count))
+    };
+    let (Some((full, _)), Some((half, count))) =
+        (gathered(Staging::Slots), gathered(Staging::SlotsHalf))
+    else {
+        return false;
+    };
+    count >= 2 * units.max(1) && half <= 2 * full
+}
+
 /// `op(A) @ op(B)`, where `op` is a transpose when asked, all in GDDR: the
 /// data mover gathers each block's tiles into L1 (transposing where needed),
 /// the resident roles compute it, and the mover writes the output tiles back.
@@ -783,6 +1138,7 @@ pub fn matmul_dram(
     fidelity: Fidelity,
     units: usize,
     allow_mop: bool,
+    pipeline: bool,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -803,10 +1159,19 @@ pub fn matmul_dram(
     }
     let k = ka;
     let (in_fmt, out_fmt) = route.formats();
-    let shape = matmul::plan_in([m, k, n], route, fidelity, Staging::Slots)
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // Pipelined (checklist 9.15): each block in half the arena, consecutive
+    // blocks of a unit alternating halves, so the session can move the next
+    // block in and the last one out while one computes -- if `K` still fits
+    // whole in half the arena.
+    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
+        Staging::SlotsHalf
+    } else {
+        Staging::Slots
+    };
+    let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
         .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
     let [mc, kc, nc] = shape.tiles;
-    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
     if kc < kt {
         return Err(TensorError::Shape(format!(
             "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
@@ -822,24 +1187,31 @@ pub fn matmul_dram(
         for j0 in (0..nt).step_by(nc) {
             let cols = nc.min(nt - j0);
             let tiles = [rows, kt, cols];
-            let matmul::Layout {
-                b_at,
-                outputs,
-                sems,
-                init,
-            } = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+            // A session deals job `j` to unit `j % units`, so a unit's blocks
+            // are every `units`-th: they alternate halves by `j / units`.
+            let half =
+                (staging == Staging::SlotsHalf).then(|| ((jobs.len() / units.max(1)) % 2) as u8);
+            let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
+                Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
                 Ok(l) => l,
                 Err(e) => {
                     alloc.free(&c.placement);
                     return Err(e.into());
                 }
             };
+            let matmul::Layout {
+                a_at,
+                b_at,
+                outputs,
+                sems,
+                init,
+            } = layout;
             let flags = u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
             let gather = [
                 [
                     record::GATHER,
                     flags,
-                    matmul::MATMUL_STAGE as u32,
+                    a_at as u32,
                     b_at as u32,
                     i0 as u32,
                     rows as u32,
@@ -851,8 +1223,11 @@ pub fn matmul_dram(
                 rb.encode()[0],
                 rb.encode()[1],
             ];
+            // The cache tells the stagings and halves apart: their programs
+            // name different addresses.
+            let variant = half.map_or(0, |h| 1 + h);
             let (roles, mop) =
-                matmul::kernel_programs(tiles, route, fidelity, sems, allow_mop, || {
+                matmul::kernel_programs(tiles, variant, route, fidelity, sems, allow_mop, || {
                     matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop)
                 });
             // Only the datums go back: the packer writes nothing else, and the
@@ -887,6 +1262,7 @@ pub fn matmul_dram(
                     init,
                     mop: Box::new(mop),
                     loops: Default::default(),
+                    half,
                 },
                 Step::List {
                     what: "matmul scatter",
@@ -896,6 +1272,63 @@ pub fn matmul_dram(
         }
     }
     Ok(Work { out: c, jobs })
+}
+
+/// Fewest tiles a pipelined element-wise or reduce run may hold. Each run
+/// is a launch and a gather and scatter record of its own: card 0 lost
+/// 5-50% splitting ops into runs of 1-4 tiles.
+pub const MIN_PIPELINED_RUN: usize = 12;
+
+/// Fewest tiles a unit's share of a pipelined element-wise or reduce op may
+/// hold, per unit the op runs on. The host queues the units' lists one after
+/// another (~6 us a unit an op on card 0, and more for each run), so on many
+/// units the op is the host's, and the extra runs pipelining makes cost more
+/// than the overlap saves -- unless each unit has more to do the more units
+/// there are. Card 0 (`sfpu_pipeline_sweep`, end to end): on one tile every
+/// op of 50 tiles and up gained (0.57-0.98); on 8, adds and reductions of
+/// 128-256 tiles a unit lost up to 1.66x and 512 broke even or gained (exp
+/// 0.96, max 0.86); on 32, adds of 32-128 tiles a unit lost up to 1.5x.
+pub const PIPELINE_SHARE: usize = 48;
+
+/// [`PIPELINE_SHARE`] for a reduction: four times as much. A reduction's
+/// device time gained wherever it pipelined (0.57-0.89 on one and two tiles),
+/// but end to end, shares under ~200 tiles a unit on one tile and ~500 on two
+/// lost up to 1.15x, and 512 a unit on 8 tiles lost 1.11x.
+pub const REDUCE_PIPELINE_SHARE: usize = 4 * PIPELINE_SHARE;
+
+/// The runs of a pipelined element-wise or reduce op over `len` items of
+/// `weight` tiles each, at most `half_max` items a run (half the arena's
+/// worth): at least two a unit, so every unit has a run moving while one
+/// computes, and the same number on every unit -- the op takes as long as its
+/// busiest unit, and one extra run on a few units cost card 0 up to 25%
+/// (`exp` over 1024 tiles on 8: 18 runs, two units doing three). `None` where
+/// that would leave a run under [`MIN_PIPELINED_RUN`] tiles, a unit's share
+/// under `share` tiles per unit ([`PIPELINE_SHARE`],
+/// [`REDUCE_PIPELINE_SHARE`]), or `half_max` is zero.
+pub fn pipelined_runs(
+    len: usize,
+    weight: usize,
+    units: usize,
+    half_max: usize,
+    share: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let units = units.max(1);
+    if half_max == 0 || len * weight < share * units * units {
+        return None;
+    }
+    let parts = len.div_ceil(half_max).div_ceil(units).max(2) * units;
+    // Contiguous, as even as integer division allows.
+    let r: Vec<_> = (0..parts)
+        .map(|p| p * len / parts..(p + 1) * len / parts)
+        .collect();
+    let shortest = r.iter().map(|r| r.len()).min()?;
+    (shortest * weight >= MIN_PIPELINED_RUN).then_some(r)
+}
+
+/// Which half of the arena run `j` of a pipelined op is staged in: a unit
+/// takes runs `j`, `j + units`, ... in turn, and alternates halves.
+fn half_of(j: usize, units: usize) -> u8 {
+    ((j / units.max(1)) % 2) as u8
 }
 
 /// `slots` tile slots of scratch for the mover's own use, planned in the data
@@ -998,6 +1431,7 @@ pub fn sfpu_eltwise(
     b: Option<&DramTensor>,
     c: Option<&DramTensor>,
     units: usize,
+    pipeline: bool,
 ) -> Result<Option<Work>> {
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
@@ -1033,15 +1467,30 @@ pub fn sfpu_eltwise(
         }
         _ => None,
     };
-    let group = sfpu_group(op, bcast, operands);
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b.map(DramTensor::tensor_ref);
+    // Pipelined (checklist 9.15): runs in alternating halves of the arena,
+    // so a unit's mover moves one run while the roles compute another.
+    let piped = pipeline
+        .then(|| {
+            pipelined_runs(
+                rt * ct,
+                1,
+                units,
+                sfpu_group(op, bcast, operands, true),
+                PIPELINE_SHARE,
+            )
+        })
+        .flatten();
+    let pipelined = piped.is_some();
+    let all = piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
     let mut jobs = Vec::new();
-    for run in runs(rt * ct, units, group) {
+    for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
-        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len) {
+        let half = pipelined.then(|| half_of(j, units));
+        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -1100,6 +1549,7 @@ pub fn sfpu_eltwise(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops,
+                half,
             },
             Step::List {
                 what: "sfpu scatter",
@@ -1146,26 +1596,35 @@ pub(crate) fn sfpu_group_for_tests(
         },
         bcast,
         operands,
+        false,
     )
 }
 
+/// `half`: in half the arena, for a pipelined run.
 fn sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
+    half: bool,
 ) -> usize {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
     // scalar and broadcast, not once per op.
-    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast), usize>>;
+    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool), usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), op.scalar2.to_bits(), bcast);
+    let key = (
+        op.kind,
+        op.scalar.to_bits(),
+        op.scalar2.to_bits(),
+        bcast,
+        half,
+    );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_sfpu_group(op, bcast, operands);
+    let g = measure_sfpu_group(op, bcast, operands, half);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -1176,6 +1635,7 @@ fn measure_sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
+    half: bool,
 ) -> usize {
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
@@ -1196,22 +1656,37 @@ fn measure_sfpu_group(
         })
         .min()
         .unwrap();
+    let arena = if half {
+        crate::matmul::HALF
+    } else {
+        tt_isa::l1::DATA.len()
+    };
     GROUP
-        .min(crate::sfpu::kernel::max_tiles(operands))
+        .min(crate::sfpu::kernel::max_tiles_in(operands, arena))
         .min(by_program)
         .max(1)
 }
 
-/// One run's layout and role programs, memoised by op, scalar and length.
+/// One run's layout and role programs, memoised by op, scalar, length and
+/// `half` (the half of the arena a pipelined run is staged in; `None` for the
+/// whole arena).
 fn sfpu_programs(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     len: usize,
+    half: Option<u8>,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (u32, u32, u32, crate::sfpu::ops::Broadcast, usize);
+    type Key = (
+        u32,
+        u32,
+        u32,
+        crate::sfpu::ops::Broadcast,
+        usize,
+        Option<u8>,
+    );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
@@ -1220,13 +1695,18 @@ fn sfpu_programs(
         op.scalar2.to_bits(),
         bcast,
         len,
+        half,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = crate::sfpu::kernel::plan_layout(len, operands)
-        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let layout = match half {
+        None => crate::sfpu::kernel::plan_layout(len, operands),
+        Some(h) => crate::sfpu::kernel::plan_layout_in(len, operands, crate::matmul::half_arena())
+            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
+    }
+    .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
@@ -1248,6 +1728,7 @@ pub fn sfpu_reduce(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     units: usize,
+    pipeline: bool,
 ) -> Result<Work> {
     a.expect("a reduction", Elem::F32)?;
     use crate::sfpu::reduce::Axis;
@@ -1257,7 +1738,7 @@ pub fn sfpu_reduce(
         Axis::Rows => (ct, rt, a.rows % 32, DramTensor::alloc(alloc, 1, a.cols)?),
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
-    let group = match reduce_group(op, axis, per, valid) {
+    let group = match reduce_group(op, axis, per, valid, false) {
         Some(g) => g,
         None => {
             alloc.free(&out.placement);
@@ -1267,10 +1748,20 @@ pub fn sfpu_reduce(
         }
     };
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
+    let piped = pipeline
+        .then(|| {
+            let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
+            pipelined_runs(outs, per, units, half, REDUCE_PIPELINE_SHARE)
+        })
+        .flatten();
+    let pipelined = piped.is_some();
+    let all = piped.unwrap_or_else(|| runs(outs, units, group));
     let mut jobs = Vec::new();
-    for run in runs(outs, units, group) {
+    for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
-        let (layout, roles) = match reduce_programs(op, axis, len, per, valid) {
+        let half = pipelined.then(|| half_of(j, units));
+        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -1319,6 +1810,7 @@ pub fn sfpu_reduce(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half,
             },
             Step::List {
                 what: "reduce scatter",
@@ -1332,25 +1824,26 @@ pub fn sfpu_reduce(
 type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
 
 /// Most output tiles one reduce run may take, from the slots the data arena
-/// holds and the role programs' length per output tile; `None` if not even
-/// one fits.
+/// (half of it, if `half`) holds and the role programs' length per output
+/// tile; `None` if not even one fits.
 fn reduce_group(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
+    half: bool,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32), Option<usize>>>;
+    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool), Option<usize>>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, per, valid);
+    let key = (op, axis, per, valid, half);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_reduce_group(op, axis, per, valid);
+    let g = measure_reduce_group(op, axis, per, valid, half);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -1362,10 +1855,16 @@ fn measure_reduce_group(
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
+    half: bool,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{math_programs, plan_layout, roles};
     const GROUP: usize = 64;
-    let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    let arena = if half {
+        crate::matmul::HALF
+    } else {
+        tt_isa::l1::DATA.len()
+    };
+    let slots = (arena / TILE_SLOT) as usize;
     let by_slots = slots / (per + 1);
     if by_slots == 0 {
         return None;
@@ -1394,25 +1893,32 @@ fn measure_reduce_group(
     Some(GROUP.min(by_slots).min(by_program).max(1))
 }
 
+/// One run's layout and role programs; `half` as for [`sfpu_programs`].
 fn reduce_programs(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     len: usize,
     per: usize,
     valid: u32,
+    half: Option<u8>,
 ) -> Result<ReducePrograms> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, roles, Axis, ReduceOp};
+    use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (ReduceOp, Axis, usize, usize, u32);
+    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>);
     type Memo = Mutex<HashMap<Key, ReducePrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, len, per, valid);
+    let key = (op, axis, len, per, valid, half);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = plan_layout(len, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let layout = match half {
+        None => plan_layout(len, per),
+        Some(h) => plan_layout_in(len, per, crate::matmul::half_arena())
+            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
+    }
+    .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (inputs, fin) = math_programs(op, axis, per, valid);
     let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
@@ -1428,7 +1934,12 @@ fn reduce_programs(
 /// One run per group of output tiles when a column of `a`'s tiles fits one
 /// ([`sfpu_reduce`]); otherwise in chunks of `ROW_CHUNK` row tiles, each
 /// starting from the last's sums, all of a group's chunks one job on one unit.
-pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
+pub fn sum_rows(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    units: usize,
+    pipeline: bool,
+) -> Result<Work> {
     use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, Axis, ReduceOp, ROW_CHUNK};
     a.expect("a sum over rows", Elem::F32)?;
     let [rt, ct] = a.grid();
@@ -1436,9 +1947,11 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
         0 => 32,
         v => v,
     };
-    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid).is_some() {
-        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units);
+    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false).is_some() {
+        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, pipeline);
     }
+    // Longer columns stay plain: each chunk gathers the sums the chunk before
+    // scattered, which a pipelined list would gather before they land.
     let group = chunk_group().ok_or_else(|| {
         TensorError::Shape("a chunk of a sum over rows does not fit one tile".into())
     })?;
@@ -1502,6 +2015,7 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
                 init: c.layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             });
             steps.push(Step::List {
                 what: "sum scatter",
@@ -1967,9 +2481,10 @@ mod tests {
                     let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[sa, sb]);
                     let route = SrcRoute::Tf32FromFp32;
                     let f = Fidelity::HiFi4;
-                    let got =
-                        super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false)
-                            .unwrap();
+                    let got = super::matmul_dram(
+                        &mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false, false,
+                    )
+                    .unwrap();
                     let want =
                         reference::matmul_dram(&mut a2, &t2[0], ta, &t2[1], tb, route, f, units)
                             .unwrap();
@@ -2195,6 +2710,7 @@ mod reference {
                 let cols = nc.min(nt - j0);
                 let tiles = [rows, kt, cols];
                 let matmul::Layout {
+                    a_at: _,
                     b_at,
                     outputs,
                     sems,
@@ -2257,6 +2773,7 @@ mod reference {
                         init,
                         mop: Box::new([None; 3]),
                         loops: Default::default(),
+                        half: None,
                     },
                     Step::List {
                         what: "matmul scatter",

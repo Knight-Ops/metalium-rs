@@ -64,8 +64,58 @@ pub const DM_B: Image = (
     tt_isa::dm::IMAGE_BASE,
 );
 
+/// RISCV NC's bring-up probe (`tt-firmware/src/bin/nc_probe.rs`), loaded at
+/// NC's image base; NC reaches it through the stub at its reset PC
+/// (`tt_isa::dm::nc::stub`).
+pub const NC_PROBE: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_NC_PROBE")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
+/// The RISCV NC data mover (`tt_isa::dm::Mover::NC`): the same mover as
+/// [`DM_B`], on NC's mailbox and ring, loaded at NC's image base.
+pub const DM_NC: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_DM_NC")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
+/// The instruction-cache probes (`tt-firmware/src/icache_probe.rs`): B's at
+/// L1 0, NC's at NC's image base.
+pub const ICACHE_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_ICACHE_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+pub const ICACHE_NC: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_ICACHE_NC")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
+/// The instruction-cache probes for T0, T1 and T2, each at its core's
+/// default reset PC.
+pub const ICACHE_T: [Image; 3] = [
+    (
+        Core::T0,
+        include_bytes!(env!("FIRMWARE_ICACHE_T0")),
+        Core::T0.default_reset_pc() as u64,
+    ),
+    (
+        Core::T1,
+        include_bytes!(env!("FIRMWARE_ICACHE_T1")),
+        Core::T1.default_reset_pc() as u64,
+    ),
+    (
+        Core::T2,
+        include_bytes!(env!("FIRMWARE_ICACHE_T2")),
+        Core::T2.default_reset_pc() as u64,
+    ),
+];
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 9] = [
+const ENTRIES: [(&str, &str); 16] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -75,6 +125,13 @@ const ENTRIES: [(&str, &str); 9] = [
     ("role_t2", env!("FIRMWARE_ROLE_T2_ENTRY")),
     ("eth_e1", env!("FIRMWARE_ETH_E1_ENTRY")),
     ("dm_b", env!("FIRMWARE_DM_B_ENTRY")),
+    ("nc_probe", env!("FIRMWARE_NC_PROBE_ENTRY")),
+    ("dm_nc", env!("FIRMWARE_DM_NC_ENTRY")),
+    ("icache_b", env!("FIRMWARE_ICACHE_B_ENTRY")),
+    ("icache_nc", env!("FIRMWARE_ICACHE_NC_ENTRY")),
+    ("icache_t0", env!("FIRMWARE_ICACHE_T0_ENTRY")),
+    ("icache_t1", env!("FIRMWARE_ICACHE_T1_ENTRY")),
+    ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -130,5 +187,21 @@ mod tests {
         assert_eq!(entry("dm_b").map(u64::from), Some(at));
         assert_eq!(at, core.default_reset_pc() as u64);
         assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);
+    }
+
+    /// NC's images run from `dm::nc::IMAGE_BASE`, reached by the stub, and
+    /// stay below NC's list ring.
+    #[test]
+    fn the_nc_images_are_linked_at_ncs_image_base() {
+        for (name, (core, image, at)) in [
+            ("nc_probe", NC_PROBE),
+            ("dm_nc", DM_NC),
+            ("icache_nc", ICACHE_NC),
+        ] {
+            assert_eq!(core, Core::NC, "{name}");
+            assert_eq!(entry(name).map(u64::from), Some(at), "{name}");
+            assert_eq!(at, tt_isa::dm::nc::IMAGE_BASE, "{name}");
+            assert!(image.len() as u64 <= tt_isa::dm::nc::IMAGE_MAX, "{name}");
+        }
     }
 }

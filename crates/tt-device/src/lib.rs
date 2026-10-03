@@ -18,6 +18,6 @@ pub mod transport;
 
 pub use device::{Device, PowerPolicy, Tile, Traffic, Window};
 pub use transport::{
-    Bar, ConfigOffset, Result, Transport, TransportError, DEVICE_ID_BLACKHOLE,
+    Bar, ConfigOffset, HostMemory, Result, Transport, TransportError, DEVICE_ID_BLACKHOLE,
     VENDOR_ID_TENSTORRENT,
 };

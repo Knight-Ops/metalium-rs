@@ -80,6 +80,13 @@ pub const THROTTLE_CYCLES: u64 = MAILBOX_BASE + 0x58;
 /// `crate::noc::niu::MAX_IN_FLIGHT`. Read at the start of every list. Lower
 /// caps are for the gates that force the throttle.
 pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
+/// The in-flight cap a tile's mover starts with (`tt_kernels::dm::DataMover::
+/// start`), against `MAX_IN_FLIGHT` (128) for 0: with every tile reading, eight
+/// requests in flight each spread the NoC's service evenly between tiles, and
+/// the card's reads rise from 425 to 467 GB/s at 64 KiB entries and to 496 at
+/// 16 KiB, against 3-4% off one tile's small reads
+/// (`docs/firmware-performance.md`, "What holds card reads").
+pub const TILE_IN_FLIGHT_CAP: u32 = 8;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -110,7 +117,39 @@ pub const QUEUE_ERROR_AT: u64 = MAILBOX_BASE + 0x9C;
 pub const QUEUE_SLOTS: u64 = MAILBOX_BASE + 0xA0;
 /// Slots in the queue.
 pub const QUEUE_LEN: u32 = 16;
-const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= MAILBOX_BASE + 0x100);
+const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
+
+/// Host -> mover: which NIU the mover's GDDR writes go out on, [`write_noc`].
+/// Read at the start of every list. Reads always go out on NoC #0: on NoC #1
+/// their data climbs the DRAM columns and shares one row's link, a single
+/// link's bandwidth for the whole row (`silicon_bench_memory::
+/// gddr_aggregate_nocs`, 4 tiles: 86 GB/s against 320). Barriers stay on
+/// NoC #0. Each request's port is the entry's mapped onto the ports its NIU
+/// owns (`crate::dram::DramChannel::port_for`), so no endpoint ever sees both
+/// NoCs.
+pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
+const _: () = assert!(WRITE_NOC + 4 <= MAILBOX_BASE + 0x100);
+
+/// Mover -> the tile's other mover: how many [`op::SIGNAL`]s this mover has
+/// run (wrapping), each after everything before it landed. Zeroed by the host
+/// before the mover starts; read by the peer's [`op::WAIT_PEER`].
+pub const PROGRESS: u64 = MAILBOX_BASE + 0xE4;
+const _: () = assert!(PROGRESS + 4 <= MAILBOX_BASE + 0x100);
+
+/// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
+pub mod write_noc {
+    /// Writes through NoC #0's NIU, with the reads: what the mover always did.
+    pub const NOC0: u32 = 0;
+    /// Writes through NoC #1's NIU, on GDDR port 1 of every channel. Both
+    /// NIUs translate coordinates the same way (`NoC/Coordinates.md`,
+    /// "Coordinate Translation"), so the entries are unchanged.
+    pub const NOC1: u32 = 1;
+    /// Write entries alternate between the two NIUs, NoC #0 first in each
+    /// list, each through a port its NIU owns. The two NoCs' write paths into
+    /// GDDR share no links -- NoC #0's run down the two DRAM columns, NoC
+    /// #1's along port 1's rows into them -- so their bandwidths can add.
+    pub const ALTERNATE: u32 = 2;
+}
 
 /// A queue slot's word: a list of `entries` from ring entry `first`.
 pub const fn queue_slot(first: u32, entries: u32) -> u32 {
@@ -179,6 +218,77 @@ pub mod op {
     /// trace's role descriptors, which the host writes for an ordinary list
     /// and cannot write during a replay. Only in a list entry.
     pub const POKE: u32 = 11;
+    /// Count this mover's progress: `[SIGNAL, 0, ...]`. The mover waits for
+    /// every move before it to land, then adds one to its
+    /// [`super::PROGRESS`] word, which the other mover on the tile reads with
+    /// [`WAIT_PEER`]. Only in a list entry.
+    pub const SIGNAL: u32 = 12;
+    /// Wait for the tile's other mover: `[WAIT_PEER, peer, target, 0, ...]`,
+    /// `peer` 0 for B's and 1 for NC's ([`super::Mover`]). The mover spins on
+    /// the peer's [`super::PROGRESS`] until it reaches `target` (compared
+    /// modulo 2^32), and reports [`super::error::PEER`] instead if the peer's
+    /// queue has stopped on an error -- so a failed peer never leaves this one
+    /// spinning. Only in a list entry.
+    pub const WAIT_PEER: u32 = 13;
+    /// The first half of [`KERNEL`]: `[LAUNCH, generation, a0, l0, a1, l1,
+    /// a2, l2]`. The mover waits for every move before it, points the roles
+    /// at their programs and posts `generation`, as `KERNEL` does, and goes on
+    /// to the next entry without waiting for the roles -- so it can move the
+    /// next block in and the last one out while they compute (checklist
+    /// 9.15). A [`KERNEL_WAIT`] collects it. Only in a list entry.
+    pub const LAUNCH: u32 = 14;
+    /// The second half of [`KERNEL`]: `[KERNEL_WAIT, generation, 0, ...]`.
+    /// Waits until each role has acknowledged `generation`, or reports
+    /// [`super::error::ROLE`] if one panics. `generation` must be the last one
+    /// the mover launched: anything else is [`super::error::GENERATION`], not
+    /// a wait that could never end. Only in a list entry.
+    pub const KERNEL_WAIT: u32 = 15;
+    /// Host memory -> L1, the card's own DMA: `[HOST_READ, host_lo,
+    /// host_hi, 0, l1, len, 0, 0]`. `host` is a NoC address at the
+    /// host-connected PCIe tile ([`crate::noc::niu::PCIE_HOST`]): the driver's
+    /// for memory it pinned for the card (`PIN_PAGES` with `NOC_DMA`). Only
+    /// the PCIe tile's two plain windows to the host are accepted
+    /// ([`super::host_window`]); `host` and `l1` congruent mod 64, as a GDDR
+    /// read's, and a move never crosses a 4 GiB boundary of `host`. Through
+    /// NoC #0. Only in a list entry.
+    pub const HOST_READ: u32 = 0x20;
+    /// L1 -> host memory: `[HOST_WRITE, host_lo, host_hi, 0, l1, len, 0, 0]`,
+    /// as [`HOST_READ`].
+    pub const HOST_WRITE: u32 = 0x21;
+    /// A row-major block into a tile slot, in L1: `[TILIZE, src, stride,
+    /// dst, valid, 0, 0, 0]`, `stride` at least the valid columns' bytes. Datum `(r, c)` of the 32x32 block whose first
+    /// datum is at `src`, its rows `stride` bytes apart, goes to its place in
+    /// the tile's faces at `dst` (a slot's datums, past its header); datums
+    /// outside the block's first `valid & 0xff` rows and `valid >> 8` columns
+    /// ([`super::fill::param`], `0` meaning 32) are zero, as a host tilize
+    /// pads. Waits for every move before it. Only in a list entry.
+    pub const TILIZE: u32 = 0x22;
+    /// A tile slot's datums into a row-major block, in L1: `[UNTILIZE, src,
+    /// stride, dst, valid, 0, 0, 0]`, [`TILIZE`]'s inverse -- only the valid
+    /// rows and columns are written, so a band of blocks side by side keeps
+    /// its neighbours'. Waits for every move before it. Only in a list entry.
+    pub const UNTILIZE: u32 = 0x23;
+}
+
+// Entry ops and record ops (`record`, from 0x10) share one numbering.
+const _: () = {
+    let ops = [op::HOST_READ, op::HOST_WRITE, op::TILIZE, op::UNTILIZE];
+    let mut i = 0;
+    while i < ops.len() {
+        assert!(!record::is_record(ops[i]));
+        assert!(ops[i] < record::GATHER || ops[i] > record::WRITE_RUN);
+        i += 1;
+    }
+};
+
+/// Whether `host` is in one of the PCIe tile's two windows a mover may use
+/// (`PCIExpressTile/README.md`, "NoC to Host"): `0x0...` (to the host's
+/// IOMMU) and `0x1000_0000_0000_0000` (through the outbound iATU, where the
+/// driver's pins land). Its other windows reach the PCIe controller's own
+/// configuration and serdeses, which a stray write would corrupt.
+pub const fn host_window(host: u64) -> bool {
+    let window = host >> 58;
+    window == 0 || window == 4
 }
 
 /// [`op::FILL`]'s parameter.
@@ -215,6 +325,123 @@ pub const TRACE_CHUNK: u64 = 0x1_9100;
 /// Entries one chunk holds.
 pub const TRACE_CHUNK_ENTRIES: u32 = 64;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
+
+/// One tile's data mover, by core: where its image, mailbox, list ring,
+/// scratch and trace chunk live. B's are this module's constants; NC's are
+/// [`nc`]'s. Both speak the same protocol, so NC's mailbox is B's layout
+/// moved ([`Mover::at`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Mover {
+    pub core: crate::tensix::Core,
+    pub image_base: u64,
+    pub image_max: u64,
+    pub mailbox: u64,
+    pub list: u64,
+    pub scratch: u64,
+    pub trace_chunk: u64,
+}
+
+/// Which of a tile's two movers, as an entry names it ([`op::WAIT_PEER`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Peer {
+    B,
+    NC,
+}
+
+impl Peer {
+    /// The mover's addresses.
+    pub const fn mover(self) -> Mover {
+        match self {
+            Peer::B => Mover::B,
+            Peer::NC => Mover::NC,
+        }
+    }
+}
+
+impl Mover {
+    /// RISCV B's mover: the image at its hardwired reset PC.
+    pub const B: Mover = Mover {
+        core: crate::tensix::Core::B,
+        image_base: IMAGE_BASE,
+        image_max: IMAGE_MAX,
+        mailbox: MAILBOX_BASE,
+        list: LIST,
+        scratch: SCRATCH,
+        trace_chunk: TRACE_CHUNK,
+    };
+    /// RISCV NC's mover: the image at the top of L1, reached by the stub at
+    /// NC's reset PC ([`nc::stub`]).
+    pub const NC: Mover = Mover {
+        core: crate::tensix::Core::NC,
+        image_base: nc::IMAGE_BASE,
+        image_max: nc::IMAGE_MAX,
+        mailbox: nc::MAILBOX_BASE,
+        list: nc::LIST,
+        scratch: nc::SCRATCH,
+        trace_chunk: nc::TRACE_CHUNK,
+    };
+
+    /// This mover's copy of mailbox word `b_word`, given as B's (one of
+    /// [`SEQ`], [`DONE`], [`QUEUE_HEAD`], ...).
+    pub const fn at(self, b_word: u64) -> u64 {
+        b_word - MAILBOX_BASE + self.mailbox
+    }
+}
+
+/// RISCV NC's mover: where its image, list ring, scratch and mailbox live.
+///
+/// NC's own slot, from its default reset PC (`0x1_2000`) to the mover's list
+/// (`0x1_4000`), is 8 KiB, and the mover image is twice that. So the image
+/// lives in the free L1 between B's mover area and the data arena
+/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk in the
+/// mailbox region's free stretch below the role mailboxes -- the program
+/// cache keeps all of the top of L1, which a long column sum needs
+/// (`step21_one_launch`) -- and NC's reset PC holds a two-instruction jump to
+/// the image ([`nc::stub`]). Its reset PC is never moved:
+/// ttsim refuses NC's reset-PC override (divergence row 43), and the default
+/// is the same on silicon. NC fetches only from L1 on Blackhole -- no
+/// instruction RAM (`BabyRISCV/README.md:39`) -- so the image runs in place.
+pub mod nc {
+    /// Where NC starts on leaving reset: the stub.
+    pub const STUB_AT: u64 = crate::tensix::Core::NC.default_reset_pc() as u64;
+    /// Where the image is linked and loaded: the first 4 KiB boundary past
+    /// B's mover area (the stub's jump needs one), up to the data arena.
+    pub const IMAGE_BASE: u64 = 0x1_A000;
+    pub const IMAGE_MAX: u64 = 0x2_0000 - IMAGE_BASE;
+    const _: () = assert!(
+        IMAGE_BASE >= super::TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES
+    );
+    /// NC's list ring, as [`super::LIST`] is B's: in the mailbox region, past
+    /// the single-core mailbox's `Dst` dump (`crate::mailbox::DUMP`) and
+    /// before the role mailboxes (`crate::mailbox::role::BASE`).
+    pub const LIST: u64 = crate::mailbox::MAILBOX_BASE + 0x4000;
+    const _: () = assert!(
+        LIST >= crate::mailbox::DUMP
+            + (crate::mailbox::DUMP_MAX_ROWS * crate::mailbox::DUMP_ROW_WORDS * 4) as u64
+    );
+    /// NC's transpose scratch slot, as [`super::SCRATCH`] is B's.
+    pub const SCRATCH: u64 = LIST + super::LIST_MAX as u64 * super::ENTRY_BYTES;
+    /// Where NC's `CALL`s stream their entries, as [`super::TRACE_CHUNK`].
+    pub const TRACE_CHUNK: u64 = SCRATCH + super::TILE_SLOT.next_multiple_of(256);
+    /// The end of what NC's mover uses.
+    pub const END: u64 = TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES;
+    /// NC's mover mailbox: B's layout ([`super::SEQ`] and on, offset by
+    /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
+    pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
+    const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
+    const _: () = assert!(END <= crate::mailbox::role::BASE);
+    const _: () = assert!(STUB_AT + 8 <= super::LIST);
+
+    /// The two instructions at [`STUB_AT`]: `lui t0, %hi(target)` and
+    /// `jalr x0, %lo(target)(t0)`, for a `target` that is a multiple of 4 KiB
+    /// (so the low part is 0).
+    pub const fn stub(target: u64) -> [u32; 2] {
+        assert!(target % 0x1000 == 0 && target < 1 << 31);
+        let lui_t0 = (target as u32) | (5 << 7) | 0x37;
+        let jalr_x0_t0 = (5 << 15) | 0x67;
+        [lui_t0, jalr_x0_t0]
+    }
+}
 
 /// One FP32 32x32 tile as it is stored on the device: the 16-byte header
 /// (zero, as `tt_layout` writes it), 1024 datums in face order, and padding to
@@ -280,6 +507,38 @@ pub enum Entry {
     },
     /// [`op::POKE`]: one role-mailbox word.
     Poke { address: u32, value: u32 },
+    /// [`op::LAUNCH`]: [`Entry::Kernel`] without the wait.
+    Launch {
+        generation: u32,
+        programs: [(u32, u32); 3],
+    },
+    /// [`op::KERNEL_WAIT`]: the wait.
+    KernelWait { generation: u32 },
+    /// [`op::SIGNAL`].
+    Signal,
+    /// [`op::WAIT_PEER`]: the peer mover, and the progress count to wait for.
+    /// A one-byte [`Peer`], not a [`Mover`]: every `Entry` is as large as its
+    /// largest variant, and the mover's per-entry path decodes one each time
+    /// (a `Mover` here cost every entry ~100 cycles on card 0).
+    WaitPeer { peer: Peer, target: u32 },
+    /// [`op::HOST_READ`] and [`op::HOST_WRITE`]. The address in two words, not
+    /// a `u64`: a `u64` would raise every `Entry`'s alignment to 8.
+    Host {
+        write: bool,
+        host_lo: u32,
+        host_hi: u32,
+        l1: u32,
+        len: u32,
+    },
+    /// [`op::TILIZE`] (`tilize`) and [`op::UNTILIZE`]: `block` is the
+    /// row-major side, `slot` the tile's datums.
+    Tilize {
+        tilize: bool,
+        block: u32,
+        stride: u32,
+        slot: u32,
+        valid: u32,
+    },
 }
 
 impl Entry {
@@ -296,6 +555,7 @@ impl Entry {
                 },
             );
         }
+
         let transform = match w[0] {
             op::READ_TRANSPOSED => Transform::Transpose,
             op::READ_BROADCAST_COL => Transform::BroadcastCol0,
@@ -318,7 +578,17 @@ impl Entry {
         if w[0] == op::LIST {
             return Err(error::OP);
         }
-        if w[0] == op::KERNEL {
+        if w[0] == op::KERNEL_WAIT {
+            if w[1] == 0 || w[2..].iter().any(|&v| v != 0) {
+                return Err(if w[1] == 0 {
+                    error::GENERATION
+                } else {
+                    error::OP
+                });
+            }
+            return Ok(Entry::KernelWait { generation: w[1] });
+        }
+        if w[0] == op::KERNEL || w[0] == op::LAUNCH {
             // Zero is what a resident runner reads as "not resident".
             if w[1] == 0 {
                 return Err(error::GENERATION);
@@ -343,9 +613,16 @@ impl Entry {
                 }
                 *p = (at, len);
             }
-            return Ok(Entry::Kernel {
-                generation: w[1],
-                programs,
+            return Ok(if w[0] == op::LAUNCH {
+                Entry::Launch {
+                    generation: w[1],
+                    programs,
+                }
+            } else {
+                Entry::Kernel {
+                    generation: w[1],
+                    programs,
+                }
             });
         }
         if w[0] == op::WAIT {
@@ -394,6 +671,74 @@ impl Entry {
                 value: w[2],
             });
         }
+        if w[0] == op::SIGNAL {
+            if w[1..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Signal);
+        }
+        if w[0] == op::HOST_READ || w[0] == op::HOST_WRITE {
+            let host = (w[2] as u64) << 32 | w[1] as u64;
+            let (l1, len) = (w[4], w[5]);
+            if w[3] != 0 || w[6] != 0 || w[7] != 0 || !host_window(host) {
+                return Err(error::OP);
+            }
+            if len == 0 {
+                return Err(error::LENGTH);
+            }
+            let in_l1 = (l1 as u64 + len as u64) <= crate::tensix::L1_SIZE;
+            let one_word = (w[1] as u64) + len as u64 <= 1 << 32;
+            if host % crate::dram::ALIGN != l1 as u64 % crate::dram::ALIGN || !in_l1 || !one_word {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Host {
+                write: w[0] == op::HOST_WRITE,
+                host_lo: w[1],
+                host_hi: w[2],
+                l1,
+                len,
+            });
+        }
+        if w[0] == op::TILIZE || w[0] == op::UNTILIZE {
+            let (block, stride, slot, valid) = (w[1], w[2], w[3], w[4]);
+            if valid & !0x1f1f != 0 || w[5..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            let l1 = crate::tensix::L1_SIZE;
+            // What it touches of the block: its valid rows' valid columns.
+            let (rows, cols) = (
+                fill::extent(valid & 0xff) as u64,
+                fill::extent(valid >> 8) as u64,
+            );
+            let block_end = block as u64 + (rows - 1) * stride as u64 + 4 * cols;
+            if block % 4 != 0
+                || stride % 4 != 0
+                || (stride as u64) < 4 * cols
+                || slot % 16 != 0
+                || block_end > l1
+                || slot as u64 + 4096 > l1
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Tilize {
+                tilize: w[0] == op::TILIZE,
+                block,
+                stride,
+                slot,
+                valid,
+            });
+        }
+        if w[0] == op::WAIT_PEER {
+            let peer = match w[1] {
+                0 => Peer::B,
+                1 => Peer::NC,
+                _ => return Err(error::OP),
+            };
+            if w[3..].iter().any(|&v| v != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::WaitPeer { peer, target: w[2] });
+        }
         if w[0] == op::FILL {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
             if !slot(w[3]) {
@@ -439,6 +784,8 @@ pub mod error {
     /// A [`super::op::KERNEL`] entry naming a program outside the program
     /// cache, misaligned, or longer than a program may be.
     pub const PROGRAM: u32 = 8;
+    /// A [`super::op::WAIT_PEER`] whose peer's queue had stopped on an error.
+    pub const PEER: u32 = 9;
 }
 
 /// A descriptor, as both sides see it.
@@ -498,6 +845,103 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_moves_decode_only_inside_the_host_windows() {
+        use super::*;
+        let iatu = 0x1000_0000_0000_0000u64;
+        let e = |op, host: u64, l1: u32, len: u32| {
+            Entry::decode(
+                0xFF,
+                [op, host as u32, (host >> 32) as u32, 0, l1, len, 0, 0],
+            )
+        };
+        assert_eq!(
+            e(op::HOST_READ, iatu + 0x40, 0x2_0040, 4096),
+            Ok(Entry::Host {
+                write: false,
+                host_lo: 0x40,
+                host_hi: 0x1000_0000,
+                l1: 0x2_0040,
+                len: 4096
+            })
+        );
+        assert!(matches!(
+            e(op::HOST_WRITE, 0x1_4000_0000, 0x2_0000, 64),
+            Ok(Entry::Host { write: true, .. })
+        ));
+        // The PCIe controller's DBI, its serdes configuration, an unused
+        // window: refused.
+        for host in [
+            0xF800_0000_0000_0000u64,
+            0xFFFF_FFFF_E000_0000,
+            0x2000_0000_0000_0000,
+        ] {
+            assert_eq!(
+                e(op::HOST_WRITE, host, 0x2_0000, 64),
+                Err(error::OP),
+                "{host:#x}"
+            );
+        }
+        assert_eq!(e(op::HOST_READ, iatu, 0x2_0000, 0), Err(error::LENGTH));
+        assert_eq!(
+            e(op::HOST_READ, iatu + 16, 0x2_0000, 64),
+            Err(error::ALIGNMENT)
+        );
+        assert_eq!(
+            e(op::HOST_READ, iatu, crate::tensix::L1_SIZE as u32 - 64, 128),
+            Err(error::ALIGNMENT)
+        );
+        // Across a 4 GiB boundary of the host address.
+        assert_eq!(
+            e(op::HOST_READ, iatu + 0xFFFF_FFC0, 0x2_0000, 128),
+            Err(error::ALIGNMENT)
+        );
+        let mut extra = [op::HOST_READ, 0, 0x1000_0000, 0, 0x2_0000, 64, 0, 0];
+        extra[3] = 1;
+        assert_eq!(Entry::decode(0xFF, extra), Err(error::OP));
+    }
+
+    #[test]
+    fn launch_and_kernel_wait_decode_as_kernel_halves() {
+        use super::*;
+        let at = crate::l1::PROGRAM_CACHE.base as u32;
+        let launch = [op::LAUNCH, 7, at, 4, 0, 0, at + 64, 8];
+        assert_eq!(
+            Entry::decode(0xFF, launch),
+            Ok(Entry::Launch {
+                generation: 7,
+                programs: [(at, 4), (0, 0), (at + 64, 8)],
+            })
+        );
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 7, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::KernelWait { generation: 7 })
+        );
+        // Generation 0 is "not resident"; a wait carries nothing else.
+        let mut zero = launch;
+        zero[1] = 0;
+        assert_eq!(Entry::decode(0xFF, zero), Err(error::GENERATION));
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]),
+            Err(error::GENERATION)
+        );
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 7, 1, 0, 0, 0, 0, 0]),
+            Err(error::OP)
+        );
+        // A launch's programs are checked as a kernel's.
+        let mut bad = launch;
+        bad[2] = 8;
+        assert_eq!(Entry::decode(0xFF, bad), Err(error::PROGRAM));
+    }
+
+    #[test]
+    fn the_nc_stub_jumps_to_the_image() {
+        // `lui t0, 0x170` and `jr t0`, as llvm-objdump decodes these words.
+        assert_eq!(nc::stub(0x17_0000), [0x0017_02B7, 0x0002_8067]);
+        assert_eq!(nc::stub(nc::IMAGE_BASE), [0x0001_A2B7, 0x0002_8067]);
+    }
+
     use super::*;
 
     const ALL: u32 = 0xFF;

@@ -115,6 +115,12 @@ impl Trace {
     /// replay, and read the output back, row-major as stored: one round trip
     /// to the device.
     pub fn run(&self, values: Vec<f32>) -> Result<Vec<f32>, EngineError> {
+        self.run_timed(values).map(|r| r.output)
+    }
+
+    /// [`Trace::run`], with the time the input's write, the replay and the
+    /// output's read each took on the device's side.
+    pub fn run_timed(&self, values: Vec<f32>) -> Result<server::TraceRun, EngineError> {
         let (id, input, output) = (self.id, self.input, self.output);
         server::run(self.device, move |e| {
             e.run_trace(id, input, &values, output)

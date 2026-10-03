@@ -27,7 +27,9 @@ const fn io(nr: u64) -> u64 {
 pub const GET_DEVICE_INFO: u64 = io(0);
 pub const QUERY_MAPPINGS: u64 = io(2);
 pub const GET_DRIVER_INFO: u64 = io(5);
+pub const PIN_PAGES: u64 = io(7);
 pub const LOCK_CTL: u64 = io(8);
+pub const UNPIN_PAGES: u64 = io(10);
 pub const ALLOCATE_TLB: u64 = io(11);
 pub const FREE_TLB: u64 = io(12);
 pub const CONFIGURE_TLB: u64 = io(13);
@@ -113,6 +115,41 @@ pub struct AllocateTlb {
     pub out_mmap_offset_uc: u64,
     pub out_mmap_offset_wc: u64,
     pub out_reserved1: u64,
+}
+
+/// `tenstorrent_pin_pages_in` followed by `tenstorrent_pin_pages_out_extended`
+/// (`ioctl.h:175-189`): the driver writes `in_output_size_bytes` of output,
+/// so asking for 16 gets the NoC address as well as the IOVA.
+#[repr(C)]
+#[derive(Default)]
+pub struct PinPages {
+    pub in_output_size_bytes: u32,
+    pub in_flags: u32,
+    pub in_virtual_address: u64,
+    pub in_size: u64,
+    pub out_physical_address: u64,
+    pub out_noc_address: u64,
+}
+
+/// `tenstorrent_pin_pages_in.flags` (`ioctl.h:169-173`).
+pub mod pin {
+    /// The caller attests the pages are physically contiguous.
+    pub const CONTIGUOUS: u32 = 1;
+    /// Map the pages for the card's NoC (through the outbound iATU) and
+    /// return the NoC address that reaches them.
+    pub const NOC_DMA: u32 = 2;
+    pub const NOC_TOP_DOWN: u32 = 4;
+    /// The card only reads them; the IOMMU enforces it.
+    pub const READ_ONLY: u32 = 8;
+}
+
+/// `tenstorrent_unpin_pages` (`ioctl.h:192-204`).
+#[repr(C)]
+#[derive(Default)]
+pub struct UnpinPages {
+    pub in_virtual_address: u64,
+    pub in_size: u64,
+    pub in_reserved: u64,
 }
 
 #[repr(C)]

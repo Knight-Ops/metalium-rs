@@ -1205,7 +1205,7 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `linear` and its three backwards | `~` default over `float_matmul` | -- |
+| `linear` and its three backwards | `~` over `float_matmul`; a rank-N input folds its batch into the rows (forward, `x` grad), `linear_{weight,bias}_backward` hand-written likewise | B6 |
 | `embedding{,_backward}` | | D4 |
 | `conv1d`, `conv2d`, `conv_transpose*`, their backwards, `unfold4d` | | D6 |
 | `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | | M2 + D6 |

@@ -83,6 +83,7 @@ impl Drop for Buffer {
 impl TtTensor {
     /// A host tensor.
     pub(crate) fn new(inner: FlexTensor, device: TtDevice) -> Self {
+        crate::report::made(false);
         let (shape, dtype) = (inner.shape(), inner.dtype());
         let host = OnceLock::new();
         let _ = host.set(inner);
@@ -104,6 +105,7 @@ impl TtTensor {
             device_elem(dtype).is_some(),
             "{dtype:?} is not stored on the device"
         );
+        crate::report::made(true);
         let cell = OnceLock::new();
         let _ = cell.set(dram);
         TtTensor {
@@ -184,6 +186,7 @@ impl TtTensor {
     pub(crate) fn reshaped_host(&self, host: FlexTensor, shape: Shape) -> TtTensor {
         debug_assert_eq!(stored_dims(&shape.to_vec()), self.stored());
         debug_assert!(self.dram().is_none_or(|d| !d.transposed));
+        crate::report::made(false);
         let h = OnceLock::new();
         let _ = h.set(host);
         TtTensor {

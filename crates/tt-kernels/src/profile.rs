@@ -127,6 +127,8 @@ pub fn op_name(op: u32) -> &'static str {
         op::READ_TRANSPOSED => "read transposed",
         op::FILL => "fill",
         op::KERNEL => "kernel",
+        op::LAUNCH => "launch",
+        op::KERNEL_WAIT => "kernel wait",
         op::WAIT => "wait",
         record::GATHER => "gather",
         record::SCATTER => "scatter",

@@ -48,6 +48,36 @@ pub fn get_driver_info(fd: BorrowedFd<'_>) -> std::io::Result<abi::GetDriverInfo
     Ok(arg)
 }
 
+/// `PIN_PAGES` — pin `size` bytes at `va` (page-aligned) for the card,
+/// with `flags` (`abi::pin`). Returns the IOVA and, with `NOC_DMA`, the NoC
+/// address the card reaches them at.
+pub fn pin_pages(
+    fd: BorrowedFd<'_>,
+    va: u64,
+    size: u64,
+    flags: u32,
+) -> std::io::Result<(u64, u64)> {
+    let mut arg = abi::PinPages {
+        in_output_size_bytes: 16,
+        in_flags: flags,
+        in_virtual_address: va,
+        in_size: size,
+        ..Default::default()
+    };
+    call(fd, abi::PIN_PAGES, &mut arg)?;
+    Ok((arg.out_physical_address, arg.out_noc_address))
+}
+
+/// `UNPIN_PAGES` — the whole of an earlier pin, by its original address.
+pub fn unpin_pages(fd: BorrowedFd<'_>, va: u64, size: u64) -> std::io::Result<()> {
+    let mut arg = abi::UnpinPages {
+        in_virtual_address: va,
+        in_size: size,
+        ..Default::default()
+    };
+    call(fd, abi::UNPIN_PAGES, &mut arg)
+}
+
 /// `QUERY_MAPPINGS` — the BAR apertures and the mmap keys that reach them.
 ///
 /// The argument is a flexible-array struct: a count, then that many entries

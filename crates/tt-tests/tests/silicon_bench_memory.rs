@@ -21,8 +21,9 @@ use tt_device::Window;
 use tt_isa::dm::{self, op};
 use tt_isa::dram::Dram;
 use tt_isa::mailbox::{trace as ev, TRACE_BUFFER, TRACE_BUFFER_BYTES};
+use tt_isa::noc::niu::{self, Niu};
 use tt_isa::noc::{Noc0, NocCoord};
-use tt_kernels::dm::DataMover;
+use tt_kernels::dm::{DataMover, WriteNoc};
 use tt_tests::backend::{device_index, tensix_grid};
 use tt_tests::bench::{on_card, pattern, report, report_rate, Conditions, Peak, Stats, REPS};
 use tt_tests::harness::{tensix_tile, tile, Dev};
@@ -91,6 +92,16 @@ struct One<'a> {
     c: Conditions,
 }
 
+/// `BENCH_MOVER=nc`: the single-tile benchmarks run RISCV NC's mover
+/// (`dm::Mover::NC`) instead of B's -- the same mover code, on a core whose
+/// instruction cache may be smaller.
+fn bench_mover() -> (dm::Mover, &'static [u8]) {
+    match std::env::var("BENCH_MOVER").as_deref() {
+        Ok("nc") => (dm::Mover::NC, tt_firmware_images::DM_NC.1),
+        _ => (dm::Mover::B, tt_firmware_images::DM_B.1),
+    }
+}
+
 /// The gate tile's mover, traced, with each channel's first MiB at [`BASE`]
 /// holding a known pattern.
 fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
@@ -100,8 +111,10 @@ fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
     let t = tensix_tile();
     let c = Conditions::measure(d, device_index(), t);
     c.print();
-    let m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
-    d.write32(&w, t, dm::TRACE, 1).unwrap();
+    let (mover, image) = bench_mover();
+    println!("MEASURE mover: {:?}", mover.core);
+    let m = DataMover::start_on(d, &w, t, &dram, mover, image).unwrap();
+    d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
     let mut one = One {
         d,
         w,
@@ -112,7 +125,7 @@ fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
     };
     f(&mut one);
     let One { d, w, m, .. } = one;
-    d.write32(&w, t, dm::TRACE, 0).unwrap();
+    d.write32(&w, t, m.mover().at(dm::TRACE), 0).unwrap();
     m.stop(d, &w).unwrap();
 }
 
@@ -135,6 +148,30 @@ fn entries_of(len: u32) -> u32 {
         .max(1)
 }
 
+/// `AGG_CAP`: the in-flight cap the benchmarks give every mover, to compare
+/// caps without a rebuild: unset, a mover's own `dm::TILE_IN_FLIGHT_CAP`; 0,
+/// `MAX_IN_FLIGHT`.
+fn env_cap() -> u32 {
+    std::env::var("AGG_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(dm::TILE_IN_FLIGHT_CAP)
+}
+
+/// `AGG_LEN`: the entry size of the card-wide lists (default 64 KiB, which
+/// is [`Shape::AGG`]), with [`MAX_REQUESTS`] 16 KiB packets' worth of
+/// entries, as there: each tile's share stays inside its MiB of a channel.
+fn agg_shape() -> Shape {
+    let len = std::env::var("AGG_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(AGG_LEN);
+    Shape {
+        entries: MAX_REQUESTS / len.div_ceil(16384),
+        len,
+    }
+}
+
 /// Which channel index and port list entry `i` uses.
 type Spread = Box<dyn Fn(u32) -> (usize, u32)>;
 
@@ -152,6 +189,9 @@ fn sweep(one: &mut One<'_>, kind: u32) {
     }
     let link = one.c.noc_link();
     let chan = one.c.gddr_channel();
+    let cap = env_cap();
+    one.m.set_in_flight_cap(one.d, &one.w, cap).unwrap();
+    println!("MEASURE sweep: in-flight cap {cap}");
     for len in SIZES {
         let count = entries_of(len);
         let bytes = (count * len) as f64;
@@ -279,6 +319,78 @@ fn mover_write_sweep() {
 /// The mover's fixed costs: a list of `WAIT`s (loop, decode, a NoC drain
 /// check), and the list itself (an empty-of-data one-entry list). Traced and
 /// untraced from the host, too: what tracing itself costs the numbers above.
+/// Would a mover image specialised to one direction be faster than the
+/// shared one? (checklist 9.15, B/NC specialisation.) One tile's mover runs
+/// the same reads and writes four ways: all reads, all writes, alternating
+/// one by one, and in blocks of 8 (a gather record's worth, then a scatter's,
+/// as a pipelined list runs them). With the split (`Session::
+/// set_scatter_mover`) each mover only ever runs one direction's code, so a
+/// shared image already keeps the other direction out of its instruction
+/// cache; what specialisation could add is the mixed lists' cost per entry
+/// over the pure lists' average -- the read and write paths evicting each
+/// other. `BENCH_MOVER=nc` runs NC's mover.
+#[test]
+#[ignore = "benchmark"]
+fn mover_mixed_directions() {
+    on_card(|d| {
+        one_tile(d, |one| {
+            let ch = one.dram.channels().next().unwrap().index();
+            let t = one.m.tile();
+            let src = pattern(L1_SPAN as usize, 5);
+            one.d.write(&one.w, t, L1 as u64, &src).unwrap();
+            for len in [64u32, 1024, 4096] {
+                const N: u32 = 128;
+                let read =
+                    |i: u32| entry(op::READ, ch, 0, BASE + (i * len) as u64, L1 + i * len, len);
+                let write = |i: u32| {
+                    entry(
+                        op::WRITE,
+                        ch,
+                        0,
+                        BASE + (32 << 20) + (i * len) as u64,
+                        L1 + (N + i) * len,
+                        len,
+                    )
+                };
+                let lists: [(&str, Vec<Entry>); 4] = [
+                    ("reads", (0..N).map(read).collect()),
+                    ("writes", (0..N).map(write).collect()),
+                    (
+                        "alternating",
+                        (0..N)
+                            .map(|i| if i % 2 == 0 { read(i) } else { write(i) })
+                            .collect(),
+                    ),
+                    (
+                        "blocks of 8",
+                        (0..N)
+                            .map(|i| if (i / 8) % 2 == 0 { read(i) } else { write(i) })
+                            .collect(),
+                    ),
+                ];
+                let mut per = Vec::new();
+                for (what, list) in &lists {
+                    let cycles = list_cycles(one.d, &one.w, &mut one.m, list);
+                    let e = cycles.map(|c| c / N as f64);
+                    report(
+                        &format!("mover {len:>5} B {what:<12} per entry"),
+                        "cycles",
+                        "device",
+                        e,
+                    );
+                    per.push(e.median);
+                }
+                let pure = (per[0] + per[1]) / 2.0;
+                println!(
+                    "MEASURE mixed {len:>5} B: alternating {:.3}x, blocks of 8 {:.3}x the pure lists' average ({pure:.0} cycles)",
+                    per[2] / pure,
+                    per[3] / pure
+                );
+            }
+        });
+    });
+}
+
 #[test]
 #[ignore = "benchmark"]
 fn mover_overhead() {
@@ -318,7 +430,9 @@ fn mover_overhead() {
                 .collect();
             let t = one.m.tile();
             for (label, on) in [("traced", 1), ("untraced", 0)] {
-                one.d.write32(&one.w, t, dm::TRACE, on).unwrap();
+                one.d
+                    .write32(&one.w, t, one.m.mover().at(dm::TRACE), on)
+                    .unwrap();
                 one.d
                     .configure_trace(&one.w, t, TRACE_BUFFER, TRACE_BUFFER_BYTES)
                     .unwrap();
@@ -339,7 +453,9 @@ fn mover_overhead() {
                     Stats::of_durations(v.into_iter().skip(1)),
                 );
             }
-            one.d.write32(&one.w, t, dm::TRACE, 1).unwrap();
+            one.d
+                .write32(&one.w, t, one.m.mover().at(dm::TRACE), 1)
+                .unwrap();
         });
     });
 }
@@ -354,6 +470,9 @@ struct Fleet {
     /// Each tile's counter less tile 0's, in cycles, and the uncertainty of it.
     offset: Vec<i64>,
     skew_bound: Vec<i64>,
+    /// Each tile's raw NoC #0 position (`NOC_NODE_ID`), for placements that
+    /// follow the physical grid rather than the translated numbering.
+    raw: Vec<(u8, u8)>,
 }
 
 fn fleet(d: &mut Dev<'static>) -> Fleet {
@@ -380,7 +499,17 @@ fn fleet(d: &mut Dev<'static>) -> Fleet {
         }
     }
     let (offset, skew_bound) = skew(d, &w, &movers, &c);
+    let raw = movers
+        .iter()
+        .map(|m| {
+            let v = d
+                .read32(&w, m.tile(), niu::NOC0_BASE + niu::NOC_NODE_ID)
+                .unwrap();
+            ((v & 0x3F) as u8, ((v >> 6) & 0x3F) as u8)
+        })
+        .collect();
     Fleet {
+        raw,
         w,
         w4,
         dram,
@@ -448,6 +577,82 @@ enum Mix {
     Half,
     /// Reads, every tile from channel 0 (through its three ports).
     OneChannel,
+    /// Writes, every tile to channel 0: whether one channel takes a channel's
+    /// worth of writes from many tiles, as it does of reads.
+    OneChannelWrite,
+    /// Reads, each tile rotating over the four channels in its half of the
+    /// chip: west of the DRAM column at raw X 9, channels 0-3 (raw X 0); east of
+    /// it, 4-7 (X 9). NoC #0 routes a read's data X first, eastward, so none of
+    /// it wraps the torus.
+    Column,
+    /// Reads, each tile from one channel of its half whose endpoint sits at or
+    /// just above it, through that endpoint ([`nearest`]): the data's Y leg is
+    /// as short as balance allows.
+    Nearest,
+    /// [`Mix::Nearest`]'s channels, but alternating each entry between the
+    /// two endpoints NoC #0 owns: whether one endpoint, not the channel or the
+    /// links, is what holds a channel back under many readers.
+    NearestBothPorts,
+}
+
+/// Raw NoC #0 Y of each channel's three endpoints, by `channel % 4` and port
+/// (tt-metal `soc_descriptors/blackhole_140_arch.yaml:11-21`, the `dram`
+/// table; raw X is 0 for channels 0-3 and 9 for 4-7). Ports are UMD's
+/// subchannels, which our translated endpoints follow
+/// (`DramChannel::endpoint`).
+const DRAM_RAW_Y: [[u8; 3]; 4] = [[0, 1, 11], [2, 10, 3], [9, 4, 8], [5, 7, 6]];
+/// The raw X of the DRAM column between the two halves of Tensix tiles.
+const DRAM_MID_X: u8 = 9;
+
+/// [`Mix::Nearest`]'s `(channel, port)` for each of the first `n` tiles. In
+/// each half the tiles, by raw row, are dealt in equal groups to the four
+/// channels by their endpoint rows, top down -- so no channel carries more
+/// than its share -- and each tile reads through the NoC #0 endpoint of its
+/// channel nearest above it: NoC #0 moves data down (`RoutingPaths.md`), so
+/// that is the shortest Y leg, wrapping at the bottom.
+fn nearest(f: &Fleet, n: usize) -> Vec<(u8, u8)> {
+    // The endpoints NoC #0 may use, by channel.
+    let owned = |c: u8| -> Vec<u8> {
+        let ch = f.dram.channel(c).unwrap();
+        (0..tt_isa::dram::PORTS)
+            .filter(|&p| ch.owns(Niu::Noc0, p))
+            .collect()
+    };
+    // Rows count down from a tile's own: a row at or above it is that far.
+    let gap = |tile_y: u8, row: u8| (tile_y as i32 - row as i32).rem_euclid(12) as u8;
+    let mut out = vec![(0u8, 0u8); n];
+    for half in [0u8, 4] {
+        let mut tiles: Vec<usize> = (0..n)
+            .filter(|&t| (f.raw[t].0 < DRAM_MID_X) == (half == 0))
+            .collect();
+        tiles.sort_by_key(|&t| (f.raw[t].1, f.raw[t].0));
+        // Channels top down by where their NoC #0 endpoints sit among the
+        // Tensix rows (2..=11), a row above 2 counting as below 11 -- so each
+        // band of tile rows gets the channel whose endpoints are in it.
+        let mut chans: Vec<u8> = (half..half + 4).collect();
+        chans.sort_by_key(|&c| {
+            owned(c)
+                .iter()
+                .map(|&p| {
+                    let row = DRAM_RAW_Y[(c % 4) as usize][p as usize];
+                    if row < 2 {
+                        row as u32 + 12
+                    } else {
+                        row as u32
+                    }
+                })
+                .sum::<u32>()
+        });
+        for (k, &t) in tiles.iter().enumerate() {
+            let ch = chans[k * 4 / tiles.len().max(1)];
+            let port = *owned(ch)
+                .iter()
+                .min_by_key(|&&p| gap(f.raw[t].1, DRAM_RAW_Y[(ch % 4) as usize][p as usize]))
+                .unwrap();
+            out[t] = (ch, port);
+        }
+    }
+    out
 }
 
 /// Entries per tile per run, of [`AGG_LEN`] each: 3.75 MiB a tile, in
@@ -490,17 +695,29 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
         0,
         0,
     ]];
+    let near = matches!(mix, Mix::Nearest | Mix::NearestBothPorts).then(|| nearest(fleet, n)[tile]);
+    if matches!(mix, Mix::Column | Mix::Nearest | Mix::NearestBothPorts) {
+        assert_eq!(nc, 8, "the placements assume all eight channels");
+    }
     for i in 0..entries {
         let (c, k) = match mix {
-            Mix::OneChannel => (0, i),
+            Mix::OneChannel | Mix::OneChannelWrite => (0, i),
+            Mix::Nearest | Mix::NearestBothPorts => (near.unwrap().0 as u32, i),
+            Mix::Column => {
+                let half = if fleet.raw[tile].0 < DRAM_MID_X { 0 } else { 4 };
+                (half + (i + tile as u32) % 4, i / 4)
+            }
             _ => ((i + tile as u32) % nc, i / nc),
         };
         let kind = match mix {
-            Mix::Write => op::WRITE,
+            Mix::Write | Mix::OneChannelWrite => op::WRITE,
             Mix::Half if i % 2 == 1 => op::WRITE,
             _ => op::READ,
         };
-        let per_tile = if mix == Mix::OneChannel {
+        let per_tile = if matches!(
+            mix,
+            Mix::OneChannel | Mix::OneChannelWrite | Mix::Nearest | Mix::NearestBothPorts
+        ) {
             (entries * len) as u64
         } else {
             1 << 20
@@ -509,7 +726,12 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
         list.push(entry(
             kind,
             chans[c as usize],
-            tile as u32 % 3,
+            match (mix, near) {
+                // NoC #0's two endpoints, 0 and 2, in turn.
+                (Mix::NearestBothPorts, _) => 2 * (i % 2),
+                (_, Some((_, p))) => p as u32,
+                _ => tile as u32 % 3,
+            },
             off,
             L1 + (i * len) % L1_SPAN,
             len,
@@ -550,6 +772,7 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     let bytes = shape.bytes();
     let mut rates = Vec::new();
     let (mut first, mut last) = (i64::MAX, i64::MIN);
+    let (mut last_release, mut first_end) = (i64::MIN, i64::MAX);
     for (i, m) in f.movers[..n].iter().enumerate() {
         let trace = d.read_trace(&f.w, m.tile(), TRACE_BUFFER).unwrap();
         // The barrier is the list's first entry: its end is the release.
@@ -566,6 +789,8 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
         rates.push(f.c.rate(bytes, (end - released) as f64));
         first = first.min(released as i64 - f.offset[i]);
         last = last.max(end as i64 - f.offset[i]);
+        last_release = last_release.max(released as i64 - f.offset[i]);
+        first_end = first_end.min(end as i64 - f.offset[i]);
     }
     let together = f.c.rate(bytes * n as f64, (last - first) as f64);
     let stalls = throttle(d, f) - stalls_before;
@@ -574,6 +799,8 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
         together,
         host_us,
         stalls,
+        release_spread: (last_release - first) as f64,
+        end_spread: (last - first_end) as f64,
     }
 }
 
@@ -585,6 +812,11 @@ struct AggRun {
     host_us: f64,
     /// Requests, over every tile, that waited under the in-flight cap.
     stalls: u64,
+    /// Cycles from the first tile's barrier release to the last's, and from
+    /// the first tile's list end to the last's: how far "together" is from
+    /// every tile moving at once.
+    release_spread: f64,
+    end_spread: f64,
 }
 
 /// [`agg_run`] after a warm-up, [`REPS`] times, reported as `label`: the
@@ -629,6 +861,18 @@ fn measure(
         shape.bytes(),
         per,
         Some(&link),
+    );
+    report(
+        &format!("{label}: barrier releases spread over"),
+        "us",
+        "device",
+        Stats::of(runs.iter().map(|r| f.c.cycles_to_us(r.release_spread))),
+    );
+    report(
+        &format!("{label}: list ends spread over"),
+        "us",
+        "device",
+        Stats::of(runs.iter().map(|r| f.c.cycles_to_us(r.end_spread))),
     );
     report(
         &format!("{label}: requests that waited under the in-flight cap, per run"),
@@ -761,6 +1005,200 @@ fn gddr_aggregate() {
     });
 }
 
+/// [`gddr_aggregate`]'s reads placed by where each tile sits: rotating over
+/// every channel (as there), over its half's four ([`Mix::Column`]), or from
+/// one channel just above it ([`Mix::Nearest`]). Whether the card-wide read
+/// plateau (~400-430 GB/s from 16 tiles up, against 64 GB/s per channel that
+/// one channel holds under 120 readers) is the crossing traffic's links.
+/// `AGG_TILES` picks the tile counts, as there.
+#[test]
+#[ignore = "benchmark"]
+fn gddr_aggregate_affinity() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let shape = agg_shape();
+        println!("MEASURE entries: {} x {} B", shape.entries, shape.len);
+        let have = f.movers.len();
+        let card = f.c.gddr_card();
+        let counts: Vec<usize> = match std::env::var("AGG_TILES") {
+            Ok(s) => s
+                .split(',')
+                .map(|n| n.trim().parse::<usize>().unwrap().min(have))
+                .collect(),
+            Err(_) => vec![8, 16, 32, 64, have],
+        };
+        let mut load = [0usize; 8];
+        for &(ch, _) in &nearest(&f, have) {
+            load[ch as usize] += 1;
+        }
+        let west = f.raw.iter().filter(|r| r.0 < DRAM_MID_X).count();
+        let near = nearest(&f, have);
+        for ch in 0..8u8 {
+            let rows: Vec<String> = (0..have)
+                .filter(|&t| near[t].0 == ch)
+                .map(|t| {
+                    format!(
+                        "{}->{}",
+                        f.raw[t].1,
+                        DRAM_RAW_Y[(ch % 4) as usize][near[t].1 as usize]
+                    )
+                })
+                .collect();
+            println!(
+                "MEASURE affinity: channel {ch}: tile row->endpoint row {}",
+                rows.join(" ")
+            );
+        }
+        println!(
+            "MEASURE affinity: {have} tiles, {west} west of X {DRAM_MID_X}; nearest's tiles per channel {load:?}"
+        );
+        let mixes: Vec<Mix> = match std::env::var("AGG_MIXES") {
+            Ok(s) if s == "nearest" => vec![Mix::Nearest, Mix::NearestBothPorts],
+            Ok(s) if s == "read" => vec![Mix::Read],
+            _ => vec![Mix::Read, Mix::Column, Mix::Nearest, Mix::NearestBothPorts],
+        };
+        // `AGG_CAP` (`env_cap`): whether fewer in flight per tile evens out
+        // the NoC's service between tiles.
+        let cap = env_cap();
+        for m in &f.movers {
+            m.set_in_flight_cap(d, &f.w, cap).unwrap();
+        }
+        println!("MEASURE affinity: in-flight cap {cap}");
+        for mix in mixes {
+            for &n in &counts {
+                measure(
+                    d,
+                    &mut f,
+                    n,
+                    mix,
+                    shape,
+                    card.as_ref(),
+                    &format!("gddr {mix:?} {n:>3} tiles"),
+                );
+            }
+            // Each checked tile's last entries, alone, against a pattern in
+            // the GDDR they name: four, or as many as hold distinct slots of
+            // the L1 ring (two at 128 KiB).
+            let keep = 4.min((L1_SPAN / shape.len) as usize).max(1);
+            for t in [0usize, have - 1] {
+                let list = agg_list(&f, t, have, mix, shape);
+                let last = &list[list.len() - keep..];
+                let mut want = Vec::new();
+                for (k, e) in last.iter().enumerate() {
+                    let ch = f.dram.channel(e[1] as u8).unwrap();
+                    let p = pattern(shape.len as usize, (t * 16 + k) as u32 + 7);
+                    d.dram_write(&f.w4, ch.range(e[3] as u64, shape.len as u64).unwrap(), &p)
+                        .unwrap();
+                    want.push(p);
+                }
+                f.movers[t].run_list(d, &f.w, last).unwrap();
+                let mut back = vec![0u8; L1_SPAN as usize];
+                d.l1_read(&f.w, f.movers[t].tile(), L1 as u64, &mut back)
+                    .unwrap();
+                for (k, e) in last.iter().enumerate() {
+                    let l1 = (e[4] - L1) as usize;
+                    assert!(
+                        back[l1..l1 + shape.len as usize] == want[k][..],
+                        "{mix:?}: tile {t}'s read entry {k} did not land"
+                    );
+                }
+            }
+        }
+        let Fleet { w, movers, .. } = f;
+        for m in movers {
+            let t = m.tile();
+            m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
+            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+    });
+}
+
+/// [`gddr_aggregate`]'s writes, and its reads and writes mixed, with the
+/// writes on each NIU (`tt_isa::dm::WRITE_NOC`; reads are always NoC #0's).
+/// Each GDDR endpoint is one NoC's (`DramChannel::owns`), so the mixes with
+/// writes on NoC #1 put both NoCs on the card at once without sharing an
+/// endpoint -- the SYS-1419 hang needs one endpoint fed by both.
+/// `AGG_TILES` picks the tile counts, as there.
+#[test]
+#[ignore = "benchmark"]
+fn gddr_aggregate_nocs() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let shape = agg_shape();
+        println!("MEASURE entries: {} x {} B", shape.entries, shape.len);
+        let have = f.movers.len();
+        let card = f.c.gddr_card();
+        let counts: Vec<usize> = match std::env::var("AGG_TILES") {
+            Ok(s) => s
+                .split(',')
+                .map(|n| n.trim().parse::<usize>().unwrap().min(have))
+                .collect(),
+            Err(_) => vec![1, 4, 16, 64, have],
+        };
+        let src = pattern(L1_SPAN as usize, 5);
+        // `AGG_CAP`, as in `gddr_aggregate_affinity`.
+        let cap = env_cap();
+        for m in &f.movers {
+            d.write(&f.w, m.tile(), L1 as u64, &src).unwrap();
+            m.set_in_flight_cap(d, &f.w, cap).unwrap();
+        }
+        println!("MEASURE nocs: in-flight cap {cap}");
+        for noc in [WriteNoc::Noc0, WriteNoc::Noc1, WriteNoc::Alternate] {
+            for m in &f.movers {
+                m.set_write_noc(d, &f.w, noc).unwrap();
+            }
+            let mixes: Vec<Mix> = match std::env::var("AGG_MIXES") {
+                Ok(s) if s == "onechannel" => vec![Mix::OneChannelWrite],
+                _ => vec![Mix::Write, Mix::Half, Mix::OneChannelWrite],
+            };
+            for mix in mixes {
+                let peak = if mix == Mix::OneChannelWrite {
+                    f.c.gddr_channel()
+                } else {
+                    card.clone()
+                };
+                for &n in &counts {
+                    measure(
+                        d,
+                        &mut f,
+                        n,
+                        mix,
+                        shape,
+                        peak.as_ref(),
+                        &format!("gddr {mix:?} writes on {noc:?} {n:>3} tiles"),
+                    );
+                }
+            }
+            // A write through `noc` lands: tile 0's first write entry, run
+            // alone from a known L1 (the mixes' reads overwrote it).
+            let list = agg_list(&f, 0, have, Mix::Write, shape);
+            d.write(&f.w, f.movers[0].tile(), L1 as u64, &src).unwrap();
+            f.movers[0].run_list(d, &f.w, &list[1..2]).unwrap();
+            let ch = f.dram.channel(list[1][1] as u8).unwrap();
+            let mut back = vec![0u8; shape.len as usize];
+            d.dram_read(
+                &f.w4,
+                ch.range(list[1][3] as u64, shape.len as u64).unwrap(),
+                &mut back,
+            )
+            .unwrap();
+            assert!(
+                back[..] == src[..shape.len as usize],
+                "{noc:?}: tile 0's write did not land"
+            );
+        }
+        let Fleet { w, movers, .. } = f;
+        for m in movers {
+            let t = m.tile();
+            m.set_write_noc(d, &w, Niu::Noc0).unwrap();
+            m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
+            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+    });
+}
+
 /// More than the NIU's 8-bit counter holds, under the worst contention:
 /// every tile reading 300 x 16 KiB -- 300 requests a list -- from one
 /// channel. The in-flight cap (`tt_isa::noc::niu::InFlight`) must engage,
@@ -838,6 +1276,304 @@ fn gddr_in_flight() {
         let Fleet { w, movers, .. } = f;
         for m in movers {
             let t = m.tile();
+            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+    });
+}
+
+/// How a tile copies GDDR -> L1 -> GDDR, block by block ([`copy_lists`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum CopyScheme {
+    /// B alone: read a block, wait, write it, wait.
+    Sequential,
+    /// B alone, software-pipelined: block k+1's read goes out with block
+    /// k's write, then one wait for both.
+    Pipelined,
+    /// B reads, NC writes: B signals each block read; NC waits for it, writes
+    /// it and signals; B waits for NC before refilling a buffer.
+    Split,
+}
+
+/// The size of a block: double-buffered in L1.
+const COPY_BLOCK: u32 = 65536;
+
+/// Blocks per tile per run: 1 MiB each way, or half that with entries under
+/// 16 KiB, so a list stays under `dm::LIST_MAX` entries and a tile's two
+/// movers under the trace buffer's 1024 events.
+fn copy_blocks() -> u32 {
+    if copy_entry() < 16384 {
+        8
+    } else {
+        16
+    }
+}
+const COPY_DST: u64 = BASE + (256 << 20);
+
+/// `COPY_ENTRY`: the entry size a block is moved in (default the whole
+/// block): small entries make each mover's per-entry cost the limit.
+fn copy_entry() -> u32 {
+    std::env::var("COPY_ENTRY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(COPY_BLOCK)
+}
+
+/// Tile `t`'s lists for one run: B's, and NC's (empty but for
+/// [`CopyScheme::Split`]). Block `k` comes from channel `(k + t) % 8` at the
+/// tile's MiB there, through L1 buffer `k % 2`, and goes to the same place
+/// above [`COPY_DST`]. `base_b` and `base_nc` are the movers' progress words
+/// before the run, which the waits count from.
+fn copy_lists(
+    f: &Fleet,
+    t: usize,
+    n: usize,
+    copy: CopyScheme,
+    base_b: u32,
+    base_nc: u32,
+) -> (Vec<Entry>, Vec<Entry>) {
+    let chans: Vec<u8> = f.dram.channels().map(|c| c.index()).collect();
+    let nc_ = chans.len() as u32;
+    let coord = f.movers[0].tile();
+    let piece = copy_entry();
+    let block = |k: u32, kind: u32| -> Vec<Entry> {
+        let ch = chans[((k + t as u32) % nc_) as usize];
+        let off = t as u64 * (1 << 20) + ((k / nc_) * COPY_BLOCK) as u64;
+        let dram = if kind == op::READ { BASE } else { COPY_DST } + off;
+        (0..COPY_BLOCK / piece)
+            .map(|p| {
+                entry(
+                    kind,
+                    ch,
+                    0,
+                    dram + (p * piece) as u64,
+                    L1 + (k % 2) * COPY_BLOCK + p * piece,
+                    piece,
+                )
+            })
+            .collect()
+    };
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    let signal = [op::SIGNAL, 0, 0, 0, 0, 0, 0, 0];
+    let wait_peer = |peer: u32, target: u32| [op::WAIT_PEER, peer, target, 0, 0, 0, 0, 0];
+    let mut b = vec![[
+        op::BARRIER,
+        n as u32,
+        coord.x() as u32,
+        coord.y() as u32,
+        0,
+        0,
+        0,
+        0,
+    ]];
+    let mut nc = Vec::new();
+    match copy {
+        CopyScheme::Sequential => {
+            for k in 0..copy_blocks() {
+                b.extend(block(k, op::READ));
+                b.push(wait);
+                b.extend(block(k, op::WRITE));
+                b.push(wait);
+            }
+        }
+        CopyScheme::Pipelined => {
+            b.extend(block(0, op::READ));
+            b.push(wait);
+            for k in 0..copy_blocks() {
+                if k + 1 < copy_blocks() {
+                    b.extend(block(k + 1, op::READ));
+                }
+                b.extend(block(k, op::WRITE));
+                b.push(wait);
+            }
+        }
+        CopyScheme::Split => {
+            for k in 0..copy_blocks() {
+                if k >= 2 {
+                    // Buffer k % 2 is free once NC has written block k - 2.
+                    b.push(wait_peer(1, base_nc.wrapping_add(k - 1)));
+                }
+                b.extend(block(k, op::READ));
+                b.push(signal);
+                nc.push(wait_peer(0, base_b.wrapping_add(k + 1)));
+                nc.extend(block(k, op::WRITE));
+                nc.push(signal);
+            }
+        }
+    }
+    (b, nc)
+}
+
+/// [`copy_pipeline`]'s run of `n` tiles: bytes copied over the earliest
+/// barrier release to the latest list end of either mover, on tile 0's clock.
+fn copy_run(
+    d: &mut Dev<'_>,
+    f: &mut Fleet,
+    ncs: &mut [DataMover<Noc0>],
+    n: usize,
+    copy: CopyScheme,
+) -> f64 {
+    let coord = f.movers[0].tile();
+    d.write32(&f.w, coord, dm::BARRIER_COUNTER, 0).unwrap();
+    let mut lists = Vec::new();
+    for t in 0..n {
+        let tile = f.movers[t].tile();
+        let base_b = d.read32(&f.w, tile, dm::Mover::B.at(dm::PROGRESS)).unwrap();
+        let base_nc = d
+            .read32(&f.w, tile, dm::Mover::NC.at(dm::PROGRESS))
+            .unwrap();
+        lists.push(copy_lists(f, t, n, copy, base_b, base_nc));
+        d.configure_trace(&f.w, tile, TRACE_BUFFER, TRACE_BUFFER_BYTES)
+            .unwrap();
+    }
+    for (t, (b, nc)) in lists.iter().enumerate() {
+        // NC's first, so it is waiting when B's first signal comes.
+        if !nc.is_empty() {
+            ncs[t].enqueue(d, &f.w, nc).unwrap();
+        }
+        f.movers[t].enqueue(d, &f.w, b).unwrap();
+    }
+    for t in 0..n {
+        f.movers[t].drain(d, &f.w).unwrap();
+        if !lists[t].1.is_empty() {
+            ncs[t].drain(d, &f.w).unwrap();
+        }
+    }
+    let (mut first, mut last) = (i64::MAX, i64::MIN);
+    for t in 0..n {
+        let trace = d
+            .read_trace(&f.w, f.movers[t].tile(), TRACE_BUFFER)
+            .unwrap();
+        // B's barrier is the first entry to end on the tile: NC's first
+        // entry waits on B's first signal, after it.
+        let released = trace
+            .iter()
+            .find(|e| ev::split(e.token) == (ev::MOVER, ev::ENTRY_END))
+            .expect("no barrier end")
+            .cycles;
+        let end = trace
+            .iter()
+            .filter(|e| ev::split(e.token) == (ev::MOVER, ev::LIST_END))
+            .map(|e| e.cycles)
+            .max()
+            .expect("no list end");
+        first = first.min(released as i64 - f.offset[t]);
+        last = last.max(end as i64 - f.offset[t]);
+    }
+    let bytes = (copy_blocks() * COPY_BLOCK) as f64 * n as f64;
+    f.c.rate(bytes, (last - first) as f64)
+}
+
+/// GDDR -> L1 -> GDDR copies, double-buffered, B alone against B reading
+/// while NC writes (`CopyScheme`): what a second mover per tile buys once each
+/// tile's reads and writes can overlap. Writes go out on NoC #1 in every
+/// scheme, so only the scheduling differs. `AGG_TILES` picks the tile counts.
+#[test]
+#[ignore = "benchmark"]
+fn copy_pipeline() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let have = f.movers.len();
+        let mut ncs: Vec<DataMover<Noc0>> = f
+            .movers
+            .iter()
+            .map(|m| {
+                DataMover::start_on(
+                    d,
+                    &f.w,
+                    m.tile(),
+                    &f.dram,
+                    dm::Mover::NC,
+                    tt_firmware_images::DM_NC.1,
+                )
+                .unwrap()
+            })
+            .collect();
+        for (m, nc) in f.movers.iter().zip(&ncs) {
+            m.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
+            nc.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
+            d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 1)
+                .unwrap();
+        }
+        let counts: Vec<usize> = match std::env::var("AGG_TILES") {
+            Ok(s) => s
+                .split(',')
+                .map(|n| n.trim().parse::<usize>().unwrap().min(have))
+                .collect(),
+            Err(_) => vec![1, 4, 16, 64, have],
+        };
+        let card = f.c.gddr_card();
+        // Tile 0's and the last tile that runs, for the check.
+        let check = [0usize, counts.iter().copied().max().unwrap_or(1) - 1];
+        for &t in &check {
+            for ch in f.dram.channels() {
+                let data = pattern(1 << 20, t as u32 * 16 + ch.index() as u32 + 1);
+                d.dram_write(
+                    &f.w4,
+                    ch.range(BASE + t as u64 * (1 << 20), 1 << 20).unwrap(),
+                    &data,
+                )
+                .unwrap();
+            }
+        }
+        for copy in [
+            CopyScheme::Sequential,
+            CopyScheme::Pipelined,
+            CopyScheme::Split,
+        ] {
+            for &n in &counts {
+                copy_run(d, &mut f, &mut ncs, n, copy);
+                let rates: Vec<f64> = (0..REPS)
+                    .map(|_| copy_run(d, &mut f, &mut ncs, n, copy))
+                    .collect();
+                let bytes = (copy_blocks() * COPY_BLOCK) as f64 * n as f64;
+                report_rate(
+                    &format!("copy {copy:?} {n:>3} tiles"),
+                    "device",
+                    bytes,
+                    Stats::of(rates.iter().map(|r| bytes / r * 1e6)),
+                    card.as_ref(),
+                );
+            }
+            // Every byte of the checked tiles' copies landed: their
+            // destinations against their sources.
+            for &t in &check {
+                for ch in f.dram.channels() {
+                    let want = pattern(1 << 20, t as u32 * 16 + ch.index() as u32 + 1);
+                    let used =
+                        (copy_blocks() / f.dram.channel_count() as u32 * COPY_BLOCK) as usize;
+                    let mut back = vec![0u8; used];
+                    d.dram_read(
+                        &f.w4,
+                        ch.range(COPY_DST + t as u64 * (1 << 20), used as u64)
+                            .unwrap(),
+                        &mut back,
+                    )
+                    .unwrap();
+                    assert!(
+                        back[..] == want[..used],
+                        "{copy:?}: tile {t}'s copy in ch {} did not land",
+                        ch.index()
+                    );
+                    d.dram_write(
+                        &f.w4,
+                        ch.range(COPY_DST + t as u64 * (1 << 20), used as u64)
+                            .unwrap(),
+                        &vec![0u8; used],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for nc in ncs {
+            d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 0)
+                .unwrap();
+            nc.stop(d, &f.w).unwrap();
+        }
+        let Fleet { w, movers, .. } = f;
+        for m in movers {
+            let t = m.tile();
+            m.set_write_noc(d, &w, Niu::Noc0).unwrap();
             d.write32(&w, t, dm::TRACE, 0).unwrap();
             m.stop(d, &w).unwrap();
         }

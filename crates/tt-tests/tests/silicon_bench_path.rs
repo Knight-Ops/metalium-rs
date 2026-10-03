@@ -193,6 +193,14 @@ fn one_unit(card: u16) -> (Session<tt_kmd::Kmd>, Conditions) {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+    // `PIPELINE=1`: GDDR matmuls overlap their moves with their kernels
+    // (`Session::set_pipeline`, checklist 9.15).
+    let pipeline = std::env::var("PIPELINE").is_ok_and(|v| v == "1");
+    s.set_pipeline(pipeline);
+    // A pipelined profile is the mover's alone: with the mover and the roles
+    // storing to the timestamper at once, card 0's streams lost events.
+    s.set_profile_roles(!pipeline);
+    println!("MEASURE pipeline: {pipeline}");
     let t = s.tile();
     let c = Conditions::measure(s.device(), card, t);
     c.print();
@@ -470,5 +478,609 @@ fn queue_steady_state() {
         }
     }) {
         panic!("{e}");
+    }
+}
+
+/// A pipeline sweep's arm: pipelining off and on, or with `SWEEP_NC` set,
+/// pipelined with every move on B ("off") and with the scatters on NC ("on",
+/// `Session::set_scatter_mover`).
+fn sweep_arm(s: &mut Session<tt_kmd::Kmd>, on: bool) {
+    if std::env::var_os("SWEEP_NC").is_some() {
+        s.set_pipeline(true);
+        s.set_scatter_mover(on.then_some(tt_firmware_images::DM_NC.1));
+    } else {
+        s.set_pipeline(on);
+    }
+}
+
+/// Whether pipelined matmuls (`Session::set_pipeline`) are ever slower:
+/// shapes from MNIST's up to 1024s, on 1, 8 and 32 tiles, each with
+/// pipelining off and on, device time from the mover's events alone in both
+/// (the same measurement either way). A pipelined block fits half the arena,
+/// so an op may gather the same operand tiles more often; this is where that
+/// would show. `SWEEP_TILES` picks the tile counts.
+#[test]
+#[ignore = "benchmark"]
+fn matmul_pipeline_sweep() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    let shapes: [[usize; 3]; 9] = [
+        [64, 784, 128],
+        [64, 128, 10],
+        [128, 128, 128],
+        [256, 256, 256],
+        [256, 1024, 256],
+        [512, 512, 512],
+        [1024, 256, 1024],
+        [64, 2048, 512],
+        [1024, 1024, 1024],
+    ];
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.set_profile_roles(false);
+            let t = s.tile();
+            let c = Conditions::measure(s.device(), card, t);
+            let f = |n: usize, seed: u32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) % 17) as f32 / 8.0
+                            - 1.0
+                    })
+                    .collect()
+            };
+            for [m, k, n] in shapes {
+                let a = s.upload(&f(m * k, 1), m, k).unwrap();
+                let b = s.upload(&f(k * n, 2), k, n).unwrap();
+                let mut median = [0f64; 2];
+                let mut overlapped = 0;
+                let mut bits: [Vec<f32>; 2] = Default::default();
+                for (on, slot) in [(false, 0usize), (true, 1)] {
+                    sweep_arm(&mut s, on);
+                    let run = |s: &mut Session<tt_kmd::Kmd>| {
+                        let o = s
+                            .matmul_dram(
+                                &a,
+                                false,
+                                &b,
+                                false,
+                                SrcRoute::Tf32FromFp32,
+                                Fidelity::HiFi4,
+                                BUDGET,
+                            )
+                            .unwrap_or_else(|e| panic!("{e}"));
+                        s.sync().unwrap();
+                        o
+                    };
+                    let lists_before: u64 = s.lists_per_tile().iter().sum();
+                    let drains_before = s.drains();
+                    let o = run(&mut s);
+                    let lists = s.lists_per_tile().iter().sum::<u64>() - lists_before;
+                    let drains = s.drains() - drains_before;
+                    println!(
+                        "MEASURE sweep {m}x{k}x{n} on {tiles} tiles, pipeline {on}: {lists} lists, {drains} drains"
+                    );
+                    bits[slot] = s.download(&o).unwrap();
+                    s.free(o).unwrap();
+                    let before = s.pipelined_blocks();
+                    // Device time from the profile; for an op whose events
+                    // overflow the timestamper's buffer, the host's time from
+                    // the op to its sync instead (marked `host`).
+                    let mut device = Vec::new();
+                    let mut host = Vec::new();
+                    let mut overflowed = false;
+                    // Past ~2^29 multiply-adds a profile's events overflow
+                    // the buffer (and the op's sync reports it): time those
+                    // from the host.
+                    // With NC scattering, B's timestamper events come out
+                    // garbled (an entry's end repeated): host time instead.
+                    let profiled = m * k * n < 1 << 29 && std::env::var_os("SWEEP_NC").is_none();
+                    overflowed |= !profiled;
+                    for _ in 0..REPS {
+                        if profiled {
+                            s.profile_start().unwrap();
+                        }
+                        let h0 = Instant::now();
+                        let o = run(&mut s);
+                        host.push(h0.elapsed().as_secs_f64() * 1e6);
+                        if profiled {
+                            match s.profile_stop() {
+                                Ok(p) => device.push(split(&p).device),
+                                Err(_) => overflowed = true,
+                            }
+                        }
+                        s.free(o).unwrap();
+                    }
+                    if on {
+                        overlapped = (s.pipelined_blocks() - before) / REPS as u64;
+                    }
+                    let (st, timed) = if overflowed {
+                        (Stats::of(host.iter().copied()), "host")
+                    } else {
+                        (
+                            Stats::of(device.iter().copied()).map(|x| c.cycles_to_us(x)),
+                            "device",
+                        )
+                    };
+                    report(
+                        &format!(
+                            "matmul {m}x{k}x{n} on {tiles} tiles, pipeline {}",
+                            if on { "on " } else { "off" }
+                        ),
+                        "us",
+                        timed,
+                        st,
+                    );
+                    median[slot] = st.median;
+                }
+                assert!(
+                    bits[0]
+                        .iter()
+                        .zip(&bits[1])
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{m}x{k}x{n} on {tiles} tiles: pipelining changed the bits"
+                );
+                println!(
+                    "MEASURE sweep {m}x{k}x{n} on {tiles} tiles: on/off {:.3} ({overlapped} blocks overlapped per op)",
+                    median[1] / median[0]
+                );
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}
+
+/// Whether pipelined element-wise ops and reductions are ever slower: an
+/// add, an `exp`, a sum over columns and a max over rows, from MNIST's sizes
+/// up to 2048², on 1, 8 and 32 tiles (`SWEEP_TILES`), each with pipelining off
+/// and on, device time from the mover's events alone in both. Prints the
+/// tiles a pipelined run held, the number `tensor::MIN_PIPELINED_RUN` is set
+/// from.
+#[test]
+#[ignore = "benchmark"]
+fn sfpu_pipeline_sweep() {
+    use tt_kernels::kind;
+    use tt_kernels::sfpu::ops::kind_sfpu;
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    use tt_kernels::tensor::{DramTensor, Eltwise};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    let shapes: [[usize; 2]; 6] = [
+        [64, 784],
+        [256, 256],
+        [512, 512],
+        [1024, 1024],
+        [2048, 1024],
+        [2048, 2048],
+    ];
+    type Op<T> = fn(&mut Session<T>, &DramTensor, &DramTensor) -> DramTensor;
+    let ops: [(&str, Op<tt_kmd::Kmd>); 4] = [
+        ("add", |s, a, b| {
+            s.eltwise(
+                Eltwise {
+                    kind: kind::ADD,
+                    scalar: 0.0,
+                    scalar2: 0.0,
+                },
+                a,
+                Some(b),
+            )
+            .unwrap()
+        }),
+        ("exp", |s, a, _| {
+            s.eltwise(
+                Eltwise {
+                    kind: kind_sfpu::EXP,
+                    scalar: 0.0,
+                    scalar2: 0.0,
+                },
+                a,
+                None,
+            )
+            .unwrap()
+        }),
+        ("sum over cols", |s, a, _| {
+            s.reduce(a, ReduceOp::Sum, Axis::Cols).unwrap()
+        }),
+        ("max over rows", |s, a, _| {
+            s.reduce(a, ReduceOp::Max, Axis::Rows).unwrap()
+        }),
+    ];
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.set_profile_roles(false);
+            let t = s.tile();
+            let c = Conditions::measure(s.device(), card, t);
+            let f = |n: usize, seed: u32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) % 17) as f32 / 8.0
+                            - 1.0
+                    })
+                    .collect()
+            };
+            for [r, cols] in shapes {
+                let a = s.upload(&f(r * cols, 1), r, cols).unwrap();
+                let b = s.upload(&f(r * cols, 2), r, cols).unwrap();
+                for (name, op) in ops {
+                    let mut median = [0f64; 2];
+                    let mut host_median = [0f64; 2];
+                    let mut bits: [Vec<f32>; 2] = Default::default();
+                    let mut overlapped = 0;
+                    for (on, slot) in [(false, 0usize), (true, 1)] {
+                        sweep_arm(&mut s, on);
+                        let lists_before: u64 = s.lists_per_tile().iter().sum();
+                        let drains_before = s.drains();
+                        let t0 = Instant::now();
+                        let o = op(&mut s, &a, &b);
+                        let t1 = Instant::now();
+                        s.sync().unwrap();
+                        println!(
+                            "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles, pipeline {on}: {} lists, {} drains, call {:?}, sync {:?}",
+                            s.lists_per_tile().iter().sum::<u64>() - lists_before,
+                            s.drains() - drains_before,
+                            t1 - t0,
+                            t1.elapsed()
+                        );
+                        bits[slot] = s.download(&o).unwrap();
+                        s.free(o).unwrap();
+                        let before = s.pipelined_blocks();
+                        let cache = |s: &Session<tt_kmd::Kmd>| {
+                            s.program_cache_stats().iter().fold([0u64; 3], |a, c| {
+                                [a[0] + c.misses, a[1] + c.bytes_uploaded, a[2] + c.bypassed]
+                            })
+                        };
+                        let cache_before = cache(&s);
+                        // Past 2048 tiles a profile's events overflow the
+                        // timestamper's buffer: time those from the host.
+                        let profiled =
+                            r * cols <= 2048 * 1024 && std::env::var_os("SWEEP_NC").is_none();
+                        let (mut device, mut host) = (Vec::new(), Vec::new());
+                        let mut overflowed = !profiled;
+                        for _ in 0..REPS {
+                            if profiled {
+                                s.profile_start().unwrap();
+                            }
+                            let h0 = Instant::now();
+                            let o = op(&mut s, &a, &b);
+                            s.sync().unwrap();
+                            host.push(h0.elapsed().as_secs_f64() * 1e6);
+                            if profiled {
+                                match s.profile_stop() {
+                                    Ok(p) => device.push(split(&p).device),
+                                    Err(_) => overflowed = true,
+                                }
+                            }
+                            s.free(o).unwrap();
+                        }
+                        if on {
+                            overlapped = (s.pipelined_blocks() - before) / REPS as u64;
+                        }
+                        // The host's time unprofiled: a profile syncs and
+                        // drains the trace inside every op's call.
+                        let mut plain_host = Vec::new();
+                        for _ in 0..REPS {
+                            let h0 = Instant::now();
+                            let o = op(&mut s, &a, &b);
+                            s.sync().unwrap();
+                            plain_host.push(h0.elapsed().as_secs_f64() * 1e6);
+                            s.free(o).unwrap();
+                        }
+                        host = plain_host;
+                        let cache_after = cache(&s);
+                        println!(
+                            "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles, pipeline {on}: per op {} program misses, {} B uploaded, {} bypassed",
+                            (cache_after[0] - cache_before[0]) / REPS as u64,
+                            (cache_after[1] - cache_before[1]) / REPS as u64,
+                            (cache_after[2] - cache_before[2]) / REPS as u64,
+                        );
+                        let (st, timed) = if overflowed {
+                            (Stats::of(host.iter().copied()), "host")
+                        } else {
+                            (
+                                Stats::of(device.iter().copied()).map(|x| c.cycles_to_us(x)),
+                                "device",
+                            )
+                        };
+                        report(
+                            &format!(
+                                "{name} {r}x{cols} on {tiles} tiles, pipeline {}",
+                                if on { "on " } else { "off" }
+                            ),
+                            "us",
+                            timed,
+                            st,
+                        );
+                        median[slot] = st.median;
+                        host_median[slot] = Stats::of(host.iter().copied()).median;
+                    }
+                    assert!(
+                        bits[0]
+                            .iter()
+                            .zip(&bits[1])
+                            .all(|(p, q)| p.to_bits() == q.to_bits()),
+                        "{name} {r}x{cols} on {tiles} tiles: pipelined bits differ"
+                    );
+                    println!(
+                        "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles: on/off {:.3}, host {:.3} ({overlapped} runs overlapped)",
+                        median[1] / median[0],
+                        host_median[1] / host_median[0],
+                    );
+                }
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}
+
+/// Where the host's time goes queueing an op (checklist 9.17): an add of
+/// MNIST's size and of 512², and a 256³ matmul, 50 of each queued back to
+/// back on 1, 8 and 32 tiles (`SWEEP_TILES`), with `Session::host_times`'s
+/// stages, PCIe traffic and TLB retargets per op, and the call's wall time.
+#[test]
+#[ignore = "benchmark"]
+fn host_time_per_op() {
+    use tt_kernels::kind;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::tensor::Eltwise;
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    const OPS: usize = 50;
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            let add = Eltwise {
+                kind: kind::ADD,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            for (name, r, c) in [("add", 64, 784), ("add", 512, 512), ("matmul", 256, 256)] {
+                let a = s.upload(&vec![0.5; r * c], r, c).unwrap();
+                let b = s.upload(&vec![0.25; r * c], r, c).unwrap();
+                let op = |s: &mut Session<tt_kmd::Kmd>| {
+                    if name == "add" {
+                        s.eltwise(add, &a, Some(&b)).unwrap()
+                    } else {
+                        s.matmul_dram(
+                            &a,
+                            false,
+                            &b,
+                            false,
+                            SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            BUDGET,
+                        )
+                        .unwrap()
+                    }
+                };
+                // Warm: programs resident, movers started.
+                for _ in 0..3 {
+                    let o = op(&mut s);
+                    s.sync().unwrap();
+                    s.free(o).unwrap();
+                }
+                s.reset_host_times();
+                let t0 = Instant::now();
+                let outs: Vec<_> = (0..OPS).map(|_| op(&mut s)).collect();
+                let calls = t0.elapsed();
+                s.sync().unwrap();
+                let total = t0.elapsed();
+                for o in outs {
+                    s.free(o).unwrap();
+                }
+                let h = s.host_times().clone();
+                let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / OPS as f64;
+                println!(
+                    "MEASURE host {name} {r}x{c} on {tiles} tiles: call {:.1} us/op, with sync {:.1} us/op",
+                    per(calls),
+                    per(total)
+                );
+                for (stage, t) in h.stages.iter() {
+                    if t.count == 0 {
+                        continue;
+                    }
+                    println!(
+                        "MEASURE host {name} {r}x{c} on {tiles} tiles:   {:<10} {:>7.1} us/op  x{:<5.1} reads {:>5.1} writes {:>6.1} retargets {:>5.1} /op",
+                        format!("{stage:?}"),
+                        per(t.time),
+                        t.count as f64 / OPS as f64,
+                        t.traffic.read_calls as f64 / OPS as f64,
+                        t.traffic.write_calls as f64 / OPS as f64,
+                        t.traffic.retargets as f64 / OPS as f64,
+                    );
+                }
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}
+
+/// Trace replay against queueing ops fresh (checklist 9.17): a layer's
+/// forward pass -- matmul, add a row, relu, matmul -- at MNIST's size and at
+/// 512 x 1024, 50 times back to back, queued fresh (pipelined and plain: a
+/// capture runs plain) and replayed from one capture, on 1, 8 and 32 tiles
+/// (`SWEEP_TILES`). Host time is the calls' alone; end to end includes the
+/// sync, so it shows what streaming a trace from GDDR costs the device.
+#[test]
+#[ignore = "benchmark"]
+fn trace_replay_vs_fresh() {
+    use tt_kernels::kind;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::tensor::{DramTensor, Eltwise};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    const PASSES: usize = 50;
+    const OPS: usize = 4;
+    fn forward(
+        s: &mut Session<tt_kmd::Kmd>,
+        x: &DramTensor,
+        w1: &DramTensor,
+        b1: &DramTensor,
+        w2: &DramTensor,
+    ) -> DramTensor {
+        let mm = |s: &mut Session<tt_kmd::Kmd>, a, b| {
+            s.matmul_dram(
+                a,
+                false,
+                b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET,
+            )
+            .unwrap()
+        };
+        let ew = |s: &mut Session<tt_kmd::Kmd>, kind, a, b| {
+            s.eltwise(
+                Eltwise {
+                    scalar2: 0.0,
+                    kind,
+                    scalar: 0.0,
+                },
+                a,
+                b,
+            )
+            .unwrap()
+        };
+        let h = mm(s, x, w1);
+        let hb = ew(s, kind::ADD_ROW, &h, Some(b1));
+        let r = ew(s, kind::RELU, &hb, None);
+        let y = mm(s, &r, w2);
+        for t in [h, hb, r] {
+            s.free(t).unwrap();
+        }
+        y
+    }
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            for (batch, input, hidden, out) in [(64, 784, 128, 10), (512, 1024, 1024, 1024)] {
+                let x = s.upload(&vec![0.5; batch * input], batch, input).unwrap();
+                let w1 = s
+                    .upload(&vec![0.01; input * hidden], input, hidden)
+                    .unwrap();
+                let b1 = s.upload(&vec![0.1; hidden], 1, hidden).unwrap();
+                let w2 = s.upload(&vec![0.02; hidden * out], hidden, out).unwrap();
+                let what = format!("{batch}x{input}x{hidden}x{out} on {tiles} tiles");
+                let per_op = |d: std::time::Duration| d.as_secs_f64() * 1e6 / (PASSES * OPS) as f64;
+                let fresh = |s: &mut Session<tt_kmd::Kmd>, pipeline: bool| {
+                    s.set_pipeline(pipeline);
+                    for _ in 0..3 {
+                        let y = forward(s, &x, &w1, &b1, &w2);
+                        s.sync().unwrap();
+                        s.free(y).unwrap();
+                    }
+                    let tr0 = s.device().traffic();
+                    let t0 = Instant::now();
+                    let ys: Vec<_> = (0..PASSES).map(|_| forward(s, &x, &w1, &b1, &w2)).collect();
+                    let calls = t0.elapsed();
+                    s.sync().unwrap();
+                    let total = t0.elapsed();
+                    let tr = s.device().traffic();
+                    for y in ys {
+                        s.free(y).unwrap();
+                    }
+                    println!(
+                        "MEASURE replay {what}, fresh {}: host {:.2} us/op, end to end {:.2} us/op, {:.1} writes {:.1} reads /op",
+                        if pipeline { "pipelined" } else { "plain    " },
+                        per_op(calls),
+                        per_op(total),
+                        (tr.write_calls - tr0.write_calls) as f64 / (PASSES * OPS) as f64,
+                        (tr.read_calls - tr0.read_calls) as f64 / (PASSES * OPS) as f64,
+                    );
+                };
+                fresh(&mut s, true);
+                fresh(&mut s, false);
+                s.set_pipeline(true);
+                s.begin_trace().unwrap();
+                let y = forward(&mut s, &x, &w1, &b1, &w2);
+                let id = s.end_trace().unwrap();
+                for _ in 0..3 {
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                }
+                let tr0 = s.device().traffic();
+                let t0 = Instant::now();
+                for _ in 0..PASSES {
+                    s.replay(id).unwrap();
+                }
+                let calls = t0.elapsed();
+                s.sync().unwrap();
+                let total = t0.elapsed();
+                let tr = s.device().traffic();
+                println!(
+                    "MEASURE replay {what}, replayed       : host {:.2} us/op, end to end {:.2} us/op, {:.1} writes {:.1} reads /op",
+                    per_op(calls),
+                    per_op(total),
+                    (tr.write_calls - tr0.write_calls) as f64 / (PASSES * OPS) as f64,
+                    (tr.read_calls - tr0.read_calls) as f64 / (PASSES * OPS) as f64,
+                );
+                // A server's batch: the input written from the host, the
+                // trace replayed, the output read back.
+                let values = vec![0.25f32; batch * input];
+                let (mut wr, mut rp, mut dl) = (Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..20 {
+                    let t0 = Instant::now();
+                    s.write(&x, &values).unwrap();
+                    let t1 = Instant::now();
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                    let t2 = Instant::now();
+                    let _ = s.download(&y).unwrap();
+                    wr.push((t1 - t0).as_secs_f64() * 1e6);
+                    rp.push((t2 - t1).as_secs_f64() * 1e6);
+                    dl.push(t2.elapsed().as_secs_f64() * 1e6);
+                }
+                println!(
+                    "MEASURE replay {what}, a served batch: write {} B {:.0} us, replay {:.0} us, read {} B {:.0} us",
+                    batch * input * 4,
+                    Stats::of(wr.into_iter()).median,
+                    Stats::of(rp.into_iter()).median,
+                    batch * out * 4,
+                    Stats::of(dl.into_iter()).median,
+                );
+                s.release_trace(id).unwrap();
+                for t in [y, x, w1, b1, w2] {
+                    s.free(t).unwrap();
+                }
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
     }
 }

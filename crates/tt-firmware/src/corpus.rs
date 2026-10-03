@@ -245,11 +245,19 @@ where
     // bad table would push whatever L1 holds.
     let (code, code_len, n) = if looped {
         // SAFETY: the program's first word, inside its checked extent.
-        let n = if program_len == 0 { u32::MAX } else { unsafe { l1_read32(program) } };
+        let n = if program_len == 0 {
+            u32::MAX
+        } else {
+            unsafe { l1_read32(program) }
+        };
         if n as usize > mailbox::loops::MAX || n + 1 > program_len {
             fail_in(mb, panic_code::EXPLICIT);
         }
-        (program + 4 * (1 + n as u64), program_len - 1 - n, n as usize)
+        (
+            program + 4 * (1 + n as u64),
+            program_len - 1 - n,
+            n as usize,
+        )
     } else {
         (program, program_len, 0)
     };
@@ -369,7 +377,8 @@ where
                 let at = self.program + (i as u64) * 4;
                 // SAFETY: sixteen words inside the staged program, whose length
                 // was checked by the caller.
-                let w: [u32; 16] = core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
+                let w: [u32; 16] =
+                    core::array::from_fn(|k| unsafe { l1_read32(at + 4 * k as u64) });
                 for word in w {
                     // SAFETY: as the loop below.
                     unsafe { push_word::<Riscv, Thread>(word) }

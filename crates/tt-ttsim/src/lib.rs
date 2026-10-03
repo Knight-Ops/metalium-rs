@@ -412,12 +412,101 @@ fn workspace_root() -> PathBuf {
 /// Installed so that unexpected DMA produces a diagnosis rather than libttsim's
 /// generic fatal error. The baseline performs no DMA; reaching here means the
 /// device tried to touch host memory, which is a bug in the code that programmed it.
-unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut core::ffi::c_void, size: u32) {
-    fatal_unexpected_dma("read", paddr, size)
+unsafe extern "C" fn dma_read_unexpected(paddr: u64, dst: *mut core::ffi::c_void, size: u32) {
+    let done = host::with_region(paddr, size as u64, |bytes| {
+        // SAFETY: libttsim hands a buffer of `size` bytes to fill.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, size as usize) }
+    });
+    if done.is_none() {
+        fatal_unexpected_dma("read", paddr, size)
+    }
 }
 
-unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const core::ffi::c_void, size: u32) {
-    fatal_unexpected_dma("write", paddr, size)
+unsafe extern "C" fn dma_write_unexpected(paddr: u64, src: *const core::ffi::c_void, size: u32) {
+    let done = host::with_region(paddr, size as u64, |bytes| {
+        // SAFETY: libttsim hands `size` bytes to take.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src as *const u8, bytes.as_mut_ptr(), size as usize)
+        }
+    });
+    if done.is_none() {
+        fatal_unexpected_dma("write", paddr, size)
+    }
+}
+
+/// Simulated host memory for the card's DMA ([`tt_device::HostMemory`]):
+/// regions the DMA callbacks serve, at made-up physical addresses the card
+/// reaches through the PCIe tile's window to the host (`0x0...`). DMA
+/// anywhere else is still fatal.
+pub mod host {
+    use std::sync::{Arc, Mutex};
+
+    type Bytes = Arc<Mutex<Vec<u8>>>;
+    static REGIONS: Mutex<Vec<(u64, Bytes)>> = Mutex::new(Vec::new());
+    static NEXT: Mutex<u64> = Mutex::new(1 << 36);
+
+    /// Run `f` on the bytes `[paddr, paddr + len)` of the region holding them.
+    pub(crate) fn with_region(paddr: u64, len: u64, f: impl FnOnce(&mut [u8])) -> Option<()> {
+        let regions = REGIONS.lock().unwrap_or_else(|p| p.into_inner());
+        let (base, bytes) = regions.iter().find(|(base, b)| {
+            let n = b.lock().unwrap_or_else(|p| p.into_inner()).len() as u64;
+            paddr >= *base && paddr + len <= base + n
+        })?;
+        let mut b = bytes.lock().unwrap_or_else(|p| p.into_inner());
+        let at = (paddr - base) as usize;
+        f(&mut b[at..at + len as usize]);
+        Some(())
+    }
+
+    /// One region, registered until dropped.
+    pub struct SimHostMemory {
+        base: u64,
+        bytes: Bytes,
+    }
+
+    impl SimHostMemory {
+        pub fn new(len: usize) -> Self {
+            let len = len.max(1).next_multiple_of(4096);
+            let mut next = NEXT.lock().unwrap_or_else(|p| p.into_inner());
+            let base = *next;
+            *next += (len as u64).next_multiple_of(1 << 30);
+            let bytes = Arc::new(Mutex::new(vec![0u8; len]));
+            REGIONS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((base, bytes.clone()));
+            SimHostMemory { base, bytes }
+        }
+    }
+
+    impl tt_device::HostMemory for SimHostMemory {
+        fn noc_address(&self) -> u64 {
+            self.base
+        }
+        fn len(&self) -> usize {
+            self.bytes.lock().unwrap_or_else(|p| p.into_inner()).len()
+        }
+        fn read(&self, offset: usize, dst: &mut [u8]) {
+            let b = self.bytes.lock().unwrap_or_else(|p| p.into_inner());
+            dst.copy_from_slice(&b[offset..offset + dst.len()]);
+        }
+        fn write(&mut self, offset: usize, src: &[u8]) {
+            let mut b = self.bytes.lock().unwrap_or_else(|p| p.into_inner());
+            b[offset..offset + src.len()].copy_from_slice(src);
+        }
+        fn with_bytes(&mut self, f: &mut dyn FnMut(&mut [u8])) {
+            f(&mut self.bytes.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+    }
+
+    impl Drop for SimHostMemory {
+        fn drop(&mut self) {
+            REGIONS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(base, _)| *base != self.base);
+        }
+    }
 }
 
 fn fatal_unexpected_dma(kind: &str, paddr: u64, size: u32) -> ! {

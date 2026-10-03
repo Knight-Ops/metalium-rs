@@ -14,3 +14,4 @@ libm.workspace = true
 tt-device.workspace = true
 tt-layout.workspace = true
 tt-kmd.workspace = true
+libc.workspace = true

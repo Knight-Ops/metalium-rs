@@ -23,6 +23,13 @@ const BINARIES: &[&str] = &[
     "role_t2",
     "eth_e1",
     "dm_b",
+    "nc_probe",
+    "dm_nc",
+    "icache_b",
+    "icache_nc",
+    "icache_t0",
+    "icache_t1",
+    "icache_t2",
 ];
 
 const TARGET: &str = "riscv32im-unknown-none-elf";
@@ -262,12 +269,11 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
              or the Matrix Unit (the data mover only moves data)",
         );
     }
-    if matches!(mnemonic, "div" | "divu" | "rem" | "remu") {
-        return Some(
-            "RISCV T2 has no integer divide or remainder; avoided everywhere so that one \
-             image can run on any core",
-        );
-    }
+    // Integer divide and remainder are allowed: every baby core implements
+    // the whole M extension (`BabyRISCV/InstructionSet.md:7`). The only
+    // divides missing are T2's vector `vdiv`/`vrem` (`InstructionSet.md:33`),
+    // which no image uses. A scalar divide takes 6-33 cycles
+    // (`BabyRISCV/README.md:51`); this gate once refused it on a misreading.
     None
 }
 

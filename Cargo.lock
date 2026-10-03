@@ -630,6 +630,7 @@ dependencies = [
  "burn-backend",
  "burn-flex",
  "burn-tensor",
+ "libc",
  "num-traits",
  "tt-device",
  "tt-firmware-images",
@@ -4825,6 +4826,7 @@ version = "0.1.0"
 name = "tt-kernels"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libm",
  "tt-device",
  "tt-isa",
@@ -4873,6 +4875,7 @@ dependencies = [
  "tt-kernels",
  "tt-kmd",
  "tt-layout",
+ "tt-mnist",
  "tt-ttsim",
 ]
 

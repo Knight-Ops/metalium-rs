@@ -79,6 +79,7 @@ use crate::TtBackend;
 
 impl FloatTensorOps<TtBackend> for TtBackend {
     fn float_from_data(data: TensorData, device: &Device<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_from_data", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_from_data(data, device.into_flex()),
@@ -91,6 +92,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_random", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_random(
@@ -107,6 +109,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_zeros", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_zeros(shape, device.into_flex(), dtype),
@@ -118,6 +121,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_ones", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_ones(shape, device.into_flex(), dtype),
@@ -130,6 +134,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_full", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_full(
@@ -144,18 +149,22 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     fn float_into_data(
         tensor: FloatTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
+        let _op = crate::report::enter("float_into_data", true);
         crate::ops::float::float_into_data(tensor)
     }
     fn float_device(tensor: &FloatTensor<TtBackend>) -> Device<TtBackend> {
+        let _op = crate::report::enter("float_device", true);
         crate::ops::float::float_device(tensor)
     }
     fn float_to_device(
         tensor: FloatTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_to_device", true);
         crate::ops::float::float_to_device(tensor, device)
     }
     fn float_into_int(tensor: FloatTensor<TtBackend>, out_dtype: IntDType) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_into_int", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_into_int(tensor.into_flex(), out_dtype),
@@ -167,6 +176,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_empty", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_empty(shape, device.into_flex(), dtype),
@@ -178,6 +188,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         times: usize,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_repeat_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_repeat_dim(tensor.into_flex(), dim, times),
@@ -188,15 +199,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_add", true);
         crate::ops::float::float_add(lhs, rhs)
     }
     fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_add_scalar", true);
         crate::ops::float::float_add_scalar(lhs, rhs)
     }
     fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_clamp_min", true);
         crate::ops::float::float_clamp_min(tensor, min)
     }
     fn float_clamp_max(tensor: FloatTensor<TtBackend>, max: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_clamp_max", true);
         crate::ops::float::float_clamp_max(tensor, max)
     }
     fn float_clamp(
@@ -204,39 +219,47 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         min: Scalar,
         max: Scalar,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_clamp", true);
         crate::ops::float::float_clamp(tensor, min, max)
     }
     fn float_sub(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sub", true);
         crate::ops::float::float_sub(lhs, rhs)
     }
     fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sub_scalar", true);
         crate::ops::float::float_sub_scalar(lhs, rhs)
     }
     fn float_mul(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mul", true);
         crate::ops::float::float_mul(lhs, rhs)
     }
     fn float_mul_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mul_scalar", true);
         crate::ops::float::float_mul_scalar(lhs, rhs)
     }
     fn float_div(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_div", true);
         crate::ops::float::float_div(lhs, rhs)
     }
     fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_div_scalar", true);
         crate::ops::float::float_div_scalar(lhs, rhs)
     }
     fn float_remainder(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_remainder", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_remainder(lhs.into_flex(), rhs.into_flex()),
@@ -244,6 +267,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_remainder_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_remainder_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_remainder_scalar(lhs.into_flex(), rhs),
@@ -254,6 +278,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_matmul", true);
         crate::ops::float::float_matmul(lhs, rhs)
     }
     fn float_cross(
@@ -261,6 +286,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         dim: usize,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cross", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cross(lhs.into_flex(), rhs.into_flex(), dim),
@@ -268,12 +294,15 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_neg(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_neg", true);
         crate::ops::float::float_neg(tensor)
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_recip", true);
         crate::ops::float::float_recip(tensor)
     }
     fn float_transpose(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_transpose", true);
         crate::ops::float::float_transpose(tensor)
     }
     fn float_swap_dims(
@@ -281,9 +310,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_swap_dims", true);
         crate::ops::float::float_swap_dims(tensor, dim1, dim2)
     }
     fn float_permute(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_permute", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_permute(tensor.into_flex(), axes),
@@ -291,6 +322,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_flip(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_flip", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_flip(tensor.into_flex(), axes),
@@ -298,6 +330,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_reshape(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_reshape", true);
         crate::ops::float::float_reshape(tensor, shape)
     }
     fn float_gather(
@@ -305,6 +338,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_gather", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_gather(
@@ -321,6 +355,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_scatter_add", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_scatter_add(
@@ -338,6 +373,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         _values: FloatTensor<TtBackend>,
         _reduction: burn_backend::tensor::IndexingUpdateOp,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_scatter_nd", false);
         let device = HasDevice::tt_device(&_data);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_scatter_nd(
@@ -353,6 +389,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         _data: FloatTensor<TtBackend>,
         _indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_gather_nd", false);
         let device = HasDevice::tt_device(&_data);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_gather_nd(
@@ -367,6 +404,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_select", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_select(
@@ -383,6 +421,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_select_add", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_select_add(
@@ -395,6 +434,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_slice(tensor: FloatTensor<TtBackend>, slices: &[Slice]) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_slice", true);
         crate::ops::float::float_slice(tensor, slices)
     }
     fn float_slice_assign(
@@ -402,6 +442,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         slices: &[Slice],
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_slice_assign", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_slice_assign(
@@ -417,6 +458,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mask_where", true);
         crate::ops::float::float_mask_where(tensor, mask, value)
     }
     fn float_mask_fill(
@@ -424,6 +466,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mask_fill", true);
         crate::ops::float::float_mask_fill(tensor, mask, value)
     }
     fn float_equal(
@@ -431,6 +474,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_equal", true);
         crate::ops::float::float_equal(lhs, rhs, out_dtype)
     }
     fn float_not_equal(
@@ -438,6 +482,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_not_equal", true);
         crate::ops::float::float_not_equal(lhs, rhs, out_dtype)
     }
     fn float_equal_elem(
@@ -445,6 +490,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_equal_elem", true);
         crate::ops::float::float_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_not_equal_elem(
@@ -452,6 +498,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_not_equal_elem", true);
         crate::ops::float::float_not_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_greater(
@@ -459,6 +506,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_greater", true);
         crate::ops::float::float_greater(lhs, rhs, out_dtype)
     }
     fn float_greater_elem(
@@ -466,6 +514,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_greater_elem", true);
         crate::ops::float::float_greater_elem(lhs, rhs, out_dtype)
     }
     fn float_greater_equal(
@@ -473,6 +522,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_greater_equal", true);
         crate::ops::float::float_greater_equal(lhs, rhs, out_dtype)
     }
     fn float_greater_equal_elem(
@@ -480,6 +530,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_greater_equal_elem", true);
         crate::ops::float::float_greater_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_lower(
@@ -487,6 +538,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_lower", true);
         crate::ops::float::float_lower(lhs, rhs, out_dtype)
     }
     fn float_lower_elem(
@@ -494,6 +546,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_lower_elem", true);
         crate::ops::float::float_lower_elem(lhs, rhs, out_dtype)
     }
     fn float_lower_equal(
@@ -501,6 +554,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_lower_equal", true);
         crate::ops::float::float_lower_equal(lhs, rhs, out_dtype)
     }
     fn float_lower_equal_elem(
@@ -508,9 +562,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_lower_equal_elem", true);
         crate::ops::float::float_lower_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_detach(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_detach", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_detach(tensor.into_flex()),
@@ -518,6 +574,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_sum(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sum", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_sum(tensor.into_flex()),
@@ -525,9 +582,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sum_dim", true);
         crate::ops::float::float_sum_dim(tensor, dim)
     }
     fn float_prod(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_prod", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_prod(tensor.into_flex()),
@@ -535,6 +594,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_prod_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_prod_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_prod_dim(tensor.into_flex(), dim),
@@ -542,6 +602,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_mean(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mean", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_mean(tensor.into_flex()),
@@ -549,6 +610,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_mean_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_mean_dim(tensor.into_flex(), dim),
@@ -556,6 +618,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cumsum(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cumsum", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cumsum(tensor.into_flex(), dim),
@@ -563,6 +626,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cumprod(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cumprod", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cumprod(tensor.into_flex(), dim),
@@ -570,6 +634,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cummin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cummin", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cummin(tensor.into_flex(), dim),
@@ -577,6 +642,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cummax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cummax", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cummax(tensor.into_flex(), dim),
@@ -584,90 +650,115 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_cast(tensor: FloatTensor<TtBackend>, dtype: FloatDType) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cast", true);
         crate::ops::float::float_cast(tensor, dtype)
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_exp", true);
         crate::ops::float::float_exp(tensor)
     }
     fn float_log(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_log", true);
         crate::ops::float::float_log(tensor)
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_log1p", true);
         crate::ops::float::float_log1p(tensor)
     }
     fn float_powf(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_powf", true);
         crate::ops::float::float_powf(lhs, rhs)
     }
     fn float_powi(
         lhs: FloatTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_powi", true);
         crate::ops::float::float_powi(lhs, rhs)
     }
     fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_powi_scalar", true);
         crate::ops::float::float_powi_scalar(lhs, rhs)
     }
     fn float_powf_scalar(tensor: FloatTensor<TtBackend>, value: Scalar) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_powf_scalar", true);
         crate::ops::float::float_powf_scalar(tensor, value)
     }
     fn float_powf_scalar_impl(
         tensor: FloatTensor<TtBackend>,
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_powf_scalar_impl", true);
         crate::ops::float::float_powf_scalar_impl(tensor, value)
     }
     fn float_sqrt(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sqrt", true);
         crate::ops::float::float_sqrt(tensor)
     }
     fn float_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_abs", true);
         crate::ops::float::float_abs(tensor)
     }
     fn float_cos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cos", true);
         crate::ops::float::float_cos(tensor)
     }
     fn float_sin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sin", true);
         crate::ops::float::float_sin(tensor)
     }
     fn float_tan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_tan", true);
         crate::ops::float::float_tan(tensor)
     }
     fn float_cosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cosh", true);
         crate::ops::float::float_cosh(tensor)
     }
     fn float_sinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sinh", true);
         crate::ops::float::float_sinh(tensor)
     }
     fn float_tanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_tanh", true);
         crate::ops::float::float_tanh(tensor)
     }
     fn float_acos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_acos", true);
         crate::ops::float::float_acos(tensor)
     }
     fn float_acosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_acosh", true);
         crate::ops::float::float_acosh(tensor)
     }
     fn float_asin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_asin", true);
         crate::ops::float::float_asin(tensor)
     }
     fn float_asinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_asinh", true);
         crate::ops::float::float_asinh(tensor)
     }
     fn float_atan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_atan", true);
         crate::ops::float::float_atan(tensor)
     }
     fn float_atanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_atanh", true);
         crate::ops::float::float_atanh(tensor)
     }
     fn float_atan2(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_atan2", true);
         crate::ops::float::float_atan2(lhs, rhs)
     }
     fn float_round(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_round", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_round(tensor.into_flex()),
@@ -675,6 +766,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_floor(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_floor", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_floor(tensor.into_flex()),
@@ -682,6 +774,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_ceil(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_ceil", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_ceil(tensor.into_flex()),
@@ -689,6 +782,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_trunc(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_trunc", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_trunc(tensor.into_flex()),
@@ -696,9 +790,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_erf(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_erf", true);
         crate::ops::float::float_erf(tensor)
     }
     fn float_cat(tensors: Vec<FloatTensor<TtBackend>>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cat", false);
         let device = HasDevice::tt_device(&tensors);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_cat(tensors.into_flex(), dim),
@@ -710,6 +806,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_argmax", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_argmax(tensor.into_flex(), dim, out_dtype),
@@ -722,6 +819,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         k: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_argtopk", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_argtopk(tensor.into_flex(), dim, k, out_dtype),
@@ -733,6 +831,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_argmin", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_argmin(tensor.into_flex(), dim, out_dtype),
@@ -740,6 +839,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_max", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_max(tensor.into_flex()),
@@ -747,6 +847,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_max_dim", true);
         crate::ops::float::float_max_dim(tensor, dim)
     }
     fn float_max_dim_with_indices(
@@ -754,6 +855,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices_dtype: IntDType,
     ) -> (FloatTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("float_max_dim_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_max_dim_with_indices(
@@ -765,6 +867,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_min(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_min", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_min(tensor.into_flex()),
@@ -772,6 +875,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_min_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_min_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_min_dim(tensor.into_flex(), dim),
@@ -783,6 +887,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices_dtype: IntDType,
     ) -> (FloatTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("float_min_dim_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_min_dim_with_indices(
@@ -794,6 +899,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_max_abs", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_max_abs(tensor.into_flex()),
@@ -801,6 +907,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_max_abs_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_max_abs_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_max_abs_dim(tensor.into_flex(), dim),
@@ -808,6 +915,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_any(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_any", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_any(tensor.into_flex(), out_dtype),
@@ -819,6 +927,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_any_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_any_dim(tensor.into_flex(), dim, out_dtype),
@@ -826,6 +935,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_all(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_all", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_all(tensor.into_flex(), out_dtype),
@@ -837,6 +947,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_all_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_all_dim(tensor.into_flex(), dim, out_dtype),
@@ -844,9 +955,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_sign(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sign", true);
         crate::ops::float::float_sign(tensor)
     }
     fn float_expand(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_expand", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_expand(tensor.into_flex(), shape),
@@ -858,6 +971,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         descending: bool,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sort", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_sort(tensor.into_flex(), dim, descending),
@@ -870,6 +984,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         descending: bool,
         indices_dtype: IntDType,
     ) -> (FloatTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("float_sort_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_sort_with_indices(
@@ -887,6 +1002,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         descending: bool,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_argsort", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_argsort(
@@ -903,6 +1019,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         grid: FloatTensor<TtBackend>,
         options: GridSampleOptions,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_grid_sample_2d", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_grid_sample_2d(
@@ -919,6 +1036,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         size: usize,
         step: usize,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_unfold", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as FloatTensorOps<Flex>>::float_unfold(tensor.into_flex(), dim, size, step),
@@ -926,9 +1044,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_is_nan(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_is_nan", true);
         crate::ops::float::float_is_nan(tensor, out_dtype)
     }
     fn float_is_inf(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("float_is_inf", true);
         crate::ops::float::float_is_inf(tensor, out_dtype)
     }
 }
@@ -939,6 +1059,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_empty", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_empty(shape, device.into_flex(), dtype),
@@ -948,9 +1069,11 @@ impl IntTensorOps<TtBackend> for TtBackend {
     fn int_into_data(
         tensor: IntTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
+        let _op = crate::report::enter("int_into_data", true);
         crate::ops::int::int_into_data(tensor)
     }
     fn int_from_data(data: TensorData, device: &Device<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_from_data", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_from_data(data, device.into_flex()),
@@ -958,18 +1081,22 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_device(tensor: &IntTensor<TtBackend>) -> Device<TtBackend> {
+        let _op = crate::report::enter("int_device", true);
         crate::ops::int::int_device(tensor)
     }
     fn int_to_device(
         tensor: IntTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_to_device", true);
         crate::ops::int::int_to_device(tensor, device)
     }
     fn int_reshape(tensor: IntTensor<TtBackend>, shape: Shape) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_reshape", true);
         crate::ops::int::int_reshape(tensor, shape)
     }
     fn int_slice(tensor: IntTensor<TtBackend>, slices: &[Slice]) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_slice", true);
         crate::ops::int::int_slice(tensor, slices)
     }
     fn int_slice_assign(
@@ -977,6 +1104,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         slices: &[Slice],
         value: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_slice_assign", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_slice_assign(
@@ -991,6 +1119,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         tensor: IntTensor<TtBackend>,
         out_dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("int_into_float", true);
         crate::ops::int::int_into_float(tensor, out_dtype)
     }
     fn int_mask_where(
@@ -998,6 +1127,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mask_where", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mask_where(
@@ -1013,6 +1143,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mask_fill", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mask_fill(
@@ -1028,6 +1159,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         tensor: IntTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_gather", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_gather(dim, tensor.into_flex(), indices.into_flex()),
@@ -1040,6 +1172,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_scatter_add", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_scatter_add(
@@ -1057,6 +1190,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         _values: IntTensor<TtBackend>,
         _reduction: burn_backend::tensor::IndexingUpdateOp,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_scatter_nd", false);
         let device = HasDevice::tt_device(&_data);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_scatter_nd(
@@ -1072,6 +1206,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         _data: IntTensor<TtBackend>,
         _indices: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_gather_nd", false);
         let device = HasDevice::tt_device(&_data);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_gather_nd(_data.into_flex(), _indices.into_flex()),
@@ -1083,6 +1218,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_select", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_select(tensor.into_flex(), dim, indices.into_flex()),
@@ -1095,6 +1231,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_select_add", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_select_add(
@@ -1111,6 +1248,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         times: usize,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_repeat_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_repeat_dim(tensor.into_flex(), dim, times),
@@ -1118,6 +1256,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cat(tensors: Vec<IntTensor<TtBackend>>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cat", false);
         let device = HasDevice::tt_device(&tensors);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cat(tensors.into_flex(), dim),
@@ -1129,6 +1268,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_equal(lhs.into_flex(), rhs.into_flex(), out_dtype),
@@ -1140,6 +1280,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_not_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_not_equal(
@@ -1155,6 +1296,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_equal_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1166,6 +1308,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_not_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_not_equal_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1177,6 +1320,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_greater", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_greater(lhs.into_flex(), rhs.into_flex(), out_dtype),
@@ -1188,6 +1332,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_greater_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_greater_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1199,6 +1344,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_greater_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_greater_equal(
@@ -1214,6 +1360,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_greater_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_greater_equal_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1225,6 +1372,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_lower", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_lower(lhs.into_flex(), rhs.into_flex(), out_dtype),
@@ -1236,6 +1384,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_lower_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_lower_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1247,6 +1396,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_lower_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_lower_equal(
@@ -1262,6 +1412,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_lower_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_lower_equal_elem(lhs.into_flex(), rhs, out_dtype),
@@ -1269,6 +1420,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_add(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_add", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_add(lhs.into_flex(), rhs.into_flex()),
@@ -1276,6 +1428,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_add_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_add_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_add_scalar(lhs.into_flex(), rhs),
@@ -1283,6 +1436,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_powi(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_powi", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_powi(lhs.into_flex(), rhs.into_flex()),
@@ -1290,6 +1444,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_powi_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_powi_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_powi_scalar(lhs.into_flex(), rhs),
@@ -1297,6 +1452,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_powi_scalar_impl(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_powi_scalar_impl", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_powi_scalar_impl(lhs.into_flex(), rhs),
@@ -1304,6 +1460,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_clamp_min(tensor: IntTensor<TtBackend>, min: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_clamp_min", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_clamp_min(tensor.into_flex(), min),
@@ -1311,6 +1468,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_clamp_max(tensor: IntTensor<TtBackend>, max: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_clamp_max", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_clamp_max(tensor.into_flex(), max),
@@ -1318,6 +1476,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_clamp(tensor: IntTensor<TtBackend>, min: Scalar, max: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_clamp", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_clamp(tensor.into_flex(), min, max),
@@ -1325,6 +1484,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sub(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sub", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sub(lhs.into_flex(), rhs.into_flex()),
@@ -1332,6 +1492,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sub_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sub_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sub_scalar(lhs.into_flex(), rhs),
@@ -1339,6 +1500,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_mul(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mul", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mul(lhs.into_flex(), rhs.into_flex()),
@@ -1346,6 +1508,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_mul_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mul_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mul_scalar(lhs.into_flex(), rhs),
@@ -1353,6 +1516,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_div(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_div", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_div(lhs.into_flex(), rhs.into_flex()),
@@ -1360,6 +1524,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_div_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_div_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_div_scalar(lhs.into_flex(), rhs),
@@ -1367,6 +1532,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_remainder(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_remainder", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_remainder(lhs.into_flex(), rhs.into_flex()),
@@ -1374,6 +1540,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_remainder_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_remainder_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_remainder_scalar(lhs.into_flex(), rhs),
@@ -1381,6 +1548,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_matmul(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_matmul", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_matmul(lhs.into_flex(), rhs.into_flex()),
@@ -1388,6 +1556,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_neg(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_neg", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_neg(tensor.into_flex()),
@@ -1399,6 +1568,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_zeros", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_zeros(shape, device.into_flex(), dtype),
@@ -1406,6 +1576,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_ones(shape: Shape, device: &Device<TtBackend>, dtype: IntDType) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_ones", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_ones(shape, device.into_flex(), dtype),
@@ -1418,6 +1589,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_full", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_full(shape, fill_value, device.into_flex(), dtype),
@@ -1425,6 +1597,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sum(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sum", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sum(tensor.into_flex()),
@@ -1432,6 +1605,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sum_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sum_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sum_dim(tensor.into_flex(), dim),
@@ -1439,6 +1613,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_prod(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_prod", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_prod(tensor.into_flex()),
@@ -1446,6 +1621,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_prod_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_prod_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_prod_dim(tensor.into_flex(), dim),
@@ -1453,6 +1629,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_mean(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mean", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mean(tensor.into_flex()),
@@ -1460,6 +1637,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_mean_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_mean_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_mean_dim(tensor.into_flex(), dim),
@@ -1467,6 +1645,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cumsum(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cumsum", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cumsum(tensor.into_flex(), dim),
@@ -1474,6 +1653,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cumprod(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cumprod", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cumprod(tensor.into_flex(), dim),
@@ -1481,6 +1661,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cummin(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cummin", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cummin(tensor.into_flex(), dim),
@@ -1488,6 +1669,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cummax(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cummax", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cummax(tensor.into_flex(), dim),
@@ -1495,6 +1677,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_argmax(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_argmax", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_argmax(tensor.into_flex(), dim),
@@ -1502,6 +1685,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_argtopk(tensor: IntTensor<TtBackend>, dim: usize, k: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_argtopk", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_argtopk(tensor.into_flex(), dim, k),
@@ -1509,6 +1693,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_argmin(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_argmin", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_argmin(tensor.into_flex(), dim),
@@ -1516,6 +1701,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_max(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_max", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_max(tensor.into_flex()),
@@ -1523,6 +1709,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_max_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_max_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_max_dim(tensor.into_flex(), dim),
@@ -1533,6 +1720,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         tensor: IntTensor<TtBackend>,
         dim: usize,
     ) -> (IntTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("int_max_dim_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_max_dim_with_indices(tensor.into_flex(), dim),
@@ -1540,6 +1728,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_max_abs(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_max_abs", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_max_abs(tensor.into_flex()),
@@ -1547,6 +1736,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_max_abs_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_max_abs_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_max_abs_dim(tensor.into_flex(), dim),
@@ -1554,6 +1744,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_min(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_min", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_min(tensor.into_flex()),
@@ -1561,6 +1752,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_min_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_min_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_min_dim(tensor.into_flex(), dim),
@@ -1571,6 +1763,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         tensor: IntTensor<TtBackend>,
         dim: usize,
     ) -> (IntTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("int_min_dim_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_min_dim_with_indices(tensor.into_flex(), dim),
@@ -1578,6 +1771,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_abs(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_abs", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_abs(tensor.into_flex()),
@@ -1585,6 +1779,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_transpose(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_transpose", true);
         crate::ops::int::int_transpose(tensor)
     }
     fn int_swap_dims(
@@ -1592,9 +1787,11 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim1: usize,
         dim2: usize,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_swap_dims", true);
         crate::ops::int::int_swap_dims(tensor, dim1, dim2)
     }
     fn int_permute(tensor: IntTensor<TtBackend>, axes: &[usize]) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_permute", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_permute(tensor.into_flex(), axes),
@@ -1602,6 +1799,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_flip(tensor: IntTensor<TtBackend>, axes: &[usize]) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_flip", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_flip(tensor.into_flex(), axes),
@@ -1614,6 +1812,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_random", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_random(
@@ -1631,6 +1830,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_arange_step", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_arange_step(range, step, device.into_flex(), dtype),
@@ -1642,6 +1842,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_arange", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_arange(range, device.into_flex(), dtype),
@@ -1649,6 +1850,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_any(tensor: IntTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_any", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_any(tensor.into_flex(), out_dtype),
@@ -1660,6 +1862,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_any_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_any_dim(tensor.into_flex(), dim, out_dtype),
@@ -1667,6 +1870,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_all(tensor: IntTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_all", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_all(tensor.into_flex(), out_dtype),
@@ -1678,6 +1882,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("int_all_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_all_dim(tensor.into_flex(), dim, out_dtype),
@@ -1685,6 +1890,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sign(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sign", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sign(tensor.into_flex()),
@@ -1692,6 +1898,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_expand(tensor: IntTensor<TtBackend>, shape: Shape) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_expand", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_expand(tensor.into_flex(), shape),
@@ -1703,6 +1910,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         descending: bool,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sort", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sort(tensor.into_flex(), dim, descending),
@@ -1714,6 +1922,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         descending: bool,
     ) -> (IntTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("int_sort_with_indices", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_sort_with_indices(
@@ -1729,6 +1938,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         dim: usize,
         descending: bool,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_argsort", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_argsort(tensor.into_flex(), dim, descending),
@@ -1736,6 +1946,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_and(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_and", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_and(lhs.into_flex(), rhs.into_flex()),
@@ -1743,6 +1954,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_and_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_and_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_and_scalar(lhs.into_flex(), rhs),
@@ -1750,6 +1962,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_or(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_or", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_or(lhs.into_flex(), rhs.into_flex()),
@@ -1757,6 +1970,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_or_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_or_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_or_scalar(lhs.into_flex(), rhs),
@@ -1764,6 +1978,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_xor(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_xor", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_xor(lhs.into_flex(), rhs.into_flex()),
@@ -1771,6 +1986,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_xor_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_xor_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_xor_scalar(lhs.into_flex(), rhs),
@@ -1778,6 +1994,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_not(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_not", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_not(tensor.into_flex()),
@@ -1788,6 +2005,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_left_shift", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_left_shift(lhs.into_flex(), rhs.into_flex()),
@@ -1795,6 +2013,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_left_shift_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_left_shift_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_left_shift_scalar(lhs.into_flex(), rhs),
@@ -1805,6 +2024,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_right_shift", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_right_shift(lhs.into_flex(), rhs.into_flex()),
@@ -1812,6 +2032,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bitwise_right_shift_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bitwise_right_shift_scalar", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::bitwise_right_shift_scalar(lhs.into_flex(), rhs),
@@ -1819,6 +2040,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_cast(tensor: IntTensor<TtBackend>, dtype: IntDType) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cast", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_cast(tensor.into_flex(), dtype),
@@ -1831,6 +2053,7 @@ impl IntTensorOps<TtBackend> for TtBackend {
         size: usize,
         step: usize,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_unfold", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as IntTensorOps<Flex>>::int_unfold(tensor.into_flex(), dim, size, step),
@@ -1845,6 +2068,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_empty", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_empty(shape, device.into_flex(), dtype),
@@ -1856,6 +2080,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_zeros", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_zeros(shape, device.into_flex(), dtype),
@@ -1867,6 +2092,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         device: &Device<TtBackend>,
         dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_ones", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_ones(shape, device.into_flex(), dtype),
@@ -1876,9 +2102,11 @@ impl BoolTensorOps<TtBackend> for TtBackend {
     fn bool_into_data(
         tensor: BoolTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
+        let _op = crate::report::enter("bool_into_data", true);
         crate::ops::bool::bool_into_data(tensor)
     }
     fn bool_from_data(data: TensorData, device: &Device<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_from_data", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_from_data(data, device.into_flex()),
@@ -1886,6 +2114,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_into_int(tensor: BoolTensor<TtBackend>, out_dtype: IntDType) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("bool_into_int", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_into_int(tensor.into_flex(), out_dtype),
@@ -1896,6 +2125,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         tensor: BoolTensor<TtBackend>,
         out_dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("bool_into_float", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_into_float(tensor.into_flex(), out_dtype),
@@ -1903,18 +2133,22 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_device(tensor: &BoolTensor<TtBackend>) -> Device<TtBackend> {
+        let _op = crate::report::enter("bool_device", true);
         crate::ops::bool::bool_device(tensor)
     }
     fn bool_to_device(
         tensor: BoolTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_to_device", true);
         crate::ops::bool::bool_to_device(tensor, device)
     }
     fn bool_reshape(tensor: BoolTensor<TtBackend>, shape: Shape) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_reshape", true);
         crate::ops::bool::bool_reshape(tensor, shape)
     }
     fn bool_slice(tensor: BoolTensor<TtBackend>, slices: &[Slice]) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_slice", true);
         crate::ops::bool::bool_slice(tensor, slices)
     }
     fn bool_slice_assign(
@@ -1922,6 +2156,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         slices: &[Slice],
         value: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_slice_assign", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_slice_assign(
@@ -1937,6 +2172,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_mask_where", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_mask_where(
@@ -1952,6 +2188,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_mask_fill", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_mask_fill(
@@ -1967,6 +2204,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         tensor: BoolTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_gather", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_gather(
@@ -1983,6 +2221,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_scatter_or", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_scatter_or(
@@ -1999,6 +2238,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_select", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_select(
@@ -2015,6 +2255,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_select_or", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_select_or(
@@ -2031,6 +2272,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         dim: usize,
         times: usize,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_repeat_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_repeat_dim(tensor.into_flex(), dim, times),
@@ -2038,6 +2280,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_cat(tensors: Vec<BoolTensor<TtBackend>>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_cat", false);
         let device = HasDevice::tt_device(&tensors);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_cat(tensors.into_flex(), dim),
@@ -2045,6 +2288,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_equal(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_equal(lhs.into_flex(), rhs.into_flex()),
@@ -2055,6 +2299,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         lhs: BoolTensor<TtBackend>,
         rhs: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_not_equal", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_not_equal(lhs.into_flex(), rhs.into_flex()),
@@ -2062,6 +2307,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_equal_elem(lhs: BoolTensor<TtBackend>, rhs: Scalar) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_equal_elem(lhs.into_flex(), rhs),
@@ -2069,6 +2315,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_not_equal_elem(lhs: BoolTensor<TtBackend>, rhs: Scalar) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_not_equal_elem", false);
         let device = HasDevice::tt_device(&lhs);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_not_equal_elem(lhs.into_flex(), rhs),
@@ -2076,18 +2323,23 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_not(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_not", true);
         crate::ops::bool::bool_not(tensor)
     }
     fn bool_and(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_and", true);
         crate::ops::bool::bool_and(lhs, rhs)
     }
     fn bool_or(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_or", true);
         crate::ops::bool::bool_or(lhs, rhs)
     }
     fn bool_xor(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_xor", true);
         crate::ops::bool::bool_xor(lhs, rhs)
     }
     fn bool_transpose(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_transpose", true);
         crate::ops::bool::bool_transpose(tensor)
     }
     fn bool_swap_dims(
@@ -2095,9 +2347,11 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         dim1: usize,
         dim2: usize,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_swap_dims", true);
         crate::ops::bool::bool_swap_dims(tensor, dim1, dim2)
     }
     fn bool_permute(tensor: BoolTensor<TtBackend>, axes: &[usize]) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_permute", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_permute(tensor.into_flex(), axes),
@@ -2105,6 +2359,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_flip(tensor: BoolTensor<TtBackend>, axes: &[usize]) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_flip", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_flip(tensor.into_flex(), axes),
@@ -2112,6 +2367,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_any(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_any", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_any(tensor.into_flex()),
@@ -2119,6 +2375,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_any_dim(tensor: BoolTensor<TtBackend>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_any_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_any_dim(tensor.into_flex(), dim),
@@ -2126,6 +2383,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_all(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_all", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_all(tensor.into_flex()),
@@ -2133,6 +2391,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_all_dim(tensor: BoolTensor<TtBackend>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_all_dim", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_all_dim(tensor.into_flex(), dim),
@@ -2143,9 +2402,11 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         tensor: BoolTensor<TtBackend>,
         out_dtype: IntDType,
     ) -> impl Future<Output = IntTensor<TtBackend>> + 'static + Send {
+        let _op = crate::report::enter("bool_argwhere", true);
         crate::ops::bool::bool_argwhere(tensor, out_dtype)
     }
     fn bool_expand(tensor: BoolTensor<TtBackend>, shape: Shape) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_expand", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_expand(tensor.into_flex(), shape),
@@ -2158,6 +2419,7 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         size: usize,
         step: usize,
     ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_unfold", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as BoolTensorOps<Flex>>::bool_unfold(tensor.into_flex(), dim, size, step),
@@ -2171,6 +2433,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         weights: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("embedding", false);
         let device = HasDevice::tt_device(&weights);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::embedding(weights.into_flex(), indices.into_flex()),
@@ -2182,6 +2445,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("embedding_backward", false);
         let device = HasDevice::tt_device(&weights);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::embedding_backward(
@@ -2192,12 +2456,24 @@ impl ModuleOps<TtBackend> for TtBackend {
             device,
         )
     }
+    fn linear_weight_backward(
+        x: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("linear_weight_backward", true);
+        crate::ops::module::linear_weight_backward(x, output_grad)
+    }
+    fn linear_bias_backward(output_grad: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("linear_bias_backward", true);
+        crate::ops::module::linear_bias_backward(output_grad)
+    }
     fn conv1d(
         x: FloatTensor<TtBackend>,
         weight: FloatTensor<TtBackend>,
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvOptions<1>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv1d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv1d(
@@ -2215,6 +2491,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv2d(
@@ -2234,6 +2511,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: DeformConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("deform_conv2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::deform_conv2d(
@@ -2256,6 +2534,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
         options: DeformConvOptions<2>,
     ) -> DeformConv2dBackward<TtBackend> {
+        let _op = crate::report::enter("deform_conv2d_backward", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::deform_conv2d_backward(
@@ -2276,6 +2555,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvOptions<3>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv3d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv3d(
@@ -2293,6 +2573,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvTransposeOptions<1>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose1d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv_transpose1d(
@@ -2310,6 +2591,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvTransposeOptions<2>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv_transpose2d(
@@ -2327,6 +2609,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvTransposeOptions<3>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose3d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::conv_transpose3d(
@@ -2346,6 +2629,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         count_include_pad: bool,
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("avg_pool2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::avg_pool2d(
@@ -2368,6 +2652,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         count_include_pad: bool,
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("avg_pool2d_backward", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::avg_pool2d_backward(
@@ -2386,6 +2671,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         x: FloatTensor<TtBackend>,
         output_size: [usize; 2],
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("adaptive_avg_pool2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::adaptive_avg_pool2d(x.into_flex(), output_size),
@@ -2396,6 +2682,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("adaptive_avg_pool2d_backward", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::adaptive_avg_pool2d_backward(
@@ -2413,6 +2700,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         dilation: [usize; 2],
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("max_pool2d", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::max_pool2d(
@@ -2434,6 +2722,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         dilation: [usize; 2],
         ceil_mode: bool,
     ) -> MaxPool2dWithIndices<TtBackend> {
+        let _op = crate::report::enter("max_pool2d_with_indices", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::max_pool2d_with_indices(
@@ -2457,6 +2746,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> MaxPool2dBackward<TtBackend> {
+        let _op = crate::report::enter("max_pool2d_with_indices_backward", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::max_pool2d_with_indices_backward(
@@ -2477,6 +2767,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_size: [usize; 2],
         options: InterpolateOptions,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("interpolate", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::interpolate(x.into_flex(), output_size, options),
@@ -2489,6 +2780,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_size: [usize; 2],
         options: InterpolateOptions,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("interpolate_backward", false);
         let device = HasDevice::tt_device(&x);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::interpolate_backward(
@@ -2508,6 +2800,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         attn_bias: Option<FloatTensor<TtBackend>>,
         options: AttentionModuleOptions,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("attention", false);
         let device = HasDevice::tt_device(&query);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::attention(
@@ -2527,6 +2820,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         beta: Option<FloatTensor<TtBackend>>,
         epsilon: f64,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("layer_norm", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::layer_norm(
@@ -2543,6 +2837,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         dim: usize,
         n: Option<usize>,
     ) -> (FloatTensor<TtBackend>, FloatTensor<TtBackend>) {
+        let _op = crate::report::enter("rfft", false);
         let device = HasDevice::tt_device(&signal);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::rfft(signal.into_flex(), dim, n),
@@ -2555,6 +2850,7 @@ impl ModuleOps<TtBackend> for TtBackend {
         dim: usize,
         n: Option<usize>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("irfft", false);
         let device = HasDevice::tt_device(&spectrum_re);
         FromFlex::from_flex(
             <Flex as ModuleOps<Flex>>::irfft(
@@ -2573,39 +2869,47 @@ impl ActivationOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         negative_slope: Scalar,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("leaky_relu", true);
         crate::ops::activation::leaky_relu(tensor, negative_slope)
     }
     fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("relu", true);
         crate::ops::activation::relu(tensor)
     }
     fn relu_backward(
         output: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("relu_backward", true);
         crate::ops::activation::relu_backward(output, grad)
     }
     fn gelu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("gelu", true);
         crate::ops::activation::gelu(tensor)
     }
     fn prelu(
         tensor: FloatTensor<TtBackend>,
         alpha: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("prelu", true);
         crate::ops::activation::prelu(tensor, alpha)
     }
     fn gelu_backward(
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("gelu_backward", true);
         crate::ops::activation::gelu_backward(x, grad)
     }
     fn sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("sigmoid", true);
         crate::ops::activation::sigmoid(tensor)
     }
     fn sigmoid_backward(
         output: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("sigmoid_backward", true);
         crate::ops::activation::sigmoid_backward(output, grad)
     }
     fn hard_sigmoid(
@@ -2613,30 +2917,37 @@ impl ActivationOps<TtBackend> for TtBackend {
         alpha: Scalar,
         beta: Scalar,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("hard_sigmoid", true);
         crate::ops::activation::hard_sigmoid(tensor, alpha, beta)
     }
     fn log_sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("log_sigmoid", true);
         crate::ops::activation::log_sigmoid(tensor)
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("softmax", true);
         crate::ops::activation::softmax(tensor, dim)
     }
     fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("log_softmax", true);
         crate::ops::activation::log_softmax(tensor, dim)
     }
     fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("softmin", true);
         crate::ops::activation::softmin(tensor, dim)
     }
     fn log_sigmoid_backward(
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("log_sigmoid_backward", true);
         crate::ops::activation::log_sigmoid_backward(x, grad)
     }
 }
 
 impl QTensorOps<TtBackend> for TtBackend {
     fn q_from_data(data: TensorData, device: &Device<TtBackend>) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_from_data", false);
         let device = HasDevice::tt_device(&device);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_from_data(data, device.into_flex()),
@@ -2648,6 +2959,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         scheme: &QuantScheme,
         qparams: QuantizationParametersPrimitive<TtBackend>,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("quantize", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::quantize(tensor.into_flex(), scheme, qparams.into_flex()),
@@ -2658,6 +2970,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         scheme: &QuantScheme,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("quantize_dynamic", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::quantize_dynamic(tensor.into_flex(), scheme),
@@ -2665,6 +2978,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         )
     }
     fn dequantize(tensor: QuantizedTensor<TtBackend>, dtype: FloatDType) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("dequantize", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::dequantize(tensor.into_flex(), dtype),
@@ -2672,15 +2986,18 @@ impl QTensorOps<TtBackend> for TtBackend {
         )
     }
     fn q_device(tensor: &QuantizedTensor<TtBackend>) -> Device<TtBackend> {
+        let _op = crate::report::enter("q_device", true);
         crate::ops::quantized::q_device(tensor)
     }
     fn q_to_device(
         tensor: QuantizedTensor<TtBackend>,
         device: &Device<TtBackend>,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_to_device", true);
         crate::ops::quantized::q_to_device(tensor, device)
     }
     fn q_reshape(tensor: QuantizedTensor<TtBackend>, shape: Shape) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_reshape", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_reshape(tensor.into_flex(), shape),
@@ -2690,9 +3007,11 @@ impl QTensorOps<TtBackend> for TtBackend {
     fn q_into_data(
         tensor: QuantizedTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
+        let _op = crate::report::enter("q_into_data", true);
         crate::ops::quantized::q_into_data(tensor)
     }
     fn q_expand(tensor: QuantizedTensor<TtBackend>, shape: Shape) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_expand", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_expand(tensor.into_flex(), shape),
@@ -2704,6 +3023,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         dim1: usize,
         dim2: usize,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_swap_dims", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_swap_dims(tensor.into_flex(), dim1, dim2),
@@ -2711,6 +3031,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         )
     }
     fn q_permute(tensor: QuantizedTensor<TtBackend>, axes: &[usize]) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_permute", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_permute(tensor.into_flex(), axes),
@@ -2718,6 +3039,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         )
     }
     fn q_flip(tensor: QuantizedTensor<TtBackend>, axes: &[usize]) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_flip", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_flip(tensor.into_flex(), axes),
@@ -2729,6 +3051,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_select", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_select(tensor.into_flex(), dim, indices.into_flex()),
@@ -2736,6 +3059,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         )
     }
     fn q_slice(tensor: QuantizedTensor<TtBackend>, slices: &[Slice]) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_slice", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_slice(tensor.into_flex(), slices),
@@ -2747,6 +3071,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         tensor: QuantizedTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> QuantizedTensor<TtBackend> {
+        let _op = crate::report::enter("q_gather", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_gather(dim, tensor.into_flex(), indices.into_flex()),
@@ -2758,6 +3083,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("q_argmax", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_argmax(tensor.into_flex(), dim, out_dtype),
@@ -2769,6 +3095,7 @@ impl QTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("q_argmin", false);
         let device = HasDevice::tt_device(&tensor);
         FromFlex::from_flex(
             <Flex as QTensorOps<Flex>>::q_argmin(tensor.into_flex(), dim, out_dtype),
@@ -2781,6 +3108,7 @@ impl TransactionOps<TtBackend> for TtBackend {
     fn tr_execute(
         transaction: TransactionPrimitive<TtBackend>,
     ) -> impl Future<Output = Result<TransactionPrimitiveData, ExecutionError>> + Send {
+        let _op = crate::report::enter("tr_execute", true);
         crate::ops::transaction::tr_execute(transaction)
     }
 }
