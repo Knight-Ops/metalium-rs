@@ -962,6 +962,63 @@ pub fn matmul_dram(
     Ok(Work { out: c, jobs })
 }
 
+/// Fewest tiles a pipelined element-wise or reduce run may hold. Each run
+/// is a launch and a gather and scatter record of its own: card 0 lost
+/// 5-50% splitting ops into runs of 1-4 tiles.
+pub const MIN_PIPELINED_RUN: usize = 12;
+
+/// Fewest tiles a unit's share of a pipelined element-wise or reduce op may
+/// hold, per unit the op runs on. The host queues the units' lists one after
+/// another (~6 us a unit an op on card 0, and more for each run), so on many
+/// units the op is the host's, and the extra runs pipelining makes cost more
+/// than the overlap saves -- unless each unit has more to do the more units
+/// there are. Card 0 (`sfpu_pipeline_sweep`, end to end): on one tile every
+/// op of 50 tiles and up gained (0.57-0.98); on 8, adds and reductions of
+/// 128-256 tiles a unit lost up to 1.66x and 512 broke even or gained (exp
+/// 0.96, max 0.86); on 32, adds of 32-128 tiles a unit lost up to 1.5x.
+pub const PIPELINE_SHARE: usize = 48;
+
+/// [`PIPELINE_SHARE`] for a reduction: four times as much. A reduction's
+/// device time gained wherever it pipelined (0.57-0.89 on one and two tiles),
+/// but end to end, shares under ~200 tiles a unit on one tile and ~500 on two
+/// lost up to 1.15x, and 512 a unit on 8 tiles lost 1.11x.
+pub const REDUCE_PIPELINE_SHARE: usize = 4 * PIPELINE_SHARE;
+
+/// The runs of a pipelined element-wise or reduce op over `len` items of
+/// `weight` tiles each, at most `half_max` items a run (half the arena's
+/// worth): at least two a unit, so every unit has a run moving while one
+/// computes, and the same number on every unit -- the op takes as long as its
+/// busiest unit, and one extra run on a few units cost card 0 up to 25%
+/// (`exp` over 1024 tiles on 8: 18 runs, two units doing three). `None` where
+/// that would leave a run under [`MIN_PIPELINED_RUN`] tiles, a unit's share
+/// under `share` tiles per unit ([`PIPELINE_SHARE`],
+/// [`REDUCE_PIPELINE_SHARE`]), or `half_max` is zero.
+pub fn pipelined_runs(
+    len: usize,
+    weight: usize,
+    units: usize,
+    half_max: usize,
+    share: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let units = units.max(1);
+    if half_max == 0 || len * weight < share * units * units {
+        return None;
+    }
+    let parts = len.div_ceil(half_max).div_ceil(units).max(2) * units;
+    // Contiguous, as even as integer division allows.
+    let r: Vec<_> = (0..parts)
+        .map(|p| p * len / parts..(p + 1) * len / parts)
+        .collect();
+    let shortest = r.iter().map(|r| r.len()).min()?;
+    (shortest * weight >= MIN_PIPELINED_RUN).then_some(r)
+}
+
+/// Which half of the arena run `j` of a pipelined op is staged in: a unit
+/// takes runs `j`, `j + units`, ... in turn, and alternates halves.
+fn half_of(j: usize, units: usize) -> u8 {
+    ((j / units.max(1)) % 2) as u8
+}
+
 /// `slots` tile slots of scratch for the mover's own use, planned in the data
 /// arena (`crate::l1`): where an element-wise run or a column sum stages its
 /// tiles.
@@ -1062,6 +1119,7 @@ pub fn sfpu_eltwise(
     b: Option<&DramTensor>,
     c: Option<&DramTensor>,
     units: usize,
+    pipeline: bool,
 ) -> Result<Option<Work>> {
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
@@ -1097,15 +1155,30 @@ pub fn sfpu_eltwise(
         }
         _ => None,
     };
-    let group = sfpu_group(op, bcast, operands);
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
     let [rt, ct] = a.grid();
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let rb = b.map(DramTensor::tensor_ref);
+    // Pipelined (checklist 9.15): runs in alternating halves of the arena,
+    // so a unit's mover moves one run while the roles compute another.
+    let piped = pipeline
+        .then(|| {
+            pipelined_runs(
+                rt * ct,
+                1,
+                units,
+                sfpu_group(op, bcast, operands, true),
+                PIPELINE_SHARE,
+            )
+        })
+        .flatten();
+    let pipelined = piped.is_some();
+    let all = piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
     let mut jobs = Vec::new();
-    for run in runs(rt * ct, units, group) {
+    for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
-        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len) {
+        let half = pipelined.then(|| half_of(j, units));
+        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -1164,7 +1237,7 @@ pub fn sfpu_eltwise(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops,
-                half: None,
+                half,
             },
             Step::List {
                 what: "sfpu scatter",
@@ -1211,26 +1284,35 @@ pub(crate) fn sfpu_group_for_tests(
         },
         bcast,
         operands,
+        false,
     )
 }
 
+/// `half`: in half the arena, for a pipelined run.
 fn sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
+    half: bool,
 ) -> usize {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
     // scalar and broadcast, not once per op.
-    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast), usize>>;
+    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool), usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op.kind, op.scalar.to_bits(), op.scalar2.to_bits(), bcast);
+    let key = (
+        op.kind,
+        op.scalar.to_bits(),
+        op.scalar2.to_bits(),
+        bcast,
+        half,
+    );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_sfpu_group(op, bcast, operands);
+    let g = measure_sfpu_group(op, bcast, operands, half);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -1241,6 +1323,7 @@ fn measure_sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
+    half: bool,
 ) -> usize {
     const GROUP: usize = 64;
     let lens = |n: usize| -> [usize; 3] {
@@ -1261,22 +1344,37 @@ fn measure_sfpu_group(
         })
         .min()
         .unwrap();
+    let arena = if half {
+        crate::matmul::HALF
+    } else {
+        tt_isa::l1::DATA.len()
+    };
     GROUP
-        .min(crate::sfpu::kernel::max_tiles(operands))
+        .min(crate::sfpu::kernel::max_tiles_in(operands, arena))
         .min(by_program)
         .max(1)
 }
 
-/// One run's layout and role programs, memoised by op, scalar and length.
+/// One run's layout and role programs, memoised by op, scalar, length and
+/// `half` (the half of the arena a pipelined run is staged in; `None` for the
+/// whole arena).
 fn sfpu_programs(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     len: usize,
+    half: Option<u8>,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (u32, u32, u32, crate::sfpu::ops::Broadcast, usize);
+    type Key = (
+        u32,
+        u32,
+        u32,
+        crate::sfpu::ops::Broadcast,
+        usize,
+        Option<u8>,
+    );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
@@ -1285,13 +1383,18 @@ fn sfpu_programs(
         op.scalar2.to_bits(),
         bcast,
         len,
+        half,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = crate::sfpu::kernel::plan_layout(len, operands)
-        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let layout = match half {
+        None => crate::sfpu::kernel::plan_layout(len, operands),
+        Some(h) => crate::sfpu::kernel::plan_layout_in(len, operands, crate::matmul::half_arena())
+            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
+    }
+    .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
@@ -1313,6 +1416,7 @@ pub fn sfpu_reduce(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     units: usize,
+    pipeline: bool,
 ) -> Result<Work> {
     a.expect("a reduction", Elem::F32)?;
     use crate::sfpu::reduce::Axis;
@@ -1322,7 +1426,7 @@ pub fn sfpu_reduce(
         Axis::Rows => (ct, rt, a.rows % 32, DramTensor::alloc(alloc, 1, a.cols)?),
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
-    let group = match reduce_group(op, axis, per, valid) {
+    let group = match reduce_group(op, axis, per, valid, false) {
         Some(g) => g,
         None => {
             alloc.free(&out.placement);
@@ -1332,10 +1436,20 @@ pub fn sfpu_reduce(
         }
     };
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
+    let piped = pipeline
+        .then(|| {
+            let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
+            pipelined_runs(outs, per, units, half, REDUCE_PIPELINE_SHARE)
+        })
+        .flatten();
+    let pipelined = piped.is_some();
+    let all = piped.unwrap_or_else(|| runs(outs, units, group));
     let mut jobs = Vec::new();
-    for run in runs(outs, units, group) {
+    for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
-        let (layout, roles) = match reduce_programs(op, axis, len, per, valid) {
+        let half = pipelined.then(|| half_of(j, units));
+        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -1384,7 +1498,7 @@ pub fn sfpu_reduce(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
-                half: None,
+                half,
             },
             Step::List {
                 what: "reduce scatter",
@@ -1398,25 +1512,26 @@ pub fn sfpu_reduce(
 type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
 
 /// Most output tiles one reduce run may take, from the slots the data arena
-/// holds and the role programs' length per output tile; `None` if not even
-/// one fits.
+/// (half of it, if `half`) holds and the role programs' length per output
+/// tile; `None` if not even one fits.
 fn reduce_group(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
+    half: bool,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32), Option<usize>>>;
+    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool), Option<usize>>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, per, valid);
+    let key = (op, axis, per, valid, half);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_reduce_group(op, axis, per, valid);
+    let g = measure_reduce_group(op, axis, per, valid, half);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -1428,10 +1543,16 @@ fn measure_reduce_group(
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
+    half: bool,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{math_programs, plan_layout, roles};
     const GROUP: usize = 64;
-    let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    let arena = if half {
+        crate::matmul::HALF
+    } else {
+        tt_isa::l1::DATA.len()
+    };
+    let slots = (arena / TILE_SLOT) as usize;
     let by_slots = slots / (per + 1);
     if by_slots == 0 {
         return None;
@@ -1460,25 +1581,32 @@ fn measure_reduce_group(
     Some(GROUP.min(by_slots).min(by_program).max(1))
 }
 
+/// One run's layout and role programs; `half` as for [`sfpu_programs`].
 fn reduce_programs(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     len: usize,
     per: usize,
     valid: u32,
+    half: Option<u8>,
 ) -> Result<ReducePrograms> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, roles, Axis, ReduceOp};
+    use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (ReduceOp, Axis, usize, usize, u32);
+    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>);
     type Memo = Mutex<HashMap<Key, ReducePrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, len, per, valid);
+    let key = (op, axis, len, per, valid, half);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = plan_layout(len, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let layout = match half {
+        None => plan_layout(len, per),
+        Some(h) => plan_layout_in(len, per, crate::matmul::half_arena())
+            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
+    }
+    .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (inputs, fin) = math_programs(op, axis, per, valid);
     let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
@@ -1494,7 +1622,12 @@ fn reduce_programs(
 /// One run per group of output tiles when a column of `a`'s tiles fits one
 /// ([`sfpu_reduce`]); otherwise in chunks of `ROW_CHUNK` row tiles, each
 /// starting from the last's sums, all of a group's chunks one job on one unit.
-pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
+pub fn sum_rows(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    units: usize,
+    pipeline: bool,
+) -> Result<Work> {
     use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, Axis, ReduceOp, ROW_CHUNK};
     a.expect("a sum over rows", Elem::F32)?;
     let [rt, ct] = a.grid();
@@ -1502,9 +1635,11 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
         0 => 32,
         v => v,
     };
-    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid).is_some() {
-        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units);
+    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false).is_some() {
+        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, pipeline);
     }
+    // Longer columns stay plain: each chunk gathers the sums the chunk before
+    // scattered, which a pipelined list would gather before they land.
     let group = chunk_group().ok_or_else(|| {
         TensorError::Shape("a chunk of a sum over rows does not fit one tile".into())
     })?;

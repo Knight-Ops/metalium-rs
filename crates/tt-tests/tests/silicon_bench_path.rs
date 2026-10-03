@@ -625,3 +625,195 @@ fn matmul_pipeline_sweep() {
         }
     }
 }
+
+/// Whether pipelined element-wise ops and reductions are ever slower: an
+/// add, an `exp`, a sum over columns and a max over rows, from MNIST's sizes
+/// up to 2048², on 1, 8 and 32 tiles (`SWEEP_TILES`), each with pipelining off
+/// and on, device time from the mover's events alone in both. Prints the
+/// tiles a pipelined run held, the number `tensor::MIN_PIPELINED_RUN` is set
+/// from.
+#[test]
+#[ignore = "benchmark"]
+fn sfpu_pipeline_sweep() {
+    use tt_kernels::kind;
+    use tt_kernels::sfpu::ops::kind_sfpu;
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    use tt_kernels::tensor::{DramTensor, Eltwise};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    let shapes: [[usize; 2]; 6] = [
+        [64, 784],
+        [256, 256],
+        [512, 512],
+        [1024, 1024],
+        [2048, 1024],
+        [2048, 2048],
+    ];
+    type Op<T> = fn(&mut Session<T>, &DramTensor, &DramTensor) -> DramTensor;
+    let ops: [(&str, Op<tt_kmd::Kmd>); 4] = [
+        ("add", |s, a, b| {
+            s.eltwise(
+                Eltwise {
+                    kind: kind::ADD,
+                    scalar: 0.0,
+                    scalar2: 0.0,
+                },
+                a,
+                Some(b),
+            )
+            .unwrap()
+        }),
+        ("exp", |s, a, _| {
+            s.eltwise(
+                Eltwise {
+                    kind: kind_sfpu::EXP,
+                    scalar: 0.0,
+                    scalar2: 0.0,
+                },
+                a,
+                None,
+            )
+            .unwrap()
+        }),
+        ("sum over cols", |s, a, _| {
+            s.reduce(a, ReduceOp::Sum, Axis::Cols).unwrap()
+        }),
+        ("max over rows", |s, a, _| {
+            s.reduce(a, ReduceOp::Max, Axis::Rows).unwrap()
+        }),
+    ];
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.set_profile_roles(false);
+            let t = s.tile();
+            let c = Conditions::measure(s.device(), card, t);
+            let f = |n: usize, seed: u32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) % 17) as f32 / 8.0
+                            - 1.0
+                    })
+                    .collect()
+            };
+            for [r, cols] in shapes {
+                let a = s.upload(&f(r * cols, 1), r, cols).unwrap();
+                let b = s.upload(&f(r * cols, 2), r, cols).unwrap();
+                for (name, op) in ops {
+                    let mut median = [0f64; 2];
+                    let mut host_median = [0f64; 2];
+                    let mut bits: [Vec<f32>; 2] = Default::default();
+                    let mut overlapped = 0;
+                    for (on, slot) in [(false, 0usize), (true, 1)] {
+                        s.set_pipeline(on);
+                        let lists_before: u64 = s.lists_per_tile().iter().sum();
+                        let drains_before = s.drains();
+                        let t0 = Instant::now();
+                        let o = op(&mut s, &a, &b);
+                        let t1 = Instant::now();
+                        s.sync().unwrap();
+                        println!(
+                            "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles, pipeline {on}: {} lists, {} drains, call {:?}, sync {:?}",
+                            s.lists_per_tile().iter().sum::<u64>() - lists_before,
+                            s.drains() - drains_before,
+                            t1 - t0,
+                            t1.elapsed()
+                        );
+                        bits[slot] = s.download(&o).unwrap();
+                        s.free(o).unwrap();
+                        let before = s.pipelined_blocks();
+                        let cache = |s: &Session<tt_kmd::Kmd>| {
+                            s.program_cache_stats().iter().fold([0u64; 3], |a, c| {
+                                [a[0] + c.misses, a[1] + c.bytes_uploaded, a[2] + c.bypassed]
+                            })
+                        };
+                        let cache_before = cache(&s);
+                        // Past 2048 tiles a profile's events overflow the
+                        // timestamper's buffer: time those from the host.
+                        let profiled = r * cols <= 2048 * 1024;
+                        let (mut device, mut host) = (Vec::new(), Vec::new());
+                        let mut overflowed = !profiled;
+                        for _ in 0..REPS {
+                            if profiled {
+                                s.profile_start().unwrap();
+                            }
+                            let h0 = Instant::now();
+                            let o = op(&mut s, &a, &b);
+                            s.sync().unwrap();
+                            host.push(h0.elapsed().as_secs_f64() * 1e6);
+                            if profiled {
+                                match s.profile_stop() {
+                                    Ok(p) => device.push(split(&p).device),
+                                    Err(_) => overflowed = true,
+                                }
+                            }
+                            s.free(o).unwrap();
+                        }
+                        if on {
+                            overlapped = (s.pipelined_blocks() - before) / REPS as u64;
+                        }
+                        // The host's time unprofiled: a profile syncs and
+                        // drains the trace inside every op's call.
+                        let mut plain_host = Vec::new();
+                        for _ in 0..REPS {
+                            let h0 = Instant::now();
+                            let o = op(&mut s, &a, &b);
+                            s.sync().unwrap();
+                            plain_host.push(h0.elapsed().as_secs_f64() * 1e6);
+                            s.free(o).unwrap();
+                        }
+                        host = plain_host;
+                        let cache_after = cache(&s);
+                        println!(
+                            "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles, pipeline {on}: per op {} program misses, {} B uploaded, {} bypassed",
+                            (cache_after[0] - cache_before[0]) / REPS as u64,
+                            (cache_after[1] - cache_before[1]) / REPS as u64,
+                            (cache_after[2] - cache_before[2]) / REPS as u64,
+                        );
+                        let (st, timed) = if overflowed {
+                            (Stats::of(host.iter().copied()), "host")
+                        } else {
+                            (
+                                Stats::of(device.iter().copied()).map(|x| c.cycles_to_us(x)),
+                                "device",
+                            )
+                        };
+                        report(
+                            &format!(
+                                "{name} {r}x{cols} on {tiles} tiles, pipeline {}",
+                                if on { "on " } else { "off" }
+                            ),
+                            "us",
+                            timed,
+                            st,
+                        );
+                        median[slot] = st.median;
+                        host_median[slot] = Stats::of(host.iter().copied()).median;
+                    }
+                    assert!(
+                        bits[0]
+                            .iter()
+                            .zip(&bits[1])
+                            .all(|(p, q)| p.to_bits() == q.to_bits()),
+                        "{name} {r}x{cols} on {tiles} tiles: pipelined bits differ"
+                    );
+                    println!(
+                        "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles: on/off {:.3}, host {:.3} ({overlapped} runs overlapped)",
+                        median[1] / median[0],
+                        host_median[1] / host_median[0],
+                    );
+                }
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}

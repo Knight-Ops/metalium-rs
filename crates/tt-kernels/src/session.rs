@@ -449,6 +449,54 @@ struct Segment {
 /// has finished. If fragmentation leaves no room beside what is pinned, the
 /// cache starts again from empty: `segments` keeps a list's programs within
 /// the region, so they always fit a fresh one.
+/// Role `t`'s program of a kernel as the cache stores it (`Code::stored`),
+/// with its [`program_cache::hash`]: worked out once per program, not once
+/// per kernel enqueued -- on 8 tiles, re-encoding and rehashing every
+/// program on every list cost the host more than the device spent on the op.
+/// Keyed by the programs' allocations, which the memo keeps alive, so a key
+/// is never reused; cleared when it grows past `MEMO_MAX`, since some ops
+/// build fresh programs every call.
+fn stored_program(
+    roles: &Arc<[Vec<Instruction>; 3]>,
+    loops: &Arc<[Vec<crate::code::Loop>; 3]>,
+    t: usize,
+) -> Result<(Arc<[u32]>, u32, u64), TensorError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Stored = (Arc<[u32]>, u32, u64);
+    type Entry = (
+        Arc<[Vec<Instruction>; 3]>,
+        Arc<[Vec<crate::code::Loop>; 3]>,
+        [Option<Stored>; 3],
+    );
+    const MEMO_MAX: usize = 4096;
+    static MEMO: OnceLock<Mutex<HashMap<(usize, usize), Entry>>> = OnceLock::new();
+    let key = (Arc::as_ptr(roles) as usize, Arc::as_ptr(loops) as usize);
+    let mut memo = MEMO
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = memo.get(&key).and_then(|e| e.2[t].clone()) {
+        return Ok(s);
+    }
+    let code = crate::code::Code {
+        ins: roles[t].clone(),
+        loops: loops[t].clone(),
+    };
+    let (words, len_word) = code
+        .stored()
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let h = crate::program_cache::hash(&words);
+    let stored: Stored = (Arc::from(words), len_word, h);
+    if memo.len() >= MEMO_MAX && !memo.contains_key(&key) {
+        memo.clear();
+    }
+    memo.entry(key)
+        .or_insert_with(|| (roles.clone(), loops.clone(), [None, None, None]))
+        .2[t] = Some(stored.clone());
+    Ok(stored)
+}
+
 fn place_programs<T: Transport>(
     dev: &mut Device<T>,
     window: &tt_device::Window,
@@ -474,14 +522,9 @@ fn place_programs<T: Transport>(
                 if program.is_empty() {
                     continue;
                 }
-                let code = crate::code::Code {
-                    ins: program.clone(),
-                    loops: seg.kernel_loops[k][t].clone(),
-                };
-                let (words, len_word) = code
-                    .stored()
-                    .map_err(|e| PlaceError::Failed(TensorError::Shape(e.to_string())))?;
-                let at = match cache.place(&words) {
+                let (words, len_word, h) =
+                    stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
+                let at = match cache.place_hashed(&words, h) {
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -868,9 +911,12 @@ fn pipeline_groups(steps: Vec<Step>) -> Vec<Item> {
             && run.len() < GROUP_MAX
             && run_entries + block_entries + 1 < LIST_MAX as usize
             && (!new || resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+            // Not the loops: a group's programs are all resident, and a
+            // resident program carries its own (`add_kernel`) -- an
+            // element-wise run's repeat its tile count.
             && run
                 .last()
-                .is_some_and(|b| b.init == init && b.mop == *mop && b.loops == loops);
+                .is_some_and(|b| b.init == init && b.mop == *mop);
         if !joins {
             flush(&mut run, &mut items);
             run_entries = 0;
@@ -2117,10 +2163,11 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
+        let pipeline = self.pipeline && self.capture.is_none();
         let alloc = &mut self.dram_state()?.alloc;
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
         // The SFPU's, or refused: the mover only moves data.
-        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units)? else {
+        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units, pipeline)? else {
             return Err(TensorError::Shape(format!(
                 "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
             )));
@@ -2176,7 +2223,8 @@ impl<T: Transport> Session<T> {
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units)?;
+        let pipeline = self.pipeline && self.capture.is_none();
+        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units, pipeline)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::SumRows.produces(&[a]));
         Ok(out)
@@ -2198,7 +2246,9 @@ impl<T: Transport> Session<T> {
             return self.sum_rows(a);
         }
         let units = self.units.len();
-        let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units)?;
+        let pipeline = self.pipeline && self.capture.is_none();
+        let work =
+            tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, pipeline)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)

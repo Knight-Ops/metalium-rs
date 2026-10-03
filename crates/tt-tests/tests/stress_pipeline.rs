@@ -1,5 +1,6 @@
 //! Stress: pipelined matmuls (`Session::set_pipeline`, on by default) queued
-//! back to back with element-wise ops between them, for as long as
+//! back to back with element-wise ops and reductions between them, each
+//! pipelined where it pays, for as long as
 //! `STRESS_SECS` says (default 60 s on silicon, two rounds on the simulator),
 //! every result checked against the plain path's bits.
 //!
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
+use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
 use tt_kernels::tensor::{pipelining_pays, Eltwise};
 use tt_tests::harness::BUDGET;
 use tt_ttsim::fork_scope;
@@ -75,10 +77,13 @@ fn soak<T: tt_device::Transport>(s: &mut Session<T>, tiles: usize) {
             .matmul_dram(&a, false, &b, false, ROUTE, Fidelity::HiFi4, BUDGET)
             .unwrap();
         let d = s.eltwise(add, &c, Some(&bias)).unwrap();
+        let e = s.reduce(&d, ReduceOp::Max, Axis::Rows).unwrap();
         let (cv, dv) = (s.download(&c).unwrap(), s.download(&d).unwrap());
-        s.free(c).unwrap();
-        s.free(d).unwrap();
-        cases.push(([m, kk, n], a, b, bias, cv, dv));
+        let ev = s.download(&e).unwrap();
+        for t in [c, d, e] {
+            s.free(t).unwrap();
+        }
+        cases.push(([m, kk, n], a, b, bias, cv, (dv, ev)));
     }
     assert!(
         SHAPES.iter().any(|&sh| pipelining_pays(
@@ -106,13 +111,18 @@ fn soak<T: tt_device::Transport>(s: &mut Session<T>, tiles: usize) {
             let d = s
                 .eltwise(add, &c, Some(bias))
                 .unwrap_or_else(|e| panic!("{tiles} tiles, round {round}: {e}"));
-            outs.push((i, c, d));
+            let e = s
+                .reduce(&d, ReduceOp::Max, Axis::Rows)
+                .unwrap_or_else(|e| panic!("{tiles} tiles, round {round}: {e}"));
+            outs.push((i, c, d, e));
         }
-        for (i, c, d) in outs {
-            let (shape, _, _, _, cv, dv) = &cases[i];
+        for (i, c, d, e) in outs {
+            let (shape, _, _, _, cv, (dv, ev)) = &cases[i];
             let what = format!("{tiles} tiles, round {round}, {shape:?}");
             same_bits(&s.download(&c).unwrap(), cv, &format!("{what}, product"));
             same_bits(&s.download(&d).unwrap(), dv, &format!("{what}, sum"));
+            same_bits(&s.download(&e).unwrap(), ev, &format!("{what}, max"));
+            s.free(e).unwrap();
             s.free(c).unwrap();
             s.free(d).unwrap();
         }

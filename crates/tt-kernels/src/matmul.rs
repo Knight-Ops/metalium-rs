@@ -912,7 +912,7 @@ pub enum Staging {
 pub const HALF: u64 = (tt_isa::l1::DATA.len() / 2) / 4096 * 4096;
 
 /// The first half of the data arena ([`Staging::SlotsHalf`]).
-fn half_arena() -> tt_isa::l1::Region {
+pub(crate) fn half_arena() -> tt_isa::l1::Region {
     tt_isa::l1::Region {
         name: "first half of the data arena",
         base: tt_isa::l1::DATA.base,

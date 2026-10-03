@@ -100,9 +100,33 @@ pub struct Layout {
     pub init: Vec<SemaphoreInit>,
 }
 
+impl Layout {
+    /// This layout with every slot `by` bytes on, its semaphores where they
+    /// were: the second half of a double-buffered pair.
+    pub fn shifted(&self, by: u64) -> Layout {
+        Layout {
+            a_at: self.a_at + by,
+            b_at: self.b_at.map(|b| b + by),
+            c_at: self.c_at.map(|c| c + by),
+            out_at: self.out_at + by,
+            ..self.clone()
+        }
+    }
+}
+
 /// Plan a run of `tiles` tiles in the data arena: slots for the operands and
 /// the outputs, and the three semaphores.
 pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError> {
+    plan_layout_in(tiles, operands, tt_isa::l1::DATA)
+}
+
+/// [`plan_layout`] in `arena`: half the data arena, for a run double-buffered
+/// with the next (`crate::matmul::half_arena`, then [`Layout::shifted`]).
+pub fn plan_layout_in(
+    tiles: usize,
+    operands: Operands,
+    arena: tt_isa::l1::Region,
+) -> Result<Layout, PlanError> {
     let mut req = Requirements::new(1);
     let bytes = tiles as u64 * TILE_SLOT;
     let align = tt_isa::dram::ALIGN;
@@ -117,7 +141,7 @@ pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError
     let unpacked = req.semaphore("sfpu unpacked", 0, 0..1);
     let free = req.semaphore("sfpu Dst free", 1, 0..1);
     let computed = req.semaphore("sfpu computed", 0, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA)?;
+    let plan = req.plan(arena)?;
     Ok(Layout {
         tiles,
         a_at: plan.addr(a),
@@ -136,12 +160,17 @@ pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError
 /// Most tiles a run may have: a slot per operand and one for the output, each,
 /// in the data arena.
 pub fn max_tiles(operands: Operands) -> usize {
+    max_tiles_in(operands, tt_isa::l1::DATA.len())
+}
+
+/// [`max_tiles`] in an arena of `bytes`.
+pub fn max_tiles_in(operands: Operands, bytes: u64) -> usize {
     let per = match operands {
         Operands::Unary => 2,
         Operands::Ternary => 4,
         _ => 3,
     };
-    (tt_isa::l1::DATA.len() / (per * TILE_SLOT)) as usize
+    (bytes / (per * TILE_SLOT)) as usize
 }
 
 /// The three role programs of a run over `layout`'s tiles, `math` -- one

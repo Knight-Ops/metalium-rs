@@ -1469,7 +1469,8 @@ tiles, done in turn. The slices from there:
     - [x] GDDR matmuls: `LAUNCH` / `KERNEL_WAIT`, blocks in two halves of the
       arena, on by default where `tensor::pipelining_pays` (`step54_pipeline`,
       `stress_pipeline`).
-    - [ ] Element-wise and reductions.
+    - [x] Element-wise and reductions, where `tensor::pipelined_runs`
+      (`step55_pipeline_sfpu`); long chunked sums over rows stay plain.
     - `KERNEL` drains the moves and blocks B until all three roles acknowledge.
     - Separate launch and wait entries, with explicit ownership of each L1
       staging buffer, let B gather the next block and scatter the previous one
@@ -1478,6 +1479,20 @@ tiles, done in turn. The slices from there:
       (`SIGNAL` / `WAIT_PEER`), B-only by default.
     - `copy_pipeline` found B's own pipelining within 3-5% of B+NC at large
       entries and NC 1.6x faster at 4 KiB, so both are measured.
+  - [ ] **9.17 Host time per op, measured first (research).**
+    - On many tiles an element-wise op or reduction is the host's: it queues
+      each unit's list in turn, ~6 us a unit an op on card 0, so a 50-tile max
+      over rows took 54 us on 8 tiles and 155 on 32 (`sfpu_pipeline_sweep`).
+      It is also why pipelining those ops loses past a few tiles
+      (`tensor::PIPELINE_SHARE`).
+    - Split the per-unit cost first (list build, program lookup, descriptor
+      reserve, ring write, doorbell) with the host profile.
+    - Likely fix: Tenstorrent's Metal Trace, recorded once and replayed. This
+      workspace already captures and replays (`Session` traces,
+      `step39_traces`): measure how much host time a replay removes, and make
+      pipelined lists capturable (pipelining is off while capturing).
+    - Then consider what replay cannot cover: one list multicast to every
+      unit, or a unit expanding its share from one record.
   - [ ] **9.16 Role program streaming, measured first.**
     - Every launch streams its program words through RISC-V stores.
     - Measure the instruction-heavy kernels (SFPU `exp`: roles 87% busy) before

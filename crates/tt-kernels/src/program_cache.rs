@@ -26,6 +26,7 @@
 //! * **Invalidated** whenever the tile is reset ([`ProgramCache::clear`]).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use tt_isa::l1::Region;
 
@@ -60,7 +61,8 @@ pub enum CacheError {
 }
 
 struct Resident {
-    words: Vec<u32>,
+    words: Arc<[u32]>,
+    hash: u64,
     at: u64,
     last_use: u64,
     pinned: bool,
@@ -90,7 +92,8 @@ pub fn admitted(words: usize) -> bool {
 /// anything else).
 const ALIGN: u64 = 16;
 
-fn hash(words: &[u32]) -> u64 {
+/// The key [`ProgramCache::place_hashed`] takes with a program's words.
+pub fn hash(words: &[u32]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     words.hash(&mut h);
@@ -123,17 +126,25 @@ impl ProgramCache {
 
     /// Place `words`, pinning it until [`ProgramCache::unpin_all`].
     pub fn place(&mut self, words: &[u32]) -> Result<Placed, CacheError> {
+        self.place_hashed(&Arc::from(words), hash(words))
+    }
+
+    /// [`ProgramCache::place`] of words whose [`hash`] the caller kept: a
+    /// hit on the same allocation costs no pass over the words (a role
+    /// program is up to eight thousand of them, and every kernel of every
+    /// list looks its three up).
+    pub fn place_hashed(&mut self, words: &Arc<[u32]>, h: u64) -> Result<Placed, CacheError> {
         if !self.admits(words.len()) {
             self.stats.bypassed += 1;
             return Ok(Placed::Bypass);
         }
         self.clock += 1;
-        let h = hash(words);
-        if let Some(&i) = self
-            .by_hash
-            .get(&h)
-            .and_then(|v| v.iter().find(|&&i| self.resident[i].words == words))
-        {
+        if let Some(&i) = self.by_hash.get(&h).and_then(|v| {
+            v.iter().find(|&&i| {
+                let r = &self.resident[i].words;
+                Arc::ptr_eq(r, words) || **r == **words
+            })
+        }) {
             let r = &mut self.resident[i];
             r.last_use = self.clock;
             r.pinned = true;
@@ -161,7 +172,8 @@ impl ProgramCache {
             self.free.insert(at + bytes, len - bytes);
         }
         self.resident.push(Resident {
-            words: words.to_vec(),
+            words: words.clone(),
+            hash: h,
             at,
             last_use: self.clock,
             pinned: true,
@@ -187,7 +199,7 @@ impl ProgramCache {
     fn reindex(&mut self) {
         self.by_hash.clear();
         for (i, r) in self.resident.iter().enumerate() {
-            self.by_hash.entry(hash(&r.words)).or_default().push(i);
+            self.by_hash.entry(r.hash).or_default().push(i);
         }
     }
 
