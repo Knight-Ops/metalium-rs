@@ -19,6 +19,8 @@ num-traits = { version = "0.2", default-features = false }
 tt-kernels.workspace = true
 tt-kmd.workspace = true
 tt-firmware-images.workspace = true
+# `atexit`, for `TT_REPORT=1` (`report.rs`).
+libc.workspace = true
 
 [dev-dependencies]
 burn-tensor.workspace = true

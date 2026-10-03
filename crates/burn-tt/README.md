@@ -19,7 +19,11 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | `float_transpose` / `float_swap_dims` (2-D) | a view: same buffer, read transposed |
 | `float_slice` of whole rows on 32-row bounds | a view, no copy |
 
-Element-wise ops go to the device only when an operand is already there. Any F32
+Element-wise ops go to the device only when an operand is already there. A rank-N
+`float_matmul` whose right side has no real batch (a `Linear` over `[b, s, d]`) folds
+the batch into the rows and runs as the 2-D product; so do `linear_weight_backward` and
+`linear_bias_backward`. The table above is the first ops; `hardware-coverage.md`'s Burn
+op tables are the full list, and `TT_REPORT=1` says what a given model ran where. Any F32
 `float_matmul` the above does not cover (batched, or an engine without GDDR such as
 `Topology::Cards`) still runs on the card, staged from the host (`Engine::matmul`).
 Everything else downloads its inputs once and runs on Flex.
@@ -70,6 +74,8 @@ unparsable value as `0`.
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
 | `TT_EXACT` | unset, `1` | `1`: only ops that reproduce `burn-flex`'s bits exactly run on the card; the approximations held to derived bounds (division, `exp`, `log`, sums over columns, softmax) run on the host. For runs checked against a host golden. |
 | `TT_PROFILE` | unset, a path | Records a device-side profile of everything an attachment runs and writes it as Chrome trace JSON on detach (`{chip}` in the path becomes the card). Silicon only. |
+| `TT_REPORT` | unset, `1` | `1`: print the per-op report at exit (`burn_tt::report`): for every op, calls, results made on the device and on the host, bytes downloaded, uploaded and host-staged, and whether `burn-tt` implements it (`tt`) or Flex runs it (`flex`). The worklist for a new model. |
+| `TT_STRICT` | unset, `1` | `1`: a download a host op causes, or a host-staged matmul, panics with the op's name (`burn_tt::set_strict`; one thread's block: `burn_tt::strictly`). Reading results back (`into_data`) is never one; `burn_tt::host_ok(..)` marks intended host work. |
 | `TT_TRACE_FALLBACK` | unset, any | Prints a backtrace whenever a device tensor is downloaded for a host op: the way to find what still crosses PCIe. |
 | `TT_TOPOLOGY` | unset, `0`, `0,1` | Which card(s) `Topology::from_env` attaches: one card, or several sharing each matmul. Read by callers that use it (the `tt-tests` harness), not by `attach` itself. |
 | `TT_TILES` | unset, `n`, `all` | How many Tensix tiles a card computes on (`tiles_from_env`). Read by callers that use it (the `tt-tests` harness; `tt-mnist` takes `--tiles` instead). |

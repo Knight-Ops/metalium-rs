@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "tt_mnist"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tt-mnist"
 path = "src/main.rs"

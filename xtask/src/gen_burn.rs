@@ -184,6 +184,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "log_sigmoid_backward",
         ],
     ),
+    (
+        "ModuleOps",
+        &["linear_weight_backward", "linear_bias_backward"],
+    ),
     ("QTensorOps", &["q_device", "q_to_device", "q_into_data"]),
     ("TransactionOps", &["tr_execute"]),
 ];
@@ -759,7 +763,12 @@ pub fn render(
                 .map(|(p, _)| p.trim_start_matches("mut ").trim())
                 .collect();
             impls.push_str(&format!("fn {}({}){ret} {{\n", m.name, params.join(", ")));
-            if hand.contains(&m.name.as_str()) {
+            let is_hand = hand.contains(&m.name.as_str());
+            impls.push_str(&format!(
+                "let _op = crate::report::enter(\"{}\", {is_hand});\n",
+                m.name
+            ));
+            if is_hand {
                 impls.push_str(&format!(
                     "crate::ops::{}::{}({})\n}}\n",
                     module_of(tr),
@@ -898,6 +907,8 @@ pub trait FloatTensorOps<B: Backend> {
         let m = parse_trait(SAMPLE, "FloatTensorOps").unwrap();
         let out = render(&[("FloatTensorOps", m)], &[]).unwrap();
         assert!(out.contains("let device = HasDevice::tt_device(&lhs);"));
+        // Every op opens a report guard, so none goes unreported.
+        assert!(out.contains("let _op = crate::report::enter(\"float_add\", false);"));
         assert!(out.contains(
             "<Flex as FloatTensorOps<Flex>>::float_add(lhs.into_flex(), rhs.into_flex())"
         ));

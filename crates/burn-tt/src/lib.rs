@@ -1,12 +1,13 @@
 //! A Burn backend for Tenstorrent Blackhole.
 //!
 //! **What runs where.** Every op runs on the host through `burn-flex` except
-//! the ones listed in `xtask/src/gen_burn.rs`'s `OVERRIDDEN`: matmul, add, sub,
-//! mul, mul by a scalar, the sum over rows, row slices and transposes, and the
-//! ReLU pair, each on the device when its F32 matrix operands are already there
-//! (tensors live in GDDR once uploaded, `tensor::TtTensor`), and on the host
-//! otherwise -- counted by [`tensor_traffic`] and named with
-//! `TT_TRACE_FALLBACK=1`. The forwarding is generated from the
+//! the ones listed in `xtask/src/gen_burn.rs`'s `OVERRIDDEN` (matmul, the
+//! element-wise and SFPU families, reductions, softmax, views; the full list
+//! is `docs/hardware-coverage.md`'s Burn op tables), each on the device when
+//! its operands are already there (tensors live in GDDR once uploaded,
+//! `tensor::TtTensor`), and on the host otherwise. [`report`] says which op
+//! ran where and what each moved (`TT_REPORT=1` prints it at exit;
+//! `TT_STRICT=1` makes a fallback that moves bytes a panic). The forwarding is generated from the
 //! pinned `burn-backend`'s op traits (`cargo xtask gen-burn-delegate`), so
 //! `burn-tt` behaves exactly as Flex does wherever it has not been told
 //! otherwise, and each op moved to the device is a change behind an unchanged
@@ -27,12 +28,16 @@
 mod convert;
 mod generated;
 mod ops;
+mod report;
 mod server;
 mod tensor;
 mod topology;
 mod trace;
 mod traffic;
 
+pub use report::{
+    host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
+};
 pub use server::{
     attach, device_traffic, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Elem,
     Engine, EngineError, KmdEngine, MeshEngine, PowArg, Serve, TraceRun,

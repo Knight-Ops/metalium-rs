@@ -72,10 +72,13 @@ fn a_2d_matmul_is_one_engine_run() {
     check::<2>(&[5, 7], &[7, 3], 1, TtDevice::new(100));
 }
 
+/// A real batch on the right is one run per element; a right side with no
+/// batch (a `Linear`'s weight, unsqueezed) folds the left's batch into its
+/// rows and is one run.
 #[test]
 fn batches_are_one_run_each_and_broadcast() {
     check::<3>(&[4, 5, 7], &[4, 7, 3], 4, TtDevice::new(101));
-    check::<3>(&[4, 5, 7], &[1, 7, 3], 4, TtDevice::new(102));
+    check::<3>(&[4, 5, 7], &[1, 7, 3], 1, TtDevice::new(102));
     check::<4>(&[2, 1, 5, 7], &[1, 3, 7, 2], 6, TtDevice::new(103));
 }
 

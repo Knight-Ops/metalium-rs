@@ -634,6 +634,7 @@ fn timed_run<R: Send + 'static>(
 
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
+    crate::report::staged(mkn);
     let (a, b) = (a.to_vec(), b.to_vec());
     timed_run("matmul_host", device, move |engine| {
         engine.matmul(&a, &b, mkn)
@@ -671,6 +672,7 @@ pub fn device_traffic(device: TtDevice) -> Option<tt_device::Traffic> {
 /// Upload, panicking on a device error.
 pub(crate) fn upload(device: TtDevice, values: Vec<f32>, rows: usize, cols: usize) -> BufferId {
     crate::traffic::uploaded(rows, cols);
+    crate::report::uploaded(rows, cols);
     timed_run("upload", device, move |engine| {
         engine.upload(&values, rows, cols)
     })
@@ -686,6 +688,7 @@ pub(crate) fn upload_bits(
     elem: Elem,
 ) -> BufferId {
     crate::traffic::uploaded(rows, cols);
+    crate::report::uploaded(rows, cols);
     timed_run("upload", device, move |engine| {
         engine.upload_bits(&bits, rows, cols, elem)
     })
@@ -698,6 +701,7 @@ pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: u
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
     debug_assert_eq!(v.len(), rows * cols);
     crate::traffic::downloaded(rows, cols);
+    crate::report::downloaded(rows, cols);
     v
 }
 
@@ -708,6 +712,7 @@ pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize)
         .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
     debug_assert_eq!(v.len(), rows * cols);
     crate::traffic::downloaded(rows, cols);
+    crate::report::downloaded(rows, cols);
     v
 }
 

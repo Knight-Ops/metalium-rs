@@ -565,6 +565,9 @@ pub mod float {
             );
             return device_result(device, id, [m, n]);
         }
+        if let Some(t) = folded_matmul(&lhs, &rhs) {
+            return t;
+        }
         let ls = lhs.shape().to_vec();
         let rs = rhs.shape().to_vec();
         let rank = ls.len().max(rs.len());
@@ -627,6 +630,34 @@ pub mod float {
         let mut shape = batch;
         shape.extend([m, n]);
         TtTensor::new(FlexTensor::from_data(TensorData::new(out, shape)), device)
+    }
+
+    /// `[.., m, k] @ [1, .., 1, k, n]` -- a Linear over a rank-N input, whose
+    /// weight Burn's `linear` unsqueezes to the input's rank -- as one matrix
+    /// product: the batch folds into the rows, `[prod(..) m, k] @ [k, n]`,
+    /// exactly the product per batch element, and the reshapes on either side
+    /// are views of resident data (`stored_dims`). On the device whenever the
+    /// rank-2 product is; `None` when the rhs has a real batch (B6).
+    fn folded_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+        use burn_backend::Shape;
+        let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
+        if ls.len() < 2 || rs.len() < 2 || ls.len().max(rs.len()) == 2 {
+            return None;
+        }
+        if rs[..rs.len() - 2].iter().any(|&b| b != 1) {
+            return None;
+        }
+        let (k, n) = (rs[rs.len() - 2], rs[rs.len() - 1]);
+        if ls[ls.len() - 1] != k {
+            return None;
+        }
+        let rows: usize = ls[..ls.len() - 1].iter().product();
+        let mut out = vec![1; rs.len().saturating_sub(ls.len())];
+        out.extend_from_slice(&ls[..ls.len() - 1]);
+        out.push(n);
+        let a = float_reshape(lhs.clone(), Shape::new([rows, k]));
+        let b = float_reshape(rhs.clone(), Shape::new([k, n]));
+        Some(float_reshape(float_matmul(a, b), Shape::from(out)))
     }
 
     /// Swapping the two dimensions of a matrix already on the device is a view
@@ -1185,6 +1216,42 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
         <Flex as FloatTensorOps<Flex>>::float_into_data(tensor.into_host())
+    }
+}
+
+pub mod module {
+    use super::*;
+    use burn_backend::Shape;
+
+    /// `dW = x^T @ dY` over every row of every batch element at once:
+    /// `[d, prod(..)] @ [prod(..), e]`, one matrix product that the device
+    /// runs on resident operands (the transpose is a view). Burn's default
+    /// takes a batched product per element and sums over the batch, which
+    /// for a rank-N input never reaches the device's rank-2 path. The same
+    /// sum, in one accumulation rather than per element then across; for a
+    /// rank-2 input, the default's exact computation.
+    pub fn linear_weight_backward(
+        x: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let (xs, gs) = (x.shape().to_vec(), output_grad.shape().to_vec());
+        let (d, e) = (xs[xs.len() - 1], gs[gs.len() - 1]);
+        let rows: usize = xs[..xs.len() - 1].iter().product();
+        let x = float::float_reshape(x, Shape::new([rows, d]));
+        let g = float::float_reshape(output_grad, Shape::new([rows, e]));
+        float::float_matmul(float::float_swap_dims(x, 0, 1), g)
+    }
+
+    /// `db`, the sum of `dY` over every row of every batch element: one sum
+    /// over the rows of `[prod(..), e]` -- on the device, in Flex's order
+    /// over those rows (`float_sum_dim`) -- where Burn's default sums one
+    /// leading dimension at a time, and a rank-N sum is not a device one.
+    pub fn linear_bias_backward(output_grad: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let gs = output_grad.shape().to_vec();
+        let e = gs[gs.len() - 1];
+        let rows: usize = gs[..gs.len() - 1].iter().product();
+        let g = float::float_reshape(output_grad, Shape::new([rows, e]));
+        float::float_reshape(float::float_sum_dim(g, 0), Shape::new([e]))
     }
 }
 
