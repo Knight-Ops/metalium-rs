@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
+use tt_kernels::tensor::{Block, BlockMove};
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, SessionError, TileChoice};
@@ -83,6 +84,28 @@ pub trait Engine {
         _a_transposed: bool,
         _b: BufferId,
         _b_transposed: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// `op(A_i) @ op(B_i)` for each pair of blocks of `a` and `b` in `items`,
+    /// every product `mkn`, stacked into one `[items.len() m, n]` result left
+    /// on the device (`Session::matmul_dram_batched`).
+    fn matmul_dram_batched(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+        _items: &[(Block, Block)],
+        _mkn: [usize; 3],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// A new `dims` buffer assembled from blocks of `a`
+    /// (`Session::copy_blocks`).
+    fn copy_blocks(
+        &mut self,
+        _a: BufferId,
+        _moves: &[BlockMove],
+        _dims: [usize; 2],
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
@@ -368,6 +391,39 @@ impl DramBuffers {
         self.next += 1;
         self.live.insert(self.next, c);
         Ok((self.next, dims))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_batched<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        b: BufferId,
+        items: &[(Block, Block)],
+        mkn: [usize; 3],
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let c = s
+            .matmul_dram_batched(&ta, &tb, items, mkn, route, fidelity, budget)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    pub fn copy_blocks<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        moves: &[BlockMove],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let c = s
+            .copy_blocks(&ta, moves, dims)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
     }
 
     pub fn eltwise<T: tt_device::Transport>(
@@ -782,6 +838,33 @@ pub(crate) fn matmul_dram(
     .unwrap_or_else(|e| panic!("matmul on {device}: {e}"))
 }
 
+/// A batched matmul over blocks on the device, panicking on a device error.
+pub(crate) fn matmul_dram_batched(
+    device: TtDevice,
+    a: BufferId,
+    b: BufferId,
+    items: Vec<(Block, Block)>,
+    mkn: [usize; 3],
+) -> (BufferId, [usize; 2]) {
+    timed_run("matmul_dram", device, move |engine| {
+        engine.matmul_dram_batched(a, b, &items, mkn)
+    })
+    .unwrap_or_else(|e| panic!("batched matmul on {device}: {e}"))
+}
+
+/// A block copy on the device, panicking on a device error.
+pub(crate) fn copy_blocks(
+    device: TtDevice,
+    a: BufferId,
+    moves: Vec<BlockMove>,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    timed_run("copy_blocks", device, move |engine| {
+        engine.copy_blocks(a, &moves, dims)
+    })
+    .unwrap_or_else(|e| panic!("block copy on {device}: {e}"))
+}
+
 // --- Silicon ------------------------------------------------------------------
 
 /// The silicon engine: a [`Session`] on `/dev/tenstorrent/N`.
@@ -896,6 +979,34 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.slice_rows(a, first, rows)
+    }
+    fn matmul_dram_batched(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        items: &[(Block, Block)],
+        mkn: [usize; 3],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul_batched(
+            &mut self.session,
+            a,
+            b,
+            items,
+            mkn,
+            self.route,
+            self.fidelity,
+            self.budget,
+        )
+    }
+    fn copy_blocks(
+        &mut self,
+        a: BufferId,
+        moves: &[BlockMove],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.copy_blocks(&mut self.session, a, moves, dims)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())

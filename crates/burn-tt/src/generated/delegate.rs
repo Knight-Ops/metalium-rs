@@ -610,12 +610,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_mean_dim", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_mean_dim(tensor.into_flex(), dim),
-            device,
-        )
+        let _op = crate::report::enter("float_mean_dim", true);
+        crate::ops::float::float_mean_dim(tensor, dim)
     }
     fn float_cumsum(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cumsum", false);

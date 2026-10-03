@@ -2922,6 +2922,27 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// A new `dims` tensor assembled from blocks of `t`
+    /// ([`tensor::copy_blocks`]): a tile-moving reshape or permute, on the
+    /// card. Its padding is `t`'s: a block ragged at all is ragged at both
+    /// tensors' edges.
+    pub fn copy_blocks(
+        &mut self,
+        t: &DramTensor,
+        moves: &[tensor::BlockMove],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let work = tensor::copy_blocks(&mut self.dram_state()?.alloc, t, moves, dims, units)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(if t.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
+    }
+
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
     /// ([`tensor::sum_rows`]).
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
@@ -3041,6 +3062,65 @@ impl<T: Transport> Session<T> {
                     fidelity,
                     units,
                     allow_mop,
+                    pipeline,
+                )
+            })
+            .and_then(|work| self.execute(work, budget));
+        for c in [ca, cb].into_iter().flatten() {
+            self.free(c)?;
+        }
+        let out = out?;
+        out.set_pad(need.produces(&[a, b]));
+        Ok(out)
+    }
+
+    /// `op(A_i) @ op(B_i)` for each pair of blocks in `items`, every product
+    /// `[m, k] @ [k, n]`, into one `[items.len() m, n]` tensor in GDDR
+    /// ([`tensor::matmul_dram_batched`]): a batched matmul whose operands are
+    /// resident tensors or tile-aligned blocks of them, gathered where they
+    /// lie.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dram_batched(
+        &mut self,
+        a: &DramTensor,
+        b: &DramTensor,
+        items: &[(tensor::Block, tensor::Block)],
+        mkn: [usize; 3],
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<DramTensor, TensorError> {
+        use tensor::OpPadding;
+        a.expect("a matmul", tensor::Elem::F32)?;
+        b.expect("a matmul", tensor::Elem::F32)?;
+        // A block that reaches its tensor's ragged edge reads the tensor's
+        // padding as `K`'s: the same fill `matmul_dram` asks for.
+        let need = tensor::MatmulPadding;
+        let ca = self.meet(a, need.requires(0))?;
+        let cb = match self.meet(b, need.requires(1)) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(c) = ca {
+                    let _ = self.free(c);
+                }
+                return Err(e);
+            }
+        };
+        let units = self.units.len();
+        let pipeline = self.pipeline && self.capture.is_none();
+        let out = self
+            .dram_state()
+            .and_then(|d| {
+                tensor::matmul_dram_batched(
+                    &mut d.alloc,
+                    ca.as_ref().unwrap_or(a),
+                    cb.as_ref().unwrap_or(b),
+                    items,
+                    mkn,
+                    route,
+                    fidelity,
+                    units,
+                    false,
                     pipeline,
                 )
             })

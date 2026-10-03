@@ -1158,7 +1158,6 @@ pub fn matmul_dram(
         )));
     }
     let k = ka;
-    let (in_fmt, out_fmt) = route.formats();
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
     // Pipelined (checklist 9.15): each block in half the arena, consecutive
     // blocks of a unit alternating halves, so the session can move the next
@@ -1182,93 +1181,257 @@ pub fn matmul_dram(
     let c = DramTensor::alloc(alloc, m, n)?;
     let rc = c.tensor_ref();
     let mut jobs = Vec::new();
-    for i0 in (0..mt).step_by(mc) {
-        let rows = mc.min(mt - i0);
-        for j0 in (0..nt).step_by(nc) {
-            let cols = nc.min(nt - j0);
-            let tiles = [rows, kt, cols];
-            // A session deals job `j` to unit `j % units`, so a unit's blocks
-            // are every `units`-th: they alternate halves by `j / units`.
-            let half =
-                (staging == Staging::SlotsHalf).then(|| ((jobs.len() / units.max(1)) % 2) as u8);
-            let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
-                Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
-                Ok(l) => l,
-                Err(e) => {
-                    alloc.free(&c.placement);
-                    return Err(e.into());
-                }
-            };
-            let matmul::Layout {
-                a_at,
-                b_at,
-                outputs,
-                sems,
-                init,
-            } = layout;
-            let flags = u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
-            let gather = [
-                [
-                    record::GATHER,
-                    flags,
-                    a_at as u32,
-                    b_at as u32,
-                    i0 as u32,
-                    rows as u32,
-                    j0 as u32,
-                    cols as u32,
-                ],
-                ra.encode()[0],
-                ra.encode()[1],
-                rb.encode()[0],
-                rb.encode()[1],
-            ];
-            // The cache tells the stagings and halves apart: their programs
-            // name different addresses.
-            let variant = half.map_or(0, |h| 1 + h);
-            let (roles, mop) =
-                matmul::kernel_programs(tiles, variant, route, fidelity, sems, allow_mop, || {
-                    matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop)
-                });
-            // Only the datums go back: the packer writes nothing else, and the
-            // unpacker skips the header whatever it holds (`step18_dram_matmul`).
-            // The outputs sit one slot apart from the first (`plan_layout_in`).
-            let out_at = outputs[0].out;
-            debug_assert!(outputs
-                .iter()
-                .enumerate()
-                .all(|(k, o)| o.out == out_at + k as u64 * TILE_SLOT));
-            let scatter = [
-                [
-                    record::SCATTER,
-                    out_at as u32,
-                    TILE_SLOT as u32,
-                    i0 as u32,
-                    rows as u32,
-                    j0 as u32,
-                    cols as u32,
-                    0,
-                ],
-                rc.encode()[0],
-                rc.encode()[1],
-            ];
-            jobs.push(vec![
-                Step::List {
-                    what: "matmul gather",
-                    entries: gather.to_vec(),
-                },
-                Step::Kernel {
-                    roles,
+    let plan = BlockPlan {
+        tiles: [mt, kt, nt],
+        block: [mc, nc],
+        staging,
+        units,
+        route,
+        fidelity,
+        allow_mop,
+    };
+    if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
+        alloc.free(&c.placement);
+        return Err(e);
+    }
+    Ok(Work { out: c, jobs })
+}
+
+/// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
+/// [`matmul_dram_batched`] share.
+struct BlockPlan {
+    tiles: [usize; 3],
+    block: [usize; 2],
+    staging: Staging,
+    units: usize,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    allow_mop: bool,
+}
+
+impl BlockPlan {
+    /// One job per `[mc, nc]` output block of `op(A) @ op(B)`, the operands
+    /// and the output named by `refs` (`[A, B, C]`, each a tensor or a
+    /// tile-aligned block of one: the records read `K` and the output from
+    /// the ref's first tile on, at the ref's row stride).
+    fn push_jobs(
+        &self,
+        jobs: &mut Vec<Job>,
+        [ra, rb, rc]: [TensorRef; 3],
+        [a_transposed, b_transposed]: [bool; 2],
+    ) -> Result<()> {
+        let [mt, kt, nt] = self.tiles;
+        let [mc, nc] = self.block;
+        let (units, staging) = (self.units, self.staging);
+        let (in_fmt, out_fmt) = self.route.formats();
+        for i0 in (0..mt).step_by(mc) {
+            let rows = mc.min(mt - i0);
+            for j0 in (0..nt).step_by(nc) {
+                let cols = nc.min(nt - j0);
+                let tiles = [rows, kt, cols];
+                // A session deals job `j` to unit `j % units`, so a unit's blocks
+                // are every `units`-th: they alternate halves by `j / units`.
+                let half = (staging == Staging::SlotsHalf)
+                    .then(|| ((jobs.len() / units.max(1)) % 2) as u8);
+                let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
+                    Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
+                    Ok(l) => l,
+                    Err(e) => return Err(e.into()),
+                };
+                let matmul::Layout {
+                    a_at,
+                    b_at,
+                    outputs,
+                    sems,
                     init,
-                    mop: Box::new(mop),
-                    loops: Default::default(),
-                    half,
-                },
-                Step::List {
-                    what: "matmul scatter",
-                    entries: scatter.to_vec(),
-                },
-            ]);
+                } = layout;
+                let flags =
+                    u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
+                let gather = [
+                    [
+                        record::GATHER,
+                        flags,
+                        a_at as u32,
+                        b_at as u32,
+                        i0 as u32,
+                        rows as u32,
+                        j0 as u32,
+                        cols as u32,
+                    ],
+                    ra.encode()[0],
+                    ra.encode()[1],
+                    rb.encode()[0],
+                    rb.encode()[1],
+                ];
+                // The cache tells the stagings and halves apart: their programs
+                // name different addresses.
+                let variant = half.map_or(0, |h| 1 + h);
+                let (fidelity, allow_mop) = (self.fidelity, self.allow_mop);
+                let (roles, mop) = matmul::kernel_programs(
+                    tiles,
+                    variant,
+                    self.route,
+                    fidelity,
+                    sems,
+                    allow_mop,
+                    || matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop),
+                );
+                // Only the datums go back: the packer writes nothing else, and the
+                // unpacker skips the header whatever it holds (`step18_dram_matmul`).
+                // The outputs sit one slot apart from the first (`plan_layout_in`).
+                let out_at = outputs[0].out;
+                debug_assert!(outputs
+                    .iter()
+                    .enumerate()
+                    .all(|(k, o)| o.out == out_at + k as u64 * TILE_SLOT));
+                let scatter = [
+                    [
+                        record::SCATTER,
+                        out_at as u32,
+                        TILE_SLOT as u32,
+                        i0 as u32,
+                        rows as u32,
+                        j0 as u32,
+                        cols as u32,
+                        0,
+                    ],
+                    rc.encode()[0],
+                    rc.encode()[1],
+                ];
+                jobs.push(vec![
+                    Step::List {
+                        what: "matmul gather",
+                        entries: gather.to_vec(),
+                    },
+                    Step::Kernel {
+                        roles,
+                        init,
+                        mop: Box::new(mop),
+                        loops: Default::default(),
+                        half,
+                    },
+                    Step::List {
+                        what: "matmul scatter",
+                        entries: scatter.to_vec(),
+                    },
+                ]);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One operand of a [`matmul_dram_batched`] product: the block of a tensor
+/// whose top-left element is `at` (a multiple of 32 on both axes), read
+/// transposed or not. Its extent is the product's `[m, k]` or `[k, n]`
+/// (transposed: `[k, m]`, `[n, k]`) of the tensor's elements.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub at: [usize; 2],
+    pub transposed: bool,
+}
+
+/// A block of `extent` elements at `at` in `t`, as a record names it: the
+/// tensor's ref with its first tile moved to the block's, the row stride
+/// kept. Refused unless the block starts on a tile and, where it does not end
+/// on one, ends at the tensor's own edge -- a ragged edge inside the tensor
+/// would read its neighbour's elements as padding.
+fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> Result<TensorRef> {
+    let ([r0, c0], [r, c]) = (at, extent);
+    let fits = r0 + r <= t.rows && c0 + c <= t.cols;
+    let aligned = r0 % 32 == 0
+        && c0 % 32 == 0
+        && (r % 32 == 0 || r0 + r == t.rows)
+        && (c % 32 == 0 || c0 + c == t.cols);
+    if !fits || !aligned {
+        return Err(TensorError::Shape(format!(
+            "{what}: a [{r}, {c}] block at [{r0}, {c0}] of a [{}, {}] tensor is not whole tiles \
+             inside it",
+            t.rows, t.cols
+        )));
+    }
+    let mut x = t.tensor_ref();
+    x.first += ((r0 / 32) * t.grid()[1] + c0 / 32) as u32;
+    Ok(x)
+}
+
+/// `op(A_i) @ op(B_i)` for every `i` of `items` -- blocks of `a` and `b`,
+/// each `[m, k] @ [k, n]` after its transposes -- as one op: the products'
+/// jobs together, each product's output written to rows `i m .. (i + 1) m`
+/// of one `[items.len() m, n]` tensor. A batched matmul of resident
+/// operands, and of views into them (a head's columns of a projection),
+/// with no copy: each block is gathered where it lies. Every product is
+/// [`matmul_dram`]'s, bit for bit. Refused, as there, if `K` would split;
+/// and with more than one item, unless `m` is whole tiles (each product's
+/// output must start on a tile row).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_dram_batched(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    b: &DramTensor,
+    items: &[(Block, Block)],
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    allow_mop: bool,
+    pipeline: bool,
+) -> Result<Work> {
+    a.expect("a matmul", Elem::F32)?;
+    b.expect("a matmul", Elem::F32)?;
+    let batch = items.len();
+    if batch == 0 || m == 0 || k == 0 || n == 0 {
+        return Err(TensorError::Shape(format!(
+            "{batch} x [{m}, {k}] @ [{k}, {n}]: nothing to compute"
+        )));
+    }
+    if batch > 1 && m % 32 != 0 {
+        return Err(TensorError::Shape(format!(
+            "{batch} x [{m}, {k}] @ [{k}, {n}]: a batch needs whole tile rows per product"
+        )));
+    }
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    let per_item = units.div_ceil(batch).max(1);
+    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, per_item) {
+        Staging::SlotsHalf
+    } else {
+        Staging::Slots
+    };
+    let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
+        .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
+    let [mc, kc, nc] = shape.tiles;
+    if kc < kt {
+        return Err(TensorError::Shape(format!(
+            "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
+        )));
+    }
+    let mut refs = Vec::with_capacity(batch);
+    for (ba, bb) in items {
+        let ea = if ba.transposed { [k, m] } else { [m, k] };
+        let eb = if bb.transposed { [n, k] } else { [k, n] };
+        refs.push((
+            block_ref(a, ba.at, ea, "a batched matmul's left operand")?,
+            block_ref(b, bb.at, eb, "a batched matmul's right operand")?,
+            [ba.transposed, bb.transposed],
+        ));
+    }
+    let plan = BlockPlan {
+        tiles: [mt, kt, nt],
+        block: blocks([mt, nt], [mc, nc], per_item),
+        staging,
+        units,
+        route,
+        fidelity,
+        allow_mop,
+    };
+    let c = DramTensor::alloc(alloc, batch * m, n)?;
+    let mut jobs = Vec::new();
+    for (i, (ra, rb, t)) in refs.into_iter().enumerate() {
+        let mut rc = c.tensor_ref();
+        rc.first += (i * mt * nt) as u32;
+        if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], t) {
+            alloc.free(&c.placement);
+            return Err(e);
         }
     }
     Ok(Work { out: c, jobs })
@@ -2245,6 +2408,118 @@ pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work>
             }]
         })
         .collect();
+    Ok(Work { out, jobs })
+}
+
+/// One block a [`copy_blocks`] moves: `extent` elements of the output at
+/// `to`, from the source's block at `from` -- of the same extent, or with
+/// `transposed`, of the transposed extent, read as its transpose. Both
+/// tile-aligned.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockMove {
+    pub from: [usize; 2],
+    pub to: [usize; 2],
+    pub extent: [usize; 2],
+    pub transposed: bool,
+}
+
+/// A new `dims` tensor of `t`'s type, assembled from blocks of `t`, bit for
+/// bit: a reshape or permute that moves whole tiles -- a head's columns into
+/// its own rows, and back, or a transpose of whole tiles -- as one copy. Each
+/// block is read where it lies ([`record::READ_RUN`] over the block's grid,
+/// transposing each tile if asked) and written where it goes
+/// ([`record::WRITE_RUN`] over the same grid, on the output's ref moved to
+/// the block). Refused unless every block is whole tiles inside both tensors
+/// (a ragged edge only at a tensor's own edge) and the blocks cover the
+/// output exactly once.
+pub fn copy_blocks(
+    alloc: &mut DramAlloc,
+    t: &DramTensor,
+    moves: &[BlockMove],
+    [rows, cols]: [usize; 2],
+    units: usize,
+) -> Result<Work> {
+    const GROUP: usize = 128;
+    let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
+    let checked = (|| {
+        let [ort, oct] = out.grid();
+        let mut covered = vec![false; ort * oct];
+        let mut refs = Vec::with_capacity(moves.len());
+        for m in moves {
+            let src_extent = if m.transposed {
+                [m.extent[1], m.extent[0]]
+            } else {
+                m.extent
+            };
+            let rs = block_ref(t, m.from, src_extent, "a block copy's source")?;
+            let ro = block_ref(&out, m.to, m.extent, "a block copy's destination")?;
+            let [r0, c0] = [m.to[0] / 32, m.to[1] / 32];
+            for i in r0..r0 + m.extent[0].div_ceil(32) {
+                for j in c0..c0 + m.extent[1].div_ceil(32) {
+                    if std::mem::replace(&mut covered[i * oct + j], true) {
+                        return Err(TensorError::Shape(format!(
+                            "a block copy writes output tile ({i}, {j}) twice"
+                        )));
+                    }
+                }
+            }
+            refs.push((rs, ro, m.extent, m.transposed));
+        }
+        if let Some(n) = covered.iter().position(|c| !c) {
+            return Err(TensorError::Shape(format!(
+                "a block copy leaves output tile ({}, {}) unwritten",
+                n / oct,
+                n % oct
+            )));
+        }
+        Ok(refs)
+    })();
+    let refs = match checked {
+        Ok(r) => r,
+        Err(e) => {
+            alloc.free(&out.placement);
+            return Err(e);
+        }
+    };
+    let stage = staging("copy slots", GROUP)?;
+    let per = units.div_ceil(moves.len().max(1)).max(1);
+    let mut jobs = Vec::new();
+    for (rs, ro, [r, c], transposed) in refs {
+        let ct = c.div_ceil(32);
+        let flags = if transposed { 8 } else { 0 };
+        for run in runs(r.div_ceil(32) * ct, per, GROUP) {
+            let (first, count) = (run.start as u32, run.len() as u32);
+            jobs.push(vec![Step::List {
+                what: "block copy list",
+                entries: vec![
+                    [
+                        record::READ_RUN,
+                        first,
+                        count,
+                        stage as u32,
+                        flags,
+                        ct as u32,
+                        0,
+                        0,
+                    ],
+                    rs.encode()[0],
+                    rs.encode()[1],
+                    [
+                        record::WRITE_RUN,
+                        first,
+                        count,
+                        stage as u32,
+                        0,
+                        ct as u32,
+                        0,
+                        0,
+                    ],
+                    ro.encode()[0],
+                    ro.encode()[1],
+                ],
+            }]);
+        }
+    }
     Ok(Work { out, jobs })
 }
 

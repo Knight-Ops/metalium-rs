@@ -48,7 +48,10 @@ pub const FILL_PAD: u32 = 0x14;
 /// ([`op::READ_BROADCAST_COL`]) -- how a `[m, 1]` tensor meets one; bit 2:
 /// the run counts column-major, down a grid `rt` tiles tall (word 6) -- tile
 /// `n` is `((first + n) % rt, (first + n) / rt)` -- which is the order a
-/// reduction over rows reads a column of tiles in.
+/// reduction over rows reads a column of tiles in; bit 3: each tile `(i, j)`
+/// of the run is `X`'s tile `(j, i)` transposed ([`op::READ_TRANSPOSED`]) --
+/// a block of `X` read as its transpose, for a block copy (not with bits
+/// 0-2).
 pub const READ_RUN: u32 = 0x15;
 /// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
 /// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
@@ -298,6 +301,10 @@ pub fn expand(
             if column_major && grid_rt == 0 {
                 return Err(super::error::LENGTH);
             }
+            let transposed = read && flags & 8 != 0;
+            if transposed && (row || col || column_major) {
+                return Err(super::error::LENGTH);
+            }
             let (mut i, mut j) = if column_major {
                 let (q, r) = (first / grid_rt, first % grid_rt);
                 (r, q)
@@ -305,7 +312,7 @@ pub fn expand(
                 (first / ct, first % ct)
             };
             // A plain run over the tensor's own grid is consecutive tiles.
-            let mut run = if !row && !col && !column_major && ct == x.ct {
+            let mut run = if !row && !col && !column_major && !transposed && ct == x.ct {
                 Some(x.cursor(i, j)?)
             } else {
                 None
@@ -325,10 +332,13 @@ pub fn expand(
                 let slot = at + n * TILE_SLOT as u32;
                 let (ch, off) = match run.as_mut() {
                     Some(r) => r.next()?,
+                    None if transposed => x.tile(j, i)?,
                     None => x.tile(if row { 0 } else { i }, if col { 0 } else { j })?,
                 };
                 let op = if col {
                     op::READ_BROADCAST_COL
+                } else if transposed {
+                    op::READ_TRANSPOSED
                 } else {
                     op::READ
                 };
@@ -475,6 +485,26 @@ mod tests {
         .unwrap();
         let want: Vec<_> = (6..17).map(|n| a.tile(n / 5, n % 5).unwrap()).collect();
         assert_eq!(got, want, "run");
+        // Transposed, over a 3-wide grid: tile `(i, j)` is `(j, i)`, each
+        // read through `READ_TRANSPOSED`.
+        let head = [READ_RUN, 1, 5, 0x2_0000, 8, 3, 0, 0];
+        let mut got = Vec::new();
+        expand(&[head, a0, a1], |e| {
+            assert_eq!(e[0], op::READ_TRANSPOSED);
+            got.push((e[1], e[3]));
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<_> = (1..6).map(|n| a.tile(n % 3, n / 3).unwrap()).collect();
+        assert_eq!(got, want, "transposed run");
+        // Not with a broadcast or column-major order.
+        for flags in [9, 10, 12] {
+            let head = [READ_RUN, 0, 1, 0x2_0000, flags, 3, 2, 0];
+            assert!(
+                expand(&[head, a0, a1], |_| Ok(())).is_err(),
+                "flags {flags}"
+            );
+        }
     }
 
     fn t(n: u8, ct: u32) -> TensorRef {

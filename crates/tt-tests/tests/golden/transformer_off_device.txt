@@ -2,22 +2,22 @@
 # or moved bytes (`burn_tt::Report::off_device`). The gate fails on a name not
 # listed here; delete a name in the commit that brings it to the card.
 #
-# Baseline 2026-10-03: nothing runs on the card. The model's matmuls are rank 3
-# and 4, which take the host-staged per-batch path (`float_matmul`'s batched
-# branch, 11 MiB staged per 3 steps), so no tensor is ever made resident, and
-# element-wise ops follow their data onto the host.
+# 2026-10-03, first baseline: nothing ran on the card -- the rank-3 and rank-4
+# matmuls were host-staged, so no tensor was ever resident.
+# 2026-10-03, after B6 (folded Linears, batched matmuls over strided views,
+# rank-N reductions along the last dim and over leading dims): every matmul,
+# swap and transpose, softmax's max and exp on the card. What is left below.
 
-# Rank-3/4 matmul: host-staged per batch element (plan slices 2 and 4).
-float_matmul
-
-# Device-capable, but every operand is a host tensor (follows from the above).
+# Device ops that still meet operands made on the host, or make a few results
+# there: approximate ops on tensors below `APPROX_MIN_TILES` (layer norm's and
+# the loss's `[b s, 1]` statistics: sqrt, log, div), which drag their
+# neighbours (add, mul, sub, div) through PCIe.
 float_add
 float_add_scalar
 float_div
 float_div_scalar
-float_exp
 float_log
-float_max_dim
+float_matmul
 float_mul
 float_mul_scalar
 float_neg
@@ -28,8 +28,7 @@ float_reshape
 float_sqrt
 float_sub
 float_sum_dim
-float_swap_dims
-float_transpose
+float_mean_dim
 int_reshape
 
 # No device kernel: forwarded to Flex.
@@ -37,5 +36,4 @@ embedding               # D4
 embedding_backward      # D4
 float_gather            # D4: CrossEntropyLoss's target column
 float_scatter_add       # D4: gather's backward
-float_mean              # composite over sum (plan slice 2)
-float_mean_dim          # composite over sum_dim (plan slice 2): LayerNorm
+float_mean              # full reduction (R1b)

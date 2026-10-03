@@ -247,6 +247,33 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.slice_rows(a, first, rows)
         }
+        fn matmul_dram_batched(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            items: &[(burn_tt::Block, burn_tt::Block)],
+            mkn: [usize; 3],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            let c = &self.config;
+            self.buffers.matmul_batched(
+                &mut self.session,
+                a,
+                b,
+                items,
+                mkn,
+                c.route,
+                c.fidelity,
+                c.budget,
+            )
+        }
+        fn copy_blocks(
+            &mut self,
+            a: burn_tt::BufferId,
+            moves: &[burn_tt::BlockMove],
+            dims: [usize; 2],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.copy_blocks(&mut self.session, a, moves, dims)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }

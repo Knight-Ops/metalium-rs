@@ -90,6 +90,11 @@ fn device_view(
 /// host anyway. MNIST's two-tile logits trained at 7.9 ms/step on one tile
 /// with them on the device, 3.6 without. A heuristic until submission is
 /// asynchronous or a lookahead exists (`burn-backend-parity.md` B8, B13, B16).
+/// Re-measured with batched submission (2026-10-03, card 0, one tile):
+/// without the threshold MNIST trains at 1.6 ms/step against 1.0 (its
+/// two-tile log-softmax still ends in a host loss), and the transformer of
+/// `tt-mnist --model transformer` at 9.0 against 10.4 (its four-tile layer
+/// norm statistics feed device ops). Kept until a lookahead can tell the two.
 const APPROX_MIN_TILES: usize = 8;
 
 /// Tiles in the tile grid of the matrix a tensor is stored as.
@@ -565,7 +570,18 @@ pub mod float {
             );
             return device_result(device, id, [m, n]);
         }
+        // A view on the left is read where it lies by the batched product
+        // (its blocks may be transposed: a gradient through `K^T`); folding
+        // it would first make it a plain matrix.
+        if lhs.is_view() {
+            if let Some(t) = batched_matmul(&lhs, &rhs) {
+                return t;
+            }
+        }
         if let Some(t) = folded_matmul(&lhs, &rhs) {
+            return t;
+        }
+        if let Some(t) = batched_matmul(&lhs, &rhs) {
             return t;
         }
         let ls = lhs.shape().to_vec();
@@ -660,6 +676,121 @@ pub mod float {
         Some(float_reshape(float_matmul(a, b), Shape::from(out)))
     }
 
+    /// A batched matmul of resident operands, or views of them -- attention's
+    /// heads, `K^T` -- on the card: each batch element's operands a block of
+    /// its operand's buffer, read where it lies, the products stacked into
+    /// one `[batch m, n]` buffer (`Session::matmul_dram_batched`). Operands
+    /// still on the host are uploaded, as the 2-D path does. `None` -- the
+    /// host-staged path -- when a batch dimension broadcasts other than
+    /// from 1, the last two dimensions of an operand are not a block of its
+    /// buffer, a block is not whole tiles, or the products are not whole
+    /// tile rows each.
+    fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+        let device = lhs.device;
+        let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
+        let rank = ls.len().max(rs.len());
+        if rank <= 2 || ls.len() < 2 || rs.len() < 2 || !crate::server::supports_dram(device) {
+            return None;
+        }
+        if !(lhs.is_stored_f32() && rhs.is_stored_f32()) {
+            return None;
+        }
+        let (m, k, n) = (ls[ls.len() - 2], ls[ls.len() - 1], rs[rs.len() - 1]);
+        if rs[rs.len() - 2] != k {
+            return None;
+        }
+        let lead = |s: &[usize]| -> Vec<usize> {
+            let mut v = vec![1; rank - s.len()];
+            v.extend_from_slice(&s[..s.len() - 2]);
+            v
+        };
+        let (la, lb) = (lead(&ls), lead(&rs));
+        let batch: Vec<usize> = la
+            .iter()
+            .zip(&lb)
+            .map(|(&a, &b)| (a == b || a == 1 || b == 1).then_some(a.max(b)))
+            .collect::<Option<_>>()?;
+        let count: usize = batch.iter().product();
+        if count > 1 && m % 32 != 0 {
+            return None;
+        }
+        let view = |t: &TtTensor| {
+            t.as_strided().or_else(|| {
+                t.to_dram();
+                t.as_strided()
+            })
+        };
+        let (va, vb) = (view(lhs)?, view(rhs)?);
+        let ba = va.matrix_blocks(&ls, &batch)?;
+        let bb = vb.matrix_blocks(&rs, &batch)?;
+        let items: Vec<_> = ba.into_iter().zip(bb).collect();
+        let (id, dims) = crate::server::matmul_dram_batched(
+            device,
+            va.src.buffer.id,
+            vb.src.buffer.id,
+            items,
+            [m, k, n],
+        );
+        let mut shape = batch;
+        shape.extend([m, n]);
+        Some(device_result_shaped(
+            device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        ))
+    }
+
+    /// `tensor` with dimensions `dim1` and `dim2` swapped, as a view of its
+    /// device copy, if it is F32 and has one (or is a view itself): nothing
+    /// moves, at any rank. A swap that leaves it a plain matrix or its 2-D
+    /// transpose is that, as before.
+    fn swapped_strided(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
+        if tensor.dtype() != DType::F32 || dim1 == dim2 {
+            return None;
+        }
+        let v = tensor.as_strided()?;
+        let mut shape = tensor.shape().to_vec();
+        shape.swap(dim1, dim2);
+        Some(TtTensor::view(
+            v.swapped(dim1, dim2),
+            burn_backend::Shape::from(shape),
+            tensor.device,
+        ))
+    }
+
+    /// A reshape of a device-resident F32 tensor (or a view) that changes the
+    /// matrix it is stored as: a view when strides still express it -- the
+    /// heads split out of a projection -- else, when it moves whole tiles, a
+    /// copy on the card into the new matrix (the heads merged back), else
+    /// `None`. A reshape that keeps a plain tensor's matrix is
+    /// [`reshaped`]'s.
+    fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
+        if tensor.dtype() != DType::F32 {
+            return None;
+        }
+        let (from, to) = (tensor.shape().to_vec(), shape.to_vec());
+        let keeps = crate::tensor::stored_dims(&from) == crate::tensor::stored_dims(&to);
+        if keeps && !tensor.is_view() && !tensor.is_transposed() {
+            return None;
+        }
+        let v = tensor.as_strided()?;
+        if let Some(r) = v.reshaped(&from, &to) {
+            return Some(TtTensor::view(r, shape.clone(), tensor.device));
+        }
+        let moves = v.tile_moves(&from, &to)?;
+        let dims = crate::tensor::stored_dims(&to)?;
+        let (id, dims) = crate::server::copy_blocks(tensor.device, v.src.buffer.id, moves, dims);
+        Some(device_result_shaped(
+            tensor.device,
+            id,
+            dims,
+            shape.clone(),
+            DType::F32,
+        ))
+    }
+
     /// Swapping the two dimensions of a matrix already on the device is a view
     /// of the same buffer: the device matmul reads it transposed, and a host op
     /// downloads it transposed. Anything else is Flex's.
@@ -668,6 +799,9 @@ pub mod float {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
+        if let Some(v) = swapped_strided(&tensor, dim1, dim2) {
+            return v;
+        }
         if let Some(v) = swapped_view(&tensor, dim1, dim2) {
             return v;
         }
@@ -695,6 +829,9 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
+        if let Some(t) = reshaped_strided(&tensor, &shape) {
+            return t;
+        }
         reshaped(tensor, shape, <Flex as FloatTensorOps<Flex>>::float_reshape)
     }
 
@@ -706,10 +843,33 @@ pub mod float {
         if let Some(t) = device_reduce(&tensor, ReduceOp::Sum, dim) {
             return t;
         }
+        if let Some(t) = device_sum_leading(&tensor, dim) {
+            return t;
+        }
         let device = tensor.device;
         TtTensor::new(
             <Flex as FloatTensorOps<Flex>>::float_sum_dim(tensor.into_host(), dim),
             device,
+        )
+    }
+
+    /// The mean along `dim`: the sum, then a multiplication by the count's
+    /// reciprocal -- each on the device where its operand is
+    /// ([`float_sum_dim`], `float_mul_scalar`; within one rounding of Flex's
+    /// division, inside the sum's own bound), when the tensor is on the
+    /// device. On the host, or in exact mode, Flex's.
+    pub fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let n = tensor.shape().to_vec()[dim];
+        if crate::exact() || tensor.dtype() != DType::F32 || tensor.as_strided().is_none() {
+            let device = tensor.device;
+            return TtTensor::new(
+                <Flex as FloatTensorOps<Flex>>::float_mean_dim(tensor.into_host(), dim),
+                device,
+            );
+        }
+        <TtBackend as FloatTensorOps<TtBackend>>::float_mul_scalar(
+            float_sum_dim(tensor, dim),
+            (1.0 / n as f32).into(),
         )
     }
 
@@ -727,9 +887,12 @@ pub mod float {
         )
     }
 
-    /// `tensor` reduced along `dim` on the device, if it is a device-resident
-    /// F32 matrix (not a transposed view), on the SFPU (`Session::reduce`): a
-    /// sum over rows in Flex's order, the rest as `sfpu::reduce` computes them.
+    /// `tensor` reduced along `dim` on the device, if it is device-resident
+    /// F32 (not a transposed view), on the SFPU (`Session::reduce`): a
+    /// matrix along either dim, a tensor of any rank along its last -- the
+    /// columns of the matrix it is stored as (softmax's and layer norm's
+    /// statistics over `[b, s, d]` or `[b, h, s, s]`). A sum over a matrix's
+    /// rows is in Flex's order; the rest as `sfpu::reduce` computes them.
     pub(crate) fn device_reduce(
         tensor: &TtTensor,
         op: tt_kernels::sfpu::reduce::ReduceOp,
@@ -740,10 +903,71 @@ pub mod float {
         // the sum over columns is in a tree order, and the maximum prefers `+0`
         // to `-0`. Those, not
         // in exact mode, and not on a tensor too small to pay for themselves.
-        if (op, dim) != (ReduceOp::Sum, 0) && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
+        let rows_sum = op == ReduceOp::Sum && dim == 0 && tensor.shape().num_dims() == 2;
+        if !rows_sum && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
             return None;
         }
         device_reduce_ungated(tensor, op, dim)
+    }
+
+    /// The sum over a leading dimension `dim` with nothing before it (`[n,
+    /// q.., c]`, every dimension before `dim` of size 1): in the matrix the
+    /// tensor is stored as, `n` consecutive blocks of `q` rows each, summed
+    /// in order. With `q = 1`, the sum over the matrix's rows; else, for `q`
+    /// whole tile rows, `+0` and the blocks' row views added one after
+    /// another -- both in Flex's order, exactly. Broadcast gradients take this path
+    /// (layer norm's scale and shift over `[b, s, d]`).
+    fn device_sum_leading(tensor: &TtTensor, dim: usize) -> Option<TtTensor> {
+        use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+        let shape = tensor.shape().to_vec();
+        let rank = shape.len();
+        if rank < 2 || dim + 1 >= rank || !tensor.is_stored_f32() {
+            return None;
+        }
+        if shape[..dim].iter().any(|&d| d != 1) || !crate::server::supports_dram(tensor.device) {
+            return None;
+        }
+        let n = shape[dim];
+        let q: usize = shape[dim + 1..rank - 1].iter().product();
+        let c = shape[rank - 1];
+        let device = tensor.device;
+        let d = tensor.dram().filter(|d| !d.transposed)?.clone();
+        let mut out_shape = shape.clone();
+        out_shape[dim] = 1;
+        let out_shape = burn_backend::Shape::from(out_shape);
+        if q == 1 {
+            let (id, dims) = crate::server::reduce(device, d.buffer.id, ReduceOp::Sum, Axis::Rows);
+            return Some(device_result_shaped(
+                device,
+                id,
+                dims,
+                out_shape,
+                DType::F32,
+            ));
+        }
+        if q % 32 != 0 {
+            return None;
+        }
+        let matrix =
+            TtTensor::on_device(d, burn_backend::Shape::new([n * q, c]), DType::F32, device);
+        let block = |i: usize| {
+            row_view(
+                &matrix,
+                &[burn_backend::Slice::new(
+                    (i * q) as isize,
+                    Some(((i + 1) * q) as isize),
+                    1,
+                )],
+            )
+        };
+        // Flex's sum starts from `+0`: `0 + -0` is `+0`, which `x0 + x1`
+        // would not give for two `-0`s.
+        let mut acc = device_eltwise_ungated(kind::ADD_SCALAR, 0.0, &block(0)?, None)?;
+        for i in 1..n {
+            acc = device_eltwise_ungated(kind::ADD, 0.0, &acc, Some(&block(i)?))?;
+        }
+        let acc = acc.dram()?.clone();
+        Some(TtTensor::on_device(acc, out_shape, DType::F32, device))
     }
 
     /// [`device_reduce`] without the size gate, for a composition.
@@ -754,13 +978,28 @@ pub mod float {
     ) -> Option<TtTensor> {
         use tt_kernels::sfpu::reduce::Axis;
         let device = tensor.device;
-        if dim > 1 || !tensor.is_matrix_f32() || !crate::server::supports_dram(device) {
+        let rank = tensor.shape().num_dims();
+        if !tensor.is_stored_f32() || !crate::server::supports_dram(device) {
             return None;
         }
+        let axis = if rank == 2 && dim == 0 {
+            Axis::Rows
+        } else if dim + 1 == rank {
+            Axis::Cols
+        } else {
+            return None;
+        };
         let d = tensor.dram().filter(|d| !d.transposed)?;
-        let axis = if dim == 0 { Axis::Rows } else { Axis::Cols };
         let (id, dims) = crate::server::reduce(device, d.buffer.id, op, axis);
-        Some(device_result(device, id, dims))
+        let mut shape = tensor.shape().to_vec();
+        shape[dim] = 1;
+        Some(device_result_shaped(
+            device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        ))
     }
 
     /// Whole tile rows, all columns, of a matrix on the device: a view of the

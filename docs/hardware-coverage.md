@@ -579,8 +579,22 @@ Each names the measurement it must move. The Burn-side ones are in
         for bit (a NaN by class) and downloading nothing; `[6, 1, 4] + [1, 6, 1]`,
         a column by the matrices but `[6, 6, 4]` by the rule, still right (watched
         failing without the rule's check). ttsim and both cards.
-  - [ ] **P1b Batch stride.** `TensorRef` batch stride (0 = broadcast) for batched
-        matmul and reductions over leading dims.
+  - [~] **P1b Batch stride.** Batched matmul done (2026-10-03), not by a batch
+        stride but by blocks: `tensor::matmul_dram_batched` takes one `(A, B)`
+        pair of tile-aligned blocks per batch element -- a `TensorRef` whose
+        first tile is the block's, the parent's row stride kept, which GATHER
+        already honours -- and writes each product to its own tile rows of one
+        output; `tensor::copy_blocks` moves whole tiles (and, with
+        `READ_RUN` flag bit 3, transposes them through `READ_TRANSPOSED`)
+        into any arrangement. burn-tt keeps rank-N reshapes and dimension
+        swaps as strided views of one buffer (`burn-tt/src/views.rs`), so
+        attention's head split, `K^T` and their gradients move nothing, and
+        the head merge is one block copy. Gates: `step60_batched_blocks`
+        (every product bit for bit the 2-D matmul of its block, copies bit
+        for bit, ragged and overlapping refusals; watched failing with the
+        block offset dropped and with the tiles read untransposed; ttsim and
+        both cards), `step59_burn_transformer`. Open: reductions over leading
+        dims.
 - [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
       a matmul's K is not capped by L1. Blocks D6's im2col.
 
@@ -1165,11 +1179,11 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `float_matmul` | `~` F32 2-D resident; batched host-staged | -- |
+| `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
 | `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU or mover by size) | S1, P1a |
 | `float_sum_dim` | x (dim 0 the mover's, exact; dim 1 the SFPU's, order bound) | R1 |
 | `float_slice` | `~` whole tile rows | D4 |
-| `float_transpose`, `float_swap_dims` | `~` 2-D view | M3 |
+| `float_transpose`, `float_swap_dims` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |

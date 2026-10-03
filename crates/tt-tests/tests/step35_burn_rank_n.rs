@@ -227,3 +227,42 @@ fn a_bias_reshaped_every_pass_is_uploaded_once() {
         assert_eq!(during.uploads, 1, "the bias, once: {during:?}");
     });
 }
+
+/// Sums over a leading dimension with nothing before it -- the broadcast
+/// gradients of a `[d]` parameter over `[b, s, d]` -- stay on the device and
+/// give Flex's bits: over `[n, c]` rows of the stored matrix, and over `n`
+/// blocks of whole tile rows added in order from `+0`. Watched failing
+/// without the `+0`: Flex's sum of a lone `-0` is `+0`.
+#[test]
+fn sums_over_leading_dimensions_are_flex_s_bits_on_the_device() {
+    with_device(Config::default(), |d| {
+        for shape in [[4, 32, 64], [1, 96, 40], [3, 64, 70]] {
+            let n: usize = shape.iter().product();
+            let v = values(11, n);
+            let tt = Tensor::<TtBackend, 3>::from_data(TensorData::new(v.clone(), shape), &d)
+                .to_device(&d);
+            let fx = Tensor::<Flex, 3>::from_data(TensorData::new(v, shape), &FlexDevice);
+            let before = tensor_traffic();
+            // Over dim 0, then dim 1 of the result: what Burn's broadcast
+            // backward does for a `[1, 1, d]` operand.
+            let s0 = tt.clone().sum_dim(0);
+            let s01 = s0.clone().sum_dim(1);
+            let moved = tensor_traffic() - before;
+            assert_eq!(
+                (moved.uploads, moved.downloads),
+                (0, 0),
+                "{shape:?}: {moved:?}"
+            );
+            assert!(
+                computed_on_device(&s0) && computed_on_device(&s01),
+                "{shape:?}"
+            );
+            let f0 = fx.clone().sum_dim(0);
+            assert!(same(bits(s0), bits(f0.clone())), "{shape:?}: over dim 0");
+            assert!(
+                same(bits(s01), bits(f0.sum_dim(1))),
+                "{shape:?}: over dims 0, 1"
+            );
+        }
+    });
+}

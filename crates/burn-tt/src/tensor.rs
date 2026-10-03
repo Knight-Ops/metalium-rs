@@ -20,6 +20,7 @@ use burn_backend::{DType, QTensorPrimitive, Shape, TensorData, TensorMetadata};
 use burn_flex::{FlexQTensor, FlexTensor};
 
 use crate::server::{self, BufferId, Elem};
+use crate::views::Strided;
 
 /// The device element type a Burn dtype is stored as (`hardware-coverage.md`
 /// D3): `F32`; `I32` -- Burn's `IntElem` here -- as its bits; a bool of any
@@ -49,6 +50,11 @@ pub(crate) struct Cell {
     /// so a parameter reshaped on every forward pass (a bias) is uploaded
     /// once, by whichever of them meets the device first.
     dram: Arc<OnceLock<DramRef>>,
+    /// For a view of another tensor's device buffer that is not a plain
+    /// copy of it (`views`): where each element lies. The device copy is
+    /// then made from it, on the card where it can be, when an op needs the
+    /// tensor as a matrix ([`TtTensor::dram`]).
+    strided: Option<Strided>,
     shape: Shape,
     dtype: DType,
 }
@@ -91,6 +97,7 @@ impl TtTensor {
             cell: Arc::new(Cell {
                 host,
                 dram: Arc::new(OnceLock::new()),
+                strided: None,
                 shape,
                 dtype,
             }),
@@ -112,6 +119,7 @@ impl TtTensor {
             cell: Arc::new(Cell {
                 host: OnceLock::new(),
                 dram: Arc::new(cell),
+                strided: None,
                 shape,
                 dtype,
             }),
@@ -119,21 +127,65 @@ impl TtTensor {
         }
     }
 
+    /// An F32 tensor of `shape` that is the view `v` of a device buffer: a
+    /// plain device tensor if the view is one, else a strided view
+    /// materialised when an op needs it as a matrix.
+    pub(crate) fn view(v: Strided, shape: Shape, device: TtDevice) -> Self {
+        if let Some(d) = v.as_plain(&shape.to_vec()) {
+            return Self::on_device(d, shape, DType::F32, device);
+        }
+        crate::report::made(true);
+        TtTensor {
+            cell: Arc::new(Cell {
+                host: OnceLock::new(),
+                dram: Arc::new(OnceLock::new()),
+                strided: Some(v),
+                shape,
+                dtype: DType::F32,
+            }),
+            device,
+        }
+    }
+
+    /// Is this a 2-D transposed view of a device buffer?
+    pub(crate) fn is_transposed(&self) -> bool {
+        self.cell.dram.get().is_some_and(|d| d.transposed)
+    }
+
+    /// Is this a strided view not yet made a matrix?
+    pub(crate) fn is_view(&self) -> bool {
+        self.cell.strided.is_some() && self.cell.dram.get().is_none()
+    }
+
+    /// This tensor's device copy as a view, without materialising anything:
+    /// its own view, or a plain view of its device copy. `None` if it has
+    /// neither.
+    pub(crate) fn as_strided(&self) -> Option<Strided> {
+        if let Some(d) = self.cell.dram.get() {
+            return Some(Strided::of(d, &self.cell.shape.to_vec()));
+        }
+        self.cell.strided.clone()
+    }
+
     /// Was this tensor computed on the device: a device copy and, so far, no
     /// host one? What a residency gate checks of an op's result -- a host
     /// fallback on operands that still had host copies moves no bytes, so
     /// the traffic counters alone cannot tell.
     pub fn computed_on_device(&self) -> bool {
-        self.cell.dram.get().is_some() && self.cell.host.get().is_none()
+        (self.cell.dram.get().is_some() || self.cell.strided.is_some())
+            && self.cell.host.get().is_none()
     }
 
     /// The host copy, downloaded the first time it is needed.
     pub(crate) fn host(&self) -> &FlexTensor {
         self.cell.host.get_or_init(|| {
+            if let (None, Some(v)) = (self.cell.dram.get(), &self.cell.strided) {
+                if !self.materialises_on_device(v) {
+                    return self.gathered(v);
+                }
+            }
             let d = self
-                .cell
-                .dram
-                .get()
+                .dram()
                 .expect("a tensor with no host copy has a device copy");
             if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
                 eprintln!(
@@ -193,6 +245,7 @@ impl TtTensor {
             cell: Arc::new(Cell {
                 host: h,
                 dram: self.cell.dram.clone(),
+                strided: None,
                 shape,
                 dtype: self.cell.dtype,
             }),
@@ -219,9 +272,45 @@ impl TtTensor {
         }
     }
 
-    /// The device copy, if there is one already.
+    /// The device copy, if there is one already -- or, for a strided view,
+    /// made now ([`TtTensor::to_dram`]).
     pub(crate) fn dram(&self) -> Option<&DramRef> {
-        self.cell.dram.get()
+        match (self.cell.dram.get(), &self.cell.strided) {
+            (Some(d), _) => Some(d),
+            (None, Some(_)) => Some(self.to_dram()),
+            (None, None) => None,
+        }
+    }
+
+    /// Can view `v` be made a plain matrix on the card, by whole-tile moves?
+    fn materialises_on_device(&self, v: &Strided) -> bool {
+        let shape = self.cell.shape.to_vec();
+        v.tile_moves(&shape, &shape).is_some()
+    }
+
+    /// A strided view's elements, on the host: its source downloaded and
+    /// read through the strides.
+    fn gathered(&self, v: &Strided) -> FlexTensor {
+        let b = &v.src.buffer;
+        if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
+            eprintln!(
+                "burn-tt: downloading [{}, {}] to read a {:?} view of it on the host\n{}",
+                b.rows,
+                b.cols,
+                self.cell.shape.to_vec(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        let src = server::download(self.device, b.id, b.rows, b.cols);
+        let shape = self.cell.shape.to_vec();
+        let n: usize = shape.iter().product();
+        let values: Vec<f32> = (0..n)
+            .map(|f| {
+                let [r, c] = v.at(&shape, f);
+                src[r * b.cols + c]
+            })
+            .collect();
+        FlexTensor::from_data(TensorData::new(values, shape))
     }
 
     /// The device copy, uploaded the first time it is needed, as the matrix
@@ -232,6 +321,23 @@ impl TtTensor {
         self.cell.dram.get_or_init(|| {
             let [rows, cols] =
                 stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
+            if let Some(v) = &self.cell.strided {
+                let shape = self.cell.shape.to_vec();
+                if let Some(moves) = v.tile_moves(&shape, &shape) {
+                    let (id, dims) =
+                        server::copy_blocks(self.device, v.src.buffer.id, moves, [rows, cols]);
+                    return DramRef {
+                        buffer: Arc::new(Buffer {
+                            id,
+                            device: self.device,
+                            rows: dims[0],
+                            cols: dims[1],
+                            parent: None,
+                        }),
+                        transposed: false,
+                    };
+                }
+            }
             let data = self.host().clone().into_data();
             let id = match device_elem(self.cell.dtype) {
                 Some(Elem::F32) => {

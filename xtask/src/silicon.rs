@@ -107,6 +107,7 @@ pub const SMOKE: &[&str] = &[
     "step12_mnist::the_mlp_trains_on_a_reduced_dataset",
     "step12_mnist::the_mlp_trains_on_four_tiles",
     "step59_burn_transformer::",
+    "step60_batched_blocks::",
 ];
 
 pub const USAGE: &str = "\

@@ -34,6 +34,7 @@ mod tensor;
 mod topology;
 mod trace;
 mod traffic;
+mod views;
 
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
@@ -79,6 +80,7 @@ pub use traffic::{
 };
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
+pub use tt_kernels::tensor::{Block, BlockMove};
 
 use burn_backend::{Backend, BackendTypes, DType, DTypeUsageSet, DeviceId, DeviceOps};
 use burn_flex::{Flex, FlexDevice};
