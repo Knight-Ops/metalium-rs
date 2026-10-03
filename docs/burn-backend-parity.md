@@ -18,10 +18,10 @@ hang mid-model.
 
 **Status, 2026-10-03** (audited against the code; the tables below are 2026-10-01's
 and are not all re-dated): B0 done but for `tracing`; B5 done but for partial-row
-downloads; B6 done for tile-aligned operands (rank-N `Linear` folded; batched products over strided views, `views.rs`); B8 partial (the engine queues ops and
-uploads until a result is needed, but each Burn call still waits for its reply,
-`server::run`); B1-B4, B7, B9-B15 not started -- B3's stale-buffer tests are still
-`#[ignore]`. The general-model gate is `tt-tests`' `step59_burn_transformer`, whose
+downloads; B6 done for tile-aligned operands (rank-N `Linear` folded; batched products over strided views, `views.rs`); B8 done (calls return at once,
+named by the caller; the first failure is sticky and reported at the next wait);
+B3's hazard closed by B8's never-reused ids (both stale-buffer tests pass); B1
+partly (deferred errors, not yet a typed `TtError`); B2, B4, B7, B9-B15 not started. The general-model gate is `tt-tests`' `step59_burn_transformer`, whose
 `tests/golden/transformer_off_device.txt` lists what still runs on the host.
 
 ---
@@ -544,7 +544,7 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B5** (storage, views and element-wise done: `hardware-coverage.md` P1a; partial-row download open -- measured: a 1000-row batch of a resident set is a host slice and a 3 MB re-upload every batch, 46 ms a batch against 2.1 on the host, row X) | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
 | **B6** (done 2026-10-03 for tile-aligned operands: a rank-N lhs against an unbatched rhs -- every `Linear` -- folds into the 2-D product, as do `linear_{weight,bias}_backward`; a real batch on both sides runs as `Session::matmul_dram_batched` over blocks of the operands' buffers, reshapes and swaps being strided views (`burn-tt/src/views.rs`); untiled shapes are still host-staged) | Batched matmul on resident operands (edge 9) | B5 | `[8,64,64]@[8,64,64]` under strict: zero downloads; bit-identical to per-batch host-staged |
 | **B7** | `download_many`, real readback futures, batched `tr_execute` | B1 | one server job per transaction |
-| **B8** | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
+| **B8** (done 2026-10-03: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
 | **B9** | `name`, `memory_cleanup`, `memory_persistent_allocations`; OOM retry | B2 | unit tests §2.1 |
 | **B10** | Vendored conformance crate on ttsim, eager policy, expected-failures | B2, B0 | §5.2 gate |
 | **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on both cards |

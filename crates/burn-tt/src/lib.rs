@@ -22,8 +22,10 @@
 //! here depends on the simulator.
 //!
 //! **Errors.** Burn's ops return tensors, not results, so a device op on a
-//! device nobody attached, or a device run that fails, **panics** with the
-//! error. The device path is never silently replaced by the host one.
+//! device nobody attached **panics** at once, and a device run that fails
+//! panics at the next wait for a result (device ops are dispatched without
+//! waiting, `server::submit`), naming the op and the engine's error. The device
+//! path is never silently replaced by the host one.
 
 mod convert;
 mod generated;

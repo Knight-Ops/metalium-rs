@@ -9,7 +9,11 @@
 //!
 //! The claim is the weakest a fix must meet: a stale tensor may be refused
 //! (a panic, or later a typed error), but it must never read, or free, a
-//! buffer that is not its own.
+//! buffer that is not its own. Met since asynchronous dispatch (B8): callers
+//! name buffers by a process-wide number never reused, which the server of
+//! each attachment translates to its engine's -- a stale tensor's number is
+//! no buffer of the new attachment's, so reading it is refused and dropping
+//! it frees nothing.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -94,7 +98,6 @@ fn values(t: Tensor<TtBackend, 2>) -> Vec<f32> {
 /// In attachment 1, `stale` is buffer 2. In attachment 2, `other` is buffer 2
 /// too. Reading `stale` must not return `other`'s data.
 #[test]
-#[ignore = "known bug: BufferIds restart per attachment (checklist Phase 9); un-ignore with the fix"]
 fn a_tensor_from_a_previous_attachment_does_not_read_another_buffer() {
     let device = TtDevice::new(120);
     let first = host_dram(device);
@@ -117,7 +120,6 @@ fn a_tensor_from_a_previous_attachment_does_not_read_another_buffer() {
 
 /// Dropping `stale` after the re-attach must not free `other`'s buffer.
 #[test]
-#[ignore = "known bug: BufferIds restart per attachment (checklist Phase 9); un-ignore with the fix"]
 fn dropping_a_stale_tensor_does_not_free_another_buffer() {
     let device = TtDevice::new(121);
     let first = host_dram(device);

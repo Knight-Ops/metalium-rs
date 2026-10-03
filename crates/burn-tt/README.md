@@ -113,8 +113,11 @@ unparsable value as `0`.
 
 ## Gotchas
 
-- **Device errors panic.** Burn ops return tensors, not results, so a device op on
-  an unattached device or a failed run panics. It never silently falls back.
+- **Device errors panic, at the next wait.** Device ops return before they run
+  (asynchronous dispatch), so a failed run panics where a result is next waited
+  for -- a download, a trace's replay -- naming the op that failed and the engine's
+  error; the first failure on an attachment is reported by every later wait. An op
+  on an unattached device panics at once. Nothing silently falls back.
 - `TT_PROFILE` records each tile's mover lists, entries and records, and its role
   runs, by the tile's own cycle counter (Perfetto, `chrome://tracing`). Silicon
   only: ttsim does not model the timestamper's event stream.
