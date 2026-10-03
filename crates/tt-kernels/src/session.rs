@@ -326,6 +326,8 @@ pub struct Session<T: Transport> {
     /// NC's mover image, when pipelined groups' scatters go to NC
     /// ([`Session::set_scatter_mover`]); `None` keeps every move on B.
     scatter_on_nc: Option<&'static [u8]>,
+    /// [`Session::host_times`].
+    host: HostTimes,
     /// [`Session::pipelined_blocks`].
     pipelined: u64,
     /// [`Session::set_profile_roles`].
@@ -406,6 +408,96 @@ struct QueuedList {
     number: u32,
     kernels: bool,
     what: &'static str,
+}
+
+/// Where the host's time goes queueing ops ([`Session::host_times`],
+/// checklist 9.17): each stage's wall time, PCIe traffic and how often it ran,
+/// summed since the session opened or [`Session::reset_host_times`].
+#[derive(Clone, Debug, Default)]
+pub struct HostTimes {
+    pub stages: [(HostStage, HostStageTotal); HostStage::ALL.len()],
+    /// Ops queued (`Session::execute` with batching).
+    pub ops: u64,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum HostStage {
+    /// The whole of queueing an op: everything below, and what is between.
+    #[default]
+    Enqueue,
+    /// Steps into mover lists (`segments`).
+    Segments,
+    /// A unit's roles and mover checked, started if they are not.
+    Ensure,
+    /// A kernel's descriptors checked against what queued lists read.
+    IdleCheck,
+    /// Programs looked up in the cache, uploaded if missing.
+    Place,
+    /// Kernel generations reserved (`Resident::reserve`).
+    Reserve,
+    /// NC's list, with the scatters on NC.
+    NcList,
+    /// The list written to the mover's ring and its doorbell rung.
+    List,
+    /// Every unit's barrier entry, on a multi-unit op.
+    Barrier,
+    /// Waiting for a unit to drain, for programs or descriptors.
+    Drain,
+}
+
+impl HostStage {
+    pub const ALL: [HostStage; 10] = [
+        HostStage::Enqueue,
+        HostStage::Segments,
+        HostStage::Ensure,
+        HostStage::IdleCheck,
+        HostStage::Place,
+        HostStage::Reserve,
+        HostStage::NcList,
+        HostStage::List,
+        HostStage::Barrier,
+        HostStage::Drain,
+    ];
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HostStageTotal {
+    pub time: std::time::Duration,
+    pub traffic: tt_device::Traffic,
+    pub count: u64,
+}
+
+impl HostTimes {
+    fn new() -> Self {
+        let mut t = HostTimes::default();
+        for (i, s) in HostStage::ALL.into_iter().enumerate() {
+            t.stages[i].0 = s;
+        }
+        t
+    }
+
+    fn add(
+        &mut self,
+        stage: HostStage,
+        since: (std::time::Instant, tt_device::Traffic),
+        now: tt_device::Traffic,
+    ) {
+        let i = HostStage::ALL.iter().position(|&s| s == stage).unwrap();
+        let t = &mut self.stages[i].1;
+        t.time += since.0.elapsed();
+        t.traffic = t.traffic + diff(now, since.1);
+        t.count += 1;
+    }
+}
+
+fn diff(a: tt_device::Traffic, b: tt_device::Traffic) -> tt_device::Traffic {
+    tt_device::Traffic {
+        bytes_written: a.bytes_written - b.bytes_written,
+        bytes_read: a.bytes_read - b.bytes_read,
+        write_calls: a.write_calls - b.write_calls,
+        read_calls: a.read_calls - b.read_calls,
+        retargets: a.retargets - b.retargets,
+    }
 }
 
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
@@ -494,7 +586,14 @@ fn stored_program(
     );
     const MEMO_MAX: usize = 4096;
     static MEMO: OnceLock<Mutex<HashMap<(usize, usize), Entry>>> = OnceLock::new();
-    let key = (Arc::as_ptr(roles) as usize, Arc::as_ptr(loops) as usize);
+    // No loops is one key, whichever allocation carries it: matmuls and
+    // reductions build a fresh empty table for every kernel.
+    let loops_key = if loops.iter().all(Vec::is_empty) {
+        0
+    } else {
+        Arc::as_ptr(loops) as usize
+    };
+    let key = (Arc::as_ptr(roles) as usize, loops_key);
     let mut memo = MEMO
         .get_or_init(Default::default)
         .lock()
@@ -1106,6 +1205,7 @@ impl<T: Transport> Session<T> {
             profile: runtime::Profile::default(),
             pipeline: true,
             scatter_on_nc: None,
+            host: HostTimes::new(),
             pipelined: 0,
             profile_roles: true,
             drains: 0,
@@ -1616,7 +1716,10 @@ impl<T: Transport> Session<T> {
             .as_ref()
             .map(|c| c.units.iter().map(|u| u.stream.len()).collect());
         let mut what = "";
+        let start = self.mark();
         let result = self.enqueue_work_inner(jobs, budget, &mut what);
+        self.host.ops += 1;
+        self.stage(HostStage::Enqueue, start);
         if let (Some(c), Some(starts)) = (self.capture.as_mut(), starts) {
             // Part of an op captured is no op a replay could run.
             c.failed |= result.is_err();
@@ -1657,25 +1760,23 @@ impl<T: Transport> Session<T> {
         // (a pipelined 1024^3 matmul on 8 tiles: 9 ms in the call, against
         // 0.4).
         let split = self.scatter_on_nc.is_some() && self.capture.is_none();
+        let start = self.mark();
         let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
             .into_iter()
             .map(|steps| segments_split(steps, split).into())
             .collect();
-        while per_unit.iter().any(|q| !q.is_empty()) {
-            for (u, q) in per_unit.iter_mut().enumerate() {
-                if let Some(seg) = q.pop_front() {
-                    if what.is_empty() {
-                        *what = seg.what;
-                    }
-                    self.enqueue_segment(u, &seg, budget)?;
-                }
-            }
-        }
-        if n > 1 {
+        self.stage(HostStage::Segments, start);
+        // With more than one unit, a barrier on every unit after its share,
+        // since the next op may read what any unit wrote. It rides at the
+        // end of the unit's last list where there is room -- a list of its
+        // own was a second enqueue a unit an op, half the host's time on
+        // many tiles (checklist 9.17) -- except while capturing, whose
+        // streams take it as an entry of its own.
+        let barrier = (n > 1).then(|| {
             self.barriers = self.barriers.wrapping_add(1);
             let target = self.barriers.wrapping_mul(n as u32);
             let c = self.units[0].tile;
-            let entry = [
+            [
                 tt_isa::dm::op::BARRIER,
                 target,
                 c.x() as u32,
@@ -1684,17 +1785,38 @@ impl<T: Transport> Session<T> {
                 0,
                 0,
                 0,
-            ];
+            ]
+        });
+        let fold = barrier.filter(|_| self.capture.is_none());
+        let mut folded = vec![false; n];
+        while per_unit.iter().any(|q| !q.is_empty()) {
+            for (u, q) in per_unit.iter_mut().enumerate() {
+                if let Some(mut seg) = q.pop_front() {
+                    if what.is_empty() {
+                        *what = seg.what;
+                    }
+                    if let Some(entry) = fold {
+                        if q.is_empty() && seg.entries.len() < tt_isa::dm::LIST_MAX as usize {
+                            seg.entries.push(entry);
+                            folded[u] = true;
+                        }
+                    }
+                    self.enqueue_segment(u, &seg, budget)?;
+                }
+            }
+        }
+        if let Some(entry) = barrier {
+            let start = self.mark();
             if let Some(c) = self.capture.as_mut() {
                 // Relative to the capture's first: a replay adds its own.
-                let rel = target.wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
+                let rel = entry[1].wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
                 c.barriers += 1;
                 for uc in &mut c.units {
                     uc.stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
-            for u in 0..n {
+            for u in (0..n).filter(|&u| !folded[u]) {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let (r, m) = (
@@ -1708,8 +1830,27 @@ impl<T: Transport> Session<T> {
                     what: "barrier",
                 });
             }
+            self.stage(HostStage::Barrier, start);
         }
         Ok(())
+    }
+
+    fn mark(&self) -> (std::time::Instant, tt_device::Traffic) {
+        (std::time::Instant::now(), self.dev.traffic())
+    }
+
+    fn stage(&mut self, stage: HostStage, since: (std::time::Instant, tt_device::Traffic)) {
+        let now = self.dev.traffic();
+        self.host.add(stage, since, now);
+    }
+
+    /// Where the host's time went queueing ops (checklist 9.17).
+    pub fn host_times(&self) -> &HostTimes {
+        &self.host
+    }
+
+    pub fn reset_host_times(&mut self) {
+        self.host = HostTimes::new();
     }
 
     /// Queue one segment on unit `u`: its programs placed (and pinned until
@@ -1720,7 +1861,9 @@ impl<T: Transport> Session<T> {
         if self.capture.is_some() && !seg.kernel_roles.is_empty() && !seg.resident {
             return Err(TraceError::NotResident.into());
         }
+        let start = self.mark();
         self.ensure_unit(u)?;
+        self.stage(HostStage::Ensure, start);
         // A drain the descriptors need comes before the programs are placed:
         // a drain unpins every program, and those placed for this list must
         // stay pinned until it has run -- the next placement would otherwise
@@ -1734,6 +1877,7 @@ impl<T: Transport> Session<T> {
                 ..Kernel::new([unpack, math, pack], Schedule::Concurrent(&seg.init))
             }
         });
+        let start = self.mark();
         if let Some(kernel) = &kernel {
             let idle = {
                 let Session { dev, units, .. } = self;
@@ -1741,9 +1885,15 @@ impl<T: Transport> Session<T> {
                 r.needs_idle(dev, kernel, seg.resident)
             };
             if idle {
+                self.stage(HostStage::IdleCheck, start);
+                let start = self.mark();
                 self.drain_unit(u)?;
+                self.stage(HostStage::Drain, start);
+            } else {
+                self.stage(HostStage::IdleCheck, start);
             }
         }
+        let start = self.mark();
         if !seg.waits.is_empty() {
             self.pipelined += seg.waits.len() as u64;
         }
@@ -1763,7 +1913,9 @@ impl<T: Transport> Session<T> {
             let placed = match placed {
                 Ok(p) => p,
                 Err(()) => {
+                    let d0 = self.mark();
                     self.drain_unit(u)?;
+                    self.stage(HostStage::Drain, d0);
                     let Session { dev, units, .. } = self;
                     let unit = &mut units[u];
                     let w = unit.resident.as_ref().unwrap().window();
@@ -1777,6 +1929,8 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+        self.stage(HostStage::Place, start);
+        let start = self.mark();
         if let Some(kernel) = &kernel {
             let Session {
                 dev, units, images, ..
@@ -1802,8 +1956,12 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         }
+        self.stage(HostStage::Reserve, start);
         if !seg.nc_entries.is_empty() {
-            if let Err(e) = self.enqueue_nc(u, seg, &mut entries) {
+            let start = self.mark();
+            let r = self.enqueue_nc(u, seg, &mut entries);
+            self.stage(HostStage::NcList, start);
+            if let Err(e) = r {
                 let r = self.units[u].resident.as_mut().unwrap();
                 if !seg.kernel_roles.is_empty() {
                     let _ = r.reserved_done(&mut self.dev, false);
@@ -1811,13 +1969,19 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         }
+        let start = self.mark();
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
             unit.resident.as_mut().unwrap(),
             unit.mover.as_mut().unwrap(),
         );
-        let number = match m.enqueue(dev, r.window(), &entries) {
+        let enqueued = m.enqueue(dev, r.window(), &entries);
+        self.stage(HostStage::List, start);
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let r = unit.resident.as_mut().unwrap();
+        let number = match enqueued {
             Ok(n) => n,
             Err(e) => {
                 if !seg.kernel_roles.is_empty() {

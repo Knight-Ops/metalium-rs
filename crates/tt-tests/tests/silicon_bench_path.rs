@@ -832,3 +832,94 @@ fn sfpu_pipeline_sweep() {
         }
     }
 }
+
+/// Where the host's time goes queueing an op (checklist 9.17): an add of
+/// MNIST's size and of 512², and a 256³ matmul, 50 of each queued back to
+/// back on 1, 8 and 32 tiles (`SWEEP_TILES`), with `Session::host_times`'s
+/// stages, PCIe traffic and TLB retargets per op, and the call's wall time.
+#[test]
+#[ignore = "benchmark"]
+fn host_time_per_op() {
+    use tt_kernels::kind;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::tensor::Eltwise;
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    const OPS: usize = 50;
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            let add = Eltwise {
+                kind: kind::ADD,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            for (name, r, c) in [("add", 64, 784), ("add", 512, 512), ("matmul", 256, 256)] {
+                let a = s.upload(&vec![0.5; r * c], r, c).unwrap();
+                let b = s.upload(&vec![0.25; r * c], r, c).unwrap();
+                let op = |s: &mut Session<tt_kmd::Kmd>| {
+                    if name == "add" {
+                        s.eltwise(add, &a, Some(&b)).unwrap()
+                    } else {
+                        s.matmul_dram(
+                            &a,
+                            false,
+                            &b,
+                            false,
+                            SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            BUDGET,
+                        )
+                        .unwrap()
+                    }
+                };
+                // Warm: programs resident, movers started.
+                for _ in 0..3 {
+                    let o = op(&mut s);
+                    s.sync().unwrap();
+                    s.free(o).unwrap();
+                }
+                s.reset_host_times();
+                let t0 = Instant::now();
+                let outs: Vec<_> = (0..OPS).map(|_| op(&mut s)).collect();
+                let calls = t0.elapsed();
+                s.sync().unwrap();
+                let total = t0.elapsed();
+                for o in outs {
+                    s.free(o).unwrap();
+                }
+                let h = s.host_times().clone();
+                let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / OPS as f64;
+                println!(
+                    "MEASURE host {name} {r}x{c} on {tiles} tiles: call {:.1} us/op, with sync {:.1} us/op",
+                    per(calls),
+                    per(total)
+                );
+                for (stage, t) in h.stages.iter() {
+                    if t.count == 0 {
+                        continue;
+                    }
+                    println!(
+                        "MEASURE host {name} {r}x{c} on {tiles} tiles:   {:<10} {:>7.1} us/op  x{:<5.1} reads {:>5.1} writes {:>6.1} retargets {:>5.1} /op",
+                        format!("{stage:?}"),
+                        per(t.time),
+                        t.count as f64 / OPS as f64,
+                        t.traffic.read_calls as f64 / OPS as f64,
+                        t.traffic.write_calls as f64 / OPS as f64,
+                        t.traffic.retargets as f64 / OPS as f64,
+                    );
+                }
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}

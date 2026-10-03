@@ -441,12 +441,23 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<u32> {
         self.check(entries)?;
         let n = entries.len() as u32;
+        let mut refreshed = false;
         let first = loop {
-            self.refresh(d, w)?;
+            // The host's own record of what is in flight is conservative --
+            // a list it has not seen finish holds its slot -- so it only
+            // reads the queue's progress (two uncached PCIe reads, most of an
+            // enqueue's cost on many tiles, checklist 9.17) when that record
+            // says the ring or the slots are full. A failed list is reported
+            // at the next wait or sync instead.
             if let Some(at) = self.room(n) {
                 if self.in_flight.len() < dm::QUEUE_LEN as usize {
                     break at;
                 }
+            }
+            if !refreshed {
+                self.refresh(d, w)?;
+                refreshed = true;
+                continue;
             }
             // Full: wait for the oldest list, which frees its slot and entries.
             let oldest = self

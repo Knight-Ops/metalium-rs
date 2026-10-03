@@ -1491,8 +1491,12 @@ tiles, done in turn. The slices from there:
       over rows took 54 us on 8 tiles and 155 on 32 (`sfpu_pipeline_sweep`).
       It is also why pipelining those ops loses past a few tiles
       (`tensor::PIPELINE_SHARE`).
-    - Split the per-unit cost first (list build, program lookup, descriptor
-      reserve, ring write, doorbell) with the host profile.
+    - [x] Split the per-unit cost first (`Session::host_times`,
+      `host_time_per_op`). It was mostly two PCIe reads an enqueue and a
+      second (barrier) list a unit, and matmul programs missing the memo:
+      fixed, 6 -> 3.4 us a unit an op on 32 tiles (MNIST 8 tiles 2.1 -> 1.6
+      ms/step). Left: three posted writes (1.3 us) and CPU work (~2 us) a
+      unit.
     - Likely fix: Tenstorrent's Metal Trace, recorded once and replayed. This
       workspace already captures and replays (`Session` traces,
       `step39_traces`): measure how much host time a replay removes, and make
