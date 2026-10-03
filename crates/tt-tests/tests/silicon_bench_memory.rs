@@ -319,6 +319,78 @@ fn mover_write_sweep() {
 /// The mover's fixed costs: a list of `WAIT`s (loop, decode, a NoC drain
 /// check), and the list itself (an empty-of-data one-entry list). Traced and
 /// untraced from the host, too: what tracing itself costs the numbers above.
+/// Would a mover image specialised to one direction be faster than the
+/// shared one? (checklist 9.15, B/NC specialisation.) One tile's mover runs
+/// the same reads and writes four ways: all reads, all writes, alternating
+/// one by one, and in blocks of 8 (a gather record's worth, then a scatter's,
+/// as a pipelined list runs them). With the split (`Session::
+/// set_scatter_mover`) each mover only ever runs one direction's code, so a
+/// shared image already keeps the other direction out of its instruction
+/// cache; what specialisation could add is the mixed lists' cost per entry
+/// over the pure lists' average -- the read and write paths evicting each
+/// other. `BENCH_MOVER=nc` runs NC's mover.
+#[test]
+#[ignore = "benchmark"]
+fn mover_mixed_directions() {
+    on_card(|d| {
+        one_tile(d, |one| {
+            let ch = one.dram.channels().next().unwrap().index();
+            let t = one.m.tile();
+            let src = pattern(L1_SPAN as usize, 5);
+            one.d.write(&one.w, t, L1 as u64, &src).unwrap();
+            for len in [64u32, 1024, 4096] {
+                const N: u32 = 128;
+                let read =
+                    |i: u32| entry(op::READ, ch, 0, BASE + (i * len) as u64, L1 + i * len, len);
+                let write = |i: u32| {
+                    entry(
+                        op::WRITE,
+                        ch,
+                        0,
+                        BASE + (32 << 20) + (i * len) as u64,
+                        L1 + (N + i) * len,
+                        len,
+                    )
+                };
+                let lists: [(&str, Vec<Entry>); 4] = [
+                    ("reads", (0..N).map(read).collect()),
+                    ("writes", (0..N).map(write).collect()),
+                    (
+                        "alternating",
+                        (0..N)
+                            .map(|i| if i % 2 == 0 { read(i) } else { write(i) })
+                            .collect(),
+                    ),
+                    (
+                        "blocks of 8",
+                        (0..N)
+                            .map(|i| if (i / 8) % 2 == 0 { read(i) } else { write(i) })
+                            .collect(),
+                    ),
+                ];
+                let mut per = Vec::new();
+                for (what, list) in &lists {
+                    let cycles = list_cycles(one.d, &one.w, &mut one.m, list);
+                    let e = cycles.map(|c| c / N as f64);
+                    report(
+                        &format!("mover {len:>5} B {what:<12} per entry"),
+                        "cycles",
+                        "device",
+                        e,
+                    );
+                    per.push(e.median);
+                }
+                let pure = (per[0] + per[1]) / 2.0;
+                println!(
+                    "MEASURE mixed {len:>5} B: alternating {:.3}x, blocks of 8 {:.3}x the pure lists' average ({pure:.0} cycles)",
+                    per[2] / pure,
+                    per[3] / pure
+                );
+            }
+        });
+    });
+}
+
 #[test]
 #[ignore = "benchmark"]
 fn mover_overhead() {

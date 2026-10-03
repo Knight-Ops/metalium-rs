@@ -1481,6 +1481,10 @@ tiles, done in turn. The slices from there:
       0.70-0.80 against pipelined B-only); costs host time on many tiles.
     - `copy_pipeline` found B's own pipelining within 3-5% of B+NC at large
       entries and NC 1.6x faster at 4 KiB, so both are measured.
+    - [x] Specialised B / NC images, measured and declined
+      (`mover_mixed_directions`): reads and writes in blocks, as pipelined
+      lists run them, cost 0.3-0.6% an entry over pure lists, so one image
+      serves both cores.
   - [ ] **9.17 Host time per op, measured first (research).**
     - On many tiles an element-wise op or reduction is the host's: it queues
       each unit's list in turn, ~6 us a unit an op on card 0, so a 50-tile max
