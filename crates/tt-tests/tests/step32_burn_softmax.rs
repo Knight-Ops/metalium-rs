@@ -46,9 +46,9 @@ fn resident(t: &Tensor<TtBackend, 2>) -> bool {
 #[test]
 fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
     with_device(Config::default(), |d| {
-        // At least eight tiles: below that `burn-tt` keeps these on the host
-        // (`APPROX_MIN_TILES`; `a_small_tensor_s_approximations_stay_on_the_host`).
-        for [r, c] in [[256, 10], [70, 120], [40, 400]] {
+        // Any size: approximations follow their data (MNIST's two-tile
+        // `[64, 10]` logits too).
+        for [r, c] in [[256, 10], [70, 120], [40, 400], [64, 10], [5, 7]] {
             let v = values((r * c) as u64, r * c);
             let t = Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d)
                 .to_device(&d);
@@ -142,26 +142,31 @@ fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
     });
 }
 
-/// Below eight tiles the approximations' fixed cost outweighs a download
-/// (`burn-tt`'s `APPROX_MIN_TILES`): they run on the host, and give Flex's
-/// bits exactly.
+/// In exact mode the approximations run on the host, at any size, and give
+/// Flex's bits exactly.
 #[test]
-fn a_small_tensor_s_approximations_stay_on_the_host() {
-    with_device(Config::default(), |d| {
-        let [r, c] = [64, 10];
-        let v = values(3, r * c);
-        let t =
-            Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d).to_device(&d);
-        let f = Tensor::<Flex, 2>::from_data(TensorData::new(v, [r, c]), &FlexDevice);
-        let soft = activation::softmax(t.clone(), 1);
-        let softmin = activation::softmin(t.clone(), 1);
-        let ex = t.clone().exp();
-        assert!(
-            !resident(&soft) && !resident(&softmin) && !resident(&ex),
-            "two tiles: the host's"
-        );
-        assert_eq!(floats(soft), floats(activation::softmax(f.clone(), 1)));
-        assert_eq!(floats(softmin), floats(activation::softmin(f.clone(), 1)));
-        assert_eq!(floats(ex), floats(f.exp()));
-    });
+fn in_exact_mode_the_approximations_are_the_host_s() {
+    with_device(
+        Config {
+            exact: true,
+            ..Config::default()
+        },
+        |d| {
+            let [r, c] = [64, 10];
+            let v = values(3, r * c);
+            let t = Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d)
+                .to_device(&d);
+            let f = Tensor::<Flex, 2>::from_data(TensorData::new(v, [r, c]), &FlexDevice);
+            let soft = activation::softmax(t.clone(), 1);
+            let softmin = activation::softmin(t.clone(), 1);
+            let ex = t.clone().exp();
+            assert!(
+                !resident(&soft) && !resident(&softmin) && !resident(&ex),
+                "exact mode: the host's"
+            );
+            assert_eq!(floats(soft), floats(activation::softmax(f.clone(), 1)));
+            assert_eq!(floats(softmin), floats(activation::softmin(f.clone(), 1)));
+            assert_eq!(floats(ex), floats(f.exp()));
+        },
+    );
 }

@@ -76,35 +76,14 @@ fn device_view(
     )
 }
 
-/// `a (kind) b` -- or `a (kind) scalar` with `b` `None` -- on the device, if
-/// that is where the data is: every operand an F32 matrix, at least one already
-/// on the device, none a transposed view, and the shapes ones the kernels take
-/// (`b` the same shape, or for `ADD_ROW` one row). `None` otherwise, and the
-/// caller runs Flex's op on the host copies.
-/// Tiles below which an SFPU-only op (an approximation: division, `exp`,
-/// `log`, the SFPU's reductions) runs on the host after a download instead.
-/// Each SFPU kernel op costs 100-200 us whatever its size -- most of it the
-/// host's submission (`silicon_perf::softmax_parts`, card 0) -- against ~190
-/// us to download a tile; and a small tensor's chain of such ops (autodiff's
-/// own `log_softmax` is five forward and more backward) usually ends on the
-/// host anyway. MNIST's two-tile logits trained at 7.9 ms/step on one tile
-/// with them on the device, 3.6 without. A heuristic until submission is
-/// asynchronous or a lookahead exists (`burn-backend-parity.md` B8, B13, B16).
-/// Re-measured with batched submission (2026-10-03, card 0, one tile):
-/// without the threshold MNIST trains at 1.6 ms/step against 1.0 (its
-/// two-tile log-softmax still ends in a host loss), and the transformer of
-/// `tt-mnist --model transformer` at 9.0 against 10.4 (its four-tile layer
-/// norm statistics feed device ops). Kept until a lookahead can tell the two.
-/// Measured again with the loss's gather on the card (D4): MNIST 1.1 against
-/// 1.7-1.8 ms/step without the threshold, the transformer 12.0 against
-/// 10.0-11.0 -- MNIST's two-tile log-softmax is cheaper on the host still.
-const APPROX_MIN_TILES: usize = 8;
-
-/// Tiles in the tile grid of the matrix a tensor is stored as.
-fn tiles(t: &TtTensor) -> usize {
-    t.stored()
-        .map_or(0, |[r, c]| r.div_ceil(32) * c.div_ceil(32))
-}
+// Approximate ops (division, `exp`, `log`, the SFPU's reductions) follow
+// their data at every size, as exact ones do: data stays on the card. Until
+// 2026-10-03 they ran on the host below eight tiles (`APPROX_MIN_TILES`), a
+// heuristic MNIST's two-tile log-softmax favoured (1.1 against 1.7-1.8
+// ms/step on card 0) and the transformer did not (12.0 against 10.0-11.0,
+// nothing downloaded); removed because nothing should come back to the host
+// to save a call (`firmware-performance.md`, change log). Only exact mode
+// keeps an approximation on the host.
 
 /// The shape `a` and `b` broadcast to (NumPy's rule, which Burn's binary ops
 /// follow), or `None` if they do not.
@@ -120,19 +99,24 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
         .collect()
 }
 
+/// `a (kind) b` -- or `a (kind) scalar` with `b` `None` -- on the device, if
+/// that is where the data is: every operand an F32 matrix, at least one already
+/// on the device, none a transposed view, and the shapes ones the kernels take
+/// (`b` the same shape, or for `ADD_ROW` one row). `None` otherwise, and the
+/// caller runs Flex's op on the host copies.
 fn device_eltwise(kind: u32, scalar: f32, a: &TtTensor, b: Option<&TtTensor>) -> Option<TtTensor> {
-    // An approximation: not in exact mode, and not on a tensor too small to
-    // pay its fixed cost (`APPROX_MIN_TILES`). An exact op follows the data.
+    // An approximation: not in exact mode. Otherwise it follows the data,
+    // as an exact op does.
     use tt_kernels::sfpu::ops::{accuracy, Accuracy};
-    if accuracy(kind) == Accuracy::Approximate && (crate::exact() || tiles(a) < APPROX_MIN_TILES) {
+    if accuracy(kind) == Accuracy::Approximate && crate::exact() {
         return None;
     }
     device_eltwise_ungated(kind, scalar, a, b)
 }
 
-/// [`device_eltwise`] without the size gate: for a composition that has
-/// already decided, on its whole input, to run on the device (a softmax's
-/// `log` of its small per-row sums, say).
+/// [`device_eltwise`] without the exact-mode gate: for a composition that has
+/// already decided, on its whole input, to run on the device, or one that is
+/// exact as composed (a gather's masked sum).
 fn device_eltwise_ungated(
     kind: u32,
     scalar: f32,
@@ -156,8 +140,7 @@ fn device_op(
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
     use tt_kernels::sfpu::ops::{accuracy, Accuracy};
-    if accuracy(op.kind) == Accuracy::Approximate && (crate::exact() || tiles(a) < APPROX_MIN_TILES)
-    {
+    if accuracy(op.kind) == Accuracy::Approximate && crate::exact() {
         return None;
     }
     device_op_ungated(op, a, b, c)
@@ -267,11 +250,11 @@ enum PowY<'a> {
 /// transposed view; an approximation, so gated as [`device_eltwise`] gates
 /// one. `None` otherwise.
 fn device_pow(x: &TtTensor, y: PowY<'_>) -> Option<TtTensor> {
-    if crate::exact() || tiles(x) < APPROX_MIN_TILES {
+    if crate::exact() {
         return None;
     }
     let device = x.device;
-    if !x.is_storable() || x.elem() != Some(Elem::F32) || !crate::server::supports_dram(device) {
+    if !x.is_storable() || x.elem() != Some(Elem::F32) {
         return None;
     }
     let yt = match y {
@@ -288,7 +271,11 @@ fn device_pow(x: &TtTensor, y: PowY<'_>) -> Option<TtTensor> {
         }
         PowY::Scalar(_) => None,
     };
+    // Resident first: a host tensor never asks its device anything.
     if x.dram().is_none() && yt.is_none_or(|t| t.dram().is_none()) {
+        return None;
+    }
+    if !crate::server::supports_dram(device) {
         return None;
     }
     let dx = x.to_dram();
@@ -907,7 +894,7 @@ pub mod float {
         // to `-0`. Those, not
         // in exact mode, and not on a tensor too small to pay for themselves.
         let rows_sum = op == ReduceOp::Sum && dim == 0 && tensor.shape().num_dims() == 2;
-        if !rows_sum && (crate::exact() || tiles(tensor) < APPROX_MIN_TILES) {
+        if !rows_sum && crate::exact() {
             return None;
         }
         device_reduce_ungated(tensor, op, dim)
@@ -982,7 +969,11 @@ pub mod float {
         use tt_kernels::sfpu::reduce::Axis;
         let device = tensor.device;
         let rank = tensor.shape().num_dims();
-        if !tensor.is_stored_f32() || !crate::server::supports_dram(device) {
+        // Resident first: a host tensor never asks its device anything.
+        if !tensor.is_stored_f32()
+            || tensor.as_strided().is_none()
+            || !crate::server::supports_dram(device)
+        {
             return None;
         }
         let axis = if rank == 2 && dim == 0 {
@@ -1874,23 +1865,11 @@ pub mod activation {
         }
     }
 
-    /// Tiles below which a softmax is Flex's after a download rather than
-    /// five device ops: each device op costs 100-200 us whatever its size, a
-    /// tile's download ~190 us and its share of the composition ~55 us
-    /// (`silicon_perf::softmax_parts`, card 0), so the composition pays from
-    /// about six tiles. A heuristic until a lookahead can see where the result
-    /// goes (Burn fusion, `burn-backend-parity.md` B13/B16): MNIST's
-    /// `[64, 10]` logits, two tiles bound for a loss on the host, stay there.
-    const SOFTMAX_DEVICE_MIN_TILES: usize = 8;
-
     /// Is `t` an F32 matrix on a device that keeps tensors in GDDR, with a
-    /// device copy already, and big enough to compose a softmax over there?
+    /// device copy already (and exact mode off: a softmax is an
+    /// approximation)?
     fn resident_matrix(t: &TtTensor) -> bool {
-        let dims = t.shape().to_vec();
-        let tiles =
-            dims.first().map_or(0, |r| r.div_ceil(32)) * dims.get(1).map_or(0, |c| c.div_ceil(32));
         !crate::exact()
-            && tiles >= SOFTMAX_DEVICE_MIN_TILES
             && t.is_matrix_f32()
             && t.dram().is_some_and(|d| !d.transposed)
             && crate::server::supports_dram(t.device)

@@ -442,7 +442,7 @@ columns (tree order), softmax. `burn_tt::set_exact(true)` or
 reproduce a host golden sets it (the MNIST golden does). Which ops are which is data:
 `tt_kernels::sfpu::ops::accuracy` -- S2's compare, select and sign ops are exact and run
 on the device in exact mode and at any size (`hardware-coverage.md` 10.2c). Below eight tiles the
-approximate ops run on the host whatever the mode (`APPROX_MIN_TILES`, measured: their
+approximate ops ran on the host whatever the mode until 2026-10-03 (`APPROX_MIN_TILES`, removed: data stays on the card; measured: their
 fixed cost outweighs a download) -- a placement heuristic B16 should replace.
 
 ### 4.4 `sync`, async dispatch, determinism

@@ -70,9 +70,9 @@ fn a_capture_that_falls_back_to_the_host_is_refused_and_ends() {
     with_device(Config::default(), |device| {
         let x: T2 = Tensor::from_data(TensorData::new(values(1, 32 * 32), [32, 32]), &device);
         let xp = primitive(x.clone());
-        // `sin` has no device path: a download, which the capture refuses.
+        // `cumsum` has no device path: a download, which the capture refuses.
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Trace::capture(&xp, || primitive(x.clone().sin()))
+            Trace::capture(&xp, || primitive(x.clone().cumsum(1)))
         }));
         assert!(
             refused.is_err() || refused.as_ref().is_ok_and(|r| r.is_err()),

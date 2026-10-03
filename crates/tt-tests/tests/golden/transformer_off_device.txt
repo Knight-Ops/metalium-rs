@@ -8,23 +8,14 @@
 # rank-N reductions along the last dim and over leading dims): every matmul,
 # swap and transpose, softmax's max and exp on the card. What is left below.
 
-# Device ops that still meet operands made on the host, or make a few results
-# there: approximate ops on tensors below `APPROX_MIN_TILES` (layer norm's and
-# the loss's `[b s, 1]` statistics: sqrt, log, div), which drag their
-# neighbours (add, mul, sub, div) through PCIe.
+# Device ops that still meet operands made on the host (Burn's `ones` and
+# `zeros`, the targets, the batch), uploading them.
 float_add
-float_div
-float_div_scalar
-float_log
 float_matmul
 float_mul
 float_mul_scalar
 float_neg
-float_powf_scalar
-float_powi_scalar
-float_recip
 float_reshape
-float_sqrt
 float_sub
 float_sum_dim
 int_reshape
@@ -32,8 +23,7 @@ int_reshape
 # On the card (D4, 2026-10-03), but host-made operands still cross: the
 # table's one upload (`select`, as a matmul's weights), the `[V, d]` zeros
 # Burn's `embedding_backward` makes on the host (`select_add`), and the
-# loss's gather and its backward, which follow a log-softmax that ends on
-# the host below `APPROX_MIN_TILES`.
+# loss's gather and its backward.
 float_select
 float_select_add
 float_gather
