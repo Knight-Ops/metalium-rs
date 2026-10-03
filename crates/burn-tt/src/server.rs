@@ -109,6 +109,26 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// Rows of `sources` gathered into a new buffer
+    /// (`Session::gather_rows`): an embedding's lookup.
+    fn gather_rows(
+        &mut self,
+        _sources: &[BufferId],
+        _rows: &[(usize, usize)],
+        _cols: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    /// `t` with `value`'s rows added to the rows `indices` name, in order
+    /// (`Session::rows_add`): an embedding's gradient.
+    fn rows_add(
+        &mut self,
+        _t: BufferId,
+        _indices: &[usize],
+        _value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
     fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
@@ -408,6 +428,38 @@ impl DramBuffers {
         let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
         let c = s
             .matmul_dram_batched(&ta, &tb, items, mkn, route, fidelity, budget)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    pub fn gather_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        sources: &[BufferId],
+        rows: &[(usize, usize)],
+        cols: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ts = sources
+            .iter()
+            .map(|&id| self.get(id).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<_> = ts.iter().collect();
+        let c = s
+            .gather_rows(&refs, rows, cols)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    pub fn rows_add<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        t: BufferId,
+        indices: &[usize],
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
+        let c = s
+            .rows_add(&tt, indices, &tv)
             .map_err(|e| EngineError(e.to_string()))?;
         Ok(self.insert(c))
     }
@@ -852,6 +904,32 @@ pub(crate) fn matmul_dram_batched(
     .unwrap_or_else(|e| panic!("batched matmul on {device}: {e}"))
 }
 
+/// A row gather on the device, panicking on a device error.
+pub(crate) fn gather_rows(
+    device: TtDevice,
+    sources: Vec<BufferId>,
+    rows: Vec<(usize, usize)>,
+    cols: usize,
+) -> (BufferId, [usize; 2]) {
+    timed_run("gather_rows", device, move |engine| {
+        engine.gather_rows(&sources, &rows, cols)
+    })
+    .unwrap_or_else(|e| panic!("row gather on {device}: {e}"))
+}
+
+/// Rows added by index on the device, panicking on a device error.
+pub(crate) fn rows_add(
+    device: TtDevice,
+    t: BufferId,
+    indices: Vec<usize>,
+    value: BufferId,
+) -> (BufferId, [usize; 2]) {
+    timed_run("rows_add", device, move |engine| {
+        engine.rows_add(t, &indices, value)
+    })
+    .unwrap_or_else(|e| panic!("rows added by index on {device}: {e}"))
+}
+
 /// A block copy on the device, panicking on a device error.
 pub(crate) fn copy_blocks(
     device: TtDevice,
@@ -1007,6 +1085,24 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.copy_blocks(&mut self.session, a, moves, dims)
+    }
+    fn gather_rows(
+        &mut self,
+        sources: &[BufferId],
+        rows: &[(usize, usize)],
+        cols: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.gather_rows(&mut self.session, sources, rows, cols)
+    }
+    fn rows_add(
+        &mut self,
+        t: BufferId,
+        indices: &[usize],
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rows_add(&mut self.session, t, indices, value)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())

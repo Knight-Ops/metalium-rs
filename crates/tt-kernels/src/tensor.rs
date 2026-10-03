@@ -2401,6 +2401,9 @@ pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work>
                     ],
                     rs.encode()[0],
                     rs.encode()[1],
+                    // The reads land before the writes read the slots: a
+                    // record's moves are issued without waiting.
+                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
                     [record::WRITE_RUN, first, count, stage as u32, 0, 0, 0, 0],
                     ro.encode()[0],
                     ro.encode()[1],
@@ -2504,6 +2507,8 @@ pub fn copy_blocks(
                     ],
                     rs.encode()[0],
                     rs.encode()[1],
+                    // The reads land before the writes read the slots.
+                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
                     [
                         record::WRITE_RUN,
                         first,
@@ -2521,6 +2526,201 @@ pub fn copy_blocks(
         }
     }
     Ok(Work { out, jobs })
+}
+
+/// A new `[rows.len(), cols]` tensor whose row `i` is row `rows[i].1` of
+/// `sources[rows[i].0]`, bit for bit: an embedding's lookup, and the rows a
+/// gradient scatters, gathered on the card.
+///
+/// A tile's row is two 64-byte face-rows (`TILE_DATA + ((r / 16) 2 + h)
+/// 1024 + (r % 16) 64`, `h` the half), each congruent to `TILE_DATA` mod 64
+/// in every slot, so any source row's face-row moves straight into any
+/// output row's with one 64-byte [`dm::op::READ`] -- the mod-64 congruence a
+/// GDDR read needs (`tt_isa::dram::ALIGN`), whatever the rows. Output tiles
+/// are built in staging slots (64-aligned), then written out after a
+/// [`dm::op::WAIT`]. Two read entries a row a tile column, ~316 cycles each
+/// on the mover. Rows past the last in the last tile row are left as the
+/// slot held them: the output's padding is undefined there.
+pub fn gather_rows(
+    alloc: &mut DramAlloc,
+    sources: &[&DramTensor],
+    rows: &[(usize, usize)],
+    cols: usize,
+    units: usize,
+) -> Result<Work> {
+    use tt_isa::dm::{op, TILE_DATA};
+    const GROUP: usize = 64;
+    let Some(first) = sources.first() else {
+        return Err(TensorError::Shape("a row gather with no source".into()));
+    };
+    let elem = first.elem;
+    for (k, t) in sources.iter().enumerate() {
+        if t.cols != cols || t.elem != elem {
+            return Err(TensorError::Shape(format!(
+                "a row gather's source {k} is [{}, {}] {:?}, not [_, {cols}] {elem:?}",
+                t.rows, t.cols, t.elem
+            )));
+        }
+    }
+    if rows.is_empty() || cols == 0 {
+        return Err(TensorError::Shape("a row gather of nothing".into()));
+    }
+    if let Some((i, &(k, r))) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, &(k, r))| k >= sources.len() || r >= sources[k].rows)
+    {
+        return Err(TensorError::Shape(format!(
+            "a row gather's row {i} names row {r} of source {k}, which has none"
+        )));
+    }
+    let stage = staging("row gather slots", GROUP)?;
+    if stage % tt_isa::dram::ALIGN != 0 {
+        return Err(TensorError::Shape(
+            "row gather staging not 64-aligned".into(),
+        ));
+    }
+    let out = DramTensor::alloc_elem(alloc, rows.len(), cols, elem)?;
+    let [ort, oct] = out.grid();
+    let face_row =
+        |r: usize, h: usize| TILE_DATA + (((r / 16) * 2 + h) * 1024 + (r % 16) * 64) as u64;
+    let mut jobs = Vec::new();
+    for run in runs(ort * oct, units, GROUP) {
+        let mut entries = Vec::new();
+        let mut n = 0u32;
+        for (k, t) in run.clone().enumerate() {
+            let (oi, oj) = (t / oct, t % oct);
+            let slot = stage + k as u64 * TILE_SLOT;
+            for r in 0..32.min(rows.len() - oi * 32) {
+                let (src, sr) = rows[oi * 32 + r];
+                let from = sources[src].tile(sr / 32, oj);
+                for h in 0..2 {
+                    entries.push([
+                        op::READ,
+                        from.channel().index() as u32,
+                        n % tt_isa::dram::PORTS as u32,
+                        (from.offset() + face_row(sr % 32, h)) as u32,
+                        (slot + face_row(r, h)) as u32,
+                        64,
+                        0,
+                        0,
+                    ]);
+                    n += 1;
+                }
+            }
+        }
+        entries.push([op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+        for (k, t) in run.enumerate() {
+            let to = out.tile(t / oct, t % oct);
+            entries.push([
+                op::WRITE,
+                to.channel().index() as u32,
+                k as u32 % tt_isa::dram::PORTS as u32,
+                (to.offset() + TILE_DATA) as u32,
+                (stage + k as u64 * TILE_SLOT + TILE_DATA) as u32,
+                4096,
+                0,
+                0,
+            ]);
+        }
+        jobs.push(vec![Step::List {
+            what: "row gather list",
+            entries,
+        }]);
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Rows of `src` written over rows of `dst` in place: `dst` row `d` becomes
+/// `src` row `s` for each `(d, s)` of `rows` (each `d` at most once), every
+/// other row untouched -- how a scatter of rows (an embedding's gradient)
+/// lands in a copy of its table without moving the rest. Each face-row is
+/// read into a staging slot at its own offset in a tile (64-byte reads, as
+/// [`gather_rows`]'s) and, after a [`dm::op::WAIT`], written straight to its
+/// place in `dst` (64-byte writes: the mod-16 congruence a write needs
+/// holds). The jobs only: the session runs them on `dst` itself.
+pub fn write_rows(
+    dst: &DramTensor,
+    src: &DramTensor,
+    rows: &[(usize, usize)],
+    units: usize,
+) -> Result<Vec<Job>> {
+    use tt_isa::dm::{op, TILE_DATA};
+    const GROUP: usize = 64;
+    if !dst.placement.owned {
+        return Err(TensorError::Shape(
+            "a view's slots are another tensor's: write that one".into(),
+        ));
+    }
+    if dst.cols != src.cols || dst.elem != src.elem {
+        return Err(TensorError::Shape(format!(
+            "rows of a [{}, {}] {:?} over a [{}, {}] {:?}",
+            src.rows, src.cols, src.elem, dst.rows, dst.cols, dst.elem
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &(d, s) in rows {
+        if d >= dst.rows || s >= src.rows || !seen.insert(d) {
+            return Err(TensorError::Shape(format!(
+                "a row write of row {s} over row {d}: out of range or twice"
+            )));
+        }
+    }
+    let stage = staging("row write slots", GROUP)?;
+    let ct = dst.grid()[1];
+    let face_row =
+        |r: usize, h: usize| TILE_DATA + (((r / 16) * 2 + h) * 1024 + (r % 16) * 64) as u64;
+    // One staging slot per (row, tile column) pair, its face-rows at the
+    // offsets they have in the destination tile: `GROUP` slots hold `32
+    // GROUP` such rows, one per slot row.
+    let per_slot = 32;
+    let pieces: Vec<(usize, usize, usize)> = rows
+        .iter()
+        .flat_map(|&(d, s)| (0..ct).map(move |j| (d, s, j)))
+        .collect();
+    let mut jobs = Vec::new();
+    for run in runs(pieces.len(), units, GROUP * per_slot) {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for (k, &(d, s, j)) in pieces[run].iter().enumerate() {
+            // Piece `k` is staged at row `k % 32` of slot `k / 32`: its own
+            // place, and every face-row offset is `TILE_DATA` mod 64 wherever
+            // it is, so the read's and the write's congruences hold.
+            let slot = stage + (k / per_slot) as u64 * TILE_SLOT;
+            let r = k % per_slot;
+            let from = src.tile(s / 32, j);
+            let to = dst.tile(d / 32, j);
+            for h in 0..2 {
+                reads.push([
+                    op::READ,
+                    from.channel().index() as u32,
+                    (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
+                    (from.offset() + face_row(s % 32, h)) as u32,
+                    (slot + face_row(r, h)) as u32,
+                    64,
+                    0,
+                    0,
+                ]);
+                writes.push([
+                    op::WRITE,
+                    to.channel().index() as u32,
+                    (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
+                    (to.offset() + face_row(d % 32, h)) as u32,
+                    (slot + face_row(r, h)) as u32,
+                    64,
+                    0,
+                    0,
+                ]);
+            }
+        }
+        reads.push([op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+        reads.extend(writes);
+        jobs.push(vec![Step::List {
+            what: "row write list",
+            entries: reads,
+        }]);
+    }
+    Ok(jobs)
 }
 
 /// Set `t`'s padding to `value` in place: a [`record::FILL_PAD`] over its edge

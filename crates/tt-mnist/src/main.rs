@@ -841,8 +841,10 @@ fn transformer_benchmark(a: &Args) {
         }
     };
     let before = burn_tt::tensor_traffic();
+    let calls = burn_tt::device_time();
     let (card, report) =
         burn_tt::with_report(|| tf::train::<Autodiff<TtBackend>>(&weights, steps, &device));
+    let card_wall: Duration = card.times.iter().sum();
     let moved = burn_tt::tensor_traffic() - before;
     drop(guard);
     let host = tf::train::<Autodiff<Flex>>(&weights, steps, &FlexDevice);
@@ -859,6 +861,7 @@ fn transformer_benchmark(a: &Args) {
         ms(host.times.first().copied())
     );
     println!("  card / host        {:8.2}x", c / h);
+    print_calls(&calls, card_wall, steps, "step");
     println!(
         "  loss               card {:.4} -> {:.4}, host {:.4} -> {:.4}",
         card.losses[0],

@@ -274,6 +274,23 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.copy_blocks(&mut self.session, a, moves, dims)
         }
+        fn gather_rows(
+            &mut self,
+            sources: &[burn_tt::BufferId],
+            rows: &[(usize, usize)],
+            cols: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .gather_rows(&mut self.session, sources, rows, cols)
+        }
+        fn rows_add(
+            &mut self,
+            t: burn_tt::BufferId,
+            indices: &[usize],
+            value: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.rows_add(&mut self.session, t, indices, value)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }

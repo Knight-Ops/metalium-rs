@@ -1158,10 +1158,25 @@ Each names the measurement it must move. The Burn-side ones are in
   - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
         format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
         measured beside the block-float ones `QTensorOps` needs.
-- [ ] **D4 Indexing on the B mover.** General `slice` (not only whole tile rows),
-      `slice_assign`, `cat`, `gather`, `scatter_add`, `select`, `select_add`, `repeat_dim`,
-      `expand`, `flip`, `embedding` and its backward. The mover moves; the SFPU is not
-      needed.
+- [~] **D4 Indexing on the B mover.** Done (2026-10-03): `gather` and
+      `scatter_add` along the last dimension with one index per row (a loss's
+      targets) as SFPU compositions -- the row masked to `-0` and summed (exact
+      but for a gathered `-0`, returned `+0`: the SFPU sum's signed zero, row
+      C), `x + v` selected where the column is the index (exact);
+      `select`/`select_add` along dimension 0 and `embedding` and its backward
+      (Burn's default compositions) on the mover: `tensor::gather_rows` moves
+      each row's two 64-byte face-rows into an output tile with plain `READ`s
+      (every face-row is `TILE_DATA` mod 64, so the C64 read rule holds for any
+      row), `tensor::write_rows` writes rows in place with 64-byte `WRITE`s,
+      and `Session::rows_add` adds by index in Flex's order touching only the
+      indexed rows. Gates: `step61_burn_gather` (Flex bit for bit, residency;
+      watched failing with the mask inverted), `step62_gather_rows` (watched
+      failing with the face halves swapped and the rounds reversed); ttsim and
+      both cards. Measured: a lookup's list is two entries a row a tile
+      column, written over PCIe -- 0.3 ms for 128 rows of 64; a record
+      carrying the row indices would cut the bytes ~18x. Open: general
+      `gather` (several indices per row, other dims), unaligned `slice`,
+      `slice_assign`, `cat`, `repeat_dim`, `expand`, `flip`.
 - [ ] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
 - [ ] **D6 Convolution.** `conv2d` as im2col on the mover plus the existing matmul, then
       its three backwards, `conv1d`, `conv_transpose2d`, `unfold4d`.
@@ -1201,7 +1216,9 @@ path today, `~` when only some shapes do.
 | `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
 | `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
-| `float_gather`, `float_scatter_add`, `float_select{,_add}`, `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
+| `float_gather`, `float_scatter_add` | `~` last dim, one index per row (SFPU; gather's `-0` returned `+0`) | D4 |
+| `float_select`, `float_select_add` | `~` dim 0 (mover rows; `select_add` in Flex's order) | D4 |
+| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
 | `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
 
 ### `ActivationOps`
@@ -1220,7 +1237,7 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `linear` and its three backwards | `~` over `float_matmul`; a rank-N input folds its batch into the rows (forward, `x` grad), `linear_{weight,bias}_backward` hand-written likewise | B6 |
-| `embedding{,_backward}` | | D4 |
+| `embedding{,_backward}` | x (Burn's default over `select`/`select_add`, on the mover) | D4 |
 | `conv1d`, `conv2d`, `conv_transpose*`, their backwards, `unfold4d` | | D6 |
 | `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | | M2 + D6 |
 | `layer_norm` | | R3 |
@@ -1270,6 +1287,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
+| A list's `READ_RUN` followed by its `WRITE_RUN` had no `WAIT` between: a record's moves are issued without waiting, so a write could read its staging slot before the read landed -- ordered only by timing (each group's writes start after all its reads are issued), which is why small groups were the risk and no gate saw it; ttsim's reads land at once | found reading the mover for D4 (2026-10-03) | closed: `tensor::copy` and `copy_blocks` put a `WAIT` between, as host DMA and `gather_rows` do |
 | The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `docs/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
 
 New ttsim refusals or disagreements found while doing any of this go in

@@ -13,7 +13,6 @@
 # the loss's `[b s, 1]` statistics: sqrt, log, div), which drag their
 # neighbours (add, mul, sub, div) through PCIe.
 float_add
-float_add_scalar
 float_div
 float_div_scalar
 float_log
@@ -28,12 +27,17 @@ float_reshape
 float_sqrt
 float_sub
 float_sum_dim
-float_mean_dim
 int_reshape
 
+# On the card (D4, 2026-10-03), but host-made operands still cross: the
+# table's one upload (`select`, as a matmul's weights), the `[V, d]` zeros
+# Burn's `embedding_backward` makes on the host (`select_add`), and the
+# loss's gather and its backward, which follow a log-softmax that ends on
+# the host below `APPROX_MIN_TILES`.
+float_select
+float_select_add
+float_gather
+float_scatter_add
+
 # No device kernel: forwarded to Flex.
-embedding               # D4
-embedding_backward      # D4
-float_gather            # D4: CrossEntropyLoss's target column
-float_scatter_add       # D4: gather's backward
 float_mean              # full reduction (R1b)

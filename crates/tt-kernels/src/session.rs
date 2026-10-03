@@ -2943,6 +2943,115 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Rows of `sources` gathered into a new tensor ([`tensor::gather_rows`]):
+    /// an embedding's lookup on the card. Its padding is zero only where every
+    /// source's is and the rows fill whole tiles.
+    pub fn gather_rows(
+        &mut self,
+        sources: &[&DramTensor],
+        rows: &[(usize, usize)],
+        cols: usize,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let work = tensor::gather_rows(&mut self.dram_state()?.alloc, sources, rows, cols, units)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        let zero = rows.len() % 32 == 0 && sources.iter().all(|t| t.pad() == tensor::Pad::Zero);
+        out.set_pad(if zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
+    }
+
+    /// Rows of `src` over rows of `dst`, in place ([`tensor::write_rows`]).
+    pub fn write_rows(
+        &mut self,
+        dst: &DramTensor,
+        src: &DramTensor,
+        rows: &[(usize, usize)],
+    ) -> Result<(), TensorError> {
+        let units = self.units.len();
+        let jobs = tensor::write_rows(dst, src, rows, units)?;
+        self.submit_jobs(jobs, RESET_BUDGET)?;
+        if src.pad() != tensor::Pad::Zero {
+            dst.set_pad(tensor::Pad::Undefined);
+        }
+        Ok(())
+    }
+
+    /// `t` with `value`'s row `i` added to its row `indices[i]`, for every `i`
+    /// in order -- Burn's `select_add` along rows, an embedding's gradient --
+    /// on the card, in a new tensor. Only the rows the indices touch are
+    /// computed: they are gathered ([`tensor::gather_rows`]); round `r` adds
+    /// each one's `r`-th occurrence in `value` (or a `-0` row, which adds
+    /// nothing, where it has fewer), so each row's additions are made in
+    /// `indices` order, as Flex makes them; and the rows are written over a
+    /// tile copy of `t` ([`tensor::write_rows`]). The work grows with the
+    /// indices and the most any row repeats, not with `t`'s rows beyond one
+    /// copy.
+    pub fn rows_add(
+        &mut self,
+        t: &DramTensor,
+        indices: &[usize],
+        value: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        let cols = t.cols;
+        if value.rows != indices.len() || value.cols != cols {
+            return Err(TensorError::Shape(format!(
+                "{} indices and a [{}, {}] value for a [{}, {cols}] tensor",
+                indices.len(),
+                value.rows,
+                value.cols,
+                t.rows
+            )));
+        }
+        if let Some(&i) = indices.iter().find(|&&i| i >= t.rows) {
+            return Err(TensorError::Shape(format!(
+                "index {i} into a tensor of {} rows",
+                t.rows
+            )));
+        }
+        // The touched rows, in order of first use, and each one's occurrences.
+        let mut slot_of = std::collections::HashMap::new();
+        let mut occurrences: Vec<Vec<usize>> = Vec::new();
+        let mut touched = Vec::new();
+        for (i, &r) in indices.iter().enumerate() {
+            let k = *slot_of.entry(r).or_insert_with(|| {
+                touched.push(r);
+                occurrences.push(Vec::new());
+                touched.len() - 1
+            });
+            occurrences[k].push(i);
+        }
+        let rounds = occurrences.iter().map(Vec::len).max().unwrap_or(0);
+        let zero = self.upload(&vec![-0.0; cols], 1, cols)?;
+        let rows: Vec<(usize, usize)> = touched.iter().map(|&r| (0, r)).collect();
+        let mut acc = self.gather_rows(&[t], &rows, cols)?;
+        let add = tensor::Eltwise {
+            kind: crate::kind::ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        for round in 0..rounds {
+            let rows: Vec<(usize, usize)> = occurrences
+                .iter()
+                .map(|o| o.get(round).map_or((1, 0), |&i| (0, i)))
+                .collect();
+            let addend = self.gather_rows(&[value, &zero], &rows, cols)?;
+            let next = self.eltwise(add, &acc, Some(&addend))?;
+            self.free(addend)?;
+            self.free(std::mem::replace(&mut acc, next))?;
+        }
+        self.free(zero)?;
+        let out = self.copy(t)?;
+        let rows: Vec<(usize, usize)> = touched.iter().enumerate().map(|(k, &r)| (r, k)).collect();
+        let written = self.write_rows(&out, &acc, &rows);
+        self.free(acc)?;
+        written?;
+        Ok(out)
+    }
+
     /// The sum over rows of `a`, `[1, cols]`, in `burn-flex`'s order
     /// ([`tensor::sum_rows`]).
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {

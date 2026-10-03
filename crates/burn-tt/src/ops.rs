@@ -95,6 +95,9 @@ fn device_view(
 /// two-tile log-softmax still ends in a host loss), and the transformer of
 /// `tt-mnist --model transformer` at 9.0 against 10.4 (its four-tile layer
 /// norm statistics feed device ops). Kept until a lookahead can tell the two.
+/// Measured again with the loss's gather on the card (D4): MNIST 1.1 against
+/// 1.7-1.8 ms/step without the threshold, the transformer 12.0 against
+/// 10.0-11.0 -- MNIST's two-tile log-softmax is cheaper on the host still.
 const APPROX_MIN_TILES: usize = 8;
 
 /// Tiles in the tile grid of the matrix a tensor is stored as.
@@ -1209,6 +1212,243 @@ pub mod float {
     predicate!(float_is_nan, kind_sfpu::IS_NAN);
     predicate!(float_is_inf, kind_sfpu::IS_INF);
 
+    /// `tensor`'s column index (`0..c` along the last dimension) at every
+    /// element, as F32 on the device: what a one-index-per-row gather
+    /// compares its indices with. Made on the host and uploaded per call (an
+    /// attachment-scoped cache waits on `burn-backend-parity.md` B3).
+    fn column_indices(tensor: &TtTensor) -> Option<TtTensor> {
+        let shape = tensor.shape().to_vec();
+        let c = *shape.last()?;
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| (i % c) as f32).collect();
+        let t = TtTensor::new(
+            FlexTensor::from_data(TensorData::new(v, shape)),
+            tensor.device,
+        );
+        t.to_dram();
+        Some(t)
+    }
+
+    /// For a gather or scatter along the last dimension with one index per
+    /// row (`indices` `tensor`'s shape with a last of 1, as Burn's
+    /// `CrossEntropyLoss` gathers its targets): `kind` (`EQ` or `NE`) of each
+    /// element's column index and its row's index, a resident `Bool` of
+    /// `tensor`'s shape, on the device. `None` unless `tensor` is resident
+    /// F32 and the indices are `I32` (uploaded if they are on the host).
+    fn index_mask(
+        tensor: &TtTensor,
+        dim: usize,
+        indices: &TtTensor,
+        kind: u32,
+    ) -> Option<TtTensor> {
+        let (ts, is) = (tensor.shape().to_vec(), indices.shape().to_vec());
+        let rank = ts.len();
+        if rank == 0 || dim + 1 != rank || is.len() != rank || is[rank - 1] != 1 {
+            return None;
+        }
+        if ts[..rank - 1] != is[..rank - 1] || indices.dtype() != DType::I32 {
+            return None;
+        }
+        if !tensor.is_stored_f32() || tensor.as_strided().is_none() {
+            return None;
+        }
+        if !crate::server::supports_dram(tensor.device) || ts[rank - 1] > 1 << 24 {
+            return None;
+        }
+        indices.to_dram();
+        let idx = device_eltwise_ungated(kind_sfpu::I32_TO_F32, 0.0, indices, None)?;
+        let cols = column_indices(tensor)?;
+        device_eltwise_ungated(kind, 0.0, &cols, Some(&idx))
+    }
+
+    /// `out[.., 0] = x[.., idx[.., 0]]` along the last dimension, on the
+    /// device where `x` is: every other element masked to `-0` and the row
+    /// summed -- the gathered element in any order, since `x + -0 = x` for
+    /// every `x` (a NaN and the infinities included), but for a gathered
+    /// `-0`, which the SFPU's sum returns as `+0` (`ttsim-divergence.md` row
+    /// C; keeping the sign would take a second, max-based pass). One index
+    /// per row (a loss's targets); anything else, Flex's.
+    pub fn float_gather(
+        dim: usize,
+        tensor: FloatTensor<TtBackend>,
+        indices: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        use tt_kernels::sfpu::reduce::ReduceOp;
+        let device = tensor.device;
+        if let Some(ne) = index_mask(&tensor, dim, &indices, kind_sfpu::NE) {
+            if let Some(kept) =
+                device_eltwise_ungated(kind_sfpu::MASK_FILL, -0.0, &tensor, Some(&ne))
+            {
+                if let Some(t) = device_reduce_ungated(&kept, ReduceOp::Sum, dim) {
+                    return t;
+                }
+            }
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_gather(
+                dim,
+                tensor.into_host(),
+                indices.into_host(),
+            ),
+            device,
+        )
+    }
+
+    /// `out = x`, then `out[.., idx[.., 0]] += v[.., 0]` along the last
+    /// dimension -- a gather's backward -- on the device where `x` is: `x +
+    /// v` (a column broadcast) where the column is the row's index, `x`
+    /// elsewhere; the one addition Flex makes. One index per row; anything
+    /// else, Flex's.
+    pub fn float_scatter_add(
+        dim: usize,
+        tensor: FloatTensor<TtBackend>,
+        indices: IntTensor<TtBackend>,
+        value: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let device = tensor.device;
+        if value.shape() == indices.shape() && value.is_stored_f32() {
+            if let Some(eq) = index_mask(&tensor, dim, &indices, kind_sfpu::EQ) {
+                value.to_dram();
+                if let Some(sum) = device_eltwise_ungated(kind::ADD, 0.0, &tensor, Some(&value)) {
+                    let op = op2(kind_sfpu::MASK_WHERE, 0.0, 0.0);
+                    if let Some(t) = device_op_ungated(op, &tensor, Some(&eq), Some(&sum)) {
+                        return t;
+                    }
+                }
+            }
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_scatter_add(
+                dim,
+                tensor.into_host(),
+                indices.into_host(),
+                value.into_host(),
+            ),
+            device,
+        )
+    }
+
+    /// An index tensor's values, from its host copy (downloaded first if it
+    /// has none: indices are few, and an embedding's come from the host),
+    /// if every one is in `0..bound`.
+    fn index_values(indices: &TtTensor, bound: usize) -> Option<Vec<usize>> {
+        let v = indices
+            .host()
+            .clone()
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .ok()?;
+        v.into_iter()
+            .map(|i| usize::try_from(i).ok().filter(|&i| i < bound))
+            .collect()
+    }
+
+    /// The rows of the matrix `tensor` is stored as that slice `i` along
+    /// dimension 0 covers: `i q .. (i + 1) q`, `q` the product of the
+    /// dimensions between the first and the last.
+    fn rows_of(shape: &[usize], idx: &[usize]) -> Vec<usize> {
+        let q: usize = shape[1..shape.len() - 1].iter().product();
+        idx.iter().flat_map(|&i| (i * q)..((i + 1) * q)).collect()
+    }
+
+    /// The slices `indices` name along dimension 0, on the device: an
+    /// embedding's lookup -- each stored row moved where it lies, two 64-byte
+    /// reads a tile column (`Session::gather_rows`), bit for bit. The table is
+    /// uploaded if it is on the host, as a matmul's operands are: a
+    /// parameter only an embedding reads would otherwise never reach the
+    /// card. Indices are read on the host. Another dimension, Flex's.
+    pub fn float_select(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        indices: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let device = tensor.device;
+        let shape = tensor.shape().to_vec();
+        if dim == 0
+            && shape.len() >= 2
+            && tensor.is_stored_f32()
+            && indices.shape().num_dims() == 1
+            && indices.shape().num_elements() > 0
+            && crate::server::supports_dram(device)
+        {
+            if let Some(idx) = index_values(&indices, shape[0]) {
+                if let Some(d) = Some(tensor.to_dram()).filter(|d| !d.transposed) {
+                    let rows: Vec<(usize, usize)> =
+                        rows_of(&shape, &idx).into_iter().map(|r| (0, r)).collect();
+                    let cols = shape[shape.len() - 1];
+                    let (id, dims) =
+                        crate::server::gather_rows(device, vec![d.buffer.id], rows, cols);
+                    let mut out = shape.clone();
+                    out[0] = idx.len();
+                    return device_result_shaped(
+                        device,
+                        id,
+                        dims,
+                        burn_backend::Shape::from(out),
+                        DType::F32,
+                    );
+                }
+            }
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_select(
+                tensor.into_host(),
+                dim,
+                indices.into_host(),
+            ),
+            device,
+        )
+    }
+
+    /// `tensor` with `value`'s slice `i` added to its slice `indices[i]`
+    /// along dimension 0, in order -- an embedding's gradient -- on the device
+    /// where `value` is (`Session::rows_add`: only the rows the indices touch
+    /// are computed, in Flex's order of additions). Indices are read on the
+    /// host. Another dimension, or `value` on the host, Flex's.
+    pub fn float_select_add(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        indices: IntTensor<TtBackend>,
+        value: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let device = tensor.device;
+        let shape = tensor.shape().to_vec();
+        let vshape = value.shape().to_vec();
+        if dim == 0
+            && shape.len() >= 2
+            && vshape.len() == shape.len()
+            && vshape[1..] == shape[1..]
+            && tensor.is_stored_f32()
+            && value.is_stored_f32()
+            && value.as_strided().is_some()
+            && indices.shape().num_elements() == vshape[0]
+            && vshape[0] > 0
+            && crate::server::supports_dram(device)
+        {
+            if let Some(idx) = index_values(&indices, shape[0]) {
+                let t = tensor.to_dram().clone();
+                if let Some(v) = value.dram().filter(|d| !d.transposed).cloned() {
+                    if !t.transposed {
+                        let rows = rows_of(&shape, &idx);
+                        let (id, dims) =
+                            crate::server::rows_add(device, t.buffer.id, rows, v.buffer.id);
+                        return device_result_shaped(device, id, dims, tensor.shape(), DType::F32);
+                    }
+                }
+            }
+        }
+        TtTensor::new(
+            <Flex as FloatTensorOps<Flex>>::float_select_add(
+                tensor.into_host(),
+                dim,
+                indices.into_host(),
+                value.into_host(),
+            ),
+            device,
+        )
+    }
+
     /// `mask ? value : x` on the device where the data is (the mask may be a
     /// row or column of `x`'s matrix), every bit of `x` kept; else Flex's.
     pub fn float_mask_fill(
@@ -1461,6 +1701,51 @@ pub mod float {
 pub mod module {
     use super::*;
     use burn_backend::Shape;
+
+    /// Burn's own composition (`ModuleOps::embedding`'s default: a
+    /// `select` of the table's rows, reshaped), through this backend's ops,
+    /// so the lookup runs on the device where the table is
+    /// (`float::float_select`); Flex's own embedding otherwise.
+    pub fn embedding(
+        weights: FloatTensor<TtBackend>,
+        indices: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let [batch, seq] = indices.shape().dims();
+        let d_model = weights.shape().to_vec()[1];
+        let indices =
+            <TtBackend as IntTensorOps<TtBackend>>::int_reshape(indices, Shape::new([batch * seq]));
+        let out = <TtBackend as FloatTensorOps<TtBackend>>::float_select(weights, 0, indices);
+        <TtBackend as FloatTensorOps<TtBackend>>::float_reshape(
+            out,
+            Shape::new([batch, seq, d_model]),
+        )
+    }
+
+    /// Burn's own composition (`ModuleOps::embedding_backward`'s default: a
+    /// `select_add` of the gradient's rows into zeros), through this
+    /// backend's ops (`float::float_select_add`).
+    pub fn embedding_backward(
+        weights: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+        indices: IntTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let [batch, seq] = indices.shape().dims();
+        let [n, d] = weights.shape().dims();
+        let device = weights.device;
+        let dtype = output_grad.dtype();
+        let indices =
+            <TtBackend as IntTensorOps<TtBackend>>::int_reshape(indices, Shape::new([batch * seq]));
+        let grad = <TtBackend as FloatTensorOps<TtBackend>>::float_reshape(
+            output_grad,
+            Shape::new([batch * seq, d]),
+        );
+        let zeros = <TtBackend as FloatTensorOps<TtBackend>>::float_zeros(
+            Shape::new([n, d]),
+            &device,
+            dtype.into(),
+        );
+        <TtBackend as FloatTensorOps<TtBackend>>::float_select_add(zeros, 0, indices, grad)
+    }
 
     /// `dW = x^T @ dY` over every row of every batch element at once:
     /// `[d, prod(..)] @ [prod(..), e]`, one matrix product that the device
