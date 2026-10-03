@@ -163,11 +163,23 @@ pub trait Engine {
         _input: BufferId,
         _values: &[f32],
         _output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
         Err(no_traces())
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
+}
+
+/// One [`crate::Trace::run`]: the output, and where its time went on the
+/// device's side -- the input written from the host, the replay to its end,
+/// and the output read back -- each a different cost (the first and last are
+/// PCIe's, the middle the card's).
+#[derive(Clone, Debug, Default)]
+pub struct TraceRun {
+    pub output: Vec<f32>,
+    pub write: std::time::Duration,
+    pub replay: std::time::Duration,
+    pub read: std::time::Duration,
 }
 
 fn no_traces() -> EngineError {
@@ -217,15 +229,29 @@ impl DramBuffers {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
+        use std::time::Instant;
         let id = *self
             .traces
             .get(&trace)
             .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
         let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        // The write waits for what was queued first: that wait is not the
+        // write's.
+        s.sync().map_err(e)?;
+        let t0 = Instant::now();
         s.write(self.get(input)?, values).map_err(e)?;
+        let t1 = Instant::now();
         s.replay(id).map_err(e)?;
-        s.download(self.get(output)?).map_err(e)
+        s.sync().map_err(e)?;
+        let t2 = Instant::now();
+        let output = s.download(self.get(output)?).map_err(e)?;
+        Ok(TraceRun {
+            output,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
     }
 
     pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
@@ -883,7 +909,7 @@ impl Engine for KmdEngine {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<TraceRun, EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.run_trace(&mut self.session, trace, input, values, output)
     }

@@ -295,6 +295,17 @@ struct Infer {
     rest: Duration,
     batches: usize,
     accuracy: f64,
+    /// With `--trace`, every batch after the first: the input's write from
+    /// the host, the replay, and the logits' read, summed -- PCIe's time and
+    /// the card's, reported apart.
+    traced: Option<TraceParts>,
+}
+
+#[derive(Default)]
+struct TraceParts {
+    write: Duration,
+    replay: Duration,
+    read: Duration,
 }
 
 /// The forward pass alone, no autodiff: the test set uploaded once, then
@@ -353,6 +364,7 @@ fn infer<B: Backend>(
         rest,
         batches,
         accuracy: right as f64 / (batches * batch).max(1) as f64,
+        traced: None,
     }
 }
 
@@ -388,13 +400,20 @@ fn infer_traced(
     let calls = burn_tt::device_time();
     let (mut first, mut rest) = (Duration::ZERO, Duration::ZERO);
     let (mut batches, mut right) = (0, 0usize);
+    let mut parts = TraceParts::default();
     for _ in 0..passes {
         for from in (0..n).step_by(batch) {
             let t = Instant::now();
             let input = test.images[from * PIXELS..(from + batch) * PIXELS].to_vec();
-            let logits = trace
-                .run(input)
+            let run = trace
+                .run_timed(input)
                 .unwrap_or_else(|e| panic!("replaying the forward pass: {e}"));
+            if batches > 0 {
+                parts.write += run.write;
+                parts.replay += run.replay;
+                parts.read += run.read;
+            }
+            let logits = run.output;
             let pred: Vec<usize> = logits
                 .chunks_exact(classes)
                 .map(|row| {
@@ -423,6 +442,7 @@ fn infer_traced(
         rest,
         batches,
         accuracy: right as f64 / (batches * batch).max(1) as f64,
+        traced: Some(parts),
     }
 }
 
@@ -443,6 +463,26 @@ fn print_infer(r: &Infer, batch: usize) {
         steady * 1e3,
         batch as f64 / steady
     );
+    if let Some(p) = &r.traced {
+        let per = |d: Duration| d.as_secs_f64() * 1e3 / (r.batches.saturating_sub(1)).max(1) as f64;
+        let replay = per(p.replay);
+        println!(
+            "    input written from the host            {:.3} ms/batch  (PCIe)",
+            per(p.write)
+        );
+        println!(
+            "    replay, to its end                     {replay:.3} ms/batch  ({:.0} images/s on the card alone)",
+            batch as f64 / (replay / 1e3)
+        );
+        println!(
+            "    logits read back                       {:.3} ms/batch  (PCIe)",
+            per(p.read)
+        );
+        println!(
+            "    the rest (argmax, server round trip)   {:.3} ms/batch",
+            steady * 1e3 - per(p.write) - replay - per(p.read)
+        );
+    }
     println!(
         "  accuracy (untrained weights: a check, not a result)  {:.2}%",
         r.accuracy * 100.0
