@@ -81,8 +81,21 @@ pub const DM_NC: Image = (
     tt_isa::dm::nc::IMAGE_BASE,
 );
 
+/// The instruction-cache probes (`tt-firmware/src/icache_probe.rs`): B's at
+/// L1 0, NC's at NC's image base.
+pub const ICACHE_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_ICACHE_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+pub const ICACHE_NC: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_ICACHE_NC")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 11] = [
+const ENTRIES: [(&str, &str); 13] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -94,6 +107,8 @@ const ENTRIES: [(&str, &str); 11] = [
     ("dm_b", env!("FIRMWARE_DM_B_ENTRY")),
     ("nc_probe", env!("FIRMWARE_NC_PROBE_ENTRY")),
     ("dm_nc", env!("FIRMWARE_DM_NC_ENTRY")),
+    ("icache_b", env!("FIRMWARE_ICACHE_B_ENTRY")),
+    ("icache_nc", env!("FIRMWARE_ICACHE_NC_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -155,7 +170,11 @@ mod tests {
     /// stay below NC's list ring.
     #[test]
     fn the_nc_images_are_linked_at_ncs_image_base() {
-        for (name, (core, image, at)) in [("nc_probe", NC_PROBE), ("dm_nc", DM_NC)] {
+        for (name, (core, image, at)) in [
+            ("nc_probe", NC_PROBE),
+            ("dm_nc", DM_NC),
+            ("icache_nc", ICACHE_NC),
+        ] {
             assert_eq!(core, Core::NC, "{name}");
             assert_eq!(entry(name).map(u64::from), Some(at), "{name}");
             assert_eq!(at, tt_isa::dm::nc::IMAGE_BASE, "{name}");

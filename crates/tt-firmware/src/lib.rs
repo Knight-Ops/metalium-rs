@@ -558,7 +558,7 @@ pub mod noc {
 
     /// `issue` at `txn`'s cap on `niu`: poll its counter until there is
     /// room, and count the wait if there was one. Out of line, so the issue
-    /// path RISCV B's instruction cache holds is only the compare that decides
+    /// path RISCV B's instruction cache (~4 KiB, `probe_icache`) holds is only the compare that decides
     /// to come here.
     #[cold]
     #[inline(never)]

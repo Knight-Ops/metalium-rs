@@ -28,6 +28,8 @@ fn main() {
     link("dm_b", "link_b.x", tt_isa::dm::MAILBOX_BASE);
     link("nc_probe", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     link("dm_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    link("icache_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
+    link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     for f in [
         "link.x",
         "link_t1.x",

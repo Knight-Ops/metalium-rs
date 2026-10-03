@@ -139,6 +139,29 @@ each tile's share fixed:
   difference.
 - **Writes: within noise at every size and tile count.**
 
+### Instruction caches: about 4 KiB on B and NC
+
+Measured by `probe_icache` on card 0 (2026-10-03); the Blackhole size is
+documented nowhere. The probe runs the last N bytes of two 8 KiB blocks:
+straight-line `nop`s, and a chain of jumps 32 bytes apart.
+
+| Code size | Straight-line, cycles/byte | Jump chain, cycles/jump |
+|--:|--:|--:|
+| 256 B – 3.5 KiB | 0.25 (one per instruction) | 5.1 |
+| 4 KiB | 0.25 | 5.4 |
+| 5 KiB | 0.29 | 8.6 |
+| 6–8 KiB | 0.31 | 10.6 |
+
+- **B and NC measure the same.** Wormhole had 2 KiB on B and 512 B on NC.
+- **A miss costs ~5.5 cycles per 32 bytes,** and straight-line code mostly hides
+  it.
+- **Why placement matters:**
+  - The plain-entry hot path is ~2.5 KiB and fits.
+  - A record's tiles also run `run_record` (~4.4 KiB), so their working set
+    overflows the cache, and where the code sits changes how many lines
+    collide.
+- **A taken jump costs ~5 cycles even when cached.**
+
 ### RISCV NC's mover costs what B's does
 
 NC runs the same mover image (`dm_nc`). One tile, per entry, `BENCH_MOVER=nc`:
@@ -300,8 +323,7 @@ difference is the host polling for the ack and posting the next send over PCIe.
    2026-10-02). NC, still held in reset, is the planned NoC #1 writer.
 3. **339 cycles per mover entry (317 at the baseline), about 116 of them before
    the NIU is touched.** The read path's hot code is about 3.0 KB.
-   - B's instruction cache is 2 KiB on Wormhole; the Blackhole size is not
-     documented (`riscv-guide-review.md`).
+   - B's and NC's instruction caches are about 4 KiB each, measured below.
    - So per-entry cost depends on code layout, not just instruction count.
 4. **Nothing overlaps within an op:** gather, compute and scatter run in sequence.
 5. **E1 stores and forwards through one staging buffer,** plus a 0.75 µs round trip
@@ -380,6 +402,7 @@ difference is the host polling for the ack and posting the next send over PCIe.
     while they compute.
 - [ ] **Ethernet moves one transfer at a time** per direction, store and forward
   through one buffer each way (checklist, Ethernet pipelining).
+- [x] **Instruction-cache size:** ~4 KiB on B and NC (`probe_icache`).
 - [ ] **Not yet measured:**
   - tile-to-tile L1 over the NoC (the mover has no op for it)
   - card 1 (`cargo xtask bench --device all`)
