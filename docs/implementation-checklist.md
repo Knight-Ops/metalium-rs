@@ -1508,8 +1508,11 @@ tiles, done in turn. The slices from there:
       tensors itself through pinned host memory (`HOST_READ` / `HOST_WRITE`,
       `Session::set_host_dma`, `step57_host_dma`): ~20 GB/s up and ~27 down
       raw, 3-4 GB/s through a `Session` upload, where the host's tilize now
-      bounds it. Left: uploads sync the session first (they need the data
-      arena); queue them behind the ops instead, and tilize on more cores.
+      bounds it. Since: uploads and writes queued behind the ops (a staging
+      ring, a barrier), and the host's tilize on up to 16 threads, with run
+      records and one host move a batch on the card (8192x1024 on 8 tiles:
+      11 GB/s up and down). Left: a step's small upload is still mostly the
+      host's tilize (~1 us a tile); tilizing on the card would remove it.
       The BAR mapping itself is still the hypervisor's to fix.
     - Then consider what replay cannot cover: one list multicast to every
       unit, or a unit expanding its share from one record.

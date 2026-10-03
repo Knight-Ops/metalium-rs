@@ -336,6 +336,10 @@ pub struct Session<T: Transport> {
     /// While set, queued work takes no barrier: a host DMA transfer, which
     /// the session syncs on at once, so nothing can run past it.
     unbarriered: bool,
+    /// The next free byte of `staging`, used as a ring by queued uploads;
+    /// and whether anything queued may still read what is behind it.
+    staging_at: usize,
+    staging_busy: bool,
     /// [`Session::pipelined_blocks`].
     pipelined: u64,
     /// [`Session::set_profile_roles`].
@@ -391,10 +395,6 @@ struct Unit {
     /// Lists enqueued on this tile's mover and not yet retired, oldest first
     /// ([`Session::sync`]).
     queued: std::collections::VecDeque<QueuedList>,
-    /// `lists` when the mover's throttle was last looked at, and the stalls
-    /// last reported ([`Session::check_throttle`]).
-    throttle_checked_at: u64,
-    throttle_reported: u32,
     /// The data mover on this tile's RISCV NC, writing out pipelined groups'
     /// scatters ([`Session::set_scatter_mover`]); started when first needed,
     /// and again whenever B's is. B's lists wait for it, so a unit is idle
@@ -405,10 +405,6 @@ struct Unit {
     b_signals: u32,
     nc_signals: u32,
 }
-
-/// Lists between looks at a unit's throttle counters: one PCIe read per this
-/// many host round trips.
-const THROTTLE_CHECK_LISTS: u64 = 1024;
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
 /// close when it is retired), and what it was, for an error.
@@ -422,9 +418,31 @@ struct QueuedList {
 /// hugepage on silicon (`tt_kmd::host`); a transfer larger moves in parts.
 const HOST_DMA_STAGING: usize = 1 << 30;
 
-/// Fewest tiles an upload or write takes by the card's DMA: below, the BAR's
-/// stores (~27 us a tile here) beat a list's round trip and the sync.
-const HOST_DMA_MIN_UPLOAD: usize = 4;
+/// Fewest tiles an upload or write takes by the card's DMA: every one. Queued,
+/// a 50-tile upload costs the host ~19 us, a 2-tile one through the BAR 66.
+const HOST_DMA_MIN_UPLOAD: usize = 1;
+
+/// `n` zeros, in memory the kernel backs with 2 MiB pages where it can
+/// (`MADV_HUGEPAGE`, before anything touches it): a download's output is
+/// written once, all of it, and in this VM every 4 KiB page's first touch is
+/// a fault that cost a 32 MB download more than the card's DMA of it.
+fn huge_zeroed(n: usize) -> Vec<f32> {
+    let v = vec![0f32; n];
+    let bytes = n * 4;
+    const HUGE: usize = 2 << 20;
+    if bytes >= 2 * HUGE {
+        let start = (v.as_ptr() as usize).next_multiple_of(HUGE);
+        let end = (v.as_ptr() as usize + bytes) / HUGE * HUGE;
+        if end > start {
+            // SAFETY: advice only, on whole pages inside `v`'s allocation,
+            // which `vec!` zeroed without touching (a fresh mapping).
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+            }
+        }
+    }
+    v
+}
 
 /// What an upload or write takes: FP32 values, or any element's datums as
 /// their bits -- tilized from either without converting the other.
@@ -1258,6 +1276,8 @@ impl<T: Transport> Session<T> {
             staging: None,
             host_dma: true,
             unbarriered: false,
+            staging_at: 0,
+            staging_busy: false,
             pipelined: 0,
             profile_roles: true,
             drains: 0,
@@ -1285,8 +1305,6 @@ impl<T: Transport> Session<T> {
                 lists: 0,
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
-                throttle_checked_at: 0,
-                throttle_reported: 0,
                 nc: None,
                 b_signals: 0,
                 nc_signals: 0,
@@ -1556,7 +1574,7 @@ impl<T: Transport> Session<T> {
             )));
         }
         let t = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)?;
-        if let Err(e) = self.write_src(&t, values) {
+        if let Err(e) = self.write_src(&t, values, true) {
             let _ = self.free(t);
             return Err(e);
         }
@@ -1564,8 +1582,15 @@ impl<T: Transport> Session<T> {
     }
 
     /// `values` into `t`'s slots: by the card from pinned host memory where
-    /// it can ([`Session::set_host_dma`]), else through the BAR.
-    fn write_src(&mut self, t: &DramTensor, values: Src<'_>) -> Result<(), TensorError> {
+    /// it can ([`Session::set_host_dma`]), queued behind what is queued, else
+    /// through the BAR -- which, for slots that are not `fresh`, waits for
+    /// queued work first, since it may still read them.
+    fn write_src(
+        &mut self,
+        t: &DramTensor,
+        values: Src<'_>,
+        fresh: bool,
+    ) -> Result<(), TensorError> {
         t.check_write(values.len(), values.bits())?;
         let [rt, ct] = t.grid();
         let tiles = rt * ct;
@@ -1574,6 +1599,9 @@ impl<T: Transport> Session<T> {
                 t.set_pad(tensor::Pad::Zero);
                 return Ok(());
             }
+        }
+        if !fresh {
+            self.sync()?;
         }
         let mut images = vec![0u8; tiles * crate::matmul::TILE_IMAGE_BYTES];
         values.tilize(t, 0..tiles, &mut images, crate::matmul::TILE_IMAGE_BYTES);
@@ -1647,9 +1675,14 @@ impl<T: Transport> Session<T> {
         self.staging.as_mut().and_then(|s| s.as_mut().ok())
     }
 
-    /// [`Session::write_bits_any`] by the card: `images` staged in host
-    /// memory, each unit moving its share to GDDR. `None` if there is no
-    /// host memory. Waits for what is queued first, and for the moves.
+    /// [`Session::write_src`] by the card: tilized into the next free part of
+    /// the staging ring, then each unit's share queued like an op's -- behind
+    /// what is queued on it (whose lists end with their kernels done, so the
+    /// L1 it stages through is free), with a barrier after, as an op has (so
+    /// no later op on another unit reads a tile before it lands, and no write
+    /// overtakes an earlier op still reading). Nothing waits: the ring syncs
+    /// only when it wraps onto memory a queued transfer may still read.
+    /// `None` if there is no host memory.
     fn dma_upload(
         &mut self,
         t: &DramTensor,
@@ -1659,21 +1692,40 @@ impl<T: Transport> Session<T> {
         if self.staging().is_none() {
             return Ok(None);
         }
-        self.sync()?;
-        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
+        let slot = tt_isa::dm::TILE_SLOT as usize;
+        let per = HOST_DMA_STAGING / slot;
         for first in (0..tiles).step_by(per) {
             let n = (tiles - first).min(per);
+            let at = self.staging_region(n * slot)?;
             let host = self.staging().expect("checked above");
             // Tilized straight into the pinned memory the card reads.
-            host.with_bytes(&mut |buf| {
-                values.tilize(t, first..first + n, buf, tt_isa::dm::TILE_SLOT as usize)
-            });
-            let base = host.noc_address();
-            let slots: Vec<_> = (first..first + n).map(|k| t.slot(k)).collect();
-            let jobs = tensor::host_dma_jobs(&slots, true, base, self.units.len());
-            self.submit_dma(jobs)?;
+            host.with_bytes(&mut |buf| values.tilize(t, first..first + n, &mut buf[at..], slot));
+            let base = host.noc_address() + at as u64;
+            let jobs = tensor::host_dma_jobs(
+                t.tensor_ref(),
+                first..first + n,
+                true,
+                base,
+                self.units.len(),
+            );
+            self.staging_busy = true;
+            self.submit_jobs(jobs, RESET_BUDGET)?;
         }
         Ok(Some(()))
+    }
+
+    /// `bytes` of the staging ring from its next free byte, syncing first if
+    /// they would wrap onto memory a queued upload may still read.
+    fn staging_region(&mut self, bytes: usize) -> Result<usize, TensorError> {
+        if self.staging_at + bytes > HOST_DMA_STAGING {
+            if self.staging_busy {
+                self.sync()?;
+            }
+            self.staging_at = 0;
+        }
+        let at = self.staging_at;
+        self.staging_at += bytes;
+        Ok(at)
     }
 
     /// Run a transfer's jobs to their end, without a barrier (nothing is
@@ -1696,12 +1748,17 @@ impl<T: Transport> Session<T> {
         let [rt, ct] = t.grid();
         let tiles = rt * ct;
         let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
-        let mut out = vec![0f32; t.rows * t.cols];
+        let mut out = huge_zeroed(t.rows * t.cols);
         for first in (0..tiles).step_by(per) {
             let n = (tiles - first).min(per);
             let base = self.staging().expect("checked above").noc_address();
-            let slots: Vec<_> = (first..first + n).map(|k| t.slot(k)).collect();
-            let jobs = tensor::host_dma_jobs(&slots, false, base, self.units.len());
+            let jobs = tensor::host_dma_jobs(
+                t.tensor_ref(),
+                first..first + n,
+                false,
+                base,
+                self.units.len(),
+            );
             self.submit_dma(jobs)?;
             let host = self.staging().expect("checked above");
             // Detilized straight out of the pinned memory the card wrote.
@@ -1794,9 +1851,14 @@ impl<T: Transport> Session<T> {
                 let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
             }
             self.apply_pending_frees();
+            self.staging_at = 0;
+            self.staging_busy = false;
             return Err(e);
         }
         self.apply_pending_frees();
+        // Nothing queued reads host memory any more.
+        self.staging_at = 0;
+        self.staging_busy = false;
         Ok(())
     }
 
@@ -1836,9 +1898,6 @@ impl<T: Transport> Session<T> {
         }
         if ok {
             unit.programs.unpin_all();
-            if unit.lists >= unit.throttle_checked_at + THROTTLE_CHECK_LISTS {
-                self.check_throttle(u);
-            }
             self.drain(u)?;
             return Ok(());
         }
@@ -2656,12 +2715,12 @@ impl<T: Transport> Session<T> {
     }
 
     /// Overwrite `t`'s values in place (`DramTensor::write`): a trace's input
-    /// between replays. Waits for what is queued, which may read it.
+    /// between replays. Queued behind what is queued, which may read it
+    /// (`Session::dma_upload`); through the BAR, it waits for that instead.
     pub fn write(&mut self, t: &DramTensor, values: &[f32]) -> Result<(), TensorError> {
         self.refuse_while_capturing("write")?;
         t.expect("a write of FP32 values", tensor::Elem::F32)?;
-        self.sync()?;
-        self.write_src(t, Src::F32(values))
+        self.write_src(t, Src::F32(values), false)
     }
 
     /// Free GDDR bytes on the fullest channel.
@@ -3277,7 +3336,10 @@ impl<T: Transport> Session<T> {
 
     /// What the in-flight cap has cost every unit's mover since it started
     /// (`DataMover::throttle`), summed: requests that waited for room, and
-    /// the cycles they waited. A PCIe read pair per unit.
+    /// the cycles they waited. A PCIe read pair per unit. Not reported
+    /// otherwise: the tile cap (`dm::TILE_IN_FLIGHT_CAP`) is chosen for
+    /// fairness between tiles, so any large move waits under it by design --
+    /// a host DMA's 266 KB batches always do -- and a warning for it was noise.
     pub fn throttle(&mut self) -> Result<Throttle, TensorError> {
         let mut sum = Throttle::default();
         for u in 0..self.units.len() {
@@ -3290,41 +3352,8 @@ impl<T: Transport> Session<T> {
         Ok(sum)
     }
 
-    /// Say so when unit `u`'s mover has waited for room under the in-flight
-    /// cap more than it had at the last report -- first at all, then each
-    /// doubling -- so a cap that has become a bottleneck is noticed rather
-    /// than paid for silently. Checked every [`THROTTLE_CHECK_LISTS`] lists
-    /// and when the session ends.
-    fn check_throttle(&mut self, u: usize) {
-        let Session { dev, units, .. } = self;
-        let unit = &mut units[u];
-        unit.throttle_checked_at = unit.lists;
-        let (Some(r), Some(m)) = (unit.resident.as_ref(), unit.mover.as_ref()) else {
-            return;
-        };
-        let Ok(t) = m.throttle(dev, r.window()) else {
-            return;
-        };
-        if t.stalls > unit.throttle_reported.saturating_mul(2) {
-            unit.throttle_reported = t.stalls;
-            eprintln!(
-                "session: tile ({}, {})'s mover has waited for room under the NoC in-flight cap \
-                 ({} requests) {} times, {} cycles in all; if this grows, revisit \
-                 tt_isa::noc::niu::MAX_IN_FLIGHT (docs/firmware-performance.md)",
-                unit.tile.x(),
-                unit.tile.y(),
-                tt_isa::noc::niu::MAX_IN_FLIGHT,
-                t.stalls,
-                t.cycles
-            );
-        }
-    }
-
     pub fn into_device(mut self) -> Device<T> {
         let _ = self.sync();
-        for u in 0..self.units.len() {
-            self.check_throttle(u);
-        }
         for u in &mut self.units {
             if let Some(r) = u.resident.take() {
                 let _ = r.stop(&mut self.dev, &self.images);

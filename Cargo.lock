@@ -4825,6 +4825,7 @@ version = "0.1.0"
 name = "tt-kernels"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libm",
  "tt-device",
  "tt-isa",

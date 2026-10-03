@@ -732,31 +732,39 @@ impl DramTensor {
 
 /// Tile slots a unit stages a [`host_dma_jobs`] batch in: two halves of
 /// this many, a batch moving in or out of one while the other's moves go on.
-pub const HOST_DMA_BATCH: usize = 32;
+pub const HOST_DMA_BATCH: usize = 64;
 const _: () = assert!(2 * HOST_DMA_BATCH as u64 * TILE_SLOT <= tt_isa::l1::DATA.len());
 
-/// Moves between host memory and tile slots in GDDR, by the card
-/// (`tt_isa::dm::op::HOST_READ` / `HOST_WRITE`), one job a unit. `slots[k]`
-/// is tile `k`'s slot; in host memory tile `k` is at `host + k * TILE_SLOT`.
-/// An upload moves each tile's image (`matmul::TILE_IMAGE_BYTES`) host ->
-/// L1 -> slot; a download each tile's datums slot -> L1 -> host, at
-/// `TILE_DATA` into both, so all three addresses stay congruent mod 64.
+/// Moves between host memory and tiles `tiles` of the tensor `x`, by the
+/// card (`tt_isa::dm::op::HOST_READ` / `HOST_WRITE`), one job a unit, each
+/// unit a contiguous run of the tiles. In host memory tile `k` is at
+/// `host + (k - tiles.start) * TILE_SLOT`, its datums `TILE_DATA` in -- the
+/// same stride and offset as tile slots in L1, so a batch is one host move of
+/// its consecutive slots and one record (`record::READ_RUN` /
+/// `record::WRITE_RUN`) for its tiles in GDDR. An upload writes the datums
+/// (a slot's header is the unpacker's to skip, as a kernel's outputs'); a
+/// download brings whole slots.
 ///
 /// Each unit's tiles go in batches of [`HOST_DMA_BATCH`], alternating
 /// halves of its staging: batch `b + 1` comes in while batch `b` goes out,
 /// a `WAIT` between (the half batch `b + 2` refills was emptied before it).
-/// The data arena must be free: the caller has synced.
-pub fn host_dma_jobs(slots: &[DramRange], upload: bool, host: u64, units: usize) -> Vec<Job> {
+/// The data arena must be free of other work: the lists run behind
+/// everything queued before them on the unit, whose lists end with their
+/// kernels done.
+pub fn host_dma_jobs(
+    x: TensorRef,
+    tiles: std::ops::Range<usize>,
+    upload: bool,
+    host: u64,
+    units: usize,
+) -> Vec<Job> {
     use tt_isa::dm::op;
-    let units = units.max(1).min(slots.len().max(1));
+    let len = tiles.len();
+    let units = units.max(1).min(len.max(1));
     let base = tt_isa::l1::DATA.base;
-    let (skip, len) = if upload {
-        (0, matmul::TILE_IMAGE_BYTES as u32)
-    } else {
-        (TILE_DATA, 4096)
-    };
-    let host_entry = |k: usize, l1: u64| {
-        let at = host + k as u64 * TILE_SLOT + skip;
+    let at = |b: usize| base + ((b % 2) * HOST_DMA_BATCH) as u64 * TILE_SLOT;
+    let host_move = |first: usize, n: usize, l1: u64| {
+        let h = host + (first - tiles.start) as u64 * TILE_SLOT;
         let kind = if upload {
             op::HOST_READ
         } else {
@@ -764,57 +772,77 @@ pub fn host_dma_jobs(slots: &[DramRange], upload: bool, host: u64, units: usize)
         };
         [
             kind,
-            at as u32,
-            (at >> 32) as u32,
+            h as u32,
+            (h >> 32) as u32,
             0,
-            (l1 + skip) as u32,
-            len,
-            0,
-            0,
-        ]
-    };
-    let dram_entry = |k: usize, l1: u64| {
-        let s = slots[k];
-        let kind = if upload { op::WRITE } else { op::READ };
-        [
-            kind,
-            s.channel().index() as u32,
-            0,
-            (s.offset() + skip) as u32,
-            (l1 + skip) as u32,
-            len,
+            l1 as u32,
+            (n as u64 * TILE_SLOT) as u32,
             0,
             0,
         ]
     };
-    // An upload brings tiles in from the host, then writes them to GDDR; a
-    // download reads them from GDDR, then sends them to the host.
-    type MakeEntry<'a> = &'a dyn Fn(usize, u64) -> [u32; 8];
-    let (bring, send): (MakeEntry, MakeEntry) = if upload {
-        (&host_entry, &dram_entry)
-    } else {
-        (&dram_entry, &host_entry)
+    let dram_run = |first: usize, n: usize, l1: u64| -> [[u32; 8]; 3] {
+        let head = if upload {
+            [
+                record::WRITE_RUN,
+                first as u32,
+                n as u32,
+                l1 as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        } else {
+            [
+                record::READ_RUN,
+                first as u32,
+                n as u32,
+                l1 as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
+        [head, x.encode()[0], x.encode()[1]]
     };
     let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
     (0..units)
         .map(|u| {
-            let mine: Vec<usize> = (u..slots.len()).step_by(units).collect();
-            let batches: Vec<&[usize]> = mine.chunks(HOST_DMA_BATCH).collect();
-            let at =
-                |b: usize, i: usize| base + (((b % 2) * HOST_DMA_BATCH + i) as u64) * TILE_SLOT;
+            let run = tiles.start + u * len / units..tiles.start + (u + 1) * len / units;
+            let batches: Vec<(usize, usize)> = run
+                .clone()
+                .step_by(HOST_DMA_BATCH)
+                .map(|f| (f, HOST_DMA_BATCH.min(run.end - f)))
+                .collect();
+            // An upload brings a batch in from the host and writes it to
+            // GDDR; a download reads it from GDDR and sends it to the host.
+            let bring = |b: usize, entries: &mut Vec<[u32; 8]>| {
+                let (f, n) = batches[b];
+                if upload {
+                    entries.push(host_move(f, n, at(b)));
+                } else {
+                    entries.extend(dram_run(f, n, at(b)));
+                }
+            };
+            let send = |b: usize, entries: &mut Vec<[u32; 8]>| {
+                let (f, n) = batches[b];
+                if upload {
+                    entries.extend(dram_run(f, n, at(b)));
+                } else {
+                    entries.push(host_move(f, n, at(b)));
+                }
+            };
             let mut entries = Vec::new();
-            for (b, batch) in batches.iter().enumerate() {
+            for b in 0..batches.len() {
                 if b == 0 {
-                    entries.extend(batch.iter().enumerate().map(|(i, &k)| bring(k, at(b, i))));
+                    bring(b, &mut entries);
                 }
                 entries.push(wait);
-                entries.extend(batch.iter().enumerate().map(|(i, &k)| send(k, at(b, i))));
-                if let Some(next) = batches.get(b + 1) {
-                    entries.extend(
-                        next.iter()
-                            .enumerate()
-                            .map(|(i, &k)| bring(k, at(b + 1, i))),
-                    );
+                send(b, &mut entries);
+                if b + 1 < batches.len() {
+                    bring(b + 1, &mut entries);
                 }
             }
             entries.push(wait);

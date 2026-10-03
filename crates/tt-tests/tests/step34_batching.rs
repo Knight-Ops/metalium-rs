@@ -293,8 +293,8 @@ fn an_upload_lands_before_the_queued_op_that_reads_it() {
 /// The barrier counter starts from zero in every session. It lives in unit
 /// 0's L1, which keeps what an earlier process left: a stale count past every
 /// target lets each barrier through at once (silicon: a batched four-tile
-/// MNIST diverged). A count left behind here, then one multi-unit op: the
-/// counter holds exactly that op's arrivals.
+/// MNIST diverged). A count left behind here, then an upload and one
+/// multi-unit op: the counter holds exactly their arrivals.
 #[test]
 fn barriers_count_from_zero_whatever_an_earlier_session_left() {
     use tt_device::tlb::WindowKind;
@@ -328,9 +328,11 @@ fn barriers_count_from_zero_whatever_an_earlier_session_left() {
         let count = d
             .read32(&w, coordinator, tt_isa::dm::BARRIER_COUNTER)
             .unwrap();
+        // Two barriers -- the upload's (queued by the card's DMA, as an op
+        // is) and the op's -- four arrivals each, from zero.
         assert_eq!(
-            count, 4,
-            "one barrier, four arrivals, from zero (stale {stale:#x})"
+            count, 8,
+            "two barriers, four arrivals each, from zero (stale {stale:#x})"
         );
         s.free(y).unwrap();
         s.free(a).unwrap();

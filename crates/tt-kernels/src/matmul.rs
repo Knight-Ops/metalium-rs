@@ -803,7 +803,50 @@ pub fn tilize_f32_fp32(values: &[f32], rows: usize, cols: usize) -> Vec<u8> {
 /// `out` one every `stride` bytes from its start: straight into the pinned
 /// buffer a DMA upload sends from, with no copy of its own.
 pub fn tilize_into(
-    get: impl Fn(usize) -> u32,
+    get: impl Fn(usize) -> u32 + Sync,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [u8],
+    stride: usize,
+) {
+    let n = tiles.len();
+    let threads = host_threads(n);
+    if threads <= 1 {
+        return tilize_serial(&get, rows, cols, tiles, out, stride);
+    }
+    // Contiguous runs of tiles, each thread its own run of `out`.
+    let per = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let get = &get;
+        for (k, chunk) in out[..n * stride].chunks_mut(per * stride).enumerate() {
+            let first = tiles.start + k * per;
+            let run = first..(first + per).min(tiles.end);
+            scope.spawn(move || tilize_serial(get, rows, cols, run, chunk, stride));
+        }
+    });
+}
+
+/// Threads to split `tiles` tiles of host tile conversion over: one per
+/// [`HOST_TILES_PER_THREAD`], up to the host's cores. A tile is ~0.5 us of
+/// conversion, a thread ~20 to spawn: on card 0's host, 64 tiles a thread
+/// left a 1024-tile upload's tilize at 0.51 ms, 256 took it to 0.28.
+fn host_threads(tiles: usize) -> usize {
+    if tiles < 2 * HOST_TILES_PER_THREAD {
+        return 1;
+    }
+    // Asked once: `available_parallelism` reads the cgroup's CPU quota
+    // files on every call, ~40 us -- more than a small transfer's DMA.
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    (tiles / HOST_TILES_PER_THREAD).clamp(1, cores.min(16))
+}
+
+/// Fewest tiles a thread of host tile conversion is given.
+const HOST_TILES_PER_THREAD: usize = 256;
+
+fn tilize_serial(
+    get: &impl Fn(usize) -> u32,
     rows: usize,
     cols: usize,
     tiles: std::ops::Range<usize>,
@@ -872,6 +915,38 @@ pub fn detilize_from(
     out: &mut [f32],
 ) {
     let ct = cols.div_ceil(32).max(1);
+    let threads = host_threads(tiles.len());
+    // Split by whole tile rows, so each thread writes its own rows of `out`.
+    let whole_rows = tiles.start % ct == 0 && tiles.end % ct == 0;
+    if threads <= 1 || !whole_rows {
+        return detilize_rows(src, stride, skip, rows, cols, tiles, out, 0);
+    }
+    let (r0, r1) = (tiles.start / ct, tiles.end / ct);
+    let per = (r1 - r0).div_ceil(threads);
+    let mine = &mut out[(32 * r0).min(rows) * cols..(32 * r1).min(rows) * cols];
+    std::thread::scope(|scope| {
+        for (k, chunk) in mine.chunks_mut(32 * per * cols).enumerate() {
+            let (a, b) = (r0 + k * per, (r0 + (k + 1) * per).min(r1));
+            let run = a * ct..b * ct;
+            let src = &src[(run.start - tiles.start) * stride..];
+            scope.spawn(move || detilize_rows(src, stride, skip, rows, cols, run, chunk, 32 * a));
+        }
+    });
+}
+
+/// [`detilize_from`] on one thread, into `out` holding rows from `row0`.
+#[allow(clippy::too_many_arguments)]
+fn detilize_rows(
+    src: &[u8],
+    stride: usize,
+    skip: usize,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [f32],
+    row0: usize,
+) {
+    let ct = cols.div_ceil(32).max(1);
     for (n, t) in tiles.enumerate() {
         let (i, j) = (t / ct, t % ct);
         let tile = &src[n * stride + skip..][..4096];
@@ -888,7 +963,10 @@ pub fn detilize_from(
                     break;
                 }
                 let at = (face * 256 + r * 16) * 4;
-                for (k, v) in out[row * cols + col0..][..m].iter_mut().enumerate() {
+                for (k, v) in out[(row - row0) * cols + col0..][..m]
+                    .iter_mut()
+                    .enumerate()
+                {
                     let b = &tile[at + 4 * k..at + 4 * k + 4];
                     *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 }
@@ -1807,6 +1885,9 @@ mod fast_layout {
             (33, 17),
             (100, 70),
             (7, 129),
+            // Enough tiles to split over threads, with ragged edges.
+            (1000, 1000),
+            (4096, 600),
         ] {
             let v = values(rows * cols);
             let (want, _) = tilize_f32(&v, rows, cols, L1Format::Fp32);
@@ -1838,6 +1919,9 @@ mod fast_layout {
             (33, 17),
             (100, 70),
             (7, 129),
+            // Enough tiles to split over threads, with ragged edges.
+            (1000, 1000),
+            (4096, 600),
         ] {
             let (rt, ct) = (rows.div_ceil(32), cols.div_ceil(32));
             let packed: Vec<u8> = (0..rt * ct * 4096).map(|i| (i * 31 % 251) as u8).collect();

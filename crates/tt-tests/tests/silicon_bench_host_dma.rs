@@ -155,7 +155,7 @@ fn session_transfers() {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
             .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
-        for (rows, cols) in [(64usize, 784usize), (1024, 1024), (8192, 1024)] {
+        for (rows, cols) in [(64usize, 10usize), (64, 784), (1024, 1024), (8192, 1024)] {
             let v: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
             for dma in [true, false] {
                 s.set_host_dma(dma);
@@ -172,8 +172,9 @@ fn session_transfers() {
                 let down = Stats::of((0..REPS).map(|_| {
                     let t0 = Instant::now();
                     let back = s.download(&t).unwrap();
+                    let us = t0.elapsed().as_secs_f64() * 1e6;
                     assert!(back == v);
-                    t0.elapsed().as_secs_f64() * 1e6
+                    us
                 }));
                 s.free(t).unwrap();
                 let how = if dma { "dma" } else { "bar" };
@@ -193,6 +194,70 @@ fn session_transfers() {
                     None,
                 );
             }
+        }
+    }
+}
+
+/// A training-shaped loop that streams its inputs: each step uploads a batch
+/// and multiplies it by resident weights, nothing synced until the end. With
+/// uploads queued behind the ops (the card's DMA, `Session::set_host_dma`),
+/// the host tilizes and queues the next batch while the card computes; with
+/// a sync after each upload (what an upload did before it was queued), the
+/// two take turns; through the BAR, the host's stores are the step.
+#[test]
+#[ignore = "benchmark"]
+fn streamed_steps() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::session::{Session, TileChoice};
+    let card = tt_tests::backend::device_index();
+    const STEPS: usize = 100;
+    for tiles in [1usize, 8] {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        for (batch, input, hidden) in [(64usize, 784usize, 128usize), (512, 1024, 1024)] {
+            let w: Vec<f32> = (0..input * hidden).map(|i| (i % 7) as f32 * 0.01).collect();
+            let w = s.upload(&w, input, hidden).unwrap();
+            let x: Vec<f32> = (0..batch * input).map(|i| (i % 13) as f32 * 0.1).collect();
+            for (how, dma, sync_each) in [
+                ("queued", true, false),
+                ("synced", true, true),
+                ("bar", false, false),
+            ] {
+                s.set_host_dma(dma);
+                let mut run = || {
+                    let t0 = Instant::now();
+                    for _ in 0..STEPS {
+                        let xt = s.upload(&x, batch, input).unwrap();
+                        if sync_each {
+                            s.sync().unwrap();
+                        }
+                        let y = s
+                            .matmul_dram(
+                                &xt,
+                                false,
+                                &w,
+                                false,
+                                SrcRoute::Tf32FromFp32,
+                                Fidelity::HiFi4,
+                                1 << 30,
+                            )
+                            .unwrap();
+                        s.free(xt).unwrap();
+                        s.free(y).unwrap();
+                    }
+                    s.sync().unwrap();
+                    t0.elapsed().as_secs_f64() * 1e6 / STEPS as f64
+                };
+                run();
+                let us = Stats::of((0..3).map(|_| run()));
+                println!(
+                    "MEASURE streamed {batch}x{input}x{hidden} on {tiles} tiles, {how}: {:.1} us/step (p10 {:.1}, p90 {:.1})",
+                    us.median, us.p10, us.p90
+                );
+            }
+            s.set_host_dma(true);
+            s.free(w).unwrap();
         }
     }
 }
