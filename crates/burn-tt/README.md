@@ -22,7 +22,10 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 Element-wise ops go to the device only when an operand is already there. A rank-N
 `float_matmul` whose right side has no real batch (a `Linear` over `[b, s, d]`) folds
 the batch into the rows and runs as the 2-D product; so do `linear_weight_backward` and
-`linear_bias_backward`. The table above is the first ops; `hardware-coverage.md`'s Burn
+`linear_bias_backward`. Reshapes and dimension swaps of a resident F32 tensor are
+strided views of its buffer at any rank (`src/views.rs`): a batched matmul reads its
+operands' blocks where they lie (attention's heads, `K^T`), and an op that needs a plain
+matrix gets one by a block copy on the card when the view is whole tiles. The table above is the first ops; `hardware-coverage.md`'s Burn
 op tables are the full list, and `TT_REPORT=1` says what a given model ran where. Any F32
 `float_matmul` the above does not cover (batched, or an engine without GDDR such as
 `Topology::Cards`) still runs on the card, staged from the host (`Engine::matmul`).
@@ -53,7 +56,9 @@ cargo test -p burn-tt
 Host only: `tests/delegation.rs` checks every non-device op is Flex's answer byte for
 byte, `tests/server.rs` drives the server with a host engine. Device behaviour is
 gated in `tt-tests` (`step11_burn`, `step19_eltwise`, `step20_many_tiles`,
-`step12_mnist`).
+`step12_mnist`, `step35_burn_rank_n`, `step59_burn_transformer` -- a small Burn
+transformer whose per-op report is held to `tests/golden/transformer_off_device.txt`
+-- and `step60_batched_blocks` for the batched matmul and block copies).
 
 ## Environment variables
 
@@ -108,8 +113,11 @@ unparsable value as `0`.
 
 ## Gotchas
 
-- **Device errors panic.** Burn ops return tensors, not results, so a device op on
-  an unattached device or a failed run panics. It never silently falls back.
+- **Device errors panic, at the next wait.** Device ops return before they run
+  (asynchronous dispatch), so a failed run panics where a result is next waited
+  for -- a download, a trace's replay -- naming the op that failed and the engine's
+  error; the first failure on an attachment is reported by every later wait. An op
+  on an unattached device panics at once. Nothing silently falls back.
 - `TT_PROFILE` records each tile's mover lists, entries and records, and its role
   runs, by the tile's own cycle counter (Perfetto, `chrome://tracing`). Silicon
   only: ttsim does not model the timestamper's event stream.

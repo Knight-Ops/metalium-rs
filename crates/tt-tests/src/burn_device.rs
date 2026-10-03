@@ -247,6 +247,50 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.slice_rows(a, first, rows)
         }
+        fn matmul_dram_batched(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            items: &[(burn_tt::Block, burn_tt::Block)],
+            mkn: [usize; 3],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            let c = &self.config;
+            self.buffers.matmul_batched(
+                &mut self.session,
+                a,
+                b,
+                items,
+                mkn,
+                c.route,
+                c.fidelity,
+                c.budget,
+            )
+        }
+        fn copy_blocks(
+            &mut self,
+            a: burn_tt::BufferId,
+            moves: &[burn_tt::BlockMove],
+            dims: [usize; 2],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.copy_blocks(&mut self.session, a, moves, dims)
+        }
+        fn gather_rows(
+            &mut self,
+            sources: &[burn_tt::BufferId],
+            rows: &[(usize, usize)],
+            cols: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .gather_rows(&mut self.session, sources, rows, cols)
+        }
+        fn rows_add(
+            &mut self,
+            t: burn_tt::BufferId,
+            indices: &[usize],
+            value: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.rows_add(&mut self.session, t, indices, value)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }

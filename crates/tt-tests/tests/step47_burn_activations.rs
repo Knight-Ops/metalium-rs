@@ -356,8 +356,7 @@ fn within(got: &[f32], want: &[f32], rel: impl Fn(usize) -> f64, what: &str) {
     }
 }
 
-/// S4's algebraic ops (10.2d) through Burn, on tensors big enough
-/// (`APPROX_MIN_TILES`) for an approximation to run on the device: `sqrt`,
+/// S4's algebraic ops (10.2d) through Burn, on the device: `sqrt`,
 /// `log1p`, `powf` by a tensor, by an integer tensor and by scalars --
 /// integral ones by Flex's own dispatch (`ones`, the tensor, a product, a
 /// reciprocal) -- and `int_into_float`, exact. Resident, nothing downloaded,

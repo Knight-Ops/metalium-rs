@@ -22,8 +22,10 @@
 //! here depends on the simulator.
 //!
 //! **Errors.** Burn's ops return tensors, not results, so a device op on a
-//! device nobody attached, or a device run that fails, **panics** with the
-//! error. The device path is never silently replaced by the host one.
+//! device nobody attached **panics** at once, and a device run that fails
+//! panics at the next wait for a result (device ops are dispatched without
+//! waiting, `server::submit`), naming the op and the engine's error. The device
+//! path is never silently replaced by the host one.
 
 mod convert;
 mod generated;
@@ -34,6 +36,7 @@ mod tensor;
 mod topology;
 mod trace;
 mod traffic;
+mod views;
 
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
@@ -79,6 +82,7 @@ pub use traffic::{
 };
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
+pub use tt_kernels::tensor::{Block, BlockMove};
 
 use burn_backend::{Backend, BackendTypes, DType, DTypeUsageSet, DeviceId, DeviceOps};
 use burn_flex::{Flex, FlexDevice};

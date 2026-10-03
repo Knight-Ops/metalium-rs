@@ -178,3 +178,101 @@ fn a_linear_layer_reaches_the_engine() {
     .into_data();
     assert_eq!(want.as_bytes(), got.as_bytes());
 }
+
+/// Keeps tensors on the host; every device matmul fails.
+#[derive(Default)]
+struct FailingMatmul {
+    next: burn_tt::BufferId,
+    live: std::collections::HashMap<burn_tt::BufferId, Vec<f32>>,
+}
+
+impl Engine for FailingMatmul {
+    fn matmul(&mut self, _: &[f32], _: &[f32], _: [usize; 3]) -> Result<Vec<f32>, EngineError> {
+        Err(EngineError("no host-staged matmul here".into()))
+    }
+    fn supports_dram(&self) -> bool {
+        true
+    }
+    fn upload(
+        &mut self,
+        v: &[f32],
+        _r: usize,
+        _c: usize,
+    ) -> Result<burn_tt::BufferId, EngineError> {
+        self.next += 1;
+        self.live.insert(self.next, v.to_vec());
+        Ok(self.next)
+    }
+    fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
+        self.live
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| EngineError(format!("no buffer {id}")))
+    }
+    fn free(&mut self, id: burn_tt::BufferId) {
+        self.live.remove(&id);
+    }
+    fn matmul_dram(
+        &mut self,
+        _: burn_tt::BufferId,
+        _: bool,
+        _: burn_tt::BufferId,
+        _: bool,
+    ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        Err(EngineError("the tile hung".into()))
+    }
+}
+
+fn panic_text(r: std::thread::Result<()>) -> String {
+    let e = r.unwrap_err();
+    e.downcast_ref::<String>().cloned().unwrap_or_default()
+}
+
+/// Asynchronous dispatch (B8): a device op returns before it runs, so its
+/// failure is reported where its result is first waited for -- naming the op
+/// and the engine's error.
+#[test]
+fn an_asynchronous_op_s_failure_is_reported_at_the_wait() {
+    let device = TtDevice::new(110);
+    let _guard = attach(device, |serve| {
+        serve.serve(&mut FailingMatmul::default());
+        Ok(())
+    })
+    .unwrap();
+    let a = Tensor::<TtBackend, 2>::ones([2, 2], &device).to_device(&device);
+    // Returns: the failure is not known yet.
+    let c = a.clone().matmul(a);
+    let msg = panic_text(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let _ = c.into_data();
+        },
+    )));
+    assert!(
+        msg.contains("matmul") && msg.contains("the tile hung"),
+        "{msg}"
+    );
+}
+
+/// A failure whose result nobody reads is not lost: the attachment's next
+/// wait reports it, whatever that wait reads.
+#[test]
+fn a_failure_nobody_reads_is_reported_by_the_next_wait() {
+    let device = TtDevice::new(111);
+    let _guard = attach(device, |serve| {
+        serve.serve(&mut FailingMatmul::default());
+        Ok(())
+    })
+    .unwrap();
+    let a = Tensor::<TtBackend, 2>::ones([2, 2], &device).to_device(&device);
+    drop(a.clone().matmul(a.clone()));
+    let b = a.mul_scalar(1.0);
+    let msg = panic_text(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let _ = b.into_data();
+        },
+    )));
+    assert!(
+        msg.contains("an earlier device op failed") && msg.contains("the tile hung"),
+        "{msg}"
+    );
+}

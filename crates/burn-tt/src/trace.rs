@@ -44,8 +44,8 @@ impl Drop for Capturing {
     fn drop(&mut self) {
         if self.open {
             // Whatever it captured, it is no trace: ended, and released.
-            if let Ok(id) = server::run(self.device, |e| e.end_trace()) {
-                server::run(self.device, move |e| e.release_trace(id));
+            if let Ok(id) = server::run(self.device, |e, _| e.end_trace()) {
+                server::run(self.device, move |e, _| e.release_trace(id));
             }
         }
     }
@@ -77,7 +77,7 @@ impl Trace {
             ));
         }
         let input_id = d.buffer.id;
-        server::run(device, |e| e.begin_trace())?;
+        server::run(device, |e, _| e.begin_trace())?;
         let mut guard = Capturing { device, open: true };
         let out = f();
         let output = match out.dram() {
@@ -89,7 +89,7 @@ impl Trace {
             )),
         };
         guard.open = false;
-        let ended = server::run(device, |e| e.end_trace());
+        let ended = server::run(device, |e, _| e.end_trace());
         let ((output, output_dims), id) = (output?, ended?);
         let trace = Trace {
             device,
@@ -100,7 +100,9 @@ impl Trace {
             _held: [input.clone(), out],
         };
         let [r, c] = output_dims;
-        let first = server::run(device, move |e| e.download(output));
+        let first = server::run(device, move |e, ids| {
+            ids.get(output).and_then(|o| e.download(o))
+        });
         debug_assert!(first.as_ref().is_ok_and(|v| v.len() == r * c));
         Ok((trace, first?))
     }
@@ -122,8 +124,9 @@ impl Trace {
     /// output's read each took on the device's side.
     pub fn run_timed(&self, values: Vec<f32>) -> Result<server::TraceRun, EngineError> {
         let (id, input, output) = (self.id, self.input, self.output);
-        server::run(self.device, move |e| {
-            e.run_trace(id, input, &values, output)
+        server::run(self.device, move |e, ids| {
+            ids.healthy()?;
+            e.run_trace(id, ids.get(input)?, &values, ids.get(output)?)
         })
     }
 }
@@ -131,6 +134,6 @@ impl Trace {
 impl Drop for Trace {
     fn drop(&mut self) {
         let id = self.id;
-        server::run(self.device, move |e| e.release_trace(id));
+        server::run(self.device, move |e, _| e.release_trace(id));
     }
 }

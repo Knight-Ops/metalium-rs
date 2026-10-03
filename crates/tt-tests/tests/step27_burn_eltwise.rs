@@ -200,8 +200,6 @@ fn every_overridden_element_wise_method_matches_flex_and_stays_resident() {
 #[test]
 fn division_through_burn_is_within_one_ulp_and_stays_resident() {
     with_device(Config::default(), |d| {
-        // Eight tiles: the size from which these approximations run on the
-        // device (`burn-tt`'s `APPROX_MIN_TILES`).
         let [r, c] = [64, 128];
         let (av, bv) = (values(4, r * c), values(5, r * c));
         let ta = |v: &[f32]| {

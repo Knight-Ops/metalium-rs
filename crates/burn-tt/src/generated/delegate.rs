@@ -338,16 +338,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         tensor: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_gather", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_gather(
-                dim,
-                tensor.into_flex(),
-                indices.into_flex(),
-            ),
-            device,
-        )
+        let _op = crate::report::enter("float_gather", true);
+        crate::ops::float::float_gather(dim, tensor, indices)
     }
     fn float_scatter_add(
         dim: usize,
@@ -355,17 +347,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_scatter_add", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_scatter_add(
-                dim,
-                tensor.into_flex(),
-                indices.into_flex(),
-                value.into_flex(),
-            ),
-            device,
-        )
+        let _op = crate::report::enter("float_scatter_add", true);
+        crate::ops::float::float_scatter_add(dim, tensor, indices, value)
     }
     fn float_scatter_nd(
         _data: FloatTensor<TtBackend>,
@@ -404,16 +387,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_select", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_select(
-                tensor.into_flex(),
-                dim,
-                indices.into_flex(),
-            ),
-            device,
-        )
+        let _op = crate::report::enter("float_select", true);
+        crate::ops::float::float_select(tensor, dim, indices)
     }
     fn float_select_add(
         tensor: FloatTensor<TtBackend>,
@@ -421,17 +396,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_select_add", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_select_add(
-                tensor.into_flex(),
-                dim,
-                indices.into_flex(),
-                value.into_flex(),
-            ),
-            device,
-        )
+        let _op = crate::report::enter("float_select_add", true);
+        crate::ops::float::float_select_add(tensor, dim, indices, value)
     }
     fn float_slice(tensor: FloatTensor<TtBackend>, slices: &[Slice]) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_slice", true);
@@ -610,12 +576,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         )
     }
     fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_mean_dim", false);
-        let device = HasDevice::tt_device(&tensor);
-        FromFlex::from_flex(
-            <Flex as FloatTensorOps<Flex>>::float_mean_dim(tensor.into_flex(), dim),
-            device,
-        )
+        let _op = crate::report::enter("float_mean_dim", true);
+        crate::ops::float::float_mean_dim(tensor, dim)
     }
     fn float_cumsum(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cumsum", false);
@@ -2433,28 +2395,16 @@ impl ModuleOps<TtBackend> for TtBackend {
         weights: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("embedding", false);
-        let device = HasDevice::tt_device(&weights);
-        FromFlex::from_flex(
-            <Flex as ModuleOps<Flex>>::embedding(weights.into_flex(), indices.into_flex()),
-            device,
-        )
+        let _op = crate::report::enter("embedding", true);
+        crate::ops::module::embedding(weights, indices)
     }
     fn embedding_backward(
         weights: FloatTensor<TtBackend>,
         output_grad: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("embedding_backward", false);
-        let device = HasDevice::tt_device(&weights);
-        FromFlex::from_flex(
-            <Flex as ModuleOps<Flex>>::embedding_backward(
-                weights.into_flex(),
-                output_grad.into_flex(),
-                indices.into_flex(),
-            ),
-            device,
-        )
+        let _op = crate::report::enter("embedding_backward", true);
+        crate::ops::module::embedding_backward(weights, output_grad, indices)
     }
     fn linear_weight_backward(
         x: FloatTensor<TtBackend>,
