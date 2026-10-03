@@ -128,7 +128,7 @@ impl TensorRef {
             return Err(super::error::RANGE);
         }
         let t = self.first + i * self.ct + j;
-        let (s, c) = div_rem(t, self.n as u32);
+        let (s, c) = (t / self.n as u32, t % self.n as u32);
         let offset = (self.base[c as usize] as u64) + s as u64 * TILE_SLOT;
         let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
         Ok((self.channels[c as usize] as u32, offset))
@@ -137,9 +137,10 @@ impl TensorRef {
 
 /// [`TensorRef::tile`] for consecutive tiles of a row, from `(i, j)` on:
 /// one division to find the first, then each next is the next channel, its
-/// slot advancing when the channels wrap. The mover's gathers and scatters
-/// walk rows, and a software division per tile ([`div_rem`]) was most of
-/// what a record cost per tile beyond the read itself (checklist 9.14).
+/// slot advancing when the channels wrap: a few cycles a tile, against a
+/// divide's 6-33 (`BabyRISCV/README.md:51`). The mover's gathers and
+/// scatters walk rows. (Before the firmware could divide, the software
+/// division this replaced was most of a gathered tile's cost, checklist 9.14.)
 struct Cursor<'a> {
     x: &'a TensorRef,
     slot: u32,
@@ -152,7 +153,7 @@ impl TensorRef {
             return Err(super::error::RANGE);
         }
         let t = self.first + i * self.ct + j;
-        let (slot, c) = div_rem(t, self.n as u32);
+        let (slot, c) = (t / self.n as u32, t % self.n as u32);
         Ok(Cursor { x: self, slot, c })
     }
 }
@@ -176,27 +177,6 @@ impl Cursor<'_> {
 }
 
 const PORTS: u32 = crate::dram::PORTS as u32;
-
-/// `(a / b, a % b)` by shift and subtract, for a `b` known only at run time.
-///
-/// The mover's image may not contain `divu`/`remu`: the firmware is built to
-/// run on any core, and RISCV T2 has no integer divide (`InstructionSet.md`;
-/// the instruction gate in `tt-firmware-images/build.rs` refuses it). Division
-/// by a constant compiles to a multiply and needs none of this.
-pub const fn div_rem(a: u32, b: u32) -> (u32, u32) {
-    assert!(b != 0);
-    let (mut q, mut r) = (0u32, 0u32);
-    let mut bit = 32;
-    while bit > 0 {
-        bit -= 1;
-        r = (r << 1) | ((a >> bit) & 1);
-        if r >= b {
-            r -= b;
-            q |= 1 << bit;
-        }
-    }
-    (q, r)
-}
 
 fn tensor(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
     TensorRef::decode([rec[at], rec[at + 1]])
@@ -319,10 +299,10 @@ pub fn expand(
                 return Err(super::error::LENGTH);
             }
             let (mut i, mut j) = if column_major {
-                let (q, r) = div_rem(first, grid_rt);
+                let (q, r) = (first / grid_rt, first % grid_rt);
                 (r, q)
             } else {
-                div_rem(first, ct)
+                (first / ct, first % ct)
             };
             // A plain run over the tensor's own grid is consecutive tiles.
             let mut run = if !row && !col && !column_major && ct == x.ct {
@@ -508,13 +488,6 @@ mod tests {
             r.base[i] = 0x1000 * (i as u32 + 1);
         }
         r
-    }
-
-    #[test]
-    fn div_rem_is_division() {
-        for (a, b) in [(0, 1), (7, 3), (u32::MAX, 7), (65_535, 8), (12, 12), (5, 9)] {
-            assert_eq!(div_rem(a, b), (a / b, a % b), "{a} / {b}");
-        }
     }
 
     #[test]

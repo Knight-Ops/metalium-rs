@@ -360,9 +360,12 @@ difference is the host polling for the ack and posting the next send over PCIe.
     - Moves are checked once per descriptor and issued from registers
       (`DramMove`, `issue_dram_on`): −40 cycles per entry.
     - **Records walk rows with a cursor.** A software division per gathered
-      tile (`record::div_rem`, 32 steps; the firmware is built without the
-      divide instruction) was more than half of a gathered tile's cost.
-      Removing it halved matmul gathers.
+      tile (32 steps) was more than half of a gathered tile's cost. Removing it
+      halved matmul gathers.
+    - **The firmware divides in hardware** (6–33 cycles). The instruction gate
+      had refused `div`/`rem` on the false belief that T2 lacks them; only T2's
+      vector divide is missing. Transposed, broadcast and per-row divisions
+      gain.
   - **Entry size matters.** Carrying a whole `dm::Mover` in an `Entry` variant
     made every decode about 100 cycles slower, as did decoding rare kinds out
     of line. Both were fixed by a one-byte `dm::Peer` and inline decode.
@@ -384,6 +387,7 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-03 | — | Hardware integer divide allowed (the gate's T2 claim was a misreading of the vector `vdiv` caveat); `record::div_rem` removed | **matmul 32×256×32:** 11.9 → 8.5 µs.<br>**128³:** 33.5 → 29.4.<br>**512³:** 1537 → 1441 (gather 493 → 414) |
 | 2026-10-03 | — | Records walk rows with a cursor (one division per row, not per tile); GDDR moves checked once per descriptor and issued from registers (`DramMove`, `issue_dram_on`) | **matmul 512³, one tile:** gather 1061 → 493 µs, scatter 162 → 91, op 2176 → 1537.<br>**matmul 128³:** 46.4 → 33.5.<br>**add, 64 tiles:** 139 → 73.5.<br>**exp, 64 tiles:** 579 → 535.<br>**Per entry:** 4 KiB read 354 → 314 cycles, write 397 → 355 |
 | 2026-10-02 | — | Option C: NoC #1 owns port 0 on channels 4–7 (port 1 on 0–3), so its writes use eight rows instead of four. The host uses CMFW's endpoint | **Card writes on NoC #1, 120 tiles:** 268 → 378 GB/s.<br>**16 tiles:** 296 → 421.<br>**Reads + writes:** 344 → 396.<br>**Reads:** unchanged (469). |
 | 2026-10-02 | — | NC mover (`dm_nc`), `SIGNAL` / `WAIT_PEER`, `copy_pipeline` | NC costs what B does per entry. Split copies run 1.6× at 4 KiB entries on 1–16 tiles and converge at 120 |
