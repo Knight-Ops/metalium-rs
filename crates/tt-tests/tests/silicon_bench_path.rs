@@ -923,3 +923,164 @@ fn host_time_per_op() {
         }
     }
 }
+
+/// Trace replay against queueing ops fresh (checklist 9.17): a layer's
+/// forward pass -- matmul, add a row, relu, matmul -- at MNIST's size and at
+/// 512 x 1024, 50 times back to back, queued fresh (pipelined and plain: a
+/// capture runs plain) and replayed from one capture, on 1, 8 and 32 tiles
+/// (`SWEEP_TILES`). Host time is the calls' alone; end to end includes the
+/// sync, so it shows what streaming a trace from GDDR costs the device.
+#[test]
+#[ignore = "benchmark"]
+fn trace_replay_vs_fresh() {
+    use tt_kernels::kind;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::tensor::{DramTensor, Eltwise};
+    let card = device_index();
+    let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
+        Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        Err(_) => vec![1, 8, 32],
+    };
+    const PASSES: usize = 50;
+    const OPS: usize = 4;
+    fn forward(
+        s: &mut Session<tt_kmd::Kmd>,
+        x: &DramTensor,
+        w1: &DramTensor,
+        b1: &DramTensor,
+        w2: &DramTensor,
+    ) -> DramTensor {
+        let mm = |s: &mut Session<tt_kmd::Kmd>, a, b| {
+            s.matmul_dram(
+                a,
+                false,
+                b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET,
+            )
+            .unwrap()
+        };
+        let ew = |s: &mut Session<tt_kmd::Kmd>, kind, a, b| {
+            s.eltwise(
+                Eltwise {
+                    scalar2: 0.0,
+                    kind,
+                    scalar: 0.0,
+                },
+                a,
+                b,
+            )
+            .unwrap()
+        };
+        let h = mm(s, x, w1);
+        let hb = ew(s, kind::ADD_ROW, &h, Some(b1));
+        let r = ew(s, kind::RELU, &hb, None);
+        let y = mm(s, &r, w2);
+        for t in [h, hb, r] {
+            s.free(t).unwrap();
+        }
+        y
+    }
+    for tiles in counts {
+        if let Err(e) = fork_scope(|| {
+            let mut s =
+                Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            for (batch, input, hidden, out) in [(64, 784, 128, 10), (512, 1024, 1024, 1024)] {
+                let x = s.upload(&vec![0.5; batch * input], batch, input).unwrap();
+                let w1 = s
+                    .upload(&vec![0.01; input * hidden], input, hidden)
+                    .unwrap();
+                let b1 = s.upload(&vec![0.1; hidden], 1, hidden).unwrap();
+                let w2 = s.upload(&vec![0.02; hidden * out], hidden, out).unwrap();
+                let what = format!("{batch}x{input}x{hidden}x{out} on {tiles} tiles");
+                let per_op = |d: std::time::Duration| d.as_secs_f64() * 1e6 / (PASSES * OPS) as f64;
+                let fresh = |s: &mut Session<tt_kmd::Kmd>, pipeline: bool| {
+                    s.set_pipeline(pipeline);
+                    for _ in 0..3 {
+                        let y = forward(s, &x, &w1, &b1, &w2);
+                        s.sync().unwrap();
+                        s.free(y).unwrap();
+                    }
+                    let tr0 = s.device().traffic();
+                    let t0 = Instant::now();
+                    let ys: Vec<_> = (0..PASSES).map(|_| forward(s, &x, &w1, &b1, &w2)).collect();
+                    let calls = t0.elapsed();
+                    s.sync().unwrap();
+                    let total = t0.elapsed();
+                    let tr = s.device().traffic();
+                    for y in ys {
+                        s.free(y).unwrap();
+                    }
+                    println!(
+                        "MEASURE replay {what}, fresh {}: host {:.2} us/op, end to end {:.2} us/op, {:.1} writes {:.1} reads /op",
+                        if pipeline { "pipelined" } else { "plain    " },
+                        per_op(calls),
+                        per_op(total),
+                        (tr.write_calls - tr0.write_calls) as f64 / (PASSES * OPS) as f64,
+                        (tr.read_calls - tr0.read_calls) as f64 / (PASSES * OPS) as f64,
+                    );
+                };
+                fresh(&mut s, true);
+                fresh(&mut s, false);
+                s.set_pipeline(true);
+                s.begin_trace().unwrap();
+                let y = forward(&mut s, &x, &w1, &b1, &w2);
+                let id = s.end_trace().unwrap();
+                for _ in 0..3 {
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                }
+                let tr0 = s.device().traffic();
+                let t0 = Instant::now();
+                for _ in 0..PASSES {
+                    s.replay(id).unwrap();
+                }
+                let calls = t0.elapsed();
+                s.sync().unwrap();
+                let total = t0.elapsed();
+                let tr = s.device().traffic();
+                println!(
+                    "MEASURE replay {what}, replayed       : host {:.2} us/op, end to end {:.2} us/op, {:.1} writes {:.1} reads /op",
+                    per_op(calls),
+                    per_op(total),
+                    (tr.write_calls - tr0.write_calls) as f64 / (PASSES * OPS) as f64,
+                    (tr.read_calls - tr0.read_calls) as f64 / (PASSES * OPS) as f64,
+                );
+                // A server's batch: the input written from the host, the
+                // trace replayed, the output read back.
+                let values = vec![0.25f32; batch * input];
+                let (mut wr, mut rp, mut dl) = (Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..20 {
+                    let t0 = Instant::now();
+                    s.write(&x, &values).unwrap();
+                    let t1 = Instant::now();
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                    let t2 = Instant::now();
+                    let _ = s.download(&y).unwrap();
+                    wr.push((t1 - t0).as_secs_f64() * 1e6);
+                    rp.push((t2 - t1).as_secs_f64() * 1e6);
+                    dl.push(t2.elapsed().as_secs_f64() * 1e6);
+                }
+                println!(
+                    "MEASURE replay {what}, a served batch: write {} B {:.0} us, replay {:.0} us, read {} B {:.0} us",
+                    batch * input * 4,
+                    Stats::of(wr.into_iter()).median,
+                    Stats::of(rp.into_iter()).median,
+                    batch * out * 4,
+                    Stats::of(dl.into_iter()).median,
+                );
+                s.release_trace(id).unwrap();
+                for t in [y, x, w1, b1, w2] {
+                    s.free(t).unwrap();
+                }
+            }
+        }) {
+            panic!("{tiles} tiles: {e}");
+        }
+    }
+}

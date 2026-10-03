@@ -1497,10 +1497,17 @@ tiles, done in turn. The slices from there:
       fixed, 6 -> 3.4 us a unit an op on 32 tiles (MNIST 8 tiles 2.1 -> 1.6
       ms/step). Left: three posted writes (1.3 us) and CPU work (~2 us) a
       unit.
-    - Likely fix: Tenstorrent's Metal Trace, recorded once and replayed. This
-      workspace already captures and replays (`Session` traces,
-      `step39_traces`): measure how much host time a replay removes, and make
-      pipelined lists capturable (pipelining is off while capturing).
+    - [x] Trace replay measured (`trace_replay_vs_fresh`): a forward pass at
+      MNIST's size goes from host-bound to device-bound past one tile (8
+      tiles 28.8 -> 11.2 us an op, 32 tiles 51.4 -> 11.5); neutral on
+      device-bound shapes; 5% slower on one tile, where captures lose
+      pipelining. Next: make pipelined lists capturable; replay from burn-tt
+      without a host-written input (the input write is PCIe-bound, below).
+    - [ ] Host<->card copies: uncached under this VM (80 MB/s writes, 28
+      reads; `ttsim-divergence.md` row M). Fix outside the code (the
+      hypervisor mapping the BARs write-combining) or around it: the card
+      pulling from pinned host memory through the PCIe tile, as tt-metal's
+      prefetcher does, which no guest mapping slows.
     - Then consider what replay cannot cover: one list multicast to every
       unit, or a unit expanding its share from one record.
   - [ ] **9.16 Role program streaming, measured first.**
