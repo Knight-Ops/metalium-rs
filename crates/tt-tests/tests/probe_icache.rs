@@ -24,6 +24,7 @@ fn instruction_cache_size_by_timing() {
     in_device(|d| {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+        let role = |t: u64| tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE;
         for (core, image, mailbox, results) in [
             (
                 Core::B,
@@ -36,6 +37,24 @@ fn instruction_cache_size_by_timing() {
                 tt_firmware_images::ICACHE_NC,
                 tt_isa::dm::nc::MAILBOX_BASE,
                 MAILBOX_BASE + 0x3100,
+            ),
+            (
+                Core::T0,
+                tt_firmware_images::ICACHE_T[0],
+                role(0),
+                MAILBOX_BASE + 0x3200,
+            ),
+            (
+                Core::T1,
+                tt_firmware_images::ICACHE_T[1],
+                role(1),
+                MAILBOX_BASE + 0x3300,
+            ),
+            (
+                Core::T2,
+                tt_firmware_images::ICACHE_T[2],
+                role(2),
+                MAILBOX_BASE + 0x3400,
             ),
         ] {
             d.write32(&w, t, mailbox + offset::STATUS, 0).unwrap();
@@ -60,6 +79,9 @@ fn instruction_cache_size_by_timing() {
                 let mut r = |i: u64| d.read32(&w, t, results + k as u64 * 12 + i * 4).unwrap();
                 let (size, line, jump) = (r(0), r(1) as f64 / PASSES, r(2) as f64 / PASSES);
                 assert!(size > 0);
+                if line == 0.0 {
+                    continue; // past this core's blocks
+                }
                 println!(
                     "MEASURE icache {core:?} {size:>5} B  line {line:9.1} ({:5.2}/B)  jump {jump:9.1} ({:5.2}/jump)",
                     line / size as f64,

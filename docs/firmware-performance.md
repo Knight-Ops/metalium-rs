@@ -139,7 +139,7 @@ each tile's share fixed:
   difference.
 - **Writes: within noise at every size and tile count.**
 
-### Instruction caches: about 4 KiB on B and NC
+### Instruction caches: about 4 KiB on every baby core
 
 Measured by `probe_icache` on card 0 (2026-10-03); the Blackhole size is
 documented nowhere. The probe runs the last N bytes of two 8 KiB blocks:
@@ -152,7 +152,9 @@ straight-line `nop`s, and a chain of jumps 32 bytes apart.
 | 5 KiB | 0.29 | 8.6 |
 | 6–8 KiB | 0.31 | 10.6 |
 
-- **B and NC measure the same.** Wormhole had 2 KiB on B and 512 B on NC.
+- **All five cores measure the same,** B, NC and T0–T2 alike. T0–T2 were run
+  with 6 KiB blocks to fit their 16 KiB slots. Wormhole's were 2 / 2 / ½ / 2 / ½
+  KiB for B / T0 / T1 / T2 / NC.
 - **A miss costs ~5.5 cycles per 32 bytes,** and straight-line code mostly hides
   it.
 - **Why placement matters:**

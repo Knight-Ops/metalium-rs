@@ -50,7 +50,7 @@ tt-metal is cited only to settle a point the guide raises, and is not part of th
 
 | # | Repo says | Evidence | Action |
 |---|---|---|---|
-| R1 | "B's **2 KiB** instruction cache" (`docs/firmware-performance.md:135`; `crates/tt-firmware/src/lib.rs:577`) | The 2 KiB / 2 / ½ / 2 / ½ KiB table is **Wormhole's** (`WormholeB0/.../InstructionCache.md:5-8`). BH `BabyRISCV/README.md:39` links an `InstructionCache.md` that exists neither in `vendor/` nor upstream (404 on `main`, 2026-10-02). **The BH icache sizes are undocumented.** | **Measured (2026-10-03, `probe_icache`): ~4 KiB on both B and NC**, a miss ~5.5 cycles per 32 bytes; the repo's "2 KiB" statements are corrected. |
+| R1 | "B's **2 KiB** instruction cache" (`docs/firmware-performance.md:135`; `crates/tt-firmware/src/lib.rs:577`) | The 2 KiB / 2 / ½ / 2 / ½ KiB table is **Wormhole's** (`WormholeB0/.../InstructionCache.md:5-8`). BH `BabyRISCV/README.md:39` links an `InstructionCache.md` that exists neither in `vendor/` nor upstream (404 on `main`, 2026-10-02). **The BH icache sizes are undocumented.** | **Measured (2026-10-03, `probe_icache`): ~4 KiB on every baby core (B, NC, T0, T1, T2)**, a miss ~5.5 cycles per 32 bytes; the repo's "2 KiB" statements are corrected. |
 | R2 | `SoftReset.md:114` (BH) mentions "core-local instruction RAM" | That is a WH leftover link. The BH memory map has no IRAM. | None. Don't read it as evidence that BH has IRAM. |
 
 ---

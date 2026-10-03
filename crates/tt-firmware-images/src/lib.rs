@@ -94,8 +94,28 @@ pub const ICACHE_NC: Image = (
     tt_isa::dm::nc::IMAGE_BASE,
 );
 
+/// The instruction-cache probes for T0, T1 and T2, each at its core's
+/// default reset PC.
+pub const ICACHE_T: [Image; 3] = [
+    (
+        Core::T0,
+        include_bytes!(env!("FIRMWARE_ICACHE_T0")),
+        Core::T0.default_reset_pc() as u64,
+    ),
+    (
+        Core::T1,
+        include_bytes!(env!("FIRMWARE_ICACHE_T1")),
+        Core::T1.default_reset_pc() as u64,
+    ),
+    (
+        Core::T2,
+        include_bytes!(env!("FIRMWARE_ICACHE_T2")),
+        Core::T2.default_reset_pc() as u64,
+    ),
+];
+
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 13] = [
+const ENTRIES: [(&str, &str); 16] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
@@ -109,6 +129,9 @@ const ENTRIES: [(&str, &str); 13] = [
     ("dm_nc", env!("FIRMWARE_DM_NC_ENTRY")),
     ("icache_b", env!("FIRMWARE_ICACHE_B_ENTRY")),
     ("icache_nc", env!("FIRMWARE_ICACHE_NC_ENTRY")),
+    ("icache_t0", env!("FIRMWARE_ICACHE_T0_ENTRY")),
+    ("icache_t1", env!("FIRMWARE_ICACHE_T1_ENTRY")),
+    ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.

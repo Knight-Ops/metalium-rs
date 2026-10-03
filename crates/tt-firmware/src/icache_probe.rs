@@ -1,8 +1,9 @@
-// The instruction-cache probe, shared by RISCV B's image (`bin/icache_b.rs`)
-// and RISCV NC's (`bin/icache_nc.rs`): each binary defines `RESULTS`, where
-// in L1 the timings go, and includes this.
+// The instruction-cache probe, shared by every core's image
+// (`bin/icache_*.rs`): each binary defines `RESULTS`, where in L1 the timings
+// go, and `BLOCK`, each block's size (8 KiB on B and NC; 6 KiB on T0-T2,
+// whose image slots are 16 KiB), and includes this.
 //
-// Two 8 KiB blocks of code, each ending in `ret`. Calling into a block at
+// Two `BLOCK`-byte blocks of code, each ending in `ret`. Calling into a block at
 // `end - size` runs its last `size` bytes:
 // * straight-line: one `nop` every 4 bytes, so every byte is fetched in
 //   order (a sequential prefetcher can hide misses);
@@ -20,7 +21,7 @@ core::arch::global_asm!(
     .balign 64
     .global probe_line_start
 probe_line_start:
-    .rept 2048
+    .rept {lines}
     nop
     .endr
     .global probe_line_end
@@ -30,7 +31,7 @@ probe_line_end:
     .balign 64
     .global probe_jump_start
 probe_jump_start:
-    .rept 256
+    .rept {jumps}
     j 1f
     .rept 7
     nop
@@ -40,7 +41,9 @@ probe_jump_start:
     .global probe_jump_end
 probe_jump_end:
     ret
-"#
+"#,
+    lines = const BLOCK / 4,
+    jumps = const BLOCK / 32,
 );
 
 extern "C" {
@@ -48,7 +51,8 @@ extern "C" {
     static probe_jump_end: u8;
 }
 
-/// Sizes probed, in bytes: multiples of 32, up to the blocks' 8 KiB.
+/// Sizes probed, in bytes: multiples of 32; those past `BLOCK` are skipped
+/// (reported with zero cycles).
 const SIZES: [u32; 14] = [
     256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
 ];
@@ -87,8 +91,9 @@ pub extern "Rust" fn firmware_main() -> ! {
         // SAFETY: `RESULTS` is free L1 this binary owns (see its definition).
         unsafe {
             l1_write32(at, size);
-            l1_write32(at + 4, time(line, size));
-            l1_write32(at + 8, time(jump, size));
+            let fits = size <= BLOCK;
+            l1_write32(at + 4, if fits { time(line, size) } else { 0 });
+            l1_write32(at + 8, if fits { time(jump, size) } else { 0 });
         }
     }
     publish();

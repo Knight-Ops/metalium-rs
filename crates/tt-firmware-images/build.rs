@@ -27,6 +27,9 @@ const BINARIES: &[&str] = &[
     "dm_nc",
     "icache_b",
     "icache_nc",
+    "icache_t0",
+    "icache_t1",
+    "icache_t2",
 ];
 
 const TARGET: &str = "riscv32im-unknown-none-elf";
