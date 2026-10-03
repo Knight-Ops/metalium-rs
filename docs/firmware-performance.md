@@ -362,6 +362,9 @@ difference is the host polling for the ack and posting the next send over PCIe.
     - **Records walk rows with a cursor.** A software division per gathered
       tile (32 steps) was more than half of a gathered tile's cost. Removing it
       halved matmul gathers.
+    - **A record's plain moves skip the general entry path.** Each goes from
+      `record::expand` through `Descriptor::decode` straight to the issue
+      (`record_entry`), placed beside `issue`.
     - **The firmware divides in hardware** (6–33 cycles). The instruction gate
       had refused `div`/`rem` on the false belief that T2 lacks them; only T2's
       vector divide is missing. Transposed, broadcast and per-row divisions
@@ -387,6 +390,7 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-03 | — | A record's plain moves go straight to the issue (`record_entry`, beside `issue` in `.text.hot`), not through `exec` and `Entry::decode` | **matmul 512³:** 1441 → 1416 µs (gather 414 → 393).<br>**128³:** 29.4 → 28.8.<br>**add, 64 tiles:** 72.1 → 69.7.<br>An out-of-line variant ran the matmul faster (1396) but added 14% to add's runs: the code's placement decides speed. |
 | 2026-10-03 | — | Hardware integer divide allowed (the gate's T2 claim was a misreading of the vector `vdiv` caveat); `record::div_rem` removed | **matmul 32×256×32:** 11.9 → 8.5 µs.<br>**128³:** 33.5 → 29.4.<br>**512³:** 1537 → 1441 (gather 493 → 414) |
 | 2026-10-03 | — | Records walk rows with a cursor (one division per row, not per tile); GDDR moves checked once per descriptor and issued from registers (`DramMove`, `issue_dram_on`) | **matmul 512³, one tile:** gather 1061 → 493 µs, scatter 162 → 91, op 2176 → 1537.<br>**matmul 128³:** 46.4 → 33.5.<br>**add, 64 tiles:** 139 → 73.5.<br>**exp, 64 tiles:** 579 → 535.<br>**Per entry:** 4 KiB read 354 → 314 cycles, write 397 → 355 |
 | 2026-10-02 | — | Option C: NoC #1 owns port 0 on channels 4–7 (port 1 on 0–3), so its writes use eight rows instead of four. The host uses CMFW's endpoint | **Card writes on NoC #1, 120 tiles:** 268 → 378 GB/s.<br>**16 tiles:** 296 → 421.<br>**Reads + writes:** 344 → 396.<br>**Reads:** unchanged (469). |

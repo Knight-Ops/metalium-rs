@@ -499,6 +499,22 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
     Ok(())
 }
 
+/// One entry of an expanded record: a plain read or write straight to the
+/// issue, decoded as a descriptor (`Descriptor::decode`, every refusal
+/// `exec` would make), without the general entry path; anything else
+/// through [`exec`]. Beside [`issue`] in `.text.hot`: a record's tiles run
+/// through here, and the general path was a third of a gathered tile's cost
+/// (checklist 9.14).
+#[link_section = ".text.hot"]
+#[inline(never)]
+fn record_entry(me: (u8, u8), usable: u32, e: [u32; 8]) -> Result<(), u32> {
+    if e[0] == op::READ || e[0] == op::WRITE {
+        issue(me, Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5])?)
+    } else {
+        exec(me, usable, e)
+    }
+}
+
 /// The `n`-entry op record at `at`, expanded ([`record::expand`]). Out of the
 /// list loop, as the rest of the cold paths are, so the loop and [`exec`]'s
 /// move path sit together in `.text.hot` (`sections.x`).
@@ -508,7 +524,7 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     for (k, e) in rec[..n].iter_mut().enumerate() {
         *e = entry_at(at + k as u64 * dm::ENTRY_BYTES);
     }
-    record::expand(&rec[..n], |e| exec(me, usable, e))
+    record::expand(&rec[..n], |e| record_entry(me, usable, e))
 }
 
 /// [`dm::op::CALL`]: a trace's entries from GDDR, a chunk at a time into
