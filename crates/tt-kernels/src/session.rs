@@ -323,6 +323,9 @@ pub struct Session<T: Transport> {
     /// overlap its kernels (`Session::set_pipeline`, checklist 9.15). On by
     /// default.
     pipeline: bool,
+    /// NC's mover image, when pipelined groups' scatters go to NC
+    /// ([`Session::set_scatter_mover`]); `None` keeps every move on B.
+    scatter_on_nc: Option<&'static [u8]>,
     /// [`Session::pipelined_blocks`].
     pipelined: u64,
     /// [`Session::set_profile_roles`].
@@ -382,6 +385,15 @@ struct Unit {
     /// last reported ([`Session::check_throttle`]).
     throttle_checked_at: u64,
     throttle_reported: u32,
+    /// The data mover on this tile's RISCV NC, writing out pipelined groups'
+    /// scatters ([`Session::set_scatter_mover`]); started when first needed,
+    /// and again whenever B's is. B's lists wait for it, so a unit is idle
+    /// once B's are done.
+    nc: Option<DataMover<Noc0>>,
+    /// `SIGNAL`s queued on B's and NC's movers since each started: the base
+    /// a segment's relative `WAIT_PEER` targets count from.
+    b_signals: u32,
+    nc_signals: u32,
 }
 
 /// Lists between looks at a unit's throttle counters: one PCIe read per this
@@ -441,6 +453,17 @@ struct Segment {
     loops: Arc<[Vec<crate::code::Loop>; 3]>,
     /// How many of the op's steps it covers, for [`Session::steps_per_tile`].
     steps: u64,
+    /// With the scatters on NC ([`Session::set_scatter_mover`]): NC's list,
+    /// queued beside this one.
+    nc_entries: Vec<[u32; 8]>,
+    /// `WAIT_PEER` entries in `entries` (on NC) and in `nc_entries` (on B):
+    /// each one's index, and the peer's `SIGNAL`s it waits for, counted from
+    /// the peer's last before this segment. Made absolute when queued.
+    b_waits_on_nc: Vec<(usize, u32)>,
+    nc_waits_on_b: Vec<(usize, u32)>,
+    /// `SIGNAL`s in `entries` and `nc_entries`.
+    b_signals: u32,
+    nc_signals: u32,
 }
 
 /// Make every program `seg`'s kernels name resident on the tile, uploading
@@ -594,6 +617,11 @@ impl From<PlaceError> for TensorError {
 /// were separate lists are separated by a `WAIT` entry, since their entries
 /// may reuse each other's L1 slots; a `KERNEL` entry waits by itself.
 fn segments(steps: Vec<Step>) -> Vec<Segment> {
+    segments_split(steps, false)
+}
+
+/// [`segments`], with each pipelined group's scatters on NC if `split`.
+fn segments_split(steps: Vec<Step>, split: bool) -> Vec<Segment> {
     use tt_isa::dm::op;
     let mut out = Vec::new();
     let mut cur = Segment::default();
@@ -641,39 +669,11 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
                 // was waited for; a scatter reads only waited-for outputs.
                 // The scatter and gather that sit next to each other touch
                 // different slots (outputs, inputs), so no `WAIT` between.
-                let mut launched = Vec::with_capacity(blocks.len());
-                let mut scatters = Vec::with_capacity(blocks.len());
-                for (k, block) in blocks.into_iter().enumerate() {
-                    let Block {
-                        gather,
-                        roles,
-                        init,
-                        mop,
-                        loops,
-                        scatter,
-                    } = block;
-                    add_list(&mut cur, &mut out, gather.0, &gather.1, false);
-                    if k > 0 {
-                        let w = launched[k - 1];
-                        cur.waits.push((cur.entries.len(), w));
-                        cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                        cur.steps += 1;
-                    }
-                    launched.push(cur.kernels.len());
-                    add_kernel(&mut cur, &mut out, roles, init, mop, loops, op::LAUNCH);
-                    if k > 0 {
-                        let (what, entries): (&'static str, Vec<[u32; 8]>) =
-                            std::mem::take(&mut scatters[k - 1]);
-                        add_list(&mut cur, &mut out, what, &entries, false);
-                    }
-                    scatters.push(scatter);
+                if split {
+                    add_split_group(&mut cur, &mut out, blocks);
+                } else {
+                    add_group(&mut cur, &mut out, blocks);
                 }
-                let last = launched.len() - 1;
-                cur.waits.push((cur.entries.len(), launched[last]));
-                cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                cur.steps += 1;
-                let (what, entries) = std::mem::take(&mut scatters[last]);
-                add_list(&mut cur, &mut out, what, &entries, false);
                 assert_eq!(out.len(), before, "a pipelined group split across lists");
                 after_list = true;
             }
@@ -681,6 +681,109 @@ fn segments(steps: Vec<Step>) -> Vec<Segment> {
     }
     close_segment(&mut cur, &mut out);
     out
+}
+
+/// A pipelined group into the current list, every move on B: `G0, L0`, then
+/// for each next block `Gk, W(k-1), Lk, S(k-1)`, then `W(last), S(last)`.
+fn add_group(cur: &mut Segment, out: &mut Vec<Segment>, blocks: Vec<Block>) {
+    use tt_isa::dm::op;
+    let mut launched = Vec::with_capacity(blocks.len());
+    let mut scatters = Vec::with_capacity(blocks.len());
+    for (k, block) in blocks.into_iter().enumerate() {
+        let Block {
+            gather,
+            roles,
+            init,
+            mop,
+            loops,
+            scatter,
+        } = block;
+        add_list(cur, out, gather.0, &gather.1, false);
+        if k > 0 {
+            let w = launched[k - 1];
+            cur.waits.push((cur.entries.len(), w));
+            cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            cur.steps += 1;
+        }
+        launched.push(cur.kernels.len());
+        add_kernel(cur, out, roles, init, mop, loops, op::LAUNCH);
+        if k > 0 {
+            let (what, entries): (&'static str, Vec<[u32; 8]>) =
+                std::mem::take(&mut scatters[k - 1]);
+            add_list(cur, out, what, &entries, false);
+        }
+        scatters.push(scatter);
+    }
+    let last = launched.len() - 1;
+    cur.waits.push((cur.entries.len(), launched[last]));
+    cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
+    let (what, entries) = std::mem::take(&mut scatters[last]);
+    add_list(cur, out, what, &entries, false);
+}
+
+/// A `WAIT_PEER` entry's word naming the mover it waits for
+/// (`tt_isa::dm::Peer`).
+const PEER_B: u32 = 0;
+const PEER_NC: u32 = 1;
+
+/// A pipelined group with its scatters on NC (`Session::set_scatter_mover`).
+/// B gathers and launches as [`add_group`] does, and after each kernel's wait
+/// signals NC, which writes that block out and signals back:
+///
+/// ```text
+/// B:  G0 L0 | G1 W0 s L1 | G2 [NC>=1] W1 s L2 | ... | W(n-1) s [NC>=n]
+/// NC: [B>=1] S0 s | [B>=2] S1 s | ... | [B>=n] S(n-1) s
+/// ```
+///
+/// Block k's launch waits for NC to have written out block k-2, whose
+/// outputs share its half; B's list ends waiting for NC's last, so the next
+/// list's gathers (another op's slots) cannot land under a scatter, and B's
+/// list done means the unit is idle. A `SIGNAL` counts only once the
+/// signaller's writes have landed.
+fn add_split_group(cur: &mut Segment, out: &mut Vec<Segment>, blocks: Vec<Block>) {
+    use tt_isa::dm::op;
+    let n = blocks.len();
+    let mut launched = Vec::with_capacity(n);
+    for (k, block) in blocks.into_iter().enumerate() {
+        let Block {
+            gather,
+            roles,
+            init,
+            mop,
+            loops,
+            scatter,
+        } = block;
+        add_list(cur, out, gather.0, &gather.1, false);
+        if k > 0 {
+            cur.waits.push((cur.entries.len(), launched[k - 1]));
+            cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            cur.entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+            cur.b_signals += 1;
+            cur.steps += 1;
+        }
+        if k > 1 {
+            cur.b_waits_on_nc.push((cur.entries.len(), (k - 1) as u32));
+            cur.entries.push([op::WAIT_PEER, PEER_NC, 0, 0, 0, 0, 0, 0]);
+        }
+        launched.push(cur.kernels.len());
+        add_kernel(cur, out, roles, init, mop, loops, op::LAUNCH);
+        cur.nc_waits_on_b
+            .push((cur.nc_entries.len(), (k + 1) as u32));
+        cur.nc_entries
+            .push([op::WAIT_PEER, PEER_B, 0, 0, 0, 0, 0, 0]);
+        cur.nc_entries.extend_from_slice(&scatter.1);
+        cur.nc_entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+        cur.nc_signals += 1;
+        cur.steps += 1;
+    }
+    cur.waits.push((cur.entries.len(), launched[n - 1]));
+    cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+    cur.entries.push([op::SIGNAL, 0, 0, 0, 0, 0, 0, 0]);
+    cur.b_signals += 1;
+    cur.b_waits_on_nc.push((cur.entries.len(), n as u32));
+    cur.entries.push([op::WAIT_PEER, PEER_NC, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
 }
 
 /// Each `KERNEL` (or `LAUNCH`) entry of `seg` its generation, in order, and
@@ -1002,6 +1105,7 @@ impl<T: Transport> Session<T> {
             images,
             profile: runtime::Profile::default(),
             pipeline: true,
+            scatter_on_nc: None,
             pipelined: 0,
             profile_roles: true,
             drains: 0,
@@ -1031,6 +1135,9 @@ impl<T: Transport> Session<T> {
                 queued: Default::default(),
                 throttle_checked_at: 0,
                 throttle_reported: 0,
+                nc: None,
+                b_signals: 0,
+                nc_signals: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -1077,6 +1184,7 @@ impl<T: Transport> Session<T> {
         // not, and what L1 holds is no longer the host's to vouch for.
         *epoch += 1;
         unit.mover = None;
+        unit.nc = None;
         unit.programs.clear();
         if let Some(r) = unit.resident.take() {
             r.stop(dev, images)?;
@@ -1467,6 +1575,13 @@ impl<T: Transport> Session<T> {
             // The barrier counter starts again below, and nothing the mover
             // was running survives: traces captured before are stale.
             *epoch += 1;
+            // B's progress word starts again from zero, so NC -- which may
+            // be waiting on it -- starts again too, when next needed.
+            if let Some(nc) = unit.nc.take() {
+                nc.stop(dev, r.window())?;
+            }
+            unit.b_signals = 0;
+            unit.nc_signals = 0;
             unit.mover = Some(DataMover::start(
                 dev,
                 r.window(),
@@ -1541,9 +1656,10 @@ impl<T: Transport> Session<T> {
         // the other units had anything to do, and they ran one after another
         // (a pipelined 1024^3 matmul on 8 tiles: 9 ms in the call, against
         // 0.4).
+        let split = self.scatter_on_nc.is_some() && self.capture.is_none();
         let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
             .into_iter()
-            .map(|steps| segments(steps).into())
+            .map(|steps| segments_split(steps, split).into())
             .collect();
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
@@ -1686,6 +1802,15 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         }
+        if !seg.nc_entries.is_empty() {
+            if let Err(e) = self.enqueue_nc(u, seg, &mut entries) {
+                let r = self.units[u].resident.as_mut().unwrap();
+                if !seg.kernel_roles.is_empty() {
+                    let _ = r.reserved_done(&mut self.dev, false);
+                }
+                return Err(e);
+            }
+        }
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
@@ -1708,6 +1833,49 @@ impl<T: Transport> Session<T> {
         });
         unit.lists += 1;
         unit.steps += seg.steps;
+        unit.b_signals = unit.b_signals.wrapping_add(seg.b_signals);
+        Ok(())
+    }
+
+    /// Queue `seg`'s NC list on unit `u`, starting NC's mover if it is not
+    /// running, and make both lists' `WAIT_PEER` targets absolute (B's in
+    /// `entries`). NC's lists are not waited on: B's list ends waiting for
+    /// NC, so B's done means NC's is, and an NC failure fails B's wait.
+    fn enqueue_nc(
+        &mut self,
+        u: usize,
+        seg: &Segment,
+        entries: &mut [[u32; 8]],
+    ) -> Result<(), TensorError> {
+        let image = self
+            .scatter_on_nc
+            .expect("an NC list only with the scatters on NC");
+        let Session {
+            dev, units, dram, ..
+        } = self;
+        let d = dram
+            .as_ref()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        let unit = &mut units[u];
+        let w = unit.resident.as_ref().unwrap().window();
+        if unit.nc.is_none() {
+            let nc = DataMover::start_on(dev, w, unit.tile, &d.dram, tt_isa::dm::Mover::NC, image)?;
+            // Writes on NoC #1, reads on NoC #0: each GDDR endpoint stays
+            // with one NoC (`DramChannel::owns`), and the two movers' traffic
+            // goes out on different NoCs.
+            nc.set_write_noc(dev, w, crate::dm::WriteNoc::Noc1)?;
+            unit.nc = Some(nc);
+            unit.nc_signals = 0;
+        }
+        for &(at, rel) in &seg.b_waits_on_nc {
+            entries[at][2] = unit.nc_signals.wrapping_add(rel);
+        }
+        let mut nc_entries = seg.nc_entries.clone();
+        for &(at, rel) in &seg.nc_waits_on_b {
+            nc_entries[at][2] = unit.b_signals.wrapping_add(rel);
+        }
+        unit.nc.as_mut().unwrap().enqueue(dev, w, &nc_entries)?;
+        unit.nc_signals = unit.nc_signals.wrapping_add(seg.nc_signals);
         Ok(())
     }
 
@@ -2663,6 +2831,16 @@ impl<T: Transport> Session<T> {
     /// trace is being captured.
     pub fn set_pipeline(&mut self, on: bool) {
         self.pipeline = on;
+    }
+
+    /// Write pipelined groups' outputs out from each tile's RISCV NC rather
+    /// than B (checklist 9.15, the reader / writer split), from the next op
+    /// on: `Some(image)` with `tt_firmware_images::DM_NC`'s bytes, `None`
+    /// (the default) for every move on B. B gathers and runs the kernels;
+    /// NC scatters each block once B signals its kernel done, writing on
+    /// NoC #1. The bits are the same. Not while a trace is being captured.
+    pub fn set_scatter_mover(&mut self, nc_image: Option<&'static [u8]>) {
+        self.scatter_on_nc = nc_image;
     }
 
     /// How many blocks have run overlapped with their neighbours' moves

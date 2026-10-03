@@ -925,6 +925,14 @@ pub fn kmd_engine(
             Ok("0") => session.set_pipeline(false),
             Ok(v) => return Err(EngineError(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
+        // `TT_SCATTER=nc`: pipelined ops write their outputs out from each
+        // tile's RISCV NC while B gathers (`Session::set_scatter_mover`);
+        // `b`, the default, keeps every move on B.
+        match std::env::var("TT_SCATTER").as_deref() {
+            Err(_) | Ok("b") => {}
+            Ok("nc") => session.set_scatter_mover(Some(tt_firmware_images::DM_NC.1)),
+            Ok(v) => return Err(EngineError(format!("TT_SCATTER={v}: expected b or nc"))),
+        }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.

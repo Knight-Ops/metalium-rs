@@ -1475,8 +1475,10 @@ tiles, done in turn. The slices from there:
     - Separate launch and wait entries, with explicit ownership of each L1
       staging buffer, let B gather the next block and scatter the previous one
       while the roles compute: 9.8's double buffering.
-    - On top of that, a `Session` policy that puts the scatters on NC
-      (`SIGNAL` / `WAIT_PEER`), B-only by default.
+    - [x] On top of that, a `Session` policy that puts the scatters on NC
+      (`SIGNAL` / `WAIT_PEER`), B-only by default (`set_scatter_mover`,
+      `step56_scatter_on_nc`). Pays on one tile for write-heavy ops (add
+      0.70-0.80 against pipelined B-only); costs host time on many tiles.
     - `copy_pipeline` found B's own pipelining within 3-5% of B+NC at large
       entries and NC 1.6x faster at 4 KiB, so both are measured.
   - [ ] **9.17 Host time per op, measured first (research).**

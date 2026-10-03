@@ -481,6 +481,18 @@ fn queue_steady_state() {
     }
 }
 
+/// A pipeline sweep's arm: pipelining off and on, or with `SWEEP_NC` set,
+/// pipelined with every move on B ("off") and with the scatters on NC ("on",
+/// `Session::set_scatter_mover`).
+fn sweep_arm(s: &mut Session<tt_kmd::Kmd>, on: bool) {
+    if std::env::var_os("SWEEP_NC").is_some() {
+        s.set_pipeline(true);
+        s.set_scatter_mover(on.then_some(tt_firmware_images::DM_NC.1));
+    } else {
+        s.set_pipeline(on);
+    }
+}
+
 /// Whether pipelined matmuls (`Session::set_pipeline`) are ever slower:
 /// shapes from MNIST's up to 1024s, on 1, 8 and 32 tiles, each with
 /// pipelining off and on, device time from the mover's events alone in both
@@ -531,7 +543,7 @@ fn matmul_pipeline_sweep() {
                 let mut overlapped = 0;
                 let mut bits: [Vec<f32>; 2] = Default::default();
                 for (on, slot) in [(false, 0usize), (true, 1)] {
-                    s.set_pipeline(on);
+                    sweep_arm(&mut s, on);
                     let run = |s: &mut Session<tt_kmd::Kmd>| {
                         let o = s
                             .matmul_dram(
@@ -567,7 +579,9 @@ fn matmul_pipeline_sweep() {
                     // Past ~2^29 multiply-adds a profile's events overflow
                     // the buffer (and the op's sync reports it): time those
                     // from the host.
-                    let profiled = m * k * n < 1 << 29;
+                    // With NC scattering, B's timestamper events come out
+                    // garbled (an entry's end repeated): host time instead.
+                    let profiled = m * k * n < 1 << 29 && std::env::var_os("SWEEP_NC").is_none();
                     overflowed |= !profiled;
                     for _ in 0..REPS {
                         if profiled {
@@ -711,7 +725,7 @@ fn sfpu_pipeline_sweep() {
                     let mut bits: [Vec<f32>; 2] = Default::default();
                     let mut overlapped = 0;
                     for (on, slot) in [(false, 0usize), (true, 1)] {
-                        s.set_pipeline(on);
+                        sweep_arm(&mut s, on);
                         let lists_before: u64 = s.lists_per_tile().iter().sum();
                         let drains_before = s.drains();
                         let t0 = Instant::now();
@@ -736,7 +750,8 @@ fn sfpu_pipeline_sweep() {
                         let cache_before = cache(&s);
                         // Past 2048 tiles a profile's events overflow the
                         // timestamper's buffer: time those from the host.
-                        let profiled = r * cols <= 2048 * 1024;
+                        let profiled =
+                            r * cols <= 2048 * 1024 && std::env::var_os("SWEEP_NC").is_none();
                         let (mut device, mut host) = (Vec::new(), Vec::new());
                         let mut overflowed = !profiled;
                         for _ in 0..REPS {
