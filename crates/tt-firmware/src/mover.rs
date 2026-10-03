@@ -7,7 +7,7 @@ use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
-use tt_isa::noc::niu::{Command, Niu, TxnId, MAX_REQUEST_BYTES};
+use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
 
 const TXN: TxnId = match TxnId::new(2) {
     Some(t) => t,
@@ -77,7 +77,11 @@ fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     let w = *writes();
     if w.alternate {
-        writes().niu = if w.niu == Niu::Noc0 { Niu::Noc1 } else { Niu::Noc0 };
+        writes().niu = if w.niu == Niu::Noc0 {
+            Niu::Noc1
+        } else {
+            Niu::Noc0
+        };
     }
     if w.niu == Niu::Noc1 {
         issue_via::<true>(w.me1, d, d.range.channel().port_for(Niu::Noc1, d.port))
@@ -89,31 +93,12 @@ fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 /// One descriptor's requests through NoC #1 (`NOC1`) or NoC #0, on `port`.
 #[inline(always)]
 fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<(), u32> {
-    let len = d.range.len() as u32;
-    let mut done = 0u32;
-    while done < len {
-        let n = (len - done).min(MAX_REQUEST_BYTES);
-        let part = d
-            .range
-            .channel()
-            .range(d.range.offset() + done as u64, n as u64)
-            .ok_or(dm::error::RANGE)?;
-        let l1 = d.l1 + done;
-        let cmd = if d.op == op::READ {
-            Command::ReadDram {
-                from: part,
-                port,
-                to_local: l1,
-            }
-        } else {
-            Command::WriteDram {
-                from_local: l1,
-                to: part,
-                port,
-            }
-        };
-        noc::issue_on::<NOC1>(&cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)?;
-        done += n;
+    let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
+    // The whole descriptor checked once; each request then only encoded.
+    let mv = DramMove::new(d.range, port, d.l1, d.op != op::READ, me, TXN, niu)
+        .map_err(|_| dm::error::ALIGNMENT)?;
+    for r in mv.words() {
+        noc::issue_dram_on::<NOC1>(r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN);
     }
     Ok(())
 }
@@ -124,7 +109,11 @@ fn list_settings() {
     noc::set_cap(TXN, rd(M.at(dm::IN_FLIGHT_CAP)));
     let mode = rd(M.at(dm::WRITE_NOC));
     let w = writes();
-    w.niu = if mode == dm::write_noc::NOC1 { Niu::Noc1 } else { Niu::Noc0 };
+    w.niu = if mode == dm::write_noc::NOC1 {
+        Niu::Noc1
+    } else {
+        Niu::Noc0
+    };
     w.alternate = mode == dm::write_noc::ALTERNATE;
 }
 
@@ -153,8 +142,14 @@ fn publish_stalls(seen: &mut noc::Stalls, traced: bool) {
 fn stalled(seen: noc::Stalls, now: noc::Stalls, traced: bool) {
     use tt_isa::mailbox::trace as ev;
     let cycles = now.cycles.wrapping_sub(seen.cycles);
-    wr(M.at(dm::THROTTLE_STALLS), rd(M.at(dm::THROTTLE_STALLS)).wrapping_add(now.count.wrapping_sub(seen.count)));
-    wr(M.at(dm::THROTTLE_CYCLES), rd(M.at(dm::THROTTLE_CYCLES)).wrapping_add(cycles));
+    wr(
+        M.at(dm::THROTTLE_STALLS),
+        rd(M.at(dm::THROTTLE_STALLS)).wrapping_add(now.count.wrapping_sub(seen.count)),
+    );
+    wr(
+        M.at(dm::THROTTLE_CYCLES),
+        rd(M.at(dm::THROTTLE_CYCLES)).wrapping_add(cycles),
+    );
     trace(traced, ev::THROTTLE, cycles.min(ev::DETAIL_MAX));
 }
 
@@ -268,7 +263,10 @@ fn trace(on: bool, event: u32, detail: u32) {
     use tt_isa::mailbox::trace as ev;
     use tt_isa::tensix::timestamper as ts;
     if on {
-        wr(ts::TIMESTAMP, ts::event_128(ev::token_with(ev::MOVER, event, detail)));
+        wr(
+            ts::TIMESTAMP,
+            ts::event_128(ev::token_with(ev::MOVER, event, detail)),
+        );
     }
 }
 
@@ -279,10 +277,18 @@ fn trace(on: bool, event: u32, detail: u32) {
 #[inline(never)]
 fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
     use tt_isa::noc::niu::Endpoint;
-    let counter = Endpoint { x, y, addr: dm::BARRIER_COUNTER as u32 };
+    let counter = Endpoint {
+        x,
+        y,
+        addr: dm::BARRIER_COUNTER as u32,
+    };
     noc::issue(
         Niu::Noc0,
-        &Command::AtomicIncrement { to: counter, value: 1, ret_local: M.at(dm::BARRIER_RET) as u32 },
+        &Command::AtomicIncrement {
+            to: counter,
+            value: 1,
+            ret_local: M.at(dm::BARRIER_RET) as u32,
+        },
         me,
         BARRIER_TXN,
     )
@@ -291,7 +297,11 @@ fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
     loop {
         noc::issue(
             Niu::Noc0,
-            &Command::Read { from: counter, to_local: M.at(dm::BARRIER_POLL) as u32, len: 4 },
+            &Command::Read {
+                from: counter,
+                to_local: M.at(dm::BARRIER_POLL) as u32,
+                len: 4,
+            },
             me,
             BARRIER_TXN,
         )
@@ -324,7 +334,13 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         } => {
             // Everything before it has landed, and the scratch is free.
             noc::wait(TXN);
-            run(me, Descriptor { l1: M.scratch as u32, ..descriptor })?;
+            run(
+                me,
+                Descriptor {
+                    l1: M.scratch as u32,
+                    ..descriptor
+                },
+            )?;
             publish();
             if transform == Transform::Transpose {
                 transpose_from_scratch(descriptor.l1 as u64);
@@ -335,7 +351,10 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             publish();
         }
         Entry::Move { descriptor, .. } => issue(me, descriptor)?,
-        Entry::Kernel { generation, programs } => {
+        Entry::Kernel {
+            generation,
+            programs,
+        } => {
             // The operands it computes on must have landed.
             noc::wait(TXN);
             publish();

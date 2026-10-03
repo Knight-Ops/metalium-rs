@@ -585,23 +585,74 @@ pub mod noc {
     /// counter read cannot overtake the issue (`Counters.md:42-43`).
     #[inline(always)]
     pub fn issue(niu: Niu, cmd: &Command, me: (u8, u8), txn: TxnId) -> Result<(), RequestError> {
+        let regs = cmd.registers(me, txn, niu)?;
         match niu {
-            Niu::Noc0 => issue_on::<false>(cmd, me, txn),
-            Niu::Noc1 => issue_on::<true>(cmd, me, txn),
+            Niu::Noc0 => issue_on::<false>(&regs, txn),
+            Niu::Noc1 => issue_on::<true>(&regs, txn),
         }
+        Ok(())
     }
 
-    /// [`issue`] through one NIU, fixed at compile time: the move path's copy
-    /// for NoC #0 has a constant base and in-flight slot and none of NoC #1's
-    /// bookkeeping. `sections.x` places both copies after `.text.hot`.
+    /// [`issue_on`] for one request of a `tt_isa::noc::niu::DramMove`, its
+    /// values as arguments -- registers, on RISC-V -- written straight to the
+    /// initiator: no register array built and read back per request. The two
+    /// address-middle words and `AT_DATA` are written zero, as
+    /// `Command::registers` lays them out.
     #[inline(never)]
-    pub fn issue_on<const NOC1: bool>(
-        cmd: &Command,
-        me: (u8, u8),
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_dram_on<const NOC1: bool>(
+        targ: u32,
+        targ_hi: u32,
+        ret: u32,
+        ret_hi: u32,
+        tag: u32,
+        ctrl: u32,
+        len: u32,
         txn: TxnId,
-    ) -> Result<(), RequestError> {
+    ) {
+        use initiator::*;
         let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
-        let regs = cmd.registers(me, txn, niu)?;
+        if NOC1 {
+            *noc1_used() = true;
+        }
+        if in_flight(niu, txn).at_cap() {
+            make_room(niu, txn);
+        }
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(niu, CMD_CTRL)) & 1 != 0 {}
+            write_volatile(reg(niu, TARG_ADDR_LO), targ);
+            write_volatile(reg(niu, TARG_ADDR_MID), 0);
+            write_volatile(reg(niu, TARG_ADDR_HI), targ_hi);
+            write_volatile(reg(niu, RET_ADDR_LO), ret);
+            write_volatile(reg(niu, RET_ADDR_MID), 0);
+            write_volatile(reg(niu, RET_ADDR_HI), ret_hi);
+            write_volatile(reg(niu, PACKET_TAG), tag);
+            write_volatile(reg(niu, CTRL), ctrl);
+            write_volatile(reg(niu, AT_LEN_BE), len);
+            write_volatile(reg(niu, AT_DATA), 0);
+            write_volatile(reg(niu, CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
+    /// Issue one request already encoded -- by `Command::registers`, or by a
+    /// `tt_isa::noc::niu::DramMove`, which checks a whole move once (the
+    /// mover's per-entry path) -- under `txn`, through NoC #1 (`NOC1`) or
+    /// NoC #0, fixed at compile time: the move path's copy for NoC #0 has a
+    /// constant base and in-flight slot and none of NoC #1's bookkeeping.
+    /// `sections.x` places both copies after `.text.hot`.
+    ///
+    /// First makes room under `txn`'s in-flight cap on the NIU: below it,
+    /// nothing is read; at it, the counter is polled until a request completes
+    /// (counted in `stalls`). Then waits for the initiator to be free
+    /// (`MemoryMap.md`, `NOC_CMD_CTRL`: software must not touch it while the
+    /// low bit reads 1), and reads `CMD_CTRL` back afterwards so a later
+    /// counter read cannot overtake the issue (`Counters.md:42-43`).
+    #[inline(never)]
+    pub fn issue_on<const NOC1: bool>(regs: &[(u64, u32); 10], txn: TxnId) {
+        let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
         if NOC1 {
             *noc1_used() = true;
         }
@@ -612,14 +663,13 @@ pub mod noc {
         // Ethernet tile, and these offsets are inside initiator 0.
         unsafe {
             while read_volatile(reg(niu, initiator::CMD_CTRL)) & 1 != 0 {}
-            for (off, value) in regs {
+            for &(off, value) in regs {
                 write_volatile(reg(niu, off), value);
             }
             write_volatile(reg(niu, initiator::CMD_CTRL), 1);
             let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
         }
         in_flight(niu, txn).after_issue();
-        Ok(())
     }
 
     /// Wait until every response-marked request issued under `txn` has

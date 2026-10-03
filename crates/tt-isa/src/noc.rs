@@ -560,24 +560,18 @@ pub mod niu {
                     }
                     (to, local(0), CMD_WR | WR_INLINE | RESP_MARKED, 0, data)
                 }
+                // One request's worth of a `DramMove`, which owns the GDDR
+                // encoding and its checks.
                 Command::ReadDram {
                     from,
                     port,
                     to_local,
-                } => {
-                    let (from, len) = dram_endpoint(from, port, niu)?;
-                    check_dram(from.addr, to_local, len, crate::dram::ALIGN as u32)?;
-                    (from, local(to_local), CMD_RD | RESP_MARKED, len, 0)
-                }
+                } => return DramMove::single(from, port, to_local, false, me, txn, niu),
                 Command::WriteDram {
                     from_local,
                     to,
                     port,
-                } => {
-                    let (to, len) = dram_endpoint(to, port, niu)?;
-                    check_dram(from_local, to.addr, len, 16)?;
-                    (local(from_local), to, CMD_WR | RESP_MARKED, len, 0)
-                }
+                } => return DramMove::single(to, port, from_local, true, me, txn, niu),
                 Command::AtomicIncrement {
                     to,
                     value,
@@ -611,39 +605,190 @@ pub mod niu {
         }
     }
 
-    /// The endpoint `port` of a DRAM range's channel, and the range's length.
-    fn dram_endpoint(
-        r: crate::dram::DramRange,
-        port: u8,
-        niu: Niu,
-    ) -> Result<(Endpoint, u32), RequestError> {
-        if port >= crate::dram::PORTS {
-            return Err(RequestError::Port);
-        }
-        let at = r
-            .channel()
-            .endpoint(niu, port)
-            .ok_or(RequestError::PortNoc)?;
-        let len = u32::try_from(r.len()).map_err(|_| RequestError::Length)?;
-        // `CHANNEL_BYTES` is below 4 GiB, so the offset fits the low word.
-        let e = Endpoint {
-            x: at.x(),
-            y: at.y(),
-            addr: r.offset() as u32,
-        };
-        Ok((e, len))
+    /// A move between one GDDR range and this tile's L1, checked whole once,
+    /// whose NIU requests ([`DramMove::requests`]) are then encoded with no
+    /// further checks: each is a sub-range of the checked move, at most
+    /// [`MAX_REQUEST_BYTES`], with the congruence preserved (every split is a
+    /// multiple of [`MAX_REQUEST_BYTES`] from the start).
+    ///
+    /// The mover's per-entry path builds one per descriptor rather than
+    /// checking each request through [`Command::registers`]: on card 0 the
+    /// per-request checks were ~110 of a 4 KiB read entry's ~350 cycles
+    /// (`docs/firmware-performance.md`, checklist 9.14).
+    #[derive(Copy, Clone, Debug)]
+    pub struct DramMove {
+        /// The DRAM endpoint, as `TARG`/`RET_ADDR_HI` take it.
+        dram_hi: u32,
+        dram_at: u32,
+        /// This tile, as `TARG`/`RET_ADDR_HI` take it.
+        me_hi: u32,
+        l1: u32,
+        len: u32,
+        write: bool,
+        tag: u32,
     }
 
-    /// A GDDR <-> L1 copy: the L1 side must be L1, the two congruent mod
-    /// `modulus`, and the length one request.
-    fn check_dram(src: u32, dst: u32, len: u32, modulus: u32) -> Result<(), RequestError> {
-        if len == 0 || len > MAX_REQUEST_BYTES {
-            return Err(RequestError::Length);
+    /// One request of a [`DramMove`]: the initiator registers that are not
+    /// zero, by name ([`DramRequest::registers`] lays them out).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct DramRequest {
+        pub targ: u32,
+        pub targ_hi: u32,
+        pub ret: u32,
+        pub ret_hi: u32,
+        pub tag: u32,
+        pub ctrl: u32,
+        pub len: u32,
+    }
+
+    impl DramRequest {
+        /// As [`Command::registers`] lays a request out.
+        pub fn registers(self) -> [(u64, u32); 10] {
+            use initiator::*;
+            [
+                (TARG_ADDR_LO, self.targ),
+                (TARG_ADDR_MID, 0),
+                (TARG_ADDR_HI, self.targ_hi),
+                (RET_ADDR_LO, self.ret),
+                (RET_ADDR_MID, 0),
+                (RET_ADDR_HI, self.ret_hi),
+                (PACKET_TAG, self.tag),
+                (CTRL, self.ctrl),
+                (AT_LEN_BE, self.len),
+                (AT_DATA, 0),
+            ]
         }
-        if src % modulus != dst % modulus || src >= MMIO_START || dst >= MMIO_START {
-            return Err(RequestError::Alignment);
+    }
+
+    impl DramMove {
+        /// All of `range` to (`write == false`) or from this tile's L1 at
+        /// `l1`, through endpoint `port`, issued by the tile at `me` through
+        /// `niu` under `txn`. Refused as [`Command::registers`] would refuse
+        /// any of its requests: a port beyond the channel's three, one `niu`
+        /// does not own (the SYS-1419 hang), zero bytes, L1 not congruent to
+        /// the GDDR address (mod [`crate::dram::ALIGN`] for a read, 16 for a
+        /// write), or either side reaching [`MMIO_START`].
+        pub fn new(
+            range: crate::dram::DramRange,
+            port: u8,
+            l1: u32,
+            write: bool,
+            me: (u8, u8),
+            txn: TxnId,
+            niu: Niu,
+        ) -> Result<Self, RequestError> {
+            if port >= crate::dram::PORTS {
+                return Err(RequestError::Port);
+            }
+            let at = range
+                .channel()
+                .endpoint(niu, port)
+                .ok_or(RequestError::PortNoc)?;
+            let len = u32::try_from(range.len()).map_err(|_| RequestError::Length)?;
+            // `CHANNEL_BYTES` is below 4 GiB, so the offset fits the low word.
+            let dram_at = range.offset() as u32;
+            let modulus = if write { 16 } else { crate::dram::ALIGN as u32 };
+            if len == 0 {
+                return Err(RequestError::Length);
+            }
+            let end = |a: u32| a.checked_add(len).filter(|&e| e <= MMIO_START);
+            if dram_at % modulus != l1 % modulus || end(dram_at).is_none() || end(l1).is_none() {
+                return Err(RequestError::Alignment);
+            }
+            Ok(DramMove {
+                dram_hi: Endpoint {
+                    x: at.x(),
+                    y: at.y(),
+                    addr: 0,
+                }
+                .hi(),
+                dram_at,
+                me_hi: Endpoint {
+                    x: me.0,
+                    y: me.1,
+                    addr: 0,
+                }
+                .hi(),
+                l1,
+                len,
+                write,
+                tag: (txn.0 as u32) << 10,
+            })
         }
-        Ok(())
+
+        /// [`Command::registers`] for a move of at most one request.
+        #[allow(clippy::too_many_arguments)]
+        fn single(
+            range: crate::dram::DramRange,
+            port: u8,
+            l1: u32,
+            write: bool,
+            me: (u8, u8),
+            txn: TxnId,
+            niu: Niu,
+        ) -> Result<[(u64, u32); 10], RequestError> {
+            let m = Self::new(range, port, l1, write, me, txn, niu)?;
+            if m.len > MAX_REQUEST_BYTES {
+                return Err(RequestError::Length);
+            }
+            Ok(m.request(0, m.len))
+        }
+
+        /// The move's NIU requests, in order: `MAX_REQUEST_BYTES` each, the
+        /// last short.
+        #[inline(always)]
+        pub fn requests(self) -> impl Iterator<Item = [(u64, u32); 10]> {
+            (0..self.len)
+                .step_by(MAX_REQUEST_BYTES as usize)
+                .map(move |done| self.request(done, (self.len - done).min(MAX_REQUEST_BYTES)))
+        }
+
+        /// The move's NIU requests as [`DramRequest`]s, in order:
+        /// `MAX_REQUEST_BYTES` each, the last short. The values the issuing
+        /// core writes, without the register array -- which the mover would
+        /// otherwise build on its stack and read back for every request.
+        #[inline(always)]
+        pub fn words(self) -> impl Iterator<Item = DramRequest> {
+            (0..self.len)
+                .step_by(MAX_REQUEST_BYTES as usize)
+                .map(move |done| self.word(done, (self.len - done).min(MAX_REQUEST_BYTES)))
+        }
+
+        #[inline(always)]
+        fn word(&self, done: u32, n: u32) -> DramRequest {
+            let (targ_hi, targ, ret_hi, ret, ctrl) = if self.write {
+                (
+                    self.me_hi,
+                    self.l1 + done,
+                    self.dram_hi,
+                    self.dram_at + done,
+                    CMD_WR,
+                )
+            } else {
+                (
+                    self.dram_hi,
+                    self.dram_at + done,
+                    self.me_hi,
+                    self.l1 + done,
+                    CMD_RD,
+                )
+            };
+            DramRequest {
+                targ,
+                targ_hi,
+                ret,
+                ret_hi,
+                tag: self.tag,
+                ctrl: ctrl | RESP_MARKED | STATIC_VC_1,
+                len: n,
+            }
+        }
+
+        /// The registers for `n` bytes from `done` into the move.
+        #[inline(always)]
+        fn request(&self, done: u32, n: u32) -> [(u64, u32); 10] {
+            self.word(done, n).registers()
+        }
     }
 
     fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
@@ -863,6 +1008,58 @@ pub mod niu {
             assert_eq!(
                 wr(0, 0, 0x2_0000).registers((3, 4), T, Niu::Noc0),
                 Err(RequestError::Length)
+            );
+        }
+
+        /// A move of several requests encodes each exactly as a `Command` of
+        /// that one request would, in order, the last short.
+        #[test]
+        fn a_long_dram_move_is_its_requests() {
+            let ch = crate::dram::Dram::FULL.channel(6).unwrap();
+            let len = 2 * MAX_REQUEST_BYTES as u64 + 96;
+            for write in [false, true] {
+                let range = ch.range(0x20_0040, len).unwrap();
+                let port = ch.port_for(Niu::Noc0, 0);
+                let mv = DramMove::new(range, port, 0x4_0040, write, (3, 4), T, Niu::Noc0).unwrap();
+                let got: [[(u64, u32); 10]; 3] = {
+                    let mut it = mv.requests();
+                    [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()]
+                };
+                assert!(mv.requests().nth(3).is_none());
+                for (k, regs) in got.iter().enumerate() {
+                    let done = k as u64 * MAX_REQUEST_BYTES as u64;
+                    let n = (len - done).min(MAX_REQUEST_BYTES as u64);
+                    let part = ch.range(range.offset() + done, n).unwrap();
+                    let l1 = 0x4_0040 + done as u32;
+                    let cmd = if write {
+                        Command::WriteDram {
+                            from_local: l1,
+                            to: part,
+                            port,
+                        }
+                    } else {
+                        Command::ReadDram {
+                            from: part,
+                            port,
+                            to_local: l1,
+                        }
+                    };
+                    assert_eq!(
+                        *regs,
+                        cmd.registers((3, 4), T, Niu::Noc0).unwrap(),
+                        "{write} {k}"
+                    );
+                }
+            }
+            // Refusals are the whole move's.
+            let r = ch.range(0x20_0040, len).unwrap();
+            assert_eq!(
+                DramMove::new(r, ch.cmfw_port(), 0x4_0050, false, (3, 4), T, Niu::Noc0).err(),
+                Some(RequestError::Alignment)
+            );
+            assert_eq!(
+                DramMove::new(r, ch.noc1_port(), 0x4_0040, false, (3, 4), T, Niu::Noc0).err(),
+                Some(RequestError::PortNoc)
             );
         }
 

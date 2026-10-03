@@ -18,6 +18,7 @@ SECTIONS
      * documented), and with the cold paths out of line this takes a WAIT
      * entry from 0.31 to 0.29 us (`silicon_perf::mover_read_shapes`). */
     *(.text.hot .text.hot.*)
+    *(.text.*11tt_firmware3noc13issue_dram_on*)
     *(.text.*11tt_firmware3noc8issue_on*)
     /* The write path's NIU choice (`dm_b::issue_write`): taken by every
      * write, kept off the reads' stretch above. */
