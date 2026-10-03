@@ -193,6 +193,14 @@ fn one_unit(card: u16) -> (Session<tt_kmd::Kmd>, Conditions) {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+    // `PIPELINE=1`: GDDR matmuls overlap their moves with their kernels
+    // (`Session::set_pipeline`, checklist 9.15).
+    let pipeline = std::env::var("PIPELINE").is_ok_and(|v| v == "1");
+    s.set_pipeline(pipeline);
+    // A pipelined profile is the mover's alone: with the mover and the roles
+    // storing to the timestamper at once, card 0's streams lost events.
+    s.set_profile_roles(!pipeline);
+    println!("MEASURE pipeline: {pipeline}");
     let t = s.tile();
     let c = Conditions::measure(s.device(), card, t);
     c.print();

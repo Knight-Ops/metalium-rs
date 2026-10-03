@@ -230,6 +230,19 @@ pub mod op {
     /// queue has stopped on an error -- so a failed peer never leaves this one
     /// spinning. Only in a list entry.
     pub const WAIT_PEER: u32 = 13;
+    /// The first half of [`KERNEL`]: `[LAUNCH, generation, a0, l0, a1, l1,
+    /// a2, l2]`. The mover waits for every move before it, points the roles
+    /// at their programs and posts `generation`, as `KERNEL` does, and goes on
+    /// to the next entry without waiting for the roles -- so it can move the
+    /// next block in and the last one out while they compute (checklist
+    /// 9.15). A [`KERNEL_WAIT`] collects it. Only in a list entry.
+    pub const LAUNCH: u32 = 14;
+    /// The second half of [`KERNEL`]: `[KERNEL_WAIT, generation, 0, ...]`.
+    /// Waits until each role has acknowledged `generation`, or reports
+    /// [`super::error::ROLE`] if one panics. `generation` must be the last one
+    /// the mover launched: anything else is [`super::error::GENERATION`], not
+    /// a wait that could never end. Only in a list entry.
+    pub const KERNEL_WAIT: u32 = 15;
 }
 
 /// [`op::FILL`]'s parameter.
@@ -448,6 +461,13 @@ pub enum Entry {
     },
     /// [`op::POKE`]: one role-mailbox word.
     Poke { address: u32, value: u32 },
+    /// [`op::LAUNCH`]: [`Entry::Kernel`] without the wait.
+    Launch {
+        generation: u32,
+        programs: [(u32, u32); 3],
+    },
+    /// [`op::KERNEL_WAIT`]: the wait.
+    KernelWait { generation: u32 },
     /// [`op::SIGNAL`].
     Signal,
     /// [`op::WAIT_PEER`]: the peer mover, and the progress count to wait for.
@@ -494,7 +514,17 @@ impl Entry {
         if w[0] == op::LIST {
             return Err(error::OP);
         }
-        if w[0] == op::KERNEL {
+        if w[0] == op::KERNEL_WAIT {
+            if w[1] == 0 || w[2..].iter().any(|&v| v != 0) {
+                return Err(if w[1] == 0 {
+                    error::GENERATION
+                } else {
+                    error::OP
+                });
+            }
+            return Ok(Entry::KernelWait { generation: w[1] });
+        }
+        if w[0] == op::KERNEL || w[0] == op::LAUNCH {
             // Zero is what a resident runner reads as "not resident".
             if w[1] == 0 {
                 return Err(error::GENERATION);
@@ -519,9 +549,16 @@ impl Entry {
                 }
                 *p = (at, len);
             }
-            return Ok(Entry::Kernel {
-                generation: w[1],
-                programs,
+            return Ok(if w[0] == op::LAUNCH {
+                Entry::Launch {
+                    generation: w[1],
+                    programs,
+                }
+            } else {
+                Entry::Kernel {
+                    generation: w[1],
+                    programs,
+                }
             });
         }
         if w[0] == op::WAIT {
@@ -693,6 +730,40 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_and_kernel_wait_decode_as_kernel_halves() {
+        use super::*;
+        let at = crate::l1::PROGRAM_CACHE.base as u32;
+        let launch = [op::LAUNCH, 7, at, 4, 0, 0, at + 64, 8];
+        assert_eq!(
+            Entry::decode(0xFF, launch),
+            Ok(Entry::Launch {
+                generation: 7,
+                programs: [(at, 4), (0, 0), (at + 64, 8)],
+            })
+        );
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 7, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::KernelWait { generation: 7 })
+        );
+        // Generation 0 is "not resident"; a wait carries nothing else.
+        let mut zero = launch;
+        zero[1] = 0;
+        assert_eq!(Entry::decode(0xFF, zero), Err(error::GENERATION));
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]),
+            Err(error::GENERATION)
+        );
+        assert_eq!(
+            Entry::decode(0xFF, [op::KERNEL_WAIT, 7, 1, 0, 0, 0, 0, 0]),
+            Err(error::OP)
+        );
+        // A launch's programs are checked as a kernel's.
+        let mut bad = launch;
+        bad[2] = 8;
+        assert_eq!(Entry::decode(0xFF, bad), Err(error::PROGRAM));
+    }
+
     #[test]
     fn the_nc_stub_jumps_to_the_image() {
         // `lui t0, 0x170` and `jr t0`, as llvm-objdump decodes these words.

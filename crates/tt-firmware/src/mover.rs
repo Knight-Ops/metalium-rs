@@ -215,15 +215,31 @@ fn fill(v: u32, param: u32, dst: u64) {
     publish();
 }
 
+/// The generation this mover last posted to the roles (`launch`), which a
+/// `KERNEL_WAIT` must name. In local data RAM; zeroed at start (no
+/// generation is 0).
+#[link_section = ".local"]
+static mut LAUNCHED: u32 = 0;
+
+fn launched() -> &'static mut u32 {
+    // SAFETY: one core, no interrupts, no reference outlives its use.
+    unsafe { &mut *core::ptr::addr_of_mut!(LAUNCHED) }
+}
+
 /// Post `generation` to the three resident roles and wait for each to
-/// acknowledge it (`dm::op::KERNEL`). The roles' programs and descriptors were
-/// staged by the host; everything this list moved before is already in L1.
-///
-/// The roles' acknowledgements are stores by other cores, which do not
-/// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
-/// goes through a fence.
+/// acknowledge it (`dm::op::KERNEL`): [`launch`] then [`await_roles`].
 #[inline(never)]
 fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
+    launch(generation, programs);
+    await_roles(generation)
+}
+
+/// Point the roles at their programs, if named, and post `generation`
+/// (`dm::op::LAUNCH`, and the first half of `KERNEL`). The roles' programs
+/// and descriptors were staged by the host; everything this list moved
+/// before is already in L1.
+#[inline(never)]
+fn launch(generation: u32, programs: [(u32, u32); 3]) {
     // Each role's resident program first, if named (checked by
     // `Entry::decode`), so the generation that starts the run finds it.
     for (t, (at, len)) in programs.into_iter().enumerate() {
@@ -238,8 +254,24 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
         wr(Mailbox::of(t).generation(), generation);
     }
     publish();
+    *launched() = generation;
     let traced = rd(M.at(dm::TRACE)) != 0;
     trace(traced, tt_isa::mailbox::trace::KICK, generation);
+}
+
+/// Wait for each role to acknowledge `generation`, the last one launched
+/// (`dm::op::KERNEL_WAIT`, and the second half of `KERNEL`), or report
+/// `ROLE` if one panics. Any other generation is `GENERATION`: the roles
+/// would never acknowledge it.
+///
+/// The roles' acknowledgements are stores by other cores, which do not
+/// invalidate this core's L0 data cache (`MemoryOrdering.md:59`): every poll
+/// goes through a fence.
+#[inline(never)]
+fn await_roles(generation: u32) -> Result<(), u32> {
+    if generation != *launched() {
+        return Err(dm::error::GENERATION);
+    }
     for t in 0..3 {
         let mb = Mailbox::of(t);
         loop {
@@ -252,6 +284,7 @@ fn kernel(generation: u32, programs: [(u32, u32); 3]) -> Result<(), u32> {
             }
         }
     }
+    let traced = rd(M.at(dm::TRACE)) != 0;
     trace(traced, tt_isa::mailbox::trace::ROLES_DONE, generation);
     Ok(())
 }
@@ -378,6 +411,17 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
         // Only as a list of its own, which `run_list_at` runs.
         Entry::Call { .. } => return Err(IS_CALL),
+        Entry::Launch {
+            generation,
+            programs,
+        } => {
+            // The operands it computes on must have landed, and anything
+            // still being written out of the slots it computes into.
+            noc::wait(TXN);
+            publish();
+            launch(generation, programs);
+        }
+        Entry::KernelWait { generation } => await_roles(generation)?,
         Entry::Signal => signal(),
         Entry::WaitPeer { peer, target } => wait_peer(peer, target)?,
         Entry::Fill { value, param, dst } => {
@@ -566,7 +610,7 @@ fn call(
             let a = M.trace_chunk + i as u64 * dm::ENTRY_BYTES;
             let head = rd(a);
             let base = match head {
-                op::KERNEL => generation_base,
+                op::KERNEL | op::LAUNCH | op::KERNEL_WAIT => generation_base,
                 op::BARRIER => barrier_base,
                 op::CALL => return Err(dm::error::OP),
                 _ => 0,
@@ -589,6 +633,8 @@ fn call(
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
+    // Local data RAM is not zeroed on the simulator (divergence row 25).
+    *launched() = 0;
     *writes() = Writes {
         niu: Niu::Noc0,
         alternate: false,

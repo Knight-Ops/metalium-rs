@@ -319,6 +319,13 @@ pub struct Session<T: Transport> {
     grid: Tensix,
     images: RoleImages<'static>,
     /// Every run's phases since the last [`Session::take_profile`].
+    /// Whether GDDR matmuls double-buffer their blocks so a unit's moves
+    /// overlap its kernels (`Session::set_pipeline`, checklist 9.15).
+    pipeline: bool,
+    /// [`Session::pipelined_blocks`].
+    pipelined: u64,
+    /// [`Session::set_profile_roles`].
+    profile_roles: bool,
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
@@ -403,8 +410,11 @@ struct Segment {
     /// What it is, for [`tensor::stats`]: its first step's.
     what: &'static str,
     entries: Vec<[u32; 8]>,
-    /// Indices into `entries` of the `KERNEL` entries.
+    /// Indices into `entries` of the `KERNEL` (or `LAUNCH`) entries.
     kernels: Vec<usize>,
+    /// `KERNEL_WAIT` entries: each one's index into `entries`, and the index
+    /// into `kernels` of the launch it waits for (in the same list).
+    waits: Vec<(usize, usize)>,
     /// The programs of each `KERNEL` entry, in order.
     kernel_roles: Vec<Arc<[Vec<Instruction>; 3]>>,
     /// Each kernel's block repeats, beside its roles: stored with its
@@ -538,109 +548,349 @@ impl From<PlaceError> for TensorError {
 /// were separate lists are separated by a `WAIT` entry, since their entries
 /// may reuse each other's L1 slots; a `KERNEL` entry waits by itself.
 fn segments(steps: Vec<Step>) -> Vec<Segment> {
-    use tt_isa::dm::{op, LIST_MAX};
+    use tt_isa::dm::op;
     let mut out = Vec::new();
     let mut cur = Segment::default();
-    let close = |cur: &mut Segment, out: &mut Vec<Segment>| {
-        if !cur.entries.is_empty() {
-            out.push(std::mem::take(cur));
-        }
-    };
-    // One entry, or one whole op record (`tt_isa::dm::record`), which a list
-    // never splits.
-    let push = |cur: &mut Segment, out: &mut Vec<Segment>, e: &[[u32; 8]]| {
-        // A full list ends here; the mover waits for all of it before it
-        // reports done, so the next list starts from a clean boundary.
-        if cur.entries.len() + e.len() > LIST_MAX as usize {
-            close(cur, out);
-        }
-        cur.entries.extend_from_slice(e);
-    };
     let mut after_list = false;
-    for step in steps {
-        match step {
-            Step::List { what, entries } => {
+    for item in pipeline_groups(steps) {
+        match item {
+            Item::Step(Step::List { what, entries }) => {
                 if entries.is_empty() {
                     continue;
                 }
-                if cur.what.is_empty() {
-                    cur.what = what;
-                }
-                if after_list && !cur.entries.is_empty() {
-                    push(&mut cur, &mut out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
-                }
-                let mut i = 0;
-                while i < entries.len() {
-                    let n = tt_isa::dm::record::len(entries[i][0]).min(entries.len() - i);
-                    push(&mut cur, &mut out, &entries[i..i + n]);
-                    i += n;
-                    if cur.what.is_empty() {
-                        // A list that spilled into a new segment.
-                        cur.what = what;
-                    }
-                }
-                cur.steps += 1;
+                add_list(&mut cur, &mut out, what, &entries, after_list);
                 after_list = true;
             }
-            Step::Kernel {
+            Item::Step(Step::Kernel {
                 roles,
                 init,
                 mop,
                 loops,
-            } => {
-                let resident = roles
-                    .iter()
-                    .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
-                let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
-                let seen = cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles));
-                let same_init = cur.init.is_empty() || cur.init == init;
-                let fits = if resident {
-                    (cur.kernels.is_empty() || cur.resident)
-                        && (seen || cur.resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
-                } else {
-                    (cur.kernels.is_empty() || !cur.resident)
-                        && cur.roles.as_ref().is_none_or(|r| {
-                            Arc::ptr_eq(r, &roles)
-                                || r.iter().zip(roles.iter()).all(|(a, b)| {
-                                    a.len() == b.len()
-                                        && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
-                                })
-                        })
-                };
-                let same_mop = cur.kernels.is_empty() || cur.mop == *mop;
-                // Resident programs carry their loops; fixed-slot kernels
-                // share one program, so one table.
-                let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
-                if !same_init
-                    || !same_mop
-                    || !same_loops
-                    || !fits
-                    || cur.entries.len() == LIST_MAX as usize
-                {
-                    close(&mut cur, &mut out);
-                }
-                cur.mop = *mop;
-                cur.loops = loops.clone();
-                cur.resident = resident;
-                if resident && !cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles)) {
-                    cur.resident_bytes += bytes;
-                }
-                cur.kernel_roles.push(roles.clone());
-                cur.kernel_loops.push(loops.clone());
-                if cur.what.is_empty() {
-                    cur.what = "matmul";
-                }
-                cur.roles = Some(roles);
-                cur.init = init;
-                cur.kernels.push(cur.entries.len());
-                cur.entries.push([op::KERNEL, 0, 0, 0, 0, 0, 0, 0]);
-                cur.steps += 1;
+                half: _,
+            }) => {
+                add_kernel(&mut cur, &mut out, roles, init, *mop, loops, op::KERNEL);
                 after_list = false;
+            }
+            Item::Group(blocks) => {
+                // A group stays in one list from its first launch to its last
+                // wait, so nothing the host does between lists (a drain, a
+                // role reconfiguration) can fall between a launch and its
+                // wait. It starts a list of its own; `pipeline_groups` kept
+                // it under `LIST_MAX` entries and its programs in the cache.
+                if !cur.entries.is_empty() {
+                    if after_list {
+                        // Its first gather may reuse the slots the list
+                        // before wrote out of.
+                        push_entries(&mut cur, &mut out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
+                    }
+                    close_segment(&mut cur, &mut out);
+                }
+                let before = out.len();
+                // `G0, L0`, then for each next block `Gk, W(k-1), Lk,
+                // S(k-1)`, then `W(last), S(last)`: block k+1 moves in, and
+                // block k-1 out, while block k computes. Every hazard is
+                // ordered: a launch waits for every move before it (its
+                // gather, and the scatter that emptied its half's outputs);
+                // a gather refills a half only after the kernel that read it
+                // was waited for; a scatter reads only waited-for outputs.
+                // The scatter and gather that sit next to each other touch
+                // different slots (outputs, inputs), so no `WAIT` between.
+                let mut launched = Vec::with_capacity(blocks.len());
+                let mut scatters = Vec::with_capacity(blocks.len());
+                for (k, block) in blocks.into_iter().enumerate() {
+                    let Block {
+                        gather,
+                        roles,
+                        init,
+                        mop,
+                        loops,
+                        scatter,
+                    } = block;
+                    add_list(&mut cur, &mut out, gather.0, &gather.1, false);
+                    if k > 0 {
+                        let w = launched[k - 1];
+                        cur.waits.push((cur.entries.len(), w));
+                        cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                        cur.steps += 1;
+                    }
+                    launched.push(cur.kernels.len());
+                    add_kernel(&mut cur, &mut out, roles, init, mop, loops, op::LAUNCH);
+                    if k > 0 {
+                        let (what, entries): (&'static str, Vec<[u32; 8]>) =
+                            std::mem::take(&mut scatters[k - 1]);
+                        add_list(&mut cur, &mut out, what, &entries, false);
+                    }
+                    scatters.push(scatter);
+                }
+                let last = launched.len() - 1;
+                cur.waits.push((cur.entries.len(), launched[last]));
+                cur.entries.push([op::KERNEL_WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                cur.steps += 1;
+                let (what, entries) = std::mem::take(&mut scatters[last]);
+                add_list(&mut cur, &mut out, what, &entries, false);
+                assert_eq!(out.len(), before, "a pipelined group split across lists");
+                after_list = true;
             }
         }
     }
-    close(&mut cur, &mut out);
+    close_segment(&mut cur, &mut out);
     out
+}
+
+/// Each `KERNEL` (or `LAUNCH`) entry of `seg` its generation, in order, and
+/// each `KERNEL_WAIT` the generation of the launch it waits for.
+fn fill_generations(
+    entries: &mut [[u32; 8]],
+    seg: &Segment,
+    generations: impl IntoIterator<Item = u32>,
+) {
+    let gens: Vec<u32> = generations.into_iter().collect();
+    for (&at, &g) in seg.kernels.iter().zip(&gens) {
+        entries[at][1] = g;
+    }
+    for &(at, k) in &seg.waits {
+        entries[at][1] = gens[k];
+    }
+}
+
+fn close_segment(cur: &mut Segment, out: &mut Vec<Segment>) {
+    if !cur.entries.is_empty() {
+        out.push(std::mem::take(cur));
+    }
+}
+
+/// One entry, or one whole op record (`tt_isa::dm::record`), which a list
+/// never splits. A full list ends here; the mover waits for all of it before
+/// it reports done, so the next list starts from a clean boundary.
+fn push_entries(cur: &mut Segment, out: &mut Vec<Segment>, e: &[[u32; 8]]) {
+    if cur.entries.len() + e.len() > tt_isa::dm::LIST_MAX as usize {
+        close_segment(cur, out);
+    }
+    cur.entries.extend_from_slice(e);
+}
+
+/// A list step's entries into the current list, after a `WAIT` if
+/// `wait_before` (the step before was a list too, whose slots these may reuse).
+fn add_list(
+    cur: &mut Segment,
+    out: &mut Vec<Segment>,
+    what: &'static str,
+    entries: &[[u32; 8]],
+    wait_before: bool,
+) {
+    use tt_isa::dm::op;
+    if cur.what.is_empty() {
+        cur.what = what;
+    }
+    if wait_before && !cur.entries.is_empty() {
+        push_entries(cur, out, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]);
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        let n = tt_isa::dm::record::len(entries[i][0]).min(entries.len() - i);
+        push_entries(cur, out, &entries[i..i + n]);
+        i += n;
+        if cur.what.is_empty() {
+            // A list that spilled into a new segment.
+            cur.what = what;
+        }
+    }
+    cur.steps += 1;
+}
+
+/// A kernel step as a `KERNEL` (or `LAUNCH`) placeholder in the current list,
+/// closing it first if the kernel cannot join: one whose semaphores start
+/// differently (a list's kernels share one setup), and -- since the fixed
+/// slots hold one kernel at a time -- one whose programs differ from the
+/// list's, unless every program involved is resident (`crate::program_cache`)
+/// and together they fit the cache.
+fn add_kernel(
+    cur: &mut Segment,
+    out: &mut Vec<Segment>,
+    roles: Arc<[Vec<Instruction>; 3]>,
+    init: Vec<runtime::SemaphoreInit>,
+    mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
+    op_code: u32,
+) {
+    use tt_isa::dm::LIST_MAX;
+    let resident = roles
+        .iter()
+        .all(|p| p.is_empty() || crate::program_cache::admitted(p.len()));
+    let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
+    let seen = cur.kernel_roles.iter().any(|r| Arc::ptr_eq(r, &roles));
+    let same_init = cur.init.is_empty() || cur.init == init;
+    let fits = if resident {
+        (cur.kernels.is_empty() || cur.resident)
+            && (seen || cur.resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+    } else {
+        (cur.kernels.is_empty() || !cur.resident)
+            && cur.roles.as_ref().is_none_or(|r| {
+                Arc::ptr_eq(r, &roles)
+                    || r.iter().zip(roles.iter()).all(|(a, b)| {
+                        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.word() == y.word())
+                    })
+            })
+    };
+    let same_mop = cur.kernels.is_empty() || cur.mop == mop;
+    // Resident programs carry their loops; fixed-slot kernels share one
+    // program, so one table.
+    let same_loops = resident || cur.kernels.is_empty() || cur.loops == loops;
+    if !same_init || !same_mop || !same_loops || !fits || cur.entries.len() == LIST_MAX as usize {
+        close_segment(cur, out);
+    }
+    cur.mop = mop;
+    cur.loops = loops.clone();
+    cur.resident = resident;
+    if resident && !seen {
+        cur.resident_bytes += bytes;
+    }
+    cur.kernel_roles.push(roles.clone());
+    cur.kernel_loops.push(loops);
+    if cur.what.is_empty() {
+        cur.what = "matmul";
+    }
+    cur.roles = Some(roles);
+    cur.init = init;
+    cur.kernels.push(cur.entries.len());
+    cur.entries.push([op_code, 0, 0, 0, 0, 0, 0, 0]);
+    cur.steps += 1;
+}
+
+/// One double-buffered block: its gather, its kernel, its scatter.
+struct Block {
+    gather: (&'static str, Vec<[u32; 8]>),
+    roles: Arc<[Vec<Instruction>; 3]>,
+    init: Vec<runtime::SemaphoreInit>,
+    mop: [Option<tt_isa::frontend::mop::MopConfig>; 3],
+    loops: Arc<[Vec<crate::code::Loop>; 3]>,
+    scatter: (&'static str, Vec<[u32; 8]>),
+}
+
+/// A unit's steps, as [`segments`] lays them out.
+enum Item {
+    Step(Step),
+    /// Consecutive double-buffered blocks to overlap.
+    Group(Vec<Block>),
+}
+
+/// Blocks per group at most: a group is one list, and a block is a gather
+/// record, a launch, a wait and a scatter record.
+const GROUP_MAX: usize = 40;
+
+/// A unit's steps with its runs of double-buffered blocks gathered into
+/// groups: `[gather, kernel (staged in a half), scatter]` jobs, one after
+/// another, in alternating halves, whose programs are resident and fit the
+/// cache together. Anything else is left as it is; so is a lone block.
+fn pipeline_groups(steps: Vec<Step>) -> Vec<Item> {
+    use tt_isa::dm::LIST_MAX;
+    let mut items: Vec<Item> = Vec::new();
+    let mut run: Vec<Block> = Vec::new();
+    let mut run_entries = 0usize;
+    let flush = |run: &mut Vec<Block>, items: &mut Vec<Item>| match run.len() {
+        0 => {}
+        1 => {
+            let b = run.pop().unwrap();
+            items.push(Item::Step(Step::List {
+                what: b.gather.0,
+                entries: b.gather.1,
+            }));
+            items.push(Item::Step(Step::Kernel {
+                roles: b.roles,
+                init: b.init,
+                mop: Box::new(b.mop),
+                loops: b.loops,
+                half: None,
+            }));
+            items.push(Item::Step(Step::List {
+                what: b.scatter.0,
+                entries: b.scatter.1,
+            }));
+        }
+        _ => items.push(Item::Group(std::mem::take(run))),
+    };
+    let mut steps = steps.into_iter().peekable();
+    let mut last_half: Option<u8> = None;
+    let mut resident_bytes = 0u64;
+    let mut seen: Vec<Arc<[Vec<Instruction>; 3]>> = Vec::new();
+    while let Some(step) = steps.next() {
+        // A block: this list, then a kernel staged in a half, then a list.
+        let is_block = matches!(step, Step::List { .. })
+            && matches!(steps.peek(), Some(Step::Kernel { half: Some(_), roles, .. })
+                if roles.iter().all(|p| p.is_empty() || crate::program_cache::admitted(p.len())));
+        if !is_block {
+            flush(&mut run, &mut items);
+            last_half = None;
+            items.push(Item::Step(step));
+            continue;
+        }
+        let Step::List { what, entries } = step else {
+            unreachable!()
+        };
+        let Some(Step::Kernel {
+            roles,
+            init,
+            mop,
+            loops,
+            half,
+        }) = steps.next()
+        else {
+            unreachable!()
+        };
+        let scatter = match steps.next() {
+            Some(Step::List { what, entries }) => (what, entries),
+            other => {
+                // Not a block after all: put it back as plain steps.
+                flush(&mut run, &mut items);
+                last_half = None;
+                items.push(Item::Step(Step::List { what, entries }));
+                items.push(Item::Step(Step::Kernel {
+                    roles,
+                    init,
+                    mop,
+                    loops,
+                    half: None,
+                }));
+                if let Some(o) = other {
+                    items.push(Item::Step(o));
+                }
+                continue;
+            }
+        };
+        let block_entries = entries.len() + scatter.1.len() + 2;
+        let bytes: u64 = roles.iter().map(|p| p.len() as u64 * 4).sum();
+        let new = !seen.iter().any(|r| Arc::ptr_eq(r, &roles));
+        let joins = !run.is_empty()
+            && half != last_half
+            && run.len() < GROUP_MAX
+            && run_entries + block_entries + 1 < LIST_MAX as usize
+            && (!new || resident_bytes + bytes <= tt_isa::l1::PROGRAM_CACHE.len())
+            && run
+                .last()
+                .is_some_and(|b| b.init == init && b.mop == *mop && b.loops == loops);
+        if !joins {
+            flush(&mut run, &mut items);
+            run_entries = 0;
+            resident_bytes = 0;
+            seen.clear();
+        }
+        if !seen.iter().any(|r| Arc::ptr_eq(r, &roles)) {
+            resident_bytes += bytes;
+            seen.push(roles.clone());
+        }
+        run_entries += block_entries;
+        last_half = half;
+        run.push(Block {
+            gather: (what, entries),
+            roles,
+            init,
+            mop: *mop,
+            loops,
+            scatter,
+        });
+    }
+    flush(&mut run, &mut items);
+    items
 }
 
 impl<T: Transport> Session<T> {
@@ -702,6 +952,9 @@ impl<T: Transport> Session<T> {
             grid,
             images,
             profile: runtime::Profile::default(),
+            pipeline: false,
+            pipelined: 0,
+            profile_roles: true,
             dram: None,
             profiling: None,
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
@@ -761,6 +1014,7 @@ impl<T: Transport> Session<T> {
     }
 
     fn prepare_unit(&mut self, u: usize) -> Result<(), RunError> {
+        let profile_roles = self.profile_roles;
         let Session {
             dev,
             units,
@@ -805,6 +1059,7 @@ impl<T: Transport> Session<T> {
             // What the stream held since the last drain belonged to the run
             // that failed; the profile goes on from an empty one.
             r.set_profiling(true);
+            r.set_profile_roles(profile_roles);
             dev.configure_trace(
                 r.window(),
                 unit.tile,
@@ -840,6 +1095,7 @@ impl<T: Transport> Session<T> {
             if self.units[u].resident.is_none() {
                 self.prepare_unit(u)?;
             }
+            let profile_roles = self.profile_roles;
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let r = unit.resident.as_mut().expect("prepared above");
@@ -850,6 +1106,7 @@ impl<T: Transport> Session<T> {
                 tt_isa::mailbox::TRACE_BUFFER_BYTES,
             )?;
             r.set_profiling(true);
+            r.set_profile_roles(profile_roles);
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
             }
@@ -1308,6 +1565,9 @@ impl<T: Transport> Session<T> {
                 self.drain_unit(u)?;
             }
         }
+        if !seg.waits.is_empty() {
+            self.pipelined += seg.waits.len() as u64;
+        }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
             let placed = {
@@ -1352,9 +1612,7 @@ impl<T: Transport> Session<T> {
                 seg.kernels.len() as u32,
                 seg.resident,
             )?;
-            for (&at, g) in seg.kernels.iter().zip(generations) {
-                entries[at][1] = g;
-            }
+            fill_generations(&mut entries, seg, generations);
         }
         if self.capture.is_some() {
             if let Err(e) = self.capture_segment(u, seg, &entries) {
@@ -1998,6 +2256,7 @@ impl<T: Transport> Session<T> {
         // default would be a path only silicon runs. `step36_mop` and
         // `step37_loops` keep the expander gated.
         let allow_mop = false;
+        let pipeline = self.pipeline && self.capture.is_none();
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -2011,6 +2270,7 @@ impl<T: Transport> Session<T> {
                     fidelity,
                     units,
                     allow_mop,
+                    pipeline,
                 )
             })
             .and_then(|work| self.execute(work, budget));
@@ -2160,6 +2420,7 @@ impl<T: Transport> Session<T> {
         if self.units[u].resident.is_none() {
             self.prepare_unit(u)?;
         }
+        self.pipelined += seg.waits.len() as u64;
         let Session {
             dev,
             units,
@@ -2217,9 +2478,7 @@ impl<T: Transport> Session<T> {
                     seg.kernels.len() as u32,
                     seg.resident,
                 )?;
-                for (&at, g) in seg.kernels.iter().zip(generations) {
-                    entries[at][1] = g;
-                }
+                fill_generations(&mut entries, seg, generations);
                 Some(kernel)
             }
         };
@@ -2325,6 +2584,29 @@ impl<T: Transport> Session<T> {
     /// Every tile the session computes on, in unit order.
     pub fn tiles(&self) -> Vec<NocCoord<Noc0>> {
         self.units.iter().map(|u| u.tile).collect()
+    }
+
+    /// Double-buffer GDDR matmuls from the next op on (checklist 9.15): each
+    /// block staged in half the data arena, a unit's consecutive blocks in
+    /// alternate halves, so its mover gathers the next block and scatters the
+    /// last while the roles compute one (`tt_isa::dm::op::LAUNCH`,
+    /// `KERNEL_WAIT`). The blocks are smaller, so the op moves more; the bits
+    /// are the same. Not while a trace is being captured.
+    pub fn set_pipeline(&mut self, on: bool) {
+        self.pipeline = on;
+    }
+
+    /// How many blocks have run overlapped with their neighbours' moves
+    /// (`Session::set_pipeline`), since the session opened.
+    pub fn pipelined_blocks(&self) -> u64 {
+        self.pipelined
+    }
+
+    /// Whether a profile records the roles' events as well as the mover's
+    /// (the default; `Resident::set_profile_roles`). A profile of pipelined
+    /// work wants the mover's alone.
+    pub fn set_profile_roles(&mut self, on: bool) {
+        self.profile_roles = on;
     }
 
     /// Steps of GDDR ops completed on each unit so far, in unit order.
@@ -2505,6 +2787,7 @@ mod tests {
                     init: init.clone(),
                     mop: Box::new([None; 3]),
                     loops: Default::default(),
+                    half: None,
                 },
                 list(1, 2),
             ]
@@ -2539,6 +2822,7 @@ mod tests {
                 init: init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             };
         let segs = segments(vec![k(&a, &init), list(1, 1), k(&b, &init), k(&a, &init)]);
         assert_eq!(segs.len(), 1, "every program is resident: one list");
@@ -2563,6 +2847,7 @@ mod tests {
             init: init.clone(),
             mop: Box::new([None; 3]),
             loops: Default::default(),
+            half: None,
         };
         let segs = segments(vec![k(&a), k(&a), k(&b)]);
         assert_eq!(segs.len(), 2);
@@ -2584,6 +2869,7 @@ mod tests {
                 init: init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             })
             .collect();
         let segs = segments(steps);

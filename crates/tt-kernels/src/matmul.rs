@@ -842,13 +842,39 @@ pub fn tile_image_bytes(format: L1Format) -> u64 {
 /// it hands `Dst` over with.
 #[derive(Clone, Debug)]
 pub struct Layout {
-    /// `B`'s first byte (`A`'s is the first of the run's staging).
+    /// `A`'s first byte.
+    pub a_at: u64,
+    /// `B`'s first byte.
     pub b_at: u64,
     /// One per output tile, row-major.
     pub outputs: Vec<OutputTile>,
     pub sems: MatmulSemaphores,
     /// What a concurrent run of it initialises: every semaphore of its plan.
     pub init: Vec<crate::runtime::SemaphoreInit>,
+}
+
+impl Layout {
+    /// The same run with its operands and outputs `by` bytes further on and
+    /// its semaphores where they were: the other half of a double-buffered
+    /// pair ([`Staging::SlotsHalf`], [`HALF`]). Two runs that share
+    /// semaphores never overlap -- the second starts once the first has
+    /// finished, and each leaves its semaphores as it found them.
+    pub fn shifted(&self, by: u64) -> Layout {
+        Layout {
+            a_at: self.a_at + by,
+            b_at: self.b_at + by,
+            outputs: self
+                .outputs
+                .iter()
+                .map(|o| OutputTile {
+                    pairs: o.pairs.iter().map(|&(a, b)| (a + by, b + by)).collect(),
+                    out: o.out + by,
+                })
+                .collect(),
+            sems: self.sems,
+            init: self.init.clone(),
+        }
+    }
 }
 
 /// Where a `[mt, kt] @ [kt, nt]`-tile matmul's operands and outputs go in L1,
@@ -875,6 +901,23 @@ pub enum Staging {
     /// can copy any tile between GDDR and L1 under the C64 rule, and an output
     /// slot is an operand slot. FP32 in L1 only.
     Slots,
+    /// [`Staging::Slots`] in the first half of the data arena, so that a
+    /// second block can be staged in the other half ([`Layout::shifted`] by
+    /// [`HALF`]) while this one computes (checklist 9.15).
+    SlotsHalf,
+}
+
+/// How far the second half of the data arena is from the first, for
+/// [`Staging::SlotsHalf`]: half the arena, on a slot-friendly boundary.
+pub const HALF: u64 = (tt_isa::l1::DATA.len() / 2) / 4096 * 4096;
+
+/// The first half of the data arena ([`Staging::SlotsHalf`]).
+fn half_arena() -> tt_isa::l1::Region {
+    tt_isa::l1::Region {
+        name: "first half of the data arena",
+        base: tt_isa::l1::DATA.base,
+        end: tt_isa::l1::DATA.base + HALF,
+    }
 }
 
 /// [`plan_layout`] for either [`Staging`].
@@ -884,12 +927,14 @@ pub fn plan_layout_in(
     staging: Staging,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
-    if staging == Staging::Slots {
-        return plan_slots([mt, kt, nt], in_fmt);
+    match staging {
+        Staging::Slots => return plan_slots([mt, kt, nt], in_fmt, tt_isa::l1::DATA),
+        Staging::SlotsHalf => return plan_slots([mt, kt, nt], in_fmt, half_arena()),
+        Staging::Host => {}
     }
     let (img, align, out_stride, out_skip) = match staging {
         Staging::Host => (tile_image_bytes(in_fmt), 16, 1024 * 4, 0),
-        Staging::Slots => unreachable!("planned by plan_slots"),
+        Staging::Slots | Staging::SlotsHalf => unreachable!("planned by plan_slots"),
     };
     let a_bytes = (mt * kt) as u64 * img;
     let b_at = (MATMUL_STAGE + a_bytes).next_multiple_of(align);
@@ -928,6 +973,7 @@ pub fn plan_layout_in(
     }
     let (sems, init) = MatmulSemaphores::alone();
     Ok(Layout {
+        a_at: MATMUL_STAGE,
         b_at,
         outputs,
         sems,
@@ -1000,6 +1046,7 @@ pub struct MatmulBuffers {
 fn plan_slots(
     [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
+    arena: tt_isa::l1::Region,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::l1::PlanError;
     use crate::runtime::RunError;
@@ -1010,7 +1057,7 @@ fn plan_slots(
         "slot staging holds FP32 tiles"
     );
     let m = matmul_requirements([mt, kt, nt]);
-    let plan = m.req.plan(tt_isa::l1::DATA).map_err(|e| match e {
+    let plan = m.req.plan(arena).map_err(|e| match e {
         PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
             what: name,
             bytes,
@@ -1037,6 +1084,7 @@ fn plan_slots(
         }
     }
     Ok(Layout {
+        a_at,
         b_at,
         outputs,
         sems: MatmulSemaphores::planned(&plan, m.sems),
@@ -1061,6 +1109,7 @@ pub fn stage_matmul(
     let Layout {
         b_at,
         outputs,
+        a_at: _,
         sems,
         init,
     } = plan_layout(tiles, in_fmt)?;
@@ -1192,7 +1241,7 @@ pub fn chunk_fits_in(
     staging: Staging,
 ) -> bool {
     let (in_fmt, out_fmt) = route.formats();
-    if staging == Staging::Slots && in_fmt != L1Format::Fp32 {
+    if staging != Staging::Host && in_fmt != L1Format::Fp32 {
         return false;
     }
     let Ok(layout) = plan_layout_in(tiles, in_fmt, staging) else {
@@ -1240,6 +1289,7 @@ pub(crate) fn programs(
 /// configurations, built once per process.
 pub(crate) fn kernel_programs(
     tiles: [usize; 3],
+    half: u8,
     route: SrcRoute,
     fidelity: Fidelity,
     sems: MatmulSemaphores,
@@ -1251,11 +1301,13 @@ pub(crate) fn kernel_programs(
 ) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    type Key = ([usize; 3], SrcRoute, Fidelity, MatmulSemaphores, bool);
+    // `half`: the half of a double-buffered pair (`Staging::SlotsHalf`), whose
+    // programs name addresses `HALF` apart under the same semaphores.
+    type Key = ([usize; 3], u8, SrcRoute, Fidelity, MatmulSemaphores, bool);
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity, sems, allow_mop);
+    let key = (tiles, half, route, fidelity, sems, allow_mop);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }

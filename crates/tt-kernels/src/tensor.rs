@@ -715,6 +715,11 @@ pub enum Step {
         /// Each role's block repeats (`runtime::Kernel::loops`): shared by a
         /// list's kernels as `mop` is, since the table is a descriptor word.
         loops: Arc<[Vec<crate::code::Loop>; 3]>,
+        /// Which half of a double-buffered pair this kernel's block is staged
+        /// in (`matmul::Staging::SlotsHalf`), if it is: the session may then
+        /// overlap the moves of a unit's next and last blocks with it
+        /// (checklist 9.15). `None` runs it as one `KERNEL`.
+        half: Option<u8>,
     },
 }
 
@@ -783,6 +788,7 @@ pub fn matmul_dram(
     fidelity: Fidelity,
     units: usize,
     allow_mop: bool,
+    pipeline: bool,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -803,10 +809,22 @@ pub fn matmul_dram(
     }
     let k = ka;
     let (in_fmt, out_fmt) = route.formats();
-    let shape = matmul::plan_in([m, k, n], route, fidelity, Staging::Slots)
+    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // Pipelined (checklist 9.15): each block in half the arena, consecutive
+    // blocks of a unit alternating halves, so the session can move the next
+    // block in and the last one out while one computes -- if `K` still fits
+    // whole in half the arena.
+    let staging = if pipeline
+        && matmul::plan_in([m, k, n], route, fidelity, Staging::SlotsHalf)
+            .is_some_and(|s| s.tiles[1] >= kt)
+    {
+        Staging::SlotsHalf
+    } else {
+        Staging::Slots
+    };
+    let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
         .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
     let [mc, kc, nc] = shape.tiles;
-    let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
     if kc < kt {
         return Err(TensorError::Shape(format!(
             "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
@@ -822,24 +840,31 @@ pub fn matmul_dram(
         for j0 in (0..nt).step_by(nc) {
             let cols = nc.min(nt - j0);
             let tiles = [rows, kt, cols];
-            let matmul::Layout {
-                b_at,
-                outputs,
-                sems,
-                init,
-            } = match matmul::plan_layout_in(tiles, in_fmt, Staging::Slots) {
+            // A session deals job `j` to unit `j % units`, so a unit's blocks
+            // are every `units`-th: they alternate halves by `j / units`.
+            let half =
+                (staging == Staging::SlotsHalf).then(|| ((jobs.len() / units.max(1)) % 2) as u8);
+            let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
+                Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
                 Ok(l) => l,
                 Err(e) => {
                     alloc.free(&c.placement);
                     return Err(e.into());
                 }
             };
+            let matmul::Layout {
+                a_at,
+                b_at,
+                outputs,
+                sems,
+                init,
+            } = layout;
             let flags = u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
             let gather = [
                 [
                     record::GATHER,
                     flags,
-                    matmul::MATMUL_STAGE as u32,
+                    a_at as u32,
                     b_at as u32,
                     i0 as u32,
                     rows as u32,
@@ -851,8 +876,11 @@ pub fn matmul_dram(
                 rb.encode()[0],
                 rb.encode()[1],
             ];
+            // The cache tells the stagings and halves apart: their programs
+            // name different addresses.
+            let variant = half.map_or(0, |h| 1 + h);
             let (roles, mop) =
-                matmul::kernel_programs(tiles, route, fidelity, sems, allow_mop, || {
+                matmul::kernel_programs(tiles, variant, route, fidelity, sems, allow_mop, || {
                     matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop)
                 });
             // Only the datums go back: the packer writes nothing else, and the
@@ -887,6 +915,7 @@ pub fn matmul_dram(
                     init,
                     mop: Box::new(mop),
                     loops: Default::default(),
+                    half,
                 },
                 Step::List {
                     what: "matmul scatter",
@@ -1100,6 +1129,7 @@ pub fn sfpu_eltwise(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops,
+                half: None,
             },
             Step::List {
                 what: "sfpu scatter",
@@ -1319,6 +1349,7 @@ pub fn sfpu_reduce(
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             },
             Step::List {
                 what: "reduce scatter",
@@ -1502,6 +1533,7 @@ pub fn sum_rows(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<W
                 init: c.layout.init.clone(),
                 mop: Box::new([None; 3]),
                 loops: Default::default(),
+                half: None,
             });
             steps.push(Step::List {
                 what: "sum scatter",
@@ -1967,9 +1999,10 @@ mod tests {
                     let [(mut a1, t1), (mut a2, t2)] = pair(&dram, &[sa, sb]);
                     let route = SrcRoute::Tf32FromFp32;
                     let f = Fidelity::HiFi4;
-                    let got =
-                        super::matmul_dram(&mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false)
-                            .unwrap();
+                    let got = super::matmul_dram(
+                        &mut a1, &t1[0], ta, &t1[1], tb, route, f, units, false, false,
+                    )
+                    .unwrap();
                     let want =
                         reference::matmul_dram(&mut a2, &t2[0], ta, &t2[1], tb, route, f, units)
                             .unwrap();
@@ -2195,6 +2228,7 @@ mod reference {
                 let cols = nc.min(nt - j0);
                 let tiles = [rows, kt, cols];
                 let matmul::Layout {
+                    a_at: _,
                     b_at,
                     outputs,
                     sems,
@@ -2257,6 +2291,7 @@ mod reference {
                         init,
                         mop: Box::new([None; 3]),
                         loops: Default::default(),
+                        half: None,
                     },
                     Step::List {
                         what: "matmul scatter",
