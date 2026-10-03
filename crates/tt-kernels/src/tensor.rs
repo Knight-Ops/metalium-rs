@@ -29,7 +29,6 @@ use tt_isa::dm::record::{self, TensorRef};
 use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
 use tt_isa::isa::Instruction;
-use tt_isa::tile::L1Format;
 
 use crate::dm::DmError;
 use crate::matmul::{self, Fidelity, SrcRoute, Staging};
@@ -512,7 +511,33 @@ impl DramTensor {
         w: &Window,
         values: &[u32],
     ) -> Result<()> {
-        if self.elem == Elem::Bool {
+        let images = self.tile_images(values)?;
+        self.write_images(dev, w, &images)
+    }
+
+    /// What [`DramTensor::write_bits`] writes: each tile's image
+    /// ([`matmul::TILE_IMAGE_BYTES`], header and datums), in tile order,
+    /// after every check a write makes.
+    pub fn tile_images(&self, values: &[u32]) -> Result<Vec<u8>> {
+        self.check_write(values.len(), Some(values))?;
+        let tiles = self.placement.tiles;
+        let mut out = vec![0u8; tiles * matmul::TILE_IMAGE_BYTES];
+        // The tilizer moves bits: every pattern is kept, NaN payloads included.
+        matmul::tilize_into(
+            |i| values[i],
+            self.rows,
+            self.cols,
+            0..tiles,
+            &mut out,
+            matmul::TILE_IMAGE_BYTES,
+        );
+        Ok(out)
+    }
+
+    /// The checks every write makes: `len` datums for this tensor, its own
+    /// slots (not a view's), and a `Bool` tensor's `bits` only `0` and `1`.
+    pub fn check_write(&self, len: usize, bits: Option<&[u32]>) -> Result<()> {
+        if let (Elem::Bool, Some(values)) = (self.elem, bits) {
             if let Some(i) = values.iter().position(|&v| v > 1) {
                 return Err(TensorError::Shape(format!(
                     "a Bool tensor's datum {i} is {:#x}, not 0 or 1",
@@ -520,15 +545,10 @@ impl DramTensor {
                 )));
             }
         }
-        // The tilizer is FP32's, which moves bits: `from_bits` keeps every
-        // pattern, NaN payloads included.
-        let values: Vec<f32> = values.iter().map(|&b| f32::from_bits(b)).collect();
-        let values = &values[..];
         let (rows, cols) = (self.rows, self.cols);
-        if values.len() != rows * cols {
+        if len != rows * cols {
             return Err(TensorError::Shape(format!(
-                "{} values for a [{rows}, {cols}] tensor",
-                values.len()
+                "{len} values for a [{rows}, {cols}] tensor"
             )));
         }
         if !self.placement.owned {
@@ -536,8 +556,18 @@ impl DramTensor {
                 "a view's slots are another tensor's: write that one".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Write [`DramTensor::tile_images`]'s images to their slots from the
+    /// host, through the BAR.
+    pub fn write_images<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        w: &Window,
+        images: &[u8],
+    ) -> Result<()> {
         let t = self;
-        let (images, _) = matmul::tilize_f32(values, rows.max(1), cols.max(1), L1Format::Fp32);
         let img = matmul::TILE_IMAGE_BYTES;
         let per = t.placement.channels.len();
         let mut regions = vec![vec![0u8; (t.placement.slots * TILE_SLOT) as usize]; per];
@@ -598,6 +628,17 @@ impl DramTensor {
         // rows, only its padding columns: no better known than the parent's.
         v.set_pad(self.pad());
         Ok(v)
+    }
+
+    /// Tile `k`'s slot, in tile order (row-major over the grid).
+    pub fn slot(&self, k: usize) -> DramRange {
+        self.placement.slot(k)
+    }
+
+    /// Row-major values from tiles' datums packed in tile order, 4 KiB each
+    /// (what [`host_dma_jobs`]'s downloads leave in host memory).
+    pub fn from_packed(&self, packed: &[u8]) -> Vec<f32> {
+        matmul::detilize_packed(packed, self.rows, self.cols)
     }
 
     /// Download to row-major values: one bulk read per channel, or, for a
@@ -687,6 +728,106 @@ impl DramTensor {
         }
         Ok(matmul::detilize_packed(&packed, 32 * rt, 32 * ct))
     }
+}
+
+/// Tile slots a unit stages a [`host_dma_jobs`] batch in: two halves of
+/// this many, a batch moving in or out of one while the other's moves go on.
+pub const HOST_DMA_BATCH: usize = 32;
+const _: () = assert!(2 * HOST_DMA_BATCH as u64 * TILE_SLOT <= tt_isa::l1::DATA.len());
+
+/// Moves between host memory and tile slots in GDDR, by the card
+/// (`tt_isa::dm::op::HOST_READ` / `HOST_WRITE`), one job a unit. `slots[k]`
+/// is tile `k`'s slot; in host memory tile `k` is at `host + k * TILE_SLOT`.
+/// An upload moves each tile's image (`matmul::TILE_IMAGE_BYTES`) host ->
+/// L1 -> slot; a download each tile's datums slot -> L1 -> host, at
+/// `TILE_DATA` into both, so all three addresses stay congruent mod 64.
+///
+/// Each unit's tiles go in batches of [`HOST_DMA_BATCH`], alternating
+/// halves of its staging: batch `b + 1` comes in while batch `b` goes out,
+/// a `WAIT` between (the half batch `b + 2` refills was emptied before it).
+/// The data arena must be free: the caller has synced.
+pub fn host_dma_jobs(slots: &[DramRange], upload: bool, host: u64, units: usize) -> Vec<Job> {
+    use tt_isa::dm::op;
+    let units = units.max(1).min(slots.len().max(1));
+    let base = tt_isa::l1::DATA.base;
+    let (skip, len) = if upload {
+        (0, matmul::TILE_IMAGE_BYTES as u32)
+    } else {
+        (TILE_DATA, 4096)
+    };
+    let host_entry = |k: usize, l1: u64| {
+        let at = host + k as u64 * TILE_SLOT + skip;
+        let kind = if upload {
+            op::HOST_READ
+        } else {
+            op::HOST_WRITE
+        };
+        [
+            kind,
+            at as u32,
+            (at >> 32) as u32,
+            0,
+            (l1 + skip) as u32,
+            len,
+            0,
+            0,
+        ]
+    };
+    let dram_entry = |k: usize, l1: u64| {
+        let s = slots[k];
+        let kind = if upload { op::WRITE } else { op::READ };
+        [
+            kind,
+            s.channel().index() as u32,
+            0,
+            (s.offset() + skip) as u32,
+            (l1 + skip) as u32,
+            len,
+            0,
+            0,
+        ]
+    };
+    // An upload brings tiles in from the host, then writes them to GDDR; a
+    // download reads them from GDDR, then sends them to the host.
+    type MakeEntry<'a> = &'a dyn Fn(usize, u64) -> [u32; 8];
+    let (bring, send): (MakeEntry, MakeEntry) = if upload {
+        (&host_entry, &dram_entry)
+    } else {
+        (&dram_entry, &host_entry)
+    };
+    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+    (0..units)
+        .map(|u| {
+            let mine: Vec<usize> = (u..slots.len()).step_by(units).collect();
+            let batches: Vec<&[usize]> = mine.chunks(HOST_DMA_BATCH).collect();
+            let at =
+                |b: usize, i: usize| base + (((b % 2) * HOST_DMA_BATCH + i) as u64) * TILE_SLOT;
+            let mut entries = Vec::new();
+            for (b, batch) in batches.iter().enumerate() {
+                if b == 0 {
+                    entries.extend(batch.iter().enumerate().map(|(i, &k)| bring(k, at(b, i))));
+                }
+                entries.push(wait);
+                entries.extend(batch.iter().enumerate().map(|(i, &k)| send(k, at(b, i))));
+                if let Some(next) = batches.get(b + 1) {
+                    entries.extend(
+                        next.iter()
+                            .enumerate()
+                            .map(|(i, &k)| bring(k, at(b + 1, i))),
+                    );
+                }
+            }
+            entries.push(wait);
+            vec![Step::List {
+                what: if upload {
+                    "host dma upload"
+                } else {
+                    "host dma download"
+                },
+                entries,
+            }]
+        })
+        .collect()
 }
 
 /// One step of a [`Job`], run on one tile.

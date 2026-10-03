@@ -791,6 +791,82 @@ pub mod niu {
         }
     }
 
+    /// The host-connected PCIe tile on a p150 board (PCIe 0), translated, as
+    /// `ethdump.c:440`'s `BH_PCIE_XY` names it: where a tile's NoC reaches host
+    /// memory (`PCIExpressTile/README.md`, "NoC to Host").
+    pub const PCIE_HOST: (u8, u8) = (19, 24);
+
+    /// One request of a [`HostMove`]: [`DramRequest`]'s registers with the
+    /// target's and the return's high address words, which a host address
+    /// fills.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct HostRequest {
+        pub targ: u32,
+        pub targ_mid: u32,
+        pub targ_hi: u32,
+        pub ret: u32,
+        pub ret_mid: u32,
+        pub ret_hi: u32,
+        pub tag: u32,
+        pub ctrl: u32,
+        pub len: u32,
+    }
+
+    /// A move between this tile's L1 and host memory at the PCIe tile
+    /// ([`crate::dm::op::HOST_READ`]): its requests, `MAX_REQUEST_BYTES` each,
+    /// on static VC 1 as every other request. The caller checked it
+    /// (`crate::dm::Entry::decode`): the host address in a host window, not
+    /// crossing a 4 GiB boundary, congruent with `l1`.
+    #[derive(Copy, Clone, Debug)]
+    pub struct HostMove {
+        pub host_lo: u32,
+        pub host_hi: u32,
+        pub l1: u32,
+        pub len: u32,
+        pub write: bool,
+        pub me: (u8, u8),
+        pub txn: TxnId,
+    }
+
+    impl HostMove {
+        pub fn words(self) -> impl Iterator<Item = HostRequest> {
+            let pcie = Endpoint {
+                x: PCIE_HOST.0,
+                y: PCIE_HOST.1,
+                addr: 0,
+            }
+            .hi();
+            let me = Endpoint {
+                x: self.me.0,
+                y: self.me.1,
+                addr: 0,
+            }
+            .hi();
+            (0..self.len)
+                .step_by(MAX_REQUEST_BYTES as usize)
+                .map(move |done| {
+                    let n = (self.len - done).min(MAX_REQUEST_BYTES);
+                    let (host, l1) = (self.host_lo + done, self.l1 + done);
+                    let (targ, targ_mid, targ_hi, ret, ret_mid, ret_hi, ctrl) = if self.write {
+                        (l1, 0, me, host, self.host_hi, pcie, CMD_WR)
+                    } else {
+                        (host, self.host_hi, pcie, l1, 0, me, CMD_RD)
+                    };
+                    HostRequest {
+                        targ,
+                        targ_mid,
+                        targ_hi,
+                        ret,
+                        ret_mid,
+                        ret_hi,
+                        tag: (self.txn.0 as u32) << 10,
+                        ctrl: ctrl | RESP_MARKED | STATIC_VC_1,
+                        len: n,
+                    }
+                })
+        }
+    }
+
     fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
         if len == 0 || len > MAX_REQUEST_BYTES {
             return Err(RequestError::Length);

@@ -1503,11 +1503,14 @@ tiles, done in turn. The slices from there:
       device-bound shapes; 5% slower on one tile, where captures lose
       pipelining. Next: make pipelined lists capturable; replay from burn-tt
       without a host-written input (the input write is PCIe-bound, below).
-    - [ ] Host<->card copies: uncached under this VM (80 MB/s writes, 28
-      reads; `ttsim-divergence.md` row M). Fix outside the code (the
-      hypervisor mapping the BARs write-combining) or around it: the card
-      pulling from pinned host memory through the PCIe tile, as tt-metal's
-      prefetcher does, which no guest mapping slows.
+    - [x] Host<->card copies: uncached under this VM (80 MB/s writes, 28
+      reads; `ttsim-divergence.md` row M). Now around it: the card moves
+      tensors itself through pinned host memory (`HOST_READ` / `HOST_WRITE`,
+      `Session::set_host_dma`, `step57_host_dma`): ~20 GB/s up and ~27 down
+      raw, 3-4 GB/s through a `Session` upload, where the host's tilize now
+      bounds it. Left: uploads sync the session first (they need the data
+      arena); queue them behind the ops instead, and tilize on more cores.
+      The BAR mapping itself is still the hypervisor's to fix.
     - Then consider what replay cannot cover: one list multicast to every
       unit, or a unit expanding its share from one record.
   - [ ] **9.16 Role program streaming, measured first.**

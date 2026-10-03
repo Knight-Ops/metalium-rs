@@ -52,6 +52,15 @@ int main(void) {
     O2("get_driver_info", struct tenstorrent_get_driver_info, out, struct tenstorrent_get_driver_info_out, driver_version);
     O2("get_driver_info", struct tenstorrent_get_driver_info, out, struct tenstorrent_get_driver_info_out, driver_version_major);
 
+    S("pin_pages_in", struct tenstorrent_pin_pages_in);
+    O("pin_pages_in", struct tenstorrent_pin_pages_in, flags);
+    O("pin_pages_in", struct tenstorrent_pin_pages_in, virtual_address);
+    O("pin_pages_in", struct tenstorrent_pin_pages_in, size);
+    S("pin_pages_out_extended", struct tenstorrent_pin_pages_out_extended);
+    O("pin_pages_out_extended", struct tenstorrent_pin_pages_out_extended, noc_address);
+    S("unpin_pages", struct tenstorrent_unpin_pages);
+    O2("unpin_pages", struct tenstorrent_unpin_pages, in, struct tenstorrent_unpin_pages_in, size);
+
     S("mapping", struct tenstorrent_mapping);
     A("mapping", struct tenstorrent_mapping);
     O("mapping", struct tenstorrent_mapping, mapping_id);
@@ -231,6 +240,26 @@ fn the_rust_abi_matches_the_c_header() {
         "query_mappings_in alignof",
         align_of::<abi::QueryMappingsIn>(),
     );
+
+    // The pin's in, then its extended out, back to back.
+    let pin_in = offset_of!(abi::PinPages, out_physical_address);
+    check("pin_pages_in sizeof", pin_in);
+    check("pin_pages_in flags", offset_of!(abi::PinPages, in_flags));
+    check(
+        "pin_pages_in virtual_address",
+        offset_of!(abi::PinPages, in_virtual_address),
+    );
+    check("pin_pages_in size", offset_of!(abi::PinPages, in_size));
+    check(
+        "pin_pages_out_extended sizeof",
+        size_of::<abi::PinPages>() - pin_in,
+    );
+    check(
+        "pin_pages_out_extended noc_address",
+        offset_of!(abi::PinPages, out_noc_address) - pin_in,
+    );
+    check("unpin_pages sizeof", size_of::<abi::UnpinPages>());
+    check("unpin_pages size", offset_of!(abi::UnpinPages, in_size));
 
     check("allocate_tlb sizeof", size_of::<abi::AllocateTlb>());
     check("allocate_tlb alignof", align_of::<abi::AllocateTlb>());

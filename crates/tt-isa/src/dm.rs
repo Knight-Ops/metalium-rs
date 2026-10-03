@@ -243,6 +243,39 @@ pub mod op {
     /// the mover launched: anything else is [`super::error::GENERATION`], not
     /// a wait that could never end. Only in a list entry.
     pub const KERNEL_WAIT: u32 = 15;
+    /// Host memory -> L1, the card's own DMA: `[HOST_READ, host_lo,
+    /// host_hi, 0, l1, len, 0, 0]`. `host` is a NoC address at the
+    /// host-connected PCIe tile ([`crate::noc::niu::PCIE_HOST`]): the driver's
+    /// for memory it pinned for the card (`PIN_PAGES` with `NOC_DMA`). Only
+    /// the PCIe tile's two plain windows to the host are accepted
+    /// ([`super::host_window`]); `host` and `l1` congruent mod 64, as a GDDR
+    /// read's, and a move never crosses a 4 GiB boundary of `host`. Through
+    /// NoC #0. Only in a list entry.
+    pub const HOST_READ: u32 = 0x20;
+    /// L1 -> host memory: `[HOST_WRITE, host_lo, host_hi, 0, l1, len, 0, 0]`,
+    /// as [`HOST_READ`].
+    pub const HOST_WRITE: u32 = 0x21;
+}
+
+// Entry ops and record ops (`record`, from 0x10) share one numbering.
+const _: () = {
+    let ops = [op::HOST_READ, op::HOST_WRITE];
+    let mut i = 0;
+    while i < ops.len() {
+        assert!(!record::is_record(ops[i]));
+        assert!(ops[i] < record::GATHER || ops[i] > record::WRITE_RUN);
+        i += 1;
+    }
+};
+
+/// Whether `host` is in one of the PCIe tile's two windows a mover may use
+/// (`PCIExpressTile/README.md`, "NoC to Host"): `0x0...` (to the host's
+/// IOMMU) and `0x1000_0000_0000_0000` (through the outbound iATU, where the
+/// driver's pins land). Its other windows reach the PCIe controller's own
+/// configuration and serdeses, which a stray write would corrupt.
+pub const fn host_window(host: u64) -> bool {
+    let window = host >> 58;
+    window == 0 || window == 4
 }
 
 /// [`op::FILL`]'s parameter.
@@ -475,6 +508,15 @@ pub enum Entry {
     /// largest variant, and the mover's per-entry path decodes one each time
     /// (a `Mover` here cost every entry ~100 cycles on card 0).
     WaitPeer { peer: Peer, target: u32 },
+    /// [`op::HOST_READ`] and [`op::HOST_WRITE`]. The address in two words, not
+    /// a `u64`: a `u64` would raise every `Entry`'s alignment to 8.
+    Host {
+        write: bool,
+        host_lo: u32,
+        host_hi: u32,
+        l1: u32,
+        len: u32,
+    },
 }
 
 impl Entry {
@@ -613,6 +655,28 @@ impl Entry {
             }
             return Ok(Entry::Signal);
         }
+        if w[0] == op::HOST_READ || w[0] == op::HOST_WRITE {
+            let host = (w[2] as u64) << 32 | w[1] as u64;
+            let (l1, len) = (w[4], w[5]);
+            if w[3] != 0 || w[6] != 0 || w[7] != 0 || !host_window(host) {
+                return Err(error::OP);
+            }
+            if len == 0 {
+                return Err(error::LENGTH);
+            }
+            let in_l1 = (l1 as u64 + len as u64) <= crate::tensix::L1_SIZE;
+            let one_word = (w[1] as u64) + len as u64 <= 1 << 32;
+            if host % crate::dram::ALIGN != l1 as u64 % crate::dram::ALIGN || !in_l1 || !one_word {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Host {
+                write: w[0] == op::HOST_WRITE,
+                host_lo: w[1],
+                host_hi: w[2],
+                l1,
+                len,
+            });
+        }
         if w[0] == op::WAIT_PEER {
             let peer = match w[1] {
                 0 => Peer::B,
@@ -730,6 +794,62 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_moves_decode_only_inside_the_host_windows() {
+        use super::*;
+        let iatu = 0x1000_0000_0000_0000u64;
+        let e = |op, host: u64, l1: u32, len: u32| {
+            Entry::decode(
+                0xFF,
+                [op, host as u32, (host >> 32) as u32, 0, l1, len, 0, 0],
+            )
+        };
+        assert_eq!(
+            e(op::HOST_READ, iatu + 0x40, 0x2_0040, 4096),
+            Ok(Entry::Host {
+                write: false,
+                host_lo: 0x40,
+                host_hi: 0x1000_0000,
+                l1: 0x2_0040,
+                len: 4096
+            })
+        );
+        assert!(matches!(
+            e(op::HOST_WRITE, 0x1_4000_0000, 0x2_0000, 64),
+            Ok(Entry::Host { write: true, .. })
+        ));
+        // The PCIe controller's DBI, its serdes configuration, an unused
+        // window: refused.
+        for host in [
+            0xF800_0000_0000_0000u64,
+            0xFFFF_FFFF_E000_0000,
+            0x2000_0000_0000_0000,
+        ] {
+            assert_eq!(
+                e(op::HOST_WRITE, host, 0x2_0000, 64),
+                Err(error::OP),
+                "{host:#x}"
+            );
+        }
+        assert_eq!(e(op::HOST_READ, iatu, 0x2_0000, 0), Err(error::LENGTH));
+        assert_eq!(
+            e(op::HOST_READ, iatu + 16, 0x2_0000, 64),
+            Err(error::ALIGNMENT)
+        );
+        assert_eq!(
+            e(op::HOST_READ, iatu, crate::tensix::L1_SIZE as u32 - 64, 128),
+            Err(error::ALIGNMENT)
+        );
+        // Across a 4 GiB boundary of the host address.
+        assert_eq!(
+            e(op::HOST_READ, iatu + 0xFFFF_FFC0, 0x2_0000, 128),
+            Err(error::ALIGNMENT)
+        );
+        let mut extra = [op::HOST_READ, 0, 0x1000_0000, 0, 0x2_0000, 64, 0, 0];
+        extra[3] = 1;
+        assert_eq!(Entry::decode(0xFF, extra), Err(error::OP));
+    }
+
     #[test]
     fn launch_and_kernel_wait_decode_as_kernel_halves() {
         use super::*;

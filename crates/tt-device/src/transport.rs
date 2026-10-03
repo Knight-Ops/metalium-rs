@@ -159,6 +159,25 @@ impl From<std::io::Error> for TransportError {
 
 pub type Result<T> = std::result::Result<T, TransportError>;
 
+/// Host memory the card reaches by DMA ([`Transport::host_memory`]). Its
+/// bytes belong to the host only while nothing queued on the card reads or
+/// writes them: the caller orders the two, as it would any shared buffer.
+pub trait HostMemory: Send {
+    /// The NoC address of its first byte at the host-connected PCIe tile.
+    fn noc_address(&self) -> u64;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Copy `dst.len()` bytes from `offset`. Panics past the end.
+    fn read(&self, offset: usize, dst: &mut [u8]);
+    /// Copy `src` in at `offset`. Panics past the end.
+    fn write(&mut self, offset: usize, src: &[u8]);
+    /// Run `f` on all of its bytes in place: for filling or reading it
+    /// without a copy.
+    fn with_bytes(&mut self, f: &mut dyn FnMut(&mut [u8]));
+}
+
 /// How the host reaches the chip.
 ///
 /// Implementations must validate every access *before* performing it. On the
@@ -212,6 +231,18 @@ pub trait Transport {
     /// Read device memory in bulk. See [`Transport::bar_write_bulk`].
     fn bar_read_bulk(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> Result<()> {
         self.bar_read(bar, offset, dst)
+    }
+
+    /// `len` bytes of host memory the card reads and writes itself, by DMA
+    /// through the PCIe tile (`tt_isa::dm::op::HOST_READ`): pinned memory on
+    /// silicon, a region the simulator's DMA callbacks serve on ttsim. A
+    /// transport without it says so rather than pretending.
+    fn host_memory(&mut self, len: usize) -> Result<Box<dyn HostMemory>> {
+        let _ = len;
+        Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this transport has no host memory for the card to reach",
+        )))
     }
 
     /// Read a single dword from a BAR.

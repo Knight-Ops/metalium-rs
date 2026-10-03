@@ -328,6 +328,14 @@ pub struct Session<T: Transport> {
     scatter_on_nc: Option<&'static [u8]>,
     /// [`Session::host_times`].
     host: HostTimes,
+    /// Host memory the card moves tensors through ([`Session::host_dma`]),
+    /// pinned on first use; `Err` once it could not be, with why.
+    staging: Option<Result<Box<dyn tt_device::HostMemory>, String>>,
+    /// Whether tensor transfers go through `staging` where they can.
+    host_dma: bool,
+    /// While set, queued work takes no barrier: a host DMA transfer, which
+    /// the session syncs on at once, so nothing can run past it.
+    unbarriered: bool,
     /// [`Session::pipelined_blocks`].
     pipelined: u64,
     /// [`Session::set_profile_roles`].
@@ -408,6 +416,47 @@ struct QueuedList {
     number: u32,
     kernels: bool,
     what: &'static str,
+}
+
+/// The host memory a session pins for the card's DMA of tensors: one 1 GiB
+/// hugepage on silicon (`tt_kmd::host`); a transfer larger moves in parts.
+const HOST_DMA_STAGING: usize = 1 << 30;
+
+/// Fewest tiles an upload or write takes by the card's DMA: below, the BAR's
+/// stores (~27 us a tile here) beat a list's round trip and the sync.
+const HOST_DMA_MIN_UPLOAD: usize = 4;
+
+/// What an upload or write takes: FP32 values, or any element's datums as
+/// their bits -- tilized from either without converting the other.
+#[derive(Copy, Clone)]
+enum Src<'a> {
+    F32(&'a [f32]),
+    Bits(&'a [u32]),
+}
+
+impl Src<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Src::F32(v) => v.len(),
+            Src::Bits(v) => v.len(),
+        }
+    }
+
+    fn bits(&self) -> Option<&[u32]> {
+        match self {
+            Src::F32(_) => None,
+            Src::Bits(v) => Some(v),
+        }
+    }
+
+    /// `t`'s tiles `tiles` into `out`, one every `stride` bytes.
+    fn tilize(&self, t: &DramTensor, tiles: std::ops::Range<usize>, out: &mut [u8], stride: usize) {
+        use crate::matmul::tilize_into;
+        match *self {
+            Src::F32(v) => tilize_into(|i| v[i].to_bits(), t.rows, t.cols, tiles, out, stride),
+            Src::Bits(v) => tilize_into(|i| v[i], t.rows, t.cols, tiles, out, stride),
+        }
+    }
 }
 
 /// Where the host's time goes queueing ops ([`Session::host_times`],
@@ -1206,6 +1255,9 @@ impl<T: Transport> Session<T> {
             pipeline: true,
             scatter_on_nc: None,
             host: HostTimes::new(),
+            staging: None,
+            host_dma: true,
+            unbarriered: false,
             pipelined: 0,
             profile_roles: true,
             drains: 0,
@@ -1475,11 +1527,7 @@ impl<T: Transport> Session<T> {
         rows: usize,
         cols: usize,
     ) -> Result<DramTensor, TensorError> {
-        let Session { dev, dram, .. } = self;
-        let d = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        DramTensor::upload(dev, &d.w4, &mut d.alloc, values, rows, cols)
+        self.upload_src(Src::F32(values), rows, cols, crate::tensor::Elem::F32)
     }
 
     /// Upload a row-major `[rows, cols]` matrix of `elem` datums, as their
@@ -1491,17 +1539,58 @@ impl<T: Transport> Session<T> {
         cols: usize,
         elem: crate::tensor::Elem,
     ) -> Result<DramTensor, TensorError> {
+        self.upload_src(Src::Bits(values), rows, cols, elem)
+    }
+
+    fn upload_src(
+        &mut self,
+        values: Src<'_>,
+        rows: usize,
+        cols: usize,
+        elem: crate::tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        if values.len() != rows * cols {
+            return Err(TensorError::Shape(format!(
+                "{} values for a [{rows}, {cols}] tensor",
+                values.len()
+            )));
+        }
+        let t = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)?;
+        if let Err(e) = self.write_src(&t, values) {
+            let _ = self.free(t);
+            return Err(e);
+        }
+        Ok(t)
+    }
+
+    /// `values` into `t`'s slots: by the card from pinned host memory where
+    /// it can ([`Session::set_host_dma`]), else through the BAR.
+    fn write_src(&mut self, t: &DramTensor, values: Src<'_>) -> Result<(), TensorError> {
+        t.check_write(values.len(), values.bits())?;
+        let [rt, ct] = t.grid();
+        let tiles = rt * ct;
+        if tiles >= HOST_DMA_MIN_UPLOAD && self.capture.is_none() {
+            if let Some(()) = self.dma_upload(t, values, tiles)? {
+                t.set_pad(tensor::Pad::Zero);
+                return Ok(());
+            }
+        }
+        let mut images = vec![0u8; tiles * crate::matmul::TILE_IMAGE_BYTES];
+        values.tilize(t, 0..tiles, &mut images, crate::matmul::TILE_IMAGE_BYTES);
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        DramTensor::upload_bits(dev, &d.w4, &mut d.alloc, values, rows, cols, elem)
+        t.write_images(dev, &d.w4, &images)
     }
 
     /// Download a tensor of any element type to row-major datums' bits.
     pub fn download_bits(&mut self, t: &DramTensor) -> Result<Vec<u32>, TensorError> {
         self.refuse_while_capturing("download")?;
         self.sync()?;
+        if let Some(v) = self.dma_download(t)? {
+            return Ok(v.iter().map(|v| v.to_bits()).collect());
+        }
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
@@ -1511,13 +1600,124 @@ impl<T: Transport> Session<T> {
 
     /// Download a tensor to row-major values.
     pub fn download(&mut self, t: &DramTensor) -> Result<Vec<f32>, TensorError> {
+        t.expect("a download as FP32 values", tensor::Elem::F32)?;
         self.refuse_while_capturing("download")?;
         self.sync()?;
+        if let Some(v) = self.dma_download(t)? {
+            return Ok(v);
+        }
         let Session { dev, dram, .. } = self;
         let d = dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
         t.download(dev, &d.w4)
+    }
+
+    /// Move tensors between the host and GDDR by the card's own DMA, through
+    /// pinned host memory (`Transport::host_memory`, one 1 GiB hugepage on
+    /// silicon), rather than the host's stores and loads through a BAR: on
+    /// card 0, ~20 GB/s up and ~27 down against 0.15 and 0.04 through this
+    /// VM's uncached BAR (`silicon_bench_host_dma`). On by default; where no
+    /// host memory can be pinned, transfers take the BAR and the reason is
+    /// said once.
+    pub fn set_host_dma(&mut self, on: bool) {
+        self.host_dma = on;
+    }
+
+    /// The pinned staging buffer, pinned on first use; `None` (said once) if
+    /// it cannot be, or host DMA is off.
+    fn staging(&mut self) -> Option<&mut Box<dyn tt_device::HostMemory>> {
+        if !self.host_dma {
+            return None;
+        }
+        if self.staging.is_none() {
+            let got = self
+                .dev
+                .transport()
+                .host_memory(HOST_DMA_STAGING)
+                .map_err(|e| e.to_string());
+            if let Err(e) = &got {
+                eprintln!(
+                    "session: tensor transfers go through the BAR, not the card's DMA: \
+                     no host memory for it ({e})"
+                );
+            }
+            self.staging = Some(got);
+        }
+        self.staging.as_mut().and_then(|s| s.as_mut().ok())
+    }
+
+    /// [`Session::write_bits_any`] by the card: `images` staged in host
+    /// memory, each unit moving its share to GDDR. `None` if there is no
+    /// host memory. Waits for what is queued first, and for the moves.
+    fn dma_upload(
+        &mut self,
+        t: &DramTensor,
+        values: Src<'_>,
+        tiles: usize,
+    ) -> Result<Option<()>, TensorError> {
+        if self.staging().is_none() {
+            return Ok(None);
+        }
+        self.sync()?;
+        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
+        for first in (0..tiles).step_by(per) {
+            let n = (tiles - first).min(per);
+            let host = self.staging().expect("checked above");
+            // Tilized straight into the pinned memory the card reads.
+            host.with_bytes(&mut |buf| {
+                values.tilize(t, first..first + n, buf, tt_isa::dm::TILE_SLOT as usize)
+            });
+            let base = host.noc_address();
+            let slots: Vec<_> = (first..first + n).map(|k| t.slot(k)).collect();
+            let jobs = tensor::host_dma_jobs(&slots, true, base, self.units.len());
+            self.submit_dma(jobs)?;
+        }
+        Ok(Some(()))
+    }
+
+    /// Run a transfer's jobs to their end, without a barrier (nothing is
+    /// queued behind them before the sync).
+    fn submit_dma(&mut self, jobs: Vec<tensor::Job>) -> Result<(), TensorError> {
+        self.unbarriered = true;
+        let r = self.submit_jobs(jobs, RESET_BUDGET);
+        self.unbarriered = false;
+        r?;
+        self.sync()
+    }
+
+    /// A download by the card: each unit moves its share of `t`'s tiles' datums
+    /// to host memory. `None` if there is no host memory (or a capture is on).
+    /// The caller has synced.
+    fn dma_download(&mut self, t: &DramTensor) -> Result<Option<Vec<f32>>, TensorError> {
+        if self.capture.is_some() || self.staging().is_none() {
+            return Ok(None);
+        }
+        let [rt, ct] = t.grid();
+        let tiles = rt * ct;
+        let per = HOST_DMA_STAGING / tt_isa::dm::TILE_SLOT as usize;
+        let mut out = vec![0f32; t.rows * t.cols];
+        for first in (0..tiles).step_by(per) {
+            let n = (tiles - first).min(per);
+            let base = self.staging().expect("checked above").noc_address();
+            let slots: Vec<_> = (first..first + n).map(|k| t.slot(k)).collect();
+            let jobs = tensor::host_dma_jobs(&slots, false, base, self.units.len());
+            self.submit_dma(jobs)?;
+            let host = self.staging().expect("checked above");
+            // Detilized straight out of the pinned memory the card wrote.
+            host.with_bytes(&mut |buf| {
+                crate::matmul::detilize_from(
+                    buf,
+                    tt_isa::dm::TILE_SLOT as usize,
+                    tt_isa::dm::TILE_DATA as usize,
+                    t.rows,
+                    t.cols,
+                    first..first + n,
+                    &mut out,
+                )
+            });
+        }
+        Ok(Some(out))
     }
 
     /// Every datum of every tile of `t`, padding included, row-major
@@ -1772,7 +1972,7 @@ impl<T: Transport> Session<T> {
         // own was a second enqueue a unit an op, half the host's time on
         // many tiles (checklist 9.17) -- except while capturing, whose
         // streams take it as an entry of its own.
-        let barrier = (n > 1).then(|| {
+        let barrier = (n > 1 && !self.unbarriered).then(|| {
             self.barriers = self.barriers.wrapping_add(1);
             let target = self.barriers.wrapping_mul(n as u32);
             let c = self.units[0].tile;
@@ -2459,12 +2659,9 @@ impl<T: Transport> Session<T> {
     /// between replays. Waits for what is queued, which may read it.
     pub fn write(&mut self, t: &DramTensor, values: &[f32]) -> Result<(), TensorError> {
         self.refuse_while_capturing("write")?;
+        t.expect("a write of FP32 values", tensor::Elem::F32)?;
         self.sync()?;
-        let Session { dev, dram, .. } = self;
-        let d = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        t.write(dev, &d.w4, values)
+        self.write_src(t, Src::F32(values))
     }
 
     /// Free GDDR bytes on the fullest channel.

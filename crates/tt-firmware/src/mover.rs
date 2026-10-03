@@ -422,6 +422,13 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             launch(generation, programs);
         }
         Entry::KernelWait { generation } => await_roles(generation)?,
+        Entry::Host {
+            write,
+            host_lo,
+            host_hi,
+            l1,
+            len,
+        } => host_move(me, write, host_lo, host_hi, l1, len),
         Entry::Signal => signal(),
         Entry::WaitPeer { peer, target } => wait_peer(peer, target)?,
         Entry::Fill { value, param, dst } => {
@@ -432,6 +439,25 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
     }
     Ok(())
+}
+
+/// `dm::op::HOST_READ` / `HOST_WRITE`: the move's requests to the PCIe tile,
+/// in flight like any other move's.
+#[cold]
+#[inline(never)]
+fn host_move(me: (u8, u8), write: bool, host_lo: u32, host_hi: u32, l1: u32, len: u32) {
+    let mv = tt_isa::noc::niu::HostMove {
+        host_lo,
+        host_hi,
+        l1,
+        len,
+        write,
+        me,
+        txn: TXN,
+    };
+    for r in mv.words() {
+        noc::issue_host(r, TXN);
+    }
 }
 
 /// `dm::op::SIGNAL`: once everything before it has landed, one more on this

@@ -218,6 +218,10 @@ fn require_dword(offset: u64, len: u64) -> std::result::Result<(), &'static str>
 }
 
 impl Transport for LibTtsim<'_> {
+    fn host_memory(&mut self, len: usize) -> Result<Box<dyn tt_device::HostMemory>> {
+        Ok(Box::new(crate::host::SimHostMemory::new(len)))
+    }
+
     fn bar_read(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> Result<()> {
         Self::validate(bar, offset, dst.len() as u64, Dir::Read)?;
         // SAFETY: the access has been validated against libttsim's decode map, and

@@ -776,10 +776,131 @@ pub fn tilize_f32(
 /// 1024 datums.
 pub const TILE_IMAGE_BYTES: usize = 16 + 1024 * 4;
 
+/// [`tilize_f32`] for FP32 tiles, as one copy pattern: each 32x32 tile, in
+/// row-major tile order, its 16-byte header then four 16x16 faces (top left,
+/// top right, bottom left, bottom right), each row-major; zeros past `rows`
+/// and `cols`. `tt_layout`'s tilizer handles every format element by element,
+/// ~18 us a tile on the host -- more than the card's DMA takes to move it
+/// (`silicon_bench_host_dma::session_transfers`). Checked against it
+/// (`fast_tilize_is_tt_layouts`).
+pub fn tilize_f32_fp32(values: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(values.len(), rows * cols);
+    let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+    let mut out = vec![0u8; tiles * TILE_IMAGE_BYTES];
+    tilize_into(
+        |i| values[i].to_bits(),
+        rows,
+        cols,
+        0..tiles,
+        &mut out,
+        TILE_IMAGE_BYTES,
+    );
+    out
+}
+
+/// Tiles `tiles` of a row-major `[rows, cols]` matrix of 32-bit datums
+/// (`get(i)` is datum `i`'s bits), as [`tilize_f32_fp32`] lays each out, into
+/// `out` one every `stride` bytes from its start: straight into the pinned
+/// buffer a DMA upload sends from, with no copy of its own.
+pub fn tilize_into(
+    get: impl Fn(usize) -> u32,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [u8],
+    stride: usize,
+) {
+    let ct = cols.div_ceil(32).max(1);
+    let header = fp32_tile_header();
+    for (n, t) in tiles.enumerate() {
+        let image = &mut out[n * stride..][..TILE_IMAGE_BYTES];
+        let (i, j) = (t / ct, t % ct);
+        image[..16].copy_from_slice(&header);
+        for face in 0..4 {
+            let (fr, fc) = (face / 2, face % 2);
+            let col0 = 32 * j + 16 * fc;
+            let n = cols.saturating_sub(col0).min(16);
+            for r in 0..16 {
+                let row = 32 * i + 16 * fr + r;
+                let at = 16 + (face * 256 + r * 16) * 4;
+                let dst = &mut image[at..at + 64];
+                if row >= rows || n == 0 {
+                    dst.fill(0);
+                    continue;
+                }
+                let base = row * cols + col0;
+                for k in 0..16 {
+                    let v = if k < n { get(base + k) } else { 0 };
+                    dst[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// The header `tt_layout` gives every FP32 tile.
+fn fp32_tile_header() -> [u8; 16] {
+    use std::sync::OnceLock;
+    static HEADER: OnceLock<[u8; 16]> = OnceLock::new();
+    *HEADER.get_or_init(|| {
+        let (image, _) = tilize_f32(&[0.0; 1024], 32, 32, L1Format::Fp32);
+        image[..16].try_into().unwrap()
+    })
+}
+
 /// Row-major `[rows, cols]` FP32 values from packed output tiles: each tile's
 /// 1024 datums as [`tile_roles`] packs them, with no header, one after another
-/// in the layout's tile order.
+/// in row-major tile order -- [`tilize_f32_fp32`]'s faces, read back.
 pub fn detilize_packed(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+    assert!(packed.len() >= tiles * 4096, "not enough packed tiles");
+    let mut out = vec![0f32; rows * cols];
+    detilize_from(packed, 4096, 0, rows, cols, 0..tiles, &mut out);
+    out
+}
+
+/// Tiles `tiles` of a `[rows, cols]` matrix into row-major `out`, from
+/// `src`: tile `first + n`'s 1024 datums at `n * stride + skip` -- straight
+/// out of the pinned buffer a DMA download lands in.
+pub fn detilize_from(
+    src: &[u8],
+    stride: usize,
+    skip: usize,
+    rows: usize,
+    cols: usize,
+    tiles: std::ops::Range<usize>,
+    out: &mut [f32],
+) {
+    let ct = cols.div_ceil(32).max(1);
+    for (n, t) in tiles.enumerate() {
+        let (i, j) = (t / ct, t % ct);
+        let tile = &src[n * stride + skip..][..4096];
+        for face in 0..4 {
+            let (fr, fc) = (face / 2, face % 2);
+            let col0 = 32 * j + 16 * fc;
+            if col0 >= cols {
+                continue;
+            }
+            let m = (cols - col0).min(16);
+            for r in 0..16 {
+                let row = 32 * i + 16 * fr + r;
+                if row >= rows {
+                    break;
+                }
+                let at = (face * 256 + r * 16) * 4;
+                for (k, v) in out[row * cols + col0..][..m].iter_mut().enumerate() {
+                    let b = &tile[at + 4 * k..at + 4 * k + 4];
+                    *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+            }
+        }
+    }
+}
+
+/// [`detilize_packed`] through `tt_layout`'s detilizer: the oracle the fast
+/// one is checked against.
+#[cfg(test)]
+fn detilize_packed_generic(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     use tt_layout::{detilize, HostDtype, Layout, TensorViewMut};
     let layout = Layout::tt_metal_32x32(L1Format::Fp32, HostDtype::F32, [1, rows, cols]).unwrap();
     let mut images = Vec::with_capacity(layout.total_bytes());
@@ -1665,6 +1786,67 @@ mod loop_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_layout {
+    use super::*;
+
+    fn values(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32) * 0.5 - 7.25).collect()
+    }
+
+    #[test]
+    fn fast_tilize_is_tt_layouts() {
+        for (rows, cols) in [
+            (1usize, 1usize),
+            (32, 32),
+            (64, 784),
+            (33, 17),
+            (100, 70),
+            (7, 129),
+        ] {
+            let v = values(rows * cols);
+            let (want, _) = tilize_f32(&v, rows, cols, L1Format::Fp32);
+            assert!(tilize_f32_fp32(&v, rows, cols) == want, "[{rows}, {cols}]");
+        }
+    }
+
+    /// `cargo test --release -p tt-kernels --lib tilize_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn tilize_speed() {
+        let (rows, cols) = (1024, 1024);
+        let v = values(rows * cols);
+        let t = std::time::Instant::now();
+        let bits: Vec<u32> = v.iter().map(|x| x.to_bits()).collect();
+        let back: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+        println!("to_bits and back {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let img = tilize_f32_fp32(&back, rows, cols);
+        println!("tilize {:?} ({} B)", t.elapsed(), img.len());
+    }
+
+    #[test]
+    fn fast_detilize_is_tt_layouts() {
+        for (rows, cols) in [
+            (1usize, 1usize),
+            (32, 32),
+            (64, 784),
+            (33, 17),
+            (100, 70),
+            (7, 129),
+        ] {
+            let (rt, ct) = (rows.div_ceil(32), cols.div_ceil(32));
+            let packed: Vec<u8> = (0..rt * ct * 4096).map(|i| (i * 31 % 251) as u8).collect();
+            let a = detilize_packed(&packed, rows, cols);
+            let b = detilize_packed_generic(&packed, rows, cols);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "[{rows}, {cols}]"
+            );
         }
     }
 }

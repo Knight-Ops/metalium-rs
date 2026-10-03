@@ -23,6 +23,7 @@
 //!   closes.
 
 pub mod abi;
+pub mod host;
 pub mod ioctl;
 pub mod mapping;
 
@@ -243,6 +244,12 @@ impl Kmd {
         })
     }
 
+    /// `len` bytes of host memory pinned for the card's NoC ([`host::HostBuffer`]).
+    pub fn pin_host(&self, len: usize) -> Result<host::HostBuffer, TransportError> {
+        let fd = self.fd.try_clone()?;
+        Ok(host::HostBuffer::pin(fd, len)?)
+    }
+
     /// The PCI address of this card, as sysfs spells it.
     pub fn bdf(&self) -> &str {
         &self.bdf
@@ -378,7 +385,29 @@ fn check_bounds(bar: Bar, offset: u64, len: usize) -> tt_device::Result<()> {
     }
 }
 
+impl tt_device::HostMemory for host::HostBuffer {
+    fn noc_address(&self) -> u64 {
+        host::HostBuffer::noc_address(self)
+    }
+    fn len(&self) -> usize {
+        host::HostBuffer::len(self)
+    }
+    fn read(&self, offset: usize, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.as_slice()[offset..offset + dst.len()]);
+    }
+    fn write(&mut self, offset: usize, src: &[u8]) {
+        self.as_mut_slice()[offset..offset + src.len()].copy_from_slice(src);
+    }
+    fn with_bytes(&mut self, f: &mut dyn FnMut(&mut [u8])) {
+        f(self.as_mut_slice())
+    }
+}
+
 impl Transport for Kmd {
+    fn host_memory(&mut self, len: usize) -> tt_device::Result<Box<dyn tt_device::HostMemory>> {
+        Ok(Box::new(self.pin_host(len)?))
+    }
+
     fn bar_read(&mut self, bar: Bar, offset: u64, dst: &mut [u8]) -> tt_device::Result<()> {
         let end = offset
             .checked_add(dst.len() as u64)

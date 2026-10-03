@@ -637,6 +637,36 @@ pub mod noc {
         in_flight(niu, txn).after_issue();
     }
 
+    /// One request of a `tt_isa::noc::niu::HostMove` through NoC #0, under
+    /// `txn`: [`issue_dram_on`] with the high address words a host address
+    /// needs. Cold: host moves are not the per-tile path.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_host(r: tt_isa::noc::niu::HostRequest, txn: TxnId) {
+        use initiator::*;
+        let niu = Niu::Noc0;
+        if in_flight(niu, txn).at_cap() {
+            make_room(niu, txn);
+        }
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(niu, CMD_CTRL)) & 1 != 0 {}
+            write_volatile(reg(niu, TARG_ADDR_LO), r.targ);
+            write_volatile(reg(niu, TARG_ADDR_MID), r.targ_mid);
+            write_volatile(reg(niu, TARG_ADDR_HI), r.targ_hi);
+            write_volatile(reg(niu, RET_ADDR_LO), r.ret);
+            write_volatile(reg(niu, RET_ADDR_MID), r.ret_mid);
+            write_volatile(reg(niu, RET_ADDR_HI), r.ret_hi);
+            write_volatile(reg(niu, PACKET_TAG), r.tag);
+            write_volatile(reg(niu, CTRL), r.ctrl);
+            write_volatile(reg(niu, AT_LEN_BE), r.len);
+            write_volatile(reg(niu, AT_DATA), 0);
+            write_volatile(reg(niu, CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
     /// Issue one request already encoded -- by `Command::registers`, or by a
     /// `tt_isa::noc::niu::DramMove`, which checks a whole move once (the
     /// mover's per-entry path) -- under `txn`, through NoC #1 (`NOC1`) or
