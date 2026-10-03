@@ -951,6 +951,14 @@ pub fn kmd_engine(
             Ok("0") => session.set_pipeline(false),
             Ok(v) => return Err(EngineError(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
+        // `TT_HOST_DMA=0`: tensors cross PCIe by the host's own stores and
+        // loads through a BAR, not the card's DMA through pinned host memory
+        // (`Session::set_host_dma`).
+        match std::env::var("TT_HOST_DMA").as_deref() {
+            Err(_) | Ok("1") => {}
+            Ok("0") => session.set_host_dma(false),
+            Ok(v) => return Err(EngineError(format!("TT_HOST_DMA={v}: expected 0 or 1"))),
+        }
         // `TT_SCATTER=nc`: pipelined ops write their outputs out from each
         // tile's RISCV NC while B gathers (`Session::set_scatter_mover`);
         // `b`, the default, keeps every move on B.
