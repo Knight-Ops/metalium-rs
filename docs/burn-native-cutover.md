@@ -39,12 +39,23 @@ NaNs for rank-one/two F32 input with I32 output and axes up to 2^23 elements.
 
 Boolean equality, Boolean-to-F32/I32 conversions, and I32/Boolean expansion
 run natively. Boolean-to-F32 also enables Burn's default float `any`/`all`
-through the supported dimensional and full sums. `float_permute` creates
+through native dimensional and full sums. `float_permute` creates
 strided views through dimension swaps; downstream operations retain the
-existing whole-tile materialization limits. `step66_burn_small_ops` checks
+native whole-tile copies or ragged word repacking. `step66_burn_small_ops` checks
 parity, residency and strict-mode execution and belongs to the silicon smoke
 suite. Burn's minimum defaults now compose argmin and gather, retaining the
 existing gather axes and signed-zero limitation.
+
+## General reductions and K blocking (silicon pending)
+
+F32 sum/mean/max dimensional reductions accept arbitrary axes and ragged
+rank-N views through native word repacking. Long sums/maxima carry the
+unfolded accumulator between chunks. Ordinary and supported tile-aligned
+batched resident matmuls now support K beyond one L1 block by reloading
+FP32 partial accumulators in original product order. `step67`/`step68`
+validate simulator execution, residency, numerical models, autodiff and
+changed-input traces; both-card silicon and release benchmarks remain pending.
+Other reduction kinds and untiled batched matmul remain separate work.
 
 ## Tenstorrent BFP formats
 

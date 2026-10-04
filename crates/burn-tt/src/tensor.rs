@@ -280,10 +280,9 @@ impl TtTensor {
         }
     }
 
-    /// Can view `v` be made a plain matrix on the card, by whole-tile moves?
-    fn materialises_on_device(&self, v: &Strided) -> bool {
-        let shape = self.cell.shape.to_vec();
-        v.tile_moves(&shape, &shape).is_some()
+    /// Can this view be materialized by native copies or word repacking?
+    fn materialises_on_device(&self, _v: &Strided) -> bool {
+        self.is_storable() && server::supports_dram(self.device)
     }
 
     /// A strided view's elements, on the host: its source downloaded and
@@ -335,6 +334,21 @@ impl TtTensor {
                         transposed: false,
                     };
                 }
+                let sources = (0..self.cell.shape.num_elements())
+                    .map(|f| v.at(&shape, f))
+                    .collect();
+                let (id, dims) =
+                    server::repack(self.device, v.src.buffer.id, sources, [rows, cols]);
+                return DramRef {
+                    buffer: Arc::new(Buffer {
+                        id,
+                        device: self.device,
+                        rows: dims[0],
+                        cols: dims[1],
+                        parent: None,
+                    }),
+                    transposed: false,
+                };
             }
             let data = self.host().clone().into_data();
             let id = match device_elem(self.cell.dtype) {

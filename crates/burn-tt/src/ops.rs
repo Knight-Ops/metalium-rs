@@ -946,9 +946,9 @@ pub mod float {
 
     /// A reshape of a device-resident F32 tensor (or a view) that changes the
     /// matrix it is stored as: a view when strides still express it -- the
-    /// heads split out of a projection -- else, when it moves whole tiles, a
-    /// copy on the card into the new matrix (the heads merged back), else
-    /// `None`. A reshape that keeps a plain tensor's matrix is
+    /// heads split out of a projection -- else a native copy/repack into the
+    /// new matrix. Invalid shapes return `None`. A reshape that keeps a plain
+    /// tensor's matrix is
     /// [`reshaped`]'s.
     fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
         if tensor.dtype() != DType::F32 {
@@ -963,9 +963,13 @@ pub mod float {
         if let Some(r) = v.reshaped(&from, &to) {
             return Some(TtTensor::view(r, shape.clone(), tensor.device));
         }
-        let moves = v.tile_moves(&from, &to)?;
         let dims = crate::tensor::stored_dims(&to)?;
-        let (id, dims) = crate::server::copy_blocks(tensor.device, v.src.buffer.id, moves, dims);
+        let (id, dims) = if let Some(moves) = v.tile_moves(&from, &to) {
+            crate::server::copy_blocks(tensor.device, v.src.buffer.id, moves, dims)
+        } else {
+            let sources = (0..from.iter().product()).map(|f| v.at(&from, f)).collect();
+            crate::server::repack(tensor.device, v.src.buffer.id, sources, dims)
+        };
         Some(device_result_shaped(
             tensor.device,
             id,
@@ -1139,17 +1143,11 @@ pub mod float {
         // Other views must be materialisable on the card.
         let d = match tensor.as_strided() {
             Some(view) if view.covers_source(&shape) => view.src.clone(),
-            Some(view) => {
-                assert!(
-                    view.tile_moves(&shape, &shape).is_some(),
-                    "{op}: this view cannot be materialized by the native block copier",
-                );
-                tensor.to_dram().clone()
-            }
-            None => tensor.to_dram().clone(),
+            _ => tensor.to_dram().clone(),
         };
-        // The column kernel requires its inputs to fit one L1 run. Use
-        // the existing bounded reduction chunk size for wider matrices;
+        // Preserve the full-sum's established scalar chunk order, even
+        // though dimensional column reductions now support continuations.
+        // Use the existing bounded chunk size for wider matrices;
         // block copies preserve ragged edges. The row sum already streams
         // long columns. Combine partial scalars in ascending column order.
         let max_cols = 32 * tt_kernels::sfpu::reduce::ROW_CHUNK;
@@ -1218,10 +1216,17 @@ pub mod float {
         acc.expect("a nonempty stored matrix has at least one column chunk")
     }
 
+    fn check_reduce_dim(tensor: &TtTensor, dim: usize, op: &str) {
+        if dim >= tensor.shape().num_dims() || !tensor.is_stored_f32() {
+            fail(op, format_args!("{}, axis={dim}", context(tensor)));
+        }
+    }
+
     /// The sum over rows (`dim` 0) of a matrix on the device stays there, in
     /// Flex's order (`tt_kernels::sfpu::reduce::accumulate_in_order`).
     /// Unsupported inputs fail with metadata.
     pub fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        check_reduce_dim(&tensor, dim, "float_sum_dim");
         use tt_kernels::sfpu::reduce::ReduceOp;
         if let Some(t) = device_reduce(&tensor, ReduceOp::Sum, dim) {
             return t;
@@ -1241,6 +1246,7 @@ pub mod float {
     /// division, inside the sum's own bound), when the tensor is on the
     /// device; supported host inputs upload as needed.
     pub fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        check_reduce_dim(&tensor, dim, "float_mean_dim");
         let n = tensor.shape().to_vec()[dim];
         <TtBackend as FloatTensorOps<TtBackend>>::float_mul_scalar(
             float_sum_dim(tensor, dim),
@@ -1251,6 +1257,7 @@ pub mod float {
     /// The maximum along `dim` of a device-resident matrix, on the SFPU
     /// (exactly Flex's value; `step31_reduce`), unsupported inputs fail.
     pub fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        check_reduce_dim(&tensor, dim, "float_max_dim");
         use tt_kernels::sfpu::reduce::ReduceOp;
         if let Some(t) = device_reduce(&tensor, ReduceOp::Max, dim) {
             return t;
@@ -1261,12 +1268,10 @@ pub mod float {
         )
     }
 
-    /// `tensor` reduced along `dim` on the device, if it is device-resident
-    /// F32 (not a transposed view), on the SFPU (`Session::reduce`): a
-    /// matrix along either dim, a tensor of any rank along its last -- the
-    /// columns of the matrix it is stored as (softmax's and layer norm's
-    /// statistics over `[b, s, d]` or `[b, h, s, s]`). A sum over a matrix's
-    /// rows is in Flex's order; the rest as `sfpu::reduce` computes them.
+    /// `tensor` reduced along `dim` on the SFPU (`Session::reduce`):
+    /// every logical axis of a nonempty F32 tensor. Matrix axes and existing
+    /// leading sums retain their order; other axes repack into matrix rows
+    /// and use the SFPU column fold. Only address metadata is host-side.
     pub(crate) fn device_reduce(
         tensor: &TtTensor,
         op: tt_kernels::sfpu::reduce::ReduceOp,
@@ -1286,7 +1291,7 @@ pub mod float {
         use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
         let shape = tensor.shape().to_vec();
         let rank = shape.len();
-        if rank < 2 || dim + 1 >= rank || !tensor.is_stored_f32() {
+        if rank < 2 || dim >= rank || dim + 1 >= rank || !tensor.is_stored_f32() {
             return None;
         }
         if shape[..dim].iter().any(|&d| d != 1) || !crate::server::supports_dram(tensor.device) {
@@ -1341,28 +1346,88 @@ pub mod float {
         op: tt_kernels::sfpu::reduce::ReduceOp,
         dim: usize,
     ) -> Option<TtTensor> {
-        use tt_kernels::sfpu::reduce::Axis;
+        use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
         let device = tensor.device;
         let rank = tensor.shape().num_dims();
         if !tensor.is_stored_f32() || !crate::server::supports_dram(device) {
             return None;
         }
-        let axis = if rank == 2 && dim == 0 {
-            Axis::Rows
-        } else if dim + 1 == rank {
-            Axis::Cols
-        } else {
+        let shape = tensor.shape().to_vec();
+        if dim >= rank || shape.contains(&0) {
             return None;
-        };
-        let d = Some(tensor.to_dram()).filter(|d| !d.transposed)?;
-        let (id, dims) = crate::server::reduce(device, d.buffer.id, op, axis);
-        let mut shape = tensor.shape().to_vec();
-        shape[dim] = 1;
+        }
+        // Retain the existing in-order leading-sum path when it applies.
+        if op == ReduceOp::Sum && rank > 2 && dim + 1 < rank {
+            if let Some(t) = device_sum_leading(tensor, dim) {
+                return Some(t);
+            }
+        }
+        let mut out_shape = shape.clone();
+        out_shape[dim] = 1;
+        let physical = crate::tensor::stored_dims(&out_shape)?;
+        if (rank == 2 && dim == 0) || dim + 1 == rank {
+            let d = plain_dram(tensor);
+            let axis = if rank == 2 && dim == 0 {
+                Axis::Rows
+            } else {
+                Axis::Cols
+            };
+            let (id, dims) = crate::server::reduce(device, d.buffer.id, op, axis);
+            return Some(device_result_shaped(
+                device,
+                id,
+                dims,
+                burn_backend::Shape::from(out_shape),
+                DType::F32,
+            ));
+        }
+        // Rows enumerate unreduced indices in logical order, columns the
+        // reduced axis. Construct only addresses on the caller's thread.
+        let view = tensor
+            .as_strided()
+            .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+        let outputs = out_shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))?;
+        let count = outputs.checked_mul(shape[dim])?;
+        let mut sources = Vec::with_capacity(count);
+        for output in 0..outputs {
+            let mut remaining = output;
+            let mut indices = vec![0; rank];
+            for k in (0..rank).rev() {
+                indices[k] = remaining % out_shape[k];
+                remaining /= out_shape[k];
+            }
+            for index in 0..shape[dim] {
+                indices[dim] = index;
+                let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+                sources.push(view.at(&shape, flat));
+            }
+        }
+        let (id, dims) =
+            crate::server::repack(device, view.src.buffer.id, sources, [outputs, shape[dim]]);
+        let packed = device_result(device, id, dims);
+        let (id, dims) = crate::server::reduce(device, packed.to_dram().buffer.id, op, Axis::Cols);
+        let reduced = device_result(device, id, dims);
+        if physical == dims {
+            return Some(TtTensor::on_device(
+                reduced.to_dram().clone(),
+                burn_backend::Shape::from(out_shape),
+                DType::F32,
+                device,
+            ));
+        }
+        let (id, dims) = crate::server::repack(
+            device,
+            reduced.to_dram().buffer.id,
+            (0..outputs).map(|i| [i, 0]).collect(),
+            physical,
+        );
         Some(device_result_shaped(
             device,
             id,
             dims,
-            burn_backend::Shape::from(shape),
+            burn_backend::Shape::from(out_shape),
             DType::F32,
         ))
     }

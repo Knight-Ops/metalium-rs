@@ -115,6 +115,15 @@ pub trait Engine {
     }
     /// A new `dims` buffer assembled from blocks of `a`
     /// (`Session::copy_blocks`).
+    /// Bit-preserving native repack from source coordinates in output order.
+    fn repack(
+        &mut self,
+        _a: BufferId,
+        _sources: &[[usize; 2]],
+        _dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     fn copy_blocks(
         &mut self,
         _a: BufferId,
@@ -476,6 +485,20 @@ impl DramBuffers {
         let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
         let c = s
             .rows_add(&tt, indices, &tv)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(c))
+    }
+
+    pub fn repack<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        sources: &[[usize; 2]],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let ta = self.get(a)?.clone();
+        let c = s
+            .repack(&ta, sources, dims)
             .map_err(|e| EngineError(e.to_string()))?;
         Ok(self.insert(c))
     }
@@ -1179,6 +1202,21 @@ pub(crate) fn copy_blocks(
     )
 }
 
+pub(crate) fn repack(
+    device: TtDevice,
+    a: BufferId,
+    sources: Vec<[usize; 2]>,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "repack",
+        device,
+        dims,
+        || "native repack".into(),
+        move |engine, ids| engine.repack(ids.get(a)?, &sources, dims),
+    )
+}
+
 // --- Silicon ------------------------------------------------------------------
 
 /// The silicon engine: a [`Session`] on `/dev/tenstorrent/N`.
@@ -1321,6 +1359,15 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.copy_blocks(&mut self.session, a, moves, dims)
+    }
+    fn repack(
+        &mut self,
+        a: BufferId,
+        sources: &[[usize; 2]],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.repack(&mut self.session, a, sources, dims)
     }
     fn gather_rows(
         &mut self,
@@ -1672,6 +1719,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = &mut self.buffers;
         bufs.copy_blocks(self.fabric.chips[0].session(), a, moves, dims)
+    }
+    fn repack(
+        &mut self,
+        a: BufferId,
+        sources: &[[usize; 2]],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .repack(self.fabric.chips[0].session(), a, sources, dims)
     }
     fn gather_rows(
         &mut self,

@@ -292,6 +292,14 @@ fn attach_engine(
                 c.budget,
             )
         }
+        fn repack(
+            &mut self,
+            a: burn_tt::BufferId,
+            sources: &[[usize; 2]],
+            dims: [usize; 2],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.repack(&mut self.session, a, sources, dims)
+        }
         fn copy_blocks(
             &mut self,
             a: burn_tt::BufferId,

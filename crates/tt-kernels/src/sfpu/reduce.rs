@@ -502,6 +502,42 @@ pub fn chunk_roles(
     })
 }
 
+/// Continuation of a bounded reduction, preserving the unfolded accumulator.
+#[allow(clippy::too_many_arguments)]
+pub fn continuation_roles(
+    c: &ChunkLayout,
+    op: ReduceOp,
+    axis: Axis,
+    prior: bool,
+    tiles: usize,
+    valid: u32,
+    last: bool,
+) -> [Vec<Instruction>; 3] {
+    let mut inputs = Vec::new();
+    if prior {
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            p.load(LReg::L0, Format::Int32, A_ROW + o);
+            p.store(LReg::L0, Format::Int32, OUT_ROW + o);
+        });
+        inputs.push(p.finish());
+    }
+    for n in 0..tiles {
+        inputs.push(accumulate(
+            op,
+            axis,
+            !prior && n == 0,
+            (n + 1 == tiles && valid < 32).then_some(valid),
+        ));
+    }
+    let fin = if last { finish(op, axis) } else { Vec::new() };
+    roles_at(&c.layout, &inputs, &fin, |k, n| match (prior, n) {
+        (true, 0) => c.prior_at + k as u64 * TILE_SLOT,
+        (true, n) => c.layout.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
+        (false, n) => c.layout.in_at + (k * ROW_CHUNK + n) as u64 * TILE_SLOT,
+    })
+}
+
 /// What the device computes for a reduction of `a` (`[rows, cols]`): the
 /// same programs run by the interpreter over each line of input tiles. The
 /// result is `[rows, 1]` for [`Axis::Cols`], `[1, cols]` for [`Axis::Rows`].

@@ -674,3 +674,17 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 | 2026-10-02 | tt-mnist, card 0 | No arithmetic on B: element-wise and the sum over rows on the SFPU only (in-order sum, chunked past 16 row tiles); image gate refuses F instructions | MNIST 1 tile 2.0 → 1.7 ms/step; 8 tiles 1.9–2.0 → 2.2 ms/step (small ops spread thin pay the SFPU kernel's launch, which the old cost model avoided). Golden unchanged |
 | 2026-10-02 | 1790953809 | Cap mover NoC requests in flight at 128 per transaction ID (fixes the 8-bit counter wrap); waits counted and reported | Per entry: 4 KiB 317 → 333 cycles, 16 KiB unchanged (357), `WAIT` 116 → 120. Card totals unchanged (reads 319 GB/s at 4 tiles, 129 at 120). The cap binds only under contention (120-tile reads: 2023 waits per run; one channel: 4235) without lowering throughput. 120 tiles × 300 requests on one channel completes exactly: 48 GB/s, 8762 waits per run |
 | 2026-10-02 | 1790950685 | Baseline: device-timed benchmarks; trace events in B, T0–T2 and E1 | — |
+
+### R1c / P2 benchmark backlog (2026-10-04)
+
+General-axis repacking and K-blocked resident matmul are implemented and
+simulator-gated (`step67`/`step68`). Repacking currently sends per-element
+coordinate metadata and may reload a partially assembled tile across several
+transfer batches; split-K matmul uses one output tile per job and serial
+accumulator reloads. These are coverage paths with no performance claim.
+No silicon device nodes are available in the implementation environment.
+Before recording a score, run release silicon on both cards, validate outputs,
+warm each shape/route/fidelity, report medians with host timing and
+`dataflow_stats`, and record run IDs. Compare new general reductions with the
+existing matrix-axis paths and forced K blocks with unsplit products where
+they fit; include `[64,8192] @ [8192,64]` and fresh/traced execution.

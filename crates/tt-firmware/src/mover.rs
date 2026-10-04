@@ -390,6 +390,19 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
+        Entry::CopyWords { src, dst, count, src_stride, dst_stride } => {
+            reader_only()?;
+            noc::wait(TXN);
+            publish();
+            for n in 0..count {
+                // SAFETY: decode checks every word lies inside the data arena.
+                unsafe {
+                    let value = core::ptr::read_volatile((src + n * src_stride) as *const u32);
+                    core::ptr::write_volatile((dst + n * dst_stride) as *mut u32, value);
+                }
+            }
+            publish();
+        }
         Entry::Buffer {
             stream,
             action,

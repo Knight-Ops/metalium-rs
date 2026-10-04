@@ -171,6 +171,10 @@ pub mod op {
     pub const RELEASED: u32 = 0x44;
     /// DRAM -> L1.
     pub const READ: u32 = 1;
+    /// Copy aligned words inside the data arena: [COPY_WORDS, src, dst,
+    /// count, src_stride, dst_stride, 0, 0]. Strides are in bytes. B waits
+    /// for preceding reads before copying; this performs no arithmetic.
+    pub const COPY_WORDS: u32 = 0x45;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
@@ -488,6 +492,13 @@ pub enum Transform {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
+    CopyWords {
+        src: u32,
+        dst: u32,
+        count: u32,
+        src_stride: u32,
+        dst_stride: u32,
+    },
     Released {
         target: u16,
         which: crate::dataflow::Release,
@@ -574,6 +585,28 @@ impl Entry {
                     transform: Transform::None,
                 },
             );
+        }
+        if w[0] == op::COPY_WORDS {
+            if w[3] == 0 || w[3] > 1024 || w[6] != 0 || w[7] != 0 {
+                return Err(error::LENGTH);
+            }
+            for (at, stride) in [(w[1], w[4]), (w[2], w[5])] {
+                let end = at as u64 + (w[3] - 1) as u64 * stride as u64 + 4;
+                if at % 4 != 0
+                    || stride % 4 != 0
+                    || (at as u64) < crate::l1::DATA.base
+                    || end > crate::l1::DATA.end
+                {
+                    return Err(error::ALIGNMENT);
+                }
+            }
+            return Ok(Self::CopyWords {
+                src: w[1],
+                dst: w[2],
+                count: w[3],
+                src_stride: w[4],
+                dst_stride: w[5],
+            });
         }
         if w[0] == op::RELEASED {
             let which = crate::dataflow::Release::decode(w[2]).ok_or(error::OP)?;
@@ -894,6 +927,32 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_word_copies_are_checked_and_reader_owned() {
+        use super::*;
+        let at = crate::l1::DATA.base as u32;
+        let entry = [op::COPY_WORDS, at, at + 4096, 16, 4, 4, 0, 0];
+        assert!(matches!(
+            Entry::decode(0xff, entry),
+            Ok(Entry::CopyWords { count: 16, .. })
+        ));
+        assert!(Mover::B.permits(op::COPY_WORDS));
+        assert!(!Mover::NC.permits(op::COPY_WORDS));
+        for (index, value) in [
+            (1, at + 1),
+            (2, crate::l1::DATA.end as u32),
+            (3, 0),
+            (3, 1025),
+            (4, 3),
+            (5, u32::MAX),
+            (6, 1),
+        ] {
+            let mut bad = entry;
+            bad[index] = value;
+            assert!(Entry::decode(0xff, bad).is_err());
+        }
+    }
+
     #[test]
     fn host_moves_decode_only_inside_the_host_windows() {
         use super::*;

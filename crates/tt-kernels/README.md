@@ -53,3 +53,18 @@ replaced, job dealing over units, list batching, matmul planning. Device gates f
   runner returns `runtime::RunError`.
 - `Topology::Cards` (via `shard`) stages operands from the host per matmul and
   computes on one tile per card. Only `Session` keeps tensors in GDDR.
+
+## General reductions and K blocking
+
+`Session::repack` constructs a matrix from source-coordinate metadata using
+aligned B reads, local word copies and NC writes, preserving bits and parent
+padding claims. Ragged output padding is undefined. Burn uses it for general
+axis reductions and materializing non-tile-coherent views. Long column sums
+and row/column maxima preserve an unfolded accumulator across bounded chunks.
+
+Resident ordinary and supported tile-aligned batched matmuls automatically
+split K when necessary. Each output tile stays on one unit, with FP32 prior
+accumulators reloaded in product order. `set_matmul_k_block_limit` optionally
+forces a maximum K tile count; `None` restores automatic planning. Existing
+unsplit pipelining remains. `step67`/`step68` cover simulator execution; silicon
+validation and release performance measurements are pending.

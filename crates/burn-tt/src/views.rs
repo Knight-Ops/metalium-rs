@@ -10,9 +10,9 @@
 //! `[s, dk]` block at `[i s, j dk]`; `K^T` is the same blocks read
 //! transposed. A batched matmul reads such blocks where they lie
 //! (`Session::matmul_dram_batched`). Anything else that needs the tensor as
-//! a plain matrix materialises it: on the card by whole-tile moves
-//! (`Session::copy_blocks`) when the view is tile-coherent, else through
-//! the host.
+//! a plain matrix materialises it on the card: whole-tile moves
+//! (`Session::copy_blocks`) when tile-coherent, otherwise aligned reads and
+//! bit-preserving word repacking (`Session::repack`).
 
 use crate::tensor::{stored_dims, DramRef};
 use crate::{Block, BlockMove};

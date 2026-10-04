@@ -561,6 +561,77 @@ pub fn matmul_kernel(
 /// spaced.
 const UNPACK_FACES: u32 = 1;
 
+/// Continuation state: the prior FP32 tile and the two-way reset/load handshake.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Reload {
+    pub prior: u64,
+    pub cleared: Semaphore,
+    pub loaded: Semaphore,
+}
+
+/// One-output K block, with a separate prior tile and declared handshakes.
+pub(crate) fn k_block_layout(kt: usize) -> Result<(Layout, Reload), crate::runtime::RunError> {
+    let mut m = matmul_requirements([1, kt, 1]);
+    let prior = m
+        .req
+        .scratch("matmul prior", tt_isa::dm::TILE_SLOT, 64, 0..1);
+    let cleared = m.req.semaphore("matmul cleared", 0, 0..1);
+    let loaded = m.req.semaphore("matmul loaded", 0, 0..1);
+    let plan = m
+        .req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|_| crate::runtime::RunError::DoesNotFit {
+            what: "a K-block matmul",
+            bytes: (2 * kt + 2) as u64 * tt_isa::dm::TILE_SLOT,
+            limit: tt_isa::l1::DATA.len(),
+        })?;
+    let (a_at, b_at) = (plan.addr(m.a), plan.addr(m.b));
+    let layout = Layout {
+        a_at,
+        b_at,
+        outputs: vec![OutputTile {
+            pairs: (0..kt)
+                .map(|k| {
+                    (
+                        a_at + k as u64 * tt_isa::dm::TILE_SLOT,
+                        b_at + k as u64 * tt_isa::dm::TILE_SLOT,
+                    )
+                })
+                .collect(),
+            out: plan.addr(m.out) + tt_isa::dm::TILE_DATA,
+        }],
+        sems: MatmulSemaphores::planned(&plan, m.sems),
+        init: plan.semaphore_init(),
+    };
+    Ok((
+        layout,
+        Reload {
+            prior: plan.addr(prior),
+            cleared: plan.semaphore(cleared),
+            loaded: plan.semaphore(loaded),
+        },
+    ))
+}
+
+/// First/continuation programs share the Matrix Unit's original product order.
+pub(crate) fn k_block_kernel(
+    layout: &Layout,
+    reload: Option<Reload>,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> [Vec<Instruction>; 3] {
+    let (in_fmt, out_fmt) = route.formats();
+    let items = matmul_items_reloading(
+        &layout.outputs,
+        layout.sems,
+        in_fmt,
+        out_fmt,
+        fidelity,
+        reload,
+    );
+    items.map(|items| crate::loops::lower_with(&items, false).words)
+}
+
 /// The three role programs of [`matmul_roles`] as loop items, before
 /// lowering: each tile pair's face block -- the same words for every pair --
 /// a shared block on the unpack and the math role, between the pairs' own
@@ -584,6 +655,17 @@ pub fn matmul_items(
     in_fmt: L1Format,
     out_fmt: u32,
     fidelity: Fidelity,
+) -> [Vec<Item>; 3] {
+    matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None)
+}
+
+fn matmul_items_reloading(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    in_fmt: L1Format,
+    out_fmt: u32,
+    fidelity: Fidelity,
+    reload: Option<Reload>,
 ) -> [Vec<Item>; 3] {
     assert!(
         outputs.iter().all(|o| !o.pairs.is_empty()),
@@ -703,7 +785,33 @@ pub fn matmul_items(
     for output in outputs {
         math.extend(i(sync::take(sems.free, Before::MATRIX)));
         // (mode, use_dst32b, addr_mod, imm10): all of `Dst`.
-        math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
+        if let Some(reload) = reload {
+            // math_prelude clears Dst before allowing T0 to load the prior.
+            // Each continuation contains one output tile, so no later clear
+            // can erase it. Both handshakes finish back at zero.
+            assert_eq!(outputs.len(), 1);
+            math.extend(i(sync::post_after(Unit::Matrix, reload.cleared)));
+            math.extend(i(sync::take(reload.loaded, Before::MATRIX)));
+            unpack.extend(i(sync::take(reload.cleared, Before::UNPACKER)));
+            unpack.extend(i(crate::datapath::thread_config()));
+            unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
+            let mut prior_words = ConfigWords::new();
+            crate::datapath::tile_unpack_config(&mut prior_words, reload.prior);
+            unpack.extend(i(config_program(&prior_words)));
+            unpack.extend(i(crate::datapath::unpack_tile_to_dst(reload.prior, 0)));
+            unpack.extend(i(sync::post_after(Unit::Unpacker0, reload.loaded)));
+            // Restore the complete Src configuration, including descriptor
+            // words and ADCs; UnpackToDst leaves different state behind.
+            unpack.extend(i(src_thread_config()));
+            unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
+            unpack.extend(i(config_program(&words)));
+            for u in [Unpacker::SrcA, Unpacker::SrcB] {
+                unpack.push(Item::I(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1)));
+            }
+            current = (u64::MAX, u64::MAX);
+        } else {
+            math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
+        }
         match even_strides(&output.pairs) {
             // Pairs evenly spaced in L1 (how the gather stages them): the
             // tiles are stepped by GPR arithmetic, so every pair is the same

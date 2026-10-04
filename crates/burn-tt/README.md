@@ -17,9 +17,9 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | `float_matmul` | `Session::matmul_dram` (operands may be transposed views) |
 | `float_add` / `sub` / `mul`, `float_mul_scalar` | SFPU element-wise (`tt_kernels::kind`); `add` of a `[1, n]` row broadcasts (`ADD_ROW`) |
 | `relu`, `relu_backward` | `RELU`, `RELU_BACKWARD` |
-| `float_sum_dim(0)` | SFPU sum over rows, in Flex's summation order |
+| `float_sum_dim` / `float_mean_dim` / `float_max_dim` | all F32 axes, including ragged rank-N views; SFPU reductions with native repacking |
 | `float_sum`, `float_mean` (rank one or more) | Native full F32 reduction, bounded column chunks followed by the chunked row sum; mean divides on the SFPU |
-| `float_transpose` / `float_swap_dims` / `float_permute` | strided views at any rank; downstream native copies require supported whole-tile layouts |
+| `float_transpose` / `float_swap_dims` / `float_permute` | strided views at any rank; downstream native copies use whole-tile moves or ragged word repacking |
 | `float_argmax` / `float_argmin` | native selection, first tie/NaN; rank-one/two F32, I32 indices, axes up to 2^23 |
 | `bool_equal` / `bool_equal_elem` | Boolean XOR/NOT or identity, native broadcasts |
 | `bool_into_float` / `bool_into_int` | exact native 0/1 conversion to F32/I32 |
@@ -33,7 +33,7 @@ the batch into the rows and runs as the 2-D product; so do `linear_weight_backwa
 `linear_bias_backward`. Reshapes and dimension swaps of a resident F32 tensor are
 strided views of its buffer at any rank (`src/views.rs`): a batched matmul reads its
 operands' blocks where they lie (attention's heads, `K^T`), and an op that needs a plain
-matrix gets one by a block copy on the card when the view is whole tiles. The table above is the first ops; `hardware-coverage.md`'s Burn
+matrix gets one by a native block copy or word repacking on the card. The table above is the first ops; `hardware-coverage.md`'s Burn
 op tables are the full list, and `TT_REPORT=1` says what a given model ran where. Any F32
 `float_matmul` the above does not cover (batched, or an engine without GDDR such as
 a minimal custom engine) still runs on the card, staged from the host (`Engine::matmul`).
@@ -166,3 +166,8 @@ unparsable value as `0`.
 - Random construction uses independent host RNG streams per `TtDevice`, seeded
   through `TtBackend::seed`. Draws are reproducible on this backend; matching
   Flex's random sequence is not required. Unseeded streams start at seed 0.
+
+General reductions and K-blocked resident matmul have simulator gates in
+`step67_general_reduce` and `step68_k_block_matmul`; both-card silicon validation
+is pending. K continuations reload FP32 accumulators and retain the original
+product order. Supported batched layouts retain their tile-alignment rules.

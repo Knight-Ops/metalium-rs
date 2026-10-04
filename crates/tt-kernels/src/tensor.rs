@@ -1180,11 +1180,10 @@ pub fn pipelining_pays(
 /// the resident roles compute it, and the mover writes the output tiles back.
 /// Nothing but descriptors, programs and semaphores crosses PCIe.
 ///
-/// Chunked by [`matmul::plan_in`] with [`Staging::Slots`], and refused if the
-/// plan splits `K`: a split `K` means a partial-sum add, which the host path
-/// does on the host, and doing it anywhere else would change the rounding.
-/// The plan's blocks are then made small enough for `units` tiles to share
-/// ([`blocks`]); each block is one [`Job`].
+/// Chunked by [`matmul::plan_in`]. When `K` fits, the output blocks are made
+/// small enough for `units` tiles to share ([`blocks`]). Otherwise each output
+/// tile is one [`Job`], continuing its FP32 accumulator across resident K
+/// blocks in the original Matrix Unit traversal order.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_dram(
     alloc: &mut DramAlloc,
@@ -1197,6 +1196,35 @@ pub fn matmul_dram(
     units: usize,
     allow_mop: bool,
     pipeline: bool,
+) -> Result<Work> {
+    matmul_dram_limited(
+        alloc,
+        a,
+        a_transposed,
+        b,
+        b_transposed,
+        route,
+        fidelity,
+        units,
+        allow_mop,
+        pipeline,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_dram_limited(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    a_transposed: bool,
+    b: &DramTensor,
+    b_transposed: bool,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    allow_mop: bool,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1229,11 +1257,12 @@ pub fn matmul_dram(
     let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
         .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
     let [mc, kc, nc] = shape.tiles;
-    if kc < kt {
-        return Err(TensorError::Shape(format!(
-            "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
-        )));
-    }
+    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
+    let kc = if kc < kt {
+        k_block_size(kc, route, fidelity)?
+    } else {
+        kc
+    };
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
     let c = DramTensor::alloc(alloc, m, n)?;
@@ -1242,6 +1271,7 @@ pub fn matmul_dram(
     let plan = BlockPlan {
         tiles: [mt, kt, nt],
         block: [mc, nc],
+        k_block: kc,
         staging,
         units,
         route,
@@ -1260,6 +1290,7 @@ pub fn matmul_dram(
 struct BlockPlan {
     tiles: [usize; 3],
     block: [usize; 2],
+    k_block: usize,
     staging: Staging,
     units: usize,
     route: SrcRoute,
@@ -1279,6 +1310,9 @@ impl BlockPlan {
         [a_transposed, b_transposed]: [bool; 2],
     ) -> Result<()> {
         let [mt, kt, nt] = self.tiles;
+        if self.k_block < kt {
+            return self.push_k_jobs(jobs, [ra, rb, rc], [a_transposed, b_transposed]);
+        }
         let [mc, nc] = self.block;
         let (units, staging) = (self.units, self.staging);
         let (in_fmt, out_fmt) = self.route.formats();
@@ -1379,6 +1413,152 @@ impl BlockPlan {
     }
 }
 
+/// Size both first and continuation programs against the resident-cache limit.
+fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
+    loop {
+        if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
+            let fits = [None, Some(reload)].into_iter().all(|r| {
+                matmul::k_block_kernel(&layout, r, route, fidelity)
+                    .iter()
+                    .all(|p| {
+                        p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                            && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+                    })
+            });
+            if fits {
+                return Ok(kc);
+            }
+        }
+        if kc == 1 {
+            return Err(TensorError::Shape("no resident K-block matmul fits".into()));
+        }
+        kc = kc.div_ceil(2);
+    }
+}
+
+impl BlockPlan {
+    fn push_k_jobs(
+        &self,
+        jobs: &mut Vec<Job>,
+        [ra, rb, rc]: [TensorRef; 3],
+        transposed: [bool; 2],
+    ) -> Result<()> {
+        let [mt, kt, nt] = self.tiles;
+        // One output tile per job keeps its prior accumulator and every K
+        // continuation on the same unit; outputs remain independent.
+        for i in 0..mt {
+            for j in 0..nt {
+                let mut steps = Vec::new();
+                for k0 in (0..kt).step_by(self.k_block) {
+                    let count = self.k_block.min(kt - k0);
+                    let (layout, reload) = matmul::k_block_layout(count)?;
+                    let mut ar = ra;
+                    let mut br = rb;
+                    ar.first += if transposed[0] {
+                        (k0 * ar.ct as usize) as u32
+                    } else {
+                        k0 as u32
+                    };
+                    br.first += if transposed[1] {
+                        k0 as u32
+                    } else {
+                        (k0 * br.ct as usize) as u32
+                    };
+                    let flags = u32::from(transposed[0])
+                        | u32::from(transposed[1]) << 1
+                        | (count as u32) << 8;
+                    let mut gather = vec![
+                        [
+                            record::GATHER,
+                            flags,
+                            layout.a_at as u32,
+                            layout.b_at as u32,
+                            i as u32,
+                            1,
+                            j as u32,
+                            1,
+                        ],
+                        ar.encode()[0],
+                        ar.encode()[1],
+                        br.encode()[0],
+                        br.encode()[1],
+                    ];
+                    if k0 > 0 {
+                        // A WAIT marks this dependent gather's footprint as
+                        // conservative: the scheduler waits for NC release,
+                        // not merely pack retirement, before reading GDDR.
+                        gather.insert(0, [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                        gather.extend([
+                            [
+                                record::READ_RUN,
+                                (i * nt + j) as u32,
+                                1,
+                                reload.prior as u32,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            rc.encode()[0],
+                            rc.encode()[1],
+                        ]);
+                    }
+                    let variant = if k0 > 0 { 0x81 } else { 0x80 };
+                    let (roles, _) = matmul::kernel_programs(
+                        [1, count, 1],
+                        variant,
+                        self.route,
+                        self.fidelity,
+                        layout.sems,
+                        false,
+                        || {
+                            (
+                                matmul::k_block_kernel(
+                                    &layout,
+                                    (k0 > 0).then_some(reload),
+                                    self.route,
+                                    self.fidelity,
+                                ),
+                                [None; 3],
+                            )
+                        },
+                    );
+                    steps.push(Step::List {
+                        what: "K-block matmul gather",
+                        entries: gather,
+                    });
+                    steps.push(Step::Kernel {
+                        roles,
+                        init: layout.init,
+                        mop: Box::new([None; 3]),
+                        loops: Default::default(),
+                        half: None,
+                    });
+                    steps.push(Step::List {
+                        what: "K-block matmul scatter",
+                        entries: vec![
+                            [
+                                record::SCATTER,
+                                layout.outputs[0].out as u32,
+                                TILE_SLOT as u32,
+                                i as u32,
+                                1,
+                                j as u32,
+                                1,
+                                0,
+                            ],
+                            rc.encode()[0],
+                            rc.encode()[1],
+                        ],
+                    });
+                }
+                jobs.push(steps);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One operand of a [`matmul_dram_batched`] product: the block of a tensor
 /// whose top-left element is `at` (a multiple of 32 on both axes), read
 /// transposed or not. Its extent is the product's `[m, k]` or `[k, n]`
@@ -1419,8 +1599,8 @@ fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> 
 /// of one `[items.len() m, n]` tensor. A batched matmul of resident
 /// operands, and of views into them (a head's columns of a projection),
 /// with no copy: each block is gathered where it lies. Every product is
-/// [`matmul_dram`]'s, bit for bit. Refused, as there, if `K` would split;
-/// and with more than one item, unless `m` is whole tiles (each product's
+/// [`matmul_dram`]'s, bit for bit, including accumulator reloads across K
+/// blocks. With more than one item, refused unless `m` is whole tiles (each product's
 /// output must start on a tile row).
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_dram_batched(
@@ -1434,6 +1614,35 @@ pub fn matmul_dram_batched(
     units: usize,
     allow_mop: bool,
     pipeline: bool,
+) -> Result<Work> {
+    matmul_dram_batched_limited(
+        alloc,
+        a,
+        b,
+        items,
+        [m, k, n],
+        route,
+        fidelity,
+        units,
+        allow_mop,
+        pipeline,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_dram_batched_limited(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    b: &DramTensor,
+    items: &[(Block, Block)],
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    allow_mop: bool,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1458,11 +1667,12 @@ pub fn matmul_dram_batched(
     let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
         .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
     let [mc, kc, nc] = shape.tiles;
-    if kc < kt {
-        return Err(TensorError::Shape(format!(
-            "[{m}, {k}] @ [{k}, {n}] would split K; not on this path"
-        )));
-    }
+    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
+    let kc = if kc < kt {
+        k_block_size(kc, route, fidelity)?
+    } else {
+        kc
+    };
     let mut refs = Vec::with_capacity(batch);
     for (ba, bb) in items {
         let ea = if ba.transposed { [k, m] } else { [m, k] };
@@ -1476,6 +1686,7 @@ pub fn matmul_dram_batched(
     let plan = BlockPlan {
         tiles: [mt, kt, nt],
         block: blocks([mt, nt], [mc, nc], per_item),
+        k_block: kc,
         staging,
         units,
         route,
@@ -1994,6 +2205,25 @@ pub fn sfpu_reduce(
 ) -> Result<Work> {
     a.expect("a reduction", Elem::F32)?;
     use crate::sfpu::reduce::Axis;
+    let per = match axis {
+        Axis::Cols => a.grid()[1],
+        Axis::Rows => a.grid()[0],
+    };
+    let valid = match axis {
+        Axis::Cols => a.cols,
+        Axis::Rows => a.rows,
+    } % 32;
+    if reduce_group(
+        op,
+        axis,
+        per,
+        if valid == 0 { 32 } else { valid as u32 },
+        false,
+    )
+    .is_none()
+    {
+        return reduce_chunked(alloc, a, op, axis, units);
+    }
     let [rt, ct] = a.grid();
     let (outs, per, valid, out) = match axis {
         Axis::Cols => (rt, ct, a.cols % 32, DramTensor::alloc(alloc, a.rows, 1)?),
@@ -2077,6 +2307,110 @@ pub fn sfpu_reduce(
                 entries: scatter.to_vec(),
             },
         ]);
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Long reductions carry the full, unfolded accumulator tile in GDDR.
+/// Each output group stays on one unit and reloads only after NC releases
+/// the preceding batch. Folding occurs once, in the final chunk.
+fn reduce_chunked(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    units: usize,
+) -> Result<Work> {
+    use crate::sfpu::reduce::{continuation_roles, plan_chunk_layout, Axis, ROW_CHUNK};
+    let [rt, ct] = a.grid();
+    let (outs, per, valid, dims) = match axis {
+        Axis::Cols => (rt, ct, a.cols % 32, [a.rows, 1]),
+        Axis::Rows => (ct, rt, a.rows % 32, [1, a.cols]),
+    };
+    let valid = if valid == 0 { 32 } else { valid as u32 };
+    let c = plan_chunk_layout(1).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let out = DramTensor::alloc(alloc, dims[0], dims[1])?;
+    let mut jobs = Vec::new();
+    // One output tile per job bounds the largest continuation program.
+    // All chunks of that output remain on the same unit.
+    let _ = units;
+    for output in 0..outs {
+        let mut steps = Vec::new();
+        for first in (0..per).step_by(ROW_CHUNK) {
+            let count = ROW_CHUNK.min(per - first);
+            let last = first + count == per;
+            let mut gather = Vec::new();
+            if first > 0 {
+                // Reload depends on the preceding GDDR write, even though
+                // its L1 destination is separate from the packer's output.
+                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        output as u32,
+                        1,
+                        c.prior_at as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    out.tensor_ref().encode()[0],
+                    out.tensor_ref().encode()[1],
+                ]);
+            }
+            gather.extend([
+                [
+                    record::READ_RUN,
+                    (output * per + first) as u32,
+                    count as u32,
+                    c.layout.in_at as u32,
+                    if axis == Axis::Rows { 4 } else { 0 },
+                    ct as u32,
+                    if axis == Axis::Rows { rt as u32 } else { 0 },
+                    0,
+                ],
+                a.tensor_ref().encode()[0],
+                a.tensor_ref().encode()[1],
+            ]);
+            steps.push(Step::List {
+                what: "reduce continuation gather",
+                entries: gather,
+            });
+            steps.push(Step::Kernel {
+                roles: Arc::new(continuation_roles(
+                    &c,
+                    op,
+                    axis,
+                    first > 0,
+                    count,
+                    if last { valid } else { 32 },
+                    last,
+                )),
+                init: c.layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            });
+            steps.push(Step::List {
+                what: "reduce continuation scatter",
+                entries: vec![
+                    [
+                        record::WRITE_RUN,
+                        output as u32,
+                        1,
+                        c.layout.out_at as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    out.tensor_ref().encode()[0],
+                    out.tensor_ref().encode()[1],
+                ],
+            });
+        }
+        jobs.push(steps);
     }
     Ok(Work { out, jobs })
 }
@@ -2233,6 +2567,8 @@ pub fn sum_rows(
             let last_valid = if r0 + tiles == rt { valid } else { 32 };
             let mut gather = Vec::new();
             if i > 0 {
+                // Require NC release before reloading the prior sums.
+                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
                 // The last chunk's sums, read back from the output.
                 gather.extend([
                     [
@@ -2626,6 +2962,137 @@ pub fn copy_blocks(
                         ro.encode()[1],
                     ],
                 }],
+            }]);
+        }
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Repack logical elements on the card, preserving every bit. `sources`
+/// names a source coordinate for each output element in row-major order.
+/// Only address metadata is built on the host; B copies words after aligned
+/// tile reads and NC writes complete output tiles. Large maps are split into
+/// ordered transfer batches, reloading the partially assembled output tile.
+pub fn repack(
+    alloc: &mut DramAlloc,
+    t: &DramTensor,
+    sources: &[[usize; 2]],
+    [rows, cols]: [usize; 2],
+) -> Result<Work> {
+    use tt_isa::dm::{face_index, op, TILE_DATA};
+    if rows == 0
+        || cols == 0
+        || rows.checked_mul(cols) != Some(sources.len())
+        || sources.iter().any(|&[r, c]| r >= t.rows || c >= t.cols)
+    {
+        return Err(TensorError::Shape("invalid native repack mapping".into()));
+    }
+    let mut req = crate::l1::Requirements::new(1);
+    let input = req.scratch("repack source tile", TILE_SLOT, 64, 0..1);
+    let output = req.scratch("repack destination tile", TILE_SLOT, 64, 0..1);
+    let layout = req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (input, output) = (layout.addr(input), layout.addr(output));
+    let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
+    let [rt, ct] = out.grid();
+    let mut jobs = Vec::new();
+    for i in 0..rt {
+        for j in 0..ct {
+            let mut tiles = std::collections::BTreeMap::<usize, Vec<(usize, usize)>>::new();
+            for r in 0..32.min(rows - i * 32) {
+                for c in 0..32.min(cols - j * 32) {
+                    let [sr, sc] = sources[(i * 32 + r) * cols + j * 32 + c];
+                    tiles
+                        .entry(sr / 32 * t.grid()[1] + sc / 32)
+                        .or_default()
+                        .push((face_index(sr % 32, sc % 32), face_index(r, c)));
+                }
+            }
+            let range = out.tile(i, j);
+            let read_prior = [
+                op::READ,
+                range.channel().index() as u32,
+                0,
+                range.offset() as u32,
+                output as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ];
+            let mut batches = Vec::new();
+            let mut read = Vec::new();
+            let flush = |read: &mut Vec<[u32; 8]>, batches: &mut Vec<TransferBatch>| {
+                if read.is_empty() {
+                    return;
+                }
+                batches.push(TransferBatch {
+                    read: std::mem::take(read),
+                    write: vec![
+                        [
+                            record::WRITE_RUN,
+                            (i * ct + j) as u32,
+                            1,
+                            output as u32,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                        out.tensor_ref().encode()[0],
+                        out.tensor_ref().encode()[1],
+                    ],
+                });
+            };
+            for (tile, mut words) in tiles {
+                words.sort_unstable();
+                let src = t.tile(tile / t.grid()[1], tile % t.grid()[1]);
+                let read_src = [
+                    op::READ,
+                    src.channel().index() as u32,
+                    0,
+                    src.offset() as u32,
+                    input as u32,
+                    TILE_SLOT as u32,
+                    0,
+                    0,
+                ];
+                let mut n = 0;
+                while n < words.len() {
+                    if read.len() >= 240 {
+                        flush(&mut read, &mut batches);
+                        read.push(read_prior);
+                    }
+                    read.push(read_src);
+                    // Consecutive words commonly cover a face-row. Merge
+                    // them without assuming a tile-coherent logical view.
+                    while n < words.len() && read.len() < 240 {
+                        let (sr, dst) = words[n];
+                        let mut count = 1;
+                        while n + count < words.len()
+                            && words[n + count] == (sr + count, dst + count)
+                        {
+                            count += 1;
+                        }
+                        read.push([
+                            op::COPY_WORDS,
+                            (input + TILE_DATA + sr as u64 * 4) as u32,
+                            (output + TILE_DATA + dst as u64 * 4) as u32,
+                            count as u32,
+                            4,
+                            4,
+                            0,
+                            0,
+                        ]);
+                        n += count;
+                    }
+                }
+            }
+            flush(&mut read, &mut batches);
+            jobs.push(vec![Step::Transfer {
+                what: "native repack",
+                depth: 1,
+                batches,
             }]);
         }
     }

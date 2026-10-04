@@ -351,6 +351,7 @@ pub struct Session<T: Transport> {
     /// overlap its kernels (`Session::set_pipeline`, checklist 9.15). On by
     /// default.
     pipeline: bool,
+    matmul_k_block_limit: Option<std::num::NonZeroUsize>,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -1641,6 +1642,7 @@ impl<T: Transport> Session<T> {
             images,
             profile: runtime::Profile::default(),
             pipeline: true,
+            matmul_k_block_limit: None,
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -3432,6 +3434,20 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Repack logical source coordinates into a new matrix on the card.
+    /// Preserves bits and leaves ragged output padding undefined.
+    pub fn repack(
+        &mut self,
+        t: &DramTensor,
+        sources: &[[usize; 2]],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        let work = tensor::repack(&mut self.dram_state()?.alloc, t, sources, dims)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
     /// A new `dims` tensor assembled from blocks of `t`
     /// ([`tensor::copy_blocks`]): a tile-moving reshape or permute, on the
     /// card. Its padding is `t`'s: a block ragged at all is ragged at both
@@ -3667,10 +3683,11 @@ impl<T: Transport> Session<T> {
         // `step37_loops` keep the expander gated.
         let allow_mop = false;
         let pipeline = self.pipeline;
+        let max_k_tiles = self.matmul_k_block_limit;
         let out = self
             .dram_state()
             .and_then(|d| {
-                tensor::matmul_dram(
+                tensor::matmul_dram_limited(
                     &mut d.alloc,
                     ca.as_ref().unwrap_or(a),
                     a_transposed,
@@ -3681,6 +3698,7 @@ impl<T: Transport> Session<T> {
                     units,
                     allow_mop,
                     pipeline,
+                    max_k_tiles,
                 )
             })
             .and_then(|work| self.execute(work, budget));
@@ -3726,10 +3744,11 @@ impl<T: Transport> Session<T> {
         };
         let units = self.units.len();
         let pipeline = self.pipeline;
+        let max_k_tiles = self.matmul_k_block_limit;
         let out = self
             .dram_state()
             .and_then(|d| {
-                tensor::matmul_dram_batched(
+                tensor::matmul_dram_batched_limited(
                     &mut d.alloc,
                     ca.as_ref().unwrap_or(a),
                     cb.as_ref().unwrap_or(b),
@@ -3740,6 +3759,7 @@ impl<T: Transport> Session<T> {
                     units,
                     false,
                     pipeline,
+                    max_k_tiles,
                 )
             })
             .and_then(|work| self.execute(work, budget));
@@ -3884,6 +3904,12 @@ impl<T: Transport> Session<T> {
     /// Every tile the session computes on, in unit order.
     pub fn tiles(&self) -> Vec<NocCoord<Noc0>> {
         self.units.iter().map(|u| u.tile).collect()
+    }
+
+    /// Limit K tiles per matmul block for reproducible chunking and gates.
+    /// `None` lets the resident planner choose the block length.
+    pub fn set_matmul_k_block_limit(&mut self, limit: Option<std::num::NonZeroUsize>) {
+        self.matmul_k_block_limit = limit;
     }
 
     /// Double-buffer GDDR matmuls from the next op on (checklist 9.15; on by
@@ -4420,6 +4446,16 @@ mod tests {
             block(0x2_0000, 0x2_0800),
         ];
         assert_eq!(waits(shared.concat()), [[1, 0], [2, 0]]);
+        // A dependent GDDR reload needs NC completion even when its L1
+        // destination is separate. A WAIT in the gather conservatively
+        // marks this dependency and works for fresh and captured lists.
+        let mut dependent = apart;
+        for steps in &mut dependent[1..] {
+            if let Step::List { entries, .. } = &mut steps[0] {
+                entries.insert(0, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            }
+        }
+        assert_eq!(waits(dependent.concat()), [[1, 0], [2, 0]]);
     }
 
     #[test]

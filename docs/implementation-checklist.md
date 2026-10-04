@@ -53,6 +53,11 @@ matmul (P2), general slicing/indexing (D4), layouts/norms (M3/R3), formats/casts
 beyond one-pass L1 limits. Their arithmetic is native SFPU execution, including
 in exact mode, with explicit errors for unsupported inputs. Mesh engines use
 native L1 staging on chip 0 rather than a host reduction.
+R1c arbitrary-axis/ragged F32 sum/mean/max and P2 resident K-blocked matmul
+are implemented with simulator gates (`step67`/`step68`). Both-card silicon
+validation and release-silicon benchmarks remain pending: this environment
+has no `/dev/tenstorrent` nodes. The implementation retains native ownership
+and arithmetic order; no fallback or exact-mode setting is introduced.
 Backend work proceeds as B1 → B2 → B10.
 The old Phase 9 timings below are dated measurements, not the current status.
 

@@ -64,13 +64,49 @@ The complete workspace host/simulator tier passes, as do lint checks for the
 changed backend, kernels and reduction/model tests. Generated delegation and
 the no-simulator-in-shipping-crates checks pass.
 
-Full reductions do not complete 10.3: arbitrary axes/layouts, the other reduction
-kinds, Tensix transpose and norms remain open.
+Full reductions do not complete 10.3. R1c arbitrary axes/layouts and P2 K
+blocking now have simulator implementations (below), with both-card silicon
+validation pending. Other reduction kinds, Tensix transpose and norms remain open.
 
-**Next for model coverage:** finish R1, add K-blocked matmul (P2), complete D4
-slicing/indexing, finish M3/R3 layout and norms, then 10.4 formats/casts and
+**Next for model coverage:** validate R1c/P2 on both cards, finish R1's other
+reduction kinds, complete D4 slicing/indexing, finish M3/R3 layout and norms,
+then 10.4 formats/casts and
 10.5 convolution/pooling/attention. Backend error/setup/conformance work is
 tracked separately as B1/B2/B10. X280 dispatch remains proposed and unscheduled.
+
+### R1c / P2 implementation (2026-10-04; silicon pending)
+
+General F32 `sum_dim`, `mean_dim` and `max_dim` now accept every logical
+axis, including ragged rank-N reshape/swap/permute views. Existing matrix
+axes and supported leading sums retain their arithmetic order. Other axes
+are repacked into rows on the card, reduced over columns, and repacked back
+to the logical output shape. Only coordinates are constructed on the host;
+B reads aligned source tiles and copies words in L1, NC writes assembled
+tiles. The input/parent's padding claims are unchanged; repacked outputs
+have undefined padding, which downstream kernels mask or repair.
+Long column sums and maxima over either matrix axis carry the full unfolded
+accumulator between bounded chunks and fold once at the end. Full sum/mean
+retain their earlier scalar chunk order and golden.
+
+Resident ordinary and supported tile-aligned batched matmuls now split K
+when necessary. Each output tile stays on one unit, packing its FP32 partial
+into GDDR and reloading it before continuing the same `MVMUL` sequence.
+First and continuation programs have distinct cache keys. A separate prior
+buffer and declared reset/load semaphores protect Dst; dependent gathers
+wait for NC release, not merely pack retirement. Split-K runs are serialized;
+existing unsplit pipelining remains. `Session::set_matmul_k_block_limit`
+selects a reproducible maximum block length; the default plans automatically.
+
+Gates: `step67_general_reduce` and `step68_k_block_matmul`, included in
+`SMOKE`. Simulator coverage includes arbitrary axes, raw-bit ragged copies,
+long reductions against the interpreter, autodiff, two-unit changed-input
+trace replay and deferred operand frees; forced K blocks versus unsplit at
+all fidelities, TF32/BF16 Src routes, transposes and specials, `[64,8192] @
+[8192,64]`, supported batches and resident Burn large-K against a derived
+bound. Negative controls fail when axis mapping, edge masking or accumulator
+reload is omitted. Neither milestone is marked complete until both cards
+pass; no device nodes are available in this implementation environment.
+Release-silicon benchmark medians and validation remain unrun.
 
 ### 10.2 close-out (historical measurements)
 
@@ -131,7 +167,7 @@ reporting and strict-mode refusal of unintended downloads.
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
-| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` rank-N storage/views, partial rank-N reductions, full F32 sum/mean; arbitrary axes, other reductions, Tensix transpose and norms open |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` rank-N storage/views and full F32 sum/mean; general axes/ragged layouts and long sum/max simulator-gated, silicon pending; other reductions, Tensix transpose and norms open |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
@@ -651,9 +687,13 @@ Each names the measurement it must move. The Burn-side ones are in
         block offset dropped and with the tiles read untransposed; ttsim and
         both cards), `step59_burn_transformer`. Last-dim sum/max and mean_dim
         compositions, plus certain leading-dim sums, are done. General
-        leading-dim reductions and untiled batched matmul remain open.
-- [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
-      a matmul's K is not capped by L1. Blocks D6's im2col.
+        leading-dim reductions are now simulator-gated by R1c; untiled
+        batched matmul remains open.
+- [~] **P2 K blocking** (concepts review G3): native FP32 Dst reload implemented
+      for resident ordinary and supported batched matmuls (`step68`). Same
+      accumulation order, no block-sum addition or packer L1 accumulation.
+      Simulator gates pass; both-card silicon and release benchmarks pending.
+      Host-staged `matmul_chunked` retains its separate arithmetic contract.
 
 ### F — SFPU foundation (blocks every S item)
 
@@ -1149,9 +1189,11 @@ Each names the measurement it must move. The Burn-side ones are in
       Burn defaults also compose `max`, `max_abs*` and the minimum family;
       minima inherit gather's axis and signed-zero limitations, and flattened
       full maxima retain reshape/layout and reduction-size limits.
-      Remaining: general axes/layouts, `prod`, native Boolean `any`/`all`,
-      broader/full max/min/product reductions, `cum*`, and long non-scalar
-      reductions other than the chunked row sum.
+      R1c adds all F32 axes and ragged view repacking, plus long column
+      sums and maxima over either axis (`step67`; silicon pending).
+      Remaining: `prod`, native Boolean `any`/`all`, broader arg-reductions,
+      product reductions and `cum*`. Full maxima compose native reshape and
+      max reductions; minimum defaults retain their gather limitations.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
       laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
@@ -1282,7 +1324,7 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
 | `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
-| `float_sum_dim` | `~` matrix axes and rank-N last dim; certain leading-dim sums; all on SFPU | R1 |
+| `float_sum_dim` | all F32 axes/layouts on SFPU; R1c silicon pending | R1 |
 | `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
 | `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs, including in exact mode; unsupported inputs fail | R1b |
 | `float_slice` | `~` whole tile rows | D4 |
@@ -1300,7 +1342,7 @@ path today, `~` when only some shapes do.
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
-| `float_max_dim` | `~` matrix axes and rank-N last dim; SFPU | R1 |
+| `float_max_dim` | all F32 axes/layouts on SFPU; R1c silicon pending | R1 |
 | `float_argmax`, `float_argmin` | `~` rank-one/two F32, I32 output, first tie/NaN, axis up to 2^23 | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
 | `float_max`, `float_max_abs*` | `~` Burn defaults over reshape/abs/max_dim; existing layout and size limits | R1 |

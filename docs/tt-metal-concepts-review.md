@@ -204,6 +204,14 @@ at all (R2 softmax is over `[B, S, V]`, R4 attention is rank 4).
 
 ### G3. K blocking without a K limit (P0, a panic mid-model)
 
+**Current implementation (2026-10-04):** resident ordinary and supported
+batched matmuls use K-blocked accumulator reload when K does not fit L1.
+`step68_k_block_matmul` validates the same product order on the simulator;
+both-card silicon and release benchmarking remain pending. The notes below
+are the original design and measured pre-implementation limits. Native Burn
+never uses their proposed host fallback, and packer L1 accumulation remains
+unimplemented.
+
 **(a)** tt-metal's matmul streams `K` in blocks of `in0_block_w` tiles. With more than one
 block (`spill`), each output subblock is packed to an intermediate CB and **reloaded into
 Dst** with `copy_tile` before the next block accumulates on top

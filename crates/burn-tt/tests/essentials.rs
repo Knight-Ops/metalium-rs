@@ -144,3 +144,34 @@ fn unsupported_boolean_conversion_dtypes_name_operation_and_input() {
         );
     }
 }
+
+#[test]
+fn invalid_reduction_axes_fail_with_metadata_before_device_access() {
+    use burn_backend::ops::FloatTensorOps;
+    use burn_tensor::TensorPrimitive;
+    type Reduce = fn(burn_tt::TtTensor, usize) -> burn_tt::TtTensor;
+    let d = TtDevice::new(305);
+    let TensorPrimitive::Float(input) = Tensor::<TtBackend, 2>::ones([2, 3], &d).into_primitive()
+    else {
+        unreachable!()
+    };
+    let cases: [(&str, Reduce); 3] = [
+        ("float_sum_dim", TtBackend::float_sum_dim),
+        ("float_mean_dim", TtBackend::float_mean_dim),
+        ("float_max_dim", TtBackend::float_max_dim),
+    ];
+    for (name, reduce) in cases {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reduce(input.clone(), usize::MAX)
+        }))
+        .unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains(name)
+                && message.contains("[2, 3]")
+                && message.contains("F32")
+                && message.contains("axis="),
+            "{message}"
+        );
+    }
+}
