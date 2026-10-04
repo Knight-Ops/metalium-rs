@@ -1500,22 +1500,67 @@ pub fn matmul_dram_batched(
 /// 5-50% splitting ops into runs of 1-4 tiles.
 pub const MIN_PIPELINED_RUN: usize = 12;
 
-/// Fewest tiles a unit's share of a pipelined element-wise or reduce op may
-/// hold, per unit the op runs on. The host queues the units' lists one after
-/// another (~6 us a unit an op on card 0, and more for each run), so on many
-/// units the op is the host's, and the extra runs pipelining makes cost more
-/// than the overlap saves -- unless each unit has more to do the more units
-/// there are. Card 0 (`sfpu_pipeline_sweep`, end to end): on one tile every
-/// op of 50 tiles and up gained (0.57-0.98); on 8, adds and reductions of
-/// 128-256 tiles a unit lost up to 1.66x and 512 broke even or gained (exp
-/// 0.96, max 0.86); on 32, adds of 32-128 tiles a unit lost up to 1.5x.
+/// How the runs of an element-wise or reduce op may overlap: the movers moving
+/// one run while the roles compute another. More runs cost the host a list
+/// each, which a captured op pays once and a replay never, so a trace may
+/// overlap where a fresh op may not.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Overlap {
+    /// One run a unit, serialized (`Session::set_pipeline(false)`).
+    Off,
+    /// An op queued now: the host pays for every run.
+    Fresh,
+    /// An op being captured into a trace.
+    Captured,
+}
+
+/// Fewest tiles a unit's share of a fresh pipelined op may hold on one unit.
+/// Card 0 (`streaming_performance_sweep`, `sfpu_pipeline_sweep`; host end to
+/// end, run 1791079325 and after): on one tile every element-wise op or
+/// reduction from 49 tiles gained (0.63-0.89), and small ones forced to
+/// overlap still did (a max over rows of 64 tiles 0.88).
 pub const PIPELINE_SHARE: usize = 48;
 
-/// [`PIPELINE_SHARE`] for a reduction: four times as much. A reduction's
-/// device time gained wherever it pipelined (0.57-0.89 on one and two tiles),
-/// but end to end, shares under ~200 tiles a unit on one tile and ~500 on two
-/// lost up to 1.15x, and 512 a unit on 8 tiles lost 1.11x.
-pub const REDUCE_PIPELINE_SHARE: usize = 4 * PIPELINE_SHARE;
+/// What each further unit adds to [`PIPELINE_SHARE`], in tiles a unit. The host
+/// queues the units' lists one after another (~6 us a unit an op), so with many
+/// units a fresh op is the host's, and the extra runs overlap makes cost more
+/// than it saves until each unit has a great deal to move. Adds on 8 tiles
+/// lost 1.07-1.20 up to 1152 tiles a unit and gained from 1568 (0.97 there,
+/// 0.87 at 2048 a unit); on 32 tiles they lost 1.37-1.44 at every size to 1152
+/// a unit; reductions on 8 and 32 tiles lost up to 1.28 or broke even.
+pub const PIPELINE_SHARE_PER_UNIT: usize = 180;
+
+/// Fewest tiles a unit's share of a captured pipelined op may hold, per unit.
+/// A replay pays no host time for its runs. Adds on 8 tiles gained 0.90 at 32
+/// tiles a unit and 0.77 at 128; on 32 tiles 0.95 at 32 and 0.93 at 128, and
+/// lost 1.016 at 8 a unit, where [`MIN_PIPELINED_RUN`] leaves one run anyway.
+pub const CAPTURED_PIPELINE_SHARE: usize = 32;
+
+/// Tiles a unit's share must hold for `overlap` on `units` units, scaled by
+/// [`set_pipeline_share_percent`].
+pub fn pipeline_share(overlap: Overlap, units: usize) -> usize {
+    let share = match overlap {
+        Overlap::Off => usize::MAX,
+        Overlap::Fresh => PIPELINE_SHARE + PIPELINE_SHARE_PER_UNIT * (units.max(1) - 1),
+        Overlap::Captured => CAPTURED_PIPELINE_SHARE,
+    };
+    if share == usize::MAX {
+        return share;
+    }
+    share * PIPELINE_SHARE_PERCENT.load(std::sync::atomic::Ordering::Relaxed) / 100
+}
+
+/// Percent of [`pipeline_share`] that [`pipelined_runs`] asks for; 100 is the
+/// constants as they stand. A benchmark lowers it to see what overlap does
+/// where the constants say no (`sfpu_pipeline_sweep`,
+/// `streaming_performance_sweep`); nothing else sets it.
+static PIPELINE_SHARE_PERCENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(100);
+
+/// Set [`PIPELINE_SHARE_PERCENT`]; returns what it was.
+pub fn set_pipeline_share_percent(percent: usize) -> usize {
+    PIPELINE_SHARE_PERCENT.swap(percent, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The runs of a pipelined element-wise or reduce op over `len` items of
 /// `weight` tiles each, at most `half_max` items a run (half the arena's
@@ -1523,18 +1568,18 @@ pub const REDUCE_PIPELINE_SHARE: usize = 4 * PIPELINE_SHARE;
 /// computes, and the same number on every unit -- the op takes as long as its
 /// busiest unit, and one extra run on a few units cost card 0 up to 25%
 /// (`exp` over 1024 tiles on 8: 18 runs, two units doing three). `None` where
-/// that would leave a run under [`MIN_PIPELINED_RUN`] tiles, a unit's share
-/// under `share` tiles per unit ([`PIPELINE_SHARE`],
-/// [`REDUCE_PIPELINE_SHARE`]), or `half_max` is zero.
+/// `overlap` is off, that would leave a run under [`MIN_PIPELINED_RUN`] tiles,
+/// a unit's share under [`pipeline_share`] tiles, or `half_max` is zero.
 pub fn pipelined_runs(
     len: usize,
     weight: usize,
     units: usize,
     half_max: usize,
-    share: usize,
+    overlap: Overlap,
 ) -> Option<Vec<std::ops::Range<usize>>> {
     let units = units.max(1);
-    if half_max == 0 || len * weight < share * units * units {
+    let share = pipeline_share(overlap, units);
+    if half_max == 0 || overlap == Overlap::Off || len * weight < share.saturating_mul(units) {
         return None;
     }
     let parts = len.div_ceil(half_max).div_ceil(units).max(2) * units;
@@ -1652,7 +1697,7 @@ pub fn sfpu_eltwise(
     b: Option<&DramTensor>,
     c: Option<&DramTensor>,
     units: usize,
-    pipeline: bool,
+    overlap: Overlap,
 ) -> Result<Option<Work>> {
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
@@ -1694,17 +1739,13 @@ pub fn sfpu_eltwise(
     let rb = b.map(DramTensor::tensor_ref);
     // Pipelined (checklist 9.15): runs in alternating halves of the arena,
     // so a unit's mover moves one run while the roles compute another.
-    let piped = pipeline
-        .then(|| {
-            pipelined_runs(
-                rt * ct,
-                1,
-                units,
-                sfpu_group(op, bcast, operands, true),
-                PIPELINE_SHARE,
-            )
-        })
-        .flatten();
+    let piped = pipelined_runs(
+        rt * ct,
+        1,
+        units,
+        sfpu_group(op, bcast, operands, true),
+        overlap,
+    );
     let pipelined = piped.is_some();
     let all = piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
     let mut jobs = Vec::new();
@@ -1949,7 +1990,7 @@ pub fn sfpu_reduce(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     units: usize,
-    pipeline: bool,
+    overlap: Overlap,
 ) -> Result<Work> {
     a.expect("a reduction", Elem::F32)?;
     use crate::sfpu::reduce::Axis;
@@ -1970,12 +2011,10 @@ pub fn sfpu_reduce(
     };
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
-    let piped = pipeline
-        .then(|| {
-            let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
-            pipelined_runs(outs, per, units, half, REDUCE_PIPELINE_SHARE)
-        })
-        .flatten();
+    let piped = {
+        let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
+        pipelined_runs(outs, per, units, half, overlap)
+    };
     let pipelined = piped.is_some();
     let all = piped.unwrap_or_else(|| runs(outs, units, group));
     let mut jobs = Vec::new();
@@ -2159,7 +2198,7 @@ pub fn sum_rows(
     alloc: &mut DramAlloc,
     a: &DramTensor,
     units: usize,
-    pipeline: bool,
+    overlap: Overlap,
 ) -> Result<Work> {
     use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, Axis, ReduceOp, ROW_CHUNK};
     a.expect("a sum over rows", Elem::F32)?;
@@ -2169,7 +2208,7 @@ pub fn sum_rows(
         v => v,
     };
     if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false).is_some() {
-        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, pipeline);
+        return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, overlap);
     }
     // Longer columns stay plain: each chunk gathers the sums the chunk before
     // scattered, which a pipelined list would gather before they land.
@@ -3396,5 +3435,60 @@ mod reference {
             }
         }
         Ok(Work { out: c, jobs })
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::{pipeline_share, pipelined_runs, Overlap};
+
+    /// `len` one-tile items on `units`, in runs of at most 64 tiles.
+    fn runs(len: usize, units: usize, overlap: Overlap) -> bool {
+        pipelined_runs(len, 1, units, 64, overlap).is_some()
+    }
+
+    #[test]
+    fn a_serialized_op_never_overlaps() {
+        for units in [1, 8, 32] {
+            assert!(!runs(1 << 20, units, Overlap::Off), "{units} units");
+        }
+    }
+
+    /// Where card 0 measured fresh ops: on one tile overlap gained from 49
+    /// tiles; on eight it lost to 1152 tiles a unit and gained from 1568
+    /// (`PIPELINE_SHARE_PER_UNIT`); on 32 it lost at every size measured.
+    #[test]
+    fn a_fresh_op_asks_more_of_each_unit_the_more_units_there_are() {
+        assert_eq!(pipeline_share(Overlap::Fresh, 1), 48);
+        assert!(runs(48, 1, Overlap::Fresh) && !runs(47, 1, Overlap::Fresh));
+        let eight = pipeline_share(Overlap::Fresh, 8);
+        assert!((1152..=1568).contains(&eight), "{eight}");
+        // 2048 x 2048 is 4096 tiles: 512 a unit, which lost.
+        assert!(!runs(4096, 8, Overlap::Fresh));
+        assert!(runs(8 * eight, 8, Overlap::Fresh) && !runs(8 * eight - 1, 8, Overlap::Fresh));
+        // 4096 x 4096 is 16384 tiles: 2048 a unit, which gained.
+        assert!(runs(16384, 8, Overlap::Fresh));
+        // 6144 x 6144 is 36864 tiles: 1152 a unit on 32, which lost 1.38.
+        assert!(!runs(36864, 32, Overlap::Fresh));
+    }
+
+    /// A replay pays no host time for its runs: a capture overlaps from 32
+    /// tiles a unit, whatever the units (8 tiles a unit lost 1.6% on 32).
+    #[test]
+    fn a_captured_op_asks_the_same_of_every_unit() {
+        for units in [1, 2, 8, 32] {
+            let share = pipeline_share(Overlap::Captured, units);
+            assert_eq!(share, 32);
+            assert!(runs(share * units, units, Overlap::Captured), "{units}");
+            assert!(
+                !runs(share * units - 1, units, Overlap::Captured),
+                "{units}"
+            );
+        }
+        // 512 x 512 on 8 units, 32 on 32 units.
+        assert!(runs(256, 8, Overlap::Captured) && !runs(256, 32, Overlap::Captured));
+        assert!(runs(1024, 32, Overlap::Captured));
+        // A capture never asks less than a fresh op's one-unit share.
+        assert!(pipeline_share(Overlap::Fresh, 1) > pipeline_share(Overlap::Captured, 1));
     }
 }

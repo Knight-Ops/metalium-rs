@@ -85,11 +85,34 @@ Counters wrap modulo 2^16 and reset at every packet; a region holds at most
 
 ### Traces
 
-Traces keep the reader and writer command streams in DRAM and every script and
-arithmetic body in the program cache. `PAIR_CALL` starts both directions from one
-B replay; the outer and nested fetch buffers are distinct. `LAUNCH`/`KERNEL_WAIT`
-generations are rebased and `LAUNCH` bodies held. Fresh and traced compute use the
-same schedule. Recovery resets the tile and invalidates traces captured before.
+Capture keeps each unit's reader and writer command streams in DRAM
+(`Session::trace_sections` counts their entries) and pins every streaming script
+and arithmetic body in the program cache for the trace's lifetime. A replay is
+one `CALL` per unit on B, which starts both directions with `PAIR_CALL`.
+
+- **Generations.** `LAUNCH` and `KERNEL_WAIT` are rebased to the capture, as
+  `KERNEL` is, each wait keeping its launch's generation, and programs a `LAUNCH`
+  names are held. Record payloads are skipped, never read as command headers. A
+  replay, queued ones included, reserves fresh generations; the firmware refuses
+  a wait whose generation is not the launch's.
+- **Chunks.** B fetches a stream 64 entries at a time. `trace::chunked` pads so
+  no record crosses a chunk; a `LAUNCH` in one chunk and its `KERNEL_WAIT` in the
+  next work because the active generation, the pair state and the dataflow
+  counters are firmware statics, saved and restored around each chunk. The outer
+  and nested fetch buffers are distinct; a nested `CALL`, or a `PAIR_CALL` in a
+  pair, is refused.
+- **NC.** It fetches writer commands on NoC #1 under its own transaction ID (4;
+  B's is 2, the barrier's 3). The same ID covers NC's data writes, so a chunk's
+  fetch wait also waits for the writes in flight.
+- **Barriers.** B's region completes only when NC has acknowledged its writes,
+  and the cross-tile barrier entry, a separate entry after the `PAIR_CALL` in a
+  capture, runs after that.
+- **Failure.** An error resets the roles and the movers; the epoch moves on, a
+  trace captured before is `Stale`, and releasing it returns its GDDR and holds
+  only in the cache generation it took them in.
+
+Fresh and traced compute use the same schedule; a capture chooses its overlap by
+the `Captured` rule (see Overlap thresholds), and a replay never replans.
 
 ### Profiling
 
@@ -97,7 +120,10 @@ Role profiles bracket whole regions; nested reader replay events are flattened
 into the outer mover list. Exports can still be unbalanced with NC running; the
 claim that this predates streaming ownership is not yet backed by a reproduction
 on the legacy NC split. Use host timing and `dataflow_stats` as the primary
-performance evidence.
+performance evidence. `sfpu_pipeline_sweep` timed ops from role profiles; on
+its first cell (a 64x784 add on one tile) the export now fails, `tile (1, 2):
+event 19: an entry began outside a list or inside one` (run `1791079283`), so the
+sweep times from the host.
 
 ### Validation
 
@@ -137,11 +163,73 @@ On silicon (card 0 unless noted; release builds):
   8.8 ms/step, burn-flex 4.35.
 
 Fresh small ops still trail the removed executor (64² add 1.16x, 32-tile 256³
-matmul 1.32x). On 32 tiles that matmul spends ~240 µs on the host per op, ~130 µs
-of it enqueueing (segments ~1 µs, placement ~0.65 µs and list checks and writes
-~1.4 µs per unit). The sweep's 32-tile rows also show overlap never engaging:
-`tensor::pipelined_runs` wants 48 tiles per unit squared, a threshold tuned for
-the B-only pipeline and not yet re-tuned for NC ownership.
+matmul 1.32x). On 32 tiles that matmul spends ~240 µs on the host per op, ~144 µs
+of it enqueueing (`silicon_bench_path::host_time_per_op`, per op): segments 35 µs,
+placement 22, kernel reservation 16, list checks 13, list writes 39 (three
+posted writes a unit), idle checks 4. The checks are ~9% of the enqueue and
+guard the card, so they stay; the host-compute stages are the open work.
+
+### Overlap thresholds (retuned for NC ownership)
+
+`tensor::pipelined_runs` was tuned for the removed B-only pipeline. Runs
+`1791079466` and `1791079480` (host end to end, one op, serial against
+overlapped, under the old constants and forced with `SWEEP_SHARE_PERCENT=0`;
+the one-tile reduction cells are `1791079325` and `1791079341`) showed:
+
+- fresh adds on 8 tiles lost 1.03-1.20 up to 1152 tiles a unit and gained from
+  1568 (0.97; 0.87 at 2048 a unit); on 32 tiles forcing overlap lost 1.37-1.44
+  from 32 to 1152 tiles a unit. On one tile it gained from 49 tiles (0.63-0.89),
+  small reductions included (a max over rows of 64 tiles, 0.88);
+- a captured op pays nothing for its runs on replay, and gained from about 32
+  tiles a unit on any tile count: 8 tiles 0.90 at 512² and 0.77 at 1024², 32 tiles
+  0.95 at 1024² and 0.93 at 2048². It lost 1.6% at 8 tiles a unit.
+
+So an element-wise op or reduction takes an `Overlap`
+(`Session::overlap`: `Off`, `Fresh`, `Captured`). A fresh op needs
+`PIPELINE_SHARE + PIPELINE_SHARE_PER_UNIT * (units - 1)` = 48 + 180 (units - 1)
+tiles a unit; a captured one `CAPTURED_PIPELINE_SHARE` = 32. The reduction's
+separate, larger share is gone. Run `1791079782`: no cell is over 3% slower than
+serial (one noise outlier in a cell where nothing overlaps, 1.12), fresh 8-tile
+2048² add went from 1.07 to 1.00, traced 8-tile 512²/1024² adds from 1.00 to
+0.90/0.77, traced 32-tile 1024²/2048² from 1.00 to 0.95/0.93, and 1-tile
+reductions of 64-256² from 1.00 to 0.91. The fresh sweep (`sfpu_pipeline_sweep`,
+host time only: device profiles are unbalanced with NC running, see
+Profiling) is run `1791079877`. Matmul keeps `pipelining_pays`, which this
+round did not touch.
+
+### Tests added with this round
+
+- A trace's program holds are stamped with the program cache's generation
+  (`ProgramCache::generation`), so a release after a recovery cleared the cache
+  no longer unholds a newer trace's program at the same address
+  (`releasing_a_stale_trace_leaves_a_newer_traces_programs_held`, and
+  `a_release_after_a_clear_leaves_the_new_hold_alone`).
+- `check_pair` refuses a reader holding an output credit, a credit at another
+  capacity than the header's, a capacity of 0 or past the counters, a writer
+  section that reads, and a section that does not fill the packet. Counters are
+  swept across the 2^16 wrap for any reservation size (`tt_isa::dataflow`), and
+  `dataflow::reached` (the release wait's comparison, now shared with the
+  firmware) across it.
+- A trace whose reader section is more than two chunks long replays over
+  changed inputs against the host (`large_streaming_pipeline_trace_crosses_chunks`,
+  `Session::trace_sections`); a `LAUNCH` and its `KERNEL_WAIT` more than a
+  chunk apart land in different chunks (`trace::a_launch_and_its_wait_can_fall_in_different_chunks`).
+- Traced matmul and reduction replay over changed operands with a fresh op
+  between, against burn-flex; a failed transfer-only packet recovers without
+  handing out storage the packet may still write
+  (`a_failed_transfer_only_packet_recovers_without_reusing_storage`); the
+  rejection messages name the preceding list and the reason; burn-tt refuses
+  `TT_EXECUTION` and `TT_SCATTER`.
+- Not covered: an NC that hangs (the ~60 ms bound). Making NC hang on purpose
+  risks a host reboot on silicon, and ttsim cannot time it.
+
+Silicon, full suite after the changes: 306/306 (run `1791079893`). Model runs
+after them (card 0, release, `tt-mnist --host`): MNIST full epoch 1.3 ms/step on
+one tile and 0.8 on four (burn-flex 0.5), 91.96% as the golden, loss curves
+within 0.1% of burn-flex at 10 of 10 checkpoints; transformer
+(`--model transformer`, 50 steps) 8.74 ms/step against burn-flex 4.38. None is more than about 0.1 ms/step from
+the figures above (1.4 / 0.9 / 8.8); which ops of the models now overlap, if any,
+was not traced.
 
 ```
 cargo test --workspace --no-fail-fast

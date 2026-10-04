@@ -42,9 +42,22 @@ pub trait Engine {
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
 
     /// Can this engine keep tensors on the device (Phase 9)? If not, every
-    /// tensor stays on the host and only `matmul` runs on the device.
+    /// tensor stays on the host; native `matmul` and `full_reduce` may stage
+    /// through L1 if the engine implements them.
     fn supports_dram(&self) -> bool {
         false
+    }
+    /// A full F32 reduction computed by native kernels, staging through L1
+    /// when this engine has no resident tensor storage. Never host arithmetic.
+    fn full_reduce(
+        &mut self,
+        _values: &[f32],
+        _dims: [usize; 2],
+        _mean: bool,
+    ) -> Result<f32, EngineError> {
+        Err(EngineError(
+            "native full reduction is unsupported by this engine".into(),
+        ))
     }
     /// Put a row-major `[rows, cols]` matrix on the device.
     fn upload(
@@ -874,6 +887,15 @@ pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) ->
     .unwrap_or_else(|e| panic!("matmul {mkn:?} on {device}: {e}"))
 }
 
+/// A native full reduction for an engine without resident tensor storage.
+pub(crate) fn full_reduce(device: TtDevice, values: Vec<f32>, dims: [usize; 2], mean: bool) -> f32 {
+    crate::report::staged_reduce(dims);
+    timed_run("full_reduce", device, move |engine, _| {
+        engine.full_reduce(&values, dims, mean)
+    })
+    .unwrap_or_else(|e| panic!("native full reduction {dims:?} on {device}: {e}"))
+}
+
 /// Does `device`'s engine keep tensors on the device? Asked once per device.
 pub(crate) fn supports_dram(device: TtDevice) -> bool {
     static KNOWN: Mutex<Option<HashMap<TtDevice, bool>>> = Mutex::new(None);
@@ -1346,6 +1368,23 @@ impl Engine for KmdEngine {
     }
 }
 
+/// Settings of the executors that were removed: refused with what replaces
+/// them rather than ignored, so a script that still sets one learns why it no
+/// longer does anything. `get` reads a variable, as `std::env::var` does.
+fn refuse_retired_settings(get: impl Fn(&str) -> Option<String>) -> Result<(), EngineError> {
+    if let Some(value) = get("TT_EXACT") {
+        return Err(EngineError(format!("TT_EXACT={value}: retired with the Flex cutover; native numerical bounds apply; unset it")));
+    }
+    for variable in ["TT_EXECUTION", "TT_SCATTER"] {
+        if let Some(value) = get(variable) {
+            return Err(EngineError(format!(
+                "{variable}={value}: retired; GDDR compute always uses B-reader/NC-writer ownership; unset it (TT_PIPELINE=0 disables overlap without changing ownership)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A factory for [`attach`] that opens `/dev/tenstorrent/{device.chip}` as a
 /// [`Session`] computing on `tile` through `route` at `fidelity`.
 pub fn kmd_engine(
@@ -1369,9 +1408,10 @@ pub fn kmd_engine(
                 "TT_ELTWISE={v}: element-wise ops always run on the SFPU now; unset it"
             )));
         }
-        // `TT_PIPELINE=0`: matmuls run their blocks one after another rather
-        // than overlapping one block's moves with the next one's compute
-        // (`Session::set_pipeline`); the bits are the same either way.
+        // `TT_PIPELINE=0`: matmuls, element-wise ops and reductions run their
+        // blocks and runs one after another rather than overlapping one's
+        // moves with the next one's compute (`Session::set_pipeline`); the
+        // bits are the same either way.
         match std::env::var("TT_PIPELINE").as_deref() {
             Err(_) | Ok("1") => {}
             Ok("0") => session.set_pipeline(false),
@@ -1393,13 +1433,7 @@ pub fn kmd_engine(
             Ok("card") => session.set_tilize(tt_kernels::session::Tilize::Card),
             Ok(v) => return Err(EngineError(format!("TT_TILIZE={v}: expected host or card"))),
         }
-        for variable in ["TT_EXECUTION", "TT_SCATTER"] {
-            if let Ok(value) = std::env::var(variable) {
-                return Err(EngineError(format!(
-                    "{variable}={value}: retired; GDDR compute always uses B-reader/NC-writer ownership; unset it (TT_PIPELINE=0 disables overlap without changing ownership)"
-                )));
-            }
-        }
+        refuse_retired_settings(|variable| std::env::var(variable).ok())?;
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.
@@ -1446,13 +1480,219 @@ pub struct MeshEngine<T: tt_device::Transport> {
     pub route: SrcRoute,
     pub fidelity: Fidelity,
     pub budget: u64,
+    buffers: DramBuffers,
+}
+
+impl<T: tt_device::Transport> MeshEngine<T> {
+    pub fn new(
+        mut fabric: tt_kernels::shard::Fabric<T>,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<Self, EngineError> {
+        fabric
+            .enable_resident(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(Self {
+            fabric,
+            route,
+            fidelity,
+            budget,
+            buffers: DramBuffers::default(),
+        })
+    }
 }
 
 impl<T: tt_device::Transport> Engine for MeshEngine<T> {
-    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError> {
-        self.fabric
-            .matmul(a, b, mkn, self.route, self.fidelity, self.budget)
-            .map_err(|e| EngineError(e.to_string()))
+    fn matmul(
+        &mut self,
+        a: &[f32],
+        b: &[f32],
+        [m, k, n]: [usize; 3],
+    ) -> Result<Vec<f32>, EngineError> {
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let a = self.upload(a, m, k)?;
+            temporary.push(a);
+            let b = self.upload(b, k, n)?;
+            temporary.push(b);
+            let (out, _) = self.matmul_dram(a, false, b, false)?;
+            temporary.push(out);
+            self.download(out)
+        })();
+        for t in temporary {
+            self.free(t);
+        }
+        result
+    }
+    fn full_reduce(
+        &mut self,
+        values: &[f32],
+        [r, c]: [usize; 2],
+        mean: bool,
+    ) -> Result<f32, EngineError> {
+        use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let input = self.upload(values, r, c)?;
+            temporary.push(input);
+            let (column, _) = self.reduce(input, ReduceOp::Sum, Axis::Cols)?;
+            temporary.push(column);
+            let (mut scalar, _) = self.reduce(column, ReduceOp::Sum, Axis::Rows)?;
+            temporary.push(scalar);
+            if mean {
+                (scalar, _) = self.eltwise(
+                    tt_kernels::sfpu::ops::kind_sfpu::DIV_SCALAR,
+                    (r * c) as f32,
+                    scalar,
+                    None,
+                )?;
+                temporary.push(scalar);
+            }
+            Ok(self.download(scalar)?[0])
+        })();
+        for t in temporary {
+            self.free(t);
+        }
+        result
+    }
+    fn supports_dram(&self) -> bool {
+        true
+    }
+    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, EngineError> {
+        let b = &mut self.buffers;
+        b.upload(self.fabric.chips[0].session(), v, rows, cols)
+    }
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+        let b = &mut self.buffers;
+        b.download(self.fabric.chips[0].session(), id)
+    }
+    fn upload_bits(
+        &mut self,
+        v: &[u32],
+        rows: usize,
+        cols: usize,
+        elem: Elem,
+    ) -> Result<BufferId, EngineError> {
+        let b = &mut self.buffers;
+        b.upload_bits(self.fabric.chips[0].session(), v, rows, cols, elem)
+    }
+    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, EngineError> {
+        let b = &mut self.buffers;
+        b.download_bits(self.fabric.chips[0].session(), id)
+    }
+    fn free(&mut self, id: BufferId) {
+        self.buffers.free(self.fabric.chips[0].session(), id);
+    }
+    fn matmul_dram(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let a = self.buffers.get(a)?.clone();
+        let b = self.buffers.get(b)?.clone();
+        let out = self
+            .fabric
+            .matmul_resident(&a, ta, &b, tb, self.route, self.fidelity, self.budget)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.buffers.insert(out))
+    }
+    fn eltwise(
+        &mut self,
+        kind: u32,
+        scalar: f32,
+        a: BufferId,
+        b: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.eltwise(self.fabric.chips[0].session(), kind, scalar, a, b)
+    }
+    fn eltwise_op(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.eltwise_op(self.fabric.chips[0].session(), op, a, b, c)
+    }
+    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.pow(self.fabric.chips[0].session(), x, y)
+    }
+    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.sum_rows(self.fabric.chips[0].session(), a)
+    }
+    fn reduce(
+        &mut self,
+        a: BufferId,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        axis: tt_kernels::sfpu::reduce::Axis,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.reduce(self.fabric.chips[0].session(), a, op, axis)
+    }
+    fn slice_rows(
+        &mut self,
+        a: BufferId,
+        first: usize,
+        rows: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.slice_rows(a, first, rows)
+    }
+    fn matmul_dram_batched(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        items: &[(Block, Block)],
+        mkn: [usize; 3],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.matmul_batched(
+            self.fabric.chips[0].session(),
+            a,
+            b,
+            items,
+            mkn,
+            self.route,
+            self.fidelity,
+            self.budget,
+        )
+    }
+    fn copy_blocks(
+        &mut self,
+        a: BufferId,
+        moves: &[BlockMove],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.copy_blocks(self.fabric.chips[0].session(), a, moves, dims)
+    }
+    fn gather_rows(
+        &mut self,
+        sources: &[BufferId],
+        rows: &[(usize, usize)],
+        cols: usize,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.gather_rows(self.fabric.chips[0].session(), sources, rows, cols)
+    }
+    fn rows_add(
+        &mut self,
+        t: BufferId,
+        indices: &[usize],
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = &mut self.buffers;
+        bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
+        Some(self.fabric.chips[0].device().traffic())
     }
 }
 
@@ -1470,6 +1710,7 @@ pub fn kmd_mesh_engine(
     use tt_device::tlb::WindowKind;
     use tt_kernels::shard::{Chip, Fabric};
     move |serve| {
+        refuse_retired_settings(|variable| std::env::var(variable).ok())?;
         let e = |e: tt_device::TransportError| EngineError(e.to_string());
         let mut chips = Vec::new();
         for &card in &cards {
@@ -1491,7 +1732,7 @@ pub fn kmd_mesh_engine(
         for p in 0..chips.len() {
             for q in p + 1..chips.len() {
                 let (l, r) = chips.split_at_mut(q);
-                let (a, b) = (&mut l[p].dev, &mut r[0].dev);
+                let (a, b) = (l[p].device(), r[0].device());
                 let wa = a.alloc_window(WindowKind::TwoMib).map_err(e)?;
                 let wb = b.alloc_window(WindowKind::TwoMib).map_err(e)?;
                 let (ga, gb) = (
@@ -1512,12 +1753,41 @@ pub fn kmd_mesh_engine(
             tt_firmware_images::ETH_E1,
         )
         .map_err(|x| EngineError(x.to_string()))?;
-        serve.serve(&mut MeshEngine {
-            fabric,
-            route,
-            fidelity,
-            budget: 400_000,
-        });
+        let mut engine = MeshEngine::new(fabric, route, fidelity, 400_000)?;
+        serve.serve(&mut engine);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_retired_settings;
+
+    #[test]
+    fn retired_executor_settings_are_refused_with_what_replaces_them() {
+        for (variable, value) in [
+            ("TT_EXECUTION", "legacy"),
+            ("TT_EXECUTION", "streaming"),
+            ("TT_SCATTER", "b"),
+            ("TT_SCATTER", "nc"),
+        ] {
+            let error = refuse_retired_settings(|name| (name == variable).then(|| value.into()))
+                .unwrap_err()
+                .0;
+            assert!(
+                error.starts_with(&format!("{variable}={value}: retired")),
+                "{error}"
+            );
+            assert!(error.contains("TT_PIPELINE=0"), "{error}");
+        }
+        assert!(refuse_retired_settings(|_| None).is_ok());
+        let error = refuse_retired_settings(|name| (name == "TT_EXACT").then(|| "1".into()))
+            .unwrap_err()
+            .0;
+        assert!(error.contains("TT_EXACT=1: retired"), "{error}");
+        assert!(
+            error.contains("native numerical bounds") && error.contains("unset"),
+            "{error}"
+        );
     }
 }

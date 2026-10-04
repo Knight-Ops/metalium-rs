@@ -503,68 +503,66 @@ fn sfpu_transcendental_cost() {
     }
 }
 
-/// Softmax through Burn on a device-resident `[rows, cols]` tensor: the
-/// device composition (max, subtract, exp, sum, divide on the device) against
-/// the host's fused softmax after a download, by size, then the result read
-/// back either way. Decides when `burn-tt` composes on the device.
+/// Native resident softmax with readback, compared with an external Flex tensor.
 #[test]
 #[ignore = "benchmark"]
 fn softmax_placement_sweep() {
     use burn::tensor::{activation, Tensor, TensorData};
+    use burn_flex::{Flex, FlexDevice};
     use burn_tt::TtBackend;
     use tt_tests::burn_device::{with_device, Config};
-    let modes: &[bool] = if std::env::var_os("SOFTMAX_DEVICE_ONLY").is_some() {
-        &[false]
-    } else {
-        &[false, true]
-    };
-    for &exact in modes {
-        with_device(
-            Config {
-                exact,
-                ..Config::default()
-            },
-            |d| {
-                let sizes: Vec<(usize, usize)> = match std::env::var("SOFTMAX_SIZE") {
-                    Ok(v) => {
-                        let (r, c) = v.split_once('x').expect("RxC");
-                        vec![(r.parse().unwrap(), c.parse().unwrap())]
-                    }
-                    Err(_) => vec![
-                        (64, 10),
-                        (256, 10),
-                        (64, 128),
-                        (512, 128),
-                        (1024, 256),
-                        (4096, 512),
-                    ],
-                };
-                for (r, c) in sizes {
-                    let v: Vec<f32> = (0..r * c).map(|i| (i % 97) as f32 * 0.01).collect();
-                    // Computed on the device, so neither path finds a host copy to
-                    // start from: the host path pays the download, as it would
-                    // after any device op.
-                    let t = Tensor::<TtBackend, 2>::from_data(TensorData::new(v, [r, c]), &d)
-                        .to_device(&d)
-                        * 1.0;
-                    let _ = activation::softmax(t.clone(), 1).into_data();
-                    let mut times = Vec::new();
-                    for _ in 0..5 {
-                        let t0 = Instant::now();
-                        let s = activation::softmax(t.clone(), 1);
-                        let _ = s.into_data();
-                        times.push(t0.elapsed());
-                    }
-                    println!(
-                        "softmax [{r}, {c}] ({} tiles) {}: {:.1} us",
-                        r.div_ceil(32) * c.div_ceil(32),
-                        if exact { "host" } else { "device" },
-                        median(times).as_secs_f64() * 1e6
-                    );
+    let device_only = std::env::var_os("SOFTMAX_DEVICE_ONLY").is_some();
+    with_device(Config::default(), |d| {
+        let sizes: Vec<(usize, usize)> = match std::env::var("SOFTMAX_SIZE") {
+            Ok(v) => {
+                let (r, c) = v.split_once('x').expect("RxC");
+                vec![(r.parse().unwrap(), c.parse().unwrap())]
+            }
+            Err(_) => vec![
+                (64, 10),
+                (256, 10),
+                (64, 128),
+                (512, 128),
+                (1024, 256),
+                (4096, 512),
+            ],
+        };
+        for (r, c) in sizes {
+            let data = TensorData::new(
+                (0..r * c)
+                    .map(|i| (i % 97) as f32 * 0.01)
+                    .collect::<Vec<_>>(),
+                [r, c],
+            );
+            let t = Tensor::<TtBackend, 2>::from_data(data.clone(), &d).to_device(&d);
+            let _ = activation::softmax(t.clone(), 1).into_data();
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                let _ = activation::softmax(t.clone(), 1).into_data();
+                times.push(t0.elapsed());
+            }
+            println!(
+                "softmax [{r}, {c}] ({} tiles) native: {:.1} us",
+                r.div_ceil(32) * c.div_ceil(32),
+                median(times).as_secs_f64() * 1e6
+            );
+            if !device_only {
+                let reference = Tensor::<Flex, 2>::from_data(data, &FlexDevice);
+                let _ = activation::softmax(reference.clone(), 1).into_data();
+                let mut times = Vec::new();
+                for _ in 0..5 {
+                    let t0 = Instant::now();
+                    let _ = activation::softmax(reference.clone(), 1).into_data();
+                    times.push(t0.elapsed());
                 }
-            },
-        );
-    }
+                println!(
+                    "softmax [{r}, {c}] external Flex: {:.1} us",
+                    median(times).as_secs_f64() * 1e6
+                );
+            }
+        }
+    });
 }
 
 /// Each op of a device softmax on one `[512, 128]` tensor, alone, through the

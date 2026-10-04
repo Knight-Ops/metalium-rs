@@ -184,7 +184,6 @@ fn same_bits(got: &[u32], want: &[u32], what: &str) {
 fn compare_select_and_sign_stay_on_the_card() {
     use burn::tensor::activation;
     let config = Config {
-        exact: true,
         ..Config::default()
     };
     with_device(config, |d| {
@@ -884,7 +883,11 @@ fn trig_stays_on_the_card_within_their_bounds() {
             .downcast_ref::<String>()
             .map(String::as_str)
             .unwrap_or_default();
-        assert!(msg.contains("one shape only"), "{msg}");
+        assert!(msg.contains("unsupported operation float_atan2"), "{msg}");
+        assert!(
+            msg.contains("F32") && msg.contains("expand operands"),
+            "{msg}"
+        );
         // `floats` has no denormals, which `atan2` reads as zeros.
         let got = vals(resident("atan2", || x.clone().atan2(g.clone())), "atan2");
         check(

@@ -72,6 +72,25 @@ fn a_2d_matmul_is_one_engine_run() {
     check::<2>(&[5, 7], &[7, 3], 1, TtDevice::new(100));
 }
 
+#[test]
+fn full_reductions_reject_an_engine_without_native_reduction_support() {
+    let device = TtDevice::new(120);
+    let (_guard, _) = host(device);
+    let input = Tensor::<TtBackend, 1>::from_data([1.0, 2.0], &device);
+    for mean in [false, true] {
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if mean {
+                input.clone().mean()
+            } else {
+                input.clone().sum()
+            }
+        }))
+        .expect_err("a native full reduction needs device storage");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("native full reduction is unsupported by this engine"));
+    }
+}
+
 /// A real batch on the right is one run per element; a right side with no
 /// batch (a `Linear`'s weight, unsqueezed) folds the left's batch into its
 /// rows and is one run.
@@ -154,17 +173,15 @@ fn an_engine_error_panics_with_it() {
 }
 
 /// `burn::nn::Linear` calls `ModuleOps::linear`, a default over `float_matmul`
-/// that Flex does not override. The generated delegation leaves it to its
-/// default, so it composes *this* backend's matmul and reaches the device --
-/// forwarding it to Flex instead once kept every `Linear` layer on the host.
+/// that generated dispatch leaves to Burn. With no bias, this minimal engine
+/// needs only matmul. Biased Linears are covered by the native model gates.
 #[test]
 fn a_linear_layer_reaches_the_engine() {
     let device = TtDevice::new(109);
     let (_guard, calls) = host(device);
     let x = Tensor::<TtBackend, 2>::from_data(ints(&[6, 5], 1), &device);
     let w = Tensor::<TtBackend, 2>::from_data(ints(&[5, 4], 2), &device);
-    let b = Tensor::<TtBackend, 1>::from_data(ints(&[4], 3), &device);
-    let got = burn_tensor::module::linear(x, w, Some(b)).into_data();
+    let got = burn_tensor::module::linear(x, w, None).into_data();
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -173,7 +190,7 @@ fn a_linear_layer_reaches_the_engine() {
     let want = burn_tensor::module::linear(
         Tensor::<Flex, 2>::from_data(ints(&[6, 5], 1), &FlexDevice),
         Tensor::<Flex, 2>::from_data(ints(&[5, 4], 2), &FlexDevice),
-        Some(Tensor::<Flex, 1>::from_data(ints(&[4], 3), &FlexDevice)),
+        None,
     )
     .into_data();
     assert_eq!(want.as_bytes(), got.as_bytes());

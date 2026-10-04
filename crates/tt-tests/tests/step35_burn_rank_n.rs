@@ -7,7 +7,7 @@
 //! too; and a reshape that keeps the matrix is a view. Each against
 //! `burn-flex` bit for bit, downloading nothing. A broadcast the matrices
 //! would misread -- `[6, 1, 4] + [6, 1]`, a column of `[6, 4]` by the
-//! matrices but `[6, 6, 4]` by the rule -- still gets Flex's answer.
+//! matrices but `[6, 6, 4]` by the rule -- expands natively before computing.
 //!
 //! What it buys: a linear layer's bias is rank 1, and its gradient comes out
 //! of `linear_bias_backward` through a reshape, so before this every training
@@ -192,7 +192,7 @@ fn tensors_of_any_rank_stay_on_the_device() {
         );
         check(
             "the broadcast the matrices misread",
-            false,
+            true,
             || x.clone() + y.clone(),
             || fx.clone() + fy.clone(),
         );

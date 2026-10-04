@@ -1,9 +1,8 @@
 //! Which op ran where, and what each one moved across PCIe.
 //!
-//! The generated delegate (`xtask/src/gen_burn.rs`) opens an [`enter`] guard
-//! at the top of every op method, hand-written or forwarded to Flex, so no op
-//! can be missed: a forwarded op is one the generator wrote, and the
-//! generator writes the guard. Downloads and uploads (`server.rs`) are charged
+//! Generated dispatch (`xtask/src/gen_burn.rs`) opens an [`enter`] guard
+//! for native and unsupported methods. Async methods enter when polled.
+//! Downloads and uploads (`server.rs`) are charged
 //! to the innermost op running on the calling thread, and the tensor
 //! constructors (`tensor.rs`) say whether an op's result was made on the
 //! device or on the host. [`report`] is the process-wide table; [`with_report`]
@@ -28,8 +27,7 @@ use std::sync::{Mutex, Once};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpStat {
     pub op: &'static str,
-    /// Hand-written in `burn-tt` (a device path exists for some inputs), or
-    /// forwarded to Flex (no device kernel).
+    /// Implemented in `burn-tt`, or an explicit unsupported method.
     pub hand_written: bool,
     pub calls: u64,
     pub on_device: u64,
@@ -117,7 +115,7 @@ impl fmt::Display for Report {
                 f,
                 "{:<34} {:>5} {:>8} {:>8} {:>8} {:>11} {:>11} {:>11}  {}",
                 s.op,
-                if s.hand_written { "tt" } else { "flex" },
+                if s.hand_written { "tt" } else { "unsupported" },
                 s.calls,
                 s.on_device,
                 s.on_host,
@@ -182,8 +180,8 @@ pub struct OpGuard {
     op: &'static str,
 }
 
-/// Enter op `op` (`hand_written`: `burn-tt` implements it; otherwise Flex
-/// runs it). Called by the generated delegate only.
+/// Enter op `op` (`hand_written`: `burn-tt` implements it; otherwise it is
+/// explicitly unsupported). Called by generated dispatch.
 pub fn enter(op: &'static str, hand_written: bool) -> OpGuard {
     static AT_EXIT: Once = Once::new();
     AT_EXIT.call_once(|| {
@@ -278,6 +276,17 @@ pub(crate) fn uploaded(rows: usize, cols: usize) {
         s.uploads += 1;
         s.uploaded += bytes;
     });
+}
+
+/// A native reduction staged its input, column result and scalar through L1.
+pub(crate) fn staged_reduce([rows, cols]: [usize; 2]) {
+    let op = current().unwrap_or(OUTSIDE);
+    // Input, column-reduction readback and reupload, scalar readback.
+    let bytes = ((rows * cols + 2 * rows + 1) * 4) as u64;
+    bump(op, None, |s| s.staged += bytes);
+    if refuses() {
+        panic!("burn-tt strict mode: `{op}` staged a native full reduction through the host (engine has no resident tensor storage)");
+    }
 }
 
 /// A matmul staged its operands through the host: `bytes` up and back.

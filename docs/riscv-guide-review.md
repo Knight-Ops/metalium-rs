@@ -134,7 +134,7 @@ Source: `EthernetTile/BabyRISCV/README.md:3-14`. Nothing contradicts the repo.
 
 ---
 
-## 3. Bringing up NC as a second mover on NoC 1
+## 3. Original NC bring-up design (implemented; 2026-10-02 review)
 
 ### 3.1 Facts that bound the design
 
@@ -182,11 +182,16 @@ These are tt-metal's choices, which bind nobody. Each is marked with how it woul
 
 ---
 
-## 5. Open questions the guide does not answer
+## 5. Questions from the guide review
 
-1. **BH L0 instruction-cache sizes per core**, NC especially. Neither the Spec nor upstream has
-   the page (R1). Probe: time a loop of N straight-line instructions on NC and on B, sweeping N,
-   and find where cycles per iteration jump.
+Status reconciled 2026-10-04. Items 1 and 3 were answered by local probes;
+the remaining questions still need evidence. The original source review is
+preserved above.
+
+1. **Answered: BH instruction caches.** `probe_icache` measured about
+   4 KiB on each baby core, including B and NC (2026-10-03). See
+   `firmware-performance.md`, "Instruction caches". This does not establish
+   an X280 cache size.
 2. **NoC atomics and inline writes into BH L1 may hang.** tt-metal's BH `dev_mem_map.h` says:
    "issuing inline writes **and atomics** requires all 4 memory ports to accept the transaction
    at the same time … the transaction will hang". The Spec states only the inline-write
@@ -194,8 +199,9 @@ These are tt-metal's choices, which bind nobody. Each is marked with how it woul
    G7's "NoC atomics and L1 semaphores" (`concepts-review.md:363`). Treat NoC atomics to L1
    as an unverified encoding: gate them on ttsim and in an isolated silicon gate before
    any use.
-3. Does ttsim model NC fetching from L1 at `0x12000`, and NIU traffic issued by NC on NoC 1?
-   `step50_noc1.rs` is in progress and should answer this. The guide is silent.
+3. **Answered: NC on ttsim and silicon.** NC firmware and NoC1 traffic are
+   gated. The current executor always uses NC as the GDDR writer and captures
+   both mover streams (`feature-streaming-dataflow-ownership.md`).
 4. NoC ordering and alignment on BH: `Ordering.md` and `Alignment.md` are absent for BH
    (`RUST_IMPL_PLAN.md:265-266`). The guide offers nothing.
 5. Whether tt-metal's dynamic-NoC split (B 0/1, NC 2/3) is a hardware need or a software

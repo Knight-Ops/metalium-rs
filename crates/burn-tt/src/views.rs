@@ -68,6 +68,40 @@ impl Strided {
         [self.src.buffer.rows, self.src.buffer.cols]
     }
 
+    /// Does this view cover every logical source element exactly once?
+    /// Reshapes and swaps can change the stored matrix (a loss's `[n, 1]`
+    /// column viewed as `[n]`) without changing a full reduction's inputs.
+    pub(crate) fn covers_source(&self, shape: &[usize]) -> bool {
+        if self.base != [0, 0] || shape.len() != self.strides.len() || shape.contains(&0) {
+            return false;
+        }
+        let mut dimensions = [Vec::new(), Vec::new()];
+        for (&n, &stride) in shape.iter().zip(&self.strides) {
+            if n == 1 {
+                continue;
+            }
+            match stride {
+                [r, 0] if r > 0 => dimensions[0].push((r, n)),
+                [0, c] if c > 0 => dimensions[1].push((c, n)),
+                _ => return false,
+            }
+        }
+        let mut covered = [1, 1];
+        for (axis, dims) in dimensions.iter_mut().enumerate() {
+            dims.sort_unstable();
+            for &(stride, n) in dims.iter() {
+                if stride != covered[axis] {
+                    return false;
+                }
+                let Some(extent) = covered[axis].checked_mul(n) else {
+                    return false;
+                };
+                covered[axis] = extent;
+            }
+        }
+        covered == self.src_dims()
+    }
+
     /// The element at row-major position `flat` of a tensor of `shape`.
     pub(crate) fn at(&self, shape: &[usize], mut flat: usize) -> [usize; 2] {
         let [mut r, mut c] = self.base;
@@ -285,6 +319,33 @@ mod tests {
     use super::*;
     use crate::tensor::{Buffer, DramRef};
     use std::sync::Arc;
+
+    #[test]
+    fn full_source_coverage_requires_each_element_once() {
+        let plain = view(64, 96, &[64, 96]);
+        assert!(plain.covers_source(&[64, 96]));
+        let split = plain.reshaped(&[64, 96], &[2, 32, 3, 32]).unwrap();
+        for a in 0..4 {
+            for b in 0..4 {
+                let mut shape = [2, 32, 3, 32];
+                shape.swap(a, b);
+                assert!(split.swapped(a, b).covers_source(&shape));
+            }
+        }
+        assert!(view(128, 1, &[128, 1])
+            .reshaped(&[128, 1], &[128])
+            .unwrap()
+            .covers_source(&[128]));
+        assert!(!plain.covers_source(&[32, 96]));
+        let mut invalid = plain.clone();
+        invalid.base = [1, 0];
+        assert!(!invalid.covers_source(&[64, 96]));
+        invalid.base = [0, 0];
+        invalid.strides[0] = [0, 0];
+        assert!(!invalid.covers_source(&[64, 96]));
+        invalid.strides[0] = [2, 0];
+        assert!(!invalid.covers_source(&[64, 96]));
+    }
 
     /// A view of a `[rows, cols]` buffer nobody frees (a test-only device).
     pub(super) fn view(rows: usize, cols: usize, shape: &[usize]) -> Strided {

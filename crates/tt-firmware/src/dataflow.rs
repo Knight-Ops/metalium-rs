@@ -146,7 +146,7 @@ pub fn released(target: u16, which: Release) -> Result<(), u32> {
     let mut poll = Poll::new();
     loop {
         poll.tick()?;
-        if (read(counter) as u16).wrapping_sub(target) as i16 >= 0 {
+        if dataflow::reached(read(counter) as u16, target) {
             write(dataflow::WAIT_REASON, 0);
             return Ok(());
         }

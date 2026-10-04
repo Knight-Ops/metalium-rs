@@ -14,7 +14,8 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |
 | `gen-cfg [--check]` | `tt-isa/src/cfg/generated.rs` from the pinned `cfg_defines.h` (fetched if absent). |
 | `gen-isa [--check]` | `tt-isa/src/isa/generated.rs` from `Bits32.lua`, cross-checked against the spec's syntax blocks, plus the measured Blackhole layouts in `src/gen_isa/Bits32_BH.lua`. |
-| `gen-burn-delegate [--check]` | `burn-tt/src/generated/delegate.rs`: every burn-backend op forwarded to burn-flex, except `OVERRIDDEN` in `src/gen_burn.rs`. |
+| `gen-burn-ops [--check]` | `burn-tt/src/generated/ops.rs`: native dispatch for `OVERRIDDEN` in `src/gen_burn.rs`, explicit unsupported methods, and inherited composing Burn defaults. |
+| `check-no-flex-in-backend` | `burn-tt` must have no Flex dependency in its normal, build, or dev dependency graphs; external comparisons remain allowed. |
 | `check-isa-sources` | Parse `Bits32.lua` and report, generating nothing. |
 | `check-no-sim-in-ship` | `cargo tree` over every `SHIPPABLE` crate (`src/ship.rs`) must not reach `tt-ttsim` / `tt-ttsim-sys`; every workspace member must be `SHIPPABLE` or `DEV_ONLY`. |
 | `silicon [options]` | The silicon suite, one test per process. |

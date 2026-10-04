@@ -19,7 +19,38 @@ from a scratch probe that called `matmul::chunk_fits_in` and `plan_in`.
 
 ---
 
-## 1. Summary
+## Current reconciliation (2026-10-04)
+
+The comparison and design sections below retain their 2026-10-01 baseline;
+use the trackers for current completion status. Since that review:
+
+- G2 is partial: rank-N storage/strided views, tile-aligned batched products,
+  last-dim reductions and some leading-dim sums are implemented. General
+  axes/layouts and untiled batched products remain open.
+- G5/G6 and the async/trace/host-DMA parts of G8 are implemented: fixed
+  B-reader / resident T0–T2 / NC-writer ownership, depth-one/two batch credits,
+  one host B packet and fresh/traced execution. This is a batch-credit
+  runtime, not an unrestricted page FIFO. Legacy schedulers are removed.
+- SFPU arithmetic, activations and transcendentals, int/bool storage and
+  Boolean logic, loss gathers and embedding operations are implemented.
+  Full F32 sum/mean (R1b) now remain resident, including full-buffer views
+  and bounded reductions beyond one L1 pass. They upload host F32 inputs and
+  run natively even in exact mode; unsupported inputs fail explicitly.
+  Mesh engines stage these reductions on chip 0's SFPU; device-resident mesh
+  tensor storage remains open.
+- Mover tilize/untilize is implemented but slower in the recorded measurements;
+  host tilize is the default. Tensix/unpacker tilize remains open.
+- G3 K blocking, G7 multicast, G9 BF16/block-float tensor formats, G12 L1
+  residency and G14 device-resident meshes remain open. Backend sync/init,
+  typed errors, conformance and fusion are tracked in the Burn roadmap.
+
+Next for model coverage: finish R1, then P2 K blocking, D4 general indexing,
+M3/R3 layout/norm paths, 10.4 formats/casts and 10.5 convolution/pooling/attention.
+X280 dispatch is optional and unscheduled. The historical K-limit measurements
+below predate loop lowering; the current GDDR code still refuses split K, but
+those old numeric limits are not a current bound.
+
+## 1. Historical comparison (2026-10-01)
 
 Status: **have** · **partial** · **different** (different by design, and fine; see §4) ·
 **missing**. Impact: C correctness, P performance, X developer experience. Priority: P0

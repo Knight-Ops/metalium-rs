@@ -472,6 +472,25 @@ impl<N: NocId> DataMover<N> {
         entries: &[[u32; 8]],
     ) -> Result<u32> {
         self.check(entries)?;
+        self.enqueue_checked(d, w, entries)
+    }
+
+    /// Check `entries` as [`DataMover::enqueue`] will before it writes them:
+    /// the same decode, so a caller that times the check apart from the queue
+    /// ([`DataMover::enqueue_checked`]) refuses exactly what `enqueue` would.
+    pub fn check_list(&self, entries: &[[u32; 8]]) -> Result<()> {
+        self.check(entries)
+    }
+
+    /// [`DataMover::enqueue`] for entries [`DataMover::check_list`] passed on
+    /// this mover just now. Nothing checks them again: an unchecked list can
+    /// hang a card, so a caller passes the very entries it checked.
+    pub fn enqueue_checked<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<u32> {
         let n = entries.len() as u32;
         let mut refreshed = false;
         let first = loop {

@@ -32,6 +32,8 @@ pub enum ShardError {
     Link(LinkError),
     /// A chip with no route to chip 0.
     Unreachable(usize),
+    /// A staged native operation does not fit the tile's L1 arena.
+    Shape(String),
 }
 
 impl From<RunError> for ShardError {
@@ -56,6 +58,7 @@ impl std::fmt::Display for ShardError {
             ShardError::Run(e) => write!(f, "{e}"),
             ShardError::Link(e) => write!(f, "{e}"),
             ShardError::Unreachable(c) => write!(f, "chip {c} has no Ethernet route to chip 0"),
+            ShardError::Shape(s) => write!(f, "{s}"),
         }
     }
 }
@@ -68,7 +71,8 @@ pub const RELAY_AT: u32 = 0x2_0000;
 
 /// One chip of a fabric.
 pub struct Chip<T: Transport> {
-    pub dev: Device<T>,
+    dev: Option<Device<T>>,
+    session: Option<crate::session::Session<T>>,
     window: Window,
     /// Where this chip computes.
     pub compute: NocCoord<Noc0>,
@@ -89,11 +93,28 @@ impl<T: Transport> Chip<T> {
         );
         let window = dev.alloc_window(tt_device::tlb::WindowKind::TwoMib)?;
         Ok(Chip {
-            dev,
+            dev: Some(dev),
+            session: None,
             window,
             compute,
             relay,
         })
+    }
+
+    pub fn device(&mut self) -> &mut Device<T> {
+        self.parts().0
+    }
+
+    fn parts(&mut self) -> (&mut Device<T>, &Window) {
+        let dev = match &mut self.session {
+            Some(session) => session.device(),
+            None => self.dev.as_mut().expect("chip owns its device"),
+        };
+        (dev, &self.window)
+    }
+
+    pub fn session(&mut self) -> &mut crate::session::Session<T> {
+        self.session.as_mut().expect("resident fabric initialized")
     }
 }
 
@@ -135,7 +156,9 @@ impl<T: Transport> Fabric<T> {
         let mut hops = Vec::new();
         for &(p, q, link) in links {
             let (a, b) = two_mut(&mut chips, p, q);
-            let mover = Mover::start(&mut a.dev, &a.window, &mut b.dev, &b.window, link, e1_image)?;
+            let (ad, aw) = a.parts();
+            let (bd, bw) = b.parts();
+            let mover = Mover::start(ad, aw, bd, bw, link, e1_image)?;
             hops.push(Hop {
                 ends: (p, q),
                 mover,
@@ -156,6 +179,242 @@ impl<T: Transport> Fabric<T> {
 
     pub fn is_empty(&self) -> bool {
         self.chips.is_empty()
+    }
+
+    /// Retain each chip's device in a session. Tensor payloads can then stay
+    /// in GDDR while E1 moves whole tile slots between chips.
+    pub fn enable_resident(
+        &mut self,
+        b: &'static [u8],
+        nc: &'static [u8],
+    ) -> Result<(), ShardError> {
+        if self.is_empty() {
+            return Err(ShardError::Unreachable(0));
+        }
+        for chip in &mut self.chips {
+            if chip.session.is_none() {
+                let dev = chip.dev.take().expect("chip device");
+                let mut session = crate::session::Session::open(
+                    dev,
+                    self.images,
+                    crate::session::TileChoice::Exactly(chip.compute.x(), chip.compute.y()),
+                    |_, _| Ok(None),
+                )
+                .map_err(|e| ShardError::Shape(e.to_string()))?;
+                session
+                    .enable_dram(b, nc)
+                    .map_err(|e| ShardError::Shape(e.to_string()))?;
+                chip.session = Some(session);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy slots over Ethernet, including intermediate L1 relays. No tensor
+    /// data is read or written by the host. Both sessions are synchronized
+    /// before E1 accesses their allocations.
+    pub fn transfer_tensor(
+        &mut self,
+        from: usize,
+        t: &crate::tensor::DramTensor,
+        to: usize,
+    ) -> Result<crate::tensor::DramTensor, crate::tensor::TensorError> {
+        use crate::tensor::TensorError;
+        if from >= self.len() || to >= self.len() {
+            return Err(TensorError::Shape(
+                "resident transfer chip is outside the fabric".into(),
+            ));
+        }
+        self.chips[from].session().sync()?;
+        if from == to {
+            return self.chips[to].session().copy(t);
+        }
+        let peer = if from == 0 {
+            to
+        } else if to == 0 {
+            from
+        } else {
+            return Err(TensorError::Shape(
+                "resident transfer must pass through chip 0".into(),
+            ));
+        };
+        let mut route = self
+            .routes
+            .get(peer)
+            .and_then(Clone::clone)
+            .ok_or_else(|| TensorError::Shape(format!("chip {peer} has no route")))?;
+        if from != 0 {
+            route.reverse();
+        }
+        self.chips[to].session().sync()?;
+        let out = self.chips[to].session().empty(t.rows, t.cols, t.elem)?;
+        let result = (|| {
+            let [rt, ct] = t.grid();
+            // Coalesce consecutive slots on the same source/destination
+            // channels, up to one Ethernet packet's payload capacity.
+            let mut ranges: Vec<(tt_isa::dram::DramRange, tt_isa::dram::DramRange)> = Vec::new();
+            for r in 0..rt {
+                for c in 0..ct {
+                    let (src, dst) = (t.tile(r, c), out.tile(r, c));
+                    if let Some((a, b)) = ranges.iter_mut().rev().find(|(a, b)| {
+                        a.channel() == src.channel()
+                            && b.channel() == dst.channel()
+                            && a.offset() + a.len() == src.offset()
+                            && b.offset() + b.len() == dst.offset()
+                            && a.len() + src.len() <= u64::from(tt_isa::eth::mover::MAX_LEN)
+                    }) {
+                        *a = a
+                            .channel()
+                            .range(a.offset(), a.len() + src.len())
+                            .expect("adjacent source slots");
+                        *b = b
+                            .channel()
+                            .range(b.offset(), b.len() + dst.len())
+                            .expect("adjacent destination slots");
+                    } else {
+                        ranges.push((src, dst));
+                    }
+                }
+            }
+            for (source, destination) in ranges {
+                for hop in 0..route.len() - 1 {
+                    let (p, q) = (route[hop], route[hop + 1]);
+                    let src = if hop == 0 {
+                        Source::Dram(source)
+                    } else {
+                        Source::Tensix(self.chips[p].relay, RELAY_AT)
+                    };
+                    let dst = if hop + 2 == route.len() {
+                        Dest::Dram(destination)
+                    } else {
+                        Dest::Tensix(self.chips[q].relay, RELAY_AT)
+                    };
+                    self.hop(p, q, src, dst, source.len() as u32).map_err(|e| {
+                        TensorError::Shape(format!("resident Ethernet transfer: {e}"))
+                    })?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = self.chips[to].session().free(out);
+            return Err(e);
+        }
+        out.set_pad(t.pad());
+        Ok(out)
+    }
+
+    /// Split output columns across reachable chips, retaining inputs/results
+    /// in GDDR. All copies, transposes and arithmetic execute on devices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_resident(
+        &mut self,
+        a: &crate::tensor::DramTensor,
+        ta: bool,
+        b: &crate::tensor::DramTensor,
+        tb: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<crate::tensor::DramTensor, crate::tensor::TensorError> {
+        use crate::tensor::{BlockMove, DramTensor, TensorError};
+        fn transpose<T: Transport>(
+            session: &mut crate::session::Session<T>,
+            t: &DramTensor,
+        ) -> Result<DramTensor, TensorError> {
+            session.copy_blocks(
+                t,
+                &[BlockMove {
+                    from: [0, 0],
+                    to: [0, 0],
+                    extent: [t.cols, t.rows],
+                    transposed: true,
+                }],
+                [t.cols, t.rows],
+            )
+        }
+        let mut temps: Vec<(usize, DramTensor)> = Vec::new();
+        let result = (|| {
+            let a = if ta {
+                let t = transpose(self.chips[0].session(), a)?;
+                temps.push((0, t.clone()));
+                t
+            } else {
+                a.clone()
+            };
+            let b = if tb {
+                let t = transpose(self.chips[0].session(), b)?;
+                temps.push((0, t.clone()));
+                t
+            } else {
+                b.clone()
+            };
+            if a.cols != b.rows {
+                return Err(TensorError::Shape(
+                    "mesh matmul inner dimensions differ".into(),
+                ));
+            }
+            let peers: Vec<_> = (0..self.len())
+                .filter(|&c| self.routes[c].is_some())
+                .collect();
+            let per = b.cols.div_ceil(32).div_ceil(peers.len());
+            let mut results = Vec::new();
+            for (i, &peer) in peers.iter().enumerate() {
+                let start = (i * per * 32).min(b.cols);
+                let end = ((i + 1) * per * 32).min(b.cols);
+                if start == end {
+                    continue;
+                }
+                let width = end - start;
+                let slice = self.chips[0].session().copy_blocks(
+                    &b,
+                    &[BlockMove {
+                        from: [0, start],
+                        to: [0, 0],
+                        extent: [b.rows, width],
+                        transposed: false,
+                    }],
+                    [b.rows, width],
+                )?;
+                temps.push((0, slice.clone()));
+                let (pa, pb) = if peer == 0 {
+                    (a.clone(), slice)
+                } else {
+                    let pa = self.transfer_tensor(0, &a, peer)?;
+                    temps.push((peer, pa.clone()));
+                    let pb = self.transfer_tensor(0, &slice, peer)?;
+                    temps.push((peer, pb.clone()));
+                    (pa, pb)
+                };
+                let c = self.chips[peer]
+                    .session()
+                    .matmul_dram(&pa, false, &pb, false, route, fidelity, budget)?;
+                temps.push((peer, c.clone()));
+                let c = transpose(self.chips[peer].session(), &c)?;
+                temps.push((peer, c.clone()));
+                let c = if peer == 0 {
+                    c
+                } else {
+                    let t = self.transfer_tensor(peer, &c, 0)?;
+                    temps.push((0, t.clone()));
+                    t
+                };
+                results.push(c);
+            }
+            let refs: Vec<_> = results.iter().collect();
+            let rows: Vec<_> = results
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| (0..t.rows).map(move |r| (i, r)))
+                .collect();
+            let combined = self.chips[0].session().gather_rows(&refs, &rows, a.rows)?;
+            temps.push((0, combined.clone()));
+            transpose(self.chips[0].session(), &combined)
+        })();
+        for (peer, t) in temps.into_iter().rev() {
+            let _ = self.chips[peer].session().free(t);
+        }
+        result
     }
 
     /// The chips from 0 to `chip`, as Ethernet carries data between them.
@@ -182,7 +441,8 @@ impl<T: Transport> Fabric<T> {
         if let Source::Staged = src {
             unreachable!("staging goes through `send`")
         }
-        h.mover.send(&mut c.dev, &c.window, dir, src, dst, len)?;
+        let (dev, window) = c.parts();
+        h.mover.send(dev, window, dir, src, dst, len)?;
         Ok(())
     }
 
@@ -215,9 +475,9 @@ impl<T: Transport> Fabric<T> {
                     .unwrap();
                 let dir = if h.ends.0 == p0 { Dir::AToB } else { Dir::BToA };
                 let c = &mut self.chips[p0];
-                h.mover.stage(&mut c.dev, &c.window, dir, piece)?;
-                h.mover
-                    .send(&mut c.dev, &c.window, dir, Source::Staged, d, len)?;
+                let (dev, window) = c.parts();
+                h.mover.stage(dev, window, dir, piece)?;
+                h.mover.send(dev, window, dir, Source::Staged, d, len)?;
             }
             for k in 1..last {
                 let (p, q) = (route[k], route[k + 1]);
@@ -252,9 +512,11 @@ impl<T: Transport> Fabric<T> {
                 self.hop(p, q, src, Dest::Tensix(self.chips[q].relay, RELAY_AT), n)?;
             }
             let c = &mut self.chips[0];
-            c.dev.read(
-                &c.window,
-                c.relay,
+            let relay = c.relay;
+            let (dev, window) = c.parts();
+            dev.read(
+                window,
+                relay,
                 RELAY_AT as u64,
                 &mut out[off..off + n as usize],
             )?;
@@ -277,14 +539,14 @@ impl<T: Transport> Fabric<T> {
         let images = self.images;
         let tile = self.chips[chip].compute;
         {
-            let dev = &mut self.chips[chip].dev;
+            let dev = self.chips[chip].device();
             reset_tile(dev, tile)?;
             reset_thread_state(dev, tile, &images)?;
         }
         if chip == 0 {
             let c = &mut self.chips[0];
             return Ok(matmul::matmul(
-                &mut c.dev,
+                c.device(),
                 tile,
                 &images,
                 a,
@@ -302,7 +564,7 @@ impl<T: Transport> Fabric<T> {
         let [unpack, math, pack] =
             matmul::matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity);
         let kernel = Kernel::new([&unpack, &math, &pack], Schedule::Concurrent(&staged.init));
-        runtime::run(&mut self.chips[chip].dev, tile, &images, &kernel, budget)?;
+        runtime::run(self.chips[chip].device(), tile, &images, &kernel, budget)?;
         let packed = self.collect(chip, MATMUL_OUT as u32, staged.out_bytes())?;
         Ok(matmul::detilize_packed(&packed, m, n))
     }
@@ -322,6 +584,12 @@ impl<T: Transport> Fabric<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<Vec<f32>, ShardError> {
+        if self.chips.iter().any(|chip| chip.session.is_some()) {
+            return Err(ShardError::Shape(
+                "resident fabric: use matmul_resident; legacy kernels would reset resident state"
+                    .into(),
+            ));
+        }
         assert_eq!(a.len(), m * k, "A is not [m, k]");
         assert_eq!(b.len(), k * n, "B is not [k, n]");
         let chips: Vec<usize> = (0..self.len())
@@ -348,6 +616,110 @@ impl<T: Transport> Fabric<T> {
             }
         }
         Ok(c)
+    }
+
+    /// Full F32 sum/mean for legacy fabrics without resident sessions.
+    /// Input and intermediate tiles are staged through L1 on chip 0.
+    /// Both reduction passes must fit the L1 arena and role program slots;
+    /// unsupported shapes return an error instead of using host arithmetic.
+    pub fn full_reduce(
+        &mut self,
+        values: &[f32],
+        [rows, cols]: [usize; 2],
+        mean: bool,
+        budget: u64,
+    ) -> Result<f32, ShardError> {
+        if self.chips.iter().any(|chip| chip.session.is_some()) {
+            return Err(ShardError::Shape("resident fabric: use session reductions; legacy kernels would reset resident state".into()));
+        }
+        use crate::sfpu::reduce::Axis;
+        if rows == 0 || cols == 0 || values.len() != rows * cols {
+            return Err(ShardError::Shape(
+                "native full reduction needs a nonempty matrix".into(),
+            ));
+        }
+        if self.is_empty() {
+            return Err(ShardError::Unreachable(0));
+        }
+        let column = self.reduce_staged(values, [rows, cols], Axis::Cols, None, budget)?;
+        let sum = self.reduce_staged(
+            &column,
+            [rows, 1],
+            Axis::Rows,
+            mean.then_some((rows * cols) as f32),
+            budget,
+        )?;
+        Ok(sum[0])
+    }
+
+    fn reduce_staged(
+        &mut self,
+        values: &[f32],
+        [rows, cols]: [usize; 2],
+        axis: crate::sfpu::reduce::Axis,
+        divisor: Option<f32>,
+        budget: u64,
+    ) -> Result<Vec<f32>, ShardError> {
+        use crate::sfpu::kernel::{A_ROW, OUT_ROW};
+        use crate::sfpu::ops::{kind_sfpu, program};
+        use crate::sfpu::reduce::{math_programs, plan_layout, roles, Axis, ReduceOp};
+        use crate::sfpu::{Format, LReg, LoopPolicy, Program};
+        use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+
+        let [rt, ct] = [rows.div_ceil(32), cols.div_ceil(32)];
+        let (outputs, per, last, dims) = match axis {
+            Axis::Cols => (rt, ct, cols, [rows, 1]),
+            Axis::Rows => (ct, rt, rows, [1, cols]),
+        };
+        let valid = ((last - 1) % 32 + 1) as u32;
+        let layout = plan_layout(outputs, per).map_err(|e| ShardError::Shape(e.to_string()))?;
+        let (inputs, mut finish) = math_programs(ReduceOp::Sum, axis, per, valid);
+        if let Some(divisor) = divisor {
+            // The division program reads A and writes OUT. Copy the sum
+            // within Dst before running it; no scalar arithmetic on the host.
+            let mut copy = Program::with_policy(LoopPolicy::Unrolled);
+            for offset in (0..64).step_by(2) {
+                copy.load(LReg::L0, Format::Fp32, OUT_ROW + offset);
+                copy.store(LReg::L0, Format::Fp32, A_ROW + offset);
+            }
+            finish.extend(copy.finish());
+            finish.extend(
+                program(kind_sfpu::DIV_SCALAR, divisor)
+                    .expect("SFPU division")
+                    .1,
+            );
+        }
+        let code = roles(&layout, &inputs, &finish);
+        let tiled = matmul::tilize_f32_fp32(values, rows, cols);
+        let mut stages = Vec::with_capacity(outputs * per);
+        for k in 0..outputs {
+            for n in 0..per {
+                let tile = match axis {
+                    Axis::Cols => k * ct + n,
+                    Axis::Rows => n * ct + k,
+                };
+                stages.push((
+                    layout.in_at + (k * per + n) as u64 * TILE_SLOT,
+                    &tiled[tile * matmul::TILE_IMAGE_BYTES..(tile + 1) * matmul::TILE_IMAGE_BYTES],
+                ));
+            }
+        }
+        let reads: Vec<_> = (0..outputs)
+            .map(|k| (layout.out_at + k as u64 * TILE_SLOT + TILE_DATA, 4096))
+            .collect();
+        let mut kernel = Kernel::new(
+            [&code[0], &code[1], &code[2]],
+            Schedule::Concurrent(&layout.init),
+        );
+        kernel.stage = &stages;
+        kernel.read_back = &reads;
+        let tile = self.chips[0].compute;
+        let dev = self.chips[0].device();
+        reset_tile(dev, tile)?;
+        reset_thread_state(dev, tile, &self.images)?;
+        let outcome = runtime::run(dev, tile, &self.images, &kernel, budget)?;
+        let packed: Vec<_> = outcome.l1.into_iter().flatten().collect();
+        Ok(matmul::detilize_packed(&packed, dims[0], dims[1]))
     }
 }
 
@@ -386,7 +758,10 @@ impl<T: Transport> Drop for Fabric<T> {
             let l = h.mover.link();
             for (chip, tile) in [(h.ends.0, l.a), (h.ends.1, l.b)] {
                 let c = &mut self.chips[chip];
-                let _ = c.dev.park_e1(&c.window, tile);
+                if c.dev.is_some() || c.session.is_some() {
+                    let (dev, window) = c.parts();
+                    let _ = dev.park_e1(window, tile);
+                }
             }
         }
     }

@@ -3,8 +3,9 @@
 //!
 //! With `Session::set_pipeline` (on by default), an op long enough for at
 //! least two runs a unit of `tensor::MIN_PIPELINED_RUN` tiles, and a share a
-//! unit of `tensor::PIPELINE_SHARE` tiles per unit, is split into runs in
-//! alternating halves of the data arena, and a unit's list runs
+//! unit of `tensor::pipeline_share` tiles (a fresh op's grows with the units,
+//! a captured one's does not), is split into runs in alternating halves of the
+//! data arena, and a unit's list runs
 //! `LAUNCH k, scatter k-1, gather k+1, KERNEL_WAIT k`. The claims:
 //!
 //! * the results are the plain path's bits -- unary, binary, row-broadcast and
@@ -109,9 +110,10 @@ fn ew(kind: u32) -> Eltwise {
 fn pipelined_element_wise_ops_and_reductions_are_the_plain_paths_bits() {
     for units in [1usize, 2] {
         with_tiles(units, |s| {
-            // 16 x 16 tiles: on two tiles, a share of 128 tiles a unit
-            // (`tensor::PIPELINE_SHARE` asks 96), two runs or more each.
-            let (r, c) = (512, 512);
+            // One tile: 16 x 16 tiles (`tensor::PIPELINE_SHARE` asks 48).
+            // Two: 32 x 32, 512 a unit (a fresh op asks 228), two runs or more
+            // each.
+            let (r, c) = if units == 1 { (512, 512) } else { (1024, 1024) };
             let a = s.upload(&floats(1, r * c), r, c).unwrap();
             let b = s.upload(&floats(2, r * c), r, c).unwrap();
             let mask = s
@@ -147,8 +149,7 @@ fn pipelined_element_wise_ops_and_reductions_are_the_plain_paths_bits() {
                 overlapped >= 4 * units as u64,
                 "{units} tiles: {overlapped} runs overlapped over {tiles} tiles x 4 ops"
             );
-            // 32 x 32 tiles: on two tiles, 512 a unit
-            // (`tensor::REDUCE_PIPELINE_SHARE` asks 384).
+            // 32 x 32 tiles: on two tiles, 512 a unit.
             let big = s.upload(&floats(5, 1024 * 1024), 1024, 1024).unwrap();
             let mut reduced = 0;
             for (op, axis) in [
@@ -179,5 +180,39 @@ fn a_short_op_runs_plain() {
         });
         assert_eq!(n, 0);
         s.free(a).unwrap();
+    });
+}
+
+/// A replay pays no host time for its runs, so a capture overlaps where a
+/// fresh op does not: 128 tiles a unit on two units is under a fresh op's
+/// share and over a captured one's. The same bits either way.
+#[test]
+fn a_captured_op_overlaps_where_a_fresh_one_does_not() {
+    with_tiles(2, |s| {
+        let a = s.upload(&floats(1, 512 * 512), 512, 512).unwrap();
+        let b = s.upload(&floats(2, 512 * 512), 512, 512).unwrap();
+        let add = |s: &mut Session<_>| s.eltwise(ew(kind::ADD), &a, Some(&b)).unwrap();
+        s.set_pipeline(false);
+        let plain = add(s);
+        let expected = s.download(&plain).unwrap();
+        s.free(plain).unwrap();
+        s.set_pipeline(true);
+        let before = s.pipelined_blocks();
+        let fresh = add(s);
+        s.sync().unwrap();
+        assert_eq!(s.pipelined_blocks() - before, 0, "a fresh op overlapped");
+        s.free(fresh).unwrap();
+        s.begin_trace().unwrap();
+        let before = s.pipelined_blocks();
+        let captured = add(s);
+        let trace = s.end_trace().unwrap();
+        assert!(s.pipelined_blocks() > before, "a capture did not overlap");
+        s.replay(trace).unwrap();
+        let replayed = s.download(&captured).unwrap();
+        assert_eq!(replayed.len(), expected.len());
+        for (i, (p, q)) in expected.iter().zip(&replayed).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "element {i}: {p} vs {q}");
+        }
+        s.release_trace(trace).unwrap();
     });
 }

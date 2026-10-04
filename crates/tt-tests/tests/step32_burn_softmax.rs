@@ -142,31 +142,28 @@ fn reductions_and_softmax_run_on_the_device_within_their_bounds() {
     });
 }
 
-/// In exact mode the approximations run on the host, at any size, and give
-/// Flex's bits exactly.
+/// Supported host inputs upload for native softmax instead of choosing a CPU path.
 #[test]
-fn in_exact_mode_the_approximations_are_the_host_s() {
-    with_device(
-        Config {
-            exact: true,
-            ..Config::default()
-        },
-        |d| {
-            let [r, c] = [64, 10];
-            let v = values(3, r * c);
-            let t = Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d)
-                .to_device(&d);
-            let f = Tensor::<Flex, 2>::from_data(TensorData::new(v, [r, c]), &FlexDevice);
-            let soft = activation::softmax(t.clone(), 1);
-            let softmin = activation::softmin(t.clone(), 1);
-            let ex = t.clone().exp();
-            assert!(
-                !resident(&soft) && !resident(&softmin) && !resident(&ex),
-                "exact mode: the host's"
-            );
-            assert_eq!(floats(soft), floats(activation::softmax(f.clone(), 1)));
-            assert_eq!(floats(softmin), floats(activation::softmin(f.clone(), 1)));
-            assert_eq!(floats(ex), floats(f.exp()));
-        },
-    );
+fn host_inputs_upload_for_native_softmax() {
+    with_device(Config::default(), |d| {
+        let [r, c] = [64, 10];
+        let v = values(3, r * c);
+        let (soft, report) = burn_tt::with_report(|| {
+            activation::softmax(
+                Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [r, c]), &d),
+                1,
+            )
+        });
+        assert!(resident(&soft));
+        let op = report.op("softmax").unwrap();
+        assert_eq!((op.on_host, op.downloads, op.staged), (0, 0, 0));
+        assert_eq!(op.uploads, 1);
+        let want = floats(activation::softmax(
+            Tensor::<Flex, 2>::from_data(TensorData::new(v, [r, c]), &FlexDevice),
+            1,
+        ));
+        for (got, want) in floats(soft).into_iter().zip(want) {
+            assert!((got - want).abs() < 5e-6);
+        }
+    });
 }

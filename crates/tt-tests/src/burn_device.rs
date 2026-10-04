@@ -8,6 +8,41 @@
 
 use burn_tt::{attach, Fidelity, SrcRoute, TtDevice};
 
+/// Core models may stage creation data and layouts, but all arithmetic stays resident.
+pub fn assert_native_model(report: &burn_tt::Report) {
+    assert!(
+        report.0.iter().any(|s| s.on_device > 0),
+        "model did not execute on the device"
+    );
+    for op in &report.0 {
+        assert!(op.hand_written, "unsupported method was called: {}", op.op);
+        assert_eq!(op.staged, 0, "{} staged model computation", op.op);
+        assert!(
+            op.on_host == 0
+                || matches!(
+                    op.op,
+                    "float_from_data"
+                        | "float_random"
+                        | "int_from_data"
+                        | "int_random"
+                        | "bool_from_data"
+                        | "bool_zeros"
+                        | "bool_ones"
+                        | "float_reshape"
+                        | "int_reshape"
+                        | "bool_reshape"
+                ),
+            "{} computed a model result on the host",
+            op.op
+        );
+        assert!(
+            op.downloads == 0 || op.op.ends_with("_into_data") || op.op == "tr_execute",
+            "{} downloaded a model operand",
+            op.op
+        );
+    }
+}
+
 /// How the device multiplies.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -18,8 +53,6 @@ pub struct Config {
     /// The Tensix tiles the device computes on; `None` is the gate tile
     /// (`harness::tensix_tile`), or on silicon what `TT_TILES` says.
     pub tiles: Option<burn_tt::TileChoice>,
-    /// `burn_tt::set_exact`: only ops that give Flex's bits on the device.
-    pub exact: bool,
 }
 
 impl Default for Config {
@@ -30,7 +63,6 @@ impl Default for Config {
             fidelity: Fidelity::HiFi4,
             budget: 4_000_000,
             tiles: None,
-            exact: false,
         }
     }
 }
@@ -41,7 +73,6 @@ impl Default for Config {
 #[track_caller]
 pub fn with_device(config: Config, f: impl FnOnce(TtDevice)) {
     if let Err(e) = tt_ttsim::fork_scope(|| {
-        burn_tt::set_exact(config.exact);
         let device = device();
         let _guard = attach_engine(device, config)
             .unwrap_or_else(|e| panic!("could not attach {device}: {e}"));
@@ -97,12 +128,7 @@ fn attach_mesh(
             tt_firmware_images::ETH_E1,
         )
         .map_err(|e| err(&e))?;
-        let mut engine = MeshEngine {
-            fabric,
-            route: config.route,
-            fidelity: config.fidelity,
-            budget: config.budget,
-        };
+        let mut engine = MeshEngine::new(fabric, config.route, config.fidelity, config.budget)?;
         serve.serve(&mut engine);
         Ok(())
     })

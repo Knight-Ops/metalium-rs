@@ -233,8 +233,15 @@ fn accuracy<B: Backend>(model: &Mlp<B>, split: &Split, n: usize, device: &B::Dev
     for from in (0..n).step_by(1000) {
         let m = 1000.min(n - from);
         let (x, y) = batch::<B>(split, from, m, device);
-        let pred = model.forward(x).argmax(1).reshape([m]);
-        right += pred.equal(y).int().sum().into_scalar().elem::<i64>() as usize;
+        let pred = model
+            .forward(x)
+            .argmax(1)
+            .into_data()
+            .convert::<i32>()
+            .to_vec::<i32>()
+            .unwrap();
+        let labels = y.into_data().convert::<i32>().to_vec::<i32>().unwrap();
+        right += pred.iter().zip(&labels).filter(|(p, l)| p == l).count();
     }
     right as f64 / n as f64
 }
@@ -275,18 +282,21 @@ fn golden() -> Option<Vec<u32>> {
 
 /// What one step may move between host and device once the dataset and
 /// weights are resident (Phase 9.5), each with why. Everything else stays in
-/// GDDR; a tensor that newly falls back to the host shows up here by shape.
+/// GDDR; only labels, index grids, autodiff initial values, and scalar readback cross.
 fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)> {
     use burn_tt::{Direction::*, Transfer};
     let t = |direction, shape| Transfer { direction, shape };
     vec![
-        (
-            t(Down, [batch, CLASSES]),
-            "the logits, for the loss on the host",
-        ),
+        (t(Up, [batch, 1]), "the target indices"),
+        (t(Up, [batch, CLASSES]), "the gather's column index grid"),
+        (t(Down, [1, 1]), "the scalar loss readback"),
+        (t(Up, [1, 1]), "autodiff's scalar seed"),
+        (t(Up, [1, batch]), "the full mean's backward initial values"),
+        (t(Up, [batch, CLASSES]), "the scatter's column index grid"),
+        (t(Up, [batch, CLASSES]), "the scatter's initial zeros"),
         (
             t(Up, [batch, CLASSES]),
-            "dL/dlogits, from the host's loss backward",
+            "the log-softmax backward initial values",
         ),
     ]
 }
@@ -345,7 +355,6 @@ fn assert_steady_state_traffic(
 )]
 fn the_mlp_trains_on_a_reduced_dataset() {
     reduced_run_matches_the_golden(Config {
-        exact: true,
         ..Config::default()
     });
 }
@@ -362,7 +371,7 @@ fn the_mlp_trains_on_a_reduced_dataset() {
 fn the_mlp_trains_on_four_tiles_matching_the_golden() {
     reduced_run_matches_the_golden(Config {
         tiles: Some(burn_tt::TileChoice::Count(4)),
-        exact: true,
+
         ..Config::default()
     });
 }
@@ -387,14 +396,18 @@ fn reduced_run_matches_the_golden(config: Config) {
         // first step's uploads.
         burn_tt::record_transfers(true);
         let mut per_step = Vec::new();
-        let ((tt, _), ..) =
+        let (training, report) = burn_tt::with_report(|| {
             train_timed::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d, &mut |_| {
                 per_step.push((
                     burn_tt::tensor_traffic(),
                     burn_tt::device_traffic(d).expect("the engine reports its traffic"),
                     burn_tt::take_transfers(),
                 ))
-            });
+            })
+        });
+        let ((tt, _), ..) = training;
+        tt_tests::burn_device::assert_native_model(&report);
+        eprintln!("{report}");
         burn_tt::record_transfers(false);
         let moved = burn_tt::tensor_traffic() - before;
         assert_steady_state_traffic(&per_step);
@@ -612,7 +625,9 @@ fn sharded_training_matches_the_golden(chips: usize) {
         )
     });
     tt_tests::burn_device::with_mesh_device(Config::default(), chips, |d| {
-        let (tt, _) = train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d);
+        let ((tt, _), report) =
+            burn_tt::with_report(|| train::<Autodiff<TtBackend>>(&split, &REDUCED, &init, &d));
+        tt_tests::burn_device::assert_native_model(&report);
         let got: Vec<u32> = tt.iter().map(|l| l.to_bits()).collect();
         let first = got.iter().zip(&want).position(|(g, w)| g != w);
         assert_eq!(

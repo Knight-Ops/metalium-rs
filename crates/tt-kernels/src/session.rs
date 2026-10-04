@@ -581,6 +581,8 @@ pub enum HostStage {
     Place,
     /// Kernel generations reserved (`Resident::reserve`).
     Reserve,
+    /// The list decoded as the mover will, before any of it is written.
+    Check,
     /// The list written to the mover's ring and its doorbell rung.
     List,
     /// Every unit's barrier entry, on a multi-unit op.
@@ -590,13 +592,14 @@ pub enum HostStage {
 }
 
 impl HostStage {
-    pub const ALL: [HostStage; 9] = [
+    pub const ALL: [HostStage; 10] = [
         HostStage::Enqueue,
         HostStage::Segments,
         HostStage::Ensure,
         HostStage::IdleCheck,
         HostStage::Place,
         HostStage::Reserve,
+        HostStage::Check,
         HostStage::List,
         HostStage::Barrier,
         HostStage::Drain,
@@ -1971,6 +1974,16 @@ impl<T: Transport> Session<T> {
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
     }
 
+    /// Allocate device storage without uploading tensor data.
+    pub fn empty(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        elem: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)
+    }
+
     /// Upload a row-major `[rows, cols]` matrix to GDDR.
     pub fn upload(
         &mut self,
@@ -2730,13 +2743,20 @@ impl<T: Transport> Session<T> {
         }
         self.stage(HostStage::Reserve, start);
         let start = self.mark();
+        let checked = self.units[u].mover.as_ref().unwrap().check_list(&entries);
+        self.stage(HostStage::Check, start);
+        let start = self.mark();
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
             unit.resident.as_mut().unwrap(),
             unit.mover.as_mut().unwrap(),
         );
-        let enqueued = m.enqueue(dev, r.window(), &entries);
+        // A list that fails its check is never written.
+        let enqueued = match checked {
+            Ok(()) => m.enqueue_checked(dev, r.window(), &entries),
+            Err(e) => Err(e),
+        };
         self.stage(HostStage::List, start);
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
@@ -2807,7 +2827,9 @@ impl<T: Transport> Session<T> {
     /// replay will run it: before its kernel, the setup run [`Resident::reserve`]
     /// did for it, if any, as a kernel of its own, and `POKE`s for whatever
     /// of the roles' descriptors the stream has not set; then its entries,
-    /// each `KERNEL`'s generation relative and its programs held.
+    /// each `KERNEL`'s, `LAUNCH`'s and `KERNEL_WAIT`'s generation relative to
+    /// the capture and the programs they name held, a packet's sections stored
+    /// as streams of their own.
     fn capture_segment(
         &mut self,
         u: usize,
@@ -2848,7 +2870,7 @@ impl<T: Transport> Session<T> {
                 // As the host staged it (`Resident::begin`): thread 0 alone,
                 // the others given nothing to run.
                 let at = self.place_held(u, program)?;
-                held.push(at);
+                held.push((self.units[u].programs.generation(), at));
                 out.poke_descriptor(
                     0,
                     &tt_isa::mailbox::Descriptor {
@@ -2868,8 +2890,9 @@ impl<T: Transport> Session<T> {
                 }
             }
             let relative = capture_commands(entries, base, |address| {
-                if self.units[u].programs.hold(address) {
-                    held.push(address);
+                let programs = &mut self.units[u].programs;
+                if programs.hold(address) {
+                    held.push((programs.generation(), address));
                 }
             })?;
             if seg.streaming {
@@ -2888,8 +2911,9 @@ impl<T: Transport> Session<T> {
                                 ))
                             }
                         };
-                        if self.units[u].programs.hold(address) {
-                            held.push(address);
+                        let programs = &mut self.units[u].programs;
+                        if programs.hold(address) {
+                            held.push((programs.generation(), address));
                         }
                     }
                 }
@@ -2904,6 +2928,7 @@ impl<T: Transport> Session<T> {
                 out.regions.push(reader_storage);
                 let (writer, writer_storage) = self.store_region(u, &relative[writer_at..])?;
                 out.regions.push(writer_storage);
+                out.sections.extend([reader[2], writer[2]]);
                 out.stream.push([
                     op::PAIR_CALL,
                     reader[0],
@@ -3015,7 +3040,7 @@ impl<T: Transport> Session<T> {
         let Some(capture) = self.capture.take() else {
             return Err(TraceError::NotCapturing.into());
         };
-        let held: Vec<Vec<u64>> = capture
+        let held: Vec<Vec<(u64, u64)>> = capture
             .units
             .iter()
             .map(|u| u.held_programs.clone())
@@ -3033,8 +3058,8 @@ impl<T: Transport> Session<T> {
                 }
             }
             for (u, held) in held.iter().enumerate() {
-                for &at in held {
-                    self.units[u].programs.release(at);
+                for &(generation, at) in held {
+                    self.units[u].programs.release_held(generation, at);
                 }
             }
         }
@@ -3190,6 +3215,7 @@ impl<T: Transport> Session<T> {
             count: words.len() as u32,
             generations,
             held_programs: uc.held_programs.clone(),
+            sections: uc.sections.clone(),
             stream,
         })
     }
@@ -3271,8 +3297,10 @@ impl<T: Transport> Session<T> {
         let t = self.traces.remove(&id.0).expect("checked above");
         for (unit, ut) in self.units.iter_mut().zip(t.units) {
             let Some(ut) = ut else { continue };
-            for at in ut.held_programs {
-                unit.programs.release(at);
+            // A reset since the capture cleared the cache: what a hold named
+            // is gone, and its address may be another trace's program now.
+            for (generation, at) in ut.held_programs {
+                unit.programs.release_held(generation, at);
             }
             if let Some(d) = self.dram.as_mut() {
                 d.alloc.free(&ut.stream);
@@ -3294,6 +3322,17 @@ impl<T: Transport> Session<T> {
             .get(&id.0)
             .map(|t| &t.ops[..])
             .ok_or(TraceError::Unknown(id.0).into())
+    }
+
+    /// Entries in each reader and writer section trace `id` stores in GDDR, per
+    /// unit and then per packet (reader, writer), chunk padding included. The
+    /// mover fetches a section [`tt_isa::dm::TRACE_CHUNK_ENTRIES`] at a time.
+    pub fn trace_sections(&self, id: TraceId) -> Result<Vec<Vec<u32>>, TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        Ok(t.units
+            .iter()
+            .map(|u| u.as_ref().map_or_else(Vec::new, |u| u.sections.clone()))
+            .collect())
     }
 
     /// Is a capture open?
@@ -3338,11 +3377,11 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let pipeline = self.pipeline;
+        let overlap = self.overlap();
         let alloc = &mut self.dram_state()?.alloc;
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
         // The SFPU's, or refused: the mover only moves data.
-        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units, pipeline)? else {
+        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units, overlap)? else {
             return Err(TensorError::Shape(format!(
                 "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
             )));
@@ -3528,8 +3567,8 @@ impl<T: Transport> Session<T> {
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let units = self.units.len();
-        let pipeline = self.pipeline;
-        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units, pipeline)?;
+        let overlap = self.overlap();
+        let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units, overlap)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::SumRows.produces(&[a]));
         Ok(out)
@@ -3551,9 +3590,8 @@ impl<T: Transport> Session<T> {
             return self.sum_rows(a);
         }
         let units = self.units.len();
-        let pipeline = self.pipeline;
-        let work =
-            tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, pipeline)?;
+        let overlap = self.overlap();
+        let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, overlap)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
@@ -3861,6 +3899,17 @@ impl<T: Transport> Session<T> {
         self.pipeline = on;
     }
 
+    /// How an element-wise op or reduction queued now may overlap its runs
+    /// ([`tensor::Overlap`]): not at all with pipelining off, as a capture
+    /// plans it while one is open, as a fresh op otherwise.
+    fn overlap(&self) -> tensor::Overlap {
+        match (self.pipeline, self.capture.is_some()) {
+            (false, _) => tensor::Overlap::Off,
+            (true, true) => tensor::Overlap::Captured,
+            (true, false) => tensor::Overlap::Fresh,
+        }
+    }
+
     /// How many blocks have run overlapped with their neighbours' moves
     /// (`Session::set_pipeline`), since the session opened.
     pub fn pipelined_blocks(&self) -> u64 {
@@ -4042,13 +4091,27 @@ mod tests {
             loops: Default::default(),
             half: None,
         };
-        assert!(streaming_segments(vec![kernel(1)], tt_isa::l1::PROGRAM_CACHE.len()).is_err());
-        let oversized = (tt_isa::l1::PROGRAM_CACHE.len() / 2 / 4 + 1) as usize;
-        assert!(streaming_segments(
-            vec![list(1, 1), kernel(oversized), list(1, 2)],
-            tt_isa::l1::PROGRAM_CACHE.len()
-        )
-        .is_err());
+        let cache = tt_isa::l1::PROGRAM_CACHE.len();
+        let message = |steps| match streaming_segments(steps, cache) {
+            Err(crate::tensor::TensorError::Shape(message)) => message,
+            other => panic!("expected a rejection, got {:?}", other.map(|s| s.len())),
+        };
+        // A kernel on its own is not between a gather and a scatter, and
+        // nothing precedes it.
+        let bare = message(vec![kernel(1)]);
+        assert!(bare.contains("after `` cannot form"), "{bare}");
+        assert!(
+            bare.contains("not between a gather list and a scatter list"),
+            "{bare}"
+        );
+        // One over half the cache is named by size, after the list before it.
+        let oversized = (cache / 2 / 4 + 1) as usize;
+        let big = message(vec![list(1, 1), kernel(oversized), list(1, 2)]);
+        assert!(big.contains("after `test` cannot form"), "{big}");
+        assert!(
+            big.contains(&format!("a role program of {oversized} words exceeds half")),
+            "{big}"
+        );
     }
 
     /// A transfer step: `batches` batches of one read and one write each.
@@ -4174,6 +4237,90 @@ mod tests {
         let writer = 1 + packet[0][1] as usize;
         // NC may not push a transfer it consumes.
         packet[writer][2] = tt_isa::dataflow::Action::Push.word();
+        assert!(crate::dm::check_pair(&packet).is_err());
+    }
+
+    /// A depth-two transfer packet, and where its writer section starts.
+    fn packet() -> (Vec<[u32; 8]>, usize) {
+        let packet = transfer_segments(vec![transfer("t", 2, 3, 1)])
+            .remove(0)
+            .entries;
+        let writer = 1 + packet[0][1] as usize;
+        (packet, writer)
+    }
+
+    #[test]
+    fn the_ownership_checks_pass_the_packet_they_break() {
+        let (packet, writer) = packet();
+        assert!(crate::dm::check_pair(&packet).is_ok());
+        // Both sections hold credits, so the cases below change real ones.
+        let credit = |from: usize, to: usize| (from..to).find(|&i| packet[i][0] == op::CB);
+        assert!(credit(1, writer).is_some() && credit(writer, packet.len()).is_some());
+    }
+
+    #[test]
+    fn a_reader_holding_an_output_credit_is_refused() {
+        use tt_isa::dataflow::{Action, Stream};
+        let (mut packet, writer) = packet();
+        let at = (1..writer).find(|&i| packet[i][0] == op::CB).unwrap();
+        // The output's producer is T2 and its consumer NC: B is neither.
+        for action in [Action::Reserve, Action::Push, Action::Wait, Action::Pop] {
+            packet[at][1] = Stream::Output.word();
+            packet[at][2] = action.word();
+            assert!(crate::dm::check_pair(&packet).is_err(), "{action:?}");
+        }
+        // Nor does a reader take the transfer's consumer side.
+        packet[at][1] = Stream::Transfer.word();
+        for action in [Action::Wait, Action::Pop] {
+            packet[at][2] = action.word();
+            assert!(crate::dm::check_pair(&packet).is_err(), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn a_credit_at_another_capacity_than_the_header_is_refused() {
+        let (packet, writer) = packet();
+        for section in [1..writer, writer..packet.len()] {
+            let at = section.clone().find(|&i| packet[i][0] == op::CB).unwrap();
+            for capacity in [1, 3, 0x7fff] {
+                let mut changed = packet.clone();
+                changed[at][3] = capacity;
+                assert!(crate::dm::check_pair(&changed).is_err(), "{capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_capacity_of_zero_or_over_the_counters_is_refused() {
+        for capacity in [0u32, 0x8000, 0xffff] {
+            let (mut packet, _) = packet();
+            packet[0][3] = capacity;
+            for entry in &mut packet {
+                if entry[0] == op::CB {
+                    entry[3] = capacity;
+                }
+            }
+            assert!(crate::dm::check_pair(&packet).is_err(), "{capacity}");
+        }
+    }
+
+    #[test]
+    fn a_writer_section_may_not_read() {
+        let (mut packet, writer) = packet();
+        // NC issues on NoC #1 beside a reading B and never reads GDDR itself.
+        let at = (writer..packet.len())
+            .find(|&i| packet[i][0] == op::WRITE)
+            .unwrap();
+        packet[at][0] = op::READ;
+        assert!(crate::dm::check_pair(&packet).is_err());
+    }
+
+    #[test]
+    fn a_section_that_does_not_fill_the_packet_is_refused() {
+        let (mut packet, _) = packet();
+        packet[0][2] += 1;
+        assert!(crate::dm::check_pair(&packet).is_err());
+        packet[0][2] -= 2;
         assert!(crate::dm::check_pair(&packet).is_err());
     }
 

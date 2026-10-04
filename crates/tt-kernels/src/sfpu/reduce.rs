@@ -94,6 +94,11 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return accumulate_in_order(first, valid.unwrap_or(32));
     }
+    let fmt = if op == ReduceOp::Max {
+        Format::Int32
+    } else {
+        Format::Fp32
+    };
     let masked = valid.is_some_and(|v| v < 32);
     let mut p = Program::with_policy(if masked {
         LoopPolicy::Unrolled
@@ -118,7 +123,7 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     }
     let v = valid.unwrap_or(32) as i32;
     p.for_each_row_group(64, |p, o| {
-        p.load(LReg::L0, Format::Fp32, A_ROW + o);
+        p.load(LReg::L0, fmt, A_ROW + o);
         if masked {
             let g = o / 4;
             // What the lane index in `L6` must stay below for the lane to
@@ -139,11 +144,11 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
             }
         }
         if first {
-            p.store(LReg::L0, Format::Fp32, OUT_ROW + o);
+            p.store(LReg::L0, fmt, OUT_ROW + o);
         } else {
-            p.load(LReg::L1, Format::Fp32, OUT_ROW + o);
+            p.load(LReg::L1, fmt, OUT_ROW + o);
             combine(p, op, LReg::L0, LReg::L1);
-            p.store(LReg::L1, Format::Fp32, OUT_ROW + o);
+            p.store(LReg::L1, fmt, OUT_ROW + o);
         }
     });
     p.finish()
@@ -206,6 +211,11 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
 /// The finishing program: the accumulator folded within the tile (see the
 /// module documentation). Nothing for a sum over rows, already in row 0.
 pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
+    let fmt = if op == ReduceOp::Max {
+        Format::Int32
+    } else {
+        Format::Fp32
+    };
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return p.finish();
@@ -219,9 +229,9 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
                 for g in 0..4 {
                     let (left, right) = (lower + 4 * g, lower + 16 + 4 * g);
                     let at = [left, left | 2, right, right | 2];
-                    p.load(LReg::L0, Format::Fp32, acc(at[0]));
+                    p.load(LReg::L0, fmt, acc(at[0]));
                     for &a in &at[1..] {
-                        p.load(LReg::L1, Format::Fp32, acc(a));
+                        p.load(LReg::L1, fmt, acc(a));
                         combine(&mut p, op, LReg::L1, LReg::L0);
                     }
                     // Across the eight lanes of each lane row.
@@ -231,7 +241,7 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
                         combine(&mut p, op, LReg::L2, LReg::L0);
                     }
                     for &a in &at {
-                        p.store(LReg::L0, Format::Fp32, acc(a));
+                        p.store(LReg::L0, fmt, acc(a));
                     }
                 }
             }
@@ -239,7 +249,7 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
         Axis::Rows => {
             for (top, bottom) in [(0, 32), (16, 48)] {
                 for half in [0, 2] {
-                    p.load(LReg::L0, Format::Fp32, acc(top + half));
+                    p.load(LReg::L0, fmt, acc(top + half));
                     for g in 0..8 {
                         let r = if g < 4 {
                             top + 4 * g
@@ -247,7 +257,7 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
                             bottom + 4 * (g - 4)
                         };
                         if r != top {
-                            p.load(LReg::L1, Format::Fp32, acc(r + half));
+                            p.load(LReg::L1, fmt, acc(r + half));
                             combine(&mut p, op, LReg::L1, LReg::L0);
                         }
                     }
@@ -256,7 +266,7 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
                     combine(&mut p, op, LReg::L1, LReg::L0);
                     combine(&mut p, op, LReg::L3, LReg::L2);
                     combine(&mut p, op, LReg::L2, LReg::L0);
-                    p.store(LReg::L0, Format::Fp32, acc(top + half));
+                    p.store(LReg::L0, fmt, acc(top + half));
                 }
             }
         }

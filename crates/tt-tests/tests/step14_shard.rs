@@ -85,7 +85,7 @@ fn sharded_equals_single(
             .matmul(&a, &b, mkn, route, fidelity, BUDGET)
             .unwrap_or_else(|e| panic!("{e}"));
         let single = matmul_on(
-            &mut fab.chips[0].dev,
+            fab.chips[0].device(),
             at(1, 2),
             &tt_firmware_images::ROLES,
             &a,

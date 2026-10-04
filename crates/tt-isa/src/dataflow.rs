@@ -180,6 +180,12 @@ pub const fn room(received: u16, consumed: u16, capacity: u16, count: u16) -> bo
     let used = available(received, consumed);
     used <= capacity && count <= capacity - used
 }
+/// Has a counter at `counter` reached `target`? Both count modulo 2^16, so
+/// the difference is read as signed: a target up to 2^15 - 1 ahead is not
+/// reached yet, and one behind is.
+pub const fn reached(counter: u16, target: u16) -> bool {
+    counter.wrapping_sub(target) as i16 >= 0
+}
 pub fn program(address: u32, length: u32) -> bool {
     let words = length & !mailbox::loops::LOOPED;
     length & STREAMED == 0
@@ -220,6 +226,49 @@ mod tests {
                 }
             }
         }
+    }
+    /// Reservations of `count` pages, every counter position across the wrap:
+    /// room is exactly `capacity - used`, ready exactly `used`, and a count the
+    /// ring cannot hold is never granted.
+    #[test]
+    fn contiguous_reservations_wrap_at_every_position() {
+        for capacity in [1u16, 2, 3, 15, 16, 17, 192] {
+            for consumed in (0..=0x30u16).chain(0xffd0..=0xffff) {
+                for used in 0..=capacity {
+                    let received = consumed.wrapping_add(used);
+                    for count in 0..=capacity + 2 {
+                        assert_eq!(
+                            room(received, consumed, capacity, count),
+                            count <= capacity - used,
+                            "room: capacity {capacity} consumed {consumed} used {used} count {count}"
+                        );
+                        assert_eq!(
+                            ready(received, consumed, count),
+                            count <= used,
+                            "ready: capacity {capacity} consumed {consumed} used {used} count {count}"
+                        );
+                    }
+                }
+            }
+        }
+        // More in use than the ring holds is a corrupt counter: nothing fits.
+        assert!(!room(5, 0, 4, 0));
+        assert!(!room(0, 1, 4, 1));
+    }
+    /// The release wait compares across the wrap: a target at or behind the
+    /// counter is reached, one up to 2^15 - 1 ahead is not.
+    #[test]
+    fn a_release_target_is_reached_across_the_wrap() {
+        for counter in (0..=0x30u16).chain(0x7fe0..=0x8020).chain(0xffd0..=0xffff) {
+            for ahead in 0..=0x7fffu16 {
+                if ahead > 0x40 && ahead < 0x7fc0 {
+                    continue;
+                }
+                assert_eq!(reached(counter, counter.wrapping_add(ahead)), ahead == 0);
+                assert!(reached(counter, counter.wrapping_sub(ahead)));
+            }
+        }
+        assert!(reached(0, 0xffff) && reached(2, 0xfffe) && !reached(0xfffe, 2));
     }
     #[test]
     fn ownership_is_checked() {

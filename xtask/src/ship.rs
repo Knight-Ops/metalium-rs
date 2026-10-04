@@ -4,6 +4,36 @@ use std::process::Command;
 
 use crate::util::workspace_root;
 
+/// Flex is a workspace reference backend, never part of burn-tt's dependency graph.
+pub fn check_no_flex_in_backend() -> Result<(), String> {
+    let out = Command::new("cargo")
+        .args([
+            "tree",
+            "--offline",
+            "--package",
+            "burn-tt",
+            "--all-features",
+            "--edges",
+            "normal,build,dev",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(workspace_root())
+        .output()
+        .map_err(|e| format!("could not run cargo tree: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    if String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("burn-flex"))
+    {
+        return Err("burn-flex leaked into burn-tt's normal, build, or dev dependencies".into());
+    }
+    println!("ok: burn-tt has no burn-flex dependency; external references remain allowed");
+    Ok(())
+}
+
 /// Crates whose dependency tree must stay free of the simulator binding.
 const SHIPPABLE: &[&str] = &[
     "tt-isa",

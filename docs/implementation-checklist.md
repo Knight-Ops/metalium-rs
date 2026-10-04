@@ -41,8 +41,20 @@ gate you have not seen reject something is not yet evidence.
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
 | 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | **Direction: tensors live in the 32 GiB of GDDR6, loaded at startup.** DRAM, the B data mover and resident role firmware gated on ttsim and both cards; MNIST 224 -> 5.8 ms/step on one card (Flex: 0.5), dataset, weights and activations resident in GDDR; 9.5 asserts the steady-state step's PCIe traffic (6224 B of tensors, 193 524 B written); 9.6 deals GDDR ops over many tiles; 9.7a one host round trip per op per tile, 9.7b op records expanded on the tile, 9.7c resident programs (2.5 ms/step on 8 tiles); 9.12a NoC ownership, NC mover, card reads 469 GB/s and NoC #1 writes 378. Next: 9.13 role trace, 9.14 per-request cost, 9.15 overlap |
-| 10 — Hardware coverage | `[ ]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** Only `MVMUL` runs on the Tensix today; element-wise is on the B core, the SFPU runs no tensor op. Next: 10.0, the SFPU foundation, with today's element-wise ops moved onto it |
+| 9 — Performance | `[~]` | GDDR residency, multi-tile execution, resident programs, host DMA, asynchronous dispatch and fresh/traced B-reader / T0–T2 / NC-writer ownership implemented. Current measurements: `firmware-performance.md`. Remaining: host submission/per-request overhead, ownership tuning, reliable concurrent profiling, Ethernet pipelining and a device-resident mesh |
+| 10 — Hardware coverage | `[~]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** 10.0–10.2 complete: SFPU arithmetic/activations, softmax, int/bool storage and logic. 10.3 started: rank-N views/reductions and full F32 sum/mean; arbitrary-axis reductions, other reduction kinds, Tensix transpose and norms remain |
+
+### Current implementation order (2026-10-04)
+
+For model coverage, use Phase 10's tracker: finish R1 reductions, then K-blocked
+matmul (P2), general slicing/indexing (D4), layouts/norms (M3/R3), formats/casts
+(10.4) and convolution/pooling/attention (10.5). Full F32 sum/mean is the first
+10.3 addition (`step63_burn_full_reduce`), including bounded scalar reductions
+beyond one-pass L1 limits. Their arithmetic is native SFPU execution, including
+in exact mode, with explicit errors for unsupported inputs. Mesh engines use
+native L1 staging on chip 0 rather than a host reduction.
+Backend work proceeds as B1 → B2 → B10.
+The old Phase 9 timings below are dated measurements, not the current status.
 
 ---
 
@@ -1450,7 +1462,7 @@ tiles, done in turn. The slices from there:
     shared packet.
   - Card reads 127 -> 469 GB/s, NoC #1 writes 52 -> 378.
   - Details in `firmware-performance.md`.
-- [ ] **Next, in order** (from an independent review, 2026-10-02, checked
+- [~] **Performance backlog** (historical order from an independent review, 2026-10-02, checked
       against the measurements above):
   - [ ] **9.13 Role `START` traced before the role's setup.**
     - Today the descriptor and config work happens before `START`, so the push
@@ -1466,7 +1478,7 @@ tiles, done in turn. The slices from there:
     - Execute GATHER / SCATTER records directly, not as re-decoded entries.
     - Merge contiguous tiles into one request.
     - Measure per entry and on matmul and element-wise gathers.
-  - [ ] **9.15 Overlap on B, then split.**
+  - [x] **9.15 Streaming ownership and traced overlap.**
     - **Superseded by fixed ownership (2026-10-03):** GDDR compute now always
       uses B-reader / resident T0–T2 / NC-writer regions and page credits, fresh
       and traced. The legacy wave, B-only pipeline and two-host-queue NC
@@ -1495,7 +1507,7 @@ tiles, done in turn. The slices from there:
       only writes (`dm::Mover::permits`), so each image drops the other
       direction's code: B 24.2 -> 20.9 KB of its 24 KB (3.7 KB free from 0.3),
       NC 22.9 -> 14.8 KB. One source, compiled twice with a const.
-  - [ ] **9.17 Host time per op, measured first (research).**
+  - [~] **9.17 Host time per op: measured and partially reduced.**
     - On many tiles an element-wise op or reduction is the host's: it queues
       each unit's list in turn, ~6 us a unit an op on card 0, so a 50-tile max
       over rows took 54 us on 8 tiles and 155 on 32 (`sfpu_pipeline_sweep`).
@@ -1510,9 +1522,10 @@ tiles, done in turn. The slices from there:
     - [x] Trace replay measured (`trace_replay_vs_fresh`): a forward pass at
       MNIST's size goes from host-bound to device-bound past one tile (8
       tiles 28.8 -> 11.2 us an op, 32 tiles 51.4 -> 11.5); neutral on
-      device-bound shapes; 5% slower on one tile, where captures lose
-      pipelining. Next: make pipelined lists capturable; replay from burn-tt
-      without a host-written input (the input write is PCIe-bound, below).
+      device-bound shapes; 5% slower on one tile, where captures lost
+      pipelining at that measurement. Fresh and traced streaming now share
+      their schedule (`feature-traced-pipelining.md`). Device-resident Burn
+      replay inputs remain a follow-up; `Trace::run` still writes its input.
     - [x] Host<->card copies: uncached under this VM (80 MB/s writes, 28
       reads; `ttsim-divergence.md` row M). Now around it: the card moves
       tensors itself through pinned host memory (`HOST_READ` / `HOST_WRITE`,
@@ -1529,7 +1542,9 @@ tiles, done in turn. The slices from there:
       The BAR mapping itself is still the hypervisor's to fix.
     - Then consider what replay cannot cover: one list multicast to every
       unit, or a unit expanding its share from one record.
-  - [ ] **9.16 Role program streaming, measured first.**
+  - [~] **9.16 Role program streaming and push-loop cost.**
+    - Resident streaming scripts now launch once per compatible region, not
+      once per batch. Push-loop instruction cost remains a performance item.
     - Every launch streams its program words through RISC-V stores.
     - Measure the instruction-heavy kernels (SFPU `exp`: roles 87% busy) before
       rewriting the push loop.
@@ -1542,14 +1557,17 @@ tiles, done in turn. The slices from there:
   - Smaller: transposed and broadcast reads drain the moves and rearrange
     through B's one scratch slot; each role launch rereads its descriptor and
     rewrites config.
-- [ ] **9.8 Overlap.** Double-buffer the L1 staging so the mover gathers the
-      next chunk while the roles compute this one, and scatters the previous
-      one (the `Src`/`Dst` double buffering and the hazards-as-data wait
-      planner from the plan belong here). Now 9.15.
-- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10, and done there (S1, milestone 10.0).
-- [ ] **9.10 Faster start-up.** The preload (2.7 s for 60 000 images) is mostly
-      host tilizing: tilize in parallel, or upload row-major and let the movers
-      tilize on the device.
+- [~] **9.8 Overlap.** The runtime is implemented as fixed streaming
+      ownership (9.15), with depth-one/two batch credits and resident roles,
+      for fresh and traced work. Backend state still retires between batches;
+      a hazard-driven wait planner and retuning the old overlap thresholds
+      remain open. See `feature-streaming-dataflow-ownership.md`.
+- [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10 and done (S1, 10.0).
+- [x] **9.10 Faster start-up.** Host DMA, parallel host tilize/detilize and
+      run-record batching are implemented and gated (`step57_host_dma`).
+      Mover tilize/untilize is also gated (`step58_tile_layout`) but is
+      slower at the measured sizes; host tilize remains the default.
+      Tensix tilize and DMA directly from caller memory are follow-ups.
 - [ ] **9.11 The mesh, device-resident.** Per-chip `Session`s with GDDR and
       resident roles, chips running concurrently, the Ethernet movers moving
       tiles between GDDR rather than host-staged operands; data-parallel

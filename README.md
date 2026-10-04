@@ -5,11 +5,17 @@ for the baby RISC-V cores, host device access, Tensix kernels, and a Burn backen
 No Python, no C++, no TT-Metalium. Developed against the
 [ttsim](https://github.com/tenstorrent/ttsim) simulator and run on two p150a cards.
 
-What it does today: a Burn MLP trains on MNIST with every matmul, element-wise op,
-ReLU, bias-gradient sum and weight update on the card, and the dataset, weights and
-activations resident in GDDR6 (`crates/tt-mnist`). The loss and the rank-1 bias
-updates still run on the host: six small tensors cross PCIe per step. A session can spread work over many Tensix
-tiles, and matmuls can be sharded over two cabled cards via Ethernet.
+What it does today: Burn MLP and small transformer models train on the card,
+with GDDR-resident matmuls, SFPU arithmetic/activations, softmax, embedding and
+loss indexing, and full F32 sums/means. Rank-N tensors use strided views;
+tile-aligned batched products stay resident. Fresh and traced compute share
+B-reader / resident T0–T2 / NC-writer streaming ownership. Host transfers use
+the card's DMA, and Burn submits device operations asynchronously.
+Unsupported operations/layouts fail explicitly with operation, shape and dtype.
+`burn-tt` owns tensor storage and seed state and has no `burn-flex` dependency;
+Flex remains an external comparison backend. Core MLP and transformer gates
+require native arithmetic and explicit result readback.
+See [the native cutover and datatype backlog](docs/burn-native-cutover.md).
 
 | Doc | What it holds |
 |---|---|
@@ -93,16 +99,23 @@ fails if any crate in `SHIPPABLE` (`xtask/src/ship.rs`) depends on `tt-ttsim` or
   |---|---|
   | `cargo xtask gen-cfg` | `crates/tt-isa/src/cfg/generated.rs`, backend config fields from `cfg_defines.h` |
   | `cargo xtask gen-isa` | `crates/tt-isa/src/isa/generated.rs`, encodings from `Bits32.lua`, cross-checked against the spec's `TT_*(...)` syntax blocks |
-  | `cargo xtask gen-burn-delegate` | `crates/burn-tt/src/generated/delegate.rs`, forwarding of every burn-backend op to burn-flex |
+  | `cargo xtask gen-burn-ops` | `crates/burn-tt/src/generated/ops.rs`, native dispatch and explicit unsupported Burn operations |
 
 - **Every encoding records which chip it is evidence for** (`isa::Provenance`). A
   Wormhole-only layout is `UNVERIFIED`; layouts measured where the spec draws only Wormhole live in
   `xtask/src/gen_isa/Bits32_BH.lua`. The Wormhole forms are under
   `isa::generated::defs::wormhole`.
 
-## Not done yet
+## Next implementation work
 
-The `ttsim-qemu` path; keeping tensors in GDDR across a multi-card mesh (today
-`Topology::Cards` stages from the host per matmul); spreading a multi-card topology
-over more than one tile per card; resident programs (Phase 9.7c). The checklist's
-"Phase 9 -- next steps" is the current list.
+Phase 10.3 is in progress: finish arbitrary-axis reductions and remaining
+reduction kinds, then K-blocked matmul, general slicing/indexing, Tensix
+transpose/norms, BF16 storage/casts and convolution/pooling/attention. See
+[`docs/hardware-coverage.md`](docs/hardware-coverage.md) for gated status.
+Backend typed errors, initialization/discovery and Burn conformance are in
+[`docs/burn-backend-parity.md`](docs/burn-backend-parity.md).
+
+Resident multi-card meshes now pass native training gates. More than one
+compute tile per card in `Topology::Cards`, Ethernet pipelining and fusion remain open. X280 dispatch
+is proposed and unscheduled. `ttsim-qemu` is deliberately deferred: the
+`tt-kmd` transport is already gated on real cards.

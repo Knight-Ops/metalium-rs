@@ -2,8 +2,7 @@
 //! device it belongs to.
 //!
 //! A tensor is a shared, immutable cell with two lazily filled copies. The host
-//! copy is a `burn-flex` tensor, which every op `burn-tt` does not run itself
-//! reads. The device copy is a buffer in the chip's GDDR (Phase 9), which the
+//! copy holds owned tensor bytes for input staging and explicit readback. The device copy is a buffer in the chip's GDDR (Phase 9), which the
 //! device ops read and write. An op on the device leaves its result there only;
 //! the first host op to need it downloads it once, and the first device op to
 //! need a host tensor uploads it once. Clones share both copies -- autodiff
@@ -15,16 +14,16 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::host::HostBuffer;
 use burn_backend::quantization::QuantScheme;
 use burn_backend::{DType, QTensorPrimitive, Shape, TensorData, TensorMetadata};
-use burn_flex::{FlexQTensor, FlexTensor};
 
 use crate::server::{self, BufferId, Elem};
 use crate::views::Strided;
 
 /// The device element type a Burn dtype is stored as (`hardware-coverage.md`
 /// D3): `F32`; `I32` -- Burn's `IntElem` here -- as its bits; a bool of any
-/// store as `0`/`1`. Anything else stays on the host.
+/// store as `0`/`1`. Other dtypes are unsupported.
 pub(crate) fn device_elem(dtype: DType) -> Option<Elem> {
     match dtype {
         DType::F32 => Some(Elem::F32),
@@ -35,7 +34,7 @@ pub(crate) fn device_elem(dtype: DType) -> Option<Elem> {
 }
 use crate::TtDevice;
 
-/// Float, int and bool tensors alike, as Flex uses one primitive for all three.
+/// Float, int and bool tensors share owned bytes and device buffer references.
 #[derive(Clone, Debug)]
 pub struct TtTensor {
     pub(crate) cell: Arc<Cell>,
@@ -44,7 +43,7 @@ pub struct TtTensor {
 
 #[derive(Debug)]
 pub(crate) struct Cell {
-    host: OnceLock<FlexTensor>,
+    host: OnceLock<HostBuffer>,
     /// The device copy, uploaded at most once -- shared by the cells of a
     /// reshape that keeps the stored matrix ([`TtTensor::reshaped_host`]),
     /// so a parameter reshaped on every forward pass (a bias) is uploaded
@@ -66,7 +65,7 @@ pub(crate) struct DramRef {
     pub(crate) transposed: bool,
 }
 
-/// A row-major `[rows, cols]` F32 matrix on the device, freed when the last
+/// A row-major `[rows, cols]` matrix of stored device elements, freed when the last
 /// tensor using it goes.
 #[derive(Debug)]
 pub(crate) struct Buffer {
@@ -88,7 +87,7 @@ impl Drop for Buffer {
 
 impl TtTensor {
     /// A host tensor.
-    pub(crate) fn new(inner: FlexTensor, device: TtDevice) -> Self {
+    pub(crate) fn new(inner: HostBuffer, device: TtDevice) -> Self {
         crate::report::made(false);
         let (shape, dtype) = (inner.shape(), inner.dtype());
         let host = OnceLock::new();
@@ -167,17 +166,16 @@ impl TtTensor {
         self.cell.strided.clone()
     }
 
-    /// Was this tensor computed on the device: a device copy and, so far, no
-    /// host one? What a residency gate checks of an op's result -- a host
-    /// fallback on operands that still had host copies moves no bytes, so
-    /// the traffic counters alone cannot tell.
+    /// Does this tensor have device storage and, so far, no host copy?
+    /// Residency gates check this alongside traffic to distinguish device
+    /// results from host input construction and layout packing.
     pub fn computed_on_device(&self) -> bool {
         (self.cell.dram.get().is_some() || self.cell.strided.is_some())
             && self.cell.host.get().is_none()
     }
 
     /// The host copy, downloaded the first time it is needed.
-    pub(crate) fn host(&self) -> &FlexTensor {
+    pub(crate) fn host(&self) -> &HostBuffer {
         self.cell.host.get_or_init(|| {
             if let (None, Some(v)) = (self.cell.dram.get(), &self.cell.strided) {
                 if !self.materialises_on_device(v) {
@@ -226,7 +224,7 @@ impl TtTensor {
                 }
                 None => unreachable!("only a stored dtype has a device copy"),
             };
-            FlexTensor::from_data(data)
+            HostBuffer::from_data(data)
         })
     }
 
@@ -235,7 +233,7 @@ impl TtTensor {
     /// reshaped) and shares `self`'s device-copy slot, so one upload serves
     /// both. Only for a tensor with no device copy yet, or an untransposed
     /// one -- a transposed view's buffer is not the reshape's.
-    pub(crate) fn reshaped_host(&self, host: FlexTensor, shape: Shape) -> TtTensor {
+    pub(crate) fn reshaped_host(&self, host: HostBuffer, shape: Shape) -> TtTensor {
         debug_assert_eq!(stored_dims(&shape.to_vec()), self.stored());
         debug_assert!(self.dram().is_none_or(|d| !d.transposed));
         crate::report::made(false);
@@ -254,7 +252,7 @@ impl TtTensor {
     }
 
     /// The host copy, owned: taken if this is the only reference to it.
-    pub(crate) fn into_host(self) -> FlexTensor {
+    pub(crate) fn into_host(self) -> HostBuffer {
         match Arc::try_unwrap(self.cell) {
             Ok(cell) if cell.host.get().is_some() => cell.host.into_inner().expect("checked"),
             Ok(cell) => TtTensor {
@@ -290,7 +288,7 @@ impl TtTensor {
 
     /// A strided view's elements, on the host: its source downloaded and
     /// read through the strides.
-    fn gathered(&self, v: &Strided) -> FlexTensor {
+    fn gathered(&self, v: &Strided) -> HostBuffer {
         let b = &v.src.buffer;
         if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
             eprintln!(
@@ -310,7 +308,7 @@ impl TtTensor {
                 src[r * b.cols + c]
             })
             .collect();
-        FlexTensor::from_data(TensorData::new(values, shape))
+        HostBuffer::from_data(TensorData::new(values, shape))
     }
 
     /// The device copy, uploaded the first time it is needed, as the matrix
@@ -426,31 +424,33 @@ impl TensorMetadata for TtTensor {
     }
 }
 
-/// A quantized tensor: Flex's, and its device.
+/// Metadata required by Burn's quantized primitive interface.
+/// Quantized construction and computation are explicitly unsupported.
 #[derive(Clone, Debug)]
 pub struct TtQTensor {
-    pub(crate) inner: FlexQTensor,
+    pub(crate) shape: Shape,
+    pub(crate) scheme: QuantScheme,
     pub(crate) device: TtDevice,
 }
 
 impl TensorMetadata for TtQTensor {
     fn dtype(&self) -> DType {
-        self.inner.dtype()
+        DType::QFloat(self.scheme)
     }
     fn shape(&self) -> Shape {
-        self.inner.shape()
+        self.shape.clone()
     }
     fn rank(&self) -> usize {
-        self.inner.rank()
+        self.shape.num_dims()
     }
 }
 
 impl QTensorPrimitive for TtQTensor {
     fn scheme(&self) -> &QuantScheme {
-        self.inner.scheme()
+        &self.scheme
     }
     fn default_scheme() -> QuantScheme {
-        FlexQTensor::default_scheme()
+        QuantScheme::default()
     }
 }
 

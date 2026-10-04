@@ -1,17 +1,11 @@
 //! A Burn backend for Tenstorrent Blackhole.
 //!
-//! **What runs where.** Every op runs on the host through `burn-flex` except
-//! the ones listed in `xtask/src/gen_burn.rs`'s `OVERRIDDEN` (matmul, the
-//! element-wise and SFPU families, reductions, softmax, views; the full list
-//! is `docs/hardware-coverage.md`'s Burn op tables), each on the device when
-//! its operands are already there (tensors live in GDDR once uploaded,
-//! `tensor::TtTensor`), and on the host otherwise. [`report`] says which op
-//! ran where and what each moved (`TT_REPORT=1` prints it at exit;
-//! `TT_STRICT=1` makes a fallback that moves bytes a panic). The forwarding is generated from the
-//! pinned `burn-backend`'s op traits (`cargo xtask gen-burn-delegate`), so
-//! `burn-tt` behaves exactly as Flex does wherever it has not been told
-//! otherwise, and each op moved to the device is a change behind an unchanged
-//! interface, gated against the delegate it replaces.
+//! **What runs where.** Compute uses native Tenstorrent kernels. Supported
+//! inputs are uploaded as needed; unsupported operations, shapes and dtypes
+//! panic with context. Host buffers serve construction and explicit readback.
+//! Burn's default operations compose this backend's primitives. The pinned
+//! traits generate native dispatch and unsupported implementations
+//! (`cargo xtask gen-burn-ops`). [`report`] records execution and transfers.
 //!
 //! **Devices.** A [`TtDevice`] names a chip; the hardware behind it is owned by
 //! a server thread started with [`attach`], which runs a caller-supplied
@@ -27,15 +21,17 @@
 //! waiting, `server::submit`), naming the op and the engine's error. The device
 //! path is never silently replaced by the host one.
 
-mod convert;
 mod generated;
+mod host;
 mod ops;
+mod random;
 mod report;
 mod server;
 mod tensor;
 mod topology;
 mod trace;
 mod traffic;
+mod unsupported;
 mod views;
 
 pub use report::{
@@ -48,33 +44,6 @@ pub use server::{
 pub use tensor::{TtQTensor, TtTensor};
 pub use trace::Trace;
 
-/// Keep on the device only what gives `burn-flex`'s bits exactly.
-///
-/// By default the device runs every op it has, and some are approximations
-/// held to derived bounds rather than to Flex's bits: division and the
-/// reciprocal (one ulp), `exp` and `log`, sums over columns (a different
-/// order), and softmax built from them. A run that must reproduce a host
-/// golden bit for bit -- the MNIST golden is one -- sets this, and those ops
-/// run on the host instead; so does `TT_EXACT=1`. Per process.
-pub fn set_exact(on: bool) {
-    EXACT.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Is exact mode on ([`set_exact`], or `TT_EXACT=1`)?
-pub fn exact() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    match EXACT.load(Relaxed) {
-        0 => {
-            let on = std::env::var("TT_EXACT").is_ok_and(|v| v == "1");
-            EXACT.store(if on { 2 } else { 1 }, Relaxed);
-            on
-        }
-        v => v == 2,
-    }
-}
-
-/// 0: not yet read from the environment; 1: off; 2: on.
-static EXACT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
 pub use traffic::{
     device_time, record_transfers, take_transfers, tensor_traffic, Direction, TensorTraffic,
@@ -84,8 +53,7 @@ pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 pub use tt_kernels::tensor::{Block, BlockMove};
 
-use burn_backend::{Backend, BackendTypes, DType, DTypeUsageSet, DeviceId, DeviceOps};
-use burn_flex::{Flex, FlexDevice};
+use burn_backend::{Backend, BackendTypes, DType, DTypeUsage, DTypeUsageSet, DeviceId, DeviceOps};
 
 /// The Burn backend. All state lives behind [`TtDevice`]s; the type itself is a
 /// marker, as Burn requires.
@@ -139,9 +107,8 @@ impl Backend for TtBackend {
         format!("tt<{device}>")
     }
 
-    fn seed(_device: &Self::Device, seed: u64) {
-        // Every op that draws random numbers runs on Flex, from Flex's seed.
-        Flex::seed(&FlexDevice, seed)
+    fn seed(device: &Self::Device, seed: u64) {
+        crate::random::seed(*device, seed)
     }
 
     fn device_count(_type_id: u16) -> usize {
@@ -149,7 +116,11 @@ impl Backend for TtBackend {
     }
 
     fn dtype_usage(_device: &Self::Device, dtype: DType) -> DTypeUsageSet {
-        // What Flex supports: the host runs everything the device does not.
-        Flex::dtype_usage(&FlexDevice, dtype)
+        match dtype {
+            DType::F32 => DTypeUsage::general() | DTypeUsage::Accelerated,
+            DType::Bool(_) => DTypeUsage::general(),
+            DType::I32 => DTypeUsage::Storage.into(),
+            _ => DTypeUsageSet::empty(),
+        }
     }
 }

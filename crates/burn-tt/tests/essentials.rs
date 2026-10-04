@@ -1,0 +1,90 @@
+//! Native storage and failure behavior need no hardware or reference backend.
+use burn_tensor::{
+    backend::Backend, Bool, DType, Distribution, Int, Tensor, TensorData, Transaction,
+};
+use burn_tt::{TtBackend, TtDevice};
+
+#[test]
+fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute() {
+    use burn_backend::DTypeUsage;
+    let d = TtDevice::new(304);
+    let float = TtBackend::dtype_usage(&d, DType::F32);
+    assert!(float.contains(DTypeUsage::Arithmetic) && float.contains(DTypeUsage::Accelerated));
+    let int = TtBackend::dtype_usage(&d, DType::I32);
+    assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
+    assert!(TtBackend::dtype_usage(&d, DType::F16).is_empty());
+    assert!(TtBackend::dtype_usage(&d, DType::BF16).is_empty());
+    assert!(TtBackend::dtype_usage(&d, DType::F64).is_empty());
+}
+
+#[test]
+fn owned_buffers_and_transactions_preserve_types_shapes_and_order() {
+    let d = TtDevice::new(300);
+    let f = Tensor::<TtBackend, 2>::from_data([[-0.0, 2.5], [3.0, 4.0]], &d);
+    let i = Tensor::<TtBackend, 1, Int>::from_data([-7, 0, i32::MAX], &d);
+    let b = Tensor::<TtBackend, 1, Bool>::from_data([true, false], &d);
+    let copies = f.clone().transpose().reshape([4, 1]).into_data();
+    assert_eq!(copies.to_vec::<f32>().unwrap(), [-0.0, 3.0, 2.5, 4.0]);
+    let data = Transaction::default()
+        .register(i)
+        .register(f.clone())
+        .register(b)
+        .register(f)
+        .execute();
+    assert_eq!(data[0].dtype, DType::I32);
+    assert_eq!(data[0].to_vec::<i32>().unwrap(), [-7, 0, i32::MAX]);
+    assert_eq!(data[1].shape.to_vec(), [2, 2]);
+    assert_eq!(
+        data[1].to_vec::<f32>().unwrap()[0].to_bits(),
+        (-0.0f32).to_bits()
+    );
+    assert_eq!(data[2].to_vec::<bool>().unwrap(), [true, false]);
+    assert_eq!(data[1], data[3]);
+}
+
+#[test]
+fn seeded_streams_repeat_and_are_independent_between_devices() {
+    let (a, b) = (TtDevice::new(301), TtDevice::new(302));
+    let draw = |device: &TtDevice| {
+        Tensor::<TtBackend, 1>::random([64], Distribution::Normal(0.0, 1.0), device).into_data()
+    };
+    TtBackend::seed(&a, 19);
+    let first = draw(&a);
+    let second = draw(&a);
+    TtBackend::seed(&b, 19);
+    assert_eq!(first, draw(&b));
+    TtBackend::seed(&b, 77);
+    assert_ne!(first, second);
+    TtBackend::seed(&a, 19);
+    assert_eq!(first, draw(&a));
+    assert_eq!(second, draw(&a));
+}
+
+#[test]
+fn unsupported_methods_name_operation_shape_and_dtype() {
+    let d = TtDevice::new(303);
+    let tensor = Tensor::<TtBackend, 2>::ones([2, 3], &d);
+    let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tensor.remainder_scalar(2.0)
+    }))
+    .unwrap_err();
+    let message = message.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("unsupported operation float_remainder_scalar"),
+        "{message}"
+    );
+    assert!(message.contains("[2, 3]"), "{message}");
+    assert!(message.contains("F32"), "{message}");
+    // Dtype rejection must report the input metadata, before attaching hardware.
+    let message = std::panic::catch_unwind(|| {
+        <TtBackend as burn_backend::ops::FloatTensorOps<TtBackend>>::float_from_data(
+            TensorData::new(vec![1.0f64], [1]),
+            &d,
+        )
+    })
+    .unwrap_err();
+    let message = message.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("float_from_data") && message.contains("F64") && message.contains("[1]")
+    );
+}
