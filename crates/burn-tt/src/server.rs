@@ -1359,7 +1359,7 @@ pub fn kmd_engine(
         // Tensors live in GDDR (Phase 9). Bit-identical to the host-staged path
         // (`step18_dram_matmul`), so on by default.
         session
-            .enable_dram(tt_firmware_images::DM_B.1)
+            .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .map_err(|e| EngineError(e.to_string()))?;
         // `TT_ELTWISE` once chose between the SFPU and the data mover's FP32
         // unit; the mover does no arithmetic now. Refused rather than ignored,
@@ -1393,13 +1393,12 @@ pub fn kmd_engine(
             Ok("card") => session.set_tilize(tt_kernels::session::Tilize::Card),
             Ok(v) => return Err(EngineError(format!("TT_TILIZE={v}: expected host or card"))),
         }
-        // `TT_SCATTER=nc`: pipelined ops write their outputs out from each
-        // tile's RISCV NC while B gathers (`Session::set_scatter_mover`);
-        // `b`, the default, keeps every move on B.
-        match std::env::var("TT_SCATTER").as_deref() {
-            Err(_) | Ok("b") => {}
-            Ok("nc") => session.set_scatter_mover(Some(tt_firmware_images::DM_NC.1)),
-            Ok(v) => return Err(EngineError(format!("TT_SCATTER={v}: expected b or nc"))),
+        for variable in ["TT_EXECUTION", "TT_SCATTER"] {
+            if let Ok(value) = std::env::var(variable) {
+                return Err(EngineError(format!(
+                    "{variable}={value}: retired; GDDR compute always uses B-reader/NC-writer ownership; unset it (TT_PIPELINE=0 disables overlap without changing ownership)"
+                )));
+            }
         }
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches

@@ -63,7 +63,7 @@ transformer whose per-op report is held to `tests/golden/transformer_off_device.
 ## Environment variables
 
 Every variable the workspace reads, by who reads it. burn-tt's own switches
-(`TT_PIPELINE`, `TT_SCATTER`, `TT_HOST_DMA`, `TT_TILIZE`, `TT_TOPOLOGY`, `TT_TILES`) refuse a
+(`TT_PIPELINE`, `TT_HOST_DMA`, `TT_TILIZE`, `TT_TOPOLOGY`, `TT_TILES`) refuse a
 value they do not accept, with an error naming it; `TT_BATCH` treats anything but
 `0` as on, `TT_EXACT` anything but `1` as off, and `TT_SILICON_DEVICE` an
 unparsable value as `0`.
@@ -72,8 +72,9 @@ unparsable value as `0`.
 
 | Variable | Values (default first) | Effect |
 |---|---|---|
-| `TT_PIPELINE` | `1`, `0` | Ops overlap a tile's data moves with its compute where that pays (`Session::set_pipeline`): GDDR matmuls, element-wise ops and reductions. `0` runs every block one after another. Same bits either way. |
-| `TT_SCATTER` | `b`, `nc` | Where pipelined ops write their outputs out from: each tile's RISCV B (with its gathers), or RISCV NC, writing on NoC 1 while B gathers (`Session::set_scatter_mover`). `nc` pays for write-heavy ops on one or two tiles and costs host time on many. |
+| `TT_EXECUTION` | must be unset | Retired: GDDR compute always uses resident B-reader/NC-writer ownership, including traces. Set, it is refused with migration guidance. |
+| `TT_PIPELINE` | `1`, `0` | Ops overlap a tile's data moves with its compute where that pays (`Session::set_pipeline`): GDDR matmuls, element-wise ops and reductions. `0` runs every block one after another; streaming still uses NC and waits for its output release before slot reuse. Captures retain the chosen schedule. Same bits either way. |
+| `TT_SCATTER` | must be unset | Retired: NC owns compute-region output writes on NoC1, even with `TT_PIPELINE=0`. Set, it is refused with migration guidance. |
 | `TT_HOST_DMA` | `1`, `0` | Tensors cross PCIe by the card's own DMA through a pinned 1 GiB hugepage (`Session::set_host_dma`), or with `0` by the host's stores and loads through a BAR -- uncached under VM passthrough, ~100x slower. Without a free 1 GiB hugepage the session uses the BAR and says so once. |
 | `TT_TILIZE` | `host`, `card` | Where tensors take the tile layout on their way to the card's GDDR and lose it on the way back (`Session::set_tilize`): the host's cores, or each tile's data mover. Burn sees row-major data either way, with the same bits. `host` is faster at every size measured: the host copies the rows into pinned memory either way, at about the cost of tilizing them, and a mover tilizes ~2.6 us a tile. |
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
@@ -96,15 +97,16 @@ unparsable value as `0`.
 | `TT_BLESS` | unset | `1`: `step12_mnist`'s ttsim run rewrites the loss golden the silicon run must reproduce. |
 | `TT_ISA_DOCS` | `vendor/tt-isa-documentation` | A local checkout of the ISA documentation for the `xtask` generators; still checked against the pinned digest. |
 | `STEP26_CASE` | unset | Runs only the named case of `step26_sfpu_isa`. |
-| `STRESS_SECS`, `STRESS_TILES`, `STRESS_NC` | 60 s on silicon; `1,8`; unset | The soak tests' length, tile counts, and (`stress_pipeline`) scatters on NC. |
+| `STRESS_SECS`, `STRESS_TILES` | 60 s on silicon; `1,8` | The soak tests' length and tile counts. NC ownership is always enabled. |
 
 ### Benchmarks (`cargo xtask bench`)
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `SWEEP_TILES`, `SWEEP_NC` | `silicon_bench_path` | The pipeline sweeps' tile counts; `SWEEP_NC` compares pipelined B-only against scatters on NC. |
+| `SWEEP_TILES` | `silicon_bench_path` | The pipeline sweeps' tile counts; both arms use NC ownership. |
 | `PIPELINE` | `silicon_bench_path` | `1`: the one-unit path benchmarks run pipelined. |
-| `BENCH_MOVER` | `silicon_bench_memory` | `nc`: the single-tile mover benchmarks run on RISCV NC. |
+| `BENCH_MOVER` | `silicon_bench_memory` | `nc`: the single-tile mover benchmarks run on RISCV NC (the writer: read benchmarks skip). B is the default and only reads. |
+| `BENCH_WRITE_NOC` | `silicon_bench_memory` | `0` (default) or `1`: single-tile write routing; `1` needs `BENCH_MOVER=nc`, since only NC writes on NoC #1. These diagnostic benchmarks bypass the session executor. |
 | `AGG_TILES`, `AGG_CAP`, `AGG_LEN`, `AGG_MIXES` | `silicon_bench_memory` | The card-wide GDDR benchmarks' tile counts, in-flight cap, entry size and read/write mixes. |
 | `COPY_ENTRY` | `silicon_bench_memory` | The entry size `copy_pipeline` moves a block in. |
 | `SOFTMAX_SIZE`, `SOFTMAX_DEVICE_ONLY` | `silicon_perf` | The softmax benchmark's shapes; device time only. |

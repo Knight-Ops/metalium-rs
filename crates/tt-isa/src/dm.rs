@@ -120,7 +120,7 @@ pub const QUEUE_LEN: u32 = 16;
 const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
 
 /// Host -> mover: which NIU the mover's GDDR writes go out on, [`write_noc`].
-/// Read at the start of every list. Reads always go out on NoC #0: on NoC #1
+/// Read at the start of every list, by NC's image only: B writes on NoC #0. Reads always go out on NoC #0: on NoC #1
 /// their data climbs the DRAM columns and shares one row's link, a single
 /// link's bandwidth for the whole row (`silicon_bench_memory::
 /// gddr_aggregate_nocs`, 4 tiles: 86 GB/s against 320). Barriers stay on
@@ -129,12 +129,6 @@ const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
 /// NoCs.
 pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
 const _: () = assert!(WRITE_NOC + 4 <= MAILBOX_BASE + 0x100);
-
-/// Mover -> the tile's other mover: how many [`op::SIGNAL`]s this mover has
-/// run (wrapping), each after everything before it landed. Zeroed by the host
-/// before the mover starts; read by the peer's [`op::WAIT_PEER`].
-pub const PROGRESS: u64 = MAILBOX_BASE + 0xE4;
-const _: () = assert!(PROGRESS + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {
@@ -157,6 +151,24 @@ pub const fn queue_slot(first: u32, entries: u32) -> u32 {
 }
 
 pub mod op {
+    /// Shared packet: `[PAIR, reader_entries, writer_entries, capacity,
+    /// barrier_trailers, 0, 0, 0]`, then reader, writer and optional barrier.
+    pub const PAIR: u32 = 0x40;
+    /// Retained region: `[PAIR_CALL, read_ch, read_off, read_count,
+    /// write_ch, write_off, write_count, capacity]`. Only B starts the pair.
+    pub const PAIR_CALL: u32 = 0x41;
+    /// Buffer action: `[CB, stream, action, capacity, 0, 0, 0, 0]`, `stream`
+    /// 0 for the input credits, 1 for the output's, 2 for a transfer's
+    /// ([`crate::dataflow::Stream`]).
+    pub const CB: u32 = 0x42;
+    /// NC descriptor: run immutable writer entries from B's list ring.
+    pub const SHARED: u32 = 0x43;
+    /// B waits on a counter: `[RELEASED, target_u16, which, 0, ...]`
+    /// ([`crate::dataflow::Release`]). `which` 0 waits for `target` output
+    /// batches written out and released by NC; 1 for `target` output batches
+    /// packed by T2 (their pack retired, whatever NC is still writing); 2 for
+    /// `target` transfer batches written out and released by NC.
+    pub const RELEASED: u32 = 0x44;
     /// DRAM -> L1.
     pub const READ: u32 = 1;
     /// L1 -> DRAM.
@@ -218,18 +230,9 @@ pub mod op {
     /// trace's role descriptors, which the host writes for an ordinary list
     /// and cannot write during a replay. Only in a list entry.
     pub const POKE: u32 = 11;
-    /// Count this mover's progress: `[SIGNAL, 0, ...]`. The mover waits for
-    /// every move before it to land, then adds one to its
-    /// [`super::PROGRESS`] word, which the other mover on the tile reads with
-    /// [`WAIT_PEER`]. Only in a list entry.
-    pub const SIGNAL: u32 = 12;
-    /// Wait for the tile's other mover: `[WAIT_PEER, peer, target, 0, ...]`,
-    /// `peer` 0 for B's and 1 for NC's ([`super::Mover`]). The mover spins on
-    /// the peer's [`super::PROGRESS`] until it reaches `target` (compared
-    /// modulo 2^32), and reports [`super::error::PEER`] instead if the peer's
-    /// queue has stopped on an error -- so a failed peer never leaves this one
-    /// spinning. Only in a list entry.
-    pub const WAIT_PEER: u32 = 13;
+    // 12 and 13 were `SIGNAL` and `WAIT_PEER`, the two movers' direct
+    // handshake. Nothing emits them since a shared packet's credits carry
+    // that ordering, and the decode refuses them.
     /// The first half of [`KERNEL`]: `[LAUNCH, generation, a0, l0, a1, l1,
     /// a2, l2]`. The mover waits for every move before it, points the roles
     /// at their programs and posts `generation`, as `KERNEL` does, and goes on
@@ -276,7 +279,7 @@ const _: () = {
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
-        assert!(ops[i] < record::GATHER || ops[i] > record::WRITE_RUN);
+        assert!(ops[i] < record::GATHER || ops[i] > record::PAD_WRITE);
         i += 1;
     }
 };
@@ -341,24 +344,34 @@ pub struct Mover {
     pub trace_chunk: u64,
 }
 
-/// Which of a tile's two movers, as an entry names it ([`op::WAIT_PEER`]).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Peer {
-    B,
-    NC,
-}
-
-impl Peer {
-    /// The mover's addresses.
-    pub const fn mover(self) -> Mover {
-        match self {
-            Peer::B => Mover::B,
-            Peer::NC => Mover::NC,
+impl Mover {
+    /// Whether this mover runs the entry or record whose first word is `op`.
+    /// The direction table both sides use: the host refuses what the firmware
+    /// would, and each image compiles in only what it runs.
+    ///
+    /// RISCV B is the reader: it never writes GDDR -- [`op::WRITE`] and the
+    /// writing records ([`record::Direction::Write`]) are its
+    /// [`error::DIRECTION`] -- and it keeps everything else: the control
+    /// entries, the roles' launches, barriers, PCIe moves ([`op::HOST_WRITE`]
+    /// included), and the reading records. RISCV NC is the writer: only
+    /// [`op::WRITE`], the writing records, [`op::WAIT`] and the credits
+    /// ([`op::CB`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
+    /// [`op::RELEASED`]) and [`op::CALL`] are B's; NC is started by B's
+    /// packet, through its `SHARED` and `CALL` words, which are not entries.
+    pub const fn permits(self, op: u32) -> bool {
+        match self.core {
+            crate::tensix::Core::B => {
+                op != op::WRITE && !matches!(record::direction(op), Some(record::Direction::Write))
+            }
+            _ => {
+                op == op::WRITE
+                    || op == op::WAIT
+                    || op == op::CB
+                    || matches!(record::direction(op), Some(record::Direction::Write))
+            }
         }
     }
-}
 
-impl Mover {
     /// RISCV B's mover: the image at its hardwired reset PC.
     pub const B: Mover = Mover {
         core: crate::tensix::Core::B,
@@ -475,6 +488,20 @@ pub enum Transform {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
+    Released {
+        target: u16,
+        which: crate::dataflow::Release,
+    },
+    Buffer {
+        stream: crate::dataflow::Stream,
+        action: crate::dataflow::Action,
+        capacity: u16,
+    },
+    PairCall {
+        reader: [u32; 3],
+        writer: [u32; 3],
+        capacity: u16,
+    },
     Move {
         descriptor: Descriptor,
         transform: Transform,
@@ -514,13 +541,6 @@ pub enum Entry {
     },
     /// [`op::KERNEL_WAIT`]: the wait.
     KernelWait { generation: u32 },
-    /// [`op::SIGNAL`].
-    Signal,
-    /// [`op::WAIT_PEER`]: the peer mover, and the progress count to wait for.
-    /// A one-byte [`Peer`], not a [`Mover`]: every `Entry` is as large as its
-    /// largest variant, and the mover's per-entry path decodes one each time
-    /// (a `Mover` here cost every entry ~100 cycles on card 0).
-    WaitPeer { peer: Peer, target: u32 },
     /// [`op::HOST_READ`] and [`op::HOST_WRITE`]. The address in two words, not
     /// a `u64`: a `u64` would raise every `Entry`'s alignment to 8.
     Host {
@@ -555,7 +575,49 @@ impl Entry {
                 },
             );
         }
-
+        if w[0] == op::RELEASED {
+            let which = crate::dataflow::Release::decode(w[2]).ok_or(error::OP)?;
+            if w[1] > u16::MAX as u32 || w[3..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Released {
+                target: w[1] as u16,
+                which,
+            });
+        }
+        if w[0] == op::CB {
+            let action = crate::dataflow::Action::decode(w[2]).ok_or(error::OP)?;
+            let stream = crate::dataflow::Stream::decode(w[1]).ok_or(error::OP)?;
+            if w[3] == 0 || w[3] >= 0x8000 || w[4..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            return Ok(Entry::Buffer {
+                stream,
+                action,
+                capacity: w[3] as u16,
+            });
+        }
+        if w[0] == op::PAIR_CALL {
+            if w[7] == 0 || w[7] >= 0x8000 {
+                return Err(error::OP);
+            }
+            for stream in [&w[1..4], &w[4..7]] {
+                let stream_end = stream[1] as u64 + stream[2] as u64 * ENTRY_BYTES;
+                if stream[0] >= crate::dram::CHANNELS as u32
+                    || usable & (1 << stream[0]) == 0
+                    || stream[1] % ENTRY_BYTES as u32 != 0
+                    || stream[2] == 0
+                    || stream_end > crate::dram::CHANNEL_BYTES
+                {
+                    return Err(error::RANGE);
+                }
+            }
+            return Ok(Entry::PairCall {
+                reader: [w[1], w[2], w[3]],
+                writer: [w[4], w[5], w[6]],
+                capacity: w[7] as u16,
+            });
+        }
         let transform = match w[0] {
             op::READ_TRANSPOSED => Transform::Transpose,
             op::READ_BROADCAST_COL => Transform::BroadcastCol0,
@@ -603,7 +665,7 @@ impl Entry {
                 // The length word may carry `mailbox::loops::LOOPED` (a loop
                 // header leads the program), which the runner reads; the
                 // bounds are the words'.
-                let words = len & !crate::mailbox::loops::LOOPED;
+                let words = len & crate::dataflow::LENGTH_MASK;
                 let bytes = words as u64 * 4;
                 if at % 16 != 0
                     || words > crate::mailbox::PROGRAM_MAX
@@ -671,12 +733,6 @@ impl Entry {
                 value: w[2],
             });
         }
-        if w[0] == op::SIGNAL {
-            if w[1..].iter().any(|&v| v != 0) {
-                return Err(error::OP);
-            }
-            return Ok(Entry::Signal);
-        }
         if w[0] == op::HOST_READ || w[0] == op::HOST_WRITE {
             let host = (w[2] as u64) << 32 | w[1] as u64;
             let (l1, len) = (w[4], w[5]);
@@ -728,17 +784,6 @@ impl Entry {
                 valid,
             });
         }
-        if w[0] == op::WAIT_PEER {
-            let peer = match w[1] {
-                0 => Peer::B,
-                1 => Peer::NC,
-                _ => return Err(error::OP),
-            };
-            if w[3..].iter().any(|&v| v != 0) {
-                return Err(error::OP);
-            }
-            return Ok(Entry::WaitPeer { peer, target: w[2] });
-        }
         if w[0] == op::FILL {
             let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
             if !slot(w[3]) {
@@ -784,8 +829,12 @@ pub mod error {
     /// A [`super::op::KERNEL`] entry naming a program outside the program
     /// cache, misaligned, or longer than a program may be.
     pub const PROGRAM: u32 = 8;
-    /// A [`super::op::WAIT_PEER`] whose peer's queue had stopped on an error.
+    /// The tile's other mover has stopped on an error or panicked, or is not
+    /// idle when a packet needs it.
     pub const PEER: u32 = 9;
+    /// An entry or record the mover's direction does not run: a GDDR write on
+    /// RISCV B, which only reads (`Mover::permits`).
+    pub const DIRECTION: u32 = 10;
 }
 
 /// A descriptor, as both sides see it.
@@ -960,6 +1009,54 @@ mod tests {
         assert_eq!(face_index(16, 0), 512);
         assert_eq!(face_index(31, 31), 1023);
         assert_eq!(face_index(1, 2), 18);
+    }
+
+    #[test]
+    fn b_reads_and_nc_writes() {
+        use record::{GATHER, PAD_WRITE, READ_RUN, SCATTER, WRITE_RUN};
+        let writes = [op::WRITE, SCATTER, WRITE_RUN, PAD_WRITE];
+        let reads = [
+            op::READ,
+            op::READ_TRANSPOSED,
+            op::READ_BROADCAST_COL,
+            GATHER,
+            READ_RUN,
+            record::FILL_PAD,
+        ];
+        let control = [
+            op::FILL,
+            op::KERNEL,
+            op::LAUNCH,
+            op::KERNEL_WAIT,
+            op::BARRIER,
+            op::POKE,
+            op::CALL,
+            op::HOST_READ,
+            op::HOST_WRITE,
+            op::TILIZE,
+            op::UNTILIZE,
+            op::PAIR,
+            op::PAIR_CALL,
+            op::RELEASED,
+        ];
+        let shared = [op::WAIT, op::CB];
+        for o in writes {
+            assert!(!Mover::B.permits(o) && Mover::NC.permits(o), "{o:#x}");
+        }
+        for o in reads.into_iter().chain(control) {
+            assert!(Mover::B.permits(o) && !Mover::NC.permits(o), "{o:#x}");
+        }
+        for o in shared {
+            assert!(Mover::B.permits(o) && Mover::NC.permits(o), "{o:#x}");
+        }
+    }
+
+    #[test]
+    fn retired_peer_ops_are_refused() {
+        // `SIGNAL` and `WAIT_PEER` (12 and 13) had their own entries once.
+        for retired in [12, 13] {
+            assert!(Entry::decode(ALL, [retired, 0, 1, 0, 0, 0, 0, 0]).is_err());
+        }
     }
 
     #[test]

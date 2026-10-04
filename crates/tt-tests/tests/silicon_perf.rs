@@ -205,7 +205,8 @@ fn dram_matmul_breakdown() {
         let (x, y) = tt_tests::backend::GATE_TILE;
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Exactly(x, y))
             .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         let cases = [
             ("x@W1", [64, 784], false, [784, 128], false),
             ("h@W2", [64, 128], false, [128, 10], false),
@@ -293,7 +294,8 @@ fn many_tiles_sweep() {
             let t0 = Instant::now();
             let mut s = Session::open_card(card, tt_firmware_images::ROLES, choice)
                 .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             let open = t0.elapsed();
             let tiles = s.tiles().len();
             let n = 512;
@@ -460,7 +462,8 @@ fn sfpu_transcendental_cost() {
     if let Err(e) = fork_scope(|| {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1))
             .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         for (name, kind) in kinds {
             let op = Eltwise {
                 kind,
@@ -580,7 +583,8 @@ fn softmax_parts() {
     if let Err(e) = fork_scope(|| {
         let mut s =
             Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1)).unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         let (r, c) = (512, 128);
         let x = s.upload(&pattern_f32(r * c, 3), r, c).unwrap();
         let col = s.upload(&pattern_f32(r, 4), r, 1).unwrap();

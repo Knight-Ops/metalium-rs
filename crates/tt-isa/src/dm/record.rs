@@ -57,6 +57,29 @@ pub const READ_RUN: u32 = 0x15;
 /// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
 /// tile `first + n` of `X`, row-major. What a kernel's packer wrote goes back.
 pub const WRITE_RUN: u32 = 0x16;
+/// The write half of [`FILL_PAD`], on the writer: `[PAD_WRITE, value, first,
+/// count, rows, cols, stage, rt]` + `A`, the same header and tensor. Each edge
+/// tile `first..first + count`, as [`FILL_PAD`] numbers them, goes from its
+/// slot at `stage` (the reader filled it) back to its place in `A`.
+pub const PAD_WRITE: u32 = 0x17;
+
+/// Does a record's expansion read GDDR (so B runs it) or write it (so NC
+/// does)? `None` for a plain entry.
+pub const fn direction(op: u32) -> Option<Direction> {
+    match op {
+        GATHER | READ_RUN | FILL_PAD => Some(Direction::Read),
+        SCATTER | WRITE_RUN | PAD_WRITE => Some(Direction::Write),
+        _ => None,
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Direction {
+    /// GDDR to L1: RISCV B's.
+    Read,
+    /// L1 to GDDR: RISCV NC's.
+    Write,
+}
 
 /// Most tiles a record may name along any one of its loops: far more than any
 /// list holds, and few enough that a corrupt record cannot keep the mover busy
@@ -67,7 +90,7 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 pub const fn len(op: u32) -> usize {
     match op {
         GATHER => 5,
-        SCATTER | FILL_PAD | READ_RUN | WRITE_RUN => 3,
+        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN => 3,
         _ => 1,
     }
 }
@@ -199,13 +222,41 @@ fn extent(v: u32) -> Result<u32, u32> {
 /// The entries are what `tt_kernels::tensor`'s list builders produced before
 /// records existed, with an [`op::WAIT`] wherever one of their lists ended
 /// inside a job: exactly the list the session used to send.
-pub fn expand(
+pub fn expand(rec: &[[u32; 8]], emit: impl FnMut([u32; 8]) -> Result<(), u32>) -> Result<(), u32> {
+    expand_for::<true, true>(rec, emit)
+}
+
+/// [`expand`] of the reading records only ([`Direction::Read`]): what RISCV
+/// B's firmware calls, so the writing records' code is not in its image. A
+/// writing record is [`super::error::DIRECTION`].
+pub fn expand_reads(
+    rec: &[[u32; 8]],
+    emit: impl FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    expand_for::<true, false>(rec, emit)
+}
+
+/// [`expand`] of the writing records only: what RISCV NC's firmware calls.
+pub fn expand_writes(
+    rec: &[[u32; 8]],
+    emit: impl FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    expand_for::<false, true>(rec, emit)
+}
+
+#[inline(always)]
+fn expand_for<const READS: bool, const WRITES: bool>(
     rec: &[[u32; 8]],
     mut emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
     let h = rec[0];
     if rec.len() != len(h[0]) || !is_record(h[0]) {
         return Err(super::error::OP);
+    }
+    match direction(h[0]) {
+        Some(Direction::Read) if !READS => return Err(super::error::DIRECTION),
+        Some(Direction::Write) if !WRITES => return Err(super::error::DIRECTION),
+        _ => {}
     }
     match h[0] {
         GATHER => {
@@ -288,7 +339,7 @@ pub fn expand(
             let [_, first, count, at, flags, grid_ct, grid_rt, _] = h;
             let count = extent(count)?;
             let x = tensor(rec, 1)?;
-            let read = h[0] == READ_RUN;
+            let read = READS && (!WRITES || h[0] == READ_RUN);
             let (row, col) = (read && flags & 1 != 0, read && flags & 2 != 0);
             // The grid the run counts over: the output's for a broadcast, the
             // tensor's own otherwise (and for every older record, whose word
@@ -358,49 +409,61 @@ pub fn expand(
                 })?;
             }
         }
-        FILL_PAD => {
-            let [_, value, first, count, rows, cols, stage, rt] = h;
-            let (count, rt) = (extent(count)?, extent(rt)?);
-            let a = tensor(rec, 1)?;
-            if a.ct == 0 || rows > 31 || cols > 31 {
-                return Err(super::error::LENGTH);
-            }
-            let (ragged_r, ragged_c) = (rows != 0, cols != 0);
-            let along_row = if ragged_r { a.ct } else { 0 };
-            let down_col = if ragged_c {
-                rt - u32::from(ragged_r)
-            } else {
-                0
-            };
-            if first + count > along_row + down_col {
-                return Err(super::error::LENGTH);
-            }
-            for n in 0..count {
-                let e = first + n;
-                let (i, j) = if e < along_row {
-                    (rt - 1, e)
-                } else {
-                    (e - along_row, a.ct - 1)
-                };
-                let (ch, off) = a.tile(i, j)?;
-                let at = stage + n * TILE_SLOT as u32;
-                emit([op::READ, ch, n % PORTS, off, at, TILE_SLOT as u32, 0, 0])?;
-                let vr = if i == rt - 1 { rows } else { 0 };
-                let vc = if j == a.ct - 1 { cols } else { 0 };
-                emit([op::FILL, value, vr | vc << 8, at, 0, 0, 0, 0])?;
-                emit([
-                    op::WRITE,
-                    ch,
-                    n % PORTS,
-                    off + TILE_DATA as u32,
-                    at + TILE_DATA as u32,
-                    4096,
-                    0,
-                    0,
-                ])?;
-            }
-        }
+        FILL_PAD => pad::<false>(rec, &mut emit)?,
+        PAD_WRITE => pad::<true>(rec, &mut emit)?,
         _ => return Err(super::error::OP),
+    }
+    Ok(())
+}
+
+/// [`FILL_PAD`]'s edge tiles (`WRITE` false: each read into its slot and
+/// filled) or [`PAD_WRITE`]'s (`WRITE` true: each written back from it).
+fn pad<const WRITE: bool>(
+    rec: &[[u32; 8]],
+    emit: &mut impl FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    let [_, value, first, count, rows, cols, stage, rt] = rec[0];
+    let (count, rt) = (extent(count)?, extent(rt)?);
+    let a = tensor(rec, 1)?;
+    if a.ct == 0 || rows > 31 || cols > 31 {
+        return Err(super::error::LENGTH);
+    }
+    let (ragged_r, ragged_c) = (rows != 0, cols != 0);
+    let along_row = if ragged_r { a.ct } else { 0 };
+    let down_col = if ragged_c {
+        rt - u32::from(ragged_r)
+    } else {
+        0
+    };
+    if first + count > along_row + down_col {
+        return Err(super::error::LENGTH);
+    }
+    for n in 0..count {
+        let e = first + n;
+        let (i, j) = if e < along_row {
+            (rt - 1, e)
+        } else {
+            (e - along_row, a.ct - 1)
+        };
+        let (ch, off) = a.tile(i, j)?;
+        let at = stage + n * TILE_SLOT as u32;
+        if WRITE {
+            emit([
+                op::WRITE,
+                ch,
+                n % PORTS,
+                off + TILE_DATA as u32,
+                at + TILE_DATA as u32,
+                4096,
+                0,
+                0,
+            ])?;
+        } else {
+            emit([op::READ, ch, n % PORTS, off, at, TILE_SLOT as u32, 0, 0])?;
+            let vr = if i == rt - 1 { rows } else { 0 };
+            let vc = if j == a.ct - 1 { cols } else { 0 };
+            emit([op::FILL, value, vr | vc << 8, at, 0, 0, 0, 0])?;
+        }
     }
     Ok(())
 }

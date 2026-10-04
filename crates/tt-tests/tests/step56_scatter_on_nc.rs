@@ -1,15 +1,15 @@
-//! Checklist 9.15, the reader / writer split: with
-//! `Session::set_scatter_mover`, a pipelined group's outputs are written out
-//! by the tile's RISCV NC while B gathers and runs the kernels, the two
-//! ordered by `SIGNAL` / `WAIT_PEER`. The claims:
+//! Fixed reader/writer ownership: B gathers, the resident roles compute,
+//! and NC writes outputs under buffer credits. The claims:
 //!
-//! * a pipelined matmul, element-wise op and reduction give B-only's bits, on
-//!   one tile and on two, with ops queued back to back (nothing synced
+//! * a pipelined matmul, element-wise op and reduction give burn-flex's bits,
+//!   on one tile and on two, with ops queued back to back (nothing synced
 //!   between them, so one op's NC scatters and the next op's B gathers are in
-//!   flight together);
-//! * it switches off and on again mid-session, B's and NC's progress counts
-//!   carrying on.
+//!   flight together) -- small-integer operands, so every product and sum is
+//!   exact and the host is the oracle, not another device schedule;
+//! * overlap switches off and on mid-session without changing NC ownership.
 
+use burn::tensor::{Tensor, TensorData};
+use burn_flex::{Flex, FlexDevice};
 use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
@@ -18,16 +18,22 @@ use tt_kernels::tensor::{DramTensor, Eltwise};
 use tt_tests::harness::BUDGET;
 use tt_ttsim::fork_scope;
 
-fn floats(seed: u64, n: usize) -> Vec<f32> {
-    let mut s = seed | 1;
+/// Integers in `-7..=7`: the 512-term products stay under 2^15, exact in TF32
+/// and FP32 alike.
+fn ints(seed: usize, n: usize) -> Vec<f32> {
     (0..n)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-        })
+        .map(|i| ((i * 17 + seed * 31 + i / 5) % 15) as f32 - 7.0)
         .collect()
+}
+
+/// burn-flex's `a @ b`, doubled, and the doubled product's column maxima.
+fn flex_chain(a: &[f32], b: &[f32], [m, k, n]: [usize; 3]) -> [Vec<f32>; 3] {
+    let tensor = |v: &[f32], r, c| {
+        Tensor::<Flex, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), &FlexDevice)
+    };
+    let product = tensor(a, m, k).matmul(tensor(b, k, n));
+    let doubled = product.clone() * 2.0;
+    [product, doubled.clone(), doubled.max_dim(0)].map(|t| t.into_data().to_vec::<f32>().unwrap())
 }
 
 #[cfg(not(feature = "silicon"))]
@@ -42,7 +48,8 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
             |_, _| Ok(None),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");
@@ -58,7 +65,8 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
             TileChoice::Count(n),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");
@@ -105,18 +113,21 @@ fn chain<T: tt_device::Transport>(
 }
 
 #[test]
-fn scatters_on_nc_are_b_onlys_bits() {
+fn fixed_nc_ownership_matches_flex() {
     for units in [1usize, 2] {
         with_tiles(units, |s| {
             // 1024 x 512 @ 512 x 1024: a pipelined matmul on both tile
             // counts, and its 1024-tile product enough for the add and the
             // max to pipeline too.
             let (m, k, n) = (1024, 512, 1024);
-            let a = s.upload(&floats(1, m * k), m, k).unwrap();
-            let b = s.upload(&floats(2, k * n), k, n).unwrap();
-            let want = chain(s, &a, &b);
+            let (av, bv) = (ints(1, m * k), ints(2, k * n));
+            let a = s.upload(&av, m, k).unwrap();
+            let b = s.upload(&bv, k, n).unwrap();
+            let want = flex_chain(&av, &bv, [m, k, n]);
+            s.set_pipeline(false);
+            assert!(chain(s, &a, &b) == want, "{units} tiles: serialized");
             for round in 0..2 {
-                s.set_scatter_mover(Some(tt_firmware_images::DM_NC.1));
+                s.set_pipeline(true);
                 let before = s.pipelined_blocks();
                 let got = chain(s, &a, &b);
                 let overlapped = s.pipelined_blocks() - before;
@@ -134,12 +145,11 @@ fn scatters_on_nc_are_b_onlys_bits() {
                 println!(
                     "{units} tiles, round {round}: {overlapped} blocks, NC scattering, bits equal"
                 );
-                // B alone between rounds: NC idles, and its count carries on.
-                s.set_scatter_mover(None);
+                s.set_pipeline(false);
                 let again = chain(s, &a, &b);
                 assert!(
                     again == want,
-                    "{units} tiles, round {round}: B alone after NC"
+                    "{units} tiles, round {round}: serialized ownership after overlap"
                 );
             }
             s.free(a).unwrap();

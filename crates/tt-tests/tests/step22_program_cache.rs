@@ -49,7 +49,8 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
             |_, _| Ok(None),
         )
         .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         // These gates count programs and bytes for the plain path's block
         // shapes; a pipelined matmul (the default) stages each shape twice,
         // once per half (`step54_pipeline`).
@@ -69,7 +70,8 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
             TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         // These gates count programs and bytes for the plain path's block
         // shapes; a pipelined matmul (the default) stages each shape twice,
         // once per half (`step54_pipeline`).
@@ -160,7 +162,11 @@ fn a_matmul_of_two_block_shapes_is_one_list_and_then_no_uploads() {
         let mkn = [512, 512, 512];
         let (lists, first) = checked_matmul(s, mkn, Fidelity::HiFi4, 1);
         assert_eq!(lists, 1, "one list for every block, of both shapes");
-        assert_eq!(first.misses, 4 * 3, "four shapes, three roles each");
+        assert_eq!(
+            first.misses,
+            4 * 3 + 3,
+            "four shapes, three roles each, plus three ownership scripts"
+        );
         assert!(first.bytes_uploaded > 0);
         let (lists, again) = checked_matmul(s, mkn, Fidelity::HiFi4, 1);
         assert_eq!(lists, 1);

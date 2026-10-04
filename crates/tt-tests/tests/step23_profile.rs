@@ -42,7 +42,8 @@ fn profiling_is_refused_on_the_simulator_and_the_session_carries_on() {
             |_, _| Ok(None),
         )
         .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         let err = s.profile_start().expect_err("ttsim has no event stream");
         assert!(err.to_string().contains("row 54"), "{err}");
         assert!(s.profile_stop().is_err(), "nothing was started");
@@ -72,7 +73,8 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
             TileChoice::Count(n),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         f(&mut s);
     }) {
         panic!("{e}");
@@ -81,7 +83,7 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
 
 #[cfg(feature = "silicon")]
 #[test]
-fn a_profile_brackets_every_entry_and_nests_every_kernel() {
+fn a_profile_brackets_every_entry_and_accounts_for_streaming_roles() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     use tt_kernels::profile::Span;
     with_tiles(2, |s| {
@@ -151,8 +153,16 @@ fn a_profile_brackets_every_entry_and_nests_every_kernel() {
                 .iter()
                 .filter(|s| s.track != "mover" && s.name == "program")
                 .count();
-            let ks = spans.iter().filter(|s| s.name == "kernel").count();
-            assert_eq!(roles, 3 * ks, "every role run belongs to a KERNEL entry");
+            let launches = spans
+                .iter()
+                .filter(|span| span.name == "kernel" || span.name == "launch")
+                .count();
+            kernels += spans.iter().filter(|span| span.name == "launch").count();
+            assert_eq!(
+                roles,
+                3 * launches,
+                "three role runs per region/control launch"
+            );
         }
         assert!(kernels > 0, "the matmul ran kernels");
         // On the mover (an `ELTWISE` record) or the SFPU (a `READ_RUN`, its

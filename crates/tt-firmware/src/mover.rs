@@ -9,7 +9,7 @@ use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
 
-const TXN: TxnId = match TxnId::new(2) {
+const TXN: TxnId = match TxnId::new(if IS_NC { 4 } else { 2 }) {
     Some(t) => t,
     None => panic!(),
 };
@@ -32,10 +32,27 @@ fn wr(addr: u64, v: u32) {
     unsafe { l1_write32(addr, v) }
 }
 
+/// Whether this image is RISCV NC's. B is a reader and NC the writer
+/// (`dm::Mover::permits`): the write path, and with it every use of NoC #1
+/// for writes, is compiled into NC's image alone.
+const IS_NC: bool = matches!(M.core, tt_isa::tensix::Core::NC);
+
+/// The entry the other direction would run, which this mover refuses
+/// (`Mover::permits`, which the host checks lists against too): NC runs
+/// writes, waits and credits only, B everything but GDDR writes. Const, so
+/// each image drops the other's arms.
+const fn reader_only() -> Result<(), u32> {
+    if IS_NC {
+        Err(dm::error::DIRECTION)
+    } else {
+        Ok(())
+    }
+}
+
 /// Where writes go out, and this tile's coordinate as NoC #1 names it: set
 /// per list by [`list_settings`], read per write. With `alternate`, `niu`
-/// flips after each write entry (`dm::write_noc::ALTERNATE`). In local data
-/// RAM, as the `noc` module's state is.
+/// flips after each write entry (`dm::write_noc::ALTERNATE`). NC's only, as
+/// its writes are. In local data RAM, as the `noc` module's state is.
 #[derive(Copy, Clone)]
 struct Writes {
     niu: Niu,
@@ -58,20 +75,27 @@ fn writes() -> &'static mut Writes {
 /// Issue one descriptor's bytes as NIU requests of at most 16 KiB, without
 /// waiting for them. Every request's range is a sub-range of the checked
 /// descriptor, so it is inside the channel and inside L1, with the congruence
-/// preserved. Reads go out on NoC #0, writes on the NIU the host chose
-/// (`M.at(dm::WRITE_NOC)`), each through the port of its channel that NIU owns
-/// nearest the one asked for (`DramChannel::port_for`).
+/// preserved. Reads go out on NoC #0; writes on NoC #0 from B, and from NC on
+/// the NIU the host chose (`M.at(dm::WRITE_NOC)`), each through the port of
+/// its channel that NIU owns nearest the one asked for
+/// (`DramChannel::port_for`).
 #[link_section = ".text.hot"]
 fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
-    if d.op == op::READ {
+    if !IS_NC && d.op == op::READ {
         let port = d.range.channel().port_for(Niu::Noc0, d.port);
         return issue_via::<false>(me, d, port);
     }
-    issue_write(me, d)
+    // B only reads and NC only writes (`Mover::permits`): the write path is
+    // NC's alone, and NC has no read path.
+    if IS_NC && d.op != op::READ {
+        issue_write(me, d)
+    } else {
+        Err(dm::error::DIRECTION)
+    }
 }
 
-/// [`issue`]'s writes: through the NIU the host chose, out of the read path
-/// (`.text.warm`: after the hot code and both NIUs' issue, `sections.x`).
+/// [`issue`]'s writes, NC's: through the NIU the host chose, out of the read
+/// path (`.text.warm`: after the hot code and both NIUs' issue, `sections.x`).
 #[link_section = ".text.warm"]
 #[inline(never)]
 fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
@@ -98,15 +122,20 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
     let mv = DramMove::new(d.range, port, d.l1, d.op != op::READ, me, TXN, niu)
         .map_err(|_| dm::error::ALIGNMENT)?;
     for r in mv.words() {
-        noc::issue_dram_on::<NOC1>(r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN);
+        noc::issue_dram_on::<NOC1>(
+            r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
+        );
     }
     Ok(())
 }
 
-/// What the host may change between lists: the in-flight cap and the NIU the
-/// writes go out on.
+/// What the host may change between lists: the in-flight cap and, on NC, the
+/// NIU the writes go out on.
 fn list_settings() {
     noc::set_cap(TXN, rd(M.at(dm::IN_FLIGHT_CAP)));
+    if !IS_NC {
+        return;
+    }
     let mode = rd(M.at(dm::WRITE_NOC));
     let w = writes();
     w.niu = if mode == dm::write_noc::NOC1 {
@@ -361,10 +390,41 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
+        Entry::Buffer {
+            stream,
+            action,
+            capacity,
+        } => {
+            use tt_isa::dataflow::{Action, Endpoint};
+            let (endpoint, actor) = if M == dm::Mover::B {
+                (Endpoint::Reader, 0)
+            } else {
+                (Endpoint::Writer, 4)
+            };
+            if matches!(action, Action::Push | Action::Pop) {
+                noc::wait(TXN);
+                publish();
+            }
+            tt_firmware::dataflow::buffer(stream, action, capacity, endpoint, actor)?;
+        }
+        Entry::Released { target, which } => {
+            reader_only()?;
+            tt_firmware::dataflow::released(target, which)?;
+        }
+        Entry::PairCall {
+            reader,
+            writer,
+            capacity,
+        } => {
+            reader_only()?;
+            let generation_base = unsafe { CALL_BASE };
+            pair_call(me, usable, reader, writer, capacity, generation_base)?;
+        }
         Entry::Move {
             descriptor,
             transform: transform @ (Transform::Transpose | Transform::BroadcastCol0),
         } => {
+            reader_only()?;
             // Everything before it has landed, and the scratch is free.
             noc::wait(TXN);
             run(
@@ -388,6 +448,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             generation,
             programs,
         } => {
+            reader_only()?;
             // The operands it computes on must have landed.
             noc::wait(TXN);
             publish();
@@ -398,37 +459,49 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             publish();
         }
         Entry::Barrier { target, x, y } => {
+            reader_only()?;
             // Everything this unit moved before it has landed.
             noc::wait(TXN);
             publish();
             barrier(me, target, x, y)?;
         }
         Entry::Poke { address, value } => {
+            reader_only()?;
             // The roles read the word only once a later `KERNEL` posts their
             // generation.
             wr(address as u64, value);
             publish();
         }
-        // Only as a list of its own, which `run_list_at` runs.
-        Entry::Call { .. } => return Err(IS_CALL),
+        // Only as a list of its own, which `run_list_at` runs (B's).
+        Entry::Call { .. } => {
+            reader_only()?;
+            return Err(IS_CALL);
+        }
         Entry::Launch {
             generation,
             programs,
         } => {
+            reader_only()?;
             // The operands it computes on must have landed, and anything
             // still being written out of the slots it computes into.
             noc::wait(TXN);
             publish();
             launch(generation, programs);
         }
-        Entry::KernelWait { generation } => await_roles(generation)?,
+        Entry::KernelWait { generation } => {
+            reader_only()?;
+            await_roles(generation)?
+        }
         Entry::Host {
             write,
             host_lo,
             host_hi,
             l1,
             len,
-        } => host_move(me, write, host_lo, host_hi, l1, len),
+        } => {
+            reader_only()?;
+            host_move(me, write, host_lo, host_hi, l1, len)
+        }
         Entry::Tilize {
             tilize,
             block,
@@ -436,6 +509,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             slot,
             valid,
         } => {
+            reader_only()?;
             // The side it reads may still be arriving.
             noc::wait(TXN);
             publish();
@@ -443,9 +517,8 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             // Visible in L1 before anything else reads it.
             publish();
         }
-        Entry::Signal => signal(),
-        Entry::WaitPeer { peer, target } => wait_peer(peer, target)?,
         Entry::Fill { value, param, dst } => {
+            reader_only()?;
             // The tile it fills may still be arriving.
             noc::wait(TXN);
             publish();
@@ -548,34 +621,6 @@ fn host_move(me: (u8, u8), write: bool, host_lo: u32, host_hi: u32, l1: u32, len
     }
 }
 
-/// `dm::op::SIGNAL`: once everything before it has landed, one more on this
-/// mover's progress word, where the tile's other mover reads it.
-#[inline(never)]
-fn signal() {
-    noc::wait(TXN);
-    publish();
-    wr(M.at(dm::PROGRESS), rd(M.at(dm::PROGRESS)).wrapping_add(1));
-    publish();
-}
-
-/// `dm::op::WAIT_PEER`: spin until `peer`'s progress reaches `target`, or
-/// fail with `dm::error::PEER` if `peer`'s queue has stopped on an error.
-/// Every read through a fence: the peer's stores do not invalidate this core's
-/// L0 data cache.
-#[inline(never)]
-fn wait_peer(peer: dm::Peer, target: u32) -> Result<(), u32> {
-    let peer = peer.mover();
-    loop {
-        publish();
-        if (rd(peer.at(dm::PROGRESS)).wrapping_sub(target) as i32) >= 0 {
-            return Ok(());
-        }
-        if rd(peer.at(dm::QUEUE_ERROR)) != dm::error::NONE {
-            return Err(dm::error::PEER);
-        }
-    }
-}
-
 /// Read list entry `i` of the ring.
 fn entry_at(at: u64) -> [u32; 8] {
     let mut w = [0u32; 8];
@@ -609,7 +654,21 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
     // inlined into `exec`, which costs every entry ~0.04 us
     // (`silicon_perf::mover_read_shapes`).
     let head = entry_at(base);
-    let result = if count == 1 && head[0] == op::CALL {
+    let result = if head[0] == op::PAIR {
+        if M != dm::Mover::B || tt_isa::dataflow::packet_length(head)? != count as usize {
+            return Err(dm::error::LENGTH);
+        }
+        pair_shared(me, usable, base + dm::ENTRY_BYTES, head[1], head[2])?;
+        if head[4] != 0 {
+            let trailer = base + (1 + head[1] as u64 + head[2] as u64) * dm::ENTRY_BYTES;
+            if rd(trailer) != op::BARRIER {
+                return Err(dm::error::OP);
+            }
+            run_entries(me, usable, trailer, head[4])
+        } else {
+            Ok(())
+        }
+    } else if count == 1 && head[0] == op::CALL {
         match exec(me, usable, head) {
             Err(IS_CALL) => call(me, usable, head[1], head[2], head[3], head[4], head[5]),
             r => r,
@@ -628,33 +687,157 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
 /// no `dm::error` code.
 const IS_CALL: u32 = u32::MAX;
 
+static mut CALL_BASE: u32 = 0;
+static mut PAIR_ACTIVE: bool = false;
+static mut TRACE_DEPTH: u32 = 0;
+
+fn begin_pair() -> Result<u32, u32> {
+    if unsafe { PAIR_ACTIVE }
+        || rd(dm::Mover::NC.mailbox + offset::STATUS) != status::RUNNING
+        || rd(dm::Mover::NC.at(dm::SEQ)) != rd(dm::Mover::NC.at(dm::DONE))
+        || rd(dm::Mover::NC.at(dm::QUEUE_HEAD)) != rd(dm::Mover::NC.at(dm::QUEUE_DONE))
+    {
+        return Err(dm::error::PEER);
+    }
+    unsafe {
+        PAIR_ACTIVE = true;
+    }
+    tt_firmware::dataflow::initialize();
+    Ok(rd(dm::Mover::NC.at(dm::DONE)).wrapping_add(1).max(1))
+}
+
+fn finish_pair(sequence: u32, result: Result<(), u32>) -> Result<(), u32> {
+    let mut poll = tt_firmware::dataflow::Poll::new();
+    let result = result.and_then(|()| loop {
+        poll.tick()?;
+        if rd(dm::Mover::NC.at(dm::DONE)) == sequence {
+            let error = rd(dm::Mover::NC.at(dm::ERROR));
+            return if error == 0 { Ok(()) } else { Err(error) };
+        }
+    });
+    if let Err(code) = result {
+        tt_firmware::dataflow::abort_with(code);
+        // NC reads this packet's writer entries out of B's ring and may still
+        // be writing GDDR: B's slot is not reported done under it. NC stops at
+        // its next credit wait, which sees the abort. Bounded (about 60 ms),
+        // since NC may be what hung; the host resets the tile after any
+        // failed region either way.
+        let mut spins = 0u32;
+        while rd(dm::Mover::NC.at(dm::DONE)) != sequence && spins < 1 << 22 {
+            publish();
+            spins += 1;
+        }
+    }
+    unsafe {
+        PAIR_ACTIVE = false;
+    }
+    result
+}
+
+#[cold]
+fn pair_shared(
+    me: (u8, u8),
+    usable: u32,
+    reader: u64,
+    reader_count: u32,
+    writer_count: u32,
+) -> Result<(), u32> {
+    let sequence = begin_pair()?;
+    let peer = dm::Mover::NC;
+    wr(peer.at(dm::OP), op::SHARED);
+    wr(
+        peer.at(dm::L1_ADDR),
+        (reader + reader_count as u64 * dm::ENTRY_BYTES) as u32,
+    );
+    wr(peer.at(dm::LEN), writer_count);
+    publish();
+    wr(peer.at(dm::SEQ), sequence);
+    publish();
+    let result = run_entries(me, usable, reader, reader_count);
+    finish_pair(sequence, result)
+}
+
+#[cold]
+fn pair_call(
+    me: (u8, u8),
+    usable: u32,
+    reader: [u32; 3],
+    writer: [u32; 3],
+    _capacity: u16,
+    generation_base: u32,
+) -> Result<(), u32> {
+    let sequence = begin_pair()?;
+    let peer = dm::Mover::NC;
+    wr(peer.at(dm::OP), op::CALL);
+    wr(peer.at(dm::CHANNEL), writer[0]);
+    wr(peer.at(dm::DRAM_OFFSET), writer[1]);
+    wr(peer.at(dm::LEN), writer[2]);
+    publish();
+    wr(peer.at(dm::SEQ), sequence);
+    publish();
+    let result = call(
+        me,
+        usable,
+        reader[0],
+        reader[1],
+        reader[2],
+        generation_base,
+        0,
+    );
+    finish_pair(sequence, result)
+}
+
 /// The `count` entries at `base` in L1, in order: a list's, or a trace chunk's
 /// ([`call`]).
 #[link_section = ".text.hot"]
+#[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
     let traced = rd(M.at(dm::TRACE)) != 0;
-    trace(traced, ev::LIST_BEGIN, count);
-    let at = |i: u64| entry_at(base + i * dm::ENTRY_BYTES);
-    let mut i = 0u64;
-    while i < count as u64 {
-        let head = at(i);
-        let n = record::len(head[0]) as u64;
-        trace(traced, ev::ENTRY_BEGIN, head[0]);
-        if n == 1 {
-            exec(me, usable, head)?;
-        } else {
-            if i + n > count as u64 {
-                return Err(dm::error::LENGTH);
-            }
-            run_record(me, usable, base + i * dm::ENTRY_BYTES, n as usize)?;
+    let outer = traced && unsafe { TRACE_DEPTH == 0 };
+    if traced {
+        unsafe {
+            TRACE_DEPTH += 1;
         }
-        trace(traced, ev::ENTRY_END, head[0]);
-        i += n;
     }
-    noc::wait(TXN);
-    trace(traced, ev::LIST_END, count);
-    Ok(())
+    trace(outer, ev::LIST_BEGIN, count);
+    let result = (|| {
+        let at = |i: u64| entry_at(base + i * dm::ENTRY_BYTES);
+        let mut i = 0u64;
+        while i < count as u64 {
+            let head = at(i);
+            let n = record::len(head[0]) as u64;
+            let entry_traced = traced && head[0] != op::PAIR_CALL;
+            trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
+            if n == 1 {
+                if let Err(code) = exec(me, usable, head) {
+                    wr(M.mailbox + offset::RESULT, head[0]);
+                    return Err(code);
+                }
+            } else {
+                if i + n > count as u64 {
+                    return Err(dm::error::LENGTH);
+                }
+                if let Err(code) = run_record(me, usable, base + i * dm::ENTRY_BYTES, n as usize) {
+                    wr(M.mailbox + offset::RESULT, head[0]);
+                    return Err(code);
+                }
+            }
+            trace(entry_traced, ev::ENTRY_END, head[0]);
+            i += n;
+        }
+        noc::wait(TXN);
+        Ok(())
+    })();
+    if traced {
+        unsafe {
+            TRACE_DEPTH -= 1;
+        }
+    }
+    if result.is_ok() {
+        trace(outer, ev::LIST_END, count);
+    }
+    result
 }
 
 /// One entry of an expanded record: a plain read or write straight to the
@@ -667,7 +850,10 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
 #[inline(never)]
 fn record_entry(me: (u8, u8), usable: u32, e: [u32; 8]) -> Result<(), u32> {
     if e[0] == op::READ || e[0] == op::WRITE {
-        issue(me, Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5])?)
+        issue(
+            me,
+            Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5])?,
+        )
     } else {
         exec(me, usable, e)
     }
@@ -682,7 +868,13 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     for (k, e) in rec[..n].iter_mut().enumerate() {
         *e = entry_at(at + k as u64 * dm::ENTRY_BYTES);
     }
-    record::expand(&rec[..n], |e| record_entry(me, usable, e))
+    // Each mover expands its own direction's records, so the other's code is
+    // not in its image.
+    if IS_NC {
+        record::expand_writes(&rec[..n], |e| record_entry(me, usable, e))
+    } else {
+        record::expand_reads(&rec[..n], |e| record_entry(me, usable, e))
+    }
 }
 
 /// [`dm::op::CALL`]: a trace's entries from GDDR, a chunk at a time into
@@ -703,6 +895,11 @@ fn call(
     barrier_base: u32,
 ) -> Result<(), u32> {
     let mut done = 0u32;
+    let chunk = if M == dm::Mover::B && !unsafe { PAIR_ACTIVE } {
+        tt_isa::dataflow::OUTER_CHUNK
+    } else {
+        M.trace_chunk
+    };
     while done < count {
         let n = (count - done).min(dm::TRACE_CHUNK_ENTRIES);
         let read = [
@@ -710,18 +907,28 @@ fn call(
             channel,
             0,
             offset + done * dm::ENTRY_BYTES as u32,
-            M.trace_chunk as u32,
+            chunk as u32,
             n * dm::ENTRY_BYTES as u32,
             0,
             0,
         ];
-        exec(me, usable, read)?;
+        if IS_NC {
+            let descriptor =
+                Descriptor::decode(usable, read[0], read[1], read[2], read[3], read[4], read[5])?;
+            issue_via::<true>(
+                noc::me(Niu::Noc1),
+                descriptor,
+                descriptor.range.channel().port_for(Niu::Noc1, 0),
+            )?;
+        } else {
+            exec(me, usable, read)?;
+        }
         noc::wait(TXN);
         // The chunk is in L1, written by the NoC past the L0 cache.
         publish();
         let mut i = 0u32;
         while i < n {
-            let a = M.trace_chunk + i as u64 * dm::ENTRY_BYTES;
+            let a = chunk + i as u64 * dm::ENTRY_BYTES;
             let head = rd(a);
             let base = match head {
                 op::KERNEL | op::LAUNCH | op::KERNEL_WAIT => generation_base,
@@ -738,7 +945,15 @@ fn call(
             return Err(dm::error::LENGTH);
         }
         publish();
-        run_entries(me, usable, M.trace_chunk, n)?;
+        let previous = unsafe { CALL_BASE };
+        unsafe {
+            CALL_BASE = generation_base;
+        }
+        let result = run_entries(me, usable, chunk, n);
+        unsafe {
+            CALL_BASE = previous;
+        }
+        result?;
         done += n;
     }
     Ok(())
@@ -749,11 +964,13 @@ pub extern "Rust" fn firmware_main() -> ! {
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
     // Local data RAM is not zeroed on the simulator (divergence row 25).
     *launched() = 0;
-    *writes() = Writes {
-        niu: Niu::Noc0,
-        alternate: false,
-        me1: noc::me(Niu::Noc1),
-    };
+    if IS_NC {
+        *writes() = Writes {
+            niu: Niu::Noc0,
+            alternate: false,
+            me1: noc::me(Niu::Noc1),
+        };
+    }
     let usable = rd(M.at(dm::USABLE));
     let mut beat: u32 = 0;
     noc::set_clock(wall_clock);
@@ -791,7 +1008,31 @@ pub extern "Rust" fn firmware_main() -> ! {
             continue;
         }
         list_settings();
-        let result = if rd(M.at(dm::OP)) == op::LIST {
+        let result = if rd(M.at(dm::OP)) == op::SHARED && M == dm::Mover::NC {
+            let address = rd(M.at(dm::L1_ADDR)) as u64;
+            let count = rd(M.at(dm::LEN));
+            if count == 0
+                || count > dm::LIST_MAX
+                || address % dm::ENTRY_BYTES != 0
+                || address < dm::LIST
+                || address + count as u64 * dm::ENTRY_BYTES
+                    > dm::LIST + dm::LIST_MAX as u64 * dm::ENTRY_BYTES
+            {
+                Err(dm::error::RANGE)
+            } else {
+                run_entries(me, usable, address, count)
+            }
+        } else if rd(M.at(dm::OP)) == op::CALL && M == dm::Mover::NC {
+            call(
+                me,
+                usable,
+                rd(M.at(dm::CHANNEL)),
+                rd(M.at(dm::DRAM_OFFSET)),
+                rd(M.at(dm::LEN)),
+                0,
+                0,
+            )
+        } else if rd(M.at(dm::OP)) == op::LIST {
             run_list(me, usable, rd(M.at(dm::LEN)))
         } else {
             Descriptor::decode(
@@ -806,6 +1047,11 @@ pub extern "Rust" fn firmware_main() -> ! {
             .and_then(|d| run(me, d))
         };
         publish_stalls(&mut stalls, rd(M.at(dm::TRACE)) != 0);
+        if let Err(code) = result {
+            if matches!(rd(M.at(dm::OP)), op::SHARED | op::CALL) {
+                tt_firmware::dataflow::abort_with(code);
+            }
+        }
         wr(M.at(dm::ERROR), result.err().unwrap_or(dm::error::NONE));
         // The data is in L1 (a read) or acknowledged by the DRAM tile (a write,
         // response-marked) before DONE is published.

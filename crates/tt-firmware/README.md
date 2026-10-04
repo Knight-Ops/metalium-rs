@@ -11,7 +11,13 @@ by hand.
 | Binary | Core | Link script | Purpose |
 |---|---|---|---|
 | `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link.x`, `link_t1.x`, `link_t2.x` | The unpack / math / pack role runners. Each at its core's default reset PC, so all three sit in one tile's L1. Resident in a `Session`. |
-| `dm_b` | B | `link_b.x` | The data mover (`tt_isa::dm`): GDDR to and from L1, list entries, op records expanded on the tile, padding fills, `KERNEL` entries that point the resident roles at their programs and run them. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
+| `dm_b` | B | `link_b.x` | The reader (`tt_isa::dm`): GDDR to L1, list entries, reading op records expanded on the tile, padding fills, tilizes, PCIe moves, barriers, `KERNEL` entries that point the resident roles at their programs and run them, and the shared packets that start NC. It never writes GDDR. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
+| `dm_nc` | NC | `link_nc.x` | The writer, loaded above the data arena via NC's reset stub: L1 to GDDR on NoC1, writing op records expanded on the tile, and the credits that order them. It runs no read, kernel launch, barrier or PCIe move. |
+
+`dm_b` and `dm_nc` are one source (`src/mover.rs`) compiled twice with a const `M`;
+`tt_isa::dm::Mover::permits` is the table of which entries each runs, refused with
+`error::DIRECTION` by the host before a list is sent and by the tile if one gets
+there anyway. Each image's other direction is compiled out. |
 | `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::eth::mover`). |
 | `corpus` / `corpus_t0` | T1 / T0 | `link.x` | Generic single-thread program runner (T1 for ttsim, T0 for silicon). |
 
@@ -26,6 +32,18 @@ silicon, so a field left unwritten is the previous process's.
 mailbox); `src/corpus.rs` is the shared body of the program runners. `build.rs`
 picks each binary's link script and passes the mailbox base from `tt-isa` as a
 `--defsym`.
+
+`Session::enable_dram(b, nc)` enables GDDR and resident streaming ownership. B receives
+one shared reader/writer packet, starts NC locally, and launches the three roles
+once per compatible region (a standalone transfer is a packet with no roles: B
+reads, NC writes). Tagged role scripts reuse the existing arithmetic
+bodies and loops. Input/output credits are released after backend retirement and
+DRAM acknowledgment, respectively; B completion joins the entire region. Traces
+retain both mover streams and all referenced programs. See
+[ownership and rollout](../../docs/feature-streaming-dataflow-ownership.md).
+This is the only GDDR compute scheduler. `set_pipeline(false)` serializes buffer
+reuse without changing ownership. Downloads and control lists run on B alone;
+low-level diagnostic movers remain available, each limited to its direction.
 
 ## Build by hand
 

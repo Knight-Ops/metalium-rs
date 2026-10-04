@@ -56,7 +56,8 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
             |_, _| Ok(None),
         )
         .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         f(&mut s);
     }) {
         panic!("{e}");
@@ -72,7 +73,8 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
             TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         f(&mut s);
     }) {
         panic!("{e}");

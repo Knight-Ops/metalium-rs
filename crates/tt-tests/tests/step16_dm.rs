@@ -71,12 +71,17 @@ fn dram_reaches_l1_through_every_channel_and_port() {
     });
 }
 
+/// GDDR writes are RISCV NC's: B only reads.
 #[test]
 fn l1_reaches_dram_through_every_channel() {
-    with_mover(|d, m, dram| {
+    in_device(|d| {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
-        let t = m.tile();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+        let mut m =
+            DataMover::start_on(d, &w, t, &dram, dm::Mover::NC, tt_firmware_images::DM_NC.1)
+                .unwrap();
         for ch in dram.channels() {
             let len = 33 * 1024 + 16;
             let data = pattern(len, 0xBEEF ^ ch.index() as u32);
@@ -87,6 +92,50 @@ fn l1_reaches_dram_through_every_channel() {
             d.dram_read(&w4, r, &mut back).unwrap();
             assert!(back == data, "channel {}", ch.index());
         }
+        m.stop(d, &w).unwrap();
+    });
+}
+
+/// B refuses a write on the host and, if one is sent anyway, on the tile.
+#[test]
+fn b_does_not_write_gddr() {
+    with_mover(|d, m, dram| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let t = m.tile();
+        let ch = dram.channel(0).unwrap();
+        let r = ch.range(0x300_0040, 64).unwrap();
+        let before = pattern(64, 9);
+        d.dram_write(&w4, r, &before).unwrap();
+        d.l1_write(&w, t, L1_AT as u64, &pattern(64, 10)).unwrap();
+        let e = m.write(d, &w, L1_AT, r, 0).unwrap_err();
+        assert!(matches!(e, DmError::Invalid(dm::error::DIRECTION)), "{e}");
+        // A raw descriptor the host did not check: the tile answers with the
+        // same code and writes nothing.
+        for (word, v) in [
+            (dm::OP, dm::op::WRITE),
+            (dm::CHANNEL, 0),
+            (dm::PORT, 0),
+            (dm::DRAM_OFFSET, 0x300_0040),
+            (dm::L1_ADDR, L1_AT),
+            (dm::LEN, 64),
+        ] {
+            d.write32(&w, t, word, v).unwrap();
+        }
+        let seq = d.read32(&w, t, dm::DONE).unwrap() + 1;
+        d.write32(&w, t, dm::SEQ, seq).unwrap();
+        let mut polls = 0;
+        while d.read32(&w, t, dm::DONE).unwrap() != seq {
+            d.tick(tt_device::core_control::CYCLES_PER_POLL);
+            polls += 1;
+            assert!(polls < 1_000_000, "the mover did not answer");
+        }
+        assert_eq!(d.read32(&w, t, dm::ERROR).unwrap(), dm::error::DIRECTION);
+        let mut back = vec![0u8; 64];
+        d.dram_read(&w4, r, &mut back).unwrap();
+        assert!(back == before, "B's refused write landed");
+        d.write32(&w, t, dm::SEQ, 0).unwrap();
+        d.write32(&w, t, dm::DONE, 0).unwrap();
     });
 }
 

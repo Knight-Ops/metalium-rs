@@ -346,7 +346,7 @@ fn attach_engine(
         .map_err(|e| EngineError(e.to_string()))?;
         let mut session = session;
         session
-            .enable_dram(tt_firmware_images::DM_B.1)
+            .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .map_err(|e| EngineError(e.to_string()))?;
         serve.serve(&mut Sim {
             session,

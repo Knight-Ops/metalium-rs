@@ -192,7 +192,8 @@ fn one_unit(card: u16) -> (Session<tt_kmd::Kmd>, Conditions) {
         TileChoice::Exactly(gate.0, gate.1),
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+    s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+        .unwrap();
     // `PIPELINE=1`: GDDR matmuls overlap their moves with their kernels
     // (`Session::set_pipeline`, checklist 9.15).
     let pipeline = std::env::var("PIPELINE").is_ok_and(|v| v == "1");
@@ -481,16 +482,9 @@ fn queue_steady_state() {
     }
 }
 
-/// A pipeline sweep's arm: pipelining off and on, or with `SWEEP_NC` set,
-/// pipelined with every move on B ("off") and with the scatters on NC ("on",
-/// `Session::set_scatter_mover`).
+/// Compare serialized and overlapped ownership, with NC as the fixed writer.
 fn sweep_arm(s: &mut Session<tt_kmd::Kmd>, on: bool) {
-    if std::env::var_os("SWEEP_NC").is_some() {
-        s.set_pipeline(true);
-        s.set_scatter_mover(on.then_some(tt_firmware_images::DM_NC.1));
-    } else {
-        s.set_pipeline(on);
-    }
+    s.set_pipeline(on);
 }
 
 /// Whether pipelined matmuls (`Session::set_pipeline`) are ever slower:
@@ -524,7 +518,8 @@ fn matmul_pipeline_sweep() {
             let mut s =
                 Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
                     .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             s.set_profile_roles(false);
             let t = s.tile();
             let c = Conditions::measure(s.device(), card, t);
@@ -581,7 +576,7 @@ fn matmul_pipeline_sweep() {
                     // from the host.
                     // With NC scattering, B's timestamper events come out
                     // garbled (an entry's end repeated): host time instead.
-                    let profiled = m * k * n < 1 << 29 && std::env::var_os("SWEEP_NC").is_none();
+                    let profiled = m * k * n < 1 << 29;
                     overflowed |= !profiled;
                     for _ in 0..REPS {
                         if profiled {
@@ -704,7 +699,8 @@ fn sfpu_pipeline_sweep() {
             let mut s =
                 Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
                     .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             s.set_profile_roles(false);
             let t = s.tile();
             let c = Conditions::measure(s.device(), card, t);
@@ -750,8 +746,7 @@ fn sfpu_pipeline_sweep() {
                         let cache_before = cache(&s);
                         // Past 2048 tiles a profile's events overflow the
                         // timestamper's buffer: time those from the host.
-                        let profiled =
-                            r * cols <= 2048 * 1024 && std::env::var_os("SWEEP_NC").is_none();
+                        let profiled = r * cols <= 2048 * 1024;
                         let (mut device, mut host) = (Vec::new(), Vec::new());
                         let mut overflowed = !profiled;
                         for _ in 0..REPS {
@@ -854,7 +849,8 @@ fn host_time_per_op() {
             let mut s =
                 Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
                     .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             let add = Eltwise {
                 kind: kind::ADD,
                 scalar: 0.0,
@@ -988,7 +984,8 @@ fn trace_replay_vs_fresh() {
             let mut s =
                 Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
                     .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             for (batch, input, hidden, out) in [(64, 784, 128, 10), (512, 1024, 1024, 1024)] {
                 let x = s.upload(&vec![0.5; batch * input], batch, input).unwrap();
                 let w1 = s

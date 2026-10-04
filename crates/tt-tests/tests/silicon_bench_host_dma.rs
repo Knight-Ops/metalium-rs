@@ -154,7 +154,8 @@ fn session_transfers() {
     for tiles in [1usize, 8, 32] {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
             .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         for (rows, cols) in [(64usize, 10usize), (64, 784), (1024, 1024), (8192, 1024)] {
             let v: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
             for (how, dma, at) in [
@@ -222,7 +223,8 @@ fn streamed_steps() {
     for tiles in [1usize, 8] {
         let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(tiles))
             .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
         for (batch, input, hidden) in [(64usize, 784usize, 128usize), (512, 1024, 1024)] {
             let w: Vec<f32> = (0..input * hidden).map(|i| (i % 7) as f32 * 0.01).collect();
             let w = s.upload(&w, input, hidden).unwrap();

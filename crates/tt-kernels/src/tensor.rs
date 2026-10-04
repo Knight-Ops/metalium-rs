@@ -746,8 +746,10 @@ const _: () = assert!(2 * HOST_DMA_BATCH as u64 * TILE_SLOT <= tt_isa::l1::DATA.
 /// download brings whole slots.
 ///
 /// Each unit's tiles go in batches of [`HOST_DMA_BATCH`], alternating
-/// halves of its staging: batch `b + 1` comes in while batch `b` goes out,
-/// a `WAIT` between (the half batch `b + 2` refills was emptied before it).
+/// halves of its staging: batch `b + 1` comes in while batch `b` goes out. An
+/// upload is a [`Step::Transfer`] of depth two (B brings a batch in, NC
+/// writes it, and the half batch `b + 2` refills is free once NC's writes are
+/// acknowledged); a download is a list on B, a `WAIT` between its batches.
 /// The data arena must be free of other work: the lists run behind
 /// everything queued before them on the unit, whose lists end with their
 /// kernels done.
@@ -816,6 +818,22 @@ pub fn host_dma_jobs(
                 .step_by(HOST_DMA_BATCH)
                 .map(|f| (f, HOST_DMA_BATCH.min(run.end - f)))
                 .collect();
+            // An upload is a transfer: B brings a batch in from the host, NC
+            // writes it to GDDR, the halves taking turns.
+            if upload {
+                return vec![Step::Transfer {
+                    what: "host dma upload",
+                    depth: 2,
+                    batches: batches
+                        .iter()
+                        .enumerate()
+                        .map(|(b, &(f, n))| TransferBatch {
+                            read: vec![host_move(f, n, at(b))],
+                            write: dram_run(f, n, at(b)).to_vec(),
+                        })
+                        .collect(),
+                }];
+            }
             // An upload brings a batch in from the host and writes it to
             // GDDR; a download reads it from GDDR and sends it to the host.
             let bring = |b: usize, entries: &mut Vec<[u32; 8]>| {
@@ -904,6 +922,7 @@ pub fn row_major_dma_jobs(
     (0..units)
         .map(|u| {
             let mut entries = Vec::new();
+            let mut batches = Vec::new();
             for &(i, j0, n) in chunks.iter().skip(u).step_by(units) {
                 let valid_rows = (rows - 32 * i).min(32);
                 // A whole band is one host move, its L1 rows `stride` apart;
@@ -970,24 +989,34 @@ pub fn row_major_dma_jobs(
                 };
                 // Each `TILIZE` / `UNTILIZE` waits for every move before it,
                 // so the next chunk's moves into the band and the slots
-                // never overtake this one's out of them.
+                // never overtake this one's out of them. An upload's chunk is
+                // one transfer batch at depth one: B brings the rows in and
+                // tilizes them into the slots, NC writes the slots out, and
+                // only then does B bring the next chunk's rows.
                 if upload {
-                    host_moves(&mut entries);
-                    layout(op::TILIZE, &mut entries);
-                    entries.extend(run(record::WRITE_RUN));
+                    let mut read = Vec::new();
+                    host_moves(&mut read);
+                    layout(op::TILIZE, &mut read);
+                    batches.push(TransferBatch {
+                        read,
+                        write: run(record::WRITE_RUN).to_vec(),
+                    });
                 } else {
                     entries.extend(run(record::READ_RUN));
                     layout(op::UNTILIZE, &mut entries);
                     host_moves(&mut entries);
                 }
             }
+            if upload {
+                return vec![Step::Transfer {
+                    what: "host dma upload, tilized on the card",
+                    depth: 1,
+                    batches,
+                }];
+            }
             entries.push(wait);
             vec![Step::List {
-                what: if upload {
-                    "host dma upload, tilized on the card"
-                } else {
-                    "host dma download, untilized on the card"
-                },
+                what: "host dma download, untilized on the card",
                 entries,
             }]
         })
@@ -1033,7 +1062,36 @@ pub enum Step {
         /// (checklist 9.15). `None` runs it as one `KERNEL`.
         half: Option<u8>,
     },
+    /// A standalone transfer through L1: B reads each batch in and NC writes
+    /// it out, one credit a batch (`tt_isa::dataflow::Stream::Transfer`).
+    /// Consecutive transfers of the same depth on a tile share one shared
+    /// packet (`dm::op::PAIR`) with no kernel in it, so B only reads and NC
+    /// only writes GDDR.
+    Transfer {
+        /// What it is, for [`stats`].
+        what: &'static str,
+        /// Batches in flight: 1, the next batch reads only after this one's
+        /// writes are acknowledged, or 2, alternating halves of a staging
+        /// area. The builder places each batch's slots to match.
+        depth: u16,
+        batches: Vec<TransferBatch>,
+    },
 }
+
+/// One credit of a [`Step::Transfer`]: the entries B runs to fill its slots
+/// (reads, and what shapes them: host moves, tilizes, padding fills) and the
+/// entries NC runs to write them out (`WRITE` entries and writing records).
+/// Each side must stay within [`TRANSFER_SIDE_MAX`] entries, so a batch fits a
+/// packet.
+#[derive(Clone, Debug)]
+pub struct TransferBatch {
+    pub read: Vec<[u32; 8]>,
+    pub write: Vec<[u32; 8]>,
+}
+
+/// Most entries either side of a [`TransferBatch`] may hold: with its two
+/// credits, a batch's side stays under half a packet (`tt_isa::dm::LIST_MAX`).
+pub const TRANSFER_SIDE_MAX: usize = 240;
 
 /// Steps that must run in order on one tile, from one L1 staging area. The
 /// jobs of one op are independent of each other: each reads only GDDR and
@@ -2386,28 +2444,32 @@ pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work>
         .into_iter()
         .map(|run| {
             let (first, count) = (run.start as u32, run.len() as u32);
-            vec![Step::List {
+            // B reads the run into the slots; NC writes them out once the reads
+            // have landed (the batch's credit).
+            vec![Step::Transfer {
                 what: "copy list",
-                entries: vec![
-                    [
-                        record::READ_RUN,
-                        first,
-                        count,
-                        stage as u32,
-                        0,
-                        ct as u32,
-                        0,
-                        0,
+                depth: 1,
+                batches: vec![TransferBatch {
+                    read: vec![
+                        [
+                            record::READ_RUN,
+                            first,
+                            count,
+                            stage as u32,
+                            0,
+                            ct as u32,
+                            0,
+                            0,
+                        ],
+                        rs.encode()[0],
+                        rs.encode()[1],
                     ],
-                    rs.encode()[0],
-                    rs.encode()[1],
-                    // The reads land before the writes read the slots: a
-                    // record's moves are issued without waiting.
-                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
-                    [record::WRITE_RUN, first, count, stage as u32, 0, 0, 0, 0],
-                    ro.encode()[0],
-                    ro.encode()[1],
-                ],
+                    write: vec![
+                        [record::WRITE_RUN, first, count, stage as u32, 0, 0, 0, 0],
+                        ro.encode()[0],
+                        ro.encode()[1],
+                    ],
+                }],
             }]
         })
         .collect();
@@ -2492,36 +2554,39 @@ pub fn copy_blocks(
         let flags = if transposed { 8 } else { 0 };
         for run in runs(r.div_ceil(32) * ct, per, GROUP) {
             let (first, count) = (run.start as u32, run.len() as u32);
-            jobs.push(vec![Step::List {
+            jobs.push(vec![Step::Transfer {
                 what: "block copy list",
-                entries: vec![
-                    [
-                        record::READ_RUN,
-                        first,
-                        count,
-                        stage as u32,
-                        flags,
-                        ct as u32,
-                        0,
-                        0,
+                depth: 1,
+                batches: vec![TransferBatch {
+                    read: vec![
+                        [
+                            record::READ_RUN,
+                            first,
+                            count,
+                            stage as u32,
+                            flags,
+                            ct as u32,
+                            0,
+                            0,
+                        ],
+                        rs.encode()[0],
+                        rs.encode()[1],
                     ],
-                    rs.encode()[0],
-                    rs.encode()[1],
-                    // The reads land before the writes read the slots.
-                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
-                    [
-                        record::WRITE_RUN,
-                        first,
-                        count,
-                        stage as u32,
-                        0,
-                        ct as u32,
-                        0,
-                        0,
+                    write: vec![
+                        [
+                            record::WRITE_RUN,
+                            first,
+                            count,
+                            stage as u32,
+                            0,
+                            ct as u32,
+                            0,
+                            0,
+                        ],
+                        ro.encode()[0],
+                        ro.encode()[1],
                     ],
-                    ro.encode()[0],
-                    ro.encode()[1],
-                ],
+                }],
             }]);
         }
     }
@@ -2537,9 +2602,9 @@ pub fn copy_blocks(
 /// in every slot, so any source row's face-row moves straight into any
 /// output row's with one 64-byte [`dm::op::READ`] -- the mod-64 congruence a
 /// GDDR read needs (`tt_isa::dram::ALIGN`), whatever the rows. Output tiles
-/// are built in staging slots (64-aligned), then written out after a
-/// [`dm::op::WAIT`]. Two read entries a row a tile column, ~316 cycles each
-/// on the mover. Rows past the last in the last tile row are left as the
+/// are built in staging slots (64-aligned) by B, then written out by NC, a few
+/// tiles to a batch ([`Step::Transfer`]). Two read entries a row a tile
+/// column, ~316 cycles each on the mover. Rows past the last in the last tile row are left as the
 /// slot held them: the output's padding is undefined there.
 pub fn gather_rows(
     alloc: &mut DramAlloc,
@@ -2584,48 +2649,61 @@ pub fn gather_rows(
     let [ort, oct] = out.grid();
     let face_row =
         |r: usize, h: usize| TILE_DATA + (((r / 16) * 2 + h) * 1024 + (r % 16) * 64) as u64;
+    // Output tiles go in batches of `PER_BATCH`: its 64 face-row reads a tile
+    // must fit a packet's side, and two batches alternate halves of the
+    // staging so NC writes one out while B reads the next.
+    const PER_BATCH: usize = (TRANSFER_SIDE_MAX - 2) / 64;
+    const _: () = assert!(2 * PER_BATCH <= GROUP);
     let mut jobs = Vec::new();
     for run in runs(ort * oct, units, GROUP) {
-        let mut entries = Vec::new();
-        let mut n = 0u32;
-        for (k, t) in run.clone().enumerate() {
-            let (oi, oj) = (t / oct, t % oct);
-            let slot = stage + k as u64 * TILE_SLOT;
-            for r in 0..32.min(rows.len() - oi * 32) {
-                let (src, sr) = rows[oi * 32 + r];
-                let from = sources[src].tile(sr / 32, oj);
-                for h in 0..2 {
-                    entries.push([
-                        op::READ,
-                        from.channel().index() as u32,
-                        n % tt_isa::dram::PORTS as u32,
-                        (from.offset() + face_row(sr % 32, h)) as u32,
-                        (slot + face_row(r, h)) as u32,
-                        64,
+        let tiles: Vec<usize> = run.collect();
+        let batches = tiles
+            .chunks(PER_BATCH)
+            .enumerate()
+            .map(|(b, batch)| {
+                let first_slot = stage + (b % 2 * PER_BATCH) as u64 * TILE_SLOT;
+                let mut read = Vec::new();
+                let mut write = Vec::new();
+                let mut n = 0u32;
+                for (k, &t) in batch.iter().enumerate() {
+                    let (oi, oj) = (t / oct, t % oct);
+                    let slot = first_slot + k as u64 * TILE_SLOT;
+                    for r in 0..32.min(rows.len() - oi * 32) {
+                        let (src, sr) = rows[oi * 32 + r];
+                        let from = sources[src].tile(sr / 32, oj);
+                        for h in 0..2 {
+                            read.push([
+                                op::READ,
+                                from.channel().index() as u32,
+                                n % tt_isa::dram::PORTS as u32,
+                                (from.offset() + face_row(sr % 32, h)) as u32,
+                                (slot + face_row(r, h)) as u32,
+                                64,
+                                0,
+                                0,
+                            ]);
+                            n += 1;
+                        }
+                    }
+                    let to = out.tile(oi, oj);
+                    write.push([
+                        op::WRITE,
+                        to.channel().index() as u32,
+                        k as u32 % tt_isa::dram::PORTS as u32,
+                        (to.offset() + TILE_DATA) as u32,
+                        (slot + TILE_DATA) as u32,
+                        4096,
                         0,
                         0,
                     ]);
-                    n += 1;
                 }
-            }
-        }
-        entries.push([op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-        for (k, t) in run.enumerate() {
-            let to = out.tile(t / oct, t % oct);
-            entries.push([
-                op::WRITE,
-                to.channel().index() as u32,
-                k as u32 % tt_isa::dram::PORTS as u32,
-                (to.offset() + TILE_DATA) as u32,
-                (stage + k as u64 * TILE_SLOT + TILE_DATA) as u32,
-                4096,
-                0,
-                0,
-            ]);
-        }
-        jobs.push(vec![Step::List {
+                TransferBatch { read, write }
+            })
+            .collect();
+        jobs.push(vec![Step::Transfer {
             what: "row gather list",
-            entries,
+            depth: 2,
+            batches,
         }]);
     }
     Ok(Work { out, jobs })
@@ -2636,9 +2714,9 @@ pub fn gather_rows(
 /// other row untouched -- how a scatter of rows (an embedding's gradient)
 /// lands in a copy of its table without moving the rest. Each face-row is
 /// read into a staging slot at its own offset in a tile (64-byte reads, as
-/// [`gather_rows`]'s) and, after a [`dm::op::WAIT`], written straight to its
-/// place in `dst` (64-byte writes: the mod-16 congruence a write needs
-/// holds). The jobs only: the session runs them on `dst` itself.
+/// [`gather_rows`]'s) by B and written straight to its place in `dst` by NC
+/// (64-byte writes: the mod-16 congruence a write needs holds), a batch of
+/// them to a credit ([`Step::Transfer`]). The jobs only: the session runs them on `dst` itself.
 pub fn write_rows(
     dst: &DramTensor,
     src: &DramTensor,
@@ -2678,46 +2756,59 @@ pub fn write_rows(
         .iter()
         .flat_map(|&(d, s)| (0..ct).map(move |j| (d, s, j)))
         .collect();
+    // Batches of `PER_BATCH` pieces (two reads and two writes each, inside a
+    // packet's side), alternating halves of the staging.
+    const PER_BATCH: usize = TRANSFER_SIDE_MAX / 2 - 1;
+    let slots_per_batch = PER_BATCH.div_ceil(per_slot);
+    const _: () = assert!(2 * PER_BATCH.div_ceil(32) <= GROUP);
     let mut jobs = Vec::new();
     for run in runs(pieces.len(), units, GROUP * per_slot) {
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
-        for (k, &(d, s, j)) in pieces[run].iter().enumerate() {
-            // Piece `k` is staged at row `k % 32` of slot `k / 32`: its own
-            // place, and every face-row offset is `TILE_DATA` mod 64 wherever
-            // it is, so the read's and the write's congruences hold.
-            let slot = stage + (k / per_slot) as u64 * TILE_SLOT;
-            let r = k % per_slot;
-            let from = src.tile(s / 32, j);
-            let to = dst.tile(d / 32, j);
-            for h in 0..2 {
-                reads.push([
-                    op::READ,
-                    from.channel().index() as u32,
-                    (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
-                    (from.offset() + face_row(s % 32, h)) as u32,
-                    (slot + face_row(r, h)) as u32,
-                    64,
-                    0,
-                    0,
-                ]);
-                writes.push([
-                    op::WRITE,
-                    to.channel().index() as u32,
-                    (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
-                    (to.offset() + face_row(d % 32, h)) as u32,
-                    (slot + face_row(r, h)) as u32,
-                    64,
-                    0,
-                    0,
-                ]);
-            }
-        }
-        reads.push([op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-        reads.extend(writes);
-        jobs.push(vec![Step::List {
+        let batches = pieces[run]
+            .chunks(PER_BATCH)
+            .enumerate()
+            .map(|(b, batch)| {
+                let half = stage + (b % 2 * slots_per_batch) as u64 * TILE_SLOT;
+                let mut read = Vec::new();
+                let mut write = Vec::new();
+                for (k, &(d, s, j)) in batch.iter().enumerate() {
+                    // Piece `k` is staged at row `k % 32` of slot `k / 32`: its
+                    // own place, and every face-row offset is `TILE_DATA` mod 64
+                    // wherever it is, so the read's and the write's congruences
+                    // hold.
+                    let slot = half + (k / per_slot) as u64 * TILE_SLOT;
+                    let r = k % per_slot;
+                    let from = src.tile(s / 32, j);
+                    let to = dst.tile(d / 32, j);
+                    for h in 0..2 {
+                        read.push([
+                            op::READ,
+                            from.channel().index() as u32,
+                            (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
+                            (from.offset() + face_row(s % 32, h)) as u32,
+                            (slot + face_row(r, h)) as u32,
+                            64,
+                            0,
+                            0,
+                        ]);
+                        write.push([
+                            op::WRITE,
+                            to.channel().index() as u32,
+                            (2 * k + h) as u32 % tt_isa::dram::PORTS as u32,
+                            (to.offset() + face_row(d % 32, h)) as u32,
+                            (slot + face_row(r, h)) as u32,
+                            64,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                TransferBatch { read, write }
+            })
+            .collect();
+        jobs.push(vec![Step::Transfer {
             what: "row write list",
-            entries: reads,
+            depth: 2,
+            batches,
         }]);
     }
     Ok(jobs)
@@ -2741,25 +2832,42 @@ pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
     }
     let stage = staging("fill-pad slots", GROUP)?;
     let r = t.tensor_ref();
+    // B reads each edge tile and fills its padding; NC writes it back. Batches
+    // of half the staging alternate, so NC writes one while B fills the next.
+    const PER_BATCH: usize = GROUP / 2;
+    let head = |op: u32, first: usize, count: usize, stage: u64| {
+        [
+            op,
+            value.to_bits(),
+            first as u32,
+            count as u32,
+            rows as u32,
+            cols as u32,
+            stage as u32,
+            rt as u32,
+        ]
+    };
     Ok(runs(edges, units, GROUP)
         .into_iter()
         .map(|run| {
-            vec![Step::List {
+            let batches = (run.start..run.end)
+                .step_by(PER_BATCH)
+                .enumerate()
+                .map(|(b, first)| {
+                    let count = PER_BATCH.min(run.end - first);
+                    let at = stage + (b % 2 * PER_BATCH) as u64 * TILE_SLOT;
+                    let side =
+                        |op: u32| vec![head(op, first, count, at), r.encode()[0], r.encode()[1]];
+                    TransferBatch {
+                        read: side(record::FILL_PAD),
+                        write: side(record::PAD_WRITE),
+                    }
+                })
+                .collect();
+            vec![Step::Transfer {
                 what: "fill-pad list",
-                entries: vec![
-                    [
-                        record::FILL_PAD,
-                        value.to_bits(),
-                        run.start as u32,
-                        run.len() as u32,
-                        rows as u32,
-                        cols as u32,
-                        stage as u32,
-                        rt as u32,
-                    ],
-                    r.encode()[0],
-                    r.encode()[1],
-                ],
+                depth: 2,
+                batches,
             }]
         })
         .collect())
@@ -2869,9 +2977,28 @@ mod tests {
         assert!(checked > 100, "{checked}");
     }
 
+    /// `entries` with each record expanded, appended to `out`.
+    fn expanded(entries: &[[u32; 8]], out: &mut Vec<Result<[u32; 8], Vec<u32>>>) {
+        let mut i = 0;
+        while i < entries.len() {
+            let n = record::len(entries[i][0]);
+            if n == 1 {
+                out.push(Ok(entries[i]));
+            } else {
+                record::expand(&entries[i..i + n], |e| {
+                    out.push(Ok(e));
+                    Ok(())
+                })
+                .unwrap_or_else(|c| panic!("record refused: code {c}"));
+            }
+            i += n;
+        }
+    }
+
     /// One job as the mover runs it: every entry in order, records expanded,
-    /// a `WAIT` between what were separate lists, and each kernel as its
-    /// programs' first words (`None` for a list entry).
+    /// a `WAIT` between what were separate lists (and, in a transfer, between
+    /// a batch's reads and its writes, which the credit orders), and each
+    /// kernel as its programs' first words (`None` for a list entry).
     fn stream(job: &Job) -> Vec<Result<[u32; 8], Vec<u32>>> {
         let mut out = Vec::new();
         let mut after_list = false;
@@ -2881,19 +3008,17 @@ mod tests {
                     if after_list {
                         out.push(Ok([op::WAIT, 0, 0, 0, 0, 0, 0, 0]));
                     }
-                    let mut i = 0;
-                    while i < entries.len() {
-                        let n = record::len(entries[i][0]);
-                        if n == 1 {
-                            out.push(Ok(entries[i]));
-                        } else {
-                            record::expand(&entries[i..i + n], |e| {
-                                out.push(Ok(e));
-                                Ok(())
-                            })
-                            .unwrap_or_else(|c| panic!("record refused: code {c}"));
-                        }
-                        i += n;
+                    expanded(entries, &mut out);
+                    after_list = true;
+                }
+                Step::Transfer { batches, .. } => {
+                    if after_list {
+                        out.push(Ok([op::WAIT, 0, 0, 0, 0, 0, 0, 0]));
+                    }
+                    for batch in batches {
+                        expanded(&batch.read, &mut out);
+                        out.push(Ok([op::WAIT, 0, 0, 0, 0, 0, 0, 0]));
+                        expanded(&batch.write, &mut out);
                     }
                     after_list = true;
                 }
@@ -3007,14 +3132,27 @@ mod tests {
                     let jobs = super::fill_pad(&t, f32::NEG_INFINITY, units).unwrap();
                     let mut got = BTreeMap::new();
                     for job in &jobs {
+                        // B reads and fills a batch's tiles; NC writes each back
+                        // from its slot, after the batch's credit.
                         let e: Vec<_> = stream(job).into_iter().map(Result::unwrap).collect();
-                        for w in e.chunks(3) {
-                            let (rd, cp, wr) = (w[0], w[1], w[2]);
-                            assert_eq!((rd[0], cp[0], wr[0]), (op::READ, op::FILL, op::WRITE));
-                            assert_eq!(cp[1], f32::NEG_INFINITY.to_bits());
-                            assert_eq!(cp[3], rd[4], "in its slot");
-                            assert_eq!((wr[1], wr[3]), (rd[1], rd[3] + TILE_DATA as u32));
-                            assert!(got.insert((rd[1], rd[3]), cp[2]).is_none(), "twice");
+                        let mut filled = BTreeMap::new();
+                        for w in e.split(|x| x[0] == op::WAIT) {
+                            let reads: Vec<_> = w
+                                .iter()
+                                .filter(|x| x[0] == op::READ || x[0] == op::FILL)
+                                .collect();
+                            for pair in reads.chunks(2) {
+                                let (rd, cp) = (pair[0], pair[1]);
+                                assert_eq!((rd[0], cp[0]), (op::READ, op::FILL));
+                                assert_eq!(cp[1], f32::NEG_INFINITY.to_bits());
+                                assert_eq!(cp[3], rd[4], "in its slot");
+                                assert!(got.insert((rd[1], rd[3]), cp[2]).is_none(), "twice");
+                                filled.insert(rd[4] + TILE_DATA as u32, (rd[1], rd[3]));
+                            }
+                            for wr in w.iter().filter(|x| x[0] == op::WRITE) {
+                                let (ch, off) = filled[&wr[4]];
+                                assert_eq!((wr[1], wr[3]), (ch, off + TILE_DATA as u32));
+                            }
                         }
                     }
                     assert_eq!(got, want, "[{r}, {c}] {mask:#x} {units}");

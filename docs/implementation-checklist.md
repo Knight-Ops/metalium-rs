@@ -1445,8 +1445,9 @@ tiles, done in turn. The slices from there:
     on channels 0-3 and port 0 on 4-7.
   - Every request goes out on static VC 1, and tile movers start with an
     in-flight cap of 8.
-  - RISCV NC runs the same mover (`dm_nc`), and `SIGNAL` / `WAIT_PEER` let the
-    two movers wait for each other.
+  - RISCV NC runs the mover's write half (`dm_nc`); the two movers' direct
+    `SIGNAL` / `WAIT_PEER` handshake was removed 2026-10-03 for credits in a
+    shared packet.
   - Card reads 127 -> 469 GB/s, NoC #1 writes 52 -> 378.
   - Details in `firmware-performance.md`.
 - [ ] **Next, in order** (from an independent review, 2026-10-02, checked
@@ -1466,6 +1467,12 @@ tiles, done in turn. The slices from there:
     - Merge contiguous tiles into one request.
     - Measure per entry and on matmul and element-wise gathers.
   - [ ] **9.15 Overlap on B, then split.**
+    - **Superseded by fixed ownership (2026-10-03):** GDDR compute now always
+      uses B-reader / resident T0–T2 / NC-writer regions and page credits, fresh
+      and traced. The legacy wave, B-only pipeline and two-host-queue NC
+      schedulers below are historical and removed. `enable_dram(b,nc)` requires
+      both images; pipelining off still uses NC. See
+      `feature-streaming-dataflow-ownership.md` for the current contract.
     - [x] GDDR matmuls: `LAUNCH` / `KERNEL_WAIT`, blocks in two halves of the
       arena, on by default where `tensor::pipelining_pays` (`step54_pipeline`,
       `stress_pipeline`).
@@ -1475,16 +1482,19 @@ tiles, done in turn. The slices from there:
     - Separate launch and wait entries, with explicit ownership of each L1
       staging buffer, let B gather the next block and scatter the previous one
       while the roles compute: 9.8's double buffering.
-    - [x] On top of that, a `Session` policy that puts the scatters on NC
-      (`SIGNAL` / `WAIT_PEER`), B-only by default (`set_scatter_mover`,
+    - [x] Originally, a `Session` policy put the scatters on NC
+      (`SIGNAL` / `WAIT_PEER`, since removed), B-only by default (the removed scatter policy,
       `step56_scatter_on_nc`). Pays on one tile for write-heavy ops (add
       0.70-0.80 against pipelined B-only); costs host time on many tiles.
     - `copy_pipeline` found B's own pipelining within 3-5% of B+NC at large
       entries and NC 1.6x faster at 4 KiB, so both are measured.
-    - [x] Specialised B / NC images, measured and declined
-      (`mover_mixed_directions`): reads and writes in blocks, as pipelined
-      lists run them, cost 0.3-0.6% an entry over pure lists, so one image
-      serves both cores.
+    - [x] Specialised B / NC images: first measured and declined
+      (`mover_mixed_directions`, since removed with the mixed lists it ran:
+      reads and writes in blocks cost 0.3-0.6% an entry over pure lists),
+      then done anyway on 2026-10-03 for size, not speed. B only reads and NC
+      only writes (`dm::Mover::permits`), so each image drops the other
+      direction's code: B 24.2 -> 20.9 KB of its 24 KB (3.7 KB free from 0.3),
+      NC 22.9 -> 14.8 KB. One source, compiled twice with a const.
   - [ ] **9.17 Host time per op, measured first (research).**
     - On many tiles an element-wise op or reduction is the host's: it queues
       each unit's list in turn, ~6 us a unit an op on card 0, so a 50-tile max

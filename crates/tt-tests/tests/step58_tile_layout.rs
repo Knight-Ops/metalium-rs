@@ -187,7 +187,8 @@ fn tilizing_on_the_card_or_the_host_gives_the_same_tensors() {
                 |_, _| Ok(None),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             check(&mut s, units);
         });
         #[cfg(feature = "silicon")]
@@ -198,7 +199,8 @@ fn tilizing_on_the_card_or_the_host_gives_the_same_tensors() {
                 TileChoice::Count(units),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             check(&mut s, units);
         });
         if let Err(e) = r {

@@ -10,7 +10,7 @@
 //! wrong generation once the ring wraps. Nothing is synced between a round's
 //! ops, so each queues behind the last; the round's downloads are its only
 //! waits. `STRESS_TILES` picks the tile counts (default 1 and 8, where the
-//! shapes below pipeline); `STRESS_NC=1` puts the scatters on NC.
+//! shapes below pipeline); NC always owns compute-region outputs.
 
 use std::time::{Duration, Instant};
 
@@ -95,10 +95,7 @@ fn soak<T: tt_device::Transport>(s: &mut Session<T>, tiles: usize) {
         "{tiles} tiles: no shape pipelines, so this stresses nothing"
     );
     s.set_pipeline(true);
-    // `STRESS_NC=1`: the scatters on NC (`Session::set_scatter_mover`).
-    if std::env::var_os("STRESS_NC").is_some() {
-        s.set_scatter_mover(Some(tt_firmware_images::DM_NC.1));
-    }
+
     let deadline = Instant::now() + secs();
     let mut round = 0usize;
     let before = s.pipelined_blocks();
@@ -169,7 +166,8 @@ fn pipelined_matmuls_queued_back_to_back_keep_the_plain_paths_bits() {
                 |_, _| Ok(None),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-            s.enable_dram(tt_firmware_images::DM_B.1).unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
             soak(&mut s, tiles);
         }) {
             panic!("{tiles} tiles: {e}");

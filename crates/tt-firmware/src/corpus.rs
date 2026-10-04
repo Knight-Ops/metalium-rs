@@ -169,8 +169,9 @@ where
     // A loop header leads the program where its length says so
     // (`mailbox::loops::LOOPED`).
     let program_len_word = unsafe { l1_read32(mb.program_len()) };
+    let streamed = program_len_word & tt_isa::dataflow::STREAMED != 0;
     let looped = program_len_word & mailbox::loops::LOOPED != 0;
-    let program_len = program_len_word & !mailbox::loops::LOOPED;
+    let program_len = program_len_word & tt_isa::dataflow::LENGTH_MASK;
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
@@ -238,6 +239,19 @@ where
             *w = unsafe { l1_read32(mb.mop_cfg(k as u32)) };
         }
         load_mop_config(&cfg);
+    }
+
+    if streamed {
+        if looped || dump_rows != 0 {
+            fail_in(mb, panic_code::EXPLICIT);
+        }
+        trace(tracing, Thread::INDEX, mailbox::trace::START);
+        if let Err(code) = run_stream::<Riscv, Thread>(program, program_len, push_window, tracing) {
+            crate::dataflow::abort_with(code);
+            fail_in(mb, code);
+        }
+        trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
+        return program_len;
     }
 
     // The block repeats (`mailbox::loops`): each inside the code, and any two
@@ -321,6 +335,157 @@ where
     }
 
     program_len
+}
+
+fn push_body<Riscv, Thread>(
+    address: u32,
+    length: u32,
+    push_window: u32,
+    last_traced: bool,
+) -> Result<(), u32>
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    use tt_isa::{dataflow, dm};
+    if address == 0 && length == 0 {
+        trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
+        return Ok(());
+    }
+    if !dataflow::program(address, length) {
+        return Err(dm::error::PROGRAM);
+    }
+    let words = length & !mailbox::loops::LOOPED;
+    let read = |offset| unsafe { l1_read32(address as u64 + offset * 4) };
+    let count = if length & mailbox::loops::LOOPED != 0 {
+        read(0)
+    } else {
+        0
+    };
+    if count as usize > mailbox::loops::MAX || (count != 0 && count + 1 > words) {
+        return Err(dm::error::PROGRAM);
+    }
+    let prefix = if length & mailbox::loops::LOOPED != 0 {
+        count + 1
+    } else {
+        0
+    };
+    if prefix > words {
+        return Err(dm::error::PROGRAM);
+    }
+    let code_len = words - prefix;
+    let mut loops = [(0u32, 0u32, 0u32); mailbox::loops::MAX];
+    for (index, entry) in loops.iter_mut().enumerate().take(count as usize) {
+        *entry = mailbox::loops::decode(read(1 + index as u64));
+        if entry.0 + entry.1 > code_len {
+            return Err(dm::error::PROGRAM);
+        }
+    }
+    for (index, current) in loops[..count as usize].iter().enumerate() {
+        let mut depth = 0;
+        for (other_index, other) in loops[..count as usize].iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            let end = current.0 + current.1;
+            let other_end = other.0 + other.1;
+            let inside = other.0 <= current.0
+                && end <= other_end
+                && (current.0, end) != (other.0, other_end);
+            let outside = current.0 <= other.0
+                && other_end <= end
+                && (current.0, end) != (other.0, other_end);
+            if !(end <= other.0 || other_end <= current.0 || inside || outside) {
+                return Err(dm::error::PROGRAM);
+            }
+            if inside {
+                depth += 1;
+            }
+        }
+        if depth > 1 {
+            return Err(dm::error::PROGRAM);
+        }
+    }
+    let mut push = Pusher::<Riscv, Thread> {
+        program: address as u64 + prefix as u64 * 4,
+        push_window,
+        until_drain: push_window,
+        _p: core::marker::PhantomData,
+    };
+    push.span(0, code_len, &loops[..count as usize]);
+    trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
+    wait_for_coprocessor();
+    Ok(())
+}
+
+fn run_stream<Riscv, Thread>(
+    program: u64,
+    words: u32,
+    push_window: u32,
+    tracing: bool,
+) -> Result<(), u32>
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    use dataflow::{Action, Endpoint, Stream};
+    use tt_isa::{dataflow, dm};
+    let read = |index| unsafe { l1_read32(program + index * 4) };
+    if words < 4 || read(0) != dataflow::VERSION || read(3) != Thread::INDEX {
+        return Err(dm::error::PROGRAM);
+    }
+    let count = read(1);
+    let capacity = read(2);
+    if count == 0
+        || count > (words - 4) / dataflow::STEP_WORDS
+        || words != 4 + count * dataflow::STEP_WORDS
+        || capacity == 0
+        || capacity >= 0x8000
+    {
+        return Err(dm::error::PROGRAM);
+    }
+    for index in 0..count {
+        let offset = 4 + index as u64 * dataflow::STEP_WORDS as u64;
+        let (address, length) = (read(offset), read(offset + 1));
+        if !(address == 0 && length == 0 || dataflow::program(address, length))
+            || read(offset + 2) != 0
+            || read(offset + 3) != 0
+        {
+            return Err(dm::error::PROGRAM);
+        }
+    }
+    let capacity = capacity as u16;
+    for index in 0..count {
+        crate::dataflow::check()?;
+        if Thread::INDEX == 0 {
+            crate::dataflow::buffer(Stream::Input, Action::Wait, capacity, Endpoint::Unpack, 1)?;
+        }
+        if Thread::INDEX == 2 {
+            crate::dataflow::buffer(Stream::Output, Action::Reserve, capacity, Endpoint::Pack, 3)?;
+        }
+        let offset = 4 + index as u64 * dataflow::STEP_WORDS as u64;
+        push_body::<Riscv, Thread>(
+            read(offset),
+            read(offset + 1),
+            push_window,
+            tracing && index + 1 == count,
+        )?;
+        if Thread::INDEX == 0 {
+            crate::dataflow::buffer(Stream::Input, Action::Pop, capacity, Endpoint::Unpack, 1)?;
+        }
+        if Thread::INDEX == 2 {
+            crate::dataflow::buffer(Stream::Output, Action::Push, capacity, Endpoint::Pack, 3)?;
+        }
+        // The roles share configuration and semaphores, so each batch starts
+        // only once all three have retired the one before. After the last,
+        // nothing follows in this region: the mover's `KERNEL_WAIT` joins.
+        if index + 1 < count {
+            crate::dataflow::retire_batch(Thread::INDEX, index + 1)?;
+        } else {
+            crate::dataflow::record_batch(Thread::INDEX, count);
+        }
+    }
+    Ok(())
 }
 
 /// Pushes ranges of a staged program, its block repeats expanded.

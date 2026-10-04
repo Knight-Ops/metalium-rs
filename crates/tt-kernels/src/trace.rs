@@ -120,6 +120,7 @@ pub struct OpRecord {
 /// One unit's share of a capture in progress.
 #[derive(Default)]
 pub(crate) struct UnitCapture {
+    pub(crate) regions: Vec<Placement>,
     /// The unit's entries, in order, generations and barrier targets relative.
     pub(crate) stream: Vec<[u32; 8]>,
     /// The resident's last generation when the capture began: the stream's
@@ -169,6 +170,7 @@ pub(crate) struct Capture {
 
 /// One unit's share of a finished trace.
 pub(crate) struct UnitTrace {
+    pub(crate) regions: Vec<Placement>,
     /// Its stream in GDDR, and where that is: the chip's channel index, the
     /// offset, the entry count.
     pub(crate) stream: Placement,

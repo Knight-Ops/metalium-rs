@@ -1,6 +1,6 @@
-//! The data mover writes GDDR through NoC #1 (`tt_isa::dm::WRITE_NOC`) while
-//! it reads through NoC #0, and every byte lands as it does with both on
-//! NoC #0.
+//! RISCV NC's data mover writes GDDR through NoC #1 (`tt_isa::dm::WRITE_NOC`)
+//! while RISCV B reads through NoC #0, and every byte lands as it does with
+//! both on NoC #0. B writes on NoC #0 only: it refuses the other modes.
 //!
 //! Each GDDR endpoint belongs to one NoC (`DramChannel::owns`): NoC #1 writes
 //! go to port 1 of every channel, and NoC #0 traffic -- the mover's reads, its
@@ -14,12 +14,14 @@
 //! (`NoC/Coordinates.md`, "Coordinate Translation"): checked first.
 
 use tt_device::tlb::WindowKind;
-use tt_isa::dm::op;
+use tt_device::Window;
+use tt_isa::dm::{op, Mover};
 use tt_isa::dram::PORTS;
 use tt_isa::noc::niu::{self, Niu};
-use tt_kernels::dm::{DataMover, WriteNoc};
+use tt_isa::noc::Noc0;
+use tt_kernels::dm::{DataMover, DmError, WriteNoc};
 use tt_tests::backend::GATE_TILE;
-use tt_tests::harness::{in_device, tile};
+use tt_tests::harness::{in_device, tile, Dev};
 
 fn pattern(len: usize, seed: u32) -> Vec<u8> {
     let mut s = seed | 1;
@@ -48,6 +50,35 @@ const WRITE_NOCS: [WriteNoc; 4] = [
     WriteNoc::Alternate,
     WriteNoc::Noc1,
 ];
+
+/// Both movers of the gate tile: B reads, NC writes.
+fn movers(
+    d: &mut Dev<'_>,
+    w: &Window,
+    dram: &tt_isa::dram::Dram,
+) -> (DataMover<Noc0>, DataMover<Noc0>) {
+    let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+    let b = DataMover::start(d, w, t, dram, tt_firmware_images::DM_B.1).unwrap();
+    let nc = DataMover::start_on(d, w, t, dram, Mover::NC, tt_firmware_images::DM_NC.1).unwrap();
+    (b, nc)
+}
+
+#[test]
+fn b_refuses_noc1_writes() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let (b, nc) = movers(d, &w, &dram);
+        for noc in [WriteNoc::Noc1, WriteNoc::Alternate] {
+            let e = b.set_write_noc(d, &w, noc).unwrap_err();
+            assert!(matches!(e, DmError::WriteNoc { .. }), "{e}");
+        }
+        b.set_write_noc(d, &w, Niu::Noc0).unwrap();
+        nc.set_write_noc(d, &w, Niu::Noc1).unwrap();
+        nc.stop(d, &w).unwrap();
+        b.stop(d, &w).unwrap();
+    });
+}
 
 #[test]
 fn noc1_translates_coordinates_as_noc0_does() {
@@ -98,7 +129,7 @@ fn writes_through_either_noc_land_through_every_channel_and_port() {
         let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
         let dram = d.dram_grid(&w).unwrap();
         let t = tile(d, GATE_TILE.0, GATE_TILE.1);
-        let mut m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
+        let (mut b, mut nc) = movers(d, &w, &dram);
         let reads = list(&dram, op::READ);
         let writes = list(&dram, op::WRITE);
         let range = |e: &[u32; 8]| {
@@ -108,11 +139,11 @@ fn writes_through_either_noc_land_through_every_channel_and_port() {
                 .unwrap()
         };
         for (k, noc) in WRITE_NOCS.into_iter().enumerate() {
-            m.set_write_noc(d, &w, noc).unwrap();
+            nc.set_write_noc(d, &w, noc).unwrap();
             // L1 -> DRAM through `noc`, from fresh patterns.
             let data = pattern(writes.len() * LEN, k as u32 + 77);
             d.l1_write(&w, t, L1_AT as u64, &data).unwrap();
-            m.run_list(d, &w, &writes).unwrap();
+            nc.run_list(d, &w, &writes).unwrap();
             for (i, e) in writes.iter().enumerate() {
                 let mut back = vec![0u8; LEN];
                 d.dram_read(&w4, range(e), &mut back).unwrap();
@@ -124,19 +155,21 @@ fn writes_through_either_noc_land_through_every_channel_and_port() {
             // And back through NoC #0's reads, into a zeroed L1.
             d.l1_write(&w, t, L1_AT as u64, &vec![0u8; reads.len() * LEN])
                 .unwrap();
-            m.run_list(d, &w, &reads).unwrap();
+            b.run_list(d, &w, &reads).unwrap();
             let mut back = vec![0u8; reads.len() * LEN];
             d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
             assert!(back == data, "{noc:?}: what was written did not read back");
         }
-        m.set_write_noc(d, &w, Niu::Noc0).unwrap();
-        m.stop(d, &w).unwrap();
+        nc.set_write_noc(d, &w, Niu::Noc0).unwrap();
+        nc.stop(d, &w).unwrap();
+        b.stop(d, &w).unwrap();
     });
 }
 
-/// Reads on NoC #0 and writes on NoC #1, then writes taking turns between
-/// the NoCs, interleaved in one list, so both NIUs have requests in flight at
-/// once: each half lands, and the list's end waits for both.
+/// B reads on NoC #0 while NC writes on NoC #1, both queued before either is
+/// waited on, so both NIUs have requests in flight at once; then NC's writes
+/// take turns between the NoCs after B's reads are done (NC's NoC #0 requests
+/// use B's initiator registers). Each half lands.
 #[test]
 fn reads_and_writes_on_both_nocs_at_once() {
     in_device(|d| {
@@ -144,7 +177,7 @@ fn reads_and_writes_on_both_nocs_at_once() {
         let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
         let dram = d.dram_grid(&w).unwrap();
         let t = tile(d, GATE_TILE.0, GATE_TILE.1);
-        let mut m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
+        let (mut b, mut nc) = movers(d, &w, &dram);
         let chans: Vec<_> = dram.channels().collect();
         const N: usize = 24;
         // Even entries read slot i from GDDR; odd ones write slot i to GDDR
@@ -152,7 +185,7 @@ fn reads_and_writes_on_both_nocs_at_once() {
         let src = pattern(N * LEN, 3);
         let up = pattern(N * LEN, 4);
         let at = |i: usize, region: u64| DRAM_AT + region + (i * LEN) as u64;
-        let mut list = Vec::new();
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
         for i in 0..N {
             let ch = chans[i % chans.len()];
             let l1 = L1_AT + (i * LEN) as u32;
@@ -163,7 +196,7 @@ fn reads_and_writes_on_both_nocs_at_once() {
                     &src[i * LEN..][..LEN],
                 )
                 .unwrap();
-                list.push([
+                reads.push([
                     op::READ,
                     ch.index() as u32,
                     (i % 3) as u32,
@@ -175,7 +208,7 @@ fn reads_and_writes_on_both_nocs_at_once() {
                 ]);
             } else {
                 d.l1_write(&w, t, l1 as u64, &up[i * LEN..][..LEN]).unwrap();
-                list.push([
+                writes.push([
                     op::WRITE,
                     ch.index() as u32,
                     (i % 3) as u32,
@@ -202,8 +235,16 @@ fn reads_and_writes_on_both_nocs_at_once() {
                 d.l1_write(&w, t, L1_AT as u64 + (i * LEN) as u64, &vec![0u8; LEN])
                     .unwrap();
             }
-            m.set_write_noc(d, &w, noc).unwrap();
-            m.run_list(d, &w, &list).unwrap();
+            nc.set_write_noc(d, &w, noc).unwrap();
+            let rn = b.enqueue(d, &w, &reads).unwrap();
+            if noc != WriteNoc::Noc1 {
+                // NC's NoC #0 writes share B's initiator registers: B must
+                // be done before they start.
+                b.wait_for(d, &w, rn).unwrap();
+            }
+            let wn = nc.enqueue(d, &w, &writes).unwrap();
+            b.wait_for(d, &w, rn).unwrap();
+            nc.wait_for(d, &w, wn).unwrap();
             for i in 0..N {
                 let ch = chans[i % chans.len()];
                 if i % 2 == 0 {
@@ -229,8 +270,9 @@ fn reads_and_writes_on_both_nocs_at_once() {
                 }
             }
         }
-        m.set_write_noc(d, &w, Niu::Noc0).unwrap();
-        m.stop(d, &w).unwrap();
+        nc.set_write_noc(d, &w, Niu::Noc0).unwrap();
+        nc.stop(d, &w).unwrap();
+        b.stop(d, &w).unwrap();
     });
 }
 
@@ -250,7 +292,8 @@ fn noc1s_cap_holds_on_its_own_counter() {
         let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
         let dram = d.dram_grid(&w).unwrap();
         let t = tile(d, GATE_TILE.0, GATE_TILE.1);
-        let mut m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
+        let mut m =
+            DataMover::start_on(d, &w, t, &dram, Mover::NC, tt_firmware_images::DM_NC.1).unwrap();
         let ch = dram.channels().next().unwrap();
         let src = pattern((SLOTS * BIG) as usize, 5);
         d.l1_write(&w, t, L1_AT as u64, &src).unwrap();

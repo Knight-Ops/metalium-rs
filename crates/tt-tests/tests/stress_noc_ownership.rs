@@ -1,4 +1,4 @@
-//! Stress: every tile's mover reading and writing GDDR at once, for as long
+//! Stress: every tile's B reading and NC writing GDDR, for as long
 //! as `STRESS_SECS` says (default 60 s on silicon, two rounds on the
 //! simulator), with every byte checked.
 //!
@@ -6,23 +6,24 @@
 //! construction and then driven hard (`DramChannel::owns`):
 //! * SYS-1419, one endpoint fed by both NoCs: here reads go out on NoC #0
 //!   (ports 0 and 2) while writes go out on NoC #1 (port 1) -- both NoCs on
-//!   every channel, never on one endpoint. The host's own GDDR traffic, on
+//!   every channel, never on one endpoint. NC's NoC #0 requests share B's
+//!   initiator registers, so the rounds that write on NoC #0 or on both run
+//!   after every B's reads are done. The host's own GDDR traffic, on
 //!   NoC #0, runs between the rounds' submit and wait.
 //! * BH-76, every tile driving all of a channel's ports on different virtual
 //!   channels: here everything is on static VC 1 (`Command::registers`), and
 //!   the all-NoC-#0 rounds drive both of NoC #0's ports from every tile.
 //!
 //! Each round moves the writes to the next of NoC #1, NoC #0, and the two
-//! in turn. A round is: every tile reads its
-//! own pattern from GDDR (64 KiB entries, rotating channel and port) and
-//! writes a fresh pattern back to its own region, interleaved in one list
-//! after a barrier; then the host checks a rotating sample of tiles' reads and
-//! writes.
+//! in turn. A round is: every tile's B reads its own pattern from GDDR (64 KiB
+//! entries, rotating channel and port) after a barrier while its NC writes a
+//! fresh pattern back to its own region; then the host checks a rotating
+//! sample of tiles' reads and writes.
 
 use std::time::{Duration, Instant};
 
 use tt_device::tlb::WindowKind;
-use tt_isa::dm::{self, op};
+use tt_isa::dm::{self, op, Mover};
 use tt_isa::noc::niu::Niu;
 use tt_isa::noc::Noc0;
 use tt_kernels::dm::{DataMover, WriteNoc};
@@ -87,6 +88,20 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                 DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap()
             })
             .collect();
+        let mut writers: Vec<DataMover<Noc0>> = movers
+            .iter()
+            .map(|m| {
+                DataMover::start_on(
+                    d,
+                    &w,
+                    m.tile(),
+                    &dram,
+                    Mover::NC,
+                    tt_firmware_images::DM_NC.1,
+                )
+                .unwrap()
+            })
+            .collect();
         let chans: Vec<_> = dram.channels().collect();
         let nc = chans.len() as u32;
         let coord = movers[0].tile();
@@ -103,7 +118,7 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                     .unwrap();
             }
         }
-        let list = |t: usize, round: u32| {
+        let lists = |t: usize, round: u32| {
             let mut l = vec![[
                 op::BARRIER,
                 n as u32 * (round + 1),
@@ -114,6 +129,7 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                 0,
                 0,
             ]];
+            let mut writes = Vec::new();
             for i in 0..PAIRS {
                 let ch = ch_of(t, i).index() as u32;
                 // Port hints rotate all three; the mover maps each onto one
@@ -129,7 +145,7 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                     0,
                     0,
                 ]);
-                l.push([
+                writes.push([
                     op::WRITE,
                     ch,
                     port,
@@ -140,7 +156,7 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                     0,
                 ]);
             }
-            l
+            (l, writes)
         };
         d.write32(&w, coord, dm::BARRIER_COUNTER, 0).unwrap();
         let host_data = pattern(1 << 20, 0xC0FFEE);
@@ -158,18 +174,38 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
                 d.l1_write(&w, movers[t].tile(), L1_WRITE as u64, &p)
                     .unwrap();
             }
-            for m in &movers {
+            for m in &writers {
                 m.set_write_noc(d, &w, noc).unwrap();
             }
-            for (t, m) in movers.iter_mut().enumerate() {
-                m.submit_list(d, &w, &list(t, round)).unwrap();
+            let lists: Vec<_> = (0..n).map(|t| lists(t, round)).collect();
+            for (m, (reads, _)) in movers.iter_mut().zip(&lists) {
+                m.submit_list(d, &w, reads).unwrap();
+            }
+            // NC's NoC #1 writes run beside B's reads; its NoC #0 requests
+            // would share B's initiator registers, so they wait for B.
+            let concurrent = noc == WriteNoc::Noc1;
+            let wait_readers = |d: &mut _, movers: &[DataMover<Noc0>]| {
+                for (t, m) in movers.iter().enumerate() {
+                    m.wait(d, &w).unwrap_or_else(|e| {
+                        panic!("round {round}: tile {t}'s reads did not finish: {e}")
+                    });
+                }
+            };
+            if !concurrent {
+                wait_readers(d, &movers);
+            }
+            for (m, (_, writes)) in writers.iter_mut().zip(&lists) {
+                m.submit_list(d, &w, writes).unwrap();
             }
             // The host on NoC #0 while the movers run.
             for ch in &chans {
                 let r = ch.range(HOST_BASE, host_data.len() as u64).unwrap();
                 d.dram_write(&w4, r, &host_data).unwrap();
             }
-            for (t, m) in movers.iter().enumerate() {
+            if concurrent {
+                wait_readers(d, &movers);
+            }
+            for (t, m) in writers.iter().enumerate() {
                 m.wait(d, &w).unwrap_or_else(|e| {
                     panic!("round {round} ({noc:?} writes): tile {t} did not finish: {e}")
                 });
@@ -218,8 +254,11 @@ fn every_tile_reads_on_noc0_and_writes_on_either_noc_and_nothing_hangs() {
             "MEASURE stress: {round} rounds on {n} tiles in {:.1?}, {gib:.1} GiB moved, every sampled byte intact",
             started.elapsed()
         );
-        for m in movers {
+        for m in writers {
             m.set_write_noc(d, &w, Niu::Noc0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+        for m in movers {
             m.stop(d, &w).unwrap();
         }
     });

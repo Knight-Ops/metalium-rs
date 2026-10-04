@@ -37,6 +37,8 @@ use crate::runtime::SemaphoreInit;
 /// Who reads or writes a circular buffer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Endpoint {
+    Reader,
+    Writer,
     /// The data mover on RISCV B.
     Mover,
     /// The unpack role (thread 0).
@@ -357,7 +359,7 @@ impl Requirements {
                 consumer,
             } = b.kind
             {
-                if pages == 0 || page % b.align != 0 || producer == consumer {
+                if pages == 0 || pages >= 0x8000 || page % b.align != 0 || producer == consumer {
                     return bad(format!(
                         "{}: a circular buffer needs pages, aligned pages, and a producer \
                          and consumer that differ",

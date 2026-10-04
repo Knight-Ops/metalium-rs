@@ -20,7 +20,7 @@ SECTIONS
     *(.text.hot .text.hot.*)
     *(.text.*11tt_firmware3noc13issue_dram_on*)
     *(.text.*11tt_firmware3noc8issue_on*)
-    /* The write path's NIU choice (`dm_b::issue_write`): taken by every
+    /* The write path's NIU choice (`issue_write` in mover.rs): taken by every
      * write, kept off the reads' stretch above. */
     *(.text.warm .text.warm.*)
     *(.text .text.*)

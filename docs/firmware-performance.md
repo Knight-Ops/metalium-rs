@@ -12,7 +12,8 @@ the Scoreboard rows it moved, and add a line to the Change log.
   - Tensix: the tile's debug timestamper, one counter for B and T0–T2.
   - Ethernet: E1's own `mcycle`, gated alone in `silicon_eth_clock` (ttsim does not
     model it; divergence row 71).
-  - *Host* figures use `Instant` and include PCIe.
+  - *Host* figures use `Instant` and include host submission and synchronization;
+    payload upload/download is included only when the benchmark times it.
 - **Each figure:** the median of 9 runs after a warm-up. Every benchmark checks
   that its data arrived intact.
 - **Code:**
@@ -31,23 +32,143 @@ the Scoreboard rows it moved, and add a line to the Change log.
 ## Scoreboard
 
 The single-tile mover and the Ethernet wire are near their ceilings. Card-wide
-GDDR6 reads reach 84% of the card since the NoC ownership rules (change log,
-2026-10-02); card-wide writes and 800G are still far off.
+GDDR6 reads reach 92% of the card with the current ownership rules and in-flight
+cap; card-wide writes and 800G are still off their ceilings. Raw mover and Ethernet
+rows were refreshed in run `1791060908`; these bypass the streaming executor.
 
 | Target | Now | Of ceiling | Goal |
 |---|--:|--:|---|
-| GDDR6, one tile, 64 KiB entries | 81.6 GB/s | 94% NoC link | hold |
+| GDDR6, one tile, 64 KiB entries | 81.4 GB/s | 94% NoC link | hold |
 | GDDR6, one tile, 4 KiB entries | 16.3 GB/s | 26% channel | cut per-entry cost |
-| GDDR6 reads, card, 120 tiles | 429 GB/s | 84% | 512 GB/s |
-| GDDR6 writes, card, 120 tiles (writes on NoC #1) | 266 GB/s | 52% | 512 GB/s |
-| GDDR6 reads + writes, card, 120 tiles (writes on NoC #1) | 343 GB/s | 67% | 512 GB/s |
+| GDDR6 reads, card, 120 tiles | 469 GB/s | 92% | 512 GB/s |
+| GDDR6 writes, card, 120 tiles (writes on NoC #1) | 389 GB/s | 76% | 512 GB/s |
+| GDDR6 reads + writes, card, 120 tiles (writes on NoC #1) | 403 GB/s | 79% | 512 GB/s |
 | Ethernet wire, one link (per-byte slope) | 48–51 GB/s | ~97% | hold |
-| 800G, both links streaming | 25.8 GB/s | 26% | 100 GB/s |
+| 800G, both links streaming | 27.0 GB/s | 27% | 100 GB/s |
 | Empty kernel, B → T0–T2 → B (device) | 566 cycles (0.42 µs) | — | lower |
 | Device busy, 16 queued 32×256×32 matmuls | 12.6% of wall | — | ~100% |
 | MNIST training, card 0, 1 tile (`tt-mnist --host`) | 1.4 ms/step | burn-flex 0.5 | ≤ burn-flex |
-| Transformer training, card 0, 1 tile (`tt-mnist --model transformer`) | 8.6 ms/step | burn-flex 4.3 | ≤ burn-flex |
+| Transformer training, card 0, 1 tile (`tt-mnist --model transformer`) | 8.8 ms/step | burn-flex 4.35 | ≤ burn-flex |
 | Requests that waited under the in-flight cap (120 tiles × 300 × 16 KiB, one channel) | 8762 per run | — | watch: revisit `MAX_IN_FLIGHT` if it binds below the NoC's own limit |
+
+## Streaming ownership rollout
+
+**Current architecture:** streaming ownership is the only GDDR compute scheduler.
+The legacy wave, B-only pipeline and two-host-queue NC schedulers are removed.
+`Session::enable_dram(b, nc)` requires both images; Burn rejects retired
+`TT_EXECUTION` and `TT_SCATTER` settings rather than silently ignoring them.
+`TT_PIPELINE=0` and `TT_BATCH=0` change overlap/waiting, not ownership.
+Standalone transfer/control primitives and diagnostic movers remain available.
+Known fresh-execution regressions are accepted to consolidate optimization work;
+the historical rollout gate did **not** pass. Measurements below predate removal
+and remain the legacy comparison baseline. Current sweeps compare serialized
+versus overlapped streaming only.
+
+After consolidation, slot reuse waits only for the earlier batch's pack where
+gathers and scatters do not meet in L1, the roles skip the retirement barrier after
+a region's last batch, credit waits run the full peer check every 64th poll, and
+consecutive transfers share a control list. Sweep run `1791067111` against
+`1791060004` (streaming, µs): traced 2048² add 2418.7 -> 2260.5 / 343.9 -> 325.1 /
+239.3 -> 228.6 on 1/8/32 tiles; fresh 64² add 18.86 -> 17.15 (legacy best 14.80);
+fresh 32-tile 256³ matmul 239.6 -> 239.7 (legacy best 181.1), host-bound at ~130 µs
+of enqueueing per op. MNIST 1.4 ms/step (unchanged), transformer 8.8 (burn-flex
+4.35). See [the ownership status](feature-streaming-dataflow-ownership.md#validation).
+
+Post-consolidation silicon run `1791063683` rechecks the identity benchmark under
+the default ownership scheduler: traced read/write payload is 178.29 GB/s each
+(356.58 combined) at 32 tiles, and 164.39 GB/s each (328.78 combined) at 120.
+These remain whole-operation host-timed useful-payload rates, not isolated DRAM
+read/write bandwidth. The removal does not claim an additional speedup.
+
+2026-10-03, silicon run `1791060004`, device 0. Resident B-reader / NC-writer
+ownership uses one host B commit per region and one role generation per compatible
+batch group. These are **host end-to-end medians**, not concurrent-core timestamper
+estimates: three warmups followed by 15 samples, against the best legacy B/NC path.
+
+| Workload | Tiles | Legacy best (µs) | Streaming (µs) | Ratio |
+|---|--:|--:|--:|--:|
+| Add 2048², traced | 1 | 3271.76 | 2418.66 | 0.739 |
+| Add 2048², traced | 8 | 457.59 | 343.87 | 0.751 |
+| Add 2048², traced | 32 | 281.61 | 239.33 | 0.850 |
+| Add 64², fresh | 1 | 14.80 | 18.86 | 1.275 |
+| Matmul 256³, fresh | 32 | 181.09 | 239.63 | 1.323 |
+
+The historical ≥10% mover-improvement gate passed, but the ≤5% regression gate
+failed. No universal speedup is claimed. The initial role stream keeps a
+retirement barrier between existing arithmetic batches, and fresh packets still
+carry per-batch script and credit work. Reducing that overhead is follow-up work.
+The sweep covers add 64²/512²/2048² and matmul 256³/512³ on 1/8/32 tiles, fresh
+and traced. Existing `Session::host_times`, transport traffic and
+`dataflow_stats`/`dataflow_progress` provide submission and ownership diagnostics.
+The known concurrent-NC timestamper corruption remains: streaming profiles can
+contain repeated or missing events even with role stamps disabled. A silicon
+test checks that profile collection preserves fresh/traced output correctness
+and reports export failures diagnostically; it does not certify device timings.
+
+```
+cargo xtask silicon --release --include-ignored --filter step60_streaming::streaming_performance_sweep
+cargo xtask silicon --release --include-ignored --filter step60_streaming::streaming_stress --timeout-secs 300
+```
+
+### GDDR and Ethernet remeasurement
+
+2026-10-03, device 0, release, AICLK 1350 MHz, GDDR 16000 MT/s.
+All benchmark invocations passed. Raw GDDR/Ethernet run `1791060908`, isolated
+NC/NoC #1 writes run `1791061578`, streaming runs `1791061555` and `1791061613`.
+Each throughput is a nine-sample median; the streaming benchmark uses three
+warmups per mode and phase and checks the identity output bit for bit.
+
+**Streaming workload:** an 8192² FP32 identity operation (`MUL_SCALAR 1.0`),
+256 MiB useful input and 256 MiB useful output, through B reads on NoC #0,
+resident T0/T1/T2 computation, and NC writes on NoC #1. Host timing includes
+submission, unpack/compute/pack, credits and synchronization, but excludes
+payload upload/download, trace capture and output validation. Read and write
+payload rates are the same bytes divided by the same whole-operation time:
+they are not independently timed physical DRAM bandwidth. Headers, padding and
+command traffic are not counted as useful payload. Concurrent NC device
+timestamps are not used.
+
+Results from the repeat run `1791061613`, GB/s:
+
+| Tiles | Streaming fresh read / write (each) | Streaming traced read / write (each) | Streaming traced combined | Best legacy traced combined |
+|--:|--:|--:|--:|--:|
+| 1 | 9.03 | 10.12 | 20.24 | 15.54 |
+| 8 | 53.30 | 80.00 | 160.00 | 111.60 |
+| 32 | 62.34 | 177.49 | 354.98 | 215.76 |
+| 120 | 72.88 | 163.86 | 327.71 | 244.09 |
+
+Traced streaming is 1.30×/1.43×/1.65×/1.34× the best legacy B/NC throughput,
+respectively. 32 tiles outperform 120 for this workload in both runs (354.97
+versus 325.86 GB/s in the first run). Fresh streaming still loses to the best
+legacy path: combined throughput at 120 tiles is 145.75 versus 186.31 GB/s,
+with latency 3.68 versus 2.88 ms. Consolidating the architecture accepts this
+regression; it does not overturn the failed historical performance gate.
+
+**Raw transfer baselines, not the streaming executor:**
+
+| Measurement | GB/s | Timing |
+|---|--:|---|
+| B read, one tile, all channels, 64 KiB entries | 81.36 | device |
+| NC write, one tile, NoC #1, all channels, 64 KiB entries | 74.94 | device |
+| B read, 120 tiles | 468.59 | device; host end-to-end 310.56 |
+| B write on NoC #1, 120 tiles | 389.36 | device; host end-to-end 314.47 |
+| B mixed read/write, writes on NoC #1, 120 tiles | 403.15 combined | device; host end-to-end 320.84 |
+| Ethernet, one link, one way, 32 × 128 KiB | 19.92 | host; device 20.23 |
+| Ethernet, two links, one way | 27.03 combined | host |
+| Ethernet, two links, both ways | 33.08 combined across both directions | host |
+| Ethernet staged wire slope, 64 → 128 KiB | 49.20 | E1 device |
+
+The isolated NC run has no concurrent B/role stamps. Card-wide raw measurements
+use B movers, including the NoC #1 write row: they do not measure 120 NC writers.
+Ethernet's E1 path is unchanged by streaming ownership. Its wire is still near
+50 GB/s per link, but store-and-forward staging, acknowledgement and host posting
+keep actual two-link one-way throughput at only 27% of the 100 GB/s ceiling.
+
+```
+cargo xtask bench --filter silicon_bench_memory --filter silicon_bench_eth --keep-going
+cargo xtask bench --filter step60_streaming::streaming_gddr_throughput
+BENCH_MOVER=nc BENCH_WRITE_NOC=1 cargo xtask bench --filter silicon_bench_memory::mover_write_sweep
+```
 
 ## GDDR6 through the data mover
 
@@ -418,12 +539,60 @@ difference is the host polling for the ack and posting the next send over PCIe.
   - tile-to-tile L1 over the NoC (the mover has no op for it)
   - card 1 (`cargo xtask bench --device all`)
 
+## Reader / writer specialisation (2026-10-03)
+
+B only reads GDDR and NC only writes it (`dm::Mover::permits`); each image is the
+shared `mover.rs` compiled with its direction's half. Standalone transfers
+(uploads, copies, block copies, row gathers and writes, padding fills) became
+kernel-less reader/writer packets on a transfer credit channel, so B no longer
+writes at all. `SIGNAL` / `WAIT_PEER`, `dm::Peer` and B's NoC #1 write path are
+gone: the "B writes on NoC #1" rows and the split-copy experiment above are
+history, measured on retired paths.
+
+Image sizes (`.text` + `.rodata` + `.bss`; B's limit 24,576 B):
+
+| Step | B | NC |
+|---|--:|--:|
+| Before | 24,240 (336 free) | ~22,900 |
+| SIGNAL / WAIT_PEER removed | 23,288 | 22,508 |
+| B's NoC #1 write path removed | 22,108 | 22,508 |
+| B never writes | 20,856 (3,720 free) | 23,096 |
+| NC never reads, launches, barriers, tilizes or moves PCIe | 20,856 | 14,840 |
+
+Silicon, card 0, release, against the same tree with B writing (the standalone
+transfers as B-only lists; end to end from the host, medians):
+
+- **Compute is untouched.** The streaming sweep (1 / 8 / 32 tiles) is within 3%
+  of the last run everywhere it measures the same thing; 64² add fresh 17.4 µs
+  on one tile (17.2 before).
+- **Models:** MNIST 1.3 ms/step on one tile, 0.9 on four (burn-flex 0.5), 91.96%
+  as the golden; transformer 8.72 ms/step (burn-flex 4.34), from 8.8.
+- **Large uploads got faster:** 1024² and 8192×1024 host-tilized on one tile
+  0.74 -> 0.50 ms and 4.97 -> 3.41 ms (-31%), presumably because B reads the next batch in
+  while NC writes the last (not isolated). 512×1024×1024 streamed on 8 tiles 1118 -> 1105 µs.
+- **Small uploads on many tiles got slower, 5-8%:** 64×784 on 8 tiles 53.5 -> 57.6 µs,
+  on 32 tiles 155 -> 165; 1024² on 8 tiles 464 -> 490; 8192×1024 on 8 / 32 tiles
+  2731 -> 2901 / 2769 -> 2945; the streamed 64×784×128 step on 8 tiles 74.9 ->
+  74.4 queued, 96.7 -> 98.0 synced (the step is unchanged within noise).
+  A one-tile 64×10 upload 7.0 -> 9.0 µs (+2 µs): the handoff, B starting NC and
+  waiting for its acknowledged write. What costs the many-tile uploads is the
+  packet's extra entries written over uncached PCIe (~6.7 ns a byte): a packet
+  carries a header and credits, 9 entries against 6; credits that cannot block
+  (the first `depth` reserves, the last pop) are left out, which took the 32-tile
+  upload from +16% to +6%. The remaining entries are the protocol's.
+- Gates: full silicon suite 296/296 on card 0, `step60_streaming`, `step56`,
+  `step62`, `step24` on card 1; `stress_noc_ownership` 137 s, `streaming_stress`
+  242 s, `stress_pipeline` 122 s clean.
+
 ## Change log
 
 Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-03 | — | B a pure reader, NC a pure writer. `SIGNAL` / `WAIT_PEER`, `dm::Peer` and B's NoC #1 writes removed; standalone transfers are kernel-less reader/writer packets (`Step::Transfer`, `dataflow::Stream::Transfer`); `Mover::permits` is the one direction table; `FILL_PAD` split with a new `PAD_WRITE`; each image compiles in only its direction. | B 24,240 -> 20,856 B (3.7 KB free from 0.3), NC ~22.9 -> 14.8 KB. Compute and the models unchanged (MNIST 1.3 ms/step, transformer 8.72); large host uploads -31%; small uploads on many tiles +5-8%, a one-tile 64×10 upload +2 µs. Silicon 296/296. |
+| 2026-10-03 | 1791063177 / 1791063683 | Consolidate GDDR compute under fixed streaming ownership; remove legacy scheduler selection and reject nonstreamable compute instead of falling back. Both firmware images required by `enable_dram`. | Full initial hardware audit 295/295, final strict ownership/cache/profile/benchmark checks 22/22, full host/simulator suite 710 passed. Mixed stress 60 s each on one/eight tiles, 39971/72561 rounds. Traced identity remains 357 / 329 GB/s combined at 32 / 120 tiles. Known fresh-dispatch regressions accepted; no universal speedup claimed. |
+| 2026-10-03 | 1791060908 / 1791061578 / 1791061613 | Remeasure raw GDDR/Ethernet and add a true streaming identity payload benchmark, repeated once. No Ethernet firmware change. | Raw 120-tile read / NoC #1 write / mixed: 469 / 389 / 403 GB/s (device). NC NoC #1 write: 74.94 GB/s on one tile. Streaming traced identity: 355 GB/s combined at 32 tiles, 328 at 120, versus legacy 216 / 244. Fresh still regresses. Two-link Ethernet one-way: 27.03 GB/s host end-to-end. |
 | 2026-10-03 | — | Asynchronous dispatch (B8): burn-tt's device calls return at once -- the caller names each result (a process-wide id, never reused) and computes its shape; the server thread translates ids and runs jobs in order; only downloads, traces and queries wait. A failed op poisons its result and is reported, with the op's name, at the attachment's next wait. | Per call, caller's side: 30-40 us -> 0.2 us. **MNIST** 1.8 -> 1.4 ms/step (burn-flex 0.5). **Transformer** 11.1 -> 8.6 ms/step (burn-flex 4.3): 2.0x. What is left is the server's own work per op, now all seen as the step's one wait (MNIST: 1.1 ms of 1.4; the transformer: nearly all of its step) -- building each op's lists and writing them over PCIe; traces and smaller lists are its levers. |
 | 2026-10-03 | — | `APPROX_MIN_TILES` and `SOFTMAX_DEVICE_MIN_TILES` removed: approximate ops follow their data at every size (exact mode alone keeps them on the host). Decided, not measured into: data is not to come back to the host to save a call; MNIST is to be made fast otherwise. | **MNIST** 1.1 -> 1.8 ms/step (burn-flex 0.5): 43 device calls a step at ~33 us each are ~1.5 ms of it (B8). **Transformer** 12.0 -> 11.1 ms/step (burn-flex 4.4); 0.16 MB downloaded over 50 steps -- the loss's last `mean` -- from 11.65. |
 | 2026-10-03 | — | Indexing on the card (D4): the loss's gather and its backward on the SFPU; `select`/`select_add`, so `nn::Embedding` and its gradient, on the mover (`gather_rows`, `write_rows`, `rows_add`). `tt-mnist --model transformer` prints where the time went per step. A latent race closed in `copy`/`copy_blocks` (a `WAIT` between reads and writes). | **Transformer** 11.9-12.0 ms/step (burn-flex 4.4-4.6), from 8.4-10.3: the embedding on the card costs ~0.9 ms a step against the host's free lookup -- its lists, two 32-byte entries a row a tile column, written over uncached PCIe (a record carrying the indices would cut that ~18x). Per step: 125 element-wise calls 4.5 ms at 36 us each, 16 uploads 1.7 ms, 14 downloads 1.0 ms, 27 matmuls 1.0 ms, 25 reductions 0.8 ms, outside calls 2.8 ms -- ~7 ms of 12 is the per-call round trip (B8). **MNIST** 1.1 ms/step, unchanged. `APPROX_MIN_TILES` at 0 measured again: transformer 10.0-11.0 with almost nothing downloaded, MNIST 1.7-1.8; kept at 8. |

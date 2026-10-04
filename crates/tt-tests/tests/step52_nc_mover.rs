@@ -1,12 +1,13 @@
-//! RISCV NC's data mover (`tt_isa::dm::Mover::NC`, `dm_nc`): the same mover
-//! as B's, on NC's own mailbox, list ring and scratch, so the two run side by
-//! side on one tile.
+//! RISCV NC's data mover (`tt_isa::dm::Mover::NC`, `dm_nc`): the writer, on
+//! NC's own mailbox, list ring and scratch, so it runs beside B on one tile.
 //!
-//! NC passes what `step16_dm` and `step49_in_flight` ask of B -- reads through
-//! every channel and port, writes on either NoC, a refused descriptor answered,
-//! more requests than the NIU counter holds -- and then B and NC move disjoint
-//! data at the same time, B reading on NoC #0 while NC writes on NoC #1, the
-//! reader / writer split (`docs/tt-metal-concepts-review.md`, G6).
+//! NC passes what `step16_dm` and `step49_in_flight` ask of a mover's writes --
+//! every channel and port, either NoC, a refused descriptor answered, more
+//! requests than the NIU counter holds -- and refuses everything B does: a
+//! read, on the host and, if one is sent anyway, on the tile
+//! (`Mover::permits`). Then B and NC move disjoint data at the same time, B
+//! reading on NoC #0 while NC writes on NoC #1, the reader / writer split
+//! (`docs/tt-metal-concepts-review.md`, G6).
 
 use tt_device::tlb::WindowKind;
 use tt_isa::dm::{self, op, Mover};
@@ -45,7 +46,7 @@ fn start(d: &mut Dev<'_>, mover: Mover) -> DataMover<Noc0> {
 }
 
 #[test]
-fn nc_reads_and_writes_every_channel_on_either_noc() {
+fn nc_writes_every_channel_on_either_noc() {
     in_device(|d| {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
@@ -53,28 +54,84 @@ fn nc_reads_and_writes_every_channel_on_either_noc() {
         let mut m = start(d, Mover::NC);
         let t = m.tile();
         for (k, ch) in dram.channels().enumerate() {
-            for port in 0..PORTS {
-                let r = ch
-                    .range(DRAM_AT + port as u64 * 0x10_0000, LEN as u64)
-                    .unwrap();
-                let data = pattern(LEN, (k * 3) as u32 + port as u32);
-                d.dram_write(&w4, r, &data).unwrap();
-                m.read(d, &w, r, port, L1_AT).unwrap();
-                let mut back = vec![0u8; LEN];
-                d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
-                assert!(back == data, "NC read, channel {} port {port}", ch.index());
-            }
             for noc in [WriteNoc::Noc1, WriteNoc::Noc0, WriteNoc::Alternate] {
                 m.set_write_noc(d, &w, noc).unwrap();
-                let r = ch.range(DRAM_AT + 0x40_0000, LEN as u64).unwrap();
-                let data = pattern(LEN, k as u32 + 100);
-                d.l1_write(&w, t, L1_AT as u64, &data).unwrap();
-                m.write(d, &w, L1_AT, r, 1).unwrap();
-                let mut back = vec![0u8; LEN];
-                d.dram_read(&w4, r, &mut back).unwrap();
-                assert!(back == data, "NC write {noc:?}, channel {}", ch.index());
+                for port in 0..PORTS {
+                    let r = ch
+                        .range(DRAM_AT + port as u64 * 0x10_0000 + 0x40_0000, LEN as u64)
+                        .unwrap();
+                    let data = pattern(LEN, (k * 3) as u32 + port as u32 + 100);
+                    d.l1_write(&w, t, L1_AT as u64, &data).unwrap();
+                    m.write(d, &w, L1_AT, r, port).unwrap();
+                    let mut back = vec![0u8; LEN];
+                    d.dram_read(&w4, r, &mut back).unwrap();
+                    assert!(
+                        back == data,
+                        "NC write {noc:?}, channel {} port {port}",
+                        ch.index()
+                    );
+                }
             }
         }
+        m.stop(d, &w).unwrap();
+    });
+}
+
+/// NC has no read path: the host refuses a read before sending it, and a raw
+/// one is answered `DIRECTION` and moves nothing.
+#[test]
+fn nc_does_not_read_gddr() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let mut m = start(d, Mover::NC);
+        let t = m.tile();
+        let ch = dram.channel(0).unwrap();
+        let r = ch.range(DRAM_AT + 0x40, 64).unwrap();
+        d.dram_write(&w4, r, &pattern(64, 3)).unwrap();
+        d.l1_write(&w, t, L1_AT as u64, &[0u8; 64]).unwrap();
+        let e = m.read(d, &w, r, 0, L1_AT).unwrap_err();
+        assert!(matches!(e, DmError::Invalid(dm::error::DIRECTION)), "{e}");
+        // Every entry NC does not run, from a list.
+        for entry in [
+            [op::READ_TRANSPOSED, 0, 0, 0x40, L1_AT, 4096, 0, 0],
+            [op::BARRIER, 1, 0, 0, 0, 0, 0, 0],
+            [op::FILL, 0, 0, L1_AT, 0, 0, 0, 0],
+            [op::KERNEL, 1, 0, 0, 0, 0, 0, 0],
+        ] {
+            let e = m.enqueue(d, &w, &[entry]).unwrap_err();
+            assert!(matches!(e, DmError::Invalid(dm::error::DIRECTION)), "{e}");
+        }
+        // The tile's own refusal, of a read the host did not check.
+        let at = |word| Mover::NC.at(word);
+        for (word, v) in [
+            (dm::OP, op::READ),
+            (dm::CHANNEL, 0),
+            (dm::PORT, 0),
+            (dm::DRAM_OFFSET, (DRAM_AT + 0x40) as u32),
+            (dm::L1_ADDR, L1_AT),
+            (dm::LEN, 64),
+        ] {
+            d.write32(&w, t, at(word), v).unwrap();
+        }
+        let seq = d.read32(&w, t, at(dm::DONE)).unwrap() + 1;
+        d.write32(&w, t, at(dm::SEQ), seq).unwrap();
+        let mut polls = 0;
+        while d.read32(&w, t, at(dm::DONE)).unwrap() != seq {
+            d.tick(tt_device::core_control::CYCLES_PER_POLL);
+            polls += 1;
+            assert!(polls < 1_000_000, "NC's mover did not answer");
+        }
+        assert_eq!(
+            d.read32(&w, t, at(dm::ERROR)).unwrap(),
+            dm::error::DIRECTION
+        );
+        let mut back = [0u8; 64];
+        d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
+        assert_eq!(back, [0u8; 64], "the refused read landed");
+        d.write32(&w, t, at(dm::SEQ), 0).unwrap();
+        d.write32(&w, t, at(dm::DONE), 0).unwrap();
         m.stop(d, &w).unwrap();
     });
 }
@@ -101,10 +158,10 @@ fn nc_refuses_a_bad_descriptor_and_survives() {
         d.write32(&w, t, at(dm::SEQ), 0).unwrap();
         d.write32(&w, t, at(dm::DONE), 0).unwrap();
         let ch = dram.channel(0).unwrap();
-        m.read(d, &w, ch.range(0x40, 64).unwrap(), 0, L1_AT)
+        m.write(d, &w, L1_AT, ch.range(0x40, 64).unwrap(), 0)
             .unwrap();
         let e = m
-            .read(d, &w, ch.range(0x10, 64).unwrap(), 0, L1_AT)
+            .write(d, &w, L1_AT, ch.range(0x08, 64).unwrap(), 0)
             .unwrap_err();
         assert!(matches!(e, DmError::Invalid(dm::error::ALIGNMENT)), "{e}");
         m.stop(d, &w).unwrap();
@@ -124,13 +181,13 @@ fn nc_lands_more_requests_than_the_counter_holds() {
         let t = m.tile();
         let ch = dram.channels().next().unwrap();
         let data = pattern((ENTRIES * SMALL) as usize, 5);
-        d.dram_write(&w4, ch.range(DRAM_AT, data.len() as u64).unwrap(), &data)
-            .unwrap();
+        d.l1_write(&w, t, L1_AT as u64, &data).unwrap();
+        let region = ch.range(DRAM_AT, data.len() as u64).unwrap();
         let list: Vec<[u32; 8]> = (0..ENTRIES)
             .map(|i| {
                 let at = DRAM_AT as u32 + i * SMALL;
                 [
-                    op::READ,
+                    op::WRITE,
                     ch.index() as u32,
                     i % 3,
                     at,
@@ -142,13 +199,12 @@ fn nc_lands_more_requests_than_the_counter_holds() {
             })
             .collect();
         for cap in [0u32, dm::TILE_IN_FLIGHT_CAP, 1] {
-            d.l1_write(&w, t, L1_AT as u64, &vec![0u8; data.len()])
-                .unwrap();
+            d.dram_write(&w4, region, &vec![0u8; data.len()]).unwrap();
             m.set_in_flight_cap(d, &w, cap).unwrap();
             let n = m.enqueue(d, &w, &list).unwrap();
             m.wait_for(d, &w, n).unwrap();
             let mut back = vec![0u8; data.len()];
-            d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
+            d.dram_read(&w4, region, &mut back).unwrap();
             assert!(back == data, "cap {cap}: the list did not land whole");
         }
         m.stop(d, &w).unwrap();

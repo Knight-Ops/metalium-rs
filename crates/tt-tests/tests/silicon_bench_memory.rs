@@ -1,4 +1,4 @@
-//! Memory throughput: what RISCV B's data mover gets out of GDDR6, device-timed.
+//! Memory throughput: what the data mover gets out of GDDR6, device-timed.
 //!
 //! `cargo xtask bench --filter silicon_bench_memory`
 //!
@@ -95,11 +95,23 @@ struct One<'a> {
 /// `BENCH_MOVER=nc`: the single-tile benchmarks run RISCV NC's mover
 /// (`dm::Mover::NC`) instead of B's -- the same mover code, on a core whose
 /// instruction cache may be smaller.
+/// `BENCH_WRITE_NOC=1` routes single-tile writes through NoC #1 (default #0;
+/// NC's mover only).
 fn bench_mover() -> (dm::Mover, &'static [u8]) {
     match std::env::var("BENCH_MOVER").as_deref() {
         Ok("nc") => (dm::Mover::NC, tt_firmware_images::DM_NC.1),
         _ => (dm::Mover::B, tt_firmware_images::DM_B.1),
     }
+}
+
+/// Whether the chosen mover can run a benchmark that writes GDDR: only NC's
+/// can (`dm::Mover::permits`), so with B (the default) it is skipped.
+fn bench_writes(what: &str) -> bool {
+    let can = bench_mover().0 != dm::Mover::B;
+    if !can {
+        println!("MEASURE skipping {what}: B does not write GDDR; BENCH_MOVER=nc runs it");
+    }
+    can
 }
 
 /// The gate tile's mover, traced, with each channel's first MiB at [`BASE`]
@@ -114,6 +126,17 @@ fn one_tile(d: &mut Dev<'static>, f: impl FnOnce(&mut One<'_>)) {
     let (mover, image) = bench_mover();
     println!("MEASURE mover: {:?}", mover.core);
     let m = DataMover::start_on(d, &w, t, &dram, mover, image).unwrap();
+    let write_noc = match std::env::var("BENCH_WRITE_NOC").as_deref() {
+        Err(_) | Ok("0") => WriteNoc::Noc0,
+        Ok("1") => WriteNoc::Noc1,
+        Ok(value) => panic!("BENCH_WRITE_NOC={value}: expected 0 or 1"),
+    };
+    assert!(
+        write_noc == WriteNoc::Noc0 || mover == dm::Mover::NC,
+        "BENCH_WRITE_NOC=1 needs BENCH_MOVER=nc: B writes on NoC #0 only"
+    );
+    m.set_write_noc(d, &w, write_noc).unwrap();
+    println!("MEASURE write routing: {write_noc:?}");
     d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
     let mut one = One {
         d,
@@ -243,6 +266,10 @@ fn sweep(one: &mut One<'_>, kind: u32) {
 #[test]
 #[ignore = "benchmark"]
 fn mover_read_sweep() {
+    if bench_mover().0 != dm::Mover::B {
+        println!("MEASURE skipping mover_read_sweep: only B reads GDDR");
+        return;
+    }
     on_card(|d| {
         one_tile(d, |one| {
             let data = pattern(1 << 20, 7);
@@ -285,6 +312,9 @@ fn mover_read_sweep() {
 #[test]
 #[ignore = "benchmark"]
 fn mover_write_sweep() {
+    if !bench_writes("mover_write_sweep") {
+        return;
+    }
     on_card(|d| {
         one_tile(d, |one| {
             sweep(one, op::WRITE);
@@ -319,78 +349,6 @@ fn mover_write_sweep() {
 /// The mover's fixed costs: a list of `WAIT`s (loop, decode, a NoC drain
 /// check), and the list itself (an empty-of-data one-entry list). Traced and
 /// untraced from the host, too: what tracing itself costs the numbers above.
-/// Would a mover image specialised to one direction be faster than the
-/// shared one? (checklist 9.15, B/NC specialisation.) One tile's mover runs
-/// the same reads and writes four ways: all reads, all writes, alternating
-/// one by one, and in blocks of 8 (a gather record's worth, then a scatter's,
-/// as a pipelined list runs them). With the split (`Session::
-/// set_scatter_mover`) each mover only ever runs one direction's code, so a
-/// shared image already keeps the other direction out of its instruction
-/// cache; what specialisation could add is the mixed lists' cost per entry
-/// over the pure lists' average -- the read and write paths evicting each
-/// other. `BENCH_MOVER=nc` runs NC's mover.
-#[test]
-#[ignore = "benchmark"]
-fn mover_mixed_directions() {
-    on_card(|d| {
-        one_tile(d, |one| {
-            let ch = one.dram.channels().next().unwrap().index();
-            let t = one.m.tile();
-            let src = pattern(L1_SPAN as usize, 5);
-            one.d.write(&one.w, t, L1 as u64, &src).unwrap();
-            for len in [64u32, 1024, 4096] {
-                const N: u32 = 128;
-                let read =
-                    |i: u32| entry(op::READ, ch, 0, BASE + (i * len) as u64, L1 + i * len, len);
-                let write = |i: u32| {
-                    entry(
-                        op::WRITE,
-                        ch,
-                        0,
-                        BASE + (32 << 20) + (i * len) as u64,
-                        L1 + (N + i) * len,
-                        len,
-                    )
-                };
-                let lists: [(&str, Vec<Entry>); 4] = [
-                    ("reads", (0..N).map(read).collect()),
-                    ("writes", (0..N).map(write).collect()),
-                    (
-                        "alternating",
-                        (0..N)
-                            .map(|i| if i % 2 == 0 { read(i) } else { write(i) })
-                            .collect(),
-                    ),
-                    (
-                        "blocks of 8",
-                        (0..N)
-                            .map(|i| if (i / 8) % 2 == 0 { read(i) } else { write(i) })
-                            .collect(),
-                    ),
-                ];
-                let mut per = Vec::new();
-                for (what, list) in &lists {
-                    let cycles = list_cycles(one.d, &one.w, &mut one.m, list);
-                    let e = cycles.map(|c| c / N as f64);
-                    report(
-                        &format!("mover {len:>5} B {what:<12} per entry"),
-                        "cycles",
-                        "device",
-                        e,
-                    );
-                    per.push(e.median);
-                }
-                let pure = (per[0] + per[1]) / 2.0;
-                println!(
-                    "MEASURE mixed {len:>5} B: alternating {:.3}x, blocks of 8 {:.3}x the pure lists' average ({pure:.0} cycles)",
-                    per[2] / pure,
-                    per[3] / pure
-                );
-            }
-        });
-    });
-}
-
 #[test]
 #[ignore = "benchmark"]
 fn mover_overhead() {
@@ -476,6 +434,16 @@ struct Fleet {
 }
 
 fn fleet(d: &mut Dev<'static>) -> Fleet {
+    fleet_on(d, dm::Mover::B)
+}
+
+/// Every tile's `mover`, traced: B's, or NC's for the benchmarks of NoC #1
+/// writes (only NC's image has them).
+fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
+    let image = match mover.core {
+        tt_isa::tensix::Core::NC => tt_firmware_images::DM_NC.1,
+        _ => tt_firmware_images::DM_B.1,
+    };
     let w = d.alloc_window(WindowKind::TwoMib).unwrap();
     let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
     let dram = d.dram_grid(&w).unwrap();
@@ -486,9 +454,9 @@ fn fleet(d: &mut Dev<'static>) -> Fleet {
     let mut movers = Vec::new();
     for t in coords {
         let t = tile(d, t.x(), t.y());
-        match DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1) {
+        match DataMover::start_on(d, &w, t, &dram, mover, image) {
             Ok(m) => {
-                d.write32(&w, t, dm::TRACE, 1).unwrap();
+                d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
                 movers.push(m);
             }
             Err(e) => println!(
@@ -573,8 +541,6 @@ fn skew(
 enum Mix {
     Read,
     Write,
-    /// Reads and writes alternating.
-    Half,
     /// Reads, every tile from channel 0 (through its three ports).
     OneChannel,
     /// Writes, every tile to channel 0: whether one channel takes a channel's
@@ -711,7 +677,6 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
         };
         let kind = match mix {
             Mix::Write | Mix::OneChannelWrite => op::WRITE,
-            Mix::Half if i % 2 == 1 => op::WRITE,
             _ => op::READ,
         };
         let per_tile = if matches!(
@@ -846,11 +811,7 @@ fn measure(
         Stats::of(runs.iter().map(|r| r.host_us)),
         peak,
     );
-    let link = if mix == Mix::Half {
-        f.c.noc_link_both()
-    } else {
-        f.c.noc_link()
-    };
+    let link = f.c.noc_link();
     let per = Stats::of(
         runs.iter()
             .flat_map(|r| r.rates.iter().map(|rate| shape.bytes() / rate * 1e6)),
@@ -891,7 +852,8 @@ fn measure(
 fn gddr_aggregate() {
     on_card(|d| {
         let t0 = Instant::now();
-        let mut f = fleet(d);
+        let mover = bench_mover().0;
+        let mut f = fleet_on(d, mover);
         let have = f.movers.len();
         println!(
             "MEASURE gddr_aggregate: {have} movers running, started in {:.1?}",
@@ -930,7 +892,17 @@ fn gddr_aggregate() {
                 c
             }
         };
-        for mix in [Mix::Read, Mix::Write, Mix::Half, Mix::OneChannel] {
+        // B reads and NC writes: each mix runs on the mover that has it
+        // (`BENCH_MOVER=nc` for the writes). Reads and writes together are
+        // what the streaming sweep measures.
+        for mix in [Mix::Read, Mix::Write, Mix::OneChannel] {
+            if (mix == Mix::Write) != (mover != dm::Mover::B) {
+                println!(
+                    "MEASURE skipping the {mix:?} mix on {:?}: B reads, NC writes",
+                    mover.core
+                );
+                continue;
+            }
             if mix == Mix::Write {
                 for m in &f.movers {
                     d.write(&f.w, m.tile(), L1 as u64, &src).unwrap();
@@ -978,19 +950,21 @@ fn gddr_aggregate() {
             }
         }
         // A tile's write landed: tile 0's first entry, its L1's first 64 KiB.
-        let list = agg_list(&f, 0, have, Mix::Write, Shape::AGG);
-        let ch = f.dram.channel(list[1][1] as u8).unwrap();
-        let mut back = vec![0u8; AGG_LEN as usize];
-        d.dram_read(
-            &f.w4,
-            ch.range(list[1][3] as u64, AGG_LEN as u64).unwrap(),
-            &mut back,
-        )
-        .unwrap();
-        assert!(
-            back[..] == src[..AGG_LEN as usize],
-            "tile 0's write did not land"
-        );
+        if mover != dm::Mover::B {
+            let list = agg_list(&f, 0, have, Mix::Write, Shape::AGG);
+            let ch = f.dram.channel(list[1][1] as u8).unwrap();
+            let mut back = vec![0u8; AGG_LEN as usize];
+            d.dram_read(
+                &f.w4,
+                ch.range(list[1][3] as u64, AGG_LEN as u64).unwrap(),
+                &mut back,
+            )
+            .unwrap();
+            assert!(
+                back[..] == src[..AGG_LEN as usize],
+                "tile 0's write did not land"
+            );
+        }
         let bound = f.skew_bound.iter().copied().max().unwrap_or(0);
         println!(
             "MEASURE gddr_aggregate: 'together' spans carry up to {bound} cycles ({:.2} us) of counter-offset uncertainty",
@@ -999,7 +973,7 @@ fn gddr_aggregate() {
         let Fleet { w, movers, .. } = f;
         for m in movers {
             let t = m.tile();
-            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            d.write32(&w, t, mover.at(dm::TRACE), 0).unwrap();
             m.stop(d, &w).unwrap();
         }
     });
@@ -1118,13 +1092,14 @@ fn gddr_aggregate_affinity() {
 /// writes on each NIU (`tt_isa::dm::WRITE_NOC`; reads are always NoC #0's).
 /// Each GDDR endpoint is one NoC's (`DramChannel::owns`), so the mixes with
 /// writes on NoC #1 put both NoCs on the card at once without sharing an
-/// endpoint -- the SYS-1419 hang needs one endpoint fed by both.
-/// `AGG_TILES` picks the tile counts, as there.
+/// endpoint -- the SYS-1419 hang needs one endpoint fed by both. Run on NC's
+/// mover, the only one with NoC #1 writes. `AGG_TILES` picks the tile
+/// counts, as there.
 #[test]
 #[ignore = "benchmark"]
 fn gddr_aggregate_nocs() {
     on_card(|d| {
-        let mut f = fleet(d);
+        let mut f = fleet_on(d, dm::Mover::NC);
         let shape = agg_shape();
         println!("MEASURE entries: {} x {} B", shape.entries, shape.len);
         let have = f.movers.len();
@@ -1150,7 +1125,7 @@ fn gddr_aggregate_nocs() {
             }
             let mixes: Vec<Mix> = match std::env::var("AGG_MIXES") {
                 Ok(s) if s == "onechannel" => vec![Mix::OneChannelWrite],
-                _ => vec![Mix::Write, Mix::Half, Mix::OneChannelWrite],
+                _ => vec![Mix::Write, Mix::OneChannelWrite],
             };
             for mix in mixes {
                 let peak = if mix == Mix::OneChannelWrite {
@@ -1193,7 +1168,7 @@ fn gddr_aggregate_nocs() {
             let t = m.tile();
             m.set_write_noc(d, &w, Niu::Noc0).unwrap();
             m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
-            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            d.write32(&w, t, dm::Mover::NC.at(dm::TRACE), 0).unwrap();
             m.stop(d, &w).unwrap();
         }
     });
@@ -1282,17 +1257,17 @@ fn gddr_in_flight() {
     });
 }
 
-/// How a tile copies GDDR -> L1 -> GDDR, block by block ([`copy_lists`]).
+/// How a tile copies GDDR -> L1 -> GDDR, block by block ([`copy_lists`]): B
+/// reads each block into L1 and NC writes it out, a transfer packet
+/// (`dm::op::PAIR`), the credits' depth the difference.
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum CopyScheme {
-    /// B alone: read a block, wait, write it, wait.
-    Sequential,
-    /// B alone, software-pipelined: block k+1's read goes out with block
-    /// k's write, then one wait for both.
-    Pipelined,
-    /// B reads, NC writes: B signals each block read; NC waits for it, writes
-    /// it and signals; B waits for NC before refilling a buffer.
-    Split,
+    /// One credit: B reads the next block only once NC's write of the last
+    /// is acknowledged.
+    Serial,
+    /// Two credits, alternating halves of L1: B reads block k + 1 while NC
+    /// writes block k.
+    Overlapped,
 }
 
 /// The size of a block: double-buffered in L1.
@@ -1319,19 +1294,12 @@ fn copy_entry() -> u32 {
         .unwrap_or(COPY_BLOCK)
 }
 
-/// Tile `t`'s lists for one run: B's, and NC's (empty but for
-/// [`CopyScheme::Split`]). Block `k` comes from channel `(k + t) % 8` at the
-/// tile's MiB there, through L1 buffer `k % 2`, and goes to the same place
-/// above [`COPY_DST`]. `base_b` and `base_nc` are the movers' progress words
-/// before the run, which the waits count from.
-fn copy_lists(
-    f: &Fleet,
-    t: usize,
-    n: usize,
-    copy: CopyScheme,
-    base_b: u32,
-    base_nc: u32,
-) -> (Vec<Entry>, Vec<Entry>) {
+/// Tile `t`'s lists for one run on B: the barrier that starts every tile
+/// together, then the transfer packet. Block `k` comes from channel
+/// `(k + t) % 8` at the tile's MiB there, through L1 buffer `k % 2`, and goes
+/// to the same place above [`COPY_DST`].
+fn copy_lists(f: &Fleet, t: usize, n: usize, copy: CopyScheme) -> (Vec<Entry>, Vec<Entry>) {
+    use tt_isa::dataflow::{Action, Stream};
     let chans: Vec<u8> = f.dram.channels().map(|c| c.index()).collect();
     let nc_ = chans.len() as u32;
     let coord = f.movers[0].tile();
@@ -1353,10 +1321,49 @@ fn copy_lists(
             })
             .collect()
     };
-    let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
-    let signal = [op::SIGNAL, 0, 0, 0, 0, 0, 0, 0];
-    let wait_peer = |peer: u32, target: u32| [op::WAIT_PEER, peer, target, 0, 0, 0, 0, 0];
-    let mut b = vec![[
+    let depth = match copy {
+        CopyScheme::Serial => 1,
+        CopyScheme::Overlapped => 2,
+    };
+    let credit = |action: Action| {
+        [
+            op::CB,
+            Stream::Transfer.word(),
+            action.word(),
+            depth,
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+    let (mut reader, mut writer) = (Vec::new(), Vec::new());
+    for k in 0..copy_blocks() {
+        reader.push(credit(Action::Reserve));
+        reader.extend(block(k, op::READ));
+        reader.push(credit(Action::Push));
+        writer.push(credit(Action::Wait));
+        writer.extend(block(k, op::WRITE));
+        writer.push(credit(Action::Pop));
+    }
+    assert!(
+        1 + reader.len() + writer.len() <= dm::LIST_MAX as usize,
+        "a packet of {} entries; raise COPY_ENTRY",
+        1 + reader.len() + writer.len()
+    );
+    let mut packet = vec![[
+        op::PAIR,
+        reader.len() as u32,
+        writer.len() as u32,
+        depth,
+        0,
+        0,
+        0,
+        0,
+    ]];
+    packet.extend(reader);
+    packet.extend(writer);
+    let barrier = vec![[
         op::BARRIER,
         n as u32,
         coord.x() as u32,
@@ -1366,86 +1373,34 @@ fn copy_lists(
         0,
         0,
     ]];
-    let mut nc = Vec::new();
-    match copy {
-        CopyScheme::Sequential => {
-            for k in 0..copy_blocks() {
-                b.extend(block(k, op::READ));
-                b.push(wait);
-                b.extend(block(k, op::WRITE));
-                b.push(wait);
-            }
-        }
-        CopyScheme::Pipelined => {
-            b.extend(block(0, op::READ));
-            b.push(wait);
-            for k in 0..copy_blocks() {
-                if k + 1 < copy_blocks() {
-                    b.extend(block(k + 1, op::READ));
-                }
-                b.extend(block(k, op::WRITE));
-                b.push(wait);
-            }
-        }
-        CopyScheme::Split => {
-            for k in 0..copy_blocks() {
-                if k >= 2 {
-                    // Buffer k % 2 is free once NC has written block k - 2.
-                    b.push(wait_peer(1, base_nc.wrapping_add(k - 1)));
-                }
-                b.extend(block(k, op::READ));
-                b.push(signal);
-                nc.push(wait_peer(0, base_b.wrapping_add(k + 1)));
-                nc.extend(block(k, op::WRITE));
-                nc.push(signal);
-            }
-        }
-    }
-    (b, nc)
+    (barrier, packet)
 }
 
 /// [`copy_pipeline`]'s run of `n` tiles: bytes copied over the earliest
-/// barrier release to the latest list end of either mover, on tile 0's clock.
-fn copy_run(
-    d: &mut Dev<'_>,
-    f: &mut Fleet,
-    ncs: &mut [DataMover<Noc0>],
-    n: usize,
-    copy: CopyScheme,
-) -> f64 {
+/// barrier release to the latest list end, on tile 0's clock.
+fn copy_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, copy: CopyScheme) -> f64 {
     let coord = f.movers[0].tile();
     d.write32(&f.w, coord, dm::BARRIER_COUNTER, 0).unwrap();
     let mut lists = Vec::new();
     for t in 0..n {
         let tile = f.movers[t].tile();
-        let base_b = d.read32(&f.w, tile, dm::Mover::B.at(dm::PROGRESS)).unwrap();
-        let base_nc = d
-            .read32(&f.w, tile, dm::Mover::NC.at(dm::PROGRESS))
-            .unwrap();
-        lists.push(copy_lists(f, t, n, copy, base_b, base_nc));
+        lists.push(copy_lists(f, t, n, copy));
         d.configure_trace(&f.w, tile, TRACE_BUFFER, TRACE_BUFFER_BYTES)
             .unwrap();
     }
-    for (t, (b, nc)) in lists.iter().enumerate() {
-        // NC's first, so it is waiting when B's first signal comes.
-        if !nc.is_empty() {
-            ncs[t].enqueue(d, &f.w, nc).unwrap();
-        }
-        f.movers[t].enqueue(d, &f.w, b).unwrap();
+    for (t, (barrier, packet)) in lists.iter().enumerate() {
+        f.movers[t].enqueue(d, &f.w, barrier).unwrap();
+        f.movers[t].enqueue(d, &f.w, packet).unwrap();
     }
     for t in 0..n {
         f.movers[t].drain(d, &f.w).unwrap();
-        if !lists[t].1.is_empty() {
-            ncs[t].drain(d, &f.w).unwrap();
-        }
     }
     let (mut first, mut last) = (i64::MAX, i64::MIN);
     for t in 0..n {
         let trace = d
             .read_trace(&f.w, f.movers[t].tile(), TRACE_BUFFER)
             .unwrap();
-        // B's barrier is the first entry to end on the tile: NC's first
-        // entry waits on B's first signal, after it.
+        // B's barrier is the first entry to end on the tile.
         let released = trace
             .iter()
             .find(|e| ev::split(e.token) == (ev::MOVER, ev::ENTRY_END))
@@ -1464,21 +1419,20 @@ fn copy_run(
     f.c.rate(bytes, (last - first) as f64)
 }
 
-/// GDDR -> L1 -> GDDR copies, double-buffered, B alone against B reading
-/// while NC writes (`CopyScheme`): what a second mover per tile buys once each
-/// tile's reads and writes can overlap. Writes go out on NoC #1 in every
-/// scheme, so only the scheduling differs. `AGG_TILES` picks the tile counts.
+/// GDDR -> L1 -> GDDR copies as transfer packets (`CopyScheme`): B reads and
+/// NC writes, on NoC #1, with one credit or two. What the second mover buys
+/// once a tile's reads and writes overlap. `AGG_TILES` picks the tile counts.
 #[test]
 #[ignore = "benchmark"]
 fn copy_pipeline() {
     on_card(|d| {
         let mut f = fleet(d);
         let have = f.movers.len();
-        let mut ncs: Vec<DataMover<Noc0>> = f
+        let ncs: Vec<DataMover<Noc0>> = f
             .movers
             .iter()
             .map(|m| {
-                DataMover::start_on(
+                let nc = DataMover::start_on(
                     d,
                     &f.w,
                     m.tile(),
@@ -1486,15 +1440,13 @@ fn copy_pipeline() {
                     dm::Mover::NC,
                     tt_firmware_images::DM_NC.1,
                 )
-                .unwrap()
+                .unwrap();
+                nc.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
+                d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 1)
+                    .unwrap();
+                nc
             })
             .collect();
-        for (m, nc) in f.movers.iter().zip(&ncs) {
-            m.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
-            nc.set_write_noc(d, &f.w, WriteNoc::Noc1).unwrap();
-            d.write32(&f.w, nc.tile(), dm::Mover::NC.at(dm::TRACE), 1)
-                .unwrap();
-        }
         let counts: Vec<usize> = match std::env::var("AGG_TILES") {
             Ok(s) => s
                 .split(',')
@@ -1516,16 +1468,10 @@ fn copy_pipeline() {
                 .unwrap();
             }
         }
-        for copy in [
-            CopyScheme::Sequential,
-            CopyScheme::Pipelined,
-            CopyScheme::Split,
-        ] {
+        for copy in [CopyScheme::Serial, CopyScheme::Overlapped] {
             for &n in &counts {
-                copy_run(d, &mut f, &mut ncs, n, copy);
-                let rates: Vec<f64> = (0..REPS)
-                    .map(|_| copy_run(d, &mut f, &mut ncs, n, copy))
-                    .collect();
+                copy_run(d, &mut f, n, copy);
+                let rates: Vec<f64> = (0..REPS).map(|_| copy_run(d, &mut f, n, copy)).collect();
                 let bytes = (copy_blocks() * COPY_BLOCK) as f64 * n as f64;
                 report_rate(
                     &format!("copy {copy:?} {n:>3} tiles"),
@@ -1573,7 +1519,6 @@ fn copy_pipeline() {
         let Fleet { w, movers, .. } = f;
         for m in movers {
             let t = m.tile();
-            m.set_write_noc(d, &w, Niu::Noc0).unwrap();
             d.write32(&w, t, dm::TRACE, 0).unwrap();
             m.stop(d, &w).unwrap();
         }

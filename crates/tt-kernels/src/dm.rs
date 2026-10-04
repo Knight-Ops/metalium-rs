@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
+use tt_isa::dataflow::{Channel, Endpoint};
 use tt_isa::dm::{self, op, record, Descriptor, Entry, Mover};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
@@ -31,6 +32,12 @@ pub enum DmError {
     },
     /// B did not reach its prologue.
     NotStarted,
+    /// The write NoC asked for is one this mover's image does not have: only
+    /// NC writes on NoC #1 (`tt_isa::dm::write_noc`); B writes on NoC #0.
+    WriteNoc {
+        mover: dm::Mover,
+        noc: WriteNoc,
+    },
     /// Queued list `list` failed with this code (`tt_isa::dm::QUEUE_ERROR`);
     /// the queue has stopped.
     Queued {
@@ -55,6 +62,9 @@ impl std::fmt::Display for DmError {
                 write!(f, "descriptor {seq} did not finish (last finished: {done})")
             }
             DmError::NotStarted => write!(f, "RISCV B did not start the data mover"),
+            DmError::WriteNoc { mover, noc } => {
+                write!(f, "{:?} writes on NoC #0 only; {noc:?} is NC's", mover.core)
+            }
             DmError::Queued { list, code } => {
                 write!(
                     f,
@@ -199,7 +209,6 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::THROTTLE_STALLS),
             mover.at(dm::THROTTLE_CYCLES),
             mover.at(dm::WRITE_NOC),
-            mover.at(dm::PROGRESS),
             mover.at(dm::QUEUE_HEAD),
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),
@@ -270,15 +279,23 @@ impl<N: NocId> DataMover<N> {
     }
 
     /// Send this mover's GDDR writes out through `noc` from its next list
-    /// (`tt_isa::self.mover.at(dm::WRITE_NOC)`): NoC #0 with the reads, NoC #1 on port 1 of
+    /// (`tt_isa::dm::WRITE_NOC`): NoC #0 with the reads, NoC #1 on port 1 of
     /// every channel, or each in turn. Reads and barriers stay on NoC #0.
+    /// Only NC's image has the NoC #1 path: B refuses anything but NoC #0.
     pub fn set_write_noc<T: Transport>(
         &self,
         d: &mut Device<T>,
         w: &Window,
         noc: impl Into<WriteNoc>,
     ) -> Result<()> {
-        let word = match noc.into() {
+        let noc = noc.into();
+        if noc != WriteNoc::Noc0 && self.mover != dm::Mover::NC {
+            return Err(DmError::WriteNoc {
+                mover: self.mover,
+                noc,
+            });
+        }
+        let word = match noc {
             WriteNoc::Noc0 => dm::write_noc::NOC0,
             WriteNoc::Noc1 => dm::write_noc::NOC1,
             WriteNoc::Alternate => dm::write_noc::ALTERNATE,
@@ -345,24 +362,8 @@ impl<N: NocId> DataMover<N> {
         if entries.len() > dm::LIST_MAX as usize {
             return Err(DmError::Invalid(dm::error::LENGTH));
         }
-        // The mover's own checks, run first, so a bad entry costs no PCIe: a
-        // plain entry decoded, a record expanded and every entry it makes
-        // decoded, as the mover will.
-        let usable = self.usable as u32;
-        let mut i = 0;
-        while i < entries.len() {
-            let n = record::len(entries[i][0]);
-            if n == 1 {
-                Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
-            } else {
-                let rec = entries
-                    .get(i..i + n)
-                    .ok_or(DmError::Invalid(dm::error::LENGTH))?;
-                record::expand(rec, |e| Entry::decode(usable, e).map(|_| ()))
-                    .map_err(DmError::Invalid)?;
-            }
-            i += n;
-        }
+        // The mover's own checks, run first, so a bad entry costs no PCIe.
+        self.check(entries)?;
         let bytes: Vec<u8> = entries
             .iter()
             .flatten()
@@ -395,6 +396,9 @@ impl<N: NocId> DataMover<N> {
         ];
         // The mover's own check, run first, so a bad descriptor costs no PCIe.
         let [(_, o), (_, c), (_, p), (_, off), (_, a), (_, n)] = words;
+        if !self.mover.permits(o) {
+            return Err(DmError::Invalid(dm::error::DIRECTION));
+        }
         Descriptor::decode(self.usable as u32, o, c, p, off, a, n).map_err(DmError::Invalid)?;
         for (at, v) in words {
             d.write32(w, self.tile, at, v)?;
@@ -407,13 +411,41 @@ impl<N: NocId> DataMover<N> {
     /// Check `entries` as the mover will, so a bad entry costs no PCIe: a
     /// plain entry decoded, a record expanded and every entry it makes decoded.
     fn check(&self, entries: &[[u32; 8]]) -> Result<()> {
+        self.check_as(self.mover, entries)
+    }
+
+    /// [`DataMover::check`] for `mover`'s direction: a packet's writer
+    /// section is NC's, whichever mover it is queued on.
+    fn check_as(&self, mover: Mover, entries: &[[u32; 8]]) -> Result<()> {
         if entries.is_empty() || entries.len() > dm::LIST_MAX as usize {
             return Err(DmError::Invalid(dm::error::LENGTH));
         }
         let usable = self.usable as u32;
+        if entries[0][0] == op::PAIR {
+            if self.mover != Mover::B
+                || tt_isa::dataflow::packet_length(entries[0]).map_err(DmError::Invalid)?
+                    != entries.len()
+            {
+                return Err(DmError::Invalid(dm::error::LENGTH));
+            }
+            self.check_as(Mover::B, &entries[1..1 + entries[0][1] as usize])?;
+            let writer_end = 1 + entries[0][1] as usize + entries[0][2] as usize;
+            self.check_as(Mover::NC, &entries[1 + entries[0][1] as usize..writer_end])?;
+            check_pair(&entries[..writer_end]).map_err(DmError::Invalid)?;
+            if entries[0][4] != 0 {
+                if entries[writer_end][0] != op::BARRIER {
+                    return Err(DmError::Invalid(dm::error::OP));
+                }
+                self.check_as(Mover::B, &entries[writer_end..])?;
+            }
+            return Ok(());
+        }
         let mut i = 0;
         while i < entries.len() {
             let n = record::len(entries[i][0]);
+            if !mover.permits(entries[i][0]) {
+                return Err(DmError::Invalid(dm::error::DIRECTION));
+            }
             if n == 1 {
                 Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
             } else {
@@ -593,6 +625,63 @@ impl<N: NocId> DataMover<N> {
         d.set_core_reset(w, self.tile, self.mover.core, true)?;
         Ok(())
     }
+}
+
+/// A shared packet's ownership rules, beyond what each entry's decode checks:
+/// every credit names the header's capacity (the role scripts carry it too,
+/// from the same header), and the writer section only writes to GDDR, so NC
+/// stays on NoC #1 -- an NC read would share B's NoC #0 initiator. `entries`
+/// is the header, the reader section and the writer section.
+pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
+    let header = entries.first().ok_or(dm::error::LENGTH)?;
+    let capacity = header[3];
+    let readers = header[1] as usize;
+    if entries.len() != 1 + readers + header[2] as usize {
+        return Err(dm::error::LENGTH);
+    }
+    let endpoint = |writer: bool| {
+        if writer {
+            Endpoint::Writer
+        } else {
+            Endpoint::Reader
+        }
+    };
+    // One pass over entry heads: the sections were each checked entry by
+    // entry already (`DataMover::check`), so a record is judged by its kind.
+    let each = |section: &[[u32; 8]], writer: bool| -> std::result::Result<(), u32> {
+        let mut index = 0;
+        while index < section.len() {
+            let head = section[index];
+            let count = record::len(head[0]);
+            if count > 1 {
+                // Only the L1 -> GDDR records may be the writer's.
+                if writer && record::direction(head[0]) != Some(record::Direction::Write) {
+                    return Err(dm::error::OP);
+                }
+            } else {
+                match Entry::decode(u32::MAX, head)? {
+                    // The reader holds the producer's credits (input,
+                    // transfer) and the writer the consumer's (output,
+                    // transfer), every one at the header's capacity.
+                    Entry::Buffer {
+                        stream,
+                        action,
+                        capacity: c,
+                    } if c as u32 == capacity
+                        && Channel::of(stream, c)
+                            .is_some_and(|ch| ch.permits(endpoint(writer), action)) => {}
+                    Entry::Buffer { .. } => return Err(dm::error::OP),
+                    Entry::Move { descriptor, .. } if writer && descriptor.op == op::WRITE => {}
+                    _ if writer => return Err(dm::error::OP),
+                    _ => {}
+                }
+            }
+            index += count;
+        }
+        Ok(())
+    };
+    each(&entries[1..1 + readers], false)?;
+    each(&entries[1 + readers..], true)
 }
 
 #[cfg(test)]

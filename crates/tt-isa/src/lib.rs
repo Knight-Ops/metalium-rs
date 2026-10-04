@@ -14,6 +14,7 @@
 pub mod arc;
 pub mod backend;
 pub mod cfg;
+pub mod dataflow;
 pub mod dm;
 pub mod dram;
 pub mod eth;
