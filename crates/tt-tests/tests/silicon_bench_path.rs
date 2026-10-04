@@ -653,6 +653,13 @@ fn sfpu_pipeline_sweep() {
         Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
         Err(_) => vec![1, 8, 32],
     };
+    // `SWEEP_SHARE_PERCENT` scales `tensor::PIPELINE_SHARE` and
+    // `REDUCE_PIPELINE_SHARE`: below 100, ops the constants keep serial
+    // overlap, which is how their values are chosen.
+    let share: usize = std::env::var("SWEEP_SHARE_PERCENT")
+        .map(|v| v.trim().parse().unwrap())
+        .unwrap_or(100);
+    tt_kernels::tensor::set_pipeline_share_percent(share);
     let shapes: [[usize; 2]; 6] = [
         [64, 784],
         [256, 256],
@@ -744,9 +751,10 @@ fn sfpu_pipeline_sweep() {
                             })
                         };
                         let cache_before = cache(&s);
-                        // Past 2048 tiles a profile's events overflow the
-                        // timestamper's buffer: time those from the host.
-                        let profiled = r * cols <= 2048 * 1024;
+                        // Host time only: with NC writing beside B, a role
+                        // profile's events are not balanced (the ownership
+                        // doc's profiling note), so no device time is certified.
+                        let profiled = false;
                         let (mut device, mut host) = (Vec::new(), Vec::new());
                         let mut overflowed = !profiled;
                         for _ in 0..REPS {
@@ -814,7 +822,7 @@ fn sfpu_pipeline_sweep() {
                         "{name} {r}x{cols} on {tiles} tiles: pipelined bits differ"
                     );
                     println!(
-                        "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles: on/off {:.3}, host {:.3} ({overlapped} runs overlapped)",
+                        "MEASURE sfpu sweep {name} {r}x{cols} on {tiles} tiles, share {share}%: on/off {:.3}, host {:.3} ({overlapped} runs overlapped)",
                         median[1] / median[0],
                         host_median[1] / host_median[0],
                     );
@@ -922,8 +930,9 @@ fn host_time_per_op() {
 
 /// Trace replay against queueing ops fresh (checklist 9.17): a layer's
 /// forward pass -- matmul, add a row, relu, matmul -- at MNIST's size and at
-/// 512 x 1024, 50 times back to back, queued fresh (pipelined and plain: a
-/// capture runs plain) and replayed from one capture, on 1, 8 and 32 tiles
+/// 512 x 1024, 50 times back to back, queued fresh (pipelined and plain) and
+/// replayed from one capture (which keeps the schedule it planned, pipelined
+/// where `tensor::Overlap::Captured` allows), on 1, 8 and 32 tiles
 /// (`SWEEP_TILES`). Host time is the calls' alone; end to end includes the
 /// sync, so it shows what streaming a trace from GDDR costs the device.
 #[test]

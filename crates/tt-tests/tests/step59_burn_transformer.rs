@@ -51,6 +51,16 @@ fn a_transformer_trains_and_the_report_only_shrinks() {
             burn_tt::with_report(|| train::<Autodiff<TtBackend>>(&weights, STEPS, &d).losses);
         eprintln!("losses: flex {host:?}\n        tt   {tt:?}\n{report}");
 
+        tt_tests::burn_device::assert_native_model(&report);
+
+        let mean = report.op("float_mean").expect("the loss uses a full mean");
+        assert!(
+            mean.on_device > 0,
+            "the loss's full mean stayed on the host"
+        );
+        assert_eq!(mean.on_host, 0);
+        assert_eq!(mean.downloads, 0);
+
         let rel = ((tt[0] - host[0]) / host[0]).abs();
         assert!(
             rel < 1e-3,

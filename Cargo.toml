@@ -33,9 +33,9 @@ tt-layout = { path = "crates/tt-layout" }
 tt-kernels = { path = "crates/tt-kernels" }
 tt-firmware-images = { path = "crates/tt-firmware-images" }
 burn-tt = { path = "crates/burn-tt" }
-# Exact pins (PINS.toml, [burn]): `cargo xtask gen-burn-delegate` reads the
+# Exact pins (PINS.toml, [burn]): `cargo xtask gen-burn-ops` reads the
 # op traits of exactly this burn-backend, so a caret range would let the
-# generated delegation drift from the source it was generated against.
+# generated operation implementations drift from their trait source.
 burn-backend = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-flex = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }

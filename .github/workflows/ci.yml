@@ -78,11 +78,12 @@ jobs:
       - name: Generated instruction table is current
         run: cargo xtask gen-isa --check
 
-      # burn-tt's forwarding of every op to burn-flex is generated from the
-      # pinned burn-backend's op traits and burn-flex's impls. This proves the
-      # committed forwarding still matches them.
-      - name: Generated Burn delegation is current
-        run: cargo xtask gen-burn-delegate --check
+      # Native dispatch and unsupported methods follow the pinned Burn traits.
+      - name: Generated Burn operations are current
+        run: cargo xtask gen-burn-ops --check
+
+      - name: Burn backend is independent of Flex
+        run: cargo xtask check-no-flex-in-backend
 
       - name: Format
         run: cargo fmt --all --check

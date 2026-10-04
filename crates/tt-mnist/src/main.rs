@@ -12,7 +12,7 @@
 //! Burn's autodiff and SGD. On the card: every matmul (forward and backward),
 //! the bias adds, the ReLU and its gradient, the bias-gradient sums and the
 //! SGD updates, with the dataset, weights and activations resident in the
-//! card's GDDR6. The cross-entropy loss is computed on the host.
+//! card's GDDR6. Cross-entropy and its backward pass use native kernels.
 //!
 //! ```text
 //! tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
@@ -97,7 +97,7 @@ struct Mlp<B: Backend> {
 
 /// The hidden layer's activation (`--activation`): Burn's own functions, so
 /// the example exercises whatever burn-tt runs of them on the card -- and
-/// shows in its timings what still falls back to the host.
+/// shows native execution and transfer costs in its timings.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Act {
     Relu,
@@ -269,9 +269,21 @@ fn train<B: AutodiffBackend>(
             ),
             device,
         );
-        let pred = model.forward(x).argmax(1).reshape([m]);
-        let y = labels::<B::InnerBackend>(test, from, m, device);
-        right += pred.equal(y).int().sum().into_scalar().elem::<i64>() as usize;
+        // Predictions are an explicit application result readback. Accuracy
+        // bookkeeping compares them with the dataset's labels on the host.
+        let pred = model
+            .forward(x)
+            .argmax(1)
+            .reshape([m])
+            .into_data()
+            .convert::<i32>()
+            .to_vec::<i32>()
+            .expect("predictions");
+        right += pred
+            .iter()
+            .zip(&test.labels[from..from + m])
+            .filter(|(p, l)| **p == i32::from(**l))
+            .count();
     }
     Run {
         calls,
@@ -875,6 +887,6 @@ fn transformer_benchmark(a: &Args) {
         moved.downloaded as f64 / 1e6,
         (moved.uploaded + moved.downloaded) as f64 / 1e3 / steps as f64
     );
-    println!("\nburn-tt per op, whole run (tt: hand-written, device path for some inputs; flex: host only):");
+    println!("\nburn-tt per op, whole run (tt: native implementation; unsupported: required method without an implementation):");
     print!("{report}");
 }

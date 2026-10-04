@@ -110,6 +110,40 @@ cargo xtask silicon --release --include-ignored --filter step60_streaming::strea
 cargo xtask silicon --release --include-ignored --filter step60_streaming::streaming_stress --timeout-secs 300
 ```
 
+### Overlap thresholds for NC ownership (run 1791079782, 2026-10-04)
+
+Element-wise and reduce ops overlap their runs where the host's cost for the
+extra lists is paid back. The old constants were measured on the B-only pipeline.
+Host end to end, one op, serialized against overlapped (< 1 wins), card 0, release:
+
+| Add, tiles a unit | 8 tiles, fresh (forced) | 8 tiles, traced | 32 tiles, fresh (forced) | 32 tiles, traced |
+|---|--:|--:|--:|--:|
+| 8 (256² on 8, 512² on 32) | 0.99 | 1.00 | 0.99 | 1.02 |
+| 32 (512² on 8, 1024² on 32) | 1.20 | 0.90 | 1.39 | 0.95 |
+| 128 (1024² on 8, 2048² on 32) | 1.10 | 0.77 | 1.37 | 0.92 |
+| 512 (2048² on 8, 4096² on 32) | 1.07 | 0.69 | 1.44 | 0.87 |
+| 1152 (3072² on 8, 6144² on 32) | 1.03 | 0.66 | 1.38 | 0.86 |
+| 1568 (3584² on 8) | 0.97 | 0.67 | | |
+| 2048 (4096² on 8) | 0.87 | 0.67 | | |
+
+(Runs 1791079466 and 1791079480, forced and under the old constants; below 12
+tiles a run, nothing overlaps either way.)
+
+Fresh overlap lost on many tiles until a unit holds about 160 tiles for each
+unit beyond the first; a replay pays no host time for its runs and gained from
+about 32 tiles a unit. `tensor::Overlap` encodes both (`Fresh`: 48 + 180
+(units - 1) tiles a unit; `Captured`: 32), replacing the old
+`PIPELINE_SHARE * units²` and the reduction's 4x share. With them no sweep cell
+is over 3% slower than serial; fresh 8-tile 2048² add 1.07 -> 1.00, traced
+8-tile 512²/1024² adds 1.00 -> 0.90/0.77, traced 32-tile 1024²/2048² 1.00 ->
+0.95/0.93, one-tile reductions of 64-256² 1.00 -> 0.91. Per-cell noise across
+three runs is up to about 0.05, rarely 0.15. `SWEEP_SHARE_PERCENT` (0 forces
+overlap above `MIN_PIPELINED_RUN`) scales the shares in both sweeps.
+
+Host enqueue of a fresh 32-tile 256³ matmul, per op (`host_time_per_op`):
+143.9 µs, of which segments 34.7, placement 22.2, reservation 16.5, list checks
+12.6 (new `HostStage::Check`), list writes 38.8, idle checks 3.5.
+
 ### GDDR and Ethernet remeasurement
 
 2026-10-03, device 0, release, AICLK 1350 MHz, GDDR 16000 MT/s.
@@ -388,6 +422,9 @@ but it is not the default.
 
 ## Core path: B → T0/T1/T2
 
+The following tables are the pre-streaming baseline. Use the ownership rollout
+and scoreboard above for current end-to-end measurements.
+
 | Hop (empty kernel, `null_kernel`) | Cycles |
 |---|--:|
 | host writes the list → B begins it | ~4250 (3.1 µs, mostly PCIe) |
@@ -440,22 +477,35 @@ Both links are up: X 3 ↔ X 3 and X 13 ↔ X 13.
 A send takes 3.46 µs on the device, but each send in a stream takes 6.47 µs. The
 difference is the host polling for the ack and posting the next send over PCIe.
 
-## Where the overhead is (ranked)
+## Where the overhead is
 
-1. **The host is in every op and every transfer.** About 100 µs of host work per
-   matmul, and about 3 µs per Ethernet send.
-2. **Card-wide writes reach half the card.** Card-wide reads are at 84% (fixed
-   2026-10-02). NC, still held in reset, is the planned NoC #1 writer.
-3. **339 cycles per mover entry (317 at the baseline), about 116 of them before
-   the NIU is touched.** The read path's hot code is about 3.0 KB.
-   - B's and NC's instruction caches are about 4 KiB each, measured below.
-   - So per-entry cost depends on code layout, not just instruction count.
-4. **Nothing overlaps within an op:** gather, compute and scatter run in sequence.
-5. **E1 stores and forwards through one staging buffer,** plus a 0.75 µs round trip
-   per transfer.
-6. **Writes:** one DRAM port tops out at ~28.5 GB/s; 128 KiB entries fall to
-   27–33 GB/s.
-7. **About 180 cycles per role from wake to first push.**
+**Current (2026-10-03 measurements):** fresh multi-tile submission remains
+host-bound; streaming overlap thresholds still need tuning for NC ownership;
+small mover requests pay per-entry setup cost; Ethernet still stores/forwards
+one transfer at a time. Concurrent B/NC timestamp exports can be unbalanced,
+so host timing and ownership counters are the primary evidence. Streaming
+ownership, traced overlap, DMA and asynchronous Burn dispatch are implemented.
+The full-reduction addition (2026-10-04) is correctness-gated separately; the
+scoreboard above has not been remeasured for it. Full `sum`/`mean` now always
+use native SFPU arithmetic, including in exact mode. Exact-mode MNIST uploads
+its 256-byte host-produced loss vector for the mean and reads back 4 bytes;
+the old 5120-byte steady-state transfer budget is now 5380 bytes. The resident
+transformer loss instead removes its 512-byte mean-input download. Mesh
+reductions stage through L1 on chip 0 and are limited by L1/program capacity.
+
+**Historical ranking (before streaming consolidation):**
+
+1. Host submission in every op/transfer: about 100 µs per matmul and 3 µs
+   per Ethernet send at that baseline.
+2. Card-wide writes used only NoC0. NC now writes on NoC1: the current
+   raw 120-tile write measurement is 389 GB/s.
+3. Per-entry request setup: about 339 cycles, with 116 before touching NIU
+   registers at that baseline. B/NC caches were later measured near 4 KiB.
+4. Gather/compute/scatter were sequential. Fixed ownership now overlaps them
+   where the scheduler selects depth two and storage permits reuse.
+5. E1's single staging buffer and a host round trip per transfer remain.
+6. Single-port write collapse was fixed by static VC1 (see below).
+7. Per-role wake/setup and instruction-push cost remains a tuning target.
 
 **Open issues:**
 
@@ -480,7 +530,9 @@ difference is the host polling for the ack and posting the next send over PCIe.
     and 128 KiB (run 1790970443).
   - The single-port write path changed in nothing else: port hint 0 maps to port
     0 on NoC #0.
-- [ ] **Per-request cost** (checklist 9.14).
+- [ ] **Per-request cost** (checklist 9.14). The detailed observations below
+  are from the 2026-10-02 profile, before streaming consolidation and the
+  direction-specialized images; removed symbols such as `dm::Peer` are historical.
   - **Where a 4 KiB read entry's ~350 cycles go** (2026-10-02). Measured with a
     temporary build stamping the wall clock between stages, about 8 cycles per
     stamp taken off:
@@ -522,16 +574,17 @@ difference is the host polling for the ack and posting the next send over PCIe.
   - ~350 cycles per entry at any size up to 4 KiB.
   - Each request rebuilds and writes ten NIU registers.
   - GATHER records expand into one ~4 KiB read per tile.
-- [~] **B stalls for a whole kernel** (checklist 9.15). Done for GDDR matmuls
-  (where `tensor::pipelining_pays`), element-wise ops and reductions (where
-  `tensor::pipelined_runs`), on by default. Long sums over rows in chunks
-  stay plain: each chunk gathers the sums the last one scattered.
+- [x] **Resident compute streams, fresh and traced** (checklist 9.15).
+  B reads, resident T0–T2 compute and NC writes under batch credits, with one
+  role generation per compatible region. Depth-two selection and backend
+  retirement still need tuning; long row-sum chunks retain their ordered
+  intermediate dependencies.
 - [~] **The host queues units one at a time** (checklist 9.17): ~6 µs a unit
   an op, now ~3.4 (PCIe reads, separate barrier lists and program-memo misses
-  gone). The rest is three posted writes and CPU work a unit: next is one
-  list fanned out on the card, or trace replay.
-  - `KERNEL` drains the moves and waits for all three roles, so nothing moves
-    while they compute.
+  gone). The rest is three posted writes and CPU work a unit: follow-ups are one
+  list fanned out on the card or further reductions in fresh submission work.
+  Trace replay is implemented. Low-level `KERNEL` remains for setup/control;
+  GDDR compute uses resident streaming regions.
 - [ ] **Ethernet moves one transfer at a time** per direction, store and forward
   through one buffer each way (checklist, Ethernet pipelining).
 - [x] **Instruction-cache size:** ~4 KiB on B and NC (`probe_icache`).
@@ -590,6 +643,7 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-04 | 1791079782 | Overlap decided per `tensor::Overlap` (off, fresh, captured) with shares measured on NC ownership; `HostStage::Check` splits list checks from the ring write; a trace's program holds carry the cache generation (a release after recovery no longer unholds a newer trace's program) | Fresh 8-tile 2048² add 1.07 -> 1.00 of serial; traced 8/32-tile adds 1.00 -> 0.77-0.95 from 512-1024²; one-tile small reductions 1.00 -> 0.91; enqueue unchanged. Silicon 306/306 (run 1791079893). |
 | 2026-10-03 | — | B a pure reader, NC a pure writer. `SIGNAL` / `WAIT_PEER`, `dm::Peer` and B's NoC #1 writes removed; standalone transfers are kernel-less reader/writer packets (`Step::Transfer`, `dataflow::Stream::Transfer`); `Mover::permits` is the one direction table; `FILL_PAD` split with a new `PAD_WRITE`; each image compiles in only its direction. | B 24,240 -> 20,856 B (3.7 KB free from 0.3), NC ~22.9 -> 14.8 KB. Compute and the models unchanged (MNIST 1.3 ms/step, transformer 8.72); large host uploads -31%; small uploads on many tiles +5-8%, a one-tile 64×10 upload +2 µs. Silicon 296/296. |
 | 2026-10-03 | 1791063177 / 1791063683 | Consolidate GDDR compute under fixed streaming ownership; remove legacy scheduler selection and reject nonstreamable compute instead of falling back. Both firmware images required by `enable_dram`. | Full initial hardware audit 295/295, final strict ownership/cache/profile/benchmark checks 22/22, full host/simulator suite 710 passed. Mixed stress 60 s each on one/eight tiles, 39971/72561 rounds. Traced identity remains 357 / 329 GB/s combined at 32 / 120 tiles. Known fresh-dispatch regressions accepted; no universal speedup claimed. |
 | 2026-10-03 | 1791060908 / 1791061578 / 1791061613 | Remeasure raw GDDR/Ethernet and add a true streaming identity payload benchmark, repeated once. No Ethernet firmware change. | Raw 120-tile read / NoC #1 write / mixed: 469 / 389 / 403 GB/s (device). NC NoC #1 write: 74.94 GB/s on one tile. Streaming traced identity: 355 GB/s combined at 32 tiles, 328 at 120, versus legacy 216 / 244. Fresh still regresses. Two-link Ethernet one-way: 27.03 GB/s host end-to-end. |

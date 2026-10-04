@@ -10,8 +10,8 @@
 //!   every supported op on the device, on one Tensix tile or many
 //!   ([`TileChoice`]; `TT_TILES` through [`tiles_from_env`]).
 //! * [`Topology::Cards`]: matmuls split along `N` across the cabled cards over
-//!   Ethernet (Phase 8), bit-identical to one card. Tensors are staged from the
-//!   host for each matmul: the mesh does not yet keep them in GDDR.
+//!   Ethernet, bit-identical to one card, with tensor slots retained in GDDR.
+//!   Other primitives and batched matmuls compute on chip 0.
 
 use crate::server::{attach, kmd_engine, kmd_mesh_engine, AttachGuard, EngineError};
 use crate::{Fidelity, SrcRoute, TileChoice, TtDevice};

@@ -343,7 +343,7 @@ mod mover {
             println!("MEASURE sharded [64,784]@[784,128] in {:?}", t0.elapsed());
             let t0 = Instant::now();
             let single = tt_kernels::session::matmul_on(
-                &mut fab.chips[0].dev,
+                fab.chips[0].device(),
                 ca,
                 &tt_firmware_images::ROLES,
                 &x,
@@ -366,7 +366,7 @@ mod mover {
             );
             assert!(single.iter().any(|&v| v != 0.0));
             for c in fab.chips.iter_mut() {
-                scrub(&mut c.dev);
+                scrub(c.device());
             }
         }) {
             panic!("{e}");

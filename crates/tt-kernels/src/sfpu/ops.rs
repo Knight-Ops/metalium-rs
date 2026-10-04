@@ -99,6 +99,8 @@ pub mod kind_sfpu {
     pub const POW_I: u32 = 0x128;
     /// An `I32` as `F32`, `as f32`'s rounding (Flex's `int_into_float`).
     pub const I32_TO_F32: u32 = 0x129;
+    /// Exact nonnegative integral F32 index below 2^23 to I32 bits.
+    pub const INDEX_TO_I32: u32 = 0x160;
     /// `e^a - 1`, within [`super::EXPM1_BOUND`] (10.2e).
     pub const EXPM1: u32 = 0x12a;
     /// `1 / (1 + e^-a)` in Flex's two branches, within [`super::SIGMOID_BOUND`].
@@ -205,6 +207,7 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
         kind_sfpu::POW_I => sig(&[F32, Elem::I32], F32),
         kind_sfpu::I32_TO_F32 => sig(&[Elem::I32], F32),
+        kind_sfpu::INDEX_TO_I32 => sig(&[F32], Elem::I32),
         _ => sig(&[F32, F32], F32),
     }
 }
@@ -2245,6 +2248,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::FILL..=kind_sfpu::LOG1P
         | kind_sfpu::POW_S
         | kind_sfpu::I32_TO_F32
+        | kind_sfpu::INDEX_TO_I32
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
@@ -3042,6 +3046,18 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             });
             Operands::Unary
         }
+        kind_sfpu::INDEX_TO_I32 => {
+            p.loadi(LReg::L3, 8_388_608.0);
+            p.loadi_bits(LReg::L4, 0x4b00_0000);
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.add(LReg::L0, LReg::L3, LReg::L2);
+                p.isub_from(LReg::L2, LReg::L4);
+                p.store(LReg::L4, Format::Int32, OUT_ROW + o);
+                p.loadi_bits(LReg::L4, 0x4b00_0000);
+            });
+            Operands::Unary
+        }
         kind::ADD_ROW => return code_for(kind::ADD, scalars, Broadcast::Row),
         _ => return None,
     };
@@ -3191,6 +3207,16 @@ pub fn reference_op(
 mod tests {
     use super::super::interp::Vector;
     use super::*;
+
+    #[test]
+    fn native_index_cast_is_exact_at_its_range_edges() {
+        let values = [0.0, 1.0, 65_535.0, 8_388_607.0];
+        let got = reference(kind_sfpu::INDEX_TO_I32, 0.0, &values, None, 1, values.len());
+        assert_eq!(
+            got.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            [0, 1, 65_535, 8_388_607]
+        );
+    }
 
     fn tile(seed: u32) -> Vec<u32> {
         let mut s = seed | 1;

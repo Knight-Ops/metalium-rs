@@ -1,29 +1,18 @@
 # Support traced pipelining
 
-## Implemented (2026-10-03)
+Implemented (2026-10-03), and part of the one design in
+[streaming dataflow ownership](feature-streaming-dataflow-ownership.md#traces):
+streaming ownership is the only GDDR compute scheduler, fresh and traced, and
+captures retain both the reader and the writer stream. The generation rebasing,
+program holds, chunk-boundary behaviour, NC fetch and recovery rules are described
+there, with the tests that cover them and the overlap thresholds a capture uses
+([measurements](firmware-performance.md#streaming-ownership-rollout)).
 
-Streaming ownership is the only GDDR compute scheduler for fresh and traced work.
-`LAUNCH` and `KERNEL_WAIT` generations are rebased, programs stay held, and replay
-preserves the captured schedule across command chunks. Record payloads are not
-interpreted as command headers when rebasing or retaining programs.
+`Session::enable_dram(b, nc)` is the only setup; `TT_PIPELINE=0` serializes slot
+reuse but keeps NC as the writer. The legacy wave, B-only pipeline and
+two-host-queue NC schedulers are removed.
 
-Capture retains
-both reader and writer streams in DRAM and pins all streaming scripts and their
-arithmetic bodies. One host B replay dispatches NC locally with `PAIR_CALL`.
-B's outer stream and nested reader fetch use distinct buffers; NC fetches writer
-commands through NoC1 with an independent transaction ID. B completes the region
-only after NC acknowledges its writes, before reaching cross-tile barriers.
-Queued replay generations are reserved afresh; errors invalidate traces and reset
-the roles as well as the movers before fresh execution resumes.
-
-Enable GDDR with `Session::enable_dram(b, nc)`; no executor selection is needed.
-`TT_PIPELINE=0` serializes slot reuse but keeps NC as the writer. The legacy wave,
-B-only pipeline and two-host-queue NC schedulers are removed. Fresh/small
-regressions are accepted as an architectural tradeoff, not a universal speedup.
-See [ownership implementation and rollout](feature-streaming-dataflow-ownership.md)
-and [measurements](firmware-performance.md#streaming-ownership-rollout).
-
-## Original investigation
+## Original investigation (historical)
 
 For B-only pipelined traces, most of the machinery already exists. The missing work is mainly in capture bookkeeping and validation. NC-backed traces need additional protocol changes.
 The firmware’s CALL replay path already recognizes and rebases KERNEL, LAUNCH, and KERNEL_WAIT. It can execute the overlapping schedule. See mover.rs.

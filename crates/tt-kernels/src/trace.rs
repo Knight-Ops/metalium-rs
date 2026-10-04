@@ -128,8 +128,13 @@ pub(crate) struct UnitCapture {
     pub(crate) generation_base: u32,
     /// What the stream has set each role's descriptor to so far.
     pub(crate) descriptors: [Option<[u32; DESCRIPTOR_WORDS]>; 3],
-    /// Program-cache addresses held for the trace, one per hold.
-    pub(crate) held_programs: Vec<u64>,
+    /// Program-cache holds for the trace, one per hold: the cache's
+    /// generation when taken ([`crate::program_cache::ProgramCache::generation`])
+    /// and the address.
+    pub(crate) held_programs: Vec<(u64, u64)>,
+    /// Entries in each reader and writer section stored for the stream's
+    /// `PAIR_CALL`s, chunk padding included: reader, then writer, per packet.
+    pub(crate) sections: Vec<u32>,
 }
 
 impl UnitCapture {
@@ -179,7 +184,10 @@ pub(crate) struct UnitTrace {
     pub(crate) count: u32,
     /// Generations a replay takes on the unit.
     pub(crate) generations: u32,
-    pub(crate) held_programs: Vec<u64>,
+    /// As [`UnitCapture::held_programs`].
+    pub(crate) held_programs: Vec<(u64, u64)>,
+    /// As [`UnitCapture::sections`].
+    pub(crate) sections: Vec<u32>,
 }
 
 /// A finished trace: see the module documentation.
@@ -243,5 +251,44 @@ mod tests {
         assert_eq!(at, chunk, "the record moved to the next chunk");
         assert!(out[chunk - 2..chunk].iter().all(|e| e[0] == op::WAIT));
         assert_eq!(out.len(), chunk + rec_len);
+    }
+
+    /// A region's `LAUNCH` and the `KERNEL_WAIT` that joins it, with more than a
+    /// chunk of mover entries between: they fall in different chunks, in order,
+    /// with their pairing (word 1, the generation) and every entry between
+    /// untouched. The firmware keeps the active generation across chunks.
+    #[test]
+    fn a_launch_and_its_wait_can_fall_in_different_chunks() {
+        let chunk = dm::TRACE_CHUNK_ENTRIES as usize;
+        let launch = [op::LAUNCH, 7, 16, 1, 32, 1, 48, 1];
+        let wait = [op::KERNEL_WAIT, 7, 0, 0, 0, 0, 0, 0];
+        let rec_len = record::len(record::GATHER);
+        let mut stream = vec![launch];
+        // Enough five-entry records to fill two chunks and a part.
+        for tag in 0..(2 * chunk / rec_len + 3) {
+            let mut rec = vec![[0u32; 8]; rec_len];
+            rec[0] = [record::GATHER, tag as u32, 0, 0, 0, 0, 0, 0];
+            stream.extend_from_slice(&rec);
+        }
+        stream.push(wait);
+        let out = chunked(&stream);
+        let at = |entry: [u32; 8]| out.iter().position(|e| *e == entry).unwrap();
+        let (launched, waited) = (at(launch), at(wait));
+        assert!(launched / chunk < waited / chunk, "{launched} {waited}");
+        assert!(waited - launched > chunk);
+        // Nothing was dropped or reordered: what is not padding is the stream.
+        let kept: Vec<_> = out
+            .iter()
+            .filter(|e| **e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0])
+            .copied()
+            .collect();
+        assert_eq!(kept, stream);
+        // No record starts in one chunk and ends in the next.
+        let mut i = 0;
+        while i < out.len() {
+            let n = record::len(out[i][0]).max(1);
+            assert_eq!(i / chunk, (i + n - 1) / chunk, "record at {i}");
+            i += n;
+        }
     }
 }

@@ -946,7 +946,7 @@ taken.
 double buffering, multi-tile distribution with NoC multicast. Measure against the theoretical
 peak figures in the spec, not against a competitor.
 
-**Direction, decided 2026-09-30: device residency first.** The release baseline is 224 ms per
+**Historical baseline and direction (2026-09-30): device residency first.** The release baseline is 224 ms per
 MNIST step on the device against 0.5 ms for Flex on the host, and almost all of it is the host
 path: every matmul re-sends its operands over PCIe and repeats per-session work (a reset, seven
 firmware loads, program rebuilds). The answer is not a faster PCIe path but not using PCIe at all:
@@ -957,17 +957,15 @@ two findings shape it: the GDDR is reachable and gated on both cards (divergence
 and under this VM the host's MMIO is uncached whatever the guest maps (measurement M), so bulk
 upload tops out at 226 MB/s -- ample for startup, and a reason to keep PCIe off the step.
 
-**Where it stands (2026-10-01).** Full MNIST trains at **2.5 ms/step on eight Tensix tiles**
-(5.1 on one; 224 at the start of the phase), bit for bit on the Phase 7 golden, with the
-dataset, weights, activations and gradients resident in GDDR. Per steady-state step exactly six
-tensors cross PCIe, 6224 B (`dL/dlogits`, the two biases and their gradients, and the logits),
-asserted by the 9.5 gate; the loss stays on the host. Done: residency (9.3–9.5), many tiles
-(9.6), one launch per op, op records expanded on the tile, and a resident program cache (9.7a–c),
-which took the device writes per step from 193 KB to 35 KB. Next: overlap of data movement and
-compute with the circular-buffer runtime (9.8), on-device tilizing for the 2.7 s preload (9.10),
-and a device-resident, concurrent two-card mesh (9.11). Element-wise on the SFPU and the loss on
-the device moved to Phase 10. The checklist's Phase 9 section has the per-slice history and
-measurements.
+**Where it stands (2026-10-04).** GDDR residency, many tiles, op records,
+resident programs, queued host DMA, parallel host tilize/detilize, asynchronous
+Burn submission and fresh/traced streaming ownership are implemented. B reads
+GDDR on NoC0, T0–T2 execute resident compute scripts and NC writes GDDR on NoC1;
+one host B packet dispatches the region. The legacy executors have been removed.
+The latest performance baseline remains the 2026-10-03 measurements in
+`firmware-performance.md`; new full reductions have not been benchmarked here.
+Remaining: host/per-request overhead, ownership tuning, concurrent profiling,
+Ethernet pipelining and a device-resident multi-card mesh (9.11).
 
 **ttsim does not model cycle-accurate timing.** It remains useful here for *correctness* of the
 more aggressive pipelined kernels — which is where correctness is hardest — but every
@@ -976,13 +974,25 @@ for each optimization, then measure on silicon.
 
 ### Phase 10 — Hardware coverage (open-ended, **ttsim + silicon**)
 
-**Deliverable:** the rest of the Tensix tile, driven. Phases 0–9 proved the path to the card
-with one compute unit doing real work: the Matrix Unit, for `MVMUL`. Element-wise ops and the
-column sum run on the B core's scalar FP32 unit (`dm_b.rs`); the SFPU -- 32 lanes, 48
-Blackhole instruction pages, the unit built for exactly this -- runs no tensor op at all, and
-`ELW*`, `GMPOOL`/`GAPOOL`, `TRNSPSRCB`, block-float and integer formats are encoded and
-unused. On the Burn side, 12 compute methods have a device path; no `ModuleOps`,
-`IntTensorOps` or `BoolTensorOps` method does.
+**Deliverable:** drive the rest of the Tensix tile and broaden resident Burn
+model coverage. Matrix matmul, SFPU arithmetic and activations, softmax,
+int/bool storage and logic, and embedding/loss indexing now have device paths.
+B and NC are data movers; they perform no tensor arithmetic. Matrix-unit
+`ELW*`, pooling and Tensix transpose, BF16 tensor storage, further integer ops
+and block-float formats remain to be implemented.
+
+**Current milestone (2026-10-04):** 10.0–10.2 complete; 10.3 in progress.
+Rank-N storage/views, tile-aligned batched matmul and partial rank-N reductions
+are implemented. Full F32 `sum`/`mean` now compose resident reductions, bounded
+column copies and scalar additions, including full-source views and dimensions
+beyond one L1 pass. Full reductions always execute natively, including in
+exact mode: host F32 inputs are uploaded, unsupported inputs fail explicitly,
+and native arithmetic is checked against derived bounds rather than Flex's bits.
+Mesh engines stage those reductions on chip 0's SFPU, with both passes limited
+by L1/program capacity; the GDDR path chunks larger shapes and stays resident.
+Gates: `step63_burn_full_reduce`, `step59_burn_transformer`.
+Next: remaining R1 axes/kinds, K blocking (P2), general D4 slicing/indexing,
+M3/R3 layouts/norms, formats/casts and convolution/pooling/attention.
 
 **Why now.** `burn-tt` is a general Burn backend, and under device residency (Phase 9) every
 op without a device path is a download, a host op and an upload. Breadth is therefore a
@@ -993,7 +1003,7 @@ norm, a convolution -- falls back on its first unsupported op.
 Burn op coverage table live in [`hardware-coverage.md`](hardware-coverage.md), which is the
 progress record. Checklist items 9.9 and 9.12 moved there.
 
-**Where it stands (2026-10-02).** Milestone 10.0 is done: a device profiler through the
+**Historical close-out (2026-10-02).** Milestone 10.0 is done: a device profiler through the
 timestamper (X3); padding as a typed property of every tensor (F0, which fixed the ragged
 `ADD_ROW` -> sum bug); whole tiles through `Dst` (F1); the SFPU program builder with
 typed registers, scoped conditional execution, automatic `SFPNOP`s and `REPLAY`-driven row
@@ -1214,8 +1224,8 @@ Phases 2–4.
 
 ## Verification
 
-**Per-phase gates.** Both must pass. Simulator gates run in CI on every commit; silicon gates
-run nightly and block merges to main.
+**Per-phase gates.** Both must pass. Simulator gates run in CI on every commit. Silicon gates run through
+`cargo xtask silicon`; nightly silicon CI and a merge gate remain checklist items.
 
 | Phase | Simulator gate | Silicon gate |
 |--:|---|---|

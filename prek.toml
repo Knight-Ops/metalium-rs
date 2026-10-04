@@ -42,10 +42,10 @@ hooks = [
     # Also runs on changes to the tests: a measured layout in
     # xtask/src/gen_isa/Bits32_BH.lua is licensed by the gate that measured it, and
     # renaming or deleting that gate must fail here rather than in CI.
-    # burn-tt's generated forwarding to burn-flex, likewise: it is read from the
-    # pinned burn-backend and burn-flex sources, so a Burn bump or a hand-edit of
-    # the generated file fails here.
-    { id = "cargo-xtask-gen-burn-delegate", name = "generated Burn delegation is current", entry = "cargo xtask gen-burn-delegate --check", language = "system", files = "^(crates/burn-tt/src/|xtask/src/|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
+    # Native dispatch and unsupported methods follow the pinned Burn traits.
+    # A Burn bump or a hand-edit of generated operations fails here.
+    { id = "cargo-xtask-gen-burn-ops", name = "generated Burn operations are current", entry = "cargo xtask gen-burn-ops --check", language = "system", files = "^(crates/burn-tt/src/|xtask/src/|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
+    { id = "cargo-xtask-no-flex", name = "Burn backend is independent of Flex", entry = "cargo xtask check-no-flex-in-backend", language = "system", files = "^(crates/burn-tt/|xtask/src/|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
 
     { id = "cargo-xtask-gen-isa", name = "generated instruction table is current", entry = "cargo xtask gen-isa --check", language = "system", files = "^(crates/tt-isa/src/isa/|crates/tt-tests/tests/|xtask/src/|PINS\\.toml)", pass_filenames = false },
 ]

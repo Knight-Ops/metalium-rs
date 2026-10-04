@@ -305,6 +305,29 @@ fn streaming_matmul_and_reduction_match_flex() {
                 bits(&expected[0])
             );
             assert_eq!(bits(&session.download(&sum).unwrap()), bits(&expected[1]));
+            // New operands between replays, and a fresh op beside them: each
+            // replay computes what burn-flex does on what is there now.
+            for seed in [6, 7] {
+                let changed = ints(256 * 256, seed);
+                let expected = flex_product_and_sum(&changed, 256);
+                session.write(&input, &changed).unwrap();
+                session.replay(trace).unwrap();
+                let fresh = run(session);
+                for (actual, expected) in fresh.iter().zip(&expected) {
+                    assert_eq!(bits(actual), bits(expected), "fresh, seed {seed}");
+                }
+                session.replay(trace).unwrap();
+                assert_eq!(
+                    bits(&session.download(&product).unwrap()),
+                    bits(&expected[0]),
+                    "replayed product, seed {seed}"
+                );
+                assert_eq!(
+                    bits(&session.download(&sum).unwrap()),
+                    bits(&expected[1]),
+                    "replayed sum, seed {seed}"
+                );
+            }
             session.release_trace(trace).unwrap();
         });
     }
@@ -618,16 +641,31 @@ fn failed_writer_cancels_the_waiting_reader() {
     });
 }
 
+/// The mover fetches a trace's sections 64 entries at a time. A region's
+/// `LAUNCH` opens its reader section and the `KERNEL_WAIT` that joins the roles
+/// closes it, so a section of several chunks has the pair in different ones.
+/// Replayed over changed inputs, bit for bit the host's sums.
 #[test]
 fn large_streaming_pipeline_trace_crosses_chunks() {
+    let chunk = tt_isa::dm::TRACE_CHUNK_ENTRIES;
     with_tiles(1, |session| {
-        let input = session.upload(&values(2048 * 2048, 7), 2048, 2048).unwrap();
+        let first = values(2048 * 2048, 7);
+        let input = session.upload(&first, 2048, 2048).unwrap();
         session.begin_trace().unwrap();
         let output = add(session, &input);
         let trace = session.end_trace().unwrap();
-        let expected = session.download(&output).unwrap();
-        session.replay(trace).unwrap();
-        assert_eq!(bits(&session.download(&output).unwrap()), bits(&expected));
+        let sections = session.trace_sections(trace).unwrap();
+        let longest = sections.iter().flatten().copied().max().unwrap_or(0);
+        assert!(
+            longest > 2 * chunk,
+            "a section of {longest} entries does not cross a chunk boundary: {sections:?}"
+        );
+        for data in [first, values(2048 * 2048, 19)] {
+            session.write(&input, &data).unwrap();
+            session.replay(trace).unwrap();
+            let expected: Vec<f32> = data.iter().map(|value| value + value).collect();
+            assert_eq!(bits(&session.download(&output).unwrap()), bits(&expected));
+        }
         session.release_trace(trace).unwrap();
     });
 }
@@ -794,6 +832,118 @@ fn a_failed_stream_role_invalidates_traces_and_recovers() {
     });
 }
 
+/// A trace captured before a recovery names programs the reset cache forgot.
+/// A second trace of the same op places its programs at the same addresses, and
+/// releasing the first must not unhold them: under cache pressure they would be
+/// evicted from beneath the second trace's replays.
+#[test]
+fn releasing_a_stale_trace_leaves_a_newer_traces_programs_held() {
+    use tt_device::tlb::WindowKind;
+    with_tiles(1, |session| {
+        session.limit_program_cache(24 * 1024).unwrap();
+        session.set_pipeline(true);
+        let first_data = values(128 * 128, 41);
+        let first_input = session.upload(&first_data, 128, 128).unwrap();
+        session.begin_trace().unwrap();
+        add(session, &first_input);
+        let stale = session.end_trace().unwrap();
+        // Fail the role's script: the recovery resets the tile and clears its
+        // program cache.
+        let tile = session.tile();
+        let device = session.device();
+        let window = device.alloc_window(WindowKind::TwoMib).unwrap();
+        let address = device
+            .read32(
+                &window,
+                tile,
+                tt_isa::mailbox::role::Mailbox::of(0).program_addr(),
+            )
+            .unwrap();
+        device
+            .write32(&window, tile, address as u64, tt_isa::dataflow::VERSION + 1)
+            .unwrap();
+        session.replay(stale).unwrap();
+        assert!(session.sync().is_err());
+        // Same op, same shape: the same programs, placed in the empty cache at
+        // the addresses the stale trace holds.
+        let data = values(128 * 128, 43);
+        let input = session.upload(&data, 128, 128).unwrap();
+        session.begin_trace().unwrap();
+        let output = add(session, &input);
+        let newer = session.end_trace().unwrap();
+        session.release_trace(stale).unwrap();
+        let expected: Vec<f32> = data.iter().map(|value| value + value).collect();
+        for scalar in 1..80 {
+            let temporary = session
+                .eltwise(
+                    Eltwise {
+                        kind: kind::ADD_SCALAR,
+                        scalar: scalar as f32 / 8.0,
+                        scalar2: 0.0,
+                    },
+                    &input,
+                    None,
+                )
+                .unwrap();
+            session.sync().unwrap();
+            session.free(temporary).unwrap();
+        }
+        assert!(session
+            .program_cache_stats()
+            .iter()
+            .any(|stats| stats.evictions > 0));
+        session.replay(newer).unwrap();
+        assert_eq!(bits(&session.download(&output).unwrap()), bits(&expected));
+        session.release_trace(newer).unwrap();
+    });
+}
+
+/// A transfer-only packet has no kernel, so its failure takes the mover's
+/// recovery (a restart, not a tile reset). A mover whose queue stopped on an
+/// error reports it when the next list is queued behind it. Afterwards what was
+/// uploaded before is intact, what the failed copy held is not handed out while
+/// something may still read it, and new transfers and compute match the host.
+#[test]
+fn a_failed_transfer_only_packet_recovers_without_reusing_storage() {
+    use tt_device::tlb::WindowKind;
+    with_tiles(1, |session| {
+        let (rows, cols) = (100usize, 70usize);
+        let data = values(rows * cols, 5);
+        let input = session.upload(&data, rows, cols).unwrap();
+        session.sync().unwrap();
+        let tile = session.tile();
+        let device = session.device();
+        let window = device.alloc_window(WindowKind::TwoMib).unwrap();
+        device
+            .write32(&window, tile, tt_isa::dm::QUEUE_ERROR_AT, 1)
+            .unwrap();
+        device
+            .write32(
+                &window,
+                tile,
+                tt_isa::dm::QUEUE_ERROR,
+                tt_isa::dm::error::OP,
+            )
+            .unwrap();
+        let doomed = session.copy(&input).unwrap();
+        assert!(session.sync().is_err());
+        assert!(session.dataflow_stats().transfer_packets > 0);
+        session.free(doomed).unwrap();
+        // What the failed copy held is free again; whatever takes it must not
+        // be overwritten by a write of the failed packet that still lands.
+        let other_data = values(rows * cols, 9);
+        let other = session.upload(&other_data, rows, cols).unwrap();
+        let copy = session.copy(&other).unwrap();
+        assert_eq!(bits(&session.download(&input).unwrap()), bits(&data));
+        assert_eq!(bits(&session.download(&other).unwrap()), bits(&other_data));
+        assert_eq!(bits(&session.download(&copy).unwrap()), bits(&other_data));
+        let sum = add(session, &input);
+        let expected: Vec<f32> = data.iter().map(|value| value + value).collect();
+        assert_eq!(bits(&session.download(&sum).unwrap()), bits(&expected));
+        session.sync().unwrap();
+    });
+}
+
 #[cfg(feature = "silicon")]
 #[test]
 #[ignore = "silicon streaming GDDR payload throughput"]
@@ -942,12 +1092,28 @@ fn streaming_collects_profile_events_without_affecting_results() {
 #[ignore = "silicon performance sweep"]
 fn streaming_performance_sweep() {
     use std::time::Instant;
+    // `SWEEP_SHARE_PERCENT` scales the element-wise and reduce overlap
+    // thresholds (`tensor::set_pipeline_share_percent`); 0 overlaps wherever a
+    // run holds `MIN_PIPELINED_RUN` tiles, fresh and captured alike.
+    if let Ok(percent) = std::env::var("SWEEP_SHARE_PERCENT") {
+        tt_kernels::tensor::set_pipeline_share_percent(percent.trim().parse().unwrap());
+    }
     for count in [1, 8, 32] {
         with_tiles(count, |session| {
             for (operation, width) in [
                 ("add", 64),
+                ("add", 256),
                 ("add", 512),
+                ("add", 1024),
                 ("add", 2048),
+                ("add", 2560),
+                ("add", 3072),
+                ("add", 3584),
+                ("add", 4096),
+                ("add", 6144),
+                ("sum", 512),
+                ("sum", 1024),
+                ("sum", 2048),
                 ("matmul", 256),
                 ("matmul", 512),
             ] {
@@ -955,10 +1121,10 @@ fn streaming_performance_sweep() {
                 let input = session.upload(&data, width, width).unwrap();
                 let expected = {
                     let a = flex(&data, width, width);
-                    bits(&flex_values(if operation == "add" {
-                        a * 2.0
-                    } else {
-                        a.clone().matmul(a)
+                    bits(&flex_values(match operation {
+                        "add" => a * 2.0,
+                        "sum" => a.sum_dim(0),
+                        _ => a.clone().matmul(a),
                     }))
                 };
                 let mut results = [[0.0f64; 2]; 2];
@@ -967,6 +1133,8 @@ fn streaming_performance_sweep() {
                     let run = |session: &mut Session<_>| {
                         if operation == "add" {
                             add(session, &input)
+                        } else if operation == "sum" {
+                            session.reduce(&input, ReduceOp::Sum, Axis::Rows).unwrap()
                         } else {
                             session
                                 .matmul_dram(

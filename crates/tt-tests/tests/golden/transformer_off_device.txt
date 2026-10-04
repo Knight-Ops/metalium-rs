@@ -16,8 +16,6 @@ float_mul
 float_mul_scalar
 float_neg
 float_reshape
-float_sub
-float_sum_dim
 int_reshape
 
 # On the card (D4, 2026-10-03), but host-made operands still cross: the
@@ -29,5 +27,12 @@ float_select_add
 float_gather
 float_scatter_add
 
-# No device kernel: forwarded to Flex.
-float_mean              # full reduction (R1b)
+# Intentional readback: the loss is now a resident scalar, downloaded once
+# per step for reporting (4 bytes instead of float_mean's 512-byte input).
+float_into_data
+
+# 2026-10-04: full mean (R1b) is resident. The names above now describe
+# host-created operands, remaining view fallbacks, and explicit readback.
+
+# Native cutover: only construction uploads, host layout metadata, and explicit
+# scalar readback remain. The model gate also rejects all host arithmetic.

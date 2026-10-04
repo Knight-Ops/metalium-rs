@@ -123,6 +123,8 @@ pub fn discover<T: Transport, U: Transport>(
 pub enum Source {
     /// A Tensix tile's L1.
     Tensix(NocCoord<Noc0>, u32),
+    /// A checked DRAM range; NoC pulls it directly into E1's send buffer.
+    Dram(tt_isa::dram::DramRange),
     /// The sender's staging buffer, as the host left it ([`Mover::stage`]).
     Staged,
 }
@@ -131,6 +133,8 @@ pub enum Source {
 #[derive(Copy, Clone, Debug)]
 pub enum Dest {
     Tensix(NocCoord<Noc0>, u32),
+    /// A checked DRAM range on the receiving chip.
+    Dram(tt_isa::dram::DramRange),
     /// Left in the receiver's landing buffer ([`mover::RX_LAND`]).
     Landed,
 }
@@ -296,10 +300,28 @@ impl Mover {
         let (tile, i) = self.end(dir);
         let (sx, sy, sa) = match src {
             Source::Tensix(c, addr) => (c.x() as u32, c.y() as u32, addr),
+            Source::Dram(range) => {
+                if range.len() != u64::from(len) || range.offset() % 64 != 0 {
+                    return Err(LinkError::Invalid("DRAM source length/alignment"));
+                }
+                let c = (0..tt_isa::dram::PORTS)
+                    .find_map(|port| range.channel().endpoint(tt_isa::noc::niu::Niu::Noc0, port))
+                    .expect("NoC0 DRAM endpoint");
+                (c.x() as u32, c.y() as u32, range.offset() as u32)
+            }
             Source::Staged => (mover::NO_TILE, 0, 0),
         };
         let (dx, dy, da) = match dst {
             Dest::Tensix(c, addr) => (c.x() as u32, c.y() as u32, addr),
+            Dest::Dram(range) => {
+                if range.len() != u64::from(len) {
+                    return Err(LinkError::Invalid("DRAM destination length"));
+                }
+                let c = (0..tt_isa::dram::PORTS)
+                    .find_map(|port| range.channel().endpoint(tt_isa::noc::niu::Niu::Noc0, port))
+                    .expect("NoC0 DRAM endpoint");
+                (c.x() as u32, c.y() as u32, range.offset() as u32)
+            }
             Dest::Landed => (mover::NO_TILE, 0, 0),
         };
         if sa % 16 != 0 || da % 16 != 0 {

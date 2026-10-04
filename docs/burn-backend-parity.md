@@ -1,5 +1,10 @@
 # Burn backend parity — what `burn-tt` needs to feel like `burn-cuda`
 
+> Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
+> explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
+> below are superseded by [the current backend contract](../crates/burn-tt/README.md)
+> and [the cutover backlog](burn-native-cutover.md).
+
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
 with Burn's wrappers and tooling, and the developer experience, measured against the
 CubeCL backends (`burn-cuda`, `burn-wgpu`, both `burn_cubecl::CubeBackend`). It does **not**
@@ -16,17 +21,31 @@ alternative; (2) automate, with a once-per-key warning that names the op, shape,
 and cost; (3) a typed, actionable error at the earliest point. Never an opaque panic or
 hang mid-model.
 
-**Status, 2026-10-03** (audited against the code; the tables below are 2026-10-01's
-and are not all re-dated): B0 done but for `tracing`; B5 done but for partial-row
-downloads; B6 done for tile-aligned operands (rank-N `Linear` folded; batched products over strided views, `views.rs`); B8 done (calls return at once,
-named by the caller; the first failure is sticky and reported at the next wait);
-B3's hazard closed by B8's never-reused ids (both stale-buffer tests pass); B1
-partly (deferred errors, not yet a typed `TtError`); B2, B4, B7, B9-B15 not started. The general-model gate is `tt-tests`' `step59_burn_transformer`, whose
-`tests/golden/transformer_off_device.txt` lists what still runs on the host.
+**Status, 2026-10-04** (current code; dated comparisons below are historical):
+B0 report/strict mode done, tracing/reason attribution open; B5 rank-N storage
+and views done, unaligned slices/partial-row readback open; B6 tile-aligned
+batched matmul done, untiled shapes host-staged. B8 asynchronous submission and
+sticky errors are implemented; `Backend::sync` still uses Burn's default, so a
+backend barrier remains open. B3's stale-id hazard is closed by never-reused
+process-wide ids. B1 is partial (`EngineError(String)`, not typed `TtError`).
+B2, B4, B7 and B9–B15 remain open. Full F32 sum/mean now have resident paths
+(R1b), so the transformer gate no longer permits a host `float_mean`; it permits
+an explicit 4-byte scalar loss readback instead. Full reductions upload host
+F32 inputs and always use native arithmetic, including in exact mode; unsupported
+inputs fail explicitly. Full reductions on mesh engines execute on chip 0's
+SFPU with L1 staging and a host scalar result; both passes must fit L1/program
+capacity.
+Legacy approximate ops follow resident data at every size unless exact mode
+is selected; the old small-op thresholds are removed. B16 placement/lookahead
+policy remains a separate proposal.
+
+Next backend order: typed errors and a real sync barrier (B1/B8), lazy init
+and device discovery/card locks (B2), then the Burn conformance suite (B10/B11).
+General model coverage continues in `hardware-coverage.md`.
 
 ---
 
-## 1. Summary
+## 1. Historical comparison (2026-10-01)
 
 | Capability | burn-cuda / burn-wgpu | burn-tt today | Gap | Pri |
 |---|---|---|---|:-:|
@@ -52,7 +71,7 @@ partly (deferred errors, not yet a typed `TtError`); B2, B4, B7, B9-B15 not star
 
 ---
 
-## 2. Trait surface
+## 2. Trait surface and design proposals (2026-10-01)
 
 ### 2.1 `Backend` / `BackendTypes`
 
@@ -438,8 +457,10 @@ Some device ops are approximations held to derived bounds rather than to Flex's 
 (`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
 `log` and the rest of S4's transcendentals (10.2d-f, trigonometry included), sums over
 columns (tree order), softmax. `burn_tt::set_exact(true)` or
-`TT_EXACT=1` keeps on the device only what gives Flex's bits exactly; a run that must
-reproduce a host golden sets it (the MNIST golden does). Which ops are which is data:
+`TT_EXACT=1` sends legacy approximate ops to Flex. Full `sum`/`mean` are native
+only and retain their device arithmetic in this mode, within derived bounds
+rather than guaranteeing Flex's bits. The MNIST device golden pins that policy.
+Which legacy ops are which is data:
 `tt_kernels::sfpu::ops::accuracy` -- S2's compare, select and sign ops are exact and run
 on the device in exact mode and at any size (`hardware-coverage.md` 10.2c). Below eight tiles the
 approximate ops ran on the host whatever the mode until 2026-10-03 (`APPROX_MIN_TILES`, removed: data stays on the card; measured: their
@@ -537,14 +558,14 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | Id | Item | Depends | Done when |
 |---|---|---|---|
 | **B0** (report, strict, `host_ok`, `with_report`, `TT_REPORT`/`TT_STRICT` done 2026-10-03: `burn-tt/src/report.rs`, a guard the generator emits in every op; `tracing` targets, per-`Reason` attribution and the once-per-key warnings open) | Report + `tracing` + strict mode (§4.2); generator emits the hook | -- | every delegated op appears in `report()` with bytes; `TT_STRICT=1` turns `step12_mnist`'s known host ops into failures unless in `host_ok`; `TT_TRACE_FALLBACK` still works |
-| **B1** | `TtError`, sticky errors, poisoned tensors, `catch_unwind` on the server thread (edges 2, 18, 19, 22, 24) | -- | `an_engine_error_panics_with_it` becomes `an_engine_error_is_try_into_data_s_error`; strict keeps the panic |
+| **B1** (partial: sticky errors and poisoning implemented; typed error remains open) | `TtError`, sticky errors, poisoned tensors, `catch_unwind` on the server thread (edges 2, 18, 19, 22, 24) | -- | `an_engine_error_panics_with_it` becomes `an_engine_error_is_try_into_data_s_error`; strict keeps the panic |
 | **B2** | Engine registry, lazy auto-attach, `init`/`TtConfig`, default tiles from the grid, card lock, `device_count`/`enumerate` (edges 1, 3, 4, 23) | B1 | §2.2 gate; `tt-mnist` without attach code |
-| **B3** | Attachment generation in `Buffer`; `supports_dram` cache per attachment (edges 20, 21) | -- | test: tensor from attachment 1 read after re-attach is `StaleTensor`, watched failing on today's code (wrong data) |
+| **B3** (done via never-reused process-wide ids, 2026-10-03) | Stale buffers and capability cache scoped to the attachment; ids are translated by that server | -- | both stale-buffer gates pass; old tensors cannot read or free a new attachment's buffer |
 | **B4** | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
 | **B5** (storage, views and element-wise done: `hardware-coverage.md` P1a; partial-row download open -- measured: a 1000-row batch of a resident set is a host slice and a 3 MB re-upload every batch, 46 ms a batch against 2.1 on the host, row X) | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
 | **B6** (done 2026-10-03 for tile-aligned operands: a rank-N lhs against an unbatched rhs -- every `Linear` -- folds into the 2-D product, as do `linear_{weight,bias}_backward`; a real batch on both sides runs as `Session::matmul_dram_batched` over blocks of the operands' buffers, reshapes and swaps being strided views (`burn-tt/src/views.rs`); untiled shapes are still host-staged) | Batched matmul on resident operands (edge 9) | B5 | `[8,64,64]@[8,64,64]` under strict: zero downloads; bit-identical to per-batch host-staged |
 | **B7** | `download_many`, real readback futures, batched `tr_execute` | B1 | one server job per transaction |
-| **B8** (done 2026-10-03: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
+| **B8** (partial: asynchronous calls done 2026-10-03; `Backend::sync` barrier open: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
 | **B9** | `name`, `memory_cleanup`, `memory_persistent_allocations`; OOM retry | B2 | unit tests §2.1 |
 | **B10** | Vendored conformance crate on ttsim, eager policy, expected-failures | B2, B0 | §5.2 gate |
 | **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on both cards |
@@ -554,7 +575,7 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B13c** | Matmul + bias + ReLU epilogue fuser | B13b, HC:S1 | Linear+ReLU is one device job |
 | **B14** | `DistributedBackend` (host all-reduce), `distributed` feature on by default | B2 | `burn-train` DDP over two cards trains MNIST (slowly); Ethernet all-reduce with checklist 9.11 |
 | **B15** | Integration gates: `Learner` run with checkpoint round trip; `burn-store` safetensors load (F32 + BF16); one `burn-onnx` model | B0, B2, B4 | each matches Flex; reports archived |
-| **B16** | Cost-aware placement for isolated device ops between host ops (edge 11). With the session batching (`hardware-coverage.md` X4c) an op no longer costs a host wait, so `APPROX_MIN_TILES` and `SOFTMAX_DEVICE_MIN_TILES` (8) are worth re-measuring: below them MNIST's `[64, 10]` loss runs on the host, the last per-step sync (row V) | B0 report data | a `burn-onnx` CNN is never slower on burn-tt than on Flex; MNIST's steady step moves nothing once the loss is resident |
+| **B16** (proposed) | Cost-aware placement/lookahead for isolated ops and model-level decisions; the old size thresholds were removed 2026-10-03, so supported approximate ops now follow resident data at every size unless exact mode is selected | B0 report data | evaluate end-to-end models and PCIe traffic; full loss mean is now resident (R1b), while other shape fallbacks and host-created operands remain |
 
 Coverage work proper (S1-S9, M1-M4, R1-R4, D1-D6) proceeds in parallel; each landed item
 shrinks the report and the expected-failures list, and B0's report is how its "downloads

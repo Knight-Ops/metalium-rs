@@ -1,44 +1,6 @@
-//! `cargo xtask gen-burn-delegate`: the part of `burn-tt` that forwards to
-//! `burn-flex`, generated from the pinned `burn-backend`'s op traits.
-//!
-//! Burn 0.21 has about two hundred op methods without a default, and `burn-tt`
-//! starts as a backend that runs every one of them on the host through
-//! `burn-flex` and routes a chosen few to a Tensix tile. Writing the forwarding
-//! by hand would be transcription of exactly the kind this workspace generates
-//! its way out of: an op forwarded to the wrong Flex op compiles when the two
-//! signatures agree, and nothing but a test of that particular op would notice.
-//!
-//! So this reads each op trait's source, and for every method Flex itself
-//! implements -- every required one, and each defaulted one Flex overrides --
-//! emits a forward that converts each argument whose type
-//! names the backend with `IntoFlex`, calls the same method on `Flex`, and
-//! converts the result back with `FromFlex`, tagged with the device of the first
-//! argument that carries one (`HasDevice`). The generator is syntactic on
-//! purpose: what a type converts to is decided by those three traits in
-//! `burn-tt/src/convert.rs`, where rustc checks it, not by a table here.
-//!
-//! **A defaulted method Flex does not override is left to its default**, which
-//! then composes `burn-tt`'s own ops -- exactly as it composes Flex's for Flex.
-//! That is what makes the two backends agree everywhere but the device ops,
-//! *and* what lets a device op reach the defaults built on it. Forwarding the
-//! default to Flex instead would run it on Flex's ops: `ModuleOps::linear` is
-//! a default over `float_matmul` that Flex does not override, and `nn::Linear`
-//! calls it, so forwarding it kept every `Linear` layer off the device (found
-//! by `step12_mnist`'s first-forward gate, which asserts the device ran).
-//! Which methods Flex implements is read from its own `impl ... for Flex`
-//! blocks, from the pinned `burn-flex` source.
-//!
-//! Methods named in [`OVERRIDDEN`] are forwarded to a hand-written function in
-//! `burn-tt/src/ops.rs` with the same signature instead. The generator refuses:
-//! a method signature it cannot parse, a `where` clause or generic parameters
-//! (none exist in 0.21; a new one needs looking at), a method whose result
-//! names the backend but none of whose arguments carries a device, an `impl
-//! Future` result not in [`OVERRIDDEN`], an identifier with no known import, and
-//! an [`OVERRIDDEN`] entry that is not a method of its trait.
-//!
-//! Dependency-free, like the rest of xtask: `cargo metadata` locates the pinned
-//! source (whose integrity `Cargo.lock`'s checksum already guarantees), and the
-//! traits are brace-matched by hand, which Burn's regular trait syntax allows.
+//! Generate native dispatch and explicit unsupported methods from Burn's
+//! pinned operation traits. Composed defaults remain Burn's implementations.
+//! No reference backend is consulted by this generator.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -68,6 +30,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     (
         "FloatTensorOps",
         &[
+            "float_from_data",
+            "float_empty",
+            "float_random",
+            "float_expand",
             "float_matmul",
             "float_add",
             "float_sub",
@@ -80,6 +46,8 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_recip",
             "float_exp",
             "float_log",
+            "float_sum",
+            "float_mean",
             "float_sum_dim",
             "float_mean_dim",
             "float_gather",
@@ -87,6 +55,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_select",
             "float_select_add",
             "float_max_dim",
+            "float_argmax",
             "float_reshape",
             "float_slice",
             "float_swap_dims",
@@ -143,6 +112,9 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     (
         "IntTensorOps",
         &[
+            "int_from_data",
+            "int_empty",
+            "int_random",
             "int_device",
             "int_to_device",
             "int_into_data",
@@ -156,6 +128,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     (
         "BoolTensorOps",
         &[
+            "bool_from_data",
+            "bool_empty",
+            "bool_zeros",
+            "bool_ones",
             "bool_device",
             "bool_to_device",
             "bool_into_data",
@@ -291,20 +267,18 @@ pub struct Method {
 pub fn generate(check_only: bool) -> Result<(), String> {
     let root = workspace_root();
     let src = crate_source(&root, "burn-backend")?;
-    let flex = flex_implements(&crate_source(&root, "burn-flex")?)?;
     let mut traits = Vec::new();
     for (name, file) in TRAITS {
         let path = src.join("src/backend").join(file);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         let methods = parse_trait(&text, name)?;
-        let implemented = flex.iter().find(|(t, _)| t == name).map(|(_, m)| m);
-        traits.push((*name, forwarded(name, methods, implemented)?));
+        traits.push((*name, selected(name, methods)));
     }
     check_overridden(&traits, OVERRIDDEN)?;
     let rendered = render(&traits, OVERRIDDEN)?;
     let generated = rustfmt(&rendered, &root)?;
-    let dest = root.join("crates/burn-tt/src/generated/delegate.rs");
+    let dest = root.join("crates/burn-tt/src/generated/ops.rs");
     if check_only {
         let current = std::fs::read_to_string(&dest)
             .map_err(|e| format!("reading {}: {e}", dest.display()))?;
@@ -317,7 +291,7 @@ pub fn generate(check_only: bool) -> Result<(), String> {
         } else {
             Err(format!(
                 "{} is out of date with burn-backend {BURN_VERSION}.\n\
-                 Run `cargo xtask gen-burn-delegate` and commit the result.",
+                 Run `cargo xtask gen-burn-ops` and commit the result.",
                 dest.display()
             ))
         }
@@ -329,111 +303,27 @@ pub fn generate(check_only: bool) -> Result<(), String> {
     }
 }
 
-/// The methods `burn-tt` must emit: every required one, every defaulted one
-/// Flex implements (so its answer is Flex's), and every hand-written one.
-/// Refuses a required method Flex does not implement, which would mean the
-/// Flex parser has stopped reading Flex.
-pub fn forwarded(
-    tr: &str,
-    methods: Vec<Method>,
-    implemented: Option<&BTreeSet<String>>,
-) -> Result<Vec<Method>, String> {
-    let empty = BTreeSet::new();
-    let implemented = implemented.unwrap_or(&empty);
-    let hand: &[&str] = OVERRIDDEN
+/// Emit required methods, native overrides, and defaults that are only
+/// unsupported placeholders in Burn. Other defaults compose our primitives.
+pub fn selected(tr: &str, methods: Vec<Method>) -> Vec<Method> {
+    let hand = OVERRIDDEN
         .iter()
         .find(|(t, _)| *t == tr)
-        .map(|(_, n)| *n)
-        .unwrap_or(&[]);
-    let mut out = Vec::new();
-    for m in methods {
-        let flex_has = implemented.contains(&m.name);
-        if !m.defaulted && !flex_has {
-            return Err(format!(
-                "{tr}::{} is required but burn-flex's impl does not seem to define it; \
-                 the Flex parser is not reading Flex",
-                m.name
-            ));
-        }
-        if !m.defaulted || flex_has || hand.contains(&m.name.as_str()) {
-            out.push(m);
-        }
-    }
-    Ok(out)
-}
-
-/// For each op trait, the methods `impl {Trait}<Flex> for Flex` defines,
-/// across every file of `burn-flex`'s source.
-fn flex_implements(flex: &Path) -> Result<Vec<(String, BTreeSet<String>)>, String> {
-    let mut found: Vec<(String, BTreeSet<String>)> = Vec::new();
-    let mut stack = vec![flex.join("src")];
-    while let Some(dir) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            for (tr, _) in TRAITS {
-                for names in impl_methods(&text, &format!("impl {tr}<Flex> for Flex")) {
-                    match found.iter_mut().find(|(t, _)| t == tr) {
-                        Some((_, set)) => set.extend(names),
-                        None => found.push((tr.to_string(), names)),
-                    }
-                }
-            }
-        }
-    }
-    Ok(found)
-}
-
-/// The names of the `fn`s directly inside each `{head} { ... }` in `source`.
-pub fn impl_methods(source: &str, head: &str) -> Vec<BTreeSet<String>> {
-    let s = strip_comments(source);
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(at) = s[from..].find(head) {
-        let start = from + at;
-        let Some(open) = s[start..].find(['{', ';']).map(|o| start + o) else {
-            break;
-        };
-        from = open + 1;
-        if s.as_bytes()[open] == b';' {
-            continue;
-        }
-        let Ok(body) = matching_body(&s, open) else {
-            break;
-        };
-        let b = body.as_bytes();
-        let mut names = BTreeSet::new();
-        let mut depth = 0;
-        for i in 0..b.len() {
-            match b[i] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                b'f' if depth == 0
-                    && body[i..].starts_with("fn ")
-                    && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) =>
-                {
-                    let rest = &body[i + 3..];
-                    let end = rest
-                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .unwrap_or(rest.len());
-                    names.insert(rest[..end].to_string());
-                }
-                _ => {}
-            }
-        }
-        out.push(names);
-    }
-    out
+        .map_or(&[][..], |(_, names)| *names);
+    let placeholders = [
+        "float_scatter_nd",
+        "float_gather_nd",
+        "int_scatter_nd",
+        "int_gather_nd",
+    ];
+    methods
+        .into_iter()
+        .filter(|m| {
+            !m.defaulted
+                || hand.contains(&m.name.as_str())
+                || placeholders.contains(&m.name.as_str())
+        })
+        .collect()
 }
 
 /// A pinned crate's source directory, from `cargo metadata`.
@@ -669,27 +559,6 @@ fn names_backend(ty: &str) -> bool {
     words(ty).any(|w| w == "B")
 }
 
-/// Whether an argument of this type can say which device it is on.
-fn carries_device(ty: &str) -> bool {
-    let t = ty.trim_start_matches('&').trim();
-    [
-        "FloatTensor<B>",
-        "IntTensor<B>",
-        "BoolTensor<B>",
-        "QuantizedTensor<B>",
-        "Device<B>",
-        "TensorPrimitive<B>",
-    ]
-    .contains(&t)
-        || [
-            "Vec<FloatTensor<B>>",
-            "Vec<IntTensor<B>>",
-            "Vec<BoolTensor<B>>",
-            "Vec<QuantizedTensor<B>>",
-        ]
-        .contains(&t)
-}
-
 fn words(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty() && !w.chars().next().unwrap().is_ascii_digit())
@@ -774,61 +643,49 @@ pub fn render(
                 .collect();
             impls.push_str(&format!("fn {}({}){ret} {{\n", m.name, params.join(", ")));
             let is_hand = hand.contains(&m.name.as_str());
+            let is_future = m.ret.as_deref().is_some_and(|r| r.contains("Future"));
+            if is_future {
+                impls.push_str("async move {\n");
+            }
             impls.push_str(&format!(
                 "let _op = crate::report::enter(\"{}\", {is_hand});\n",
                 m.name
             ));
             if is_hand {
                 impls.push_str(&format!(
-                    "crate::ops::{}::{}({})\n}}\n",
+                    "crate::ops::{}::{}({})",
                     module_of(tr),
                     m.name,
                     names.join(", ")
                 ));
+                if is_future {
+                    impls.push_str(".await\n}\n");
+                }
+                impls.push_str("\n}\n");
                 continue;
             }
-            if m.ret.as_deref().is_some_and(|r| r.contains("Future")) {
-                return Err(format!(
-                    "{tr}::{} returns a future; implement it in burn-tt/src/ops.rs and \
-                     name it in OVERRIDDEN",
-                    m.name
-                ));
-            }
-            let converts_ret = m.ret.as_deref().is_some_and(names_backend);
-            let device_arg = m
+            let details: Vec<String> = m
                 .args
                 .iter()
                 .zip(&names)
-                .find(|((_, t), _)| carries_device(t))
-                .map(|(_, n)| *n);
-            if converts_ret {
-                let d = device_arg.ok_or_else(|| {
-                    format!(
-                        "{tr}::{}: the result names the backend but no argument \
-                         says which device it is on; implement it by hand",
-                        m.name
-                    )
-                })?;
-                impls.push_str(&format!("let device = HasDevice::tt_device(&{d});\n"));
-            }
-            let call_args: Vec<String> = m
-                .args
-                .iter()
-                .zip(&names)
-                .map(|((_, t), n)| {
-                    if names_backend(t) {
-                        format!("{n}.into_flex()")
+                .map(|((_, ty), n)| {
+                    if names_backend(ty) || ty == "TensorData" {
+                        format!("format!(\"{n}={{}}\", crate::unsupported::context(&{n}))")
                     } else {
-                        n.to_string()
+                        format!("format!(\"{n}={{:?}}\", {n})")
                     }
                 })
                 .collect();
-            let call = format!("<Flex as {tr}<Flex>>::{}({})", m.name, call_args.join(", "));
-            if converts_ret {
-                impls.push_str(&format!("FromFlex::from_flex({call}, device)\n}}\n"));
-            } else {
-                impls.push_str(&format!("{call}\n}}\n"));
+            let call = format!(
+                "crate::unsupported::fail(\"{}\", [{}].join(\"; \"))",
+                m.name,
+                details.join(", ")
+            );
+            impls.push_str(&call);
+            if is_future {
+                impls.push_str("\n}\n");
             }
+            impls.push_str("\n}\n");
         }
         impls.push_str("}\n\n");
     }
@@ -850,17 +707,16 @@ pub fn render(
     }
     let trait_imports: Vec<&str> = TRAITS.iter().map(|(t, _)| *t).collect();
     Ok(format!(
-        "//! Forwarding of every `burn-backend` {BURN_VERSION} op to `burn-flex`, except\n\
-         //! the ones `burn-tt/src/ops.rs` implements.\n\
+        "//! Native dispatch and unsupported operations for `burn-backend` {BURN_VERSION};\n\
+         //! Burn defaults compose the primitives implemented by this backend.\n\
          //!\n\
-         //! @generated by `cargo xtask gen-burn-delegate` from the pinned\n\
-         //! burn-backend's op traits. Do not edit: `gen-burn-delegate --check` fails\n\
+         //! @generated by `cargo xtask gen-burn-ops` from the pinned\n\
+         //! burn-backend's op traits. Do not edit: `gen-burn-ops --check` fails\n\
          //! if this file and its source disagree.\n\n\
-         #![allow(clippy::too_many_arguments, unused_variables)]\n\n\
+         // Signatures mirror Burn's traits, including explicit Future bounds.\n\
+         #![allow(clippy::too_many_arguments, clippy::manual_async_fn, unused_variables)]\n\n\
          use burn_backend::ops::{{{}}};\n\
-         use burn_flex::Flex;\n\n\
          {imports}\n\
-         use crate::convert::{{FromFlex, HasDevice, IntoFlex}};\n\
          use crate::TtBackend;\n\n\
          {impls}",
         trait_imports.join(", ")
@@ -913,17 +769,16 @@ pub trait FloatTensorOps<B: Backend> {
     }
 
     #[test]
-    fn forwards_with_the_first_argument_that_carries_a_device() {
-        let m = parse_trait(SAMPLE, "FloatTensorOps").unwrap();
+    fn unsupported_methods_name_arguments_without_reading_tensor_values() {
+        let m = selected(
+            "FloatTensorOps",
+            parse_trait(SAMPLE, "FloatTensorOps").unwrap(),
+        );
         let out = render(&[("FloatTensorOps", m)], &[]).unwrap();
-        assert!(out.contains("let device = HasDevice::tt_device(&lhs);"));
-        // Every op opens a report guard, so none goes unreported.
-        assert!(out.contains("let _op = crate::report::enter(\"float_add\", false);"));
-        assert!(out.contains(
-            "<Flex as FloatTensorOps<Flex>>::float_add(lhs.into_flex(), rhs.into_flex())"
-        ));
-        // `shape` and `dtype` do not name the backend and pass through.
-        assert!(out.contains("float_zeros(shape, device.into_flex(), dtype)"));
+        assert!(out.contains("crate::unsupported::fail(\"float_add\""));
+        assert!(out.contains("crate::unsupported::context(&lhs)"));
+        assert!(out.contains("crate::report::enter(\"float_add\", false)"));
+        assert!(!out.contains("fn float_zeros"));
     }
 
     #[test]
@@ -934,41 +789,22 @@ pub trait FloatTensorOps<B: Backend> {
     }
 
     #[test]
-    fn a_default_flex_does_not_override_is_left_to_the_default() {
+    fn composed_defaults_are_preserved_unless_overridden() {
         let m = parse_trait(SAMPLE, "FloatTensorOps").unwrap();
-        let flex: BTreeSet<String> = ["float_add", "float_sort_with_indices"]
-            .map(String::from)
-            .into();
-        let kept: Vec<String> = forwarded("FloatTensorOps", m.clone(), Some(&flex))
-            .unwrap()
+        let kept: Vec<_> = selected("FloatTensorOps", m)
             .into_iter()
             .map(|m| m.name)
             .collect();
         assert_eq!(kept, ["float_add", "float_sort_with_indices"]);
-        // Flex overriding the default brings it back.
-        let flex: BTreeSet<String> = ["float_add", "float_zeros", "float_sort_with_indices"]
-            .map(String::from)
-            .into();
-        assert_eq!(
-            forwarded("FloatTensorOps", m.clone(), Some(&flex))
-                .unwrap()
-                .len(),
-            3
-        );
-        // A required method Flex does not define means the parser is lost.
-        let flex: BTreeSet<String> = ["float_add"].map(String::from).into();
-        assert!(forwarded("FloatTensorOps", m, Some(&flex)).is_err());
-    }
-
-    #[test]
-    fn reads_the_methods_of_an_impl_block() {
-        let src = "impl FloatTensorOps<Flex> for Flex {\n fn a(x: u8) -> u8 { if x > 0 { 1 } else { 0 } }\n async fn b() {}\n}\nimpl TransactionOps<Flex> for Flex {}";
-        let got = impl_methods(src, "impl FloatTensorOps<Flex> for Flex");
-        assert_eq!(got, vec![["a", "b"].map(String::from).into()]);
-        assert_eq!(
-            impl_methods(src, "impl TransactionOps<Flex> for Flex"),
-            vec![BTreeSet::new()]
-        );
+        let out = render(
+            &[(
+                "FloatTensorOps",
+                parse_trait(SAMPLE, "FloatTensorOps").unwrap(),
+            )],
+            &[("FloatTensorOps", &["float_add"])],
+        )
+        .unwrap();
+        assert!(out.contains("crate::ops::float::float_add(lhs, rhs)"));
     }
 
     #[test]
@@ -982,14 +818,6 @@ pub trait FloatTensorOps<B: Backend> {
     }
 
     #[test]
-    fn refuses_a_result_with_no_device_to_tag_it_with() {
-        let src = "pub trait FloatTensorOps<B: Backend> { fn f(x: usize) -> FloatTensor<B>; }";
-        let m = parse_trait(src, "FloatTensorOps").unwrap();
-        let err = render(&[("FloatTensorOps", m)], &[]).unwrap_err();
-        assert!(err.contains("no argument"), "{err}");
-    }
-
-    #[test]
     fn refuses_an_unknown_identifier() {
         let src = "pub trait FloatTensorOps<B: Backend> { fn f(x: FloatTensor<B>, y: Mystery) -> FloatTensor<B>; }";
         let m = parse_trait(src, "FloatTensorOps").unwrap();
@@ -998,13 +826,13 @@ pub trait FloatTensorOps<B: Backend> {
     }
 
     #[test]
-    fn refuses_generics_and_futures() {
+    fn refuses_generics_and_generates_unsupported_futures() {
         let g = "pub trait FloatTensorOps<B: Backend> { fn f<T>(x: FloatTensor<B>) -> T; }";
         assert!(parse_trait(g, "FloatTensorOps").is_err());
         let f = "pub trait FloatTensorOps<B: Backend> { fn f(x: FloatTensor<B>) -> impl Future<Output = TensorData> + Send; }";
         let m = parse_trait(f, "FloatTensorOps").unwrap();
-        assert!(render(&[("FloatTensorOps", m)], &[])
-            .unwrap_err()
-            .contains("future"));
+        let generated = render(&[("FloatTensorOps", m)], &[]).unwrap();
+        assert!(generated.contains("async move {"));
+        assert!(generated.contains("crate::unsupported::fail"));
     }
 }

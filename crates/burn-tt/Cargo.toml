@@ -5,16 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# A Burn backend for Tenstorrent Blackhole. Every op delegates to burn-flex on
-# the host except the ones routed to a Tensix tile (matmul first). Shippable --
-# no simulator dependency (`cargo xtask check-no-sim-in-ship`); the simulator
-# engine the gates use lives in tt-tests.
+# Native Burn backend. Flex and simulator comparisons live in tt-tests.
 [dependencies]
 burn-backend.workspace = true
-burn-flex.workspace = true
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
 tt-device.workspace = true
 tt-isa.workspace = true
-# `Scalar::to_f64`, as `burn-flex` converts a scalar (`ops/binary.rs:454`).
+# Native scalar conversion for SFPU parameters.
 num-traits = { version = "0.2", default-features = false }
 tt-kernels.workspace = true
 tt-kmd.workspace = true

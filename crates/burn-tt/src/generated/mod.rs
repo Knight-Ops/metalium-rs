@@ -1,3 +1,2 @@
-//! Generated code; see each file's header.
-
-mod delegate;
+// @generated operations from the pinned Burn traits.
+mod ops;

@@ -1,5 +1,10 @@
 # Hardware coverage — Phase 10 tracker
 
+> Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
+> explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
+> below are superseded by [the current backend contract](../crates/burn-tt/README.md)
+> and [the cutover backlog](burn-native-cutover.md).
+
 The working tick-list for Phase 10 of `RUST_IMPL_PLAN.md` ("Phase 10 — Hardware
 coverage"). The plan says *why*; this file says *which parts of a Blackhole Tensix tile
 this stack can drive, which it cannot yet, and in what order the rest arrives*. It is the
@@ -18,7 +23,56 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-02, 10.2 done)
+## Where things stand (2026-10-04, 10.3 in progress)
+
+Milestones 10.0–10.2 are complete. Since their close-out, rank-N storage and
+strided views, tile-aligned batched matmul, last-dimension reductions and some
+leading-dimension sums, embedding and loss indexing, asynchronous Burn dispatch,
+host DMA, and fresh/traced streaming ownership have landed. B only reads GDDR;
+NC only writes it; on-card tensor arithmetic runs on Tensix.
+
+The first 10.3 addition is resident full F32 `sum` and `mean` (R1b): reduce
+columns, then rows, dividing a mean by the logical element count. Full-buffer
+reshape/swap views are reduced at their source; whole-tile-row slices reduce
+only their view. Wide matrices use at most 16 tile columns per chunk, with
+device block copies and scalar partial sums; tall matrices reuse the existing
+chunked row sum. Both ops are native only: host F32 inputs are uploaded, and
+unsupported dtypes, empty/rank-zero inputs, engines without native reduction
+support and resident views that cannot be copied on the card fail explicitly.
+Mesh engines compute the same reductions on chip 0's SFPU, staging through
+L1; both passes must fit L1/program slots, and their scalar result is on the
+host. The resident path chunks larger shapes. Exact mode also uses
+the native reduction and division order, within derived bounds rather than
+guaranteeing Flex's bits. No Flex arithmetic is called by either op.
+Gates: `step63_burn_full_reduce` and `step59_burn_transformer`.
+The scalar gates cover `[37, 8193]` wide chunks, `[8193, 1]` long row sums,
+ragged views, special values, native execution in exact mode, host-input uploads,
+autodiff and two-tile trace replay with changed inputs. The transformer gate
+replaces a 512-byte mean-input download with the explicit 4-byte loss readback
+per step. Exact-mode MNIST still computes its per-example losses on the host,
+then uploads 256 bytes for the native mean and reads back 4 bytes. Its updated
+32-step golden differs by at most four F32 ulps from the earlier golden, all
+within the derived reduction/division bound.
+
+Native-only validation (2026-10-04): eight scalar gates pass on ttsim,
+including staged mesh sums/means and explicit capacity rejection. All five
+MNIST end-to-end gates pass against the updated golden, including two/four-chip
+meshes. Device 1 run `1791079196` passes 10/10: seven resident scalar gates,
+the transformer loss gate, and single/four-tile MNIST goldens. This run uses
+device 1 exclusively; the staged mesh revision has simulator validation only.
+The complete workspace host/simulator tier passes, as do lint checks for the
+changed backend, kernels and reduction/model tests. Generated delegation and
+the no-simulator-in-shipping-crates checks pass.
+
+Full reductions do not complete 10.3: arbitrary axes/layouts, the other reduction
+kinds, Tensix transpose and norms remain open.
+
+**Next for model coverage:** finish R1, add K-blocked matmul (P2), complete D4
+slicing/indexing, finish M3/R3 layout and norms, then 10.4 formats/casts and
+10.5 convolution/pooling/attention. Backend error/setup/conformance work is
+tracked separately as B1/B2/B10. X280 dispatch remains proposed and unscheduled.
+
+### 10.2 close-out (historical measurements)
 
 10.2 (branch `phase10-2-activations`) has its instructions (10.2a): every SFPU
 instruction the rest of S2-S4 needs has a typed helper, an interpreter model and a
@@ -44,35 +98,31 @@ derived bound of a few ulps and through Burn's autodiff -- so S4 is done, and wi
 both cards at 2.0 / 1.7 ms a step, 1 / 4 tiles). Next: 10.3, reductions over any dim,
 device transpose, norms.
 
-### After 10.1
+### Current compute paths
 
-10.1 added, on top of the table below: reciprocal, division, `exp` and `log` on the SFPU
+10.1 added: reciprocal, division, `exp` and `log` on the SFPU
 (S3, S4a), lane movement (S8), `sum` and `max` over either dim (R1a), softmax and
 log-softmax on the device (R2); the matmul's loops replayed and the MOP Expander gated
 (X1, X2); the movers' queues, barriers, batching and traces (X4); and wedged tiles
-detected and recovered (X5). The table is 10.0's.
+detected and recovered (X5).
 
-Phases 0–9 built the path to the card. The compute that actually runs on it is narrow:
+Phases 0–9 built the path to the card. Compute currently uses these units:
 
 | Unit | What runs there today | Where |
 |---|---|---|
 | **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
-| **B core** | no arithmetic (2026-10-02): data movement, padding fills (`dm::op::FILL`), transposed and column-broadcast reads, kernel dispatch. The firmware image gate refuses every F-extension instruction | `dm_b.rs` |
+| **B / NC cores** | no arithmetic: B reads GDDR, transposes/broadcasts inputs and dispatches; NC writes GDDR and padding. Transfers and compute share ownership packets. Firmware image gates refuse F-extension instructions | `dm_b.rs`, `dm_nc.rs` |
 | **SFPU** | every element-wise op: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` (`tt_kernels::kind`) and `kind_sfpu`'s; the sum over rows in Flex's order (`sfpu::reduce::accumulate_in_order`) | `tt_kernels::sfpu::{ops, kernel, reduce}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
-The instruction *table* is far ahead of the kernels: `tt_isa::isa::generated` encodes 161
-instructions, every SFPU instruction among them, and `ELW*`, `GMPOOL`/`GAPOOL`, `MOP`,
-`REPLAY`, `TRNSPSRCB` and the ThCon set besides. The hand-written `tt_isa::sfpu` layer on
-top has `loadi`, `load`, `store`, `mad`, `mul`, `add`, `sub`, `load_f32` and `nop` -- no
-conditional execution, LUT, reciprocal, exponent or mantissa ops, casts, integer ops,
-swaps, transposes or PRNG.
+The instruction table includes units not yet used by tensor kernels (`ELW*`,
+`GMPOOL`/`GAPOOL`, `TRNSPSRCB`). The SFPU builder covers the activation and
+transcendental families, conditional execution, LUTs, lane movement, comparisons
+and Boolean logic. Remaining integer arithmetic, casts and PRNG are tracked below.
 
-On the Burn side, 12 compute methods have a device path (`burn-tt/src/ops.rs`, listed in
-`OVERRIDDEN`, `xtask/src/gen_burn.rs`); no `ModuleOps`, `IntTensorOps` or
-`BoolTensorOps` method does. Under device residency every other op is a download, a
-Flex op on the host and an upload, which is why breadth is a performance problem and not
-only a feature list.
+Burn's device paths are listed in `OVERRIDDEN` (`xtask/src/gen_burn.rs`) and the
+coverage tables below. Unsupported operations still use Flex, with per-op
+reporting and strict-mode refusal of unintended downloads.
 
 **Milestones** (detail in "Work items"):
 
@@ -81,7 +131,7 @@ only a feature list.
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
-| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[ ]` |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` rank-N storage/views, partial rank-N reductions, full F32 sum/mean; arbitrary axes, other reductions, Tensix transpose and norms open |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
@@ -544,7 +594,13 @@ Each names the measurement it must move. The Burn-side ones are in
       register persistence to be checked on ttsim and in a gate first). Moves:
       `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
       the gather's share of a step (row V: 0.94 ms of 2.4).
-- [ ] **X7 Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
+- [~] **X7 Host transfers** (DMA and batching, 2026-10-03). Tensors use pinned
+      host memory and the card's `HOST_READ`/`HOST_WRITE` DMA; parallel host
+      tilize/detilize and run records deliver about 11 GB/s on large Session
+      transfers. Gated by `step57_host_dma`; measurements in
+      `firmware-performance.md`. A Device-level posted-write fence API remains
+      open in the checklist. The following is the historical motivation:
+      **Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
       a call and a download of the same ~140 us past its sync (rows Z, measurement M:
       uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
       a tensor touches). Batch the read-backs per tensor, not per channel write; read
@@ -593,8 +649,9 @@ Each names the measurement it must move. The Burn-side ones are in
         (every product bit for bit the 2-D matmul of its block, copies bit
         for bit, ragged and overlapping refusals; watched failing with the
         block offset dropped and with the tiles read untransposed; ttsim and
-        both cards), `step59_burn_transformer`. Open: reductions over leading
-        dims.
+        both cards), `step59_burn_transformer`. Last-dim sum/max and mean_dim
+        compositions, plus certain leading-dim sums, are done. General
+        leading-dim reductions and untiled batched matmul remain open.
 - [ ] **P2 K blocking** (concepts review G3): `Dst` reload or packer L1 accumulation, so
       a matmul's K is not capped by L1. Blocks D6's im2col.
 
@@ -1069,14 +1126,23 @@ Each names the measurement it must move. The Burn-side ones are in
       gather reads a tile column in column-major order (`READ_RUN` flag bit 2). Max is
       exact (total order: a positive NaN propagates, a negative one is ordered below
       `-inf`); a sum over columns is in tree order, within `2 (n-1) u sum|x|` of
-      Flex's; a sum over rows stays on the mover, in Flex's order. Oracle: the same
+      Flex's; a sum over rows stays on the SFPU, in Flex's order. Oracle: the same
       programs in the interpreter (`reduce::reference`), exact on integer data for
       every shape. Gates: `step31_reduce` (device equal to the program bit for bit;
       max equal to Flex's, sums within the bound; ragged shapes, lines of up to 32
       tiles), `step32_burn_softmax`. Burn: `float_max_dim`, `float_sum_dim` (both
-      dims). Remaining (R1b, 10.3): `mean`, `min`, `prod`, `argmax`/`argmin`,
-      `any`/`all`, full reductions, `cum*`, more than ~200 tiles along the reduced
-      dimension (one pass's L1 limit; refused with a typed error today).
+      dims). Full F32 `sum`/`mean` are now resident (R1b): bounded column
+      chunks and the existing chunked row sum remove their one-pass L1 limit;
+      means use the logical count, and full-source views require no copy.
+      `mean_dim` already composes sum_dim and scaling on supported axes.
+      `step63_burn_full_reduce` checks the composed program models bit for bit,
+      a derived addition-order/division bound against Flex, ragged padding,
+      special values, views, native execution in exact mode, host-input uploads,
+      autodiff and trace replay. Unsupported inputs fail explicitly; neither
+      full reduction delegates arithmetic to Flex.
+      Remaining: general axes/layouts, `min`, `prod`, `argmax`/`argmin`,
+      `any`/`all`, full max/min/product, `cum*`, and long non-scalar reductions
+      other than the chunked row sum.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
       laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
@@ -1089,24 +1155,22 @@ Each names the measurement it must move. The Burn-side ones are in
       and `[64, 96]`; Flex bit for bit, `DIV` within one ulp; device equal to the
       program; padding claims checked against raw tiles) and `step27_burn_eltwise`'s
       broadcast cases; ttsim and both cards.
-- [~] **R2 Softmax, log-softmax on the device**; cross-entropy waits on D4. `softmax`
+- [x] **R2 Softmax, log-softmax and resident loss compositions** (D4 indexing and R1b full mean). `softmax`
       and `log_softmax` (either dim of a resident matrix) run Burn's own composition
       -- max, broadcast subtract, `exp`, sum, broadcast divide or `log` and subtract --
       on the device end to end, decided once on the whole input; `softmin`
       (10.2e) the same on an exact `NEG`. Against Flex's fused
       softmax: a bound derived from the parts' (`EXP_BOUND` twice, the sum's order, the
       division's ulp, Flex's own counterparts); measured worst `1.0e-6` relative.
-      Burn's `CrossEntropyLoss` gathers the target column with an integer index
-      tensor (`float_gather`, D4), so MNIST's loss -- and its logits download -- stays
-      on the host for now. **Placement** (measurement S): an SFPU kernel op costs
-      100-200 us whatever its size, a tile's download ~190 us, so the approximate ops
-      (division, `exp`, `log`, the SFPU's reductions) reached through Burn's methods run
-      on the host below eight tiles (`burn-tt`'s `APPROX_MIN_TILES`) -- autodiff's own
-      `log_softmax` on MNIST's two-tile logits took the step from 3.8 to 7.9 ms/step
-      on the device -- and softmax compositions decide on their input's size. Heuristic
-      until submission is asynchronous or a lookahead exists (X4, B8, B13, B16).
-      **Exact mode** (`burn_tt::set_exact`, `TT_EXACT=1`): only ops that give Flex's
-      bits run on the device; the MNIST golden runs so. Gates: `step32_burn_softmax`
+      Burn's `CrossEntropyLoss` now gathers its target column on the card
+      (D4), and its final full mean is resident (R1b). The small-tensor
+      placement thresholds (`APPROX_MIN_TILES`, `SOFTMAX_DEVICE_MIN_TILES`)
+      were removed 2026-10-03: approximate operations follow resident data
+      at every size. The old placement measurements remain in
+      `firmware-performance.md`'s change log.
+      **Exact mode** (`burn_tt::set_exact`, `TT_EXACT=1`): legacy approximate
+      ops use Flex. Full `sum`/`mean` always use native arithmetic within their
+      derived bounds, including in this mode. Gates: `step32_burn_softmax`
       (every step resident, both dims, three shapes; a two-tile tensor on the host and
       bit-identical); the MNIST golden in exact mode. Was: **R2 Softmax, log-softmax,
       cross-entropy on the device** (was checklist 9.12): max,
@@ -1177,7 +1241,11 @@ Each names the measurement it must move. The Burn-side ones are in
       carrying the row indices would cut the bytes ~18x. Open: general
       `gather` (several indices per row, other dims), unaligned `slice`,
       `slice_assign`, `cat`, `repeat_dim`, `expand`, `flip`.
-- [ ] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
+- [~] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
+      Mover `TILIZE`/`UNTILIZE`, `Session::set_tilize` and `TT_TILIZE=card`
+      are implemented and gated (`step58_tile_layout`), but slower than
+      host tilize at the measured sizes. Host tilize remains the default.
+      Unpacker/Tensix tilize and direct reads from caller memory remain open.
 - [ ] **D6 Convolution.** `conv2d` as im2col on the mover plus the existing matmul, then
       its three backwards, `conv1d`, `conv_transpose2d`, `unfold4d`.
 
@@ -1195,11 +1263,13 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
-| `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU or mover by size) | S1, P1a |
-| `float_sum_dim` | x (dim 0 the mover's, exact; dim 1 the SFPU's, order bound) | R1 |
+| `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
+| `float_sum_dim` | `~` matrix axes and rank-N last dim; certain leading-dim sums; all on SFPU | R1 |
+| `float_mean_dim` | `~` sum_dim plus scaling on supported axes; exact mode uses Flex | R1 |
+| `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs, including in exact mode; unsupported inputs fail | R1b |
 | `float_slice` | `~` whole tile rows | D4 |
 | `float_transpose`, `float_swap_dims` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
-| `float_add_scalar`, `float_sub_scalar` | x (SFPU or mover by size) | S1 |
+| `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
@@ -1212,8 +1282,8 @@ path today, `~` when only some shapes do.
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
-| `float_max_dim` | x (SFPU, exact value) | R1 |
-| `float_sum`, `float_mean{,_dim}`, `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
+| `float_max_dim` | `~` matrix axes and rank-N last dim; SFPU | R1 |
+| `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
 | `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add` | `~` last dim, one index per row (SFPU; gather's `-0` returned `+0`) | D4 |
@@ -1225,12 +1295,12 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `relu`, `relu_backward` | x (SFPU or mover by size) | S1 |
+| `relu`, `relu_backward` | x (SFPU) | S1 |
 | `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
 | `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
-| `softmax`, `log_softmax` | x (device composition, derived bound; from 8 tiles) | R2 |
-| `softmin` | x (device composition, derived bound; from 8 tiles) | R2 |
+| `softmax`, `log_softmax` | x (device composition, derived bound; every supported size) | R2 |
+| `softmin` | x (device composition, derived bound; every supported size) | R2 |
 
 ### `ModuleOps`
 

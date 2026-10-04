@@ -79,6 +79,9 @@ pub struct ProgramCache {
     by_hash: HashMap<u64, Vec<usize>>,
     clock: u64,
     stats: CacheStats,
+    /// How many times the cache was forgotten ([`ProgramCache::clear`]): a
+    /// hold taken before one names a program that is no longer there.
+    clears: u64,
 }
 
 /// Is a role program of `words` words cached on a tile, rather than run from
@@ -111,6 +114,7 @@ impl ProgramCache {
             by_hash: HashMap::new(),
             clock: 0,
             stats: CacheStats::default(),
+            clears: 0,
         }
     }
 
@@ -216,6 +220,20 @@ impl ProgramCache {
         }
     }
 
+    /// Which life of the cache a hold is taken in: [`ProgramCache::clear`]
+    /// starts the next, and a hold from an earlier one is gone with it.
+    pub fn generation(&self) -> u64 {
+        self.clears
+    }
+
+    /// [`ProgramCache::release`] for a hold taken in `generation`: nothing if
+    /// the cache was cleared since, when `at` may hold another trace's program.
+    pub fn release_held(&mut self, generation: u64, at: u64) {
+        if generation == self.clears {
+            self.release(at);
+        }
+    }
+
     /// One trace no longer names the program at `at`.
     pub fn release(&mut self, at: u64) {
         if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
@@ -241,9 +259,10 @@ impl ProgramCache {
     /// Forget everything: the tile was reset, and what is in its L1 is no
     /// longer the host's to vouch for.
     pub fn clear(&mut self) {
-        let stats = self.stats;
+        let (stats, clears) = (self.stats, self.clears + 1);
         *self = ProgramCache::new(self.region);
         self.stats = stats;
+        self.clears = clears;
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -411,6 +430,32 @@ mod tests {
         c.clear_unheld();
         assert!(matches!(c.place(&[1, 2, 3]), Ok(Placed::Hit(at)) if at == a));
         assert!(!c.hold(b), "the unheld program was evicted");
+    }
+
+    #[test]
+    fn a_release_after_a_clear_leaves_the_new_hold_alone() {
+        let mut c = ProgramCache::new(tt_isa::l1::PROGRAM_CACHE);
+        let Ok(Placed::Upload(old)) = c.place(&[1, 2, 3]) else {
+            panic!("a first program is uploaded")
+        };
+        assert!(c.hold(old));
+        let before = c.generation();
+        c.clear();
+        assert_ne!(c.generation(), before);
+        // A later trace's program lands where the first one was.
+        let Ok(Placed::Upload(new)) = c.place(&[4, 5, 6]) else {
+            panic!("the cleared cache uploads again")
+        };
+        assert_eq!(new, old);
+        assert!(c.hold(new));
+        // The first trace is released late: it must not unhold the second.
+        c.release_held(before, old);
+        c.unpin_all();
+        c.clear_unheld();
+        assert!(matches!(c.place(&[4, 5, 6]), Ok(Placed::Hit(at)) if at == new));
+        c.release_held(c.generation(), new);
+        c.clear_unheld();
+        assert!(!c.hold(new), "released in its own life, it is evictable");
     }
 
     #[test]

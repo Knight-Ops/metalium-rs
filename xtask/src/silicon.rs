@@ -110,6 +110,7 @@ pub const SMOKE: &[&str] = &[
     "step60_batched_blocks::",
     "step61_burn_gather::",
     "step62_gather_rows::",
+    "step63_burn_full_reduce::",
 ];
 
 pub const USAGE: &str = "\
