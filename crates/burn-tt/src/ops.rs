@@ -470,6 +470,20 @@ pub mod float {
     /// metadata is constructed on the host; comparisons and selection stay
     /// on the device. Only I32 output and rank-one/two inputs are supported.
     pub fn float_argmax(tensor: TtTensor, dim: usize, out_dtype: IntDType) -> TtTensor {
+        argextreme(tensor, dim, out_dtype, false)
+    }
+
+    /// First minimum index, with the same tie and NaN priority as argmax.
+    pub fn float_argmin(tensor: TtTensor, dim: usize, out_dtype: IntDType) -> TtTensor {
+        argextreme(tensor, dim, out_dtype, true)
+    }
+
+    fn argextreme(tensor: TtTensor, dim: usize, out_dtype: IntDType, minimum: bool) -> TtTensor {
+        let op = if minimum {
+            "float_argmin"
+        } else {
+            "float_argmax"
+        };
         let shape = tensor.shape().to_vec();
         if out_dtype != IntDType::I32
             || shape.is_empty()
@@ -481,10 +495,11 @@ pub mod float {
             || !crate::server::supports_dram(tensor.device)
         {
             fail(
-                "float_argmax",
+                op,
                 format_args!("{}, dim={dim}, out_dtype={out_dtype:?}", context(&tensor)),
             );
         }
+        let tensor = if minimum { float_neg(tensor) } else { tensor };
         let axis = if shape.len() == 1 { 1 } else { dim };
         let dims = tensor.stored().expect("matrix");
         let tensor = reshaped(tensor, burn_backend::Shape::new(dims));
@@ -981,6 +996,40 @@ pub mod float {
             }
             TtTensor::new(tensor.into_host().swap_dims(dim1, dim2), device)
         }
+    }
+
+    /// Reorder dimensions as existing strided views or host staging layouts.
+    pub fn float_permute(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        let rank = tensor.shape().num_dims();
+        let mut seen = vec![false; rank];
+        if axes.len() != rank
+            || axes.iter().any(|&a| {
+                if a >= rank || seen[a] {
+                    true
+                } else {
+                    seen[a] = true;
+                    false
+                }
+            })
+        {
+            fail(
+                "float_permute",
+                format_args!("{}, axes={axes:?}", context(&tensor)),
+            );
+        }
+        let mut order: Vec<_> = (0..rank).collect();
+        let mut tensor = tensor;
+        for (i, &axis) in axes.iter().enumerate() {
+            let j = order
+                .iter()
+                .position(|&a| a == axis)
+                .expect("validated axes");
+            if i != j {
+                tensor = float_swap_dims(tensor, i, j);
+                order.swap(i, j);
+            }
+        }
+        tensor
     }
 
     /// The last two dimensions swapped; see [`float_swap_dims`].
@@ -2349,6 +2398,11 @@ pub mod int {
         )
     }
 
+    /// Broadcast I32 bytes with the native copier.
+    pub fn int_expand(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
+        expanded(&tensor, shape, "int_expand")
+    }
+
     /// A view where the stored matrix is kept, as `float_reshape`.
     pub fn int_reshape(
         tensor: IntTensor<TtBackend>,
@@ -2457,6 +2511,67 @@ pub mod bool {
         device: &Device<TtBackend>,
     ) -> BoolTensor<TtBackend> {
         to_device_resident(tensor, device)
+    }
+
+    /// Broadcast Boolean bytes with the native copier.
+    pub fn bool_expand(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
+        expanded(&tensor, shape, "bool_expand")
+    }
+
+    /// Convert device Boolean 0/1 to F32 without reading back.
+    pub fn bool_into_float(tensor: TtTensor, out_dtype: burn_backend::FloatDType) -> TtTensor {
+        if out_dtype == burn_backend::FloatDType::F32 {
+            if let Some(t) = device_eltwise(kind_sfpu::BOOL_TO_F32, 0.0, &tensor, None) {
+                return t;
+            }
+        }
+        fail(
+            "bool_into_float",
+            format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
+        )
+    }
+
+    /// Copy Boolean 0/1 to a typed I32 device buffer.
+    pub fn bool_into_int(tensor: TtTensor, out_dtype: IntDType) -> TtTensor {
+        if out_dtype == IntDType::I32 {
+            if let Some(t) = device_eltwise(kind_sfpu::BOOL_TO_I32, 0.0, &tensor, None) {
+                return t;
+            }
+        }
+        fail(
+            "bool_into_int",
+            format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
+        )
+    }
+
+    /// Boolean equality, including the existing native broadcasts.
+    pub fn bool_equal(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        if let Some(t) = device_eltwise(kind_sfpu::BOOL_XOR, 0.0, &lhs, Some(&rhs)) {
+            return bool_not(t);
+        }
+        fail(
+            "bool_equal",
+            format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+        )
+    }
+
+    /// Equality with true is an identity; equality with false is native NOT.
+    pub fn bool_equal_elem(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        if lhs.elem() != Some(Elem::Bool)
+            || !lhs.is_storable()
+            || !crate::server::supports_dram(lhs.device)
+        {
+            fail(
+                "bool_equal_elem",
+                format_args!("{}, rhs={rhs:?}", context(&lhs)),
+            );
+        }
+        if rhs.elem::<bool>() {
+            let _ = lhs.to_dram();
+            lhs
+        } else {
+            bool_not(lhs)
+        }
     }
 
     pub fn bool_reshape(

@@ -10,7 +10,7 @@ by the gates lives in `tt-tests`).
 ## What runs on the device
 
 With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
-`tt-tests`), on 2-D F32 tensors:
+`tt-tests`), supported operations include:
 
 | Burn op | On the card as |
 |---|---|
@@ -19,7 +19,12 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | `relu`, `relu_backward` | `RELU`, `RELU_BACKWARD` |
 | `float_sum_dim(0)` | SFPU sum over rows, in Flex's summation order |
 | `float_sum`, `float_mean` (rank one or more) | Native full F32 reduction, bounded column chunks followed by the chunked row sum; mean divides on the SFPU |
-| `float_transpose` / `float_swap_dims` (2-D) | a view: same buffer, read transposed |
+| `float_transpose` / `float_swap_dims` / `float_permute` | strided views at any rank; downstream native copies require supported whole-tile layouts |
+| `float_argmax` / `float_argmin` | native selection, first tie/NaN; rank-one/two F32, I32 indices, axes up to 2^23 |
+| `bool_equal` / `bool_equal_elem` | Boolean XOR/NOT or identity, native broadcasts |
+| `bool_into_float` / `bool_into_int` | exact native 0/1 conversion to F32/I32 |
+| `float_any` / `float_all` and dimensional variants | Burn defaults over comparisons, Boolean-to-F32 and supported native sums |
+| `float_expand` / `int_expand` / `bool_expand` | native byte-preserving gathers and transposes |
 | `float_slice` of whole rows on 32-row bounds | a view, no copy |
 
 Supported element-wise ops upload inputs as needed and compute on the device. A rank-N
@@ -72,7 +77,8 @@ cargo test -p burn-tt
 seed reproducibility and contextual unsupported failures without hardware.
 `tests/stale_buffer.rs` guards attachment and buffer lifetimes. External Flex
 comparisons live in `tt-tests`, including `burn_server`, `step11_burn`,
-`step12_mnist`, `step59_burn_transformer`, and `step64_burn_native_broadcast`.
+`step12_mnist`, `step59_burn_transformer`, `step64_burn_native_broadcast`, and
+`step66_burn_small_ops`.
 The MLP and transformer gates reject host arithmetic and staged model compute.
 
 ## Dtypes and physical formats
@@ -155,7 +161,7 @@ unparsable value as `0`.
   only: ttsim does not model the timestamper's event stream.
 - `Topology::Cards` uses resident buffers and one compute tile per card;
   `on_tiles` refuses more. Non-matmul primitives execute on chip 0.
-- Native argmax supports rank-one/two F32 input, I32 output, and reduced axes
+- Native argmax and argmin support rank-one/two F32 input, I32 output, and reduced axes
   of at most 2^23 elements, with first-tie and first-NaN semantics.
 - Random construction uses independent host RNG streams per `TtDevice`, seeded
   through `TtBackend::seed`. Draws are reproducible on this backend; matching

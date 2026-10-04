@@ -88,3 +88,59 @@ fn unsupported_methods_name_operation_shape_and_dtype() {
         message.contains("float_from_data") && message.contains("F64") && message.contains("[1]")
     );
 }
+
+#[test]
+fn host_permutation_and_backend_axis_validation() {
+    use burn_backend::{ops::FloatTensorOps, Shape};
+    let d = TtDevice::new(305);
+    let data = TensorData::new((0..24).map(|i| i as f32).collect::<Vec<_>>(), [2, 3, 4]);
+    let result = Tensor::<TtBackend, 3>::from_data(data, &d)
+        .permute([2, 0, 1])
+        .into_data();
+    assert_eq!(result.shape, Shape::new([4, 2, 3]));
+    let expected: Vec<_> = (0..4)
+        .flat_map(|k| (0..2).flat_map(move |i| (0..3).map(move |j| (i * 12 + j * 4 + k) as f32)))
+        .collect();
+    assert_eq!(result.to_vec::<f32>().unwrap(), expected);
+    for axes in [vec![0, 0, 2], vec![0, 1], vec![0, 1, 3]] {
+        let tensor = <TtBackend as FloatTensorOps<TtBackend>>::float_from_data(
+            TensorData::new(vec![1.0f32; 24], [2, 3, 4]),
+            &d,
+        );
+        let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            <TtBackend as FloatTensorOps<TtBackend>>::float_permute(tensor, &axes)
+        }))
+        .unwrap_err();
+        let message = message.downcast_ref::<String>().unwrap();
+        assert!(message.contains("float_permute") && message.contains("axes="));
+    }
+}
+
+#[test]
+fn unsupported_boolean_conversion_dtypes_name_operation_and_input() {
+    use burn_backend::{ops::BoolTensorOps, FloatDType, IntDType};
+    let d = TtDevice::new(306);
+    for float in [true, false] {
+        let tensor = <TtBackend as BoolTensorOps<TtBackend>>::bool_from_data(
+            TensorData::new(vec![true, false], [2]),
+            &d,
+        );
+        let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if float {
+                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_float(tensor, FloatDType::F16)
+            } else {
+                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_int(tensor, IntDType::I64)
+            }
+        }))
+        .unwrap_err();
+        let message = message.downcast_ref::<String>().unwrap();
+        assert!(message.contains(if float {
+            "bool_into_float"
+        } else {
+            "bool_into_int"
+        }));
+        assert!(
+            message.contains("Bool") && message.contains("[2]") && message.contains("out_dtype=")
+        );
+    }
+}

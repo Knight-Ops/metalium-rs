@@ -252,15 +252,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_swap_dims(tensor, dim1, dim2)
     }
     fn float_permute(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_permute", false);
-        crate::unsupported::fail(
-            "float_permute",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_permute", true);
+        crate::ops::float::float_permute(tensor, axes)
     }
     fn float_flip(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_flip", false);
@@ -706,16 +699,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         dim: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("float_argmin", false);
-        crate::unsupported::fail(
-            "float_argmin",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_argmin", true);
+        crate::ops::float::float_argmin(tensor, dim, out_dtype)
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_max_dim", true);
@@ -1409,15 +1394,8 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_random(shape, distribution, device, dtype)
     }
     fn int_expand(tensor: IntTensor<TtBackend>, shape: Shape) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_expand", false);
-        crate::unsupported::fail(
-            "int_expand",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("shape={:?}", shape),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_expand", true);
+        crate::ops::int::int_expand(tensor, shape)
     }
     fn bitwise_and(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("bitwise_and", false);
@@ -1611,29 +1589,15 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         crate::ops::bool::bool_from_data(data, device)
     }
     fn bool_into_int(tensor: BoolTensor<TtBackend>, out_dtype: IntDType) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bool_into_int", false);
-        crate::unsupported::fail(
-            "bool_into_int",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_into_int", true);
+        crate::ops::bool::bool_into_int(tensor, out_dtype)
     }
     fn bool_into_float(
         tensor: BoolTensor<TtBackend>,
         out_dtype: FloatDType,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("bool_into_float", false);
-        crate::unsupported::fail(
-            "bool_into_float",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_into_float", true);
+        crate::ops::bool::bool_into_float(tensor, out_dtype)
     }
     fn bool_device(tensor: &BoolTensor<TtBackend>) -> Device<TtBackend> {
         let _op = crate::report::enter("bool_device", true);
@@ -1771,26 +1735,12 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         )
     }
     fn bool_equal(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_equal", false);
-        crate::unsupported::fail(
-            "bool_equal",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_equal", true);
+        crate::ops::bool::bool_equal(lhs, rhs)
     }
     fn bool_equal_elem(lhs: BoolTensor<TtBackend>, rhs: Scalar) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_equal_elem", false);
-        crate::unsupported::fail(
-            "bool_equal_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_equal_elem", true);
+        crate::ops::bool::bool_equal_elem(lhs, rhs)
     }
     fn bool_not(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("bool_not", true);
@@ -1852,15 +1802,8 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         }
     }
     fn bool_expand(tensor: BoolTensor<TtBackend>, shape: Shape) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_expand", false);
-        crate::unsupported::fail(
-            "bool_expand",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("shape={:?}", shape),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_expand", true);
+        crate::ops::bool::bool_expand(tensor, shape)
     }
     fn bool_unfold(
         tensor: BoolTensor<TtBackend>,

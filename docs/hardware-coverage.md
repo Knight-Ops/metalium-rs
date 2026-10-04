@@ -1109,8 +1109,9 @@ Each names the measurement it must move. The Burn-side ones are in
       `float_mean_dim`, `max_pool2d`, `avg_pool2d`, `adaptive_avg_pool2d` (with D6's
       windowing).
 - [ ] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
-      place of the B core's face transpose (`READ_TRANSPOSED`). Burn: `float_permute`,
-      materialised transposes.
+      place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
+      transposes remain open; `float_permute` now creates native strided views
+      through dimension swaps, without a new transpose kernel (`step66`).
 - [ ] **M4 `DOTPV`, `SHIFTXA`/`SHIFTXB`.** Silicon-only (row 50). Only when a kernel
       wants them.
 
@@ -1140,9 +1141,17 @@ Each names the measurement it must move. The Burn-side ones are in
       special values, views, native execution in exact mode, host-input uploads,
       autodiff and trace replay. Unsupported inputs fail explicitly; neither
       full reduction delegates arithmetic to Flex.
-      Remaining: general axes/layouts, `min`, `prod`, `argmax`/`argmin`,
-      `any`/`all`, full max/min/product, `cum*`, and long non-scalar reductions
-      other than the chunked row sum.
+      Native `argmax`/`argmin` now support rank-one/two F32, I32 indices and
+      reduced axes up to 2^23, preserving first ties and first NaNs (`step65`,
+      `step66`). Argmin negates then shares argmax's selection. Boolean-to-F32
+      conversion unlocks Burn's default float `any`/`all`, full and along
+      supported sum axes; `step66` checks truth reductions without host compute.
+      Burn defaults also compose `max`, `max_abs*` and the minimum family;
+      minima inherit gather's axis and signed-zero limitations, and flattened
+      full maxima retain reshape/layout and reduction-size limits.
+      Remaining: general axes/layouts, `prod`, native Boolean `any`/`all`,
+      broader/full max/min/product reductions, `cum*`, and long non-scalar
+      reductions other than the chunked row sum.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
       laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
@@ -1215,10 +1224,19 @@ Each names the measurement it must move. The Burn-side ones are in
       reshape, slice, swap_dims, transpose}` keep a device copy as `float_`'s do
       (shared helpers `reshaped`, `swapped_view`, `row_view`), `bool_{not, and,
       or, xor}` run on it; other int dtypes stay on the host.
+      `step66` adds native Boolean equality (`NOT(XOR)`; scalar true is an
+      identity and scalar false a not), exact Boolean-to-F32/I32 conversion,
+      and `{int,bool}_expand` over the dtype-generic native copier. Conversions
+      allocate typed output buffers: physical element types are checked by the
+      engine. Unsupported output dtypes fail with input metadata. The gate
+      covers all three Boolean stores, ragged shapes and row/column broadcasts;
+      ttsim and both cards, in `SMOKE`. Watched failing with Boolean-to-F32's
+      integer conversion omitted (divergence log measurement AN).
       `step47_burn_activations::integers_and_booleans_stay_on_the_card` against
       Flex, nothing downloaded, `computed_on_device` (watched failing with
       `bool_and` routed to the host); in `SMOKE`. MNIST unchanged (labels stay
-      host values). Element-wise ops still do not read a transposed view (M3).
+      host values). Element-wise ops copy matrix transposes natively;
+      arbitrary strided views retain the whole-tile materialization limits.
   - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
         format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
         measured beside the block-float ones `QTensorOps` needs.
@@ -1265,10 +1283,10 @@ path today, `~` when only some shapes do.
 | `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
 | `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
 | `float_sum_dim` | `~` matrix axes and rank-N last dim; certain leading-dim sums; all on SFPU | R1 |
-| `float_mean_dim` | `~` sum_dim plus scaling on supported axes; exact mode uses Flex | R1 |
+| `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
 | `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs, including in exact mode; unsupported inputs fail | R1b |
 | `float_slice` | `~` whole tile rows | D4 |
-| `float_transpose`, `float_swap_dims` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
+| `float_transpose`, `float_swap_dims`, `float_permute` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |
@@ -1283,12 +1301,17 @@ path today, `~` when only some shapes do.
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
 | `float_random` | | S7 |
 | `float_max_dim` | `~` matrix axes and rank-N last dim; SFPU | R1 |
-| `float_prod{,_dim}`, `float_max`, `float_min*`, `float_argmax`, `float_argmin`, `float_any*`, `float_all*`, `float_max_abs*` | | R1 |
+| `float_argmax`, `float_argmin` | `~` rank-one/two F32, I32 output, first tie/NaN, axis up to 2^23 | R1 |
+| `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
+| `float_max`, `float_max_abs*` | `~` Burn defaults over reshape/abs/max_dim; existing layout and size limits | R1 |
+| `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
+| `float_prod{,_dim}` | | R1 |
 | `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add` | `~` last dim, one index per row (SFPU; gather's `-0` returned `+0`) | D4 |
 | `float_select`, `float_select_add` | `~` dim 0 (mover rows; `select_add` in Flex's order) | D4 |
-| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_expand`, `float_flip`, `float_permute`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
+| `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
+| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_flip`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
 | `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
 
 ### `ActivationOps`
@@ -1322,9 +1345,10 @@ path today, `~` when only some shapes do.
 | `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul,div,remainder}{,_scalar}`, `int_neg`, `int_abs`, comparisons, `bitwise_*` | | S5 |
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
-| `int_cast`, `bool_into_float`, `bool_into_int` | | S6 |
+| `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
+| `int_cast` | | S6 |
 | `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
-| `bool_and`, `bool_or`, `bool_xor`, `bool_not` | x (SFPU, exact) | D3 |
+| `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_mask_*` | | S5 |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
 | `QTensorOps` | | D2 (stays Flex's until then) |

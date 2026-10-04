@@ -111,6 +111,7 @@ pub const SMOKE: &[&str] = &[
     "step61_burn_gather::",
     "step62_gather_rows::",
     "step63_burn_full_reduce::",
+    "step66_burn_small_ops::",
 ];
 
 pub const USAGE: &str = "\

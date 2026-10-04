@@ -152,8 +152,12 @@ pub mod kind_sfpu {
     pub const ASIN: u32 = 0x13d;
     /// `acos a`, within [`super::ACOS_BOUND`].
     pub const ACOS: u32 = 0x13e;
+    /// Boolean integer 0/1 to F32, exact.
+    pub const BOOL_TO_F32: u32 = 0x13f;
+    /// Boolean integer 0/1 copied to a typed I32 buffer, exact.
+    pub const BOOL_TO_I32: u32 = 0x140;
     /// The last SFPU kind: the tests that run every kind go to it.
-    pub const LAST: u32 = ACOS;
+    pub const LAST: u32 = BOOL_TO_I32;
 }
 
 /// The IEEE comparisons, tensor with tensor, with their scalar forms.
@@ -207,6 +211,8 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
         kind_sfpu::POW_I => sig(&[F32, Elem::I32], F32),
         kind_sfpu::I32_TO_F32 => sig(&[Elem::I32], F32),
+        kind_sfpu::BOOL_TO_F32 => sig(&[Bool], F32),
+        kind_sfpu::BOOL_TO_I32 => sig(&[Bool], Elem::I32),
         kind_sfpu::INDEX_TO_I32 => sig(&[F32], Elem::I32),
         _ => sig(&[F32, F32], F32),
     }
@@ -2249,6 +2255,8 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::POW_S
         | kind_sfpu::I32_TO_F32
         | kind_sfpu::INDEX_TO_I32
+        | kind_sfpu::BOOL_TO_F32
+        | kind_sfpu::BOOL_TO_I32
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
@@ -3038,11 +3046,18 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             });
             Operands::Binary
         }
-        kind_sfpu::I32_TO_F32 => {
+        kind_sfpu::I32_TO_F32 | kind_sfpu::BOOL_TO_F32 => {
             p.for_each_row_group(64, |p, o| {
                 p.load(LReg::L1, Format::Int32, A_ROW + o);
                 i32_to_float(p, LReg::L1, LReg::L2, LReg::L3);
                 p.store(LReg::L1, Format::Int32, OUT_ROW + o);
+            });
+            Operands::Unary
+        }
+        kind_sfpu::BOOL_TO_I32 => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                p.store(LReg::L0, Format::Int32, OUT_ROW + o);
             });
             Operands::Unary
         }

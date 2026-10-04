@@ -34,8 +34,17 @@ relayed links have native residency and numerical gates.
 
 `tt-mnist` trains and evaluates with native argmax and a bit-preserving I32
 column-to-vector reshape. Prediction indices are explicitly read back for
-application accuracy bookkeeping. Native argmax preserves first ties and first
+application accuracy bookkeeping. Native argmax and argmin preserve first ties and first
 NaNs for rank-one/two F32 input with I32 output and axes up to 2^23 elements.
+
+Boolean equality, Boolean-to-F32/I32 conversions, and I32/Boolean expansion
+run natively. Boolean-to-F32 also enables Burn's default float `any`/`all`
+through the supported dimensional and full sums. `float_permute` creates
+strided views through dimension swaps; downstream operations retain the
+existing whole-tile materialization limits. `step66_burn_small_ops` checks
+parity, residency and strict-mode execution and belongs to the silicon smoke
+suite. Burn's minimum defaults now compose argmin and gather, retaining the
+existing gather axes and signed-zero limitation.
 
 ## Tenstorrent BFP formats
 
