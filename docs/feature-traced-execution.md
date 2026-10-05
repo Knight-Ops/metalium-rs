@@ -222,3 +222,100 @@ In deep learning models with token inputs (Transformers, LLMs):
    - `cargo run --release -p tt-mnist -- --steps 50 --train-trace`
    - `cargo run --release -p tt-mnist -- --model transformer --steps 10 --train-trace`
    - Verify steady-state time per step drops by ~0.2–0.4 ms/step over untraced mode.
+
+---
+
+## 8. Scaling Roadmap & Future Work
+
+Empirical evaluations on physical Tenstorrent Blackhole silicon (`/dev/tenstorrent/0`) demonstrate that hardware tracing delivers significant speedups over host-dispatched execution and CPU baselines. On a production-scale 535k-parameter MNIST MLP ($784 \to 512 \to 256 \to 10$):
+- **Single Tensix Tile vs. 12-Core AMD EPYC 7443 CPU**:
+  - **Training Step**: Blackhole achieves **99.45 ms/step** vs. CPU **102.03 ms/step**.
+  - **Inference Throughput (Batch 512)**: Blackhole achieves **145,150 img/s** vs. CPU **94,152 img/s** (1.54× faster).
+- **Multi-Tile Scaling (`--tiles 8`)**:
+  - Inference throughput scales to **205,301 img/s** (2.18× faster than the 12-core CPU).
+
+To scale traced execution from single-tile benchmarks to large deep learning models across multiple Tensix cores, full chips (140 tiles), and multi-card clusters (p150a mesh), four architectural frontiers must be addressed:
+
+### 8.1. Trace Cache Segmentation & Instruction Streaming
+
+#### Physical Constraint: 240 KB L1 Program Cache
+Each Tensix tile provides 1.5 MB of local L1 SRAM, of which **240 KB** is strictly dedicated to the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`).
+When capturing a multi-layer network's entire training step (forward pass, loss, backward pass, optimizer momentum updates, and parameter writebacks) on a single tile, the unrolled kernel instruction stream exceeds 240 KB. This triggers:
+```text
+a list's programs do not fit an empty program cache
+```
+While inference traces fit comfortably within 240 KB (e.g. 535k MLP inference uses <80 KB), deep training graphs require program cache management.
+
+#### Architectural Solution:
+1. **Instruction Segment Chunking**:
+   - Rather than requiring the entire training step to reside concurrently in L1 SRAM, segment the trace into logical execution phases:
+     - Segment 0: Forward pass ($L_1 \to L_2 \to \dots \to L_N$).
+     - Segment 1: Loss & backward gradient propagation ($dL_N \to \dots \to dL_1$).
+     - Segment 2: Optimizer step & in-place `copy_into` writebacks.
+   - The firmware `CALL` dispatcher pages in program chunks from GDDR on demand, evicting completed segments while preserving intermediate data buffers in L1/GDDR.
+2. **Spatial Program Sharding**:
+   - Distribute operations across multiple Tensix tiles ($N \ge 4$). Because each tile only receives the mover and compute instructions for its assigned tensor shards, the per-tile program footprint drops proportionally by $1/N$, fitting within the 240 KB threshold.
+
+---
+
+### 8.2. Distributed Data Parallel (DDP) Training
+
+Current multi-tile execution decomposes individual matrix multiplications across tiles via spatial blocks (`SpatialDecomposition` in `tt-kernels`). While ideal for inference latency, training large batch sizes achieves maximum hardware efficiency through **Data Parallelism**.
+
+#### Architectural Design:
+1. **Tile-Group Replicas**:
+   - Partition the 140 Tensix tiles on a Blackhole chip into independent replica groups (e.g. 4 groups of 32 tiles, or 8 groups of 16 tiles).
+   - Replicate model weights across all groups; partition each minibatch across groups along the batch dimension $B$.
+2. **On-Chip AllReduce via Tensix NoC Rings**:
+   - At the completion of the backward pass, each group holds local parameter gradients $\nabla W_k$.
+   - Execute an on-device ring or tree `AllReduce` across the high-bandwidth on-chip Network-on-Chip (NoC0/NoC1) routers to compute the mean gradient $\frac{1}{K}\sum \nabla W_k$.
+   - Optimizer step and weight writebacks execute locally on the averaged gradients with zero host interaction.
+3. **Trace Integration**:
+   - The `AllReduce` communication primitives are captured directly into the trace command stream alongside compute kernels. The entire multi-tile data-parallel training iteration replays with a single host dispatch call.
+
+---
+
+### 8.3. Multi-Card Scaling (Inter-Card Ethernet Fabric)
+
+Tenstorrent Blackhole cards (such as the dual-p150a PCIe platform) are connected via high-speed 400 Gbps Ethernet channels. The workspace already provides foundational inter-card building blocks:
+- `tt_kernels::mesh::MeshEngine` and `Fabric` abstraction.
+- Multi-device sessions (`--cards 0,1`).
+- Tensix Ethernet mover cores (E1 customer core).
+
+#### Next Steps for Traced Multi-Card Training:
+1. **Cross-Card Gradient AllReduce**:
+   - Implement pipelined Ring-AllReduce across the inter-card 400G Ethernet links, driven directly by the E1 Ethernet cores.
+   - Overlap inter-card gradient communication with backward-pass computation of earlier layers (bucketed AllReduce).
+2. **Unified Multi-Card Trace Capture**:
+   - Synchronize trace capture across multiple card sessions, assigning aligned `trace_id` handles.
+   - Provide a unified `TracedTrainingStep` coordinator that triggers multi-card execution via non-blocking PCIe queues, preventing host-side synchronization bubbles.
+
+---
+
+### 8.4. L1 SRAM Operator Fusion (Norm, Activations, Attention)
+
+In standard eager execution, every intermediate operation writes its output back to GDDR and re-reads it in the subsequent kernel:
+$$\text{Linear} \xrightarrow{\text{GDDR}} \text{LayerNorm} \xrightarrow{\text{GDDR}} \text{GELU} \xrightarrow{\text{GDDR}} \text{Linear}$$
+On modern accelerators like Blackhole, memory bandwidth (GDDR) is the primary performance bottleneck for non-GEMM operators.
+
+#### Architectural Design:
+1. **Fused Matmul + Epilogue**:
+   - Fuse bias addition, activation functions (ReLU, GELU, SiLU), and dropout directly into the packer/NC writer pipeline before writing out of Tensix L1 SRAM.
+   - Tensix math/pack cores can evaluate element-wise SFPU functions on Dst registers directly before packing to GDDR, eliminating intermediate round-trips.
+2. **Fused Normalization**:
+   - Replace composed multi-kernel LayerNorm/RMSNorm (mean reduction $\to$ variance reduction $\to$ normalize $\to$ affine scale) with a single-pass L1 fused kernel that computes statistics within the tile's 1.5 MB SRAM.
+3. **Fused FlashAttention for Transformers**:
+   - Implement tiled online softmax attention ($Q K^T / \sqrt{d} \to \text{Softmax} \to V$) operating entirely in Tensix L1 staging buffers.
+   - Prevents materializing the $O(S^2)$ attention matrix in GDDR, yielding major speedups for language models and Vision Transformers (`TinyTransformer`).
+
+---
+
+### 8.5. Auto-Tuning Dynamic Grid Selection
+
+Multi-tile launch introduces a trade-off:
+- Highly parallel layers ($M, K, N \gg 1024$) scale efficiently across 8–64 tiles.
+- Thin projection layers (e.g. classification head $256 \to 10$) incur higher relative tile-synchronization and NoC multicast overhead when spread across too many tiles.
+
+#### Architectural Design:
+- Implement an automated heuristic / cost model within `tt-kernels` that selects the optimal tile grid $(R \times C)$ per layer based on operand tensor dimensions, arithmetic intensity, and batch size during trace capture.
+- Static layers with small matrix dimensions are scheduled on 1–2 tiles, while wide GEMMs are distributed across the full core grid.
