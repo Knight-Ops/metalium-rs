@@ -132,7 +132,7 @@ support overlap backwards. BF16 averages use GAPOOL; F32 averages and general ma
 use SFPU to retain their numerical contracts. All-padding windows fail explicitly.
 Pooling geometry constants use replayable metadata, enabling trace capture. The GMPOOL
 block API is opt-in. `step74`–`step78` cover these paths; see
-[the implementation record](../../docs/tensix-next-features.md) for runs and limits.
+[the implementation record](../../docs/plans/tensix-next-features.md) for runs and limits.
 BF16 currently saves storage rather than time: the first packed gather path is
 slower than TF32 on the measured MNIST GEMMs.
 
@@ -141,7 +141,7 @@ device layout. Host byte counts are not device allocation sizes. Tenstorrent
 BFP2/BFP4/BFP8 and their `a` variants are separate physical tile formats with
 shared exponents, rather than aliases for Burn's scalar dtypes. Their layout and
 decoders already exist in `tt-isa::tile`, but backend storage and compute support
-need separate gates. See [the cutover and dtype backlog](../../docs/burn-native-cutover.md).
+need separate gates. See [the cutover and dtype backlog](../../docs/plans/burn-native-cutover.md).
 
 ## Environment variables
 

@@ -62,5 +62,5 @@ Prerequisites: `cargo xtask fetch-ttsim` and `fetch-mnist`; `fetch-spec` for
   first. Do not hardcode coordinates outside the surviving columns; the gate tile is
   `backend::GATE_TILE` (3, 4).
 - Simulator-specific assertions are `#[cfg(not(feature = "silicon"))]`.
-- Divergences: `docs/ttsim-divergence.md`. Operating rules: "Silicon operating
-  notes" in `docs/implementation-checklist.md`.
+- Divergences: [`docs/learnings/ttsim-divergence.md`](../../docs/learnings/ttsim-divergence.md). Operating rules:
+  [`docs/learnings/silicon-operating-notes.md`](../../docs/learnings/silicon-operating-notes.md).

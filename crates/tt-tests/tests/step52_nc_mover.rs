@@ -7,7 +7,7 @@
 //! read, on the host and, if one is sent anyway, on the tile
 //! (`Mover::permits`). Then B and NC move disjoint data at the same time, B
 //! reading on NoC #0 while NC writes on NoC #1, the reader / writer split
-//! (`docs/tt-metal-concepts-review.md`, G6).
+//! (`docs/learnings/tt-metal-concepts-review.md`, G6).
 
 use tt_device::tlb::WindowKind;
 use tt_isa::dm::{self, op, Mover};

@@ -91,7 +91,7 @@ consecutive transfers share a control list. Sweep run `1791067111` against
 239.3 -> 228.6 on 1/8/32 tiles; fresh 64² add 18.86 -> 17.15 (legacy best 14.80);
 fresh 32-tile 256³ matmul 239.6 -> 239.7 (legacy best 181.1), host-bound at ~130 µs
 of enqueueing per op. MNIST 1.4 ms/step (unchanged), transformer 8.8 (burn-flex
-4.35). See [the ownership status](feature-streaming-dataflow-ownership.md#validation).
+4.35). See [the ownership status](streaming-dataflow-architecture.md#validation).
 
 Post-consolidation silicon run `1791063683` rechecks the identity benchmark under
 the default ownership scheduler: traced read/write payload is 178.29 GB/s each

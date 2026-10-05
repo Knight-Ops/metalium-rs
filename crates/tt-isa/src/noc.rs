@@ -614,7 +614,7 @@ pub mod niu {
     /// The mover's per-entry path builds one per descriptor rather than
     /// checking each request through [`Command::registers`]: on card 0 the
     /// per-request checks were ~110 of a 4 KiB read entry's ~350 cycles
-    /// (`docs/firmware-performance.md`, checklist 9.14).
+    /// (`docs/learnings/firmware-performance.md`, checklist 9.14).
     #[derive(Copy, Clone, Debug)]
     pub struct DramMove {
         /// The DRAM endpoint, as `TARG`/`RET_ADDR_HI` take it.

@@ -158,7 +158,7 @@ const SIZES: [u32; 7] = [64, 256, 1024, 4096, 16384, 65536, 131072];
 /// NoC requests the sweeps put in one list. Not a limit any more -- the mover
 /// keeps its requests in flight under `tt_isa::noc::niu::MAX_IN_FLIGHT`, so a
 /// list of any length completes exactly (`gddr_in_flight` runs 300 a tile) --
-/// but the size of the baseline's lists (`docs/firmware-performance.md`), so
+/// but the size of the baseline's lists (`docs/learnings/firmware-performance.md`), so
 /// the numbers stay comparable.
 const MAX_REQUESTS: u32 = 240;
 

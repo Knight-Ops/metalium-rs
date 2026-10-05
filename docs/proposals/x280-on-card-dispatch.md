@@ -110,7 +110,7 @@ Each step gated on silicon (no ttsim), each one useful alone:
 
 - `vendor/tt-isa-documentation/BlackholeA0/L2CPUTile/` (README, MemoryMap, TLBWindows,
   Caches, RNMIs, MSICatcher).
-- `docs/RUST_IMPL_PLAN.md`, "L2CPU tiles (optional on-chip host)".
-- `docs/tt-metal-concepts-review.md` G8: tt-metal's fast dispatch and traces.
-- `docs/hardware-coverage.md`, "Out of scope": the earlier reason for leaving these tiles
+- `../plans/master-roadmap.md`, "L2CPU tiles (optional on-chip host)".
+- `../learnings/tt-metal-concepts-review.md` G8: tt-metal's fast dispatch and traces.
+- `../plans/hardware-coverage.md`, "Out of scope": the earlier reason for leaving these tiles
   out, which this request revisits.

@@ -85,7 +85,7 @@ pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
 /// requests in flight each spread the NoC's service evenly between tiles, and
 /// the card's reads rise from 425 to 467 GB/s at 64 KiB entries and to 496 at
 /// 16 KiB, against 3-4% off one tile's small reads
-/// (`docs/firmware-performance.md`, "What holds card reads").
+/// (`docs/learnings/firmware-performance.md`, "What holds card reads").
 pub const TILE_IN_FLIGHT_CAP: u32 = 8;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's

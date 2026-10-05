@@ -42,4 +42,4 @@ compiler is missing. Everything that talks to a card runs through
   reports it; fix the access that hangs rather than gating on it.
 - `TENSTORRENT_IOCTL_GET_HARVESTING` is a stub in driver 2.11. Harvesting comes from
   ARC telemetry (`tt_device::Device::tensix_grid`).
-- See "Silicon operating notes" in `docs/implementation-checklist.md`.
+- See [`docs/learnings/silicon-operating-notes.md`](../../docs/learnings/silicon-operating-notes.md).

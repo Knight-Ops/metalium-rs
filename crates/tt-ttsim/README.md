@@ -42,4 +42,4 @@ matching rule should be deleted, not kept.
 - `init` may be called once per process, and libttsim is not thread safe. Never use
   it outside `Simulator`, and run test bodies in `fork_scope`.
 - ttsim is not silicon. It models an unharvested chip and differs in logged ways
-  (`docs/ttsim-divergence.md`). A simulator pass is evidence about the simulator.
+  ([`docs/learnings/ttsim-divergence.md`](../../docs/learnings/ttsim-divergence.md)). A simulator pass is evidence about the simulator.

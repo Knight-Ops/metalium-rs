@@ -130,7 +130,7 @@ impl<T: Transport> Device<T> {
     /// `SrcA`/`SrcB` drop or misplace datums in chip-specific column pairs --
     /// `MVMUL`, `ELWADD` and `MOV*2D` all return wrong values, deterministically
     /// per chip -- while the SFPU, `UnpackToDst` and the packer are unaffected.
-    /// Measured on both p150a cards (`docs/ttsim-divergence.md` row 48).
+    /// Measured on both p150a cards (`docs/learnings/ttsim-divergence.md` row 48).
     /// A no-op on the simulator, which has no ARC firmware.
     ///
     /// Waits for the transition to finish: the ARC acknowledges at once, but

@@ -45,7 +45,7 @@ with `boot_id`; each test's output goes to `target/silicon/out/`. After a host
 crash, the last `START` without an `END` names the test that took it down, and a
 changed `boot_id` proves a reboot. A run stops at the first failure by default,
 because a failed gate may leave the card in a bad state.
-Background: "Silicon operating notes" in `docs/implementation-checklist.md`.
+Background: [`docs/learnings/silicon-operating-notes.md`](../docs/learnings/silicon-operating-notes.md).
 
 ## `cargo xtask bench`
 
@@ -61,4 +61,4 @@ by default the `BENCH` selection in `src/silicon.rs`:
 Every other `silicon` option applies; `--filter` replaces the default selection.
 Every `BENCH {json}` line the tests print is collected into
 `target/silicon/bench/<stamp>.jsonl` (one record per line, with its test) and
-`<stamp>.md` (a table). `docs/firmware-performance.md` is built from one such run.
+`<stamp>.md` (a table). [`docs/learnings/firmware-performance.md`](../docs/learnings/firmware-performance.md) is built from one such run.

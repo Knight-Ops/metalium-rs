@@ -27,7 +27,7 @@ const EXPECTED: u32 = 0x40C0_0000;
 /// (`tensix_dst_rd32` verifies `pipe == 1`), so a `Dst` read from T0 terminates the
 /// process. The image is identical either way — `load_and_start` points the core's
 /// reset-PC override at it — and the choice is a simulator constraint, not a
-/// hardware one. See `docs/ttsim-divergence.md`.
+/// hardware one. See `docs/learnings/ttsim-divergence.md`.
 const CORE: Core = Core::T1;
 
 /// The Tensix thread [`CORE`] drives. `mhartid` reads zero on every core, so the

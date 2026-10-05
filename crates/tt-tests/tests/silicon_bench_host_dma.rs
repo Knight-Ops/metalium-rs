@@ -1,6 +1,6 @@
 //! How fast the card moves host memory itself (`tt_isa::dm::op::HOST_READ`,
 //! `HOST_WRITE`), against the host's own copies through a BAR, which this
-//! machine's VM passthrough leaves uncached (`docs/ttsim-divergence.md` row
+//! machine's VM passthrough leaves uncached (`docs/learnings/ttsim-divergence.md` row
 //! M): 1 to 32 tiles each streaming 16 KiB requests between their L1 and
 //! their own part of one pinned 1 GiB buffer, host-timed from the first
 //! enqueue to the last list's end.

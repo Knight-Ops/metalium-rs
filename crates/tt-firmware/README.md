@@ -40,7 +40,7 @@ reads, NC writes). Tagged role scripts reuse the existing arithmetic
 bodies and loops. Input/output credits are released after backend retirement and
 DRAM acknowledgment, respectively; B completion joins the entire region. Traces
 retain both mover streams and all referenced programs. See
-[ownership and rollout](../../docs/feature-streaming-dataflow-ownership.md).
+[ownership and rollout](../../docs/learnings/streaming-dataflow-architecture.md).
 This is the only GDDR compute scheduler. `set_pipeline(false)` serializes buffer
 reuse without changing ownership. Downloads and control lists run on B alone;
 low-level diagnostic movers remain available, each limited to its direction.

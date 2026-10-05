@@ -291,7 +291,7 @@ pub enum RunError {
     /// The tile's reset never finished: these roles' threads take no
     /// instruction even after the backend pulse, every semaphore released and
     /// their `Src` banks fed (`session::unwedge_tile`). What else holds them is
-    /// unknown; a board reset clears it (`docs/hardware-coverage.md`, "Hazards
+    /// unknown; a board reset clears it (`docs/plans/hardware-coverage.md`, "Hazards
     /// and known bugs").
     Wedged {
         tile: (u8, u8),

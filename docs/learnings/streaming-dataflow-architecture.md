@@ -344,7 +344,7 @@ Streaming refuses unsupported configurations instead of silently falling back. L
 Add TT_EXECUTION=auto|streaming|legacy. Preserve TT_SCATTER=b as an explicit legacy B-only override; reject contradictory forced-streaming configuration.
 Preserve TT_PIPELINE=0: use serialized batch credits, released after NC finishes the batch. NC remains the writer even when overlap is disabled.
 Add per-stage progress, wait-reason, and error reporting. Every software wait must detect cancellation and peer failure. Host timeout/reset recovery must stop all five cores, invalidate captured state, and reclaim resources only after execution is stopped.
-Extend docs/feature-traced-pipelining.md:1 into the unified ownership/streaming design. Preserve the repository’s current unrelated work.
+Extend ../plans/traced-execution.md into the unified ownership/streaming design. Preserve the repository’s current unrelated work.
 
 ### Validation and Rollout
 

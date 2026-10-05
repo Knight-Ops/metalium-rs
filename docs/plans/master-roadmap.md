@@ -1,4 +1,4 @@
-# Rust-Native Software Stack for Tenstorrent Blackhole → Burn Backend
+# Master Roadmap: Rust-Native Software Stack for Tenstorrent Blackhole → Burn Backend
 
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
@@ -14,13 +14,13 @@ requirements below are superseded for ordinary validation.
 (hardware coverage) in progress. Current state per item is in the checklist.
 **Target hardware:** Blackhole A0 (p100 / p150)
 **Spec source:** `tt-isa-documentation` @ `f848eb6` (2026-09-18)
-**Working checklist:** [`docs/implementation-checklist.md`](implementation-checklist.md)
+**Working checklist:** [`implementation-checklist.md`](implementation-checklist.md)
 — per-phase tick-list, current state, and the verification backlog as actual checkboxes.
-**Hardware coverage tracker:** [`docs/hardware-coverage.md`](hardware-coverage.md)
+**Hardware coverage tracker:** [`hardware-coverage.md`](hardware-coverage.md)
 — Phase 10: which Tensix units and Burn ops run on the device, and the order the rest arrives.
-**Implementation guides:** [`docs/tt-metal-concepts-review.md`](tt-metal-concepts-review.md)
+**Implementation guides:** [`../learnings/tt-metal-concepts-review.md`](../learnings/tt-metal-concepts-review.md)
 — Tenstorrent-system concepts we lack or do differently (G1–G16), and the hardware sharp
-edges to handle in code; [`docs/burn-backend-parity.md`](burn-backend-parity.md) — what
+edges to handle in code; [`burn-backend-parity.md`](burn-backend-parity.md) — what
 `burn-tt` needs to be a CUDA-grade Burn backend (roadmap B0–B16).
 
 ---

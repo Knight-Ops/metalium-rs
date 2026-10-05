@@ -4,7 +4,7 @@
 //! The specification's `Bits32.lua` is the only encoding source this generator
 //! trusts, and for most of the Matrix Unit it draws only Wormhole. Phase 6 found
 //! that one of those drawings is wrong for Blackhole: `MVMUL`'s `AddrMod` sits at
-//! bits 14..15, not 15..16 (`docs/ttsim-divergence.md` row 42), so an encoder
+//! bits 14..15, not 15..16 (`docs/learnings/ttsim-divergence.md` row 42), so an encoder
 //! generated from the Wormhole diagram applies the wrong address modifier and
 //! nothing says so.
 //!

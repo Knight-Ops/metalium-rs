@@ -82,7 +82,7 @@ pub const fn is_within_csm(addr: u64, len: u64) -> bool {
 /// this crate needs is [`msg::AICLK_GO_BUSY`], which UMD sends whenever it brings
 /// a chip up: without it the chip stays at its idle operating point, where the
 /// Matrix Unit's reads of `SrcA`/`SrcB` are not reliable -- see
-/// `docs/ttsim-divergence.md` row 48.
+/// `docs/learnings/ttsim-divergence.md` row 48.
 pub mod queue {
     /// Holds the CSM address of the queue control block (`SCRATCH_RAM_11`).
     pub const CONTROL_PTR: u64 = super::reset_scratch(11);

@@ -2,7 +2,7 @@
 
 > Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
 > explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
-> below are superseded by [the current backend contract](../crates/burn-tt/README.md)
+> below are superseded by [the current backend contract](../../crates/burn-tt/README.md)
 > and [the cutover backlog](burn-native-cutover.md).
 
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
@@ -34,7 +34,7 @@ backwards are resident; BF16 average pooling uses GAPOOL. Packed BF16 batched
 products, BF16 mesh execution and F32/BF16 pooling traces are gated. Mesh operands
 widen on device for Ethernet transport. Integer reductions are resident;
 division/remainder and integer mean remain unsupported pending domain-flag validation. See [the implementation record](tensix-next-features.md)
-and [the backend contract](../crates/burn-tt/README.md) for limitations.
+and [the backend contract](../../crates/burn-tt/README.md) for limitations.
 B0 reporting and B3 stale-id protection are implemented; tracing, typed errors,
 lazy discovery, conformance, fusion and placement remain separate backend work.
 

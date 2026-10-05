@@ -115,7 +115,7 @@ fn ttsim_executes_setdmareg_and_wrcfg() {
 
     // `RISC_DEST_ACCESS_CTRL_SEC1_fmt` rather than something more neutral: ttsim
     // models `Config` as a switch over specific registers rather than as an array
-    // (`docs/ttsim-divergence.md` row 21), so a register no workload has exercised
+    // (`docs/learnings/ttsim-divergence.md` row 21), so a register no workload has exercised
     // is fatal. This one is exercised -- the corpus firmware writes it through the
     // RISC-V path on every run -- so a refusal here is about the *instructions*,
     // which is the question. Writing the reset default keeps the tail's answer

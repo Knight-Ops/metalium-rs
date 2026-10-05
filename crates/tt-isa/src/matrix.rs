@@ -74,7 +74,7 @@ use crate::isa::{EncodeError, Instruction};
 /// `UNPACR` bit 0: claimed by no field in the specification, and required.
 ///
 /// ttsim calls it `last` and refuses the instruction without it (`tensix_unpacr:
-/// last=0`); `docs/ttsim-divergence.md` row F.
+/// last=0`); `docs/learnings/ttsim-divergence.md` row F.
 pub const UNPACR_LAST: u32 = 1;
 
 /// The unpacker owns the operand's current bank, and nothing is staged in it.

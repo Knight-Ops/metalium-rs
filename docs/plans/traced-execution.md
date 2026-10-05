@@ -351,12 +351,25 @@ On modern accelerators like Blackhole, memory bandwidth (GDDR) is the primary pe
 
 ---
 
-### 8.5. Auto-Tuning Dynamic Grid Selection
 
-Multi-tile launch introduces a trade-off:
-- Highly parallel layers ($M, K, N \gg 1024$) scale efficiently across 8–64 tiles.
-- Thin projection layers (e.g. classification head $256 \to 10$) incur higher relative tile-synchronization and NoC multicast overhead when spread across too many tiles.
+---
 
-#### Architectural Design:
-- Implement an automated heuristic / cost model within `tt-kernels` that selects the optimal tile grid $(R \times C)$ per layer based on operand tensor dimensions, arithmetic intensity, and batch size during trace capture.
-- Static layers with small matrix dimensions are scheduled on 1–2 tiles, while wide GEMMs are distributed across the full core grid.
+### 8.6. Pipelined Tracing: Historical Investigation & Protocol Rules
+
+Implemented (2026-10-03), and part of the unified design in
+[`streaming-dataflow-architecture.md`](../learnings/streaming-dataflow-architecture.md#traces):
+streaming ownership is the only GDDR compute scheduler, fresh and traced, and
+captures retain both the reader and the writer stream. The generation rebasing,
+program holds, chunk-boundary behaviour, NC fetch and recovery rules are described
+there, with the tests that cover them and the overlap thresholds a capture uses
+([measurements](../learnings/firmware-performance.md#streaming-ownership-rollout)).
+
+`Session::enable_dram(b, nc)` is the only setup; `TT_PIPELINE=0` serializes slot
+reuse but keeps NC as the writer. The legacy wave, B-only pipeline and
+two-host-queue NC schedulers are removed.
+
+#### Original Investigation & Protocol Findings:
+- **Rebase generations**: The firmware’s CALL replay path recognizes and rebases `KERNEL`, `LAUNCH`, and `KERNEL_WAIT`. `capture_segment()` converts `KERNEL` generations into offsets relative to the capture, and converts `LAUNCH` and `KERNEL_WAIT` as well, preserving each launch/wait pairing so replay uses newly reserved generations.
+- **Program cache retention**: Capture code holds program-cache references from `LAUNCH` entries in addition to `KERNEL` entries, preventing eviction until the trace is released.
+- **Trace-chunk boundary handling**: Replay fetches commands in 64-entry chunks and drains NoC requests between chunks. When launch and wait land in different chunks, the active generation and staging-buffer ownership must be preserved across boundaries.
+- **NC reader/writer streams**: Captures retain both the B reader and NC writer streams (via `PAIR_CALL` shared packets) and track NC lifetime and completion status.
