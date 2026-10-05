@@ -8,6 +8,7 @@ Documentation in this repository is strictly organized into a **3-tier lifecycle
 flowchart TD
     subgraph Tier3["Tier 3: docs/proposals/ (RFCs & Design Notes)"]
         P1["x280-on-card-dispatch.md<br/><i>(Proposed, unscheduled)</i>"]
+        P2["future-fusion-features.md<br/><i>(FlashAttention, Sharded L1, NoC stream)</i>"]
     end
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs & Checklists)"]
@@ -18,6 +19,7 @@ flowchart TD
         PL5["burn-backend-parity.md (B0-B16 Roadmap)"]
         PL6["burn-native-cutover.md (Native & BFP Roadmap)"]
         PL7["traced-execution.md (Unified Inference & Training)"]
+        PL8["kernel-fusion.md (B12 & B13a-c Burn Fusion)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -27,6 +29,7 @@ flowchart TD
         L4["riscv-guide-review.md (Baby RISC-V Facts vs Myths)"]
         L5["tt-metal-concepts-review.md (G1-G16 System Concepts)"]
         L6["streaming-dataflow-architecture.md (Reader/Writer Contract)"]
+        L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
     end
 
     Tier3 --"Approval & Scheduling"--> Tier2
@@ -48,6 +51,7 @@ Permanent, cumulative empirical realities discovered through silicon execution, 
   - [`riscv-guide-review.md`](learnings/riscv-guide-review.md): Measured facts vs external misconceptions regarding baby RISC-V cores, caches, and memory maps.
   - [`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md): Architectural comparison of tt-metal concepts (G1–G16) vs this native Rust stack.
   - [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md): The core architectural contract of the GDDR streaming scheduler (B reader on NoC0, T0–T2 compute, NC writer on NoC1, streaming credits, transfer channels).
+  - [`kernel-fusion-architecture.md`](learnings/kernel-fusion-architecture.md): Architectural ground truth on two-stage kernel fusion (Burn IR vs. Tensix hardware), Dst register allocation, and L1 Circular Buffer streaming.
 
 ### 2. `docs/plans/` — Active Implementation Plans & Checklists
 Actionable technical specifications, interface contracts, and execution checklists (`[ ]` / `[x]`) for active and long-running engineering milestones.
@@ -60,12 +64,14 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`burn-backend-parity.md`](plans/burn-backend-parity.md): B0–B16 roadmap for `burn-tt` to achieve full backend parity with CubeCL/CUDA.
   - [`burn-native-cutover.md`](plans/burn-native-cutover.md): Native cutover record, retired Flex fallback, and Tenstorrent BFP physical format backlog.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
+  - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
 
 ### 3. `docs/proposals/` — Feature Proposals & RFCs
 Unscheduled design proposals and exploratory RFCs evaluating trade-offs before implementation.
 - **Contract**: When approved and scheduled, a proposal graduates into an implementation plan in `docs/plans/` (or is incorporated into an existing plan) and is removed from proposals.
 - **Contents**:
   - [`x280-on-card-dispatch.md`](proposals/x280-on-card-dispatch.md): RFC proposing use of on-card SiFive X280 RISC-V cores for on-card host orchestration.
+  - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
 
 ---
 

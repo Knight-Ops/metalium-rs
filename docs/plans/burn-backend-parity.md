@@ -5,6 +5,16 @@
 > below are superseded by [the current backend contract](../../crates/burn-tt/README.md)
 > and [the cutover backlog](burn-native-cutover.md).
 
+Current implementation record (2026-10-05): native grouped/depthwise Conv2D,
+Conv1D composition, transposed Conv2D, unfold and gradients now have resident
+F32/BF16 paths; output padding requires less than the maximum of stride and dilation. Resident
+arbitrary-axis gather/select and float scatter/select-add remove index readback.
+Slice assignment enables native cat/repeat. Mesh batched products partition across
+cards, including convolution/attention backwards. Both-card gates, changed-input
+traces, analytic/Flex oracles and remaining acceptance gaps are recorded in
+[tensix-next-features.md](tensix-next-features.md). Historical unchecked inventory
+rows below are not evidence that these paths are absent.
+
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
 with Burn's wrappers and tooling, and the developer experience, measured against the
 CubeCL backends (`burn-cuda`, `burn-wgpu`, both `burn_cubecl::CubeBackend`). It does **not**
@@ -33,7 +43,10 @@ are implemented, with silicon gates for late narrowing. NCHW pooling and its
 backwards are resident; BF16 average pooling uses GAPOOL. Packed BF16 batched
 products, BF16 mesh execution and F32/BF16 pooling traces are gated. Mesh operands
 widen on device for Ethernet transport. Integer reductions are resident;
-division/remainder and integer mean remain unsupported pending domain-flag validation. See [the implementation record](tensix-next-features.md)
+checked division/remainder and integer mean now pass simulator and card-0 gates
+(`1791232718`). Native attention passes card-0 forward/gradient/F32 trace and
+BF16 training gates; distributed batched products pass actual two-card forward
+(distributed gradients remain unvalidated). See [the implementation record](tensix-next-features.md)
 and [the backend contract](../../crates/burn-tt/README.md) for limitations.
 B0 reporting and B3 stale-id protection are implemented; tracing, typed errors,
 lazy discovery, conformance, fusion and placement remain separate backend work.
@@ -270,7 +283,7 @@ is eight conversions between primitives and one `Handle` type. Reference impleme
 `ElementWiseFuser`, `MatmulFuser`, `ReduceFuser`, `ReduceBroadcastedFuser`, and a
 `FallbackOperation` wrapper for ops a fused kernel cannot absorb).
 
-**Steps for `burn-tt`.**
+**Steps for `burn-tt`.** *(Detailed specification and checklists in [`kernel-fusion.md`](kernel-fusion.md); architectural ground truth in [`kernel-fusion-architecture.md`](../learnings/kernel-fusion-architecture.md)).*
 
 1. **`impl BackendIr for TtBackend`** (B12). `Handle` must be one type for all four
    kinds; `TtTensor` covers three, quantized is `TtQTensor`. Use
