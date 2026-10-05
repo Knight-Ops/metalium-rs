@@ -35,7 +35,11 @@ fn main() {
         ("icache_t1", "link_t1.x", 1),
         ("icache_t2", "link_t2.x", 2),
     ] {
-        link(bin, script, tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE);
+        link(
+            bin,
+            script,
+            tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE,
+        );
     }
     for f in [
         "link.x",

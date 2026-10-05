@@ -208,6 +208,128 @@ fn one_unit(card: u16) -> (Session<tt_kmd::Kmd>, Conditions) {
     (s, c)
 }
 
+/// Resident inputs, one warm-up and nine host-timed completed runs. Readback
+/// validates every run after timing; no concurrent NC timestamp exports.
+#[test]
+#[ignore = "benchmark"]
+fn tensix_extensions() {
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    use tt_kernels::sfpu::scan::ScanOp;
+    if let Err(e) = fork_scope(|| {
+        let (mut s, _) = one_unit(device_index());
+        for (rows, cols) in [(37usize, 70usize), (8193, 3)] {
+            let a = s.upload(&vec![1.0; rows * cols], rows, cols).unwrap();
+            for name in ["prod", "cumsum", "cumprod"] {
+                let before = s.dataflow_stats().clone();
+                let mut samples = Vec::new();
+                for rep in 0..=REPS {
+                    let start = Instant::now();
+                    let out = match name {
+                        "prod" => s.reduce(&a, ReduceOp::Prod, Axis::Rows),
+                        "cumsum" => s.scan(&a, ScanOp::Sum),
+                        _ => s.scan(&a, ScanOp::Prod),
+                    }
+                    .unwrap();
+                    s.sync().unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                    let values = s.download(&out).unwrap();
+                    for (i, value) in values.into_iter().enumerate() {
+                        let expected = if name == "cumsum" {
+                            (i / cols + 1) as f32
+                        } else {
+                            1.0
+                        };
+                        assert_eq!(value.to_bits(), expected.to_bits());
+                    }
+                    s.free(out).unwrap();
+                    if rep != 0 {
+                        samples.push(elapsed);
+                    }
+                }
+                report(
+                    &format!("tensix/{name}/{rows}x{cols}"),
+                    "us",
+                    "host",
+                    Stats::of(samples),
+                );
+                let after = s.dataflow_stats();
+                println!(
+                    "MEASURE {name}/{rows}x{cols} ownership including warm-up: regions {}, batches {}, pack waits {}, release waits {}",
+                    after.regions - before.regions,
+                    after.batches - before.batches,
+                    after.pack_waits - before.pack_waits,
+                    after.release_waits - before.release_waits,
+                );
+            }
+            s.free(a).unwrap();
+        }
+    }) {
+        panic!("{e}");
+    }
+}
+
+/// MNIST's two forward GEMMs, with resident operands and completed host timing.
+#[test]
+#[ignore = "release silicon benchmark, run through cargo xtask bench"]
+fn bf16_mnist_matmul() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    if let Err(e) = fork_scope(|| {
+        let (mut s, conditions) = one_unit(device_index());
+        s.set_profile_roles(false);
+        println!("{conditions:?}");
+        for (m, k, n) in [(64usize, 784usize, 128usize), (64, 128, 10)] {
+            let a = vec![1.0; m * k];
+            let b = vec![0.5; k * n];
+            let fa = s.upload(&a, m, k).unwrap();
+            let fb = s.upload(&b, k, n).unwrap();
+            let ba = s.upload_bf16(&vec![0x3f80; m * k], m, k).unwrap();
+            let bb = s.upload_bf16(&vec![0x3f00; k * n], k, n).unwrap();
+            for packed in [false, true] {
+                let mut samples = Vec::new();
+                for rep in 0..=REPS {
+                    let start = Instant::now();
+                    let out = if packed {
+                        s.matmul_bf16(&ba, &bb, Fidelity::HiFi4, 40_000_000)
+                    } else {
+                        s.matmul_dram(
+                            &fa,
+                            false,
+                            &fb,
+                            false,
+                            SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            40_000_000,
+                        )
+                    }
+                    .unwrap();
+                    s.sync().unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                    assert_eq!(s.download(&out).unwrap(), vec![k as f32 / 2.0; m * n]);
+                    s.free(out).unwrap();
+                    if rep > 0 {
+                        samples.push(elapsed);
+                    }
+                }
+                report(
+                    &format!(
+                        "mnist-matmul/{m}x{k}x{n}/{}",
+                        if packed { "bf16" } else { "tf32" }
+                    ),
+                    "us",
+                    "host",
+                    Stats::of(samples),
+                );
+            }
+            s.free(fa).unwrap();
+            s.free(fb).unwrap();
+            s.free_bf16(ba).unwrap();
+            s.free_bf16(bb).unwrap();
+        }
+    }) {
+        panic!("{e}");
+    }
+}
+
 /// What one profiled op's device time went to, on one unit: the union of
 /// its lists, each entry kind's share of it, the kernels' hand-offs, and
 /// each role's program, wake and acknowledgement time.

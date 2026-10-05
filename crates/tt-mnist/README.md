@@ -11,7 +11,7 @@ API 2). No Python, C++ or TT-Metalium.
 - **On the card:** every matmul (forward and backward), bias adds, ReLU and its
   gradient, bias-gradient sums, SGD updates. Dataset, weights, activations and
   gradients stay resident in GDDR6.
-- **On the host:** the cross-entropy loss.
+- **On the card:** cross-entropy and its backward pass as native kernels.
 
 ## Run
 
@@ -27,10 +27,19 @@ tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
 | `--epochs E` | Passes over the 60 000 training images (default 1). |
 | `--steps S` | Stop after `S` steps. |
 | `--host` | Also train the same model from the same initial weights on the CPU (`burn-flex`) and compare. |
+| `--bf16` | Store single-card MNIST parameters, data and activations in BF16. Matrix accumulation/loss and trace input/output remain F32. Mesh and transformer modes reject this flag. |
 
 The binary does not read `TT_TILES` or `TT_TOPOLOGY`; use the flags. It prints the
 loss every 100 steps, then timings, test accuracy and the tensor data that crossed
 PCIe.
+
+BF16 is opt-in. Raw storage uses half-sized datums; most arithmetic widens on
+Tensix to F32 and rounds ties-even back to BF16 at operation boundaries, with
+BF16 subnormals flushed to signed zero on device conversion. The current packed
+gather route is slower than TF32 on MNIST's measured forward GEMMs (about
+662/81 us versus 94/18 us, one tile, release, both cards). This mode has native
+SGD and trace gates; full MNIST BF16 accuracy has not been measured. See
+[the implementation record](../../docs/tensix-next-features.md).
 
 ## Build
 

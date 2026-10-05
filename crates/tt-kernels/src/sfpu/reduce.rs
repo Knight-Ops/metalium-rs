@@ -56,6 +56,20 @@ use crate::runtime::SemaphoreInit;
 pub enum ReduceOp {
     Sum,
     Max,
+    /// Direct multiplication, with one final fold after all input chunks.
+    Prod,
+    /// Conjunction of canonical Boolean words.
+    All,
+    /// Disjunction of canonical Boolean words.
+    Any,
+    /// OR the raw bits of F32 storage, with zero-bit padding. Used after
+    /// masking to one selected datum per row, preserving zeros/NaN payloads.
+    /// This is a bit fold, not a floating-point arithmetic reduction.
+    BitOr,
+    SumI32,
+    ProdI32,
+    MinI32,
+    MaxI32,
 }
 
 impl ReduceOp {
@@ -64,6 +78,36 @@ impl ReduceOp {
         match self {
             ReduceOp::Sum => 0,
             ReduceOp::Max => 0xff80_0000,
+            ReduceOp::Prod => 0x3f80_0000,
+            ReduceOp::All => 1,
+            ReduceOp::Any | ReduceOp::BitOr => 0,
+            ReduceOp::SumI32 => 0,
+            ReduceOp::ProdI32 => 1,
+            ReduceOp::MinI32 => i32::MAX as u32,
+            ReduceOp::MaxI32 => i32::MIN as u32,
+        }
+    }
+
+    /// Physical element type consumed and produced by this reduction.
+    pub fn elem(self) -> crate::tensor::Elem {
+        match self {
+            Self::All | Self::Any => crate::tensor::Elem::Bool,
+            Self::SumI32 | Self::ProdI32 | Self::MinI32 | Self::MaxI32 => crate::tensor::Elem::I32,
+            _ => crate::tensor::Elem::F32,
+        }
+    }
+
+    fn format(self) -> Format {
+        match self {
+            Self::Max
+            | Self::All
+            | Self::Any
+            | Self::BitOr
+            | Self::SumI32
+            | Self::ProdI32
+            | Self::MinI32
+            | Self::MaxI32 => Format::Int32,
+            _ => Format::Fp32,
         }
     }
 }
@@ -82,6 +126,47 @@ fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
     match op {
         ReduceOp::Sum => p.add(other, into, into),
         ReduceOp::Max => p.if_(Cond::Less(into, other), |p| p.mov(other, into)),
+        ReduceOp::Prod => p.mul(other, into, into),
+        ReduceOp::All => p.and(other, into, into),
+        ReduceOp::Any | ReduceOp::BitOr => p.or(other, into, into),
+        ReduceOp::SumI32 => p.iadd(other, into),
+        ReduceOp::ProdI32 => {
+            // Preserve L0..L3: finishing a row fold still needs the other
+            // three transposed row registers. Reconstruct a full low-32-bit
+            // product from 16-bit limbs and the low/upper MUL24 modes.
+            p.loadi_bits(LReg::L6, 0xffff);
+            p.and(other, LReg::L6, LReg::L4);
+            p.and(into, LReg::L6, LReg::L5);
+            p.mov(into, LReg::L7);
+            p.loadi_bits(LReg::L6, (-16i32) as u32);
+            p.shr_by(LReg::L6, LReg::L7);
+            p.mul24(LReg::L4, LReg::L7, false, LReg::L7);
+            p.shl(LReg::L7, 16, LReg::L7);
+            p.mul24(LReg::L4, LReg::L5, false, into);
+            p.mul24(LReg::L4, LReg::L5, true, LReg::L6);
+            p.shl(LReg::L6, 23, LReg::L6);
+            p.or(LReg::L6, into, into);
+            p.iadd(LReg::L7, into);
+            p.mov(other, LReg::L4);
+            p.loadi_bits(LReg::L6, (-16i32) as u32);
+            p.shr_by(LReg::L6, LReg::L4);
+            p.mul24(LReg::L4, LReg::L5, false, LReg::L7);
+            p.shl(LReg::L7, 16, LReg::L7);
+            p.iadd(LReg::L7, into);
+        }
+        ReduceOp::MinI32 | ReduceOp::MaxI32 => {
+            p.loadi_bits(LReg::L4, 0x7fffffff);
+            p.mov(other, LReg::L5);
+            p.mov(into, LReg::L7);
+            p.if_(Cond::Lt0(LReg::L5), |p| p.xor(LReg::L4, LReg::L5));
+            p.if_(Cond::Lt0(LReg::L7), |p| p.xor(LReg::L4, LReg::L7));
+            let cond = if op == ReduceOp::MinI32 {
+                Cond::Less(LReg::L5, LReg::L7)
+            } else {
+                Cond::Less(LReg::L7, LReg::L5)
+            };
+            p.if_(cond, |p| p.mov(other, into));
+        }
     }
 }
 
@@ -94,18 +179,14 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return accumulate_in_order(first, valid.unwrap_or(32));
     }
-    let fmt = if op == ReduceOp::Max {
-        Format::Int32
-    } else {
-        Format::Fp32
-    };
+    let fmt = op.format();
     let masked = valid.is_some_and(|v| v < 32);
     let mut p = Program::with_policy(if masked {
         LoopPolicy::Unrolled
     } else {
         LoopPolicy::Replay
     });
-    if masked {
+    let mask_setup = |p: &mut Program| {
         // `L6` = this lane's column within its half (`2 * (lane & 7)`), or
         // its row within its group (`lane >> 3`), from `LReg[15] = 2 * lane`.
         match axis {
@@ -120,9 +201,15 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
             }
         }
         p.loadi_bits(LReg::L4, op.identity());
+    };
+    if masked {
+        mask_setup(&mut p);
     }
     let v = valid.unwrap_or(32) as i32;
     p.for_each_row_group(64, |p, o| {
+        if masked && matches!(op, ReduceOp::ProdI32 | ReduceOp::MinI32 | ReduceOp::MaxI32) {
+            mask_setup(p);
+        }
         p.load(LReg::L0, fmt, A_ROW + o);
         if masked {
             let g = o / 4;
@@ -211,11 +298,7 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
 /// The finishing program: the accumulator folded within the tile (see the
 /// module documentation). Nothing for a sum over rows, already in row 0.
 pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
-    let fmt = if op == ReduceOp::Max {
-        Format::Int32
-    } else {
-        Format::Fp32
-    };
+    let fmt = op.format();
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return p.finish();

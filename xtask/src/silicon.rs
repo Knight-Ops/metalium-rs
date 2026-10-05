@@ -114,6 +114,19 @@ pub const SMOKE: &[&str] = &[
     "step66_burn_small_ops::",
     "step67_general_reduce::",
     "step68_k_block_matmul::",
+    "step69_reduction_primitives::",
+    "step70_native_norms::",
+    "step71_integer_alu::",
+    "step72_round_cast::",
+    "step73_fpu_transpose::",
+    "step74_bf16_storage::",
+    "step75_fpu_pooling::",
+    "step76_burn_bf16::",
+    "step77_bf16_matmul::",
+    "step78_burn_pooling::",
+    "step79_extremum_scans::",
+    "step80_integer_reductions::",
+    "step81_hardware_rounding::",
 ];
 
 pub const USAGE: &str = "\

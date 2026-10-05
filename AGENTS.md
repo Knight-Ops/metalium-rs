@@ -29,16 +29,18 @@ Docs retain superseded designs and stale checklist entries. Check current code,
 crate READMEs and current-contract sections before treating historical prose as
 an API or implementing a supposedly missing feature.
 
-| Task | Reference |
-|---|---|
-| Setup and task options | [README.md](README.md), [xtask/README.md](xtask/README.md) |
-| New kernel/op; completion criteria | [hardware-coverage.md](docs/hardware-coverage.md) |
-| Burn backend changes | [burn-native-cutover.md](docs/burn-native-cutover.md), [burn-backend-parity.md](docs/burn-backend-parity.md) |
-| Scheduler, credits, traces or recovery | [streaming ownership](docs/feature-streaming-dataflow-ownership.md) |
-| Hardware access/bring-up | [implementation-checklist.md](docs/implementation-checklist.md), especially “Silicon operating notes” |
-| Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/ttsim-divergence.md); read refutations as well as original findings |
-| Performance changes | [firmware-performance.md](docs/firmware-performance.md) |
-| Architecture/specification rationale | [RUST_IMPL_PLAN.md](docs/RUST_IMPL_PLAN.md), [tt-metal concepts review](docs/tt-metal-concepts-review.md) |
+Use documentation in vendor/tt-isa-documentation/, cfg_defines.h, and ioctl.h if you need documentation about the Tenstorrent Blackhole devices.
+
+| Task                                    | Reference                                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                   |
+| New kernel/op; completion criteria      | [hardware-coverage.md](docs/hardware-coverage.md)                                                            |
+| Burn backend changes                    | [burn-native-cutover.md](docs/burn-native-cutover.md), [burn-backend-parity.md](docs/burn-backend-parity.md) |
+| Scheduler, credits, traces or recovery  | [streaming ownership](docs/feature-streaming-dataflow-ownership.md)                                          |
+| Hardware access/bring-up                | [implementation-checklist.md](docs/implementation-checklist.md), especially “Silicon operating notes”        |
+| Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/ttsim-divergence.md); read refutations as well as original findings               |
+| Performance changes                     | [firmware-performance.md](docs/firmware-performance.md)                                                      |
+| Architecture/specification rationale    | [RUST_IMPL_PLAN.md](docs/RUST_IMPL_PLAN.md), [tt-metal concepts review](docs/tt-metal-concepts-review.md)    |
 
 ## Build and check
 
@@ -88,11 +90,11 @@ and simulator results do not establish silicon correctness.
 Never hand-edit outputs. Change the generator/input, regenerate, then run its
 `--check` mode:
 
-| `cargo xtask` task | Output |
-|---|---|
-| `gen-cfg` | `crates/tt-isa/src/cfg/generated.rs` |
-| `gen-isa` | `crates/tt-isa/src/isa/generated.rs` |
-| `gen-burn-ops` | `crates/burn-tt/src/generated/ops.rs` |
+| `cargo xtask` task | Output                                |
+| ------------------ | ------------------------------------- |
+| `gen-cfg`          | `crates/tt-isa/src/cfg/generated.rs`  |
+| `gen-isa`          | `crates/tt-isa/src/isa/generated.rs`  |
+| `gen-burn-ops`     | `crates/burn-tt/src/generated/ops.rs` |
 
 Burn routing is `OVERRIDDEN` in `xtask/src/gen_burn.rs`. Historical
 `gen-burn-delegate` instructions are obsolete. Measured Blackhole encodings belong
@@ -101,6 +103,7 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
 
 ## Preserve these contracts
 
+- Ensure that documentation stays up to date.
 - `burn-tt` has no Flex dependency or host arithmetic fallback. Unsupported ops,
   shapes and dtypes fail explicitly. Preserve Burn defaults that compose native
   primitives. Model gates reject intermediate downloads and staged host compute;

@@ -28,10 +28,13 @@
 //! computed, never hand-derived. It is checked instruction by instruction
 //! against ttsim and both cards (`step26_sfpu_isa`).
 
+pub mod integer;
 pub mod interp;
 pub mod kernel;
 pub mod ops;
 pub mod reduce;
+pub mod round;
+pub mod scan;
 
 use tt_isa::frontend;
 use tt_isa::isa::generated::{defs, encode};
@@ -284,6 +287,32 @@ impl Program {
     /// `d = s`.
     pub fn mov(&mut self, s: LReg, d: LReg) {
         self.push(encode::sfpmov(s.index(), Self::dst(d), 0).unwrap());
+    }
+
+    /// Read and advance the hardware's per-lane PRNG. Its state is inherited
+    /// from prior programs; this does not provide seedable application RNG.
+    pub fn read_prng(&mut self, d: LReg) {
+        self.push(encode::sfpmov(9, Self::dst(d), 8).unwrap());
+    }
+
+    /// Explicit hardware precision reduction, including the documented NaN,
+    /// signed-zero and rounding defects. Ordinary BF16 casts use ties-even.
+    pub fn hardware_round(
+        &mut self,
+        s: LReg,
+        d: LReg,
+        precision: tt_isa::numerics::stochastic::Precision,
+        rounding: tt_isa::numerics::stochastic::Rounding,
+    ) {
+        self.push(
+            encode::Sfpstochrnd::ZERO
+                .rounding_mode(rounding as u32)
+                .vc(s.index())
+                .vd(Self::dst(d))
+                .mod1(precision as u32)
+                .encode()
+                .unwrap(),
+        );
     }
 
     /// `d = s` with its sign bit flipped: FP32 negation, NaNs included.

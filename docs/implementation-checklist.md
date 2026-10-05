@@ -1,5 +1,15 @@
 # Implementation checklist
 
+Current Tensix continuation status (2026-10-05): see
+[tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
+for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
+extremum scans, hardware precision modes, accuracy results and remaining work.
+Checked integer division/remainder is disabled after a failing simulator gate.
+Ordinary validation uses one card; both cards are reserved for actual mesh tests
+or device-specific investigations per the user's instruction. Historical two-card
+requirements below are superseded for ordinary validation.
+
+
 The working tick-list for `RUST_IMPL_PLAN.md`. The plan says *why*; this says *what
 is done, what is next, and what must not be forgotten*.
 
@@ -28,6 +38,24 @@ gate you have not seen reject something is not yet evidence.
 
 ---
 
+## Current Tensix extensions (2026-10-05)
+
+Direct products, Boolean reductions, rank-N arg-reductions and ordered scans
+are simulator-gated (`step69`); native reversal/stepped copies support scan
+backward. Existing LayerNorm/RMSNorm compositions have dedicated gates
+(`step70`). I32 ALU and deterministic rounding/casts have `step71`/`step72`.
+The typed SrcB transpose helper has TF32 simulator coverage (`step73`).
+Both-card silicon passed for `step67`–`step73` (58/58, run `1791145571`).
+BF16 physical storage, casts, layout copies, packed matmul, native arithmetic
+adapters and normalization are implemented. GMPOOL/GAPOOL block kernels and
+native NCHW pooling/backwards are implemented; BF16 averages use GAPOOL.
+`step74`–`step78` passed both cards (24/24, final run `1791160155`), including SGD
+with F32 loss and changed-input traces retaining BF16 temporary allocations.
+The pinned simulator refuses late BF16 narrowing, so conversion/arithmetic gates
+are silicon-only; raw BF16 storage, packed MMA and window staging run on ttsim.
+The execution and
+remaining work are recorded in [tensix-next-features.md](tensix-next-features.md).
+
 ## Where things stand
 
 | Phase | State | Note |
@@ -54,9 +82,9 @@ beyond one-pass L1 limits. Their arithmetic is native SFPU execution, including
 in exact mode, with explicit errors for unsupported inputs. Mesh engines use
 native L1 staging on chip 0 rather than a host reduction.
 R1c arbitrary-axis/ragged F32 sum/mean/max and P2 resident K-blocked matmul
-are implemented with simulator gates (`step67`/`step68`). Both-card silicon
-validation and release-silicon benchmarks remain pending: this environment
-has no `/dev/tenstorrent` nodes. The implementation retains native ownership
+are implemented with simulator and both-card gates (`step67`/`step68`).
+General reduction/K-continuation performance measurements remain open.
+The implementation retains native ownership
 and arithmetic order; no fallback or exact-mode setting is introduced.
 Backend work proceeds as B1 → B2 → B10.
 The old Phase 9 timings below are dated measurements, not the current status.

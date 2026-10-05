@@ -46,6 +46,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_recip",
             "float_exp",
             "float_log",
+            "float_cumsum",
+            "float_cumprod",
+            "float_prod",
+            "float_prod_dim",
             "float_sum",
             "float_mean",
             "float_sum_dim",
@@ -60,6 +64,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_permute",
             "float_reshape",
             "float_slice",
+            "float_flip",
             "float_swap_dims",
             "float_transpose",
             "float_device",
@@ -87,6 +92,11 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_is_inf",
             "float_mask_fill",
             "float_mask_where",
+            "float_round",
+            "float_floor",
+            "float_ceil",
+            "float_trunc",
+            "float_into_int",
             "float_cast",
             "float_sqrt",
             "float_log1p",
@@ -114,6 +124,39 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     (
         "IntTensorOps",
         &[
+            "int_add",
+            "int_sub",
+            "int_mul",
+            "int_sum",
+            "int_sum_dim",
+            "int_prod",
+            "int_prod_dim",
+            "int_min_dim",
+            "int_max_dim",
+            "bitwise_and",
+            "bitwise_or",
+            "bitwise_xor",
+            "bitwise_left_shift",
+            "bitwise_right_shift",
+            "int_add_scalar",
+            "int_sub_scalar",
+            "int_mul_scalar",
+            "bitwise_and_scalar",
+            "bitwise_or_scalar",
+            "bitwise_xor_scalar",
+            "bitwise_left_shift_scalar",
+            "bitwise_right_shift_scalar",
+            "bitwise_not",
+            "int_equal",
+            "int_equal_elem",
+            "int_greater",
+            "int_greater_elem",
+            "int_greater_equal",
+            "int_greater_equal_elem",
+            "int_lower",
+            "int_lower_elem",
+            "int_lower_equal",
+            "int_lower_equal_elem",
             "int_from_data",
             "int_empty",
             "int_random",
@@ -147,6 +190,10 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "bool_and",
             "bool_or",
             "bool_xor",
+            "bool_any",
+            "bool_all",
+            "bool_any_dim",
+            "bool_all_dim",
             "bool_equal",
             "bool_equal_elem",
             "bool_expand",
@@ -176,6 +223,13 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
     (
         "ModuleOps",
         &[
+            "avg_pool2d",
+            "avg_pool2d_backward",
+            "adaptive_avg_pool2d",
+            "adaptive_avg_pool2d_backward",
+            "max_pool2d",
+            "max_pool2d_with_indices",
+            "max_pool2d_with_indices_backward",
             "linear_weight_backward",
             "linear_bias_backward",
             "embedding",
@@ -660,6 +714,62 @@ pub fn render(
                 m.name
             ));
             if is_hand {
+                // BF16 arithmetic has an explicit native F32 compute / BF16
+                // result policy. Metadata, raw transfers and views retain their
+                // own dtype-aware implementation and never round view bytes.
+                let floats: Vec<_> = m
+                    .args
+                    .iter()
+                    .zip(&names)
+                    .filter(|((_, ty), _)| ty == "FloatTensor<B>")
+                    .map(|(_, name)| *name)
+                    .collect();
+                let storage = [
+                    "float_cast",
+                    "float_into_data",
+                    "float_to_device",
+                    "float_reshape",
+                    "float_swap_dims",
+                    "float_transpose",
+                    "float_permute",
+                    "float_slice",
+                    "float_flip",
+                    "float_expand",
+                    "avg_pool2d",
+                    "adaptive_avg_pool2d",
+                ];
+                if !is_future && !floats.is_empty() && !storage.contains(&m.name.as_str()) {
+                    impls.push_str(&format!(
+                        "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif compute_dtype == burn_backend::DType::BF16 {{\n",
+                        floats.iter().map(|name| format!("&{name}")).collect::<Vec<_>>().join(", ")
+                    ));
+                    if m.name == "float_matmul" {
+                        impls.push_str("if let Some(output) = crate::ops::bf16_matmul(&lhs, &rhs) { return output; }\n");
+                    }
+                    for name in &floats {
+                        impls.push_str(&format!(
+                            "let {name} = crate::ops::float_compute_input({name});\n"
+                        ));
+                    }
+                    let call = format!(
+                        "crate::ops::{}::{}({})",
+                        module_of(tr),
+                        m.name,
+                        names.join(", ")
+                    );
+                    if m.ret.as_deref() == Some("FloatTensor<B>") {
+                        impls.push_str(&format!(
+                            "return crate::ops::cast_native({call}, compute_dtype);\n"
+                        ));
+                    } else if m.ret.as_deref() == Some("MaxPool2dWithIndices<B>") {
+                        impls.push_str(&format!("let mut output = {call};\noutput.output = crate::ops::cast_native(output.output, compute_dtype);\nreturn output;\n"));
+                    } else if m.ret.as_deref() == Some("MaxPool2dBackward<B>") {
+                        impls.push_str(&format!("let mut output = {call};\noutput.x_grad = crate::ops::cast_native(output.x_grad, compute_dtype);\nreturn output;\n"));
+                    } else {
+                        impls.push_str(&format!("return {call};\n"));
+                    }
+                    impls.push_str("}\n");
+                }
                 impls.push_str(&format!(
                     "crate::ops::{}::{}({})",
                     module_of(tr),

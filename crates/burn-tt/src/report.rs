@@ -251,8 +251,12 @@ fn is_readback(op: &str) -> bool {
 
 /// A tensor of stored `[rows, cols]` was downloaded.
 pub(crate) fn downloaded(rows: usize, cols: usize) {
+    downloaded_width(rows, cols, 4);
+}
+
+pub(crate) fn downloaded_width(rows: usize, cols: usize, width: usize) {
     let op = current().unwrap_or(OUTSIDE);
-    let bytes = (rows * cols * 4) as u64;
+    let bytes = (rows * cols * width) as u64;
     bump(op, None, |s| {
         s.downloads += 1;
         s.downloaded += bytes;
@@ -270,8 +274,12 @@ pub(crate) fn downloaded(rows: usize, cols: usize) {
 
 /// A tensor of stored `[rows, cols]` was uploaded.
 pub(crate) fn uploaded(rows: usize, cols: usize) {
+    uploaded_width(rows, cols, 4);
+}
+
+pub(crate) fn uploaded_width(rows: usize, cols: usize, width: usize) {
     let op = current().unwrap_or(OUTSIDE);
-    let bytes = (rows * cols * 4) as u64;
+    let bytes = (rows * cols * width) as u64;
     bump(op, None, |s| {
         s.uploads += 1;
         s.uploaded += bytes;

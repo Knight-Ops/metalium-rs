@@ -226,6 +226,18 @@ impl<A> Banks<A, Filling> {
 // --- Matrix Unit consumers -----------------------------------------------------
 
 impl Banks<Loaded, Loaded> {
+    /// `GMPOOL`, keeping both sources for accumulation. Scaling, NaNs and
+    /// partial argmax follow the matrix-unit contract, not IEEE max.
+    pub fn gmpool(self, base: encode::Gmpool) -> Result<(Instruction, Self), EncodeError> {
+        Ok((base.flip_src_a(0).flip_src_b(0).encode()?, banks()))
+    }
+
+    /// `GAPOOL`'s four-row matrix product, keeping both sources. A mean
+    /// requires an explicit SrcB matrix of averaging weights.
+    pub fn gapool(self, addr_mod: u32, dst_row: u32) -> Result<(Instruction, Self), EncodeError> {
+        Ok((encode::gapool(0, 0, addr_mod, dst_row)?, banks()))
+    }
+
     /// `MVMUL`, keeping both operands. `base` carries `DstRow`, `AddrMod` and
     /// `BroadcastSrcBRow`; the flip bits are set here.
     pub fn mvmul(self, base: encode::Mvmul) -> Result<(Instruction, Self), EncodeError> {
@@ -272,6 +284,19 @@ impl<B> Banks<Loaded, B> {
 }
 
 impl<A> Banks<A, Loaded> {
+    /// Transpose the aligned 16x16 block in SrcB rows 16..32, keeping
+    /// ownership. This moves reduced-precision Src datums, not F32 words.
+    /// Blackhole silicon validation is pending; the encoding retains its
+    /// Wormhole-only provenance until measured on both cards.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::Banks;
+    /// let _ = Banks::after_reset().transpose_b();
+    /// ```
+    pub fn transpose_b(self) -> Result<(Instruction, Self), EncodeError> {
+        Ok((encode::trnspsrcb()?, banks()))
+    }
+
     /// `MOVB2D`: copy `SrcB` rows into `Dst`. Does not flip.
     pub fn movb2d(self, base: encode::Movb2D) -> Result<(Instruction, Self), EncodeError> {
         Ok((base.encode()?, banks()))
@@ -280,6 +305,18 @@ impl<A> Banks<A, Loaded> {
     /// `SETRWC` with only `FlipSrcB`.
     pub fn release_b(self) -> Result<(Instruction, Banks<A, Empty>), EncodeError> {
         Ok((release(false, true)?, banks()))
+    }
+}
+
+/// The documented TRNSPSRCB permutation on raw Src datums. Rows 0..16
+/// remain untouched; format conversion belongs to the unpacker model.
+pub fn transpose_b_reference(src: &mut [[u32; 16]; 32]) {
+    for i in 0..16 {
+        for j in 0..i {
+            let a = src[16 + i][j];
+            src[16 + i][j] = src[16 + j][i];
+            src[16 + j][i] = a;
+        }
     }
 }
 

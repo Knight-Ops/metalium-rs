@@ -1,5 +1,15 @@
 # Rust-Native Software Stack for Tenstorrent Blackhole → Burn Backend
 
+Current Tensix continuation status (2026-10-05): see
+[tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
+for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
+extremum scans, hardware precision modes, accuracy results and remaining work.
+Checked integer division/remainder is disabled after a failing simulator gate.
+Ordinary validation uses one card; both cards are reserved for actual mesh tests
+or device-specific investigations per the user's instruction. Historical two-card
+requirements below are superseded for ordinary validation.
+
+
 **Status:** Phases 0–8 closed on ttsim and silicon; Phase 9 (performance) and Phase 10
 (hardware coverage) in progress. Current state per item is in the checklist.
 **Target hardware:** Blackhole A0 (p100 / p150)
@@ -978,26 +988,38 @@ for each optimization, then measure on silicon.
 model coverage. Matrix matmul, SFPU arithmetic and activations, softmax,
 int/bool storage and logic, and embedding/loss indexing now have device paths.
 B and NC are data movers; they perform no tensor arithmetic. Matrix-unit
-`ELW*`, pooling and Tensix transpose, BF16 tensor storage, further integer ops
-and block-float formats remain to be implemented.
+`ELW*`, tensor-level Tensix transpose, further integer ops and block-float
+formats remain to be implemented. BF16 storage and pooling are described below.
 
-**Current milestone (2026-10-04):** 10.0–10.2 complete; 10.3 in progress.
+**Current milestone (2026-10-05):** 10.0–10.2 complete; 10.3–10.5 in progress.
+Reduction/scan, norm-composition, I32 ALU and deterministic cast/rounding
+extensions have simulator gates (`step69`–`step72`); a typed FPU SrcB transpose
+has TF32 coverage (`step73`). `step67`–`step73` pass both cards (run `1791145571`).
+Physical BF16 storage, native casts/layouts, packed MMA, native Burn F32 compute
+adapters, normalization, BF16 SGD and trace lifetimes pass `step74`–`step77` on
+both cards. BF16 NCHW mean/adaptive pooling uses GAPOOL; general max and F32 means
+retain SFPU semantics, with resident indices/backwards (`step78`). The simulator
+refuses late narrowing, so BF16 conversion/arithmetic is silicon-only.
+See `tensix-next-features.md` for limits and measured BF16 performance regressions.
 Rank-N storage/views, tile-aligned batched matmul and partial rank-N reductions
 are implemented. Full F32 `sum`/`mean` now compose resident reductions, bounded
 column copies and scalar additions, including full-source views and dimensions
-beyond one L1 pass. Full reductions always execute natively, including in
-exact mode: host F32 inputs are uploaded, unsupported inputs fail explicitly,
+beyond one L1 pass. Full reductions always execute natively, and host F32 inputs are uploaded; unsupported inputs fail explicitly,
 and native arithmetic is checked against derived bounds rather than Flex's bits.
 Mesh engines stage those reductions on chip 0's SFPU, with both passes limited
 by L1/program capacity; the GDDR path chunks larger shapes and stays resident.
 Gates: `step63_burn_full_reduce`, `step59_burn_transformer`.
-Next: remaining R1 axes/kinds, K blocking (P2), general D4 slicing/indexing,
-M3/R3 layouts/norms, formats/casts and convolution/pooling/attention.
+Packed BF16 gathers/K continuations/batching, mesh execution, pooling traces,
+integer reductions, extremum scans and hardware precision modes now have gates.
+Next: checked integer division/remainder (currently disabled), general GMPOOL
+semantics/window staging, M3 tensor transpose, general D4 indexing and
+convolution/attention. See the current implementation record for evidence and
+remaining negative controls.
 
 **Why now.** `burn-tt` is a general Burn backend, and under device residency (Phase 9) every
 op without a device path is a download, a host op and an upload. Breadth is therefore a
 performance item as much as a feature list, and the next model -- anything with a softmax, a
-norm, a convolution -- falls back on its first unsupported op.
+norm, a convolution -- fails explicitly on its first unsupported op.
 
 **Tracking.** The inventory, the work items (F, S, M, R, D), the milestones 10.0–10.6 and a
 Burn op coverage table live in [`hardware-coverage.md`](hardware-coverage.md), which is the

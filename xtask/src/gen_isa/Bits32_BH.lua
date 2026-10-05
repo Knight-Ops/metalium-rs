@@ -16,6 +16,27 @@
 -- is a cross-check against the document, not a substitute for it.
 
 local diagrams = {
+  GMPOOL_BH = function()
+    return Bits32{
+      {0, 10, "DstRow"},
+      {14, 1, "ArgMax"},
+      {15, 2, "AddrMod"},
+      {19, 1, "1"},
+      {22, 1, "FlipSrcA"},
+      {23, 1, "FlipSrcB"},
+      {24, 8, "0x33"},
+    }
+  end,
+  GAPOOL_BH = function()
+    return Bits32{
+      {0, 10, "DstRow"},
+      {15, 2, "AddrMod"},
+      {19, 1, "1"},
+      {22, 1, "FlipSrcA"},
+      {23, 1, "FlipSrcB"},
+      {24, 8, "0x34"},
+    }
+  end,
   MVMUL_BH = function()
     return Bits32{
       {0, 10, "DstRow"},

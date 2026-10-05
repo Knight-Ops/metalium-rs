@@ -117,7 +117,7 @@ impl Backend for TtBackend {
 
     fn dtype_usage(_device: &Self::Device, dtype: DType) -> DTypeUsageSet {
         match dtype {
-            DType::F32 => DTypeUsage::general() | DTypeUsage::Accelerated,
+            DType::F32 | DType::BF16 => DTypeUsage::general() | DTypeUsage::Accelerated,
             DType::Bool(_) => DTypeUsage::general(),
             DType::I32 => DTypeUsage::Storage.into(),
             _ => DTypeUsageSet::empty(),

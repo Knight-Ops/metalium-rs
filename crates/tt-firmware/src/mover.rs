@@ -229,14 +229,19 @@ fn broadcast_col0_from_scratch(dst: u64) {
 /// first `param & 0xff` rows and `param >> 8` columns (`0` meaning 32).
 /// Stores only: the mover moves data and does no arithmetic.
 #[inline(never)]
-fn fill(v: u32, param: u32, dst: u64) {
+fn fill(v: u32, param: u32, dst: u64, halfwords: bool) {
     let dst = dst + dm::TILE_DATA;
     let rows = dm::fill::extent(param & 0xff) as usize;
     let cols = dm::fill::extent(param >> 8) as usize;
     for r in 0..32usize {
         for c in 0..32usize {
             if r >= rows || c >= cols {
-                wr(dst + dm::face_index(r, c) as u64 * 4, v);
+                if halfwords {
+                    // SAFETY: Entry::decode checks the whole slot in L1.
+                    unsafe { core::ptr::write_volatile((dst + dm::face_index(r, c) as u64 * 2) as *mut u16, v as u16); }
+                } else {
+                    wr(dst + dm::face_index(r, c) as u64 * 4, v);
+                }
             }
         }
     }
@@ -390,15 +395,20 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
-        Entry::CopyWords { src, dst, count, src_stride, dst_stride } => {
+        Entry::CopyWords { src, dst, count, src_stride, dst_stride, halfwords } => {
             reader_only()?;
             noc::wait(TXN);
             publish();
             for n in 0..count {
                 // SAFETY: decode checks every word lies inside the data arena.
                 unsafe {
-                    let value = core::ptr::read_volatile((src + n * src_stride) as *const u32);
-                    core::ptr::write_volatile((dst + n * dst_stride) as *mut u32, value);
+                    if halfwords {
+                        let value = core::ptr::read_volatile((src + n * src_stride) as *const u16);
+                        core::ptr::write_volatile((dst + n * dst_stride) as *mut u16, value);
+                    } else {
+                        let value = core::ptr::read_volatile((src + n * src_stride) as *const u32);
+                        core::ptr::write_volatile((dst + n * dst_stride) as *mut u32, value);
+                    }
                 }
             }
             publish();
@@ -485,6 +495,21 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             wr(address as u64, value);
             publish();
         }
+        Entry::CheckFlags { slot, rows, cols } => {
+            if !IS_NC { return Err(dm::error::DIRECTION); }
+            // The packet's ready credit follows pack retirement. Fence the
+            // SFPU-generated status tile before validating it; no tensor
+            // arithmetic or host intermediate download is involved.
+            publish();
+            for r in 0..rows {
+                for c in 0..cols {
+                    let index = dm::face_index(r as usize, c as usize);
+                    if rd(slot as u64 + dm::TILE_DATA + index as u64 * 4) != 1 {
+                        return Err(dm::error::DOMAIN);
+                    }
+                }
+            }
+        }
         // Only as a list of its own, which `run_list_at` runs (B's).
         Entry::Call { .. } => {
             reader_only()?;
@@ -530,12 +555,12 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             // Visible in L1 before anything else reads it.
             publish();
         }
-        Entry::Fill { value, param, dst } => {
+        Entry::Fill { value, param, dst, halfwords } => {
             reader_only()?;
             // The tile it fills may still be arriving.
             noc::wait(TXN);
             publish();
-            fill(value, param, dst as u64);
+            fill(value, param, dst as u64, halfwords);
         }
     }
     Ok(())

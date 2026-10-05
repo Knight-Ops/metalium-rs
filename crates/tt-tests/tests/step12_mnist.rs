@@ -282,17 +282,16 @@ fn golden() -> Option<Vec<u32>> {
 
 /// What one step may move between host and device once the dataset and
 /// weights are resident (Phase 9.5), each with why. Everything else stays in
-/// GDDR; only labels, index grids, autodiff initial values, and scalar readback cross.
+/// GDDR; only labels, autodiff initial values, and scalar readback cross.
+/// Gather/scatter index grids are replayable mover metadata, not tensor uploads.
 fn steady_state_transfers(batch: usize) -> Vec<(burn_tt::Transfer, &'static str)> {
     use burn_tt::{Direction::*, Transfer};
     let t = |direction, shape| Transfer { direction, shape };
     vec![
         (t(Up, [batch, 1]), "the target indices"),
-        (t(Up, [batch, CLASSES]), "the gather's column index grid"),
         (t(Down, [1, 1]), "the scalar loss readback"),
         (t(Up, [1, 1]), "autodiff's scalar seed"),
         (t(Up, [1, batch]), "the full mean's backward initial values"),
-        (t(Up, [batch, CLASSES]), "the scatter's column index grid"),
         (t(Up, [batch, CLASSES]), "the scatter's initial zeros"),
         (
             t(Up, [batch, CLASSES]),

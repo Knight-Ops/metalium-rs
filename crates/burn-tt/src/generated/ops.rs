@@ -105,15 +105,13 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_to_device(tensor, device)
     }
     fn float_into_int(tensor: FloatTensor<TtBackend>, out_dtype: IntDType) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("float_into_int", false);
-        crate::unsupported::fail(
-            "float_into_int",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_into_int", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_into_int(tensor, out_dtype);
+        }
+        crate::ops::float::float_into_int(tensor, out_dtype)
     }
     fn float_empty(
         shape: Shape,
@@ -128,18 +126,48 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(crate::ops::float::float_add(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_add(lhs, rhs)
     }
     fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_add_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_add_scalar(lhs, rhs)
     }
     fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp_min", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_clamp_min(tensor, min),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_clamp_min(tensor, min)
     }
     fn float_clamp_max(tensor: FloatTensor<TtBackend>, max: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp_max", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_clamp_max(tensor, max),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_clamp_max(tensor, max)
     }
     fn float_clamp(
@@ -148,6 +176,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         max: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_clamp(tensor, min, max),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_clamp(tensor, min, max)
     }
     fn float_sub(
@@ -155,10 +191,24 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(crate::ops::float::float_sub(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_sub(lhs, rhs)
     }
     fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_sub_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_sub_scalar(lhs, rhs)
     }
     fn float_mul(
@@ -166,10 +216,24 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(crate::ops::float::float_mul(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_mul(lhs, rhs)
     }
     fn float_mul_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_mul_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_mul_scalar(lhs, rhs)
     }
     fn float_div(
@@ -177,10 +241,24 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_div", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(crate::ops::float::float_div(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_div(lhs, rhs)
     }
     fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_div_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_div_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_div_scalar(lhs, rhs)
     }
     fn float_remainder(
@@ -213,6 +291,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_matmul", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            if let Some(output) = crate::ops::bf16_matmul(&lhs, &rhs) {
+                return output;
+            }
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_matmul(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_matmul(lhs, rhs)
     }
     fn float_cross(
@@ -233,10 +323,20 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_neg(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_neg", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_neg(tensor), compute_dtype);
+        }
         crate::ops::float::float_neg(tensor)
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_recip", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_recip(tensor), compute_dtype);
+        }
         crate::ops::float::float_recip(tensor)
     }
     fn float_transpose(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
@@ -256,15 +356,8 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_permute(tensor, axes)
     }
     fn float_flip(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_flip", false);
-        crate::unsupported::fail(
-            "float_flip",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_flip", true);
+        crate::ops::float::float_flip(tensor, axes)
     }
     fn float_reshape(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_reshape", true);
@@ -276,6 +369,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_gather", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_gather(dim, tensor, indices),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_gather(dim, tensor, indices)
     }
     fn float_scatter_add(
@@ -285,6 +386,15 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_scatter_add", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &value]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let value = crate::ops::float_compute_input(value);
+            return crate::ops::cast_native(
+                crate::ops::float::float_scatter_add(dim, tensor, indices, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_scatter_add(dim, tensor, indices, value)
     }
     fn float_scatter_nd(
@@ -325,6 +435,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_select", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_select(tensor, dim, indices),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_select(tensor, dim, indices)
     }
     fn float_select_add(
@@ -334,6 +452,15 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_select_add", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &value]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let value = crate::ops::float_compute_input(value);
+            return crate::ops::cast_native(
+                crate::ops::float::float_select_add(tensor, dim, indices, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_select_add(tensor, dim, indices, value)
     }
     fn float_slice(tensor: FloatTensor<TtBackend>, slices: &[Slice]) -> FloatTensor<TtBackend> {
@@ -362,6 +489,15 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mask_where", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &value]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let value = crate::ops::float_compute_input(value);
+            return crate::ops::cast_native(
+                crate::ops::float::float_mask_where(tensor, mask, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_mask_where(tensor, mask, value)
     }
     fn float_mask_fill(
@@ -370,6 +506,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mask_fill", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_mask_fill(tensor, mask, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_mask_fill(tensor, mask, value)
     }
     fn float_equal(
@@ -378,6 +522,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_equal", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_equal(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_equal(lhs, rhs, out_dtype)
     }
     fn float_not_equal(
@@ -386,6 +536,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_not_equal", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_not_equal(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_not_equal(lhs, rhs, out_dtype)
     }
     fn float_equal_elem(
@@ -394,6 +550,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_equal_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_equal_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_not_equal_elem(
@@ -402,6 +563,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_not_equal_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_not_equal_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_not_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_greater(
@@ -410,6 +576,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_greater(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_greater(lhs, rhs, out_dtype)
     }
     fn float_greater_elem(
@@ -418,6 +590,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_greater_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_greater_elem(lhs, rhs, out_dtype)
     }
     fn float_greater_equal(
@@ -426,6 +603,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_equal", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_greater_equal(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_greater_equal(lhs, rhs, out_dtype)
     }
     fn float_greater_equal_elem(
@@ -434,6 +617,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_equal_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_greater_equal_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_greater_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_lower(
@@ -442,6 +630,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_lower(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_lower(lhs, rhs, out_dtype)
     }
     fn float_lower_elem(
@@ -450,6 +644,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_lower_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_lower_elem(lhs, rhs, out_dtype)
     }
     fn float_lower_equal(
@@ -458,6 +657,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_equal", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::float::float_lower_equal(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_lower_equal(lhs, rhs, out_dtype)
     }
     fn float_lower_equal_elem(
@@ -466,45 +671,99 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_equal_elem", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::float::float_lower_equal_elem(lhs, rhs, out_dtype);
+        }
         crate::ops::float::float_lower_equal_elem(lhs, rhs, out_dtype)
     }
     fn float_sum(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sum", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_sum(tensor), compute_dtype);
+        }
         crate::ops::float::float_sum(tensor)
     }
     fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sum_dim", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_sum_dim(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_sum_dim(tensor, dim)
+    }
+    fn float_prod(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_prod", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_prod(tensor), compute_dtype);
+        }
+        crate::ops::float::float_prod(tensor)
+    }
+    fn float_prod_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_prod_dim", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_prod_dim(tensor, dim),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_prod_dim(tensor, dim)
     }
     fn float_mean(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mean", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_mean(tensor), compute_dtype);
+        }
         crate::ops::float::float_mean(tensor)
     }
     fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mean_dim", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_mean_dim(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_mean_dim(tensor, dim)
     }
     fn float_cumsum(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_cumsum", false);
-        crate::unsupported::fail(
-            "float_cumsum",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_cumsum", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_cumsum(tensor, dim),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_cumsum(tensor, dim)
     }
     fn float_cumprod(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_cumprod", false);
-        crate::unsupported::fail(
-            "float_cumprod",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_cumprod", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_cumprod(tensor, dim),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_cumprod(tensor, dim)
     }
     fn float_cummin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cummin", false);
@@ -534,14 +793,29 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_exp", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_exp(tensor), compute_dtype);
+        }
         crate::ops::float::float_exp(tensor)
     }
     fn float_log(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_log", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_log(tensor), compute_dtype);
+        }
         crate::ops::float::float_log(tensor)
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_log1p", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_log1p(tensor), compute_dtype);
+        }
         crate::ops::float::float_log1p(tensor)
     }
     fn float_powf(
@@ -549,6 +823,12 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(crate::ops::float::float_powf(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_powf(lhs, rhs)
     }
     fn float_powi(
@@ -556,14 +836,35 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powi", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(crate::ops::float::float_powi(lhs, rhs), compute_dtype);
+        }
         crate::ops::float::float_powi(lhs, rhs)
     }
     fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powi_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_powi_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_powi_scalar(lhs, rhs)
     }
     fn float_powf_scalar(tensor: FloatTensor<TtBackend>, value: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf_scalar", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_powf_scalar(tensor, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_powf_scalar(tensor, value)
     }
     fn float_powf_scalar_impl(
@@ -571,62 +872,140 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf_scalar_impl", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_powf_scalar_impl(tensor, value),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_powf_scalar_impl(tensor, value)
     }
     fn float_sqrt(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sqrt", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_sqrt(tensor), compute_dtype);
+        }
         crate::ops::float::float_sqrt(tensor)
     }
     fn float_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_abs", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_abs(tensor), compute_dtype);
+        }
         crate::ops::float::float_abs(tensor)
     }
     fn float_cos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cos", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_cos(tensor), compute_dtype);
+        }
         crate::ops::float::float_cos(tensor)
     }
     fn float_sin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sin", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_sin(tensor), compute_dtype);
+        }
         crate::ops::float::float_sin(tensor)
     }
     fn float_tan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_tan", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_tan(tensor), compute_dtype);
+        }
         crate::ops::float::float_tan(tensor)
     }
     fn float_cosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cosh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_cosh(tensor), compute_dtype);
+        }
         crate::ops::float::float_cosh(tensor)
     }
     fn float_sinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sinh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_sinh(tensor), compute_dtype);
+        }
         crate::ops::float::float_sinh(tensor)
     }
     fn float_tanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_tanh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_tanh(tensor), compute_dtype);
+        }
         crate::ops::float::float_tanh(tensor)
     }
     fn float_acos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_acos", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_acos(tensor), compute_dtype);
+        }
         crate::ops::float::float_acos(tensor)
     }
     fn float_acosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_acosh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_acosh(tensor), compute_dtype);
+        }
         crate::ops::float::float_acosh(tensor)
     }
     fn float_asin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_asin", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_asin(tensor), compute_dtype);
+        }
         crate::ops::float::float_asin(tensor)
     }
     fn float_asinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_asinh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_asinh(tensor), compute_dtype);
+        }
         crate::ops::float::float_asinh(tensor)
     }
     fn float_atan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atan", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_atan(tensor), compute_dtype);
+        }
         crate::ops::float::float_atan(tensor)
     }
     fn float_atanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atanh", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_atanh(tensor), compute_dtype);
+        }
         crate::ops::float::float_atanh(tensor)
     }
     fn float_atan2(
@@ -634,38 +1013,60 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atan2", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_atan2(lhs, rhs),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_atan2(lhs, rhs)
     }
     fn float_round(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_round", false);
-        crate::unsupported::fail(
-            "float_round",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("float_round", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_round(tensor), compute_dtype);
+        }
+        crate::ops::float::float_round(tensor)
     }
     fn float_floor(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_floor", false);
-        crate::unsupported::fail(
-            "float_floor",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("float_floor", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_floor(tensor), compute_dtype);
+        }
+        crate::ops::float::float_floor(tensor)
     }
     fn float_ceil(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_ceil", false);
-        crate::unsupported::fail(
-            "float_ceil",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("float_ceil", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_ceil(tensor), compute_dtype);
+        }
+        crate::ops::float::float_ceil(tensor)
     }
     fn float_trunc(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_trunc", false);
-        crate::unsupported::fail(
-            "float_trunc",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("float_trunc", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_trunc(tensor), compute_dtype);
+        }
+        crate::ops::float::float_trunc(tensor)
     }
     fn float_erf(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_erf", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_erf(tensor), compute_dtype);
+        }
         crate::ops::float::float_erf(tensor)
     }
     fn float_argmax(
@@ -674,6 +1075,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("float_argmax", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_argmax(tensor, dim, out_dtype);
+        }
         crate::ops::float::float_argmax(tensor, dim, out_dtype)
     }
     fn float_argtopk(
@@ -700,14 +1106,32 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("float_argmin", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_argmin(tensor, dim, out_dtype);
+        }
         crate::ops::float::float_argmin(tensor, dim, out_dtype)
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_max_dim", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_max_dim(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::float::float_max_dim(tensor, dim)
     }
     fn float_sign(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sign", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::float::float_sign(tensor), compute_dtype);
+        }
         crate::ops::float::float_sign(tensor)
     }
     fn float_expand(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
@@ -734,10 +1158,20 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_is_nan(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_is_nan", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_is_nan(tensor, out_dtype);
+        }
         crate::ops::float::float_is_nan(tensor, out_dtype)
     }
     fn float_is_inf(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_is_inf", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_is_inf(tensor, out_dtype);
+        }
         crate::ops::float::float_is_inf(tensor, out_dtype)
     }
 }
@@ -942,226 +1376,104 @@ impl IntTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_equal", false);
-        crate::unsupported::fail(
-            "int_equal",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_equal", true);
+        crate::ops::int::int_equal(lhs, rhs, out_dtype)
     }
     fn int_equal_elem(
         lhs: IntTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_equal_elem", false);
-        crate::unsupported::fail(
-            "int_equal_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_equal_elem", true);
+        crate::ops::int::int_equal_elem(lhs, rhs, out_dtype)
     }
     fn int_greater(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_greater", false);
-        crate::unsupported::fail(
-            "int_greater",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_greater", true);
+        crate::ops::int::int_greater(lhs, rhs, out_dtype)
     }
     fn int_greater_elem(
         lhs: IntTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_greater_elem", false);
-        crate::unsupported::fail(
-            "int_greater_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_greater_elem", true);
+        crate::ops::int::int_greater_elem(lhs, rhs, out_dtype)
     }
     fn int_greater_equal(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_greater_equal", false);
-        crate::unsupported::fail(
-            "int_greater_equal",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_greater_equal", true);
+        crate::ops::int::int_greater_equal(lhs, rhs, out_dtype)
     }
     fn int_greater_equal_elem(
         lhs: IntTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_greater_equal_elem", false);
-        crate::unsupported::fail(
-            "int_greater_equal_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_greater_equal_elem", true);
+        crate::ops::int::int_greater_equal_elem(lhs, rhs, out_dtype)
     }
     fn int_lower(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_lower", false);
-        crate::unsupported::fail(
-            "int_lower",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_lower", true);
+        crate::ops::int::int_lower(lhs, rhs, out_dtype)
     }
     fn int_lower_elem(
         lhs: IntTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_lower_elem", false);
-        crate::unsupported::fail(
-            "int_lower_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_lower_elem", true);
+        crate::ops::int::int_lower_elem(lhs, rhs, out_dtype)
     }
     fn int_lower_equal(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_lower_equal", false);
-        crate::unsupported::fail(
-            "int_lower_equal",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_lower_equal", true);
+        crate::ops::int::int_lower_equal(lhs, rhs, out_dtype)
     }
     fn int_lower_equal_elem(
         lhs: IntTensor<TtBackend>,
         rhs: Scalar,
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("int_lower_equal_elem", false);
-        crate::unsupported::fail(
-            "int_lower_equal_elem",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_lower_equal_elem", true);
+        crate::ops::int::int_lower_equal_elem(lhs, rhs, out_dtype)
     }
     fn int_add(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_add", false);
-        crate::unsupported::fail(
-            "int_add",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_add", true);
+        crate::ops::int::int_add(lhs, rhs)
     }
     fn int_add_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_add_scalar", false);
-        crate::unsupported::fail(
-            "int_add_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_add_scalar", true);
+        crate::ops::int::int_add_scalar(lhs, rhs)
     }
     fn int_sub(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_sub", false);
-        crate::unsupported::fail(
-            "int_sub",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_sub", true);
+        crate::ops::int::int_sub(lhs, rhs)
     }
     fn int_sub_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_sub_scalar", false);
-        crate::unsupported::fail(
-            "int_sub_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_sub_scalar", true);
+        crate::ops::int::int_sub_scalar(lhs, rhs)
     }
     fn int_mul(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_mul", false);
-        crate::unsupported::fail(
-            "int_mul",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_mul", true);
+        crate::ops::int::int_mul(lhs, rhs)
     }
     fn int_mul_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_mul_scalar", false);
-        crate::unsupported::fail(
-            "int_mul_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_mul_scalar", true);
+        crate::ops::int::int_mul_scalar(lhs, rhs)
     }
     fn int_div(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_div", false);
@@ -1219,40 +1531,20 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_sum(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_sum", false);
-        crate::unsupported::fail(
-            "int_sum",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("int_sum", true);
+        crate::ops::int::int_sum(tensor)
     }
     fn int_sum_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_sum_dim", false);
-        crate::unsupported::fail(
-            "int_sum_dim",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_sum_dim", true);
+        crate::ops::int::int_sum_dim(tensor, dim)
     }
     fn int_prod(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_prod", false);
-        crate::unsupported::fail(
-            "int_prod",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("int_prod", true);
+        crate::ops::int::int_prod(tensor)
     }
     fn int_prod_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_prod_dim", false);
-        crate::unsupported::fail(
-            "int_prod_dim",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_prod_dim", true);
+        crate::ops::int::int_prod_dim(tensor, dim)
     }
     fn int_mean_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_mean_dim", false);
@@ -1343,6 +1635,14 @@ impl IntTensorOps<TtBackend> for TtBackend {
             .join("; "),
         )
     }
+    fn int_max_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_max_dim", true);
+        crate::ops::int::int_max_dim(tensor, dim)
+    }
+    fn int_min_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_min_dim", true);
+        crate::ops::int::int_min_dim(tensor, dim)
+    }
     fn int_abs(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_abs", false);
         crate::unsupported::fail(
@@ -1398,127 +1698,54 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_expand(tensor, shape)
     }
     fn bitwise_and(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_and", false);
-        crate::unsupported::fail(
-            "bitwise_and",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_and", true);
+        crate::ops::int::bitwise_and(lhs, rhs)
     }
     fn bitwise_and_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_and_scalar", false);
-        crate::unsupported::fail(
-            "bitwise_and_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_and_scalar", true);
+        crate::ops::int::bitwise_and_scalar(lhs, rhs)
     }
     fn bitwise_or(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_or", false);
-        crate::unsupported::fail(
-            "bitwise_or",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_or", true);
+        crate::ops::int::bitwise_or(lhs, rhs)
     }
     fn bitwise_or_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_or_scalar", false);
-        crate::unsupported::fail(
-            "bitwise_or_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_or_scalar", true);
+        crate::ops::int::bitwise_or_scalar(lhs, rhs)
     }
     fn bitwise_xor(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_xor", false);
-        crate::unsupported::fail(
-            "bitwise_xor",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_xor", true);
+        crate::ops::int::bitwise_xor(lhs, rhs)
     }
     fn bitwise_xor_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_xor_scalar", false);
-        crate::unsupported::fail(
-            "bitwise_xor_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_xor_scalar", true);
+        crate::ops::int::bitwise_xor_scalar(lhs, rhs)
     }
     fn bitwise_not(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_not", false);
-        crate::unsupported::fail(
-            "bitwise_not",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("bitwise_not", true);
+        crate::ops::int::bitwise_not(tensor)
     }
     fn bitwise_left_shift(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_left_shift", false);
-        crate::unsupported::fail(
-            "bitwise_left_shift",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_left_shift", true);
+        crate::ops::int::bitwise_left_shift(lhs, rhs)
     }
     fn bitwise_left_shift_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_left_shift_scalar", false);
-        crate::unsupported::fail(
-            "bitwise_left_shift_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_left_shift_scalar", true);
+        crate::ops::int::bitwise_left_shift_scalar(lhs, rhs)
     }
     fn bitwise_right_shift(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_right_shift", false);
-        crate::unsupported::fail(
-            "bitwise_right_shift",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_right_shift", true);
+        crate::ops::int::bitwise_right_shift(lhs, rhs)
     }
     fn bitwise_right_shift_scalar(lhs: IntTensor<TtBackend>, rhs: Scalar) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("bitwise_right_shift_scalar", false);
-        crate::unsupported::fail(
-            "bitwise_right_shift_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bitwise_right_shift_scalar", true);
+        crate::ops::int::bitwise_right_shift_scalar(lhs, rhs)
     }
     fn int_cast(tensor: IntTensor<TtBackend>, dtype: IntDType) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_cast", false);
@@ -1792,6 +2019,22 @@ impl BoolTensorOps<TtBackend> for TtBackend {
             .join("; "),
         )
     }
+    fn bool_any(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_any", true);
+        crate::ops::bool::bool_any(tensor)
+    }
+    fn bool_any_dim(tensor: BoolTensor<TtBackend>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_any_dim", true);
+        crate::ops::bool::bool_any_dim(tensor, dim)
+    }
+    fn bool_all(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_all", true);
+        crate::ops::bool::bool_all(tensor)
+    }
+    fn bool_all_dim(tensor: BoolTensor<TtBackend>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_all_dim", true);
+        crate::ops::bool::bool_all_dim(tensor, dim)
+    }
     fn bool_argwhere(
         tensor: BoolTensor<TtBackend>,
         out_dtype: IntDType,
@@ -1831,6 +2074,14 @@ impl ModuleOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("embedding", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&weights]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let weights = crate::ops::float_compute_input(weights);
+            return crate::ops::cast_native(
+                crate::ops::module::embedding(weights, indices),
+                compute_dtype,
+            );
+        }
         crate::ops::module::embedding(weights, indices)
     }
     fn embedding_backward(
@@ -1839,6 +2090,15 @@ impl ModuleOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("embedding_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&weights, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let weights = crate::ops::float_compute_input(weights);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::embedding_backward(weights, output_grad, indices),
+                compute_dtype,
+            );
+        }
         crate::ops::module::embedding_backward(weights, output_grad, indices)
     }
     fn linear_weight_backward(
@@ -1846,10 +2106,27 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("linear_weight_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::linear_weight_backward(x, output_grad),
+                compute_dtype,
+            );
+        }
         crate::ops::module::linear_weight_backward(x, output_grad)
     }
     fn linear_bias_backward(output_grad: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("linear_bias_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::linear_bias_backward(output_grad),
+                compute_dtype,
+            );
+        }
         crate::ops::module::linear_bias_backward(output_grad)
     }
     fn conv2d(
@@ -1978,18 +2255,14 @@ impl ModuleOps<TtBackend> for TtBackend {
         count_include_pad: bool,
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("avg_pool2d", false);
-        crate::unsupported::fail(
-            "avg_pool2d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("kernel_size={:?}", kernel_size),
-                format!("stride={:?}", stride),
-                format!("padding={:?}", padding),
-                format!("count_include_pad={:?}", count_include_pad),
-                format!("ceil_mode={:?}", ceil_mode),
-            ]
-            .join("; "),
+        let _op = crate::report::enter("avg_pool2d", true);
+        crate::ops::module::avg_pool2d(
+            x,
+            kernel_size,
+            stride,
+            padding,
+            count_include_pad,
+            ceil_mode,
         )
     }
     fn avg_pool2d_backward(
@@ -2001,48 +2274,56 @@ impl ModuleOps<TtBackend> for TtBackend {
         count_include_pad: bool,
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("avg_pool2d_backward", false);
-        crate::unsupported::fail(
-            "avg_pool2d_backward",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("grad={}", crate::unsupported::context(&grad)),
-                format!("kernel_size={:?}", kernel_size),
-                format!("stride={:?}", stride),
-                format!("padding={:?}", padding),
-                format!("count_include_pad={:?}", count_include_pad),
-                format!("ceil_mode={:?}", ceil_mode),
-            ]
-            .join("; "),
+        let _op = crate::report::enter("avg_pool2d_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::module::avg_pool2d_backward(
+                    x,
+                    grad,
+                    kernel_size,
+                    stride,
+                    padding,
+                    count_include_pad,
+                    ceil_mode,
+                ),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::avg_pool2d_backward(
+            x,
+            grad,
+            kernel_size,
+            stride,
+            padding,
+            count_include_pad,
+            ceil_mode,
         )
     }
     fn adaptive_avg_pool2d(
         x: FloatTensor<TtBackend>,
         output_size: [usize; 2],
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("adaptive_avg_pool2d", false);
-        crate::unsupported::fail(
-            "adaptive_avg_pool2d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("output_size={:?}", output_size),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("adaptive_avg_pool2d", true);
+        crate::ops::module::adaptive_avg_pool2d(x, output_size)
     }
     fn adaptive_avg_pool2d_backward(
         x: FloatTensor<TtBackend>,
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("adaptive_avg_pool2d_backward", false);
-        crate::unsupported::fail(
-            "adaptive_avg_pool2d_backward",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("grad={}", crate::unsupported::context(&grad)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("adaptive_avg_pool2d_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::module::adaptive_avg_pool2d_backward(x, grad),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::adaptive_avg_pool2d_backward(x, grad)
     }
     fn max_pool2d(
         x: FloatTensor<TtBackend>,
@@ -2052,19 +2333,23 @@ impl ModuleOps<TtBackend> for TtBackend {
         dilation: [usize; 2],
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("max_pool2d", false);
-        crate::unsupported::fail(
-            "max_pool2d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("kernel_size={:?}", kernel_size),
-                format!("stride={:?}", stride),
-                format!("padding={:?}", padding),
-                format!("dilation={:?}", dilation),
-                format!("ceil_mode={:?}", ceil_mode),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("max_pool2d", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            return crate::ops::cast_native(
+                crate::ops::module::max_pool2d(
+                    x,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    ceil_mode,
+                ),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::max_pool2d(x, kernel_size, stride, padding, dilation, ceil_mode)
     }
     fn max_pool2d_with_indices(
         x: FloatTensor<TtBackend>,
@@ -2074,18 +2359,28 @@ impl ModuleOps<TtBackend> for TtBackend {
         dilation: [usize; 2],
         ceil_mode: bool,
     ) -> MaxPool2dWithIndices<TtBackend> {
-        let _op = crate::report::enter("max_pool2d_with_indices", false);
-        crate::unsupported::fail(
-            "max_pool2d_with_indices",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("kernel_size={:?}", kernel_size),
-                format!("stride={:?}", stride),
-                format!("padding={:?}", padding),
-                format!("dilation={:?}", dilation),
-                format!("ceil_mode={:?}", ceil_mode),
-            ]
-            .join("; "),
+        let _op = crate::report::enter("max_pool2d_with_indices", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let mut output = crate::ops::module::max_pool2d_with_indices(
+                x,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                ceil_mode,
+            );
+            output.output = crate::ops::cast_native(output.output, compute_dtype);
+            return output;
+        }
+        crate::ops::module::max_pool2d_with_indices(
+            x,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            ceil_mode,
         )
     }
     fn max_pool2d_with_indices_backward(
@@ -2098,20 +2393,33 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> MaxPool2dBackward<TtBackend> {
-        let _op = crate::report::enter("max_pool2d_with_indices_backward", false);
-        crate::unsupported::fail(
-            "max_pool2d_with_indices_backward",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("kernel_size={:?}", kernel_size),
-                format!("stride={:?}", stride),
-                format!("padding={:?}", padding),
-                format!("dilation={:?}", dilation),
-                format!("ceil_mode={:?}", ceil_mode),
-                format!("output_grad={}", crate::unsupported::context(&output_grad)),
-                format!("indices={}", crate::unsupported::context(&indices)),
-            ]
-            .join("; "),
+        let _op = crate::report::enter("max_pool2d_with_indices_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            let mut output = crate::ops::module::max_pool2d_with_indices_backward(
+                x,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                ceil_mode,
+                output_grad,
+                indices,
+            );
+            output.x_grad = crate::ops::cast_native(output.x_grad, compute_dtype);
+            return output;
+        }
+        crate::ops::module::max_pool2d_with_indices_backward(
+            x,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            ceil_mode,
+            output_grad,
+            indices,
         )
     }
     fn interpolate(
@@ -2212,10 +2520,23 @@ impl ActivationOps<TtBackend> for TtBackend {
         negative_slope: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("leaky_relu", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::leaky_relu(tensor, negative_slope),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::leaky_relu(tensor, negative_slope)
     }
     fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("relu", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::activation::relu(tensor), compute_dtype);
+        }
         crate::ops::activation::relu(tensor)
     }
     fn relu_backward(
@@ -2223,10 +2544,24 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("relu_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let output = crate::ops::float_compute_input(output);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::activation::relu_backward(output, grad),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::relu_backward(output, grad)
     }
     fn gelu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("gelu", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::activation::gelu(tensor), compute_dtype);
+        }
         crate::ops::activation::gelu(tensor)
     }
     fn prelu(
@@ -2234,6 +2569,15 @@ impl ActivationOps<TtBackend> for TtBackend {
         alpha: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("prelu", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &alpha]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let alpha = crate::ops::float_compute_input(alpha);
+            return crate::ops::cast_native(
+                crate::ops::activation::prelu(tensor, alpha),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::prelu(tensor, alpha)
     }
     fn gelu_backward(
@@ -2241,10 +2585,24 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("gelu_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::activation::gelu_backward(x, grad),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::gelu_backward(x, grad)
     }
     fn sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("sigmoid", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(crate::ops::activation::sigmoid(tensor), compute_dtype);
+        }
         crate::ops::activation::sigmoid(tensor)
     }
     fn sigmoid_backward(
@@ -2252,6 +2610,15 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("sigmoid_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let output = crate::ops::float_compute_input(output);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::activation::sigmoid_backward(output, grad),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::sigmoid_backward(output, grad)
     }
     fn hard_sigmoid(
@@ -2260,22 +2627,62 @@ impl ActivationOps<TtBackend> for TtBackend {
         beta: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("hard_sigmoid", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::hard_sigmoid(tensor, alpha, beta),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::hard_sigmoid(tensor, alpha, beta)
     }
     fn log_sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_sigmoid", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::log_sigmoid(tensor),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::log_sigmoid(tensor)
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("softmax", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::softmax(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::softmax(tensor, dim)
     }
     fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_softmax", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::log_softmax(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::log_softmax(tensor, dim)
     }
     fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("softmin", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::activation::softmin(tensor, dim),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::softmin(tensor, dim)
     }
     fn log_sigmoid_backward(
@@ -2283,6 +2690,15 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_sigmoid_backward", true);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::activation::log_sigmoid_backward(x, grad),
+                compute_dtype,
+            );
+        }
         crate::ops::activation::log_sigmoid_backward(x, grad)
     }
 }

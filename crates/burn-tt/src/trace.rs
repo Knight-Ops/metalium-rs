@@ -81,11 +81,11 @@ impl Trace {
         let mut guard = Capturing { device, open: true };
         let out = f();
         let output = match out.dram() {
-            Some(d) if !d.transposed && out.device == device => {
+            Some(d) if !d.transposed && out.device == device && out.is_stored_f32() => {
                 Ok((d.buffer.id, [d.buffer.rows, d.buffer.cols]))
             }
             _ => Err(EngineError(
-                "a trace's output must be computed on its device, untransposed".into(),
+                "a trace's output must be F32, computed on its device, untransposed".into(),
             )),
         };
         guard.open = false;

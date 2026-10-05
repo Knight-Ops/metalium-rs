@@ -691,6 +691,7 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
                             .is_some_and(|ch| ch.permits(endpoint(writer), action)) => {}
                     Entry::Buffer { .. } => return Err(dm::error::OP),
                     Entry::Move { descriptor, .. } if writer && descriptor.op == op::WRITE => {}
+                    Entry::CheckFlags { .. } if writer => {}
                     _ if writer => return Err(dm::error::OP),
                     _ => {}
                 }

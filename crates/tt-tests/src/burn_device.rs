@@ -178,6 +178,48 @@ fn attach_engine(
         buffers: burn_tt::DramBuffers,
     }
     impl Engine for Sim<'_> {
+        fn pool_bf16(
+            &mut self,
+            a: burn_tt::BufferId,
+            windows: &[Vec<[usize; 2]>],
+            divisors: &[usize],
+            dims: [usize; 2],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .pool_bf16(&mut self.session, a, windows, divisors, dims)
+        }
+        fn matmul_bf16(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.matmul_bf16(
+                &mut self.session,
+                a,
+                b,
+                self.config.fidelity,
+                self.config.budget,
+            )
+        }
+        fn upload_bf16(
+            &mut self,
+            bits: &[u16],
+            rows: usize,
+            cols: usize,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers
+                .upload_bf16(&mut self.session, bits, rows, cols)
+        }
+        fn download_bf16(&mut self, id: burn_tt::BufferId) -> Result<Vec<u16>, EngineError> {
+            self.buffers.download_bf16(&mut self.session, id)
+        }
+        fn cast_float(
+            &mut self,
+            id: burn_tt::BufferId,
+            bf16: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.cast_float(&mut self.session, id, bf16)
+        }
         fn supports_dram(&self) -> bool {
             true
         }
@@ -188,6 +230,14 @@ fn attach_engine(
             c: usize,
         ) -> Result<burn_tt::BufferId, EngineError> {
             self.buffers.upload(&mut self.session, v, r, c)
+        }
+        fn metadata(
+            &mut self,
+            bits: &[u32],
+            dims: [usize; 2],
+            elem: burn_tt::Elem,
+        ) -> Result<burn_tt::BufferId, EngineError> {
+            self.buffers.metadata(&mut self.session, bits, dims, elem)
         }
         fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
             self.buffers.download(&mut self.session, id)
@@ -264,6 +314,13 @@ fn attach_engine(
             axis: tt_kernels::sfpu::reduce::Axis,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.reduce(&mut self.session, a, op, axis)
+        }
+        fn scan(
+            &mut self,
+            a: burn_tt::BufferId,
+            op: tt_kernels::sfpu::scan::ScanOp,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.scan(&mut self.session, a, op)
         }
         fn slice_rows(
             &mut self,

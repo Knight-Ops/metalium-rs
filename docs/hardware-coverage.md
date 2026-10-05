@@ -1,5 +1,15 @@
 # Hardware coverage — Phase 10 tracker
 
+Current Tensix continuation status (2026-10-05): see
+[tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
+for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
+extremum scans, hardware precision modes, accuracy results and remaining work.
+Checked integer division/remainder is disabled after a failing simulator gate.
+Ordinary validation uses one card; both cards are reserved for actual mesh tests
+or device-specific investigations per the user's instruction. Historical two-card
+requirements below are superseded for ordinary validation.
+
+
 > Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
 > explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
 > below are superseded by [the current backend contract](../crates/burn-tt/README.md)
@@ -23,7 +33,7 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-04, 10.3 in progress)
+## Where things stand (2026-10-05, 10.3–10.5 in progress)
 
 Milestones 10.0–10.2 are complete. Since their close-out, rank-N storage and
 strided views, tile-aligned batched matmul, last-dimension reductions and some
@@ -65,16 +75,70 @@ changed backend, kernels and reduction/model tests. Generated delegation and
 the no-simulator-in-shipping-crates checks pass.
 
 Full reductions do not complete 10.3. R1c arbitrary axes/layouts and P2 K
-blocking now have simulator implementations (below), with both-card silicon
-validation pending. Other reduction kinds, Tensix transpose and norms remain open.
+blocking pass simulator and both-card gates (below). Product/Boolean reductions,
+scans and norm compositions are also gated. Tensix tensor transpose remains open.
 
-**Next for model coverage:** validate R1c/P2 on both cards, finish R1's other
-reduction kinds, complete D4 slicing/indexing, finish M3/R3 layout and norms,
-then 10.4 formats/casts and
-10.5 convolution/pooling/attention. Backend error/setup/conformance work is
+**Next for model coverage:** optimize BF16 packed gathers/continuations, broaden
+BF16 conformance and validate model accuracy; finish D4 indexing and M3 tensor
+transpose, then convolution/attention and remaining integer operations.
+Backend error/setup/conformance work is
 tracked separately as B1/B2/B10. X280 dispatch remains proposed and unscheduled.
 
-### R1c / P2 implementation (2026-10-04; silicon pending)
+### Reduction and ALU extensions (2026-10-04; both-card validated)
+
+`step69_reduction_primitives` adds direct F32 product, typed Boolean AND/OR
+reductions, rank-N argmax/argmin repacking, and inclusive F32 sum/product scans.
+Product masks padding to one and carries an unfolded accumulator through long
+axes before a single fold; full products reduce logical axes in descending order.
+Scans traverse logical indices in order and reload the preceding tile's last
+prefix only after NC release. Native flip/stepped slicing supports scan backward.
+`step70_native_norms` validates Burn's existing LayerNorm and RMSNorm compositions,
+including wide/ragged inputs, permuted rank-four views, affine parameters and
+analytic input/parameter gradients. No fused norm kernel is added.
+
+`step71_integer_alu` covers wrapping I32 add/sub/mul, tensor/scalar bitwise ops,
+signed comparisons and modulo-32 shifts (right shift arithmetic). Multiplication
+reconstructs full low-32-bit products from 16-bit limbs and both SFPMUL24 halves;
+its 23-bit result alone is insufficient. `step72_round_cast` covers ties-even
+round/floor/ceil/trunc and saturating F32-to-I32 (NaN to zero). These use raw-bit
+SFPU programs, not SFPSTOCHRND's bounded sign-magnitude modes. Existing I32-to-F32
+conversion is preserved. `step73_fpu_transpose` gates the typed, non-flipping
+TRNSPSRCB helper on TF32 Src data against a permutation oracle and its inverse.
+Its encoding retains Wormhole provenance; tensor integration is not enabled.
+
+All new gates belong to SMOKE. Wrong product padding, omitted scan carry,
+incorrect multiplication high bits and wrong rounding mode were each watched
+failing. `step67`–`step73` pass both cards: 58/58, run `1791145571`.
+BF16 transpose integration remains open. See [the implementation record](tensix-next-features.md).
+
+### BF16 and pooling (2026-10-05)
+
+`step74`–`step78` pass both cards (24/24, final run `1791160155`). Raw BF16 storage,
+views and repacking use two-byte datums and 2112-byte slots, preserving payloads.
+Native conversion rounds ties-even, quiets NaNs and flushes BF16 subnormals to
+signed zero. Narrowing is silicon-only because ttsim refuses late pack mode
+`0x105`; widening uses SrcA/MOVA2D. Packed rank-two matmul accumulates in F32,
+with local ragged masking that preserves the parent's bits. Native Burn adapters
+widen other operations to F32 and narrow once per operation boundary. Gates cover
+normalization derivatives, mixed F32-loss/BF16-parameter SGD and trace replay.
+
+Measured GMPOOL/GAPOOL encodings keep AddrMod at bit 15 and require bit 19.
+Block max/sum/mean kernels retain banks through their phases and release once.
+General BF16 mean/adaptive pooling stages 16-lane GAPOOL chunks with F32
+continuation and explicit divisors. F32 mean uses SFPU; general max uses SFPU
+argmax plus raw-bit OR selection to preserve zeros/NaN payloads and agree with
+the backward index. Indices and overlap backwards stay resident.
+All-padding windows fail explicitly. Geometry
+constants now use replayable metadata descriptors, enabling pooling trace capture. A matmul-then-window-pool gate
+was observed failing with stale unpacker ADCs; both unpackers are now reset explicitly.
+
+`tt-mnist --bf16` opts into single-card BF16 storage, with F32 accumulation/loss
+and F32 trace boundaries. No speedup is claimed: run `1791158550` measures the
+two forward GEMMs at approximately 662/81 us (BF16) versus 94/18 us (TF32).
+Packed continuation/batched products, actual two-card BF16 mesh execution and
+full model accuracy are now gated; see the current implementation record. BF16 tensor transpose uses native bit copies, not TRNSPSRCB.
+
+### R1c / P2 implementation (2026-10-04; both-card validated)
 
 General F32 `sum_dim`, `mean_dim` and `max_dim` now accept every logical
 axis, including ragged rank-N reshape/swap/permute views. Existing matrix
@@ -104,8 +168,7 @@ trace replay and deferred operand frees; forced K blocks versus unsplit at
 all fidelities, TF32/BF16 Src routes, transposes and specials, `[64,8192] @
 [8192,64]`, supported batches and resident Burn large-K against a derived
 bound. Negative controls fail when axis mapping, edge masking or accumulator
-reload is omitted. Neither milestone is marked complete until both cards
-pass; no device nodes are available in this implementation environment.
+reload is omitted. Both cards passed in run `1791145571`.
 Release-silicon benchmark medians and validation remain unrun.
 
 ### 10.2 close-out (historical measurements)
@@ -146,19 +209,19 @@ Phases 0–9 built the path to the card. Compute currently uses these units:
 
 | Unit | What runs there today | Where |
 |---|---|---|
-| **Matrix Unit** | `MVMUL` only, for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), plus `ZEROACC` | `tt_kernels::matmul`, `role_t0..2` |
+| **Matrix Unit** | `MVMUL` for matmul (TF32/BF16 `Src`, `Lo`..`HiFi4`), `ZEROACC`, GMPOOL/GAPOOL block pooling and BF16 window averages | `tt_kernels::{matmul,fpu}`, `role_t0..2` |
 | **B / NC cores** | no arithmetic: B reads GDDR, transposes/broadcasts inputs and dispatches; NC writes GDDR and padding. Transfers and compute share ownership packets. Firmware image gates refuse F-extension instructions | `dm_b.rs`, `dm_nc.rs` |
 | **SFPU** | every element-wise op: `ADD`, `SUB`, `MUL`, `MUL_SCALAR`, `ADD_SCALAR`, `RELU`, `RELU_BACKWARD`, `ADD_ROW` (`tt_kernels::kind`) and `kind_sfpu`'s; the sum over rows in Flex's order (`sfpu::reduce::accumulate_in_order`) | `tt_kernels::sfpu::{ops, kernel, reduce}` |
 | **Unpackers / packer** | flat FP32 runs and the matmul's tile path; `UnpackToDst` for 128 datums | `tt_kernels::datapath`, `matmul` |
 
 The instruction table includes units not yet used by tensor kernels (`ELW*`,
-`GMPOOL`/`GAPOOL`, `TRNSPSRCB`). The SFPU builder covers the activation and
+`TRNSPSRCB`). The SFPU builder covers the activation and
 transcendental families, conditional execution, LUTs, lane movement, comparisons
 and Boolean logic. Remaining integer arithmetic, casts and PRNG are tracked below.
 
 Burn's device paths are listed in `OVERRIDDEN` (`xtask/src/gen_burn.rs`) and the
-coverage tables below. Unsupported operations still use Flex, with per-op
-reporting and strict-mode refusal of unintended downloads.
+coverage tables below. Unsupported operations fail explicitly. Flex is an external test oracle;
+there is no backend fallback or exact mode.
 
 **Milestones** (detail in "Work items"):
 
@@ -167,9 +230,9 @@ reporting and strict-mode refusal of unintended downloads.
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
-| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` rank-N storage/views and full F32 sum/mean; general axes/ragged layouts and long sum/max simulator-gated, silicon pending; other reductions, Tensix transpose and norms open |
-| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[ ]` |
-| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[ ]` |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` general F32 reductions/scans and norm compositions pass both cards; pooling implemented; Tensix tensor transpose remains open |
+| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; integer division/remainder and tensor transpose remain open |
+| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native NCHW pooling/backwards; convolution and attention open |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
@@ -199,7 +262,7 @@ it, and a line that does not apply says why in the item.
    watched failing at least once (an empty kernel, a wrong constant, a swapped operand).
 4. **A silicon gate**, the same test on both cards through `cargo xtask silicon`.
 5. **Burn routing**: the method overridden in `burn-tt/src/ops.rs` and listed in
-   `OVERRIDDEN` (then `cargo xtask gen-burn-delegate`), agreeing with `burn-flex` bit for
+   `OVERRIDDEN` (then `cargo xtask gen-burn-ops` and its `--check` mode), agreeing with `burn-flex` bit for
    bit or within the item's derived bound; a residency check that the op downloads
    nothing (`tensor_traffic`, `TT_TRACE_FALLBACK=1` silent); and an entry in the silicon
    smoke tier (`xtask/src/silicon.rs`, `SMOKE`), where burn-tt is compared with
@@ -261,8 +324,8 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 | `ZEROACC`, `ZEROSRC` | x (`ZEROACC` measured) | | x | x | x | -- |
 | `MOVA2D`, `MOVB2D`, `MOVD2A`, `MOVD2B`, `MOVB2A` | x (measured) | `~` (`mova2d`, `movb2d`) | | x | x | F1 |
 | `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured) | | | `~` encoding only | `~` | M1 |
-| `GMPOOL`, `GAPOOL` | x | | | | | M2 |
-| `TRNSPSRCB` | x (WH) | | | | | M3 |
+| `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
+| `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | | x (TF32 Src) | pending | M3 |
 | `DOTPV`, `SHIFTXA`, `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 |
 
 ### Unpackers and packer
@@ -275,7 +338,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums, a datum sub-run of a tile (base moved) | `[x]` | -- |
 | `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
-| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[ ]` | D1 |
+| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[~]` BF16 native ties-even late narrowing, both-card `step74`; FP16 open | D1 |
 | Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
@@ -692,7 +755,7 @@ Each names the measurement it must move. The Burn-side ones are in
 - [~] **P2 K blocking** (concepts review G3): native FP32 Dst reload implemented
       for resident ordinary and supported batched matmuls (`step68`). Same
       accumulation order, no block-sum addition or packer L1 accumulation.
-      Simulator gates pass; both-card silicon and release benchmarks pending.
+      Simulator and both-card gates pass (`1791145571`); release benchmarks pending.
       Host-staged `matmul_chunked` retains its separate arithmetic contract.
 
 ### F — SFPU foundation (blocks every S item)
@@ -1103,10 +1166,13 @@ Each names the measurement it must move. The Burn-side ones are in
         `float_asin`, `float_acos`, with Burn's autodiff (`g/sqrt(1 - x^2)`);
         `step46` watched failing with `acos`'s `pi - 2v` dropped. Cost per
         tile (row AL): `atan` 15.0 us, `asin` 17.8, `acos` 17.0, `tan` 28.0.
-- [ ] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
+- [~] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
-- [ ] **S6 Casts and rounding.** `SFPCAST` int ↔ float (never `SFPCAST_IntAbs`: Tier 2,
+- [~] **S6 Casts and rounding.** Deterministic F32 rounding and saturating
+      I32 conversion are simulator-gated by `step72`; I32-to-F32 already runs
+      natively. Hardware SFPSTOCHRND modes and reduced storage remain open.
+      Historical intended instruction coverage: `SFPCAST` int ↔ float (never `SFPCAST_IntAbs`: Tier 2,
       use `SFPABS`); `SFPSTOCHRND` FP32 → BF16/FP16 in round-to-nearest and stochastic
       modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
       `float_cast`, `float_into_int`, `int_into_float`, `float_round`, `float_floor`,
@@ -1145,9 +1211,11 @@ Each names the measurement it must move. The Burn-side ones are in
 - [ ] **M1 `ELWADD`/`ELWSUB`/`ELWMUL`** with `Src` row, column and scalar broadcast: binary
       element-wise at matrix-unit throughput, at TF32/BF16 `Src` precision. Opt-in, like
       `Fidelity`; never a silent replacement for the FP32 SFPU path.
-- [ ] **M2 `GMPOOL`/`GAPOOL`.** Max and average over rows. Burn: `float_max_dim`,
-      `float_mean_dim`, `max_pool2d`, `avg_pool2d`, `adaptive_avg_pool2d` (with D6's
-      windowing).
+- [~] **M2 `GMPOOL`/`GAPOOL`.** Block max/sum/mean kernels gated on simulator and
+      both cards (`step75`). BF16 NCHW average/adaptive pooling uses GAPOOL;
+      F32/general max retains SFPU semantics, including resident indices and
+      overlapping backwards (`step78`). General GMPOOL routing and performance
+      remain open. Pooling traces currently refuse metadata uploads.
 - [ ] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain open; `float_permute` now creates native strided views
@@ -1190,9 +1258,10 @@ Each names the measurement it must move. The Burn-side ones are in
       minima inherit gather's axis and signed-zero limitations, and flattened
       full maxima retain reshape/layout and reduction-size limits.
       R1c adds all F32 axes and ragged view repacking, plus long column
-      sums and maxima over either axis (`step67`; silicon pending).
-      Remaining: `prod`, native Boolean `any`/`all`, broader arg-reductions,
-      product reductions and `cum*`. Full maxima compose native reshape and
+      sums and maxima over either axis (`step67`; both-card validated).
+      Simulator and both-card gates (`step69`) cover direct product, native Boolean
+      `any`/`all`, rank-N arg-reductions and inclusive cumsum/cumprod.
+      Remaining: both-card validation and cumulative min/max. Full maxima compose native reshape and
       max reductions; minimum defaults retain their gather limitations.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
@@ -1228,14 +1297,24 @@ Each names the measurement it must move. The Burn-side ones are in
       subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
       per-step logits download goes away as a consequence, not as the goal. Burn:
       `softmax`, `log_softmax`, `softmin`.
-- [ ] **R3 Norms.** `ModuleOps::layer_norm`, RMS norm as a composite, and their backwards.
+- [~] **R3 Norms.** Burn LayerNorm and RMSNorm already compose native primitives.
+      Dedicated forward/backward, layout and residency gates are in `step70`;
+      both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
+      Performance measurements remain open. Fusion is deferred.
 - [ ] **R4 `ModuleOps::attention`.** Matmul, scale, mask, softmax, matmul -- after R2 and
       the fusion work in Phase 9.
 
 ### D — Formats and data movement
 
-- [ ] **D1 BF16 tensors in GDDR.** Packer FP32 → BF16, unpacker BF16 → `Src` and `Dst`;
-      half the bytes for every op. `DramTensor` grows a format.
+- [~] **D1 BF16 tensors in GDDR.** Separate `Bf16Tensor`/2112-byte physical slots,
+      raw transfers/views/repack, native ties-even pack and SrcA/MOVA2D widening,
+      packed rank-two MMA and native Burn compute adapters. `step74`, `step76`,
+      `step77` pass both cards; narrowing is silicon-only (ttsim mode `0x105`
+      refusal). BF16 operands use half the bytes; most arithmetic still widens
+      to F32. Compact packed gathers, K continuations, batched/view products,
+      actual two-card mesh execution and full MNIST accuracy are now gated.
+      Mesh transport still widens to F32. Measured MNIST GEMMs are slower, not accelerated
+      relative to TF32.
 - [ ] **D2 Block float (BFP8/BFP4).** Measure the codes as divergence rows G and H did,
       then exponent sharing and `CLREXPHIST`. Prerequisite for `QTensorOps` on the device.
 - [x] **D3 Integer and bool storage** (10.2b; was INT32, INT8, bool as a format).
@@ -1324,36 +1403,37 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
 | `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
-| `float_sum_dim` | all F32 axes/layouts on SFPU; R1c silicon pending | R1 |
+| `float_sum_dim` | all F32 axes/layouts on SFPU; both-card validated; BF16 via native adapters | R1 |
 | `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
-| `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs, including in exact mode; unsupported inputs fail | R1b |
-| `float_slice` | `~` whole tile rows | D4 |
+| `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs,  unsupported inputs fail | R1b |
+| `float_slice`, `float_flip` | x nonempty resident F32/BF16, arbitrary steps/axes via bit-preserving copies; both-card validated | D4 |
 | `float_transpose`, `float_swap_dims`, `float_permute` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
-| `float_cast` | `~` to the tensor's own dtype (a no-op); others S6 | S6 |
+| `float_cast` | x same dtype or native F32↔BF16; other reduced floats refused | D1, S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
 | `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
-| `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_cast`, `float_into_int` | | S6 |
+| `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
 | `float_random` | | S7 |
-| `float_max_dim` | all F32 axes/layouts on SFPU; R1c silicon pending | R1 |
-| `float_argmax`, `float_argmin` | `~` rank-one/two F32, I32 output, first tie/NaN, axis up to 2^23 | R1 |
+| `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
+| `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
 | `float_max`, `float_max_abs*` | `~` Burn defaults over reshape/abs/max_dim; existing layout and size limits | R1 |
 | `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
-| `float_prod{,_dim}` | | R1 |
-| `float_cumsum`, `float_cumprod`, `float_cummin`, `float_cummax` | | R1 |
+| `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
+| `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
+| `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add` | `~` last dim, one index per row (SFPU; gather's `-0` returned `+0`) | D4 |
 | `float_select`, `float_select_add` | `~` dim 0 (mover rows; `select_add` in Flex's order) | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
-| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_flip`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
+| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
 | `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
 
 ### `ActivationOps`
@@ -1374,8 +1454,8 @@ path today, `~` when only some shapes do.
 | `linear` and its three backwards | `~` over `float_matmul`; a rank-N input folds its batch into the rows (forward, `x` grad), `linear_{weight,bias}_backward` hand-written likewise | B6 |
 | `embedding{,_backward}` | x (Burn's default over `select`/`select_add`, on the mover) | D4 |
 | `conv1d`, `conv2d`, `conv_transpose*`, their backwards, `unfold4d` | | D6 |
-| `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | | M2 + D6 |
-| `layer_norm` | | R3 |
+| `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | x NCHW 2-D and Burn's 1-D compositions; all-padding windows refused; BF16 averages use GAPOOL | M2 |
+| `layer_norm` | x Burn composition over native primitives; F32 and BF16 numerical/gradient gates | R3 |
 | `attention` | | R4 |
 | `conv3d`, `deform_conv2d`, `interpolate`, `ctc_loss`, `rfft`/`irfft` | | not planned until a model needs them |
 
@@ -1385,12 +1465,14 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | storage on the device | x `I32`, `Bool` (any store); other int dtypes host | D3 |
 | `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
-| `int_{add,sub,mul,div,remainder}{,_scalar}`, `int_neg`, `int_abs`, comparisons, `bitwise_*` | | S5 |
+| `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*` | x I32 full-width wrapping ALU, signed comparisons, masked shifts; both-card validated | S5 |
+| `int_{div,remainder}{,_scalar}`, `int_neg`, `int_abs` | | S5 |
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
 | `int_cast` | | S6 |
 | `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
+| `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
 | `bool_mask_*` | | S5 |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
 | `QTensorOps` | | D2 (stays Flex's until then) |

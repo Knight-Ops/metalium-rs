@@ -23,6 +23,7 @@
 //!   hardware's bugs and must be matched rather than fixed.
 
 pub mod sfpu;
+pub mod stochastic;
 
 /// `x * y + z` as Blackhole computes it, on FP32 bit patterns.
 ///

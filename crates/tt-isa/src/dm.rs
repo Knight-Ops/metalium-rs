@@ -175,6 +175,15 @@ pub mod op {
     /// count, src_stride, dst_stride, 0, 0]. Strides are in bytes. B waits
     /// for preceding reads before copying; this performs no arithmetic.
     pub const COPY_WORDS: u32 = 0x45;
+    /// Copy aligned 16-bit datums in the data arena, with byte strides.
+    /// Same descriptor as COPY_WORDS. Used for bit-preserving BF16 views.
+    pub const COPY_HALFWORDS: u32 = 0x46;
+    /// BF16 tile padding fill, same descriptor/region convention as FILL.
+    pub const FILL_HALFWORDS: u32 = 0x47;
+    /// Validate a packed tile of canonical device status flags before NC
+    /// writes a result: `[CHECK_FLAGS, slot, rows, cols, 0, ...]`.
+    /// Only valid logical lanes are checked; zero reports DOMAIN.
+    pub const CHECK_FLAGS: u32 = 0x48;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
@@ -365,10 +374,13 @@ impl Mover {
     pub const fn permits(self, op: u32) -> bool {
         match self.core {
             crate::tensix::Core::B => {
-                op != op::WRITE && !matches!(record::direction(op), Some(record::Direction::Write))
+                op != op::WRITE
+                    && op != op::CHECK_FLAGS
+                    && !matches!(record::direction(op), Some(record::Direction::Write))
             }
             _ => {
                 op == op::WRITE
+                    || op == op::CHECK_FLAGS
                     || op == op::WAIT
                     || op == op::CB
                     || matches!(record::direction(op), Some(record::Direction::Write))
@@ -466,6 +478,8 @@ pub mod nc {
 /// wherever it sits, and any slot may be copied to any other under the C64
 /// read rule (divergence row 64).
 pub const TILE_SLOT: u64 = 4160;
+/// BF16's 1024 two-byte datums plus header, rounded to 64-byte slot alignment.
+pub const BF16_TILE_SLOT: u64 = 2112;
 /// Where a tile's datums start within its slot.
 pub const TILE_DATA: u64 = 16;
 const _: () = assert!(TILE_SLOT % crate::dram::ALIGN == 0);
@@ -498,6 +512,7 @@ pub enum Entry {
         count: u32,
         src_stride: u32,
         dst_stride: u32,
+        halfwords: bool,
     },
     Released {
         target: u16,
@@ -523,6 +538,7 @@ pub enum Entry {
         /// The valid region ([`fill::param`]).
         param: u32,
         dst: u32,
+        halfwords: bool,
     },
     /// [`op::KERNEL`]: point each role at its program, if named, post
     /// `generation`, and wait for it.
@@ -545,6 +561,8 @@ pub enum Entry {
     },
     /// [`op::POKE`]: one role-mailbox word.
     Poke { address: u32, value: u32 },
+    /// Device-generated domain flags, checked by the writer before scatter.
+    CheckFlags { slot: u32, rows: u32, cols: u32 },
     /// [`op::LAUNCH`]: [`Entry::Kernel`] without the wait.
     Launch {
         generation: u32,
@@ -576,6 +594,22 @@ impl Entry {
     /// Decode entry words against the `usable` mask. A transposed read must be
     /// exactly one slot into a 16-aligned L1 slot inside L1.
     pub fn decode(usable: u32, w: [u32; 8]) -> Result<Self, u32> {
+        if w[0] == op::CHECK_FLAGS {
+            let (slot, rows, cols) = (w[1], w[2], w[3]);
+            if !(1..=32).contains(&rows)
+                || !(1..=32).contains(&cols)
+                || w[4..].iter().any(|&v| v != 0)
+            {
+                return Err(error::OP);
+            }
+            if slot % 16 != 0
+                || (slot as u64) < crate::l1::DATA.base
+                || slot as u64 + TILE_SLOT > crate::l1::DATA.end
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::CheckFlags { slot, rows, cols });
+        }
         // The hot path first: a plain read or write is most of every list
         // (`silicon_perf::mover_read_shapes` times it per entry).
         if w[0] == op::READ || w[0] == op::WRITE {
@@ -586,14 +620,15 @@ impl Entry {
                 },
             );
         }
-        if w[0] == op::COPY_WORDS {
+        if matches!(w[0], op::COPY_WORDS | op::COPY_HALFWORDS) {
             if w[3] == 0 || w[3] > 1024 || w[6] != 0 || w[7] != 0 {
                 return Err(error::LENGTH);
             }
+            let width = if w[0] == op::COPY_HALFWORDS { 2 } else { 4 };
             for (at, stride) in [(w[1], w[4]), (w[2], w[5])] {
-                let end = at as u64 + (w[3] - 1) as u64 * stride as u64 + 4;
-                if at % 4 != 0
-                    || stride % 4 != 0
+                let end = at as u64 + (w[3] - 1) as u64 * stride as u64 + width as u64;
+                if at % width != 0
+                    || stride % width != 0
                     || (at as u64) < crate::l1::DATA.base
                     || end > crate::l1::DATA.end
                 {
@@ -606,6 +641,7 @@ impl Entry {
                 count: w[3],
                 src_stride: w[4],
                 dst_stride: w[5],
+                halfwords: width == 2,
             });
         }
         if w[0] == op::RELEASED {
@@ -817,8 +853,16 @@ impl Entry {
                 valid,
             });
         }
-        if w[0] == op::FILL {
-            let slot = |at: u32| at % 16 == 0 && at as u64 + TILE_SLOT <= crate::tensix::L1_SIZE;
+        if matches!(w[0], op::FILL | op::FILL_HALFWORDS) {
+            if w[0] == op::FILL_HALFWORDS && w[1] > u16::MAX as u32 {
+                return Err(error::OP);
+            }
+            let bytes = if w[0] == op::FILL_HALFWORDS {
+                BF16_TILE_SLOT
+            } else {
+                TILE_SLOT
+            };
+            let slot = |at: u32| at % 16 == 0 && at as u64 + bytes <= crate::tensix::L1_SIZE;
             if !slot(w[3]) {
                 return Err(error::ALIGNMENT);
             }
@@ -831,6 +875,7 @@ impl Entry {
                 value: w[1],
                 param: w[2],
                 dst: w[3],
+                halfwords: w[0] == op::FILL_HALFWORDS,
             });
         }
         Descriptor::decode(usable, w[0], w[1], w[2], w[3], w[4], w[5]).map(|descriptor| {
@@ -868,6 +913,8 @@ pub mod error {
     /// An entry or record the mover's direction does not run: a GDDR write on
     /// RISCV B, which only reads (`Mover::permits`).
     pub const DIRECTION: u32 = 10;
+    /// A native arithmetic operation rejected a logical input (division by zero).
+    pub const DOMAIN: u32 = 11;
 }
 
 /// A descriptor, as both sides see it.
@@ -1216,9 +1263,53 @@ mod tests {
             Ok(Entry::Fill {
                 value: 0xff80_0000,
                 param: fill::param(5, 32),
-                dst: 0x2_0000
+                dst: 0x2_0000,
+                halfwords: false
             })
         );
+        let half = [
+            op::FILL_HALFWORDS,
+            0x7fc1,
+            fill::param(3, 7),
+            0x2_0000,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert!(matches!(
+            Entry::decode(ALL, half),
+            Ok(Entry::Fill {
+                halfwords: true,
+                ..
+            })
+        ));
+        let mut bad_half = half;
+        bad_half[1] = 0x1_0000;
+        assert!(Entry::decode(ALL, bad_half).is_err());
+        let mut end_half = half;
+        end_half[3] = (crate::tensix::L1_SIZE - BF16_TILE_SLOT) as u32;
+        assert!(Entry::decode(ALL, end_half).is_ok());
+        end_half[3] += 16;
+        assert!(Entry::decode(ALL, end_half).is_err());
+        let copy_half = [op::COPY_HALFWORDS, 0x2_0012, 0x2_1052, 1024, 0, 2, 0, 0];
+        assert!(matches!(
+            Entry::decode(ALL, copy_half),
+            Ok(Entry::CopyWords {
+                halfwords: true,
+                ..
+            })
+        ));
+        for opcode in [op::COPY_HALFWORDS, op::FILL_HALFWORDS] {
+            assert!(Mover::B.permits(opcode));
+            assert!(!Mover::NC.permits(opcode));
+        }
+        let mut bad_half = copy_half;
+        bad_half[1] += 1;
+        assert!(Entry::decode(ALL, bad_half).is_err());
+        let mut bad_half = copy_half;
+        bad_half[2] = crate::l1::DATA.end as u32 - 2;
+        assert!(Entry::decode(ALL, bad_half).is_err());
         let mut bad = fill;
         bad[2] = 0x2000;
         assert_eq!(Entry::decode(ALL, bad), Err(error::OP), "a region past 32");

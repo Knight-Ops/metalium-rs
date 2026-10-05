@@ -4,13 +4,13 @@
 //! file matches the specification revision pinned in `PINS.toml`.
 //!
 //! Source: tt-isa-documentation `f848eb668c2aeae742a88a49a86157e24a0a20c6`,
-//! 161 instruction encodings and 19 datum layouts, each
+//! 163 instruction encodings and 19 datum layouts, each
 //! cross-checked against the `TT_*(…)` syntax block on the page that embeds
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 24 superseded on Blackhole, 63 Wormhole-only and therefore
-//! **`UNVERIFIED`**, 13 **`MEASURED`** against ttsim where the specification
+//! to be identical, 26 superseded on Blackhole, 61 Wormhole-only and therefore
+//! **`UNVERIFIED`**, 15 **`MEASURED`** against ttsim where the specification
 //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 3
 //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate
 //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).
@@ -732,24 +732,6 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/ZEROSRC.md",
     );
 
-    /// `GMPOOL`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static GMPOOL: InstructionDef = InstructionDef::new(
-        "GMPOOL",
-        "GMPOOL",
-        0x33,
-        &[
-            Field::new("FlipSrcB", 23, 1, false, None),
-            Field::new("FlipSrcA", 22, 1, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("ArgMax", 14, 1, false, None),
-            Field::new("DstRow", 0, 10, false, None),
-        ],
-        &[],
-        0x003e3c00,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md",
-    );
-
     /// `TRNSPSRCB`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/TRNSPSRCB.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
     pub static TRNSPSRCB: InstructionDef = InstructionDef::new(
         "TRNSPSRCB",
@@ -784,23 +766,6 @@ pub mod defs {
         0x00ffffff,
         Provenance::WormholeOnly,
         "WormholeB0/TensixTile/TensixCoprocessor/CLREXPHIST.md",
-    );
-
-    /// `GAPOOL`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static GAPOOL: InstructionDef = InstructionDef::new(
-        "GAPOOL",
-        "GAPOOL",
-        0x34,
-        &[
-            Field::new("FlipSrcB", 23, 1, false, None),
-            Field::new("FlipSrcA", 22, 1, false, None),
-            Field::new("AddrMod", 15, 2, false, None),
-            Field::new("DstRow", 0, 10, false, None),
-        ],
-        &[],
-        0x003e7c00,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md",
     );
 
     /// `CLEARDVALID`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/CLEARDVALID.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
@@ -2104,6 +2069,30 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md",
     );
 
+    /// `GMPOOL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static GMPOOL: InstructionDef = InstructionDef::new(
+        "GMPOOL_BH",
+        "GMPOOL",
+        0x33,
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddrMod", 15, 2, false, None), Field::new("ArgMax", 14, 1, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[(Field::new("", 19, 1, false, None), 1)],
+        0x00363c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks", moved: &[], dropped: &[], widened: &[] },
+        "WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md",
+    );
+
+    /// `GAPOOL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static GAPOOL: InstructionDef = InstructionDef::new(
+        "GAPOOL_BH",
+        "GAPOOL",
+        0x34,
+        &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddrMod", 15, 2, false, None), Field::new("DstRow", 0, 10, false, None)],
+        &[(Field::new("", 19, 1, false, None), 1)],
+        0x00367c00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks", moved: &[], dropped: &[], widened: &[] },
+        "WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md",
+    );
+
     /// `MVMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MVMUL: InstructionDef = InstructionDef::new(
         "MVMUL_BH",
@@ -2485,6 +2474,24 @@ pub mod defs {
             "WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md",
         );
 
+        /// `GMPOOL`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md`. Blackhole replaces it with `GMPOOL_BH`; use that instead.
+        pub static GMPOOL: InstructionDef = InstructionDef::new(
+            "GMPOOL",
+            "GMPOOL",
+            0x33,
+            &[
+                Field::new("FlipSrcB", 23, 1, false, None),
+                Field::new("FlipSrcA", 22, 1, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("ArgMax", 14, 1, false, None),
+                Field::new("DstRow", 0, 10, false, None),
+            ],
+            &[],
+            0x003e3c00,
+            Provenance::SupersededOnBlackhole { by: "GMPOOL_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md",
+        );
+
         /// `ZEROACC`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md`. Blackhole replaces it with `ZEROACC_BH`; use that instead.
         pub static ZEROACC: InstructionDef = InstructionDef::new(
             "ZEROACC",
@@ -2552,6 +2559,23 @@ pub mod defs {
             0x003e7c00,
             Provenance::SupersededOnBlackhole { by: "DOTPV_BH" },
             "WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md",
+        );
+
+        /// `GAPOOL`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md`. Blackhole replaces it with `GAPOOL_BH`; use that instead.
+        pub static GAPOOL: InstructionDef = InstructionDef::new(
+            "GAPOOL",
+            "GAPOOL",
+            0x34,
+            &[
+                Field::new("FlipSrcB", 23, 1, false, None),
+                Field::new("FlipSrcA", 22, 1, false, None),
+                Field::new("AddrMod", 15, 2, false, None),
+                Field::new("DstRow", 0, 10, false, None),
+            ],
+            &[],
+            0x003e7c00,
+            Provenance::SupersededOnBlackhole { by: "GAPOOL_BH" },
+            "WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md",
         );
 
         /// `SFPLOAD`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/SFPLOAD.md`. Blackhole replaces it with `SFPLOAD_BH`; use that instead.
@@ -2748,7 +2772,7 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::wormhole::ELWMUL,
     &defs::wormhole::ELWADD,
     &defs::wormhole::ELWSUB,
-    &defs::GMPOOL,
+    &defs::wormhole::GMPOOL,
     &defs::wormhole::ZEROACC,
     &defs::TRNSPSRCB,
     &defs::SHIFTXA,
@@ -2756,7 +2780,7 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::CLREXPHIST,
     &defs::wormhole::MVMUL,
     &defs::wormhole::DOTPV,
-    &defs::GAPOOL,
+    &defs::wormhole::GAPOOL,
     &defs::CLEARDVALID,
     &defs::SETRWC,
     &defs::INCRWC,
@@ -2844,6 +2868,8 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::UNPACR_NOP_Nop,
     &defs::UNPACR_NOP_SETREG,
     &defs::UNPACR_NOP_SETDVALID,
+    &defs::GMPOOL,
+    &defs::GAPOOL,
     &defs::MVMUL,
     &defs::MOVA2D,
     &defs::MOVB2D,
@@ -6248,111 +6274,6 @@ pub mod encode {
         }
     }
 
-    /// `GMPOOL`, built field by field.
-    ///
-    /// 5 operands is too many to pass positionally without inviting a
-    /// transposition, so each is named: `Gmpool::ZERO.flip_src_b(1).encode()`.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub struct Gmpool {
-        flip_src_b: u32,
-        flip_src_a: u32,
-        addr_mod: u32,
-        arg_max: u32,
-        dst_row: u32,
-    }
-
-    impl Gmpool {
-        /// Every operand zero. Fixed bits are added by [`Self::encode`].
-        pub const ZERO: Self = Gmpool {
-            flip_src_b: 0,
-            flip_src_a: 0,
-            addr_mod: 0,
-            arg_max: 0,
-            dst_row: 0,
-        };
-
-        pub const fn flip_src_b(mut self, value: u32) -> Self {
-            self.flip_src_b = value;
-            self
-        }
-
-        pub const fn flip_src_a(mut self, value: u32) -> Self {
-            self.flip_src_a = value;
-            self
-        }
-
-        pub const fn addr_mod(mut self, value: u32) -> Self {
-            self.addr_mod = value;
-            self
-        }
-
-        pub const fn arg_max(mut self, value: u32) -> Self {
-            self.arg_max = value;
-            self
-        }
-
-        pub const fn dst_row(mut self, value: u32) -> Self {
-            self.dst_row = value;
-            self
-        }
-
-        pub const fn encode(self) -> Result<Instruction, EncodeError> {
-            let def = &defs::GMPOOL;
-            let mut word = def.skeleton();
-            let f = def.fields()[0];
-            if !f.fits(self.flip_src_b) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.flip_src_b,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.flip_src_b);
-            let f = def.fields()[1];
-            if !f.fits(self.flip_src_a) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.flip_src_a,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.flip_src_a);
-            let f = def.fields()[2];
-            if !f.fits(self.addr_mod) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.addr_mod,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.addr_mod);
-            let f = def.fields()[3];
-            if !f.fits(self.arg_max) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.arg_max,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.arg_max);
-            let f = def.fields()[4];
-            if !f.fits(self.dst_row) {
-                return Err(EncodeError::FieldTooLarge {
-                    instruction: def.key(),
-                    field: f.name(),
-                    value: self.dst_row,
-                    width: f.width(),
-                });
-            }
-            word |= f.place(self.dst_row);
-            Ok(Instruction::new(word, def))
-        }
-    }
-
     /// `TRNSPSRCB`.
     pub const fn trnspsrcb() -> Result<Instruction, EncodeError> {
         let def = &defs::TRNSPSRCB;
@@ -6381,58 +6302,6 @@ pub mod encode {
     pub const fn clrexphist() -> Result<Instruction, EncodeError> {
         let def = &defs::CLREXPHIST;
         let word = def.skeleton();
-        Ok(Instruction::new(word, def))
-    }
-
-    /// `GAPOOL`.
-    pub const fn gapool(
-        flip_src_b: u32,
-        flip_src_a: u32,
-        addr_mod: u32,
-        dst_row: u32,
-    ) -> Result<Instruction, EncodeError> {
-        let def = &defs::GAPOOL;
-        let mut word = def.skeleton();
-        let f = def.fields()[0];
-        if !f.fits(flip_src_b) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: flip_src_b,
-                width: f.width(),
-            });
-        }
-        word |= f.place(flip_src_b);
-        let f = def.fields()[1];
-        if !f.fits(flip_src_a) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: flip_src_a,
-                width: f.width(),
-            });
-        }
-        word |= f.place(flip_src_a);
-        let f = def.fields()[2];
-        if !f.fits(addr_mod) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: addr_mod,
-                width: f.width(),
-            });
-        }
-        word |= f.place(addr_mod);
-        let f = def.fields()[3];
-        if !f.fits(dst_row) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: dst_row,
-                width: f.width(),
-            });
-        }
-        word |= f.place(dst_row);
         Ok(Instruction::new(word, def))
     }
 
@@ -10734,6 +10603,163 @@ pub mod encode {
         Ok(Instruction::new(word, def))
     }
 
+    /// `GMPOOL_BH`, built field by field.
+    ///
+    /// 5 operands is too many to pass positionally without inviting a
+    /// transposition, so each is named: `Gmpool::ZERO.flip_src_b(1).encode()`.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Gmpool {
+        flip_src_b: u32,
+        flip_src_a: u32,
+        addr_mod: u32,
+        arg_max: u32,
+        dst_row: u32,
+    }
+
+    impl Gmpool {
+        /// Every operand zero. Fixed bits are added by [`Self::encode`].
+        pub const ZERO: Self = Gmpool {
+            flip_src_b: 0,
+            flip_src_a: 0,
+            addr_mod: 0,
+            arg_max: 0,
+            dst_row: 0,
+        };
+
+        pub const fn flip_src_b(mut self, value: u32) -> Self {
+            self.flip_src_b = value;
+            self
+        }
+
+        pub const fn flip_src_a(mut self, value: u32) -> Self {
+            self.flip_src_a = value;
+            self
+        }
+
+        pub const fn addr_mod(mut self, value: u32) -> Self {
+            self.addr_mod = value;
+            self
+        }
+
+        pub const fn arg_max(mut self, value: u32) -> Self {
+            self.arg_max = value;
+            self
+        }
+
+        pub const fn dst_row(mut self, value: u32) -> Self {
+            self.dst_row = value;
+            self
+        }
+
+        pub const fn encode(self) -> Result<Instruction, EncodeError> {
+            let def = &defs::GMPOOL;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(self.flip_src_b) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.flip_src_b,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.flip_src_b);
+            let f = def.fields()[1];
+            if !f.fits(self.flip_src_a) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.flip_src_a,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.flip_src_a);
+            let f = def.fields()[2];
+            if !f.fits(self.addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.addr_mod);
+            let f = def.fields()[3];
+            if !f.fits(self.arg_max) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.arg_max,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.arg_max);
+            let f = def.fields()[4];
+            if !f.fits(self.dst_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: self.dst_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(self.dst_row);
+            Ok(Instruction::new(word, def))
+        }
+    }
+
+    /// `GAPOOL_BH`.
+    pub const fn gapool(
+        flip_src_b: u32,
+        flip_src_a: u32,
+        addr_mod: u32,
+        dst_row: u32,
+    ) -> Result<Instruction, EncodeError> {
+        let def = &defs::GAPOOL;
+        let mut word = def.skeleton();
+        let f = def.fields()[0];
+        if !f.fits(flip_src_b) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: flip_src_b,
+                width: f.width(),
+            });
+        }
+        word |= f.place(flip_src_b);
+        let f = def.fields()[1];
+        if !f.fits(flip_src_a) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: flip_src_a,
+                width: f.width(),
+            });
+        }
+        word |= f.place(flip_src_a);
+        let f = def.fields()[2];
+        if !f.fits(addr_mod) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: addr_mod,
+                width: f.width(),
+            });
+        }
+        word |= f.place(addr_mod);
+        let f = def.fields()[3];
+        if !f.fits(dst_row) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: dst_row,
+                width: f.width(),
+            });
+        }
+        word |= f.place(dst_row);
+        Ok(Instruction::new(word, def))
+    }
+
     /// `MVMUL_BH`, built field by field.
     ///
     /// 5 operands is too many to pass positionally without inviting a
@@ -13207,6 +13233,111 @@ pub mod encode {
             }
         }
 
+        /// `GMPOOL`, built field by field.
+        ///
+        /// 5 operands is too many to pass positionally without inviting a
+        /// transposition, so each is named: `Gmpool::ZERO.flip_src_b(1).encode()`.
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        pub struct Gmpool {
+            flip_src_b: u32,
+            flip_src_a: u32,
+            addr_mod: u32,
+            arg_max: u32,
+            dst_row: u32,
+        }
+
+        impl Gmpool {
+            /// Every operand zero. Fixed bits are added by [`Self::encode`].
+            pub const ZERO: Self = Gmpool {
+                flip_src_b: 0,
+                flip_src_a: 0,
+                addr_mod: 0,
+                arg_max: 0,
+                dst_row: 0,
+            };
+
+            pub const fn flip_src_b(mut self, value: u32) -> Self {
+                self.flip_src_b = value;
+                self
+            }
+
+            pub const fn flip_src_a(mut self, value: u32) -> Self {
+                self.flip_src_a = value;
+                self
+            }
+
+            pub const fn addr_mod(mut self, value: u32) -> Self {
+                self.addr_mod = value;
+                self
+            }
+
+            pub const fn arg_max(mut self, value: u32) -> Self {
+                self.arg_max = value;
+                self
+            }
+
+            pub const fn dst_row(mut self, value: u32) -> Self {
+                self.dst_row = value;
+                self
+            }
+
+            pub const fn encode(self) -> Result<Instruction, EncodeError> {
+                let def = &defs::wormhole::GMPOOL;
+                let mut word = def.skeleton();
+                let f = def.fields()[0];
+                if !f.fits(self.flip_src_b) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.flip_src_b,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.flip_src_b);
+                let f = def.fields()[1];
+                if !f.fits(self.flip_src_a) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.flip_src_a,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.flip_src_a);
+                let f = def.fields()[2];
+                if !f.fits(self.addr_mod) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.addr_mod,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.addr_mod);
+                let f = def.fields()[3];
+                if !f.fits(self.arg_max) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.arg_max,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.arg_max);
+                let f = def.fields()[4];
+                if !f.fits(self.dst_row) {
+                    return Err(EncodeError::FieldTooLarge {
+                        instruction: def.key(),
+                        field: f.name(),
+                        value: self.dst_row,
+                        width: f.width(),
+                    });
+                }
+                word |= f.place(self.dst_row);
+                Ok(Instruction::new(word, def))
+            }
+        }
+
         /// `ZEROACC`, built field by field.
         ///
         /// 5 operands is too many to pass positionally without inviting a
@@ -13466,6 +13597,58 @@ pub mod encode {
             dst_row: u32,
         ) -> Result<Instruction, EncodeError> {
             let def = &defs::wormhole::DOTPV;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(flip_src_b) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: flip_src_b,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(flip_src_b);
+            let f = def.fields()[1];
+            if !f.fits(flip_src_a) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: flip_src_a,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(flip_src_a);
+            let f = def.fields()[2];
+            if !f.fits(addr_mod) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: addr_mod,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(addr_mod);
+            let f = def.fields()[3];
+            if !f.fits(dst_row) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: dst_row,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(dst_row);
+            Ok(Instruction::new(word, def))
+        }
+
+        /// `GAPOOL`.
+        pub const fn gapool(
+            flip_src_b: u32,
+            flip_src_a: u32,
+            addr_mod: u32,
+            dst_row: u32,
+        ) -> Result<Instruction, EncodeError> {
+            let def = &defs::wormhole::GAPOOL;
             let mut word = def.skeleton();
             let f = def.fields()[0];
             if !f.fits(flip_src_b) {

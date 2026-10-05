@@ -1986,6 +1986,214 @@ impl<T: Transport> Session<T> {
         DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)
     }
 
+    /// Convert resident F32 data to physically packed BF16 using ties-even.
+    /// NaNs are quieted; BF16 subnormals become signed zero.
+    pub fn bf16_from_f32(
+        &mut self,
+        input: &DramTensor,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) = crate::bf16::compress(&mut self.dram_state()?.alloc, input)?;
+        if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
+    /// Widen physically packed BF16 through SrcA and MOVA2D on Tensix.
+    pub fn bf16_to_f32(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::bf16::expand(&mut self.dram_state()?.alloc, input)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    pub fn free_bf16(&mut self, tensor: crate::bf16::Bf16Tensor) -> Result<(), TensorError> {
+        self.free_placement(tensor.placement)
+    }
+
+    pub fn repack_bf16(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+        sources: &[[usize; 2]],
+        dims: [usize; 2],
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) = crate::bf16::repack(&mut self.dram_state()?.alloc, input, sources, dims)?;
+        if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn repack_bf16_padded(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+        sources: &[Option<[usize; 2]>],
+        dims: [usize; 2],
+        padding: u16,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) = crate::bf16::repack_padded(
+            &mut self.dram_state()?.alloc,
+            input,
+            sources,
+            dims,
+            padding,
+        )?;
+        if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
+    /// General BF16 FPU windows, grouped into sixteen columns and continued
+    /// over sixteen-datum blocks. Results remain F32 until the caller casts.
+    pub fn bf16_pool_windows(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+        windows: &[Vec<[usize; 2]>],
+        divisors: &[usize],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        crate::fpu::windows(self, input, windows, divisors, dims)
+    }
+
+    /// Upload BF16 storage bits without converting their values.
+    pub fn upload_bf16(
+        &mut self,
+        values: &[u16],
+        rows: usize,
+        cols: usize,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(values.len()) {
+            return Err(TensorError::Shape("invalid BF16 upload shape".into()));
+        }
+        self.refuse_while_capturing("upload BF16")?;
+        let tiles = rows
+            .div_ceil(32)
+            .checked_mul(cols.div_ceil(32))
+            .ok_or_else(|| TensorError::Shape("BF16 tile count overflow".into()))?;
+        let output = crate::bf16::Bf16Tensor {
+            rows,
+            cols,
+            placement: self
+                .dram_state()?
+                .alloc
+                .alloc_slots(tiles, crate::bf16::TILE_SLOT)?,
+        };
+        let result = (|| {
+            let d = self.dram.as_ref().expect("enabled above");
+            for t in 0..tiles {
+                let mut image = vec![0u8; crate::bf16::TILE_SLOT as usize];
+                for r in 0..32 {
+                    for c in 0..32 {
+                        let row = t / cols.div_ceil(32) * 32 + r;
+                        let col = t % cols.div_ceil(32) * 32 + c;
+                        if row < rows && col < cols {
+                            let offset =
+                                tt_isa::dm::TILE_DATA as usize + tt_isa::dm::face_index(r, c) * 2;
+                            image[offset..offset + 2]
+                                .copy_from_slice(&values[row * cols + col].to_le_bytes());
+                        }
+                    }
+                }
+                self.dev.dram_write(&d.w4, output.slot(t), &image)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&output.placement);
+            return Err(error);
+        }
+        Ok(output)
+    }
+
+    /// Explicit raw BF16 readback. Never used for native arithmetic.
+    pub fn download_bf16(
+        &mut self,
+        tensor: &crate::bf16::Bf16Tensor,
+    ) -> Result<Vec<u16>, TensorError> {
+        self.refuse_while_capturing("download BF16")?;
+        self.sync()?;
+        let mut values = vec![0; tensor.rows * tensor.cols];
+        let ct = tensor.cols.div_ceil(32);
+        let d = self.dram.as_ref().expect("BF16 requires enabled GDDR");
+        for t in 0..tensor.tile_count() {
+            let mut image = vec![0u8; crate::bf16::TILE_SLOT as usize];
+            self.dev.dram_read(&d.w4, tensor.slot(t), &mut image)?;
+            for r in 0..32 {
+                for c in 0..32 {
+                    let row = t / ct * 32 + r;
+                    let col = t % ct * 32 + c;
+                    if row < tensor.rows && col < tensor.cols {
+                        let at = tt_isa::dm::TILE_DATA as usize + tt_isa::dm::face_index(r, c) * 2;
+                        values[row * tensor.cols + col] =
+                            u16::from_le_bytes([image[at], image[at + 1]]);
+                    }
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// Opt-in BF16 Src pooling of a resident 16x16 block. General F32
+    /// reductions retain their SFPU numerical contracts.
+    pub fn fpu_pool_block(
+        &mut self,
+        tensor: &DramTensor,
+        op: crate::fpu::PoolOp,
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::fpu::block(&mut self.dram_state()?.alloc, tensor, op)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Pool a physically packed BF16 16x16 block directly through SrcA.
+    /// The result is F32; BF16 inputs do not undergo another rounding step.
+    pub fn bf16_pool_block(
+        &mut self,
+        tensor: &crate::bf16::Bf16Tensor,
+        op: crate::fpu::PoolOp,
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::fpu::bf16_block(&mut self.dram_state()?.alloc, tensor, op)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Multiply packed BF16 matrices with F32 accumulation/output. Large K
+    /// reloads the prior F32 accumulator between packed operand blocks.
+    pub fn matmul_bf16(
+        &mut self,
+        a: &crate::bf16::Bf16Tensor,
+        b: &crate::bf16::Bf16Tensor,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let k_limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
+        let work = crate::bf16::matmul(
+            &mut self.dram_state()?.alloc,
+            a,
+            b,
+            fidelity,
+            units,
+            k_limit,
+        )?;
+        self.execute(work, budget)
+    }
+
+    /// Traceable shape/index constants encoded as mover immediates. Callers
+    /// must use upload for tensor data; this API is for operation metadata.
+    pub fn metadata(
+        &mut self,
+        bits: &[u32],
+        dims: [usize; 2],
+        elem: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        let work = tensor::metadata(&mut self.dram_state()?.alloc, bits, dims, elem)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
     /// Upload a row-major `[rows, cols]` matrix to GDDR.
     pub fn upload(
         &mut self,
@@ -3611,6 +3819,41 @@ impl<T: Transport> Session<T> {
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
+    }
+
+    /// Inclusive sum/product or raw-total-order min/max down rows, carrying
+    /// each prefix between tiles. Min/max preserve selected datum bits.
+    pub fn scan(
+        &mut self,
+        a: &DramTensor,
+        op: crate::sfpu::scan::ScanOp,
+    ) -> Result<DramTensor, TensorError> {
+        let work = tensor::sfpu_scan(&mut self.dram_state()?.alloc, a, op)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Opt-in hardware precision reduction. Stochastic state is inherited
+    /// from each executing core, so replay advances it. See the functional
+    /// model for documented non-IEEE zero/NaN and rounding behavior.
+    pub fn hardware_round(
+        &mut self,
+        a: &DramTensor,
+        precision: tt_isa::numerics::stochastic::Precision,
+        rounding: tt_isa::numerics::stochastic::Rounding,
+    ) -> Result<DramTensor, TensorError> {
+        use tt_isa::numerics::stochastic::Precision;
+        let offset = if precision == Precision::Bf16 { 0 } else { 3 };
+        self.eltwise(
+            tensor::Eltwise {
+                kind: crate::sfpu::ops::kind_sfpu::HARDWARE_ROUND + offset + rounding as u32,
+                scalar: 0.0,
+                scalar2: 0.0,
+            },
+            a,
+            None,
+        )
     }
 
     /// Make `t`'s padding what an op needs (`tensor::PadNeed`): nothing when

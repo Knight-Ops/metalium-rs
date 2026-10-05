@@ -12,8 +12,8 @@
 
 use tt_firmware::cfg::write_config_field;
 use tt_firmware::tensix::{push, read_dst32, wait_for_coprocessor};
-use tt_isa::backend;
 use tt_firmware::{fail, finish, l1_read32, publish, spin};
+use tt_isa::backend;
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::{self, panic_code};
 use tt_isa::sfpu::{self, dst32_address, store_format};
@@ -91,9 +91,15 @@ pub extern "Rust" fn firmware_main() -> ! {
 
     // Build the program first. Every encoding is checked, and a bad one fails
     // loudly here rather than being pushed and silently misexecuting.
-    let Ok(load_a) = sfpu::load_f32(0, a) else { fail(panic_code::EXPLICIT) };
-    let Ok(load_b) = sfpu::load_f32(1, b) else { fail(panic_code::EXPLICIT) };
-    let Ok(multiply) = sfpu::mul(0, 1, 2) else { fail(panic_code::EXPLICIT) };
+    let Ok(load_a) = sfpu::load_f32(0, a) else {
+        fail(panic_code::EXPLICIT)
+    };
+    let Ok(load_b) = sfpu::load_f32(1, b) else {
+        fail(panic_code::EXPLICIT)
+    };
+    let Ok(multiply) = sfpu::mul(0, 1, 2) else {
+        fail(panic_code::EXPLICIT)
+    };
     let Ok(store) = sfpu::store(2, store_format::FP32, 0, 0) else {
         fail(panic_code::EXPLICIT)
     };

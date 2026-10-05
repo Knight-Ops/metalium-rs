@@ -75,6 +75,9 @@ pub struct Vector {
     /// `ADDR_MOD_DST_SEC[i].DestIncr`.
     pub dst_incr: [u32; 8],
     replay: [Option<Instruction>; 32],
+    /// Per-lane hardware PRNG state. Unknown until a caller supplies a seed
+    /// or an observed snapshot; software cannot assume silicon reset seeds.
+    pub prng: Option<[u32; 32]>,
 }
 
 impl Default for Vector {
@@ -104,6 +107,7 @@ impl Vector {
             rwc_dst: 0,
             dst_incr: [0; 8],
             replay: [None; 32],
+            prng: None,
         }
     }
 
@@ -278,12 +282,59 @@ impl Vector {
             }
             "SFPMOV" => {
                 let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1") & !4);
+                if mod1 & 8 != 0 && vc == 9 {
+                    let mut state = self.prng.ok_or_else(|| InterpError::Unmodelled {
+                        at,
+                        what: "unknown PRNG state".into(),
+                    })?;
+                    let old = state;
+                    for (lane, value) in state.iter_mut().enumerate() {
+                        if self.lane_enabled(lane) {
+                            *value = tt_isa::numerics::stochastic::advance(*value);
+                        }
+                    }
+                    self.prng = Some(state);
+                    self.write(vd, old, false);
+                    return Ok(());
+                }
                 if mod1 & 8 != 0 {
                     return unmodelled("SFPMOV from a special register".into());
                 }
                 let x = self.read(at, vc)?;
                 let v = x.map(|x| if mod1 & 1 != 0 { x ^ 0x8000_0000 } else { x });
                 self.write(vd, v, mod1 == 2);
+            }
+            "SFP_STOCH_RND" => {
+                use tt_isa::numerics::stochastic::{self, Precision, Rounding};
+                let precision = match op("Mod1") {
+                    0 => Precision::Tf32,
+                    1 => Precision::Bf16,
+                    _ => return unmodelled("SFPSTOCHRND integer conversion".into()),
+                };
+                let rounding = match op("RoundingMode") {
+                    0 => Rounding::Nearest,
+                    1 => Rounding::Stochastic,
+                    2 => Rounding::TowardZero,
+                    _ => return unmodelled("SFPSTOCHRND rounding mode".into()),
+                };
+                if rounding == Rounding::Stochastic && self.prng.is_none() {
+                    return unmodelled("unknown PRNG state".into());
+                }
+                let input = self.read(at, op("VC"))?;
+                let state = self.prng.unwrap_or([0; 32]);
+                let result = std::array::from_fn(|l| {
+                    stochastic::round(input[l], state[l], precision, rounding)
+                });
+                if self.prng.is_some() {
+                    let mut next = state;
+                    for l in 0..32 {
+                        if self.lane_enabled(l) {
+                            next[l] = stochastic::advance(state[l]);
+                        }
+                    }
+                    self.prng = Some(next);
+                }
+                self.write(op("VD"), result, false);
             }
             "SFPABS" => {
                 let (vc, vd, mod1) = (op("VC"), op("VD"), op("Mod1"));

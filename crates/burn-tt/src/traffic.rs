@@ -88,13 +88,21 @@ fn log(direction: Direction, rows: usize, cols: usize) {
 }
 
 pub(crate) fn uploaded(rows: usize, cols: usize) {
-    UP.fetch_add((rows * cols * 4) as u64, Ordering::Relaxed);
+    uploaded_width(rows, cols, 4);
+}
+
+pub(crate) fn uploaded_width(rows: usize, cols: usize, width: usize) {
+    UP.fetch_add((rows * cols * width) as u64, Ordering::Relaxed);
     UPLOADS.fetch_add(1, Ordering::Relaxed);
     log(Direction::Up, rows, cols);
 }
 
 pub(crate) fn downloaded(rows: usize, cols: usize) {
-    DOWN.fetch_add((rows * cols * 4) as u64, Ordering::Relaxed);
+    downloaded_width(rows, cols, 4);
+}
+
+pub(crate) fn downloaded_width(rows: usize, cols: usize, width: usize) {
+    DOWN.fetch_add((rows * cols * width) as u64, Ordering::Relaxed);
     DOWNLOADS.fetch_add(1, Ordering::Relaxed);
     log(Direction::Down, rows, cols);
 }

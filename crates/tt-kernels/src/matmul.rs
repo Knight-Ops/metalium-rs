@@ -1384,10 +1384,9 @@ fn plan_slots(
     use crate::l1::PlanError;
     use crate::runtime::RunError;
     use tt_isa::dm::{TILE_DATA, TILE_SLOT};
-    assert_eq!(
-        tile_image_bytes(in_fmt),
-        TILE_DATA + 4096,
-        "slot staging holds FP32 tiles"
+    assert!(
+        tile_image_bytes(in_fmt) <= TILE_DATA + 4096,
+        "slot staging must fit the operand image"
     );
     let m = matmul_requirements([mt, kt, nt]);
     let plan = m.req.plan(arena).map_err(|e| match e {
@@ -1574,7 +1573,7 @@ pub fn chunk_fits_in(
     staging: Staging,
 ) -> bool {
     let (in_fmt, out_fmt) = route.formats();
-    if staging != Staging::Host && in_fmt != L1Format::Fp32 {
+    if staging != Staging::Host && !matches!(in_fmt, L1Format::Fp32 | L1Format::Bf16) {
         return false;
     }
     let Ok(layout) = plan_layout_in(tiles, in_fmt, staging) else {

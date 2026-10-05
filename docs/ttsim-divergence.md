@@ -154,6 +154,53 @@ re-deriving at the first silicon gate.
 
 ## Numerics worth knowing
 
+### Unresolved BF16 control in the FPU transpose probe (2026-10-04)
+
+`step73_fpu_transpose` currently enables only TF32 (unpacker output code 4).
+Changing its format list to `[4, 5]` exercises a BF16 control as well. With
+512 staged FP32 datums `((i as f32) - 256.0).to_bits() | 0x1fff`, even the
+zero-transpose SrcB-to-Dst copy fails: datum zero is `c3808086`, while the
+BF16 truncation/widening oracle expects `c3800000`. The older
+`probe_src::fp32_unpacks_into_src_as_truncated_bf16` still passes its smaller
+positive corpus. Dst width/layout and this larger signed control must be
+reconciled before enabling the BF16 case. This is an unresolved probe setup
+or simulator observation, not a confirmed simulator divergence or a silicon
+measurement. No BF16 transpose support or new encoding is inferred from it.
+
+### BF16 late narrowing and FPU pooling (2026-10-05)
+
+`step74_bf16_storage` uses SFPU ties-even bit quantization followed by FP32 Dst
+to BF16 pack (`Out_data_format=5`, ordinary `In_data_format=0`). Pinned ttsim
+refuses PACR mode `0x105`. Both cards pass physical two-byte payload checks,
+including signed zero, subnormal flush to signed zero, quiet NaNs retaining sign
+and high payload, infinities, extremes and ties. Conversion and Burn BF16
+arithmetic gates are silicon-only; raw storage/copy, SrcA→MOVA2D widening and
+packed BF16 matmul have simulator gates. A direct BF16 `UnpackToDst` widening
+setup timed out on silicon during bring-up; the SrcA/MOVA2D path is used instead.
+That timeout does not refute row 31's separately measured BF16→BF16 behavior.
+
+GMPOOL/GAPOOL require bit 19 set in both ttsim and the measured Blackhole paths.
+AddrMod remains at bits 15–16, with bank flips at 22/23; GMPOOL's ArgMax remains
+at bit 14. A GAPOOL encoding with AddrMod at 14 was refused with
+`max_pool_index_en=1`. Measured overrides live in `Bits32_BH.lua`; generator
+credentials validate the extra fixed bit without changing opcode bits.
+`step75` passes simulator and both cards (run `1791147578`).
+
+The matmul-then-window-pool extension of `step77` initially returned
+`[0,0,0,0.1171875]` instead of `[0,0.375,0.71875,0.85546875]` on ttsim.
+Both unpackers' XY/ZW ADCs retained face/context counters from matmul. Explicitly
+resetting all these counters fixes the gate; this is a program-state bug, not a
+simulator divergence. Window products, sums and power-of-two divisions in that
+fixture are exact binary rationals, so no numerical tolerance is used.
+
+General max pooling now selects through SFPU argmax and a raw-bit OR fold.
+The ordinary arithmetic `float_gather` path canonicalized selected `-0` to `+0`
+and negative NaN payload `ffc12345` to `7fc00000`; this was observed failing
+`step78`'s independent raw-bit/indices fixture. Masking unselected datums to
+zero bits and OR-folding them preserves the selected value's bits, while keeping
+the first-tie/first-NaN index used by the backward path. Ordinary gather's
+historical arithmetic contract is unchanged.
+
 
 | # | Behaviour | Note |
 |--:|---|---|
@@ -162,3 +209,18 @@ re-deriving at the first silicon gate.
 | E | **`SFPMAD` is not a fused multiply-add**: the product keeps four bits past FP32 and a sticky one (`Miscellaneous/FMA/README.md`), so `fma(a, b, -fl(a b))` is not the product's rounding error | Found in 10.2e: `gelu`'s split of `x/sqrt 2` and of `a^2` missed by 6e-8 and 1e-6. Error-free products on the SFPU are Dekker's: Veltkamp's 12-bit halves (`ops::split12`), each product of halves exact. A plain multiply or add is still correctly rounded; the Newton steps of `recip`/`div`/`sqrt` lean on the fma but self-correct, and their sweeps hold the measured bounds. |
 | F | **A product in the denormal range is dropped inside `SFPMAD`**, even where the sum is normal: `E - E lo` with `E` near `2^-123` and `lo` near `2^-16` returned `E` | Found in 10.2e (`gelu` near `x = -13`). Write such corrections as a product of normals: `E (1 - lo)`. |
 | G | **The reference is not always the accurate side: std's `f32::atanh` is `0.5 * log1p(2x/(1 - x))` on the signed `x`** (Flex calls it), so for `x` near `-1` the argument nears `-1` and `log1p` amplifies its two roundings by `k = \|w/((1 + w) ln(1 + w))\|` -- 42 at `x = -0.99`; measured 9 ulps at `-0.9914851`, 2e-5 relative at `-0.99923` | Found in 10.2e. The device's `atanh` works on `\|x\|` (odd symmetry, `k <= 1`) and is within 3.3 ulps of the exact value everywhere (`ops::transcendental`); the gates against Flex add Flex's own error, derived (`flex_atanh_error` in `step45`, `step47`). `asinhf`/`acoshf` are glibc's and accurate. |
+
+## Hardware precision modes, 2026-10-05
+
+`step81_hardware_rounding` observed pinned ttsim refusing SFPSTOCHRND_BH
+`rnd_mode=1` (stochastic), `rnd_mode=2` (toward zero), and TF32 `instr_mod1=0`.
+The default gate therefore covers BF16 nearest only. Card 0 silicon run
+`1791165365` passes all six combinations, comparing every output bit with the
+Blackhole functional model and each lane's observed predecessor PRNG state.
+The model preserves the documented >= threshold bias, occasional toward-zero
+round-away, exponent-zero positive-zero flush, and NaN-to-infinity conversion.
+Ordinary BF16 casts retain their separate ties-even/NaN-preserving contract.
+
+The experimental checked integer divide's DOMAIN=11 on valid inputs is **not**
+classified as a simulator divergence. Its status packing/ownership still needs
+isolation; execution is disabled. See `tensix-next-features.md` for the handoff.

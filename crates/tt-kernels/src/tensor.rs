@@ -111,6 +111,7 @@ pub struct Placement {
     channels: Vec<DramChannel>,
     base: Vec<u64>,
     slots: u64,
+    slot_bytes: u64,
     tiles: usize,
     /// A view's first tile within the allocation it borrows from.
     first: usize,
@@ -120,6 +121,27 @@ pub struct Placement {
 }
 
 impl Placement {
+    pub(crate) fn tensor_ref(&self, ct: usize) -> TensorRef {
+        let mut r = TensorRef {
+            n: self.channels.len() as u8,
+            first: self.first as u32,
+            ct: ct as u32,
+            ..TensorRef::default()
+        };
+        for (i, (c, b)) in self.channels.iter().zip(&self.base).enumerate() {
+            r.channels[i] = c.index();
+            r.base[i] = *b as u32;
+        }
+        r
+    }
+    pub(crate) fn borrowed_tiles(&self, first: usize, tiles: usize) -> Self {
+        Self {
+            first: self.first + first,
+            tiles,
+            owned: false,
+            ..self.clone()
+        }
+    }
     /// Did this placement allocate its slots, or is it a view of another's?
     pub fn owned(&self) -> bool {
         self.owned
@@ -132,7 +154,7 @@ impl Placement {
         let n = self.channels.len();
         let (c, i) = (t % n, (t / n) as u64);
         self.channels[c]
-            .range(self.base[c] + i * TILE_SLOT, TILE_SLOT)
+            .range(self.base[c] + i * self.slot_bytes, self.slot_bytes)
             .expect("the allocator placed every slot inside its channel")
     }
 
@@ -143,7 +165,7 @@ impl Placement {
     /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
     pub(crate) fn region(&self) -> Option<DramRange> {
         match self.channels[..] {
-            [c] => c.range(self.base[0], self.slots * TILE_SLOT),
+            [c] => c.range(self.base[0], self.slots * self.slot_bytes),
             _ => None,
         }
     }
@@ -162,7 +184,7 @@ impl FreeSnapshot {
     /// captured then can name them?
     pub(crate) fn was_free(&self, p: &Placement) -> bool {
         p.channels.iter().zip(&p.base).all(|(c, &at)| {
-            let len = p.slots * TILE_SLOT;
+            let len = p.slots * p.slot_bytes;
             let Some(i) = self.channels.iter().position(|k| k == c) else {
                 return false;
             };
@@ -219,6 +241,7 @@ impl DramAlloc {
             channels: vec![self.channels[channel]],
             base: vec![at],
             slots,
+            slot_bytes: TILE_SLOT,
             tiles: 1,
             first: 0,
             owned: true,
@@ -227,9 +250,18 @@ impl DramAlloc {
 
     /// Room for `tiles` tile slots, interleaved.
     pub fn alloc(&mut self, tiles: usize) -> Result<Placement> {
+        self.alloc_slots(tiles, TILE_SLOT)
+    }
+
+    /// Format-aware tile allocation. The slot includes its header/alignment;
+    /// it must preserve the NoC's 64-byte read alignment on every channel.
+    pub(crate) fn alloc_slots(&mut self, tiles: usize, slot_bytes: u64) -> Result<Placement> {
+        if slot_bytes == 0 || slot_bytes % tt_isa::dram::ALIGN != 0 {
+            return Err(TensorError::Shape("unaligned physical tile slot".into()));
+        }
         let n = self.channels.len();
         let slots = (tiles.max(1)).div_ceil(n) as u64;
-        let bytes = slots * TILE_SLOT;
+        let bytes = slots * slot_bytes;
         let mut base = Vec::with_capacity(n);
         for i in 0..n {
             let Some((&at, &len)) = self.free[i].iter().find(|(_, &len)| len >= bytes) else {
@@ -249,6 +281,7 @@ impl DramAlloc {
             channels: self.channels.clone(),
             base,
             slots,
+            slot_bytes,
             tiles,
             first: 0,
             owned: true,
@@ -267,7 +300,7 @@ impl DramAlloc {
                 .iter()
                 .position(|k| k == c)
                 .expect("a placement's channel is the allocator's");
-            release(&mut self.free[i], b, p.slots * TILE_SLOT);
+            release(&mut self.free[i], b, p.slots * p.slot_bytes);
         }
     }
 
@@ -398,19 +431,7 @@ impl DramTensor {
 
     /// This tensor as an op record names it (`tt_isa::dm::record::TensorRef`).
     pub fn tensor_ref(&self) -> TensorRef {
-        let p = &self.placement;
-        let mut r = TensorRef {
-            n: p.channels.len() as u8,
-            first: p.first as u32,
-            ct: self.grid()[1] as u32,
-            ..TensorRef::default()
-        };
-        for (i, (c, b)) in p.channels.iter().zip(&p.base).enumerate() {
-            r.channels[i] = c.index();
-            // Inside a channel, which `CHANNEL_BYTES` keeps under 4 GiB.
-            r.base[i] = *b as u32;
-        }
-        r
+        self.placement.tensor_ref(self.grid()[1])
     }
 
     /// The slot of tile `(i, j)`.
@@ -1414,7 +1435,7 @@ impl BlockPlan {
 }
 
 /// Size both first and continuation programs against the resident-cache limit.
-fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
+pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
     loop {
         if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
@@ -1914,6 +1935,9 @@ pub fn sfpu_eltwise(
     use crate::sfpu::ops::Broadcast;
     let (kind, bcast) = broadcast_of(op, a, b)?;
     let op = Eltwise { kind, ..op };
+    if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
+        return sfpu_divide(alloc, op, a, b, bcast).map(Some);
+    }
     let Some((operands, _)) = crate::sfpu::ops::program_for(kind, [op.scalar, op.scalar2], bcast)
     else {
         return Ok(None);
@@ -2033,18 +2057,251 @@ pub fn sfpu_eltwise(
     Ok(Some(Work { out, jobs }))
 }
 
+/// Checked full-width integer division. The packer publishes canonical
+/// domain flags; NC validates them before scattering, without host reads.
+fn sfpu_divide(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+    bcast: crate::sfpu::ops::Broadcast,
+) -> Result<Work> {
+    // Keep the experimental builder for diagnosis, but do not expose an
+    // execution path until packed status flags pass simulator and silicon.
+    const DOMAIN_FLAGS_VALIDATED: bool = false;
+    if !DOMAIN_FLAGS_VALIDATED {
+        return Err(TensorError::Shape(
+            "integer division/remainder disabled: domain flags await validation".into(),
+        ));
+    }
+    use crate::sfpu::{
+        kernel,
+        ops::{self, Broadcast},
+    };
+    use tt_isa::dm::op as mover;
+    let layout = kernel::plan_layout(1, kernel::Operands::Binary)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (operands, code) = ops::code2(op.kind, [op.scalar, op.scalar2]).expect("integer division");
+    let (roles, loops) = kernel::roles_code_validated(&layout, operands, &code, true);
+    let roles = Arc::new(roles);
+    let loops = Arc::new(loops);
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, Elem::I32)?;
+    let [rt, ct] = a.grid();
+    let ra = a.tensor_ref().encode();
+    let rb = b.map(|t| t.tensor_ref().encode());
+    let ro = out.tensor_ref().encode();
+    let b_at = layout.b_at.expect("packed domain flags");
+    let mut jobs = Vec::new();
+    for tile in 0..rt * ct {
+        let read = |at: u64, flags: u32, reference: [[u32; 8]; 2]| {
+            vec![
+                [
+                    record::READ_RUN,
+                    tile as u32,
+                    1,
+                    at as u32,
+                    flags,
+                    ct as u32,
+                    0,
+                    0,
+                ],
+                reference[0],
+                reference[1],
+            ]
+        };
+        let mut gather = read(layout.a_at, 0, ra);
+        if let Some(rb) = rb {
+            let flags = match bcast {
+                Broadcast::None => 0,
+                Broadcast::Row => 1,
+                Broadcast::Col => 2,
+            };
+            gather.extend(read(b_at, flags, rb));
+            if bcast == Broadcast::Row {
+                // Materialize this one row within its local tile so the
+                // long divide body can use the runner's compact row loop.
+                for row in 1..32 {
+                    for col in [0, 16] {
+                        gather.push([
+                            mover::COPY_WORDS,
+                            (b_at + TILE_DATA + tt_isa::dm::face_index(0, col) as u64 * 4) as u32,
+                            (b_at + TILE_DATA + tt_isa::dm::face_index(row, col) as u64 * 4) as u32,
+                            16,
+                            4,
+                            4,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+            }
+        }
+        jobs.push(vec![
+            Step::List {
+                what: "integer division gather",
+                entries: gather,
+            },
+            Step::Kernel {
+                roles: roles.clone(),
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: loops.clone(),
+                half: None,
+            },
+            Step::List {
+                what: "checked integer division scatter",
+                entries: vec![
+                    [
+                        mover::CHECK_FLAGS,
+                        b_at as u32,
+                        (a.rows - tile / ct * 32).min(32) as u32,
+                        (a.cols - tile % ct * 32).min(32) as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    [
+                        record::WRITE_RUN,
+                        tile as u32,
+                        1,
+                        layout.out_at as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    ro[0],
+                    ro[1],
+                ],
+            },
+        ]);
+    }
+    out.set_pad(Pad::Undefined);
+    Ok(Work { out, jobs })
+}
+
 type SfpuPrograms = (
     crate::sfpu::kernel::Layout,
     Arc<[Vec<Instruction>; 3]>,
     Arc<[Vec<crate::code::Loop>; 3]>,
 );
 
-/// Most tiles one SFPU run of `op` may take: 64, or fewer if the data arena
-/// cannot hold their slots or a role's program -- which grows by a fixed
-/// amount per tile -- would outgrow a program slot (`mailbox::PROGRAM_MAX`).
-/// Measured from the programs themselves, at one tile and at two, so an op
-/// with a long program (`ADD_ROW`'s unrolled loop) gets shorter runs rather
-/// than a refusal.
+/// Materialize shape/index constants from descriptor immediates. This is
+/// deliberately separate from tensor upload: traces replay the same metadata
+/// without a host data write, and movers only fill/copy raw words.
+pub(crate) fn metadata(
+    alloc: &mut DramAlloc,
+    bits: &[u32],
+    dims: [usize; 2],
+    elem: Elem,
+) -> Result<Work> {
+    use tt_isa::dm::{fill, op};
+    let [rows, cols] = dims;
+    if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(bits.len()) {
+        return Err(TensorError::Shape("invalid metadata dimensions".into()));
+    }
+    let mut req = crate::l1::Requirements::new(1);
+    let dst = req.scratch("metadata destination", TILE_SLOT, 64, 0..1);
+    let constant = req.scratch("metadata immediate", TILE_SLOT, 64, 0..1);
+    let plan = req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (dst, constant) = (plan.addr(dst), plan.addr(constant));
+    let out = DramTensor::alloc_elem(alloc, rows, cols, elem)?;
+    let mut jobs = Vec::new();
+    let ct = cols.div_ceil(32);
+    for tile in 0..out.placement.tiles() {
+        let mut positions = Vec::new();
+        for r in 0..32.min(rows - tile / ct * 32) {
+            for c in 0..32.min(cols - tile % ct * 32) {
+                positions.push((
+                    bits[(tile / ct * 32 + r) * cols + tile % ct * 32 + c],
+                    tt_isa::dm::face_index(r, c),
+                ));
+            }
+        }
+        positions.sort_unstable();
+        let mut batches = Vec::new();
+        let range = out.tile(tile / ct, tile % ct);
+        for (batch, chunk) in positions.chunks(200).enumerate() {
+            let mut read = Vec::new();
+            if batch == 0 {
+                read.extend([
+                    [op::FILL, 0, fill::param(1, 1), constant as u32, 0, 0, 0, 0],
+                    [
+                        op::COPY_WORDS,
+                        (constant + TILE_DATA + 4) as u32,
+                        (dst + TILE_DATA) as u32,
+                        1024,
+                        0,
+                        4,
+                        0,
+                        0,
+                    ],
+                ]);
+            } else {
+                read.push([
+                    op::READ,
+                    range.channel().index() as u32,
+                    0,
+                    range.offset() as u32,
+                    dst as u32,
+                    TILE_SLOT as u32,
+                    0,
+                    0,
+                ]);
+            }
+            let mut prior = None;
+            for &(value, index) in chunk {
+                if prior != Some(value) {
+                    read.push([
+                        op::FILL,
+                        value,
+                        fill::param(1, 1),
+                        constant as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]);
+                    prior = Some(value);
+                }
+                read.push([
+                    op::COPY_WORDS,
+                    (constant + TILE_DATA + 4) as u32,
+                    (dst + TILE_DATA + index as u64 * 4) as u32,
+                    1,
+                    0,
+                    4,
+                    0,
+                    0,
+                ]);
+            }
+            batches.push(TransferBatch {
+                read,
+                write: vec![[
+                    op::WRITE,
+                    range.channel().index() as u32,
+                    0,
+                    (range.offset() + TILE_DATA) as u32,
+                    (dst + TILE_DATA) as u32,
+                    4096,
+                    0,
+                    0,
+                ]],
+            });
+        }
+        jobs.push(vec![Step::Transfer {
+            what: "resident metadata",
+            depth: 1,
+            batches,
+        }]);
+    }
+    out.set_pad(Pad::Zero);
+    Ok(Work { out, jobs })
+}
+
 #[cfg(test)]
 pub(crate) fn sfpu_group_for_tests(
     kind: u32,
@@ -2203,7 +2460,7 @@ pub fn sfpu_reduce(
     units: usize,
     overlap: Overlap,
 ) -> Result<Work> {
-    a.expect("a reduction", Elem::F32)?;
+    a.expect("a reduction", op.elem())?;
     use crate::sfpu::reduce::Axis;
     let per = match axis {
         Axis::Cols => a.grid()[1],
@@ -2226,8 +2483,18 @@ pub fn sfpu_reduce(
     }
     let [rt, ct] = a.grid();
     let (outs, per, valid, out) = match axis {
-        Axis::Cols => (rt, ct, a.cols % 32, DramTensor::alloc(alloc, a.rows, 1)?),
-        Axis::Rows => (ct, rt, a.rows % 32, DramTensor::alloc(alloc, 1, a.cols)?),
+        Axis::Cols => (
+            rt,
+            ct,
+            a.cols % 32,
+            DramTensor::alloc_elem(alloc, a.rows, 1, op.elem())?,
+        ),
+        Axis::Rows => (
+            ct,
+            rt,
+            a.rows % 32,
+            DramTensor::alloc_elem(alloc, 1, a.cols, op.elem())?,
+        ),
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
     let group = match reduce_group(op, axis, per, valid, false) {
@@ -2311,6 +2578,88 @@ pub fn sfpu_reduce(
     Ok(Work { out, jobs })
 }
 
+/// Inclusive scan down matrix rows. Each column tile is a job, so its
+/// continuations stay on one unit. A WAIT protects every prior-output reload.
+pub fn sfpu_scan(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::scan::ScanOp,
+) -> Result<Work> {
+    use crate::sfpu::{kernel, scan};
+    use kernel::Operands;
+    a.expect("a scan", Elem::F32)?;
+    let [rt, ct] = a.grid();
+    let first_layout =
+        kernel::plan_layout(1, Operands::Unary).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let next_layout =
+        kernel::plan_layout(1, Operands::Binary).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let first_roles = Arc::new(kernel::roles(
+        &first_layout,
+        Operands::Unary,
+        &scan::program(op, true),
+    ));
+    let next_roles = Arc::new(kernel::roles(
+        &next_layout,
+        Operands::Binary,
+        &scan::program(op, false),
+    ));
+    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let read = |tensor: &DramTensor, tile: usize, at: u64| {
+        vec![
+            [record::READ_RUN, tile as u32, 1, at as u32, 0, 0, 0, 0],
+            tensor.tensor_ref().encode()[0],
+            tensor.tensor_ref().encode()[1],
+        ]
+    };
+    let mut jobs = Vec::new();
+    for c in 0..ct {
+        let mut steps = Vec::new();
+        for r in 0..rt {
+            let tile = r * ct + c;
+            let layout = if r == 0 { &first_layout } else { &next_layout };
+            let mut gather = read(a, tile, layout.a_at);
+            if r > 0 {
+                gather.insert(0, [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                gather.extend(read(&out, tile - ct, layout.b_at.expect("continuation B")));
+            }
+            steps.push(Step::List {
+                what: "scan gather",
+                entries: gather,
+            });
+            steps.push(Step::Kernel {
+                roles: if r == 0 {
+                    first_roles.clone()
+                } else {
+                    next_roles.clone()
+                },
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            });
+            steps.push(Step::List {
+                what: "scan scatter",
+                entries: vec![
+                    [
+                        record::WRITE_RUN,
+                        tile as u32,
+                        1,
+                        layout.out_at as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    out.tensor_ref().encode()[0],
+                    out.tensor_ref().encode()[1],
+                ],
+            });
+        }
+        jobs.push(steps);
+    }
+    Ok(Work { out, jobs })
+}
+
 /// Long reductions carry the full, unfolded accumulator tile in GDDR.
 /// Each output group stays on one unit and reloads only after NC releases
 /// the preceding batch. Folding occurs once, in the final chunk.
@@ -2329,7 +2678,7 @@ fn reduce_chunked(
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
     let c = plan_chunk_layout(1).map_err(|e| TensorError::Shape(e.to_string()))?;
-    let out = DramTensor::alloc(alloc, dims[0], dims[1])?;
+    let out = DramTensor::alloc_elem(alloc, dims[0], dims[1], op.elem())?;
     let mut jobs = Vec::new();
     // One output tile per job bounds the largest continuation program.
     // All chunks of that output remain on the same unit.

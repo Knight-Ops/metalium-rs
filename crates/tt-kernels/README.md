@@ -12,6 +12,8 @@ on-tile and chip-to-chip data movers. Shippable; depends on `tt-isa`, `tt-device
 |---|---|
 | `session` | `Session<T>`: owns a chip for compute. Bring-up order, per-tile reset, resident roles. `TileChoice::{Exactly, First, Count(n), All}`; `Session::open_card(index, ROLES, choice)` for silicon. `enable_dram`, `upload`/`download`/`free`, `matmul_dram`, `eltwise`, `sum_rows`. Also `matmul_on`, the reset-per-run host-staged matmul. |
 | `tensor` | `DramTensor`: row-major `[rows, cols]` FP32 stored as 32x32 tiles interleaved over the usable GDDR channels. `DramAlloc`. The GDDR matmul, element-wise and column-sum ops, built as `Work` (jobs) dealt over the session's tiles. |
+| `bf16` | `Bf16Tensor`: separate two-byte storage in 2112-byte aligned slots. Raw upload/download, native bit copies/views, device ties-even narrowing and SrcA/MOVA2D widening, compact packed gathers and K-block matmul with F32 accumulation. Allocation and trace holds retain the physical slot size. |
+| `fpu` | Opt-in 16×16 GMPOOL/GAPOOL block max/sum/mean, and BF16 window sums with F32 continuation and explicit mean divisors. General F32 reductions keep their SFPU semantics. |
 | `dm` | `DataMover`: the `dm_b` image (a pure GDDR reader) on RISCV B of one tile, or the `dm_nc` image (a pure writer) on RISCV NC. `read`/`write`, `run_list`/`submit_list`/`wait`, and `enqueue`, which checks a list as the mover will before writing it. Lists carry op records (`tt_isa::dm::record`), `KERNEL`/`LAUNCH` entries that drive the resident roles, and `PAIR` packets: a reader and a writer section joined by circular-buffer credits, one host commit. |
 | `runtime` | `Kernel` (three role programs + `Schedule`), `run` (stage, start, wait, collect), `Resident` (role images left running between kernels), `Profile`. |
 | `program_cache` | `ProgramCache`: the host's mirror of one tile's resident programs in `tt_isa::l1::PROGRAM_CACHE` (exact-word keys, first fit, LRU, pinned while a list names them, programs over half the region bypassed, cleared on reset). A `KERNEL` entry names each role's resident program, so one list runs kernels of any shape. `Session::program_cache_stats` gives hits, misses, uploads and evictions per tile. |
@@ -22,6 +24,13 @@ on-tile and chip-to-chip data movers. Shippable; depends on `tt-isa`, `tt-device
 | `shard` | `Fabric`, `Chip`: a matmul split along `N` across cabled chips, bit-identical to one chip. |
 
 ## Many tiles
+
+BF16 narrowing is silicon-only with the pinned simulator, which refuses late
+pack mode `0x105`. Raw BF16 storage/copy, packed matmul and BF16 pooling window
+staging have simulator gates. Device conversion rounds ties-even, quiets NaNs
+while retaining sign/high payload and flushes BF16 subnormals to signed zero;
+raw storage/copies preserve every bit. See `step74`–`step78` and
+[the implementation record](../../docs/tensix-next-features.md).
 
 A session with `TileChoice::Count(n)` or `All` runs one unit (resident roles + data
 mover) per surviving tile. A GDDR op is a set of independent jobs dealt round-robin
@@ -68,3 +77,12 @@ accumulators reloaded in product order. `set_matmul_k_block_limit` optionally
 forces a maximum K tile count; `None` restores automatic planning. Existing
 unsplit pipelining remains. `step67`/`step68` cover simulator execution; silicon
 validation and release performance measurements are pending.
+
+## Current extension status
+
+Inclusive min/max scans use raw F32 total ordering. Integer reductions use
+wrapping sum/product and signed min/max without F32 conversion. Hardware BF16/
+TF32 precision modes are opt-in and preserve documented Blackhole rounding
+behavior; ordinary BF16 casts retain their separate contract. Experimental
+checked integer division/remainder execution is disabled pending status-flag
+validation. See [the current handoff](../../docs/tensix-next-features.md).

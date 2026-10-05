@@ -20,6 +20,9 @@ const FIRST_NAN: u32 = 0x7f80_0001;
 
 /// The element-wise ops beyond `crate::kind`'s, numbered above them.
 pub mod kind_sfpu {
+    /// Explicit SFPSTOCHRND modes: BF16 nearest/stochastic/toward-zero,
+    /// then TF32 nearest/stochastic/toward-zero. These preserve hardware bugs.
+    pub const HARDWARE_ROUND: u32 = 0x1b0;
     /// `1 / a`, within one ulp of the correctly rounded reciprocal
     /// (`Program::recip`).
     pub const RECIP: u32 = 0x100;
@@ -156,7 +159,47 @@ pub mod kind_sfpu {
     pub const BOOL_TO_F32: u32 = 0x13f;
     /// Boolean integer 0/1 copied to a typed I32 buffer, exact.
     pub const BOOL_TO_I32: u32 = 0x140;
-    /// The last SFPU kind: the tests that run every kind go to it.
+    pub const ROUND: u32 = 0x190;
+    pub const FLOOR: u32 = 0x191;
+    pub const CEIL: u32 = 0x192;
+    pub const TRUNC: u32 = 0x193;
+    pub const F32_TO_I32: u32 = 0x194;
+    // I32 operations; scalar immediates carry raw I32 bits.
+    pub const INT_ADD: u32 = 0x170;
+    pub const INT_SUB: u32 = 0x171;
+    pub const INT_MUL: u32 = 0x172;
+    pub const INT_AND: u32 = 0x173;
+    pub const INT_OR: u32 = 0x174;
+    pub const INT_XOR: u32 = 0x175;
+    pub const INT_SHL: u32 = 0x176;
+    pub const INT_SHR: u32 = 0x177;
+    pub const INT_EQ: u32 = 0x178;
+    pub const INT_NE: u32 = 0x179;
+    pub const INT_GT: u32 = 0x17a;
+    pub const INT_GE: u32 = 0x17b;
+    pub const INT_LT: u32 = 0x17c;
+    pub const INT_LE: u32 = 0x17d;
+    pub const INT_NOT: u32 = 0x17e;
+    pub const INT_DIV: u32 = 0x18e;
+    pub const INT_REM: u32 = 0x18f;
+    pub const INT_DIV_S: u32 = 0x190;
+    pub const INT_REM_S: u32 = 0x191;
+    pub const INT_ADD_S: u32 = 0x180;
+    pub const INT_SUB_S: u32 = 0x181;
+    pub const INT_MUL_S: u32 = 0x182;
+    pub const INT_AND_S: u32 = 0x183;
+    pub const INT_OR_S: u32 = 0x184;
+    pub const INT_XOR_S: u32 = 0x185;
+    pub const INT_SHL_S: u32 = 0x186;
+    pub const INT_SHR_S: u32 = 0x187;
+    pub const INT_EQ_S: u32 = 0x188;
+    pub const INT_NE_S: u32 = 0x189;
+    pub const INT_GT_S: u32 = 0x18a;
+    pub const INT_GE_S: u32 = 0x18b;
+    pub const INT_LT_S: u32 = 0x18c;
+    pub const INT_LE_S: u32 = 0x18d;
+    /// End of the original contiguous activation range. Additional kinds
+    /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
 }
 
@@ -202,6 +245,23 @@ pub struct Sig {
 pub fn elems(kind: u32) -> Sig {
     use Elem::{Bool, F32};
     let sig = |inputs, out| Sig { inputs, out };
+    if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
+        return sig(&[F32], F32);
+    }
+    if let Some((op, scalar)) = super::integer::operation(kind) {
+        return sig(
+            if scalar || op == 14 {
+                &[Elem::I32]
+            } else {
+                &[Elem::I32, Elem::I32]
+            },
+            if (8..=13).contains(&op) {
+                Bool
+            } else {
+                Elem::I32
+            },
+        );
+    }
     match kind {
         kind_sfpu::BOOL_NOT => sig(&[Bool], Bool),
         kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => sig(&[Bool, Bool], Bool),
@@ -213,7 +273,8 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::I32_TO_F32 => sig(&[Elem::I32], F32),
         kind_sfpu::BOOL_TO_F32 => sig(&[Bool], F32),
         kind_sfpu::BOOL_TO_I32 => sig(&[Bool], Elem::I32),
-        kind_sfpu::INDEX_TO_I32 => sig(&[F32], Elem::I32),
+        kind_sfpu::INDEX_TO_I32 | kind_sfpu::F32_TO_I32 => sig(&[F32], Elem::I32),
+        kind_sfpu::ROUND..=kind_sfpu::TRUNC => sig(&[F32], F32),
         _ => sig(&[F32, F32], F32),
     }
 }
@@ -2222,6 +2283,19 @@ pub fn pow_fix(p: &mut Program) {
 
 /// What operands `kind` takes, if the SFPU has it.
 pub fn operands(kind: u32) -> Option<Operands> {
+    if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
+        return Some(Operands::Unary);
+    }
+    if let Some((op, scalar)) = super::integer::operation(kind) {
+        return Some(if scalar || op == 14 {
+            Operands::Unary
+        } else {
+            Operands::Binary
+        });
+    }
+    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32) {
+        return Some(Operands::Unary);
+    }
     Some(match kind {
         kind::ADD
         | kind::SUB
@@ -2318,6 +2392,9 @@ pub enum Broadcast {
 
 /// The kinds that take a broadcast second operand.
 pub fn broadcasts(kind: u32) -> bool {
+    if matches!(kind, 0x170..=0x17d | 0x18e..=0x18f) {
+        return true;
+    }
     matches!(
         kind,
         kind::ADD
@@ -2345,6 +2422,11 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     };
     p.load(LReg::L0, fmt, a_at);
     p.load(LReg::L1, fmt, b_at);
+    if let Some((op, _)) = super::integer::operation(kind) {
+        super::integer::body(p, op);
+        p.store(LReg::L2, Format::Int32, out_at);
+        return;
+    }
     let out = match kind {
         kind_sfpu::BOOL_AND => {
             p.and(LReg::L0, LReg::L1, LReg::L2);
@@ -2738,6 +2820,69 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
 
 /// [`program2`] as a role's slot holds it ([`code_for`]).
 pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Code)> {
+    if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
+        use tt_isa::numerics::stochastic::{Precision, Rounding};
+        let offset = kind - kind_sfpu::HARDWARE_ROUND;
+        let precision = if offset < 3 {
+            Precision::Bf16
+        } else {
+            Precision::Tf32
+        };
+        let rounding = match offset % 3 {
+            0 => Rounding::Nearest,
+            1 => Rounding::Stochastic,
+            _ => Rounding::TowardZero,
+        };
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            p.load(LReg::L0, Format::Int32, A_ROW + o);
+            p.hardware_round(LReg::L0, LReg::L2, precision, rounding);
+            p.store(LReg::L2, Format::Int32, OUT_ROW + o);
+        });
+        return Some((Operands::Unary, p.finish_code()));
+    }
+    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32) {
+        use super::round::{self, RoundOp};
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            p.load(LReg::L0, Format::Int32, A_ROW + o);
+            match kind {
+                kind_sfpu::ROUND => round::body(p, RoundOp::Even),
+                kind_sfpu::FLOOR => round::body(p, RoundOp::Floor),
+                kind_sfpu::CEIL => round::body(p, RoundOp::Ceil),
+                kind_sfpu::TRUNC => round::body(p, RoundOp::Trunc),
+                _ => round::to_i32(p),
+            }
+            p.store(LReg::L2, Format::Int32, OUT_ROW + o);
+        });
+        return Some((Operands::Unary, p.finish_code()));
+    }
+    if let Some((op, scalar)) = super::integer::operation(kind) {
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            p.load(LReg::L0, Format::Int32, A_ROW + o);
+            if scalar {
+                p.loadi_bits(LReg::L1, scalars[0].to_bits());
+            } else if op != 14 {
+                p.load(LReg::L1, Format::Int32, B_ROW + o);
+            }
+            if op == 15 || op == 16 {
+                p.loadi_bits(LReg::L3, 1);
+                p.if_(Cond::Eq0(LReg::L1), |p| p.mov(LReg::ZERO, LReg::L3));
+                p.store(LReg::L3, Format::Int32, super::kernel::C_ROW + o);
+            }
+            super::integer::body(p, op);
+            p.store(LReg::L2, Format::Int32, OUT_ROW + o);
+        });
+        return Some((
+            if scalar || op == 14 {
+                Operands::Unary
+            } else {
+                Operands::Binary
+            },
+            p.finish_code(),
+        ));
+    }
     let scalar = scalars[0];
     let mut p = Program::new();
     if let Some(o) = exact_program(&mut p, kind, scalars) {
@@ -3349,7 +3494,12 @@ mod fit {
             kind::RELU,
             kind::RELU_BACKWARD,
             kind::ADD_ROW,
-        ] {
+        ]
+        .into_iter()
+        .chain(kind_sfpu::INT_ADD..=kind_sfpu::INT_NOT)
+        .chain(kind_sfpu::INT_ADD_S..=kind_sfpu::INT_LE_S)
+        .chain(kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32)
+        {
             let bcast = if k == kind::ADD_ROW {
                 Broadcast::Row
             } else {
@@ -4666,7 +4816,13 @@ mod arity {
     /// shape check and the kernel cannot disagree.
     #[test]
     fn operands_agrees_with_program() {
-        for k in (1..=kind::LAST).chain(0x100..=kind_sfpu::LAST) {
+        for k in (1..=kind::LAST)
+            .chain(0x100..=kind_sfpu::LAST)
+            .chain([kind_sfpu::INDEX_TO_I32])
+            .chain(0x170..=0x17e)
+            .chain(0x180..=0x18d)
+            .chain(0x190..=0x194)
+        {
             // Scalars any kind takes: `CLAMP`'s bounds uncrossed.
             let got = program2(k, [-0.5, 0.5]).map(|(o, _)| o);
             assert_eq!(operands(k), got, "kind {k:#x}");

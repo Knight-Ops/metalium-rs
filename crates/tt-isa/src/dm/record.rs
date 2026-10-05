@@ -22,8 +22,13 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// rows, j0, cols]` + `A` + `B`. Row `i` of the block's `A` tiles, `K` tile
 /// `kk`, goes to `a_at + (i * kt + kk) * TILE_SLOT`; `K` tile `kk` of its
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
-/// `A` is read transposed, bit 1 `B`, bits 8.. `kt`.
+/// `A` is read transposed, bit 1 `B`, bits 8.. `kt`. Bit 2 selects packed
+/// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
+/// logical rows/columns and words 6/7 their tile row/column origins.
+/// GDDR slots are 2112 bytes; L1 slots remain 4160.
+/// Only local ragged lanes are zeroed, without changing the source tensor.
 pub const GATHER: u32 = 0x10;
+pub const GATHER_BF16: u32 = 1 << 2;
 /// One matmul block's outputs, L1 -> GDDR: `[SCATTER, out_at, out_stride, i0,
 /// rows, j0, cols, 0]` + `C`. Output `(i, j)`'s datums are at `out_at + (i *
 /// cols + j) * out_stride`.
@@ -189,8 +194,12 @@ impl Cursor<'_> {
     /// the next.
     #[inline(always)]
     fn next(&mut self) -> Result<(u32, u32), u32> {
+        self.next_with_slot(TILE_SLOT)
+    }
+
+    fn next_with_slot(&mut self, stride: u64) -> Result<(u32, u32), u32> {
         let c = self.c as usize;
-        let offset = (self.x.base[c] as u64) + self.slot as u64 * TILE_SLOT;
+        let offset = (self.x.base[c] as u64) + self.slot as u64 * stride;
         let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
         let at = (self.x.channels[c] as u32, offset);
         self.c += 1;
@@ -264,6 +273,64 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(flags >> 8)?);
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let (a, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
+            if flags & GATHER_BF16 != 0 {
+                if flags & 0xff != GATHER_BF16 {
+                    return Err(super::error::RANGE);
+                }
+                for (x, meta, r0, nr, c0, nc, at) in [
+                    (&a, rec[1], i0, rows, 0, kt, a_at),
+                    (&b, rec[3], 0, kt, j0, cols, b_at),
+                ] {
+                    let (height, width) = (meta[4], meta[5]);
+                    let r0 = r0.checked_add(meta[6]).ok_or(super::error::RANGE)?;
+                    let c0 = c0.checked_add(meta[7]).ok_or(super::error::RANGE)?;
+                    if height == 0
+                        || width == 0
+                        || height > MAX_EXTENT * 32
+                        || width > MAX_EXTENT * 32
+                        || x.ct != width.div_ceil(32)
+                        || r0
+                            .checked_add(nr)
+                            .is_none_or(|end| end > height.div_ceil(32))
+                        || c0.checked_add(nc).is_none_or(|end| end > x.ct)
+                    {
+                        return Err(super::error::RANGE);
+                    }
+                    for i in 0..nr {
+                        let mut row = x.cursor(r0 + i, c0)?;
+                        for j in 0..nc {
+                            let (ch, off) = row.next_with_slot(super::BF16_TILE_SLOT)?;
+                            let to = (at as u64) + (i as u64 * nc as u64 + j as u64) * TILE_SLOT;
+                            let to = u32::try_from(to).map_err(|_| super::error::RANGE)?;
+                            emit([
+                                op::READ,
+                                ch,
+                                (i + j) % PORTS,
+                                off,
+                                to,
+                                super::BF16_TILE_SLOT as u32,
+                                0,
+                                0,
+                            ])?;
+                            let valid_rows = (height - (r0 + i) * 32).min(32);
+                            let valid_cols = (width - (c0 + j) * 32).min(32);
+                            if valid_rows != 32 || valid_cols != 32 {
+                                emit([
+                                    op::FILL_HALFWORDS,
+                                    0,
+                                    super::fill::param(valid_rows, valid_cols),
+                                    to,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ])?;
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // Tile (i, j) of op(X), into L1 at `to`.
             let fetch =
                 |x: &TensorRef, t: bool, i: u32, j: u32, to: u32| -> Result<[u32; 8], u32> {
@@ -473,6 +540,79 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn packed_gather_uses_halfword_slots_and_only_fills_edges() {
+        let mut a = t(3, 3);
+        a.first = 2;
+        let b = t(3, 2);
+        let [mut a0, a1] = a.encode();
+        let [mut b0, b1] = b.encode();
+        a0[4] = 37;
+        a0[5] = 65;
+        b0[4] = 65;
+        b0[5] = 35;
+        let head = [GATHER, GATHER_BF16 | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
+        let mut got = Vec::new();
+        expand_reads(&[head, a0, a1, b0, b1], |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let mut next = 0;
+        for (x, height, width, nr, nc, at) in
+            [(a, 37u32, 65u32, 2, 3, 0x20000), (b, 65, 35, 3, 2, 0x60000)]
+        {
+            for i in 0..nr {
+                for j in 0..nc {
+                    let tile = x.first + i * x.ct + j;
+                    let channel = (tile % 3) as usize;
+                    let off = x.base[channel] + tile / 3 * 2112;
+                    let to = at + (i * nc + j) * 4160;
+                    assert_eq!(
+                        got[next],
+                        [
+                            op::READ,
+                            x.channels[channel] as u32,
+                            (i + j) % PORTS,
+                            off,
+                            to,
+                            2112,
+                            0,
+                            0
+                        ]
+                    );
+                    next += 1;
+                    let rows = (height - i * 32).min(32);
+                    let cols = (width - j * 32).min(32);
+                    if rows != 32 || cols != 32 {
+                        assert_eq!(
+                            got[next],
+                            [
+                                op::FILL_HALFWORDS,
+                                0,
+                                super::super::fill::param(rows, cols),
+                                to,
+                                0,
+                                0,
+                                0,
+                                0
+                            ]
+                        );
+                        next += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(next, 20);
+        assert_eq!(next, got.len());
+        let mut bad = head;
+        bad[1] |= 1; // A BF16 transpose cannot enter the F32 mover transform.
+        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| Ok(())).is_err());
+        a0[5] = 32; // Descriptor dimensions must agree with its grid.
+        assert!(expand_reads(&[head, a0, a1, b0, b1], |_| Ok(())).is_err());
+        assert!(expand_writes(&[head, a0, a1, b0, b1], |_| Ok(())).is_err());
+    }
 
     /// Every tile a record names is the one `TensorRef::tile` gives: the
     /// cursor that steps along rows agrees with dividing per tile, across a

@@ -4,6 +4,25 @@ This is the reference for how fast the firmware is: the data mover, the
 B → T0/T1/T2 path, and E1. After each optimization, run `cargo xtask bench`, update
 the Scoreboard rows it moved, and add a line to the Change log.
 
+## Packed BF16 update, 2026-10-05
+
+Run `1791162075`, card 0 p150a, one Tensix, release, SHA
+`0d6ba5227fdb+dirty`, 1350 MHz AICLK, 16000 MT/s GDDR, eight channels, HiFi4,
+pipeline/profiling off, resident operands, one warmup, nine synchronized host
+samples, output validated outside timing:
+
+| GEMM | Earlier packed BF16 (us) | Compact packed BF16 (us) | Current TF32 (us) |
+|---|---:|---:|---:|
+| 64×784×128 | 661.742 | 141.092 | 97.741 |
+| 64×128×10 | 80.840 | 53.499 | 18.083 |
+
+Compact GATHER descriptors replace per-tile read/fill entries; only ragged lanes
+are filled. The larger BF16 case improves about 4.7×. Both BF16 cases remain
+slower than TF32, so no MNIST speedup is established. Results:
+`target/silicon/bench/1791162075.{md,jsonl}`. The separate BF16 accuracy run
+achieves 91.82% after one epoch; see the implementation record for conditions.
+Ordinary benchmarks now use one card; test both for actual cross-card behavior.
+
 ## How to measure
 
 - `cargo xtask bench` runs every benchmark in release, one per process. It writes
@@ -643,6 +662,10 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-05 | 1791160155 (gates) | Final BF16/pooling gates include integer/Boolean casts, analytic norm derivatives, mixed F32-loss SGD, BF16 trace temporary holds, matmul-to-pooling ADC reset, partial ceil windows and exact max-pool zero/NaN value/index selection. | Both cards pass 24/24. Max pooling uses SFPU argmax plus a raw-bit OR fold; the arithmetic gather negative control changed signed zero/NaN payloads and failed. This adds correctness coverage, not a speedup. |
+| 2026-10-05 | 1791158550 | Packed BF16 versus resident F32→TF32 operands for MNIST's 64×784×128 and 64×128×10 forward GEMMs. Both p150a cards, one gate tile, HiFi4, pipeline off, role profiling off, 1350 MHz AICLK, 16000 MT/s GDDR, eight channels, SHA `0d6ba5227fdb+dirty`; one warm-up, nine completed host-timed samples, output validated every run outside timing. | Card 0: TF32 93.964/18.135 us, BF16 661.742/80.840 us. Card 1: TF32 93.102/18.294 us, BF16 663.076/82.012 us. Current per-tile BF16 gather/mask path is slower; storage savings do not establish an MNIST speedup. No full MNIST performance run. Results: `target/silicon/bench/1791158550.{jsonl,md}`. |
+| 2026-10-05 | 1791158962 (gates) | Native BF16 storage/layout/casts, packed MMA, arithmetic adapters, normalization derivatives, F32-loss/BF16 SGD, trace temporary holds and NCHW pooling/backwards. GMPOOL/GAPOOL encodings measure required bit 19 while preserving AddrMod at 15. | Both-card correctness: 22/22. BF16 narrowing refuses pinned ttsim mode `0x105`; those arithmetic gates are silicon-only. Pool window staging remains a coverage path, not a performance optimization. |
+| 2026-10-04 | unrun | Reduction/scan and ALU extensions; `silicon_bench_path::tensix_extensions` stages one warm-up and nine completed host-timed runs with per-run output validation | No measured claim: no cards available. Run `cargo xtask bench --device all --filter tensix_extensions`; record run IDs before changing the scoreboard. |
 | 2026-10-04 | 1791079782 | Overlap decided per `tensor::Overlap` (off, fresh, captured) with shares measured on NC ownership; `HostStage::Check` splits list checks from the ring write; a trace's program holds carry the cache generation (a release after recovery no longer unholds a newer trace's program) | Fresh 8-tile 2048² add 1.07 -> 1.00 of serial; traced 8/32-tile adds 1.00 -> 0.77-0.95 from 512-1024²; one-tile small reductions 1.00 -> 0.91; enqueue unchanged. Silicon 306/306 (run 1791079893). |
 | 2026-10-03 | — | B a pure reader, NC a pure writer. `SIGNAL` / `WAIT_PEER`, `dm::Peer` and B's NoC #1 writes removed; standalone transfers are kernel-less reader/writer packets (`Step::Transfer`, `dataflow::Stream::Transfer`); `Mover::permits` is the one direction table; `FILL_PAD` split with a new `PAD_WRITE`; each image compiles in only its direction. | B 24,240 -> 20,856 B (3.7 KB free from 0.3), NC ~22.9 -> 14.8 KB. Compute and the models unchanged (MNIST 1.3 ms/step, transformer 8.72); large host uploads -31%; small uploads on many tiles +5-8%, a one-tile 64×10 upload +2 µs. Silicon 296/296. |
 | 2026-10-03 | 1791063177 / 1791063683 | Consolidate GDDR compute under fixed streaming ownership; remove legacy scheduler selection and reject nonstreamable compute instead of falling back. Both firmware images required by `enable_dram`. | Full initial hardware audit 295/295, final strict ownership/cache/profile/benchmark checks 22/22, full host/simulator suite 710 passed. Mixed stress 60 s each on one/eight tiles, 39971/72561 rounds. Traced identity remains 357 / 329 GB/s combined at 32 / 120 tiles. Known fresh-dispatch regressions accepted; no universal speedup claimed. |
@@ -682,7 +705,7 @@ simulator-gated (`step67`/`step68`). Repacking currently sends per-element
 coordinate metadata and may reload a partially assembled tile across several
 transfer batches; split-K matmul uses one output tile per job and serial
 accumulator reloads. These are coverage paths with no performance claim.
-No silicon device nodes are available in the implementation environment.
+Both-card correctness passed in run `1791145571`; performance remains unmeasured.
 Before recording a score, run release silicon on both cards, validate outputs,
 warm each shape/route/fidelity, report medians with host timing and
 `dataflow_stats`, and record run IDs. Compare new general reductions with the

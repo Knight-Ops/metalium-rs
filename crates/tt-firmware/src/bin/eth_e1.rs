@@ -46,7 +46,10 @@ fn tt_link(src: u64, dst: u64, len: u32) {
     while done < len {
         let n = (len - done).min(mover::TT_LINK_CHUNK);
         txq_idle();
-        wr(q + eth::txq::TRANSFER_START_ADDR, (src + done as u64) as u32);
+        wr(
+            q + eth::txq::TRANSFER_START_ADDR,
+            (src + done as u64) as u32,
+        );
         wr(q + eth::txq::TRANSFER_SIZE_BYTES, n);
         wr(q + eth::txq::DEST_ADDR, (dst + done as u64) as u32);
         wr(q + eth::txq::CMD, cmd);
@@ -62,12 +65,24 @@ fn noc_copy(me: (u8, u8), tile: (u8, u8, u32), local: u64, len: u32, into_local:
     let mut done = 0u32;
     while done < len {
         let n = (len - done).min(MAX_REQUEST_BYTES);
-        let remote = Endpoint { x: tile.0, y: tile.1, addr: tile.2 + done };
+        let remote = Endpoint {
+            x: tile.0,
+            y: tile.1,
+            addr: tile.2 + done,
+        };
         let l = (local + done as u64) as u32;
         let cmd = if into_local {
-            Command::Read { from: remote, to_local: l, len: n }
+            Command::Read {
+                from: remote,
+                to_local: l,
+                len: n,
+            }
         } else {
-            Command::Write { from_local: l, to: remote, len: n }
+            Command::Write {
+                from_local: l,
+                to: remote,
+                len: n,
+            }
         };
         if noc::issue(Niu::Noc0, &cmd, me, TXN).is_err() {
             fail(mover::error::ALIGNMENT);
@@ -108,7 +123,11 @@ fn send(me: (u8, u8), seq: u32) {
     if len == 0 || len % 16 != 0 || len > mover::MAX_LEN {
         fail(mover::error::LENGTH);
     }
-    let (sx, sy, sa) = (rd(mover::SEND_SRC_X), rd(mover::SEND_SRC_Y), rd(mover::SEND_SRC_ADDR));
+    let (sx, sy, sa) = (
+        rd(mover::SEND_SRC_X),
+        rd(mover::SEND_SRC_Y),
+        rd(mover::SEND_SRC_ADDR),
+    );
     if sx != mover::NO_TILE {
         if sa % 16 != 0 {
             fail(mover::error::ALIGNMENT);
@@ -132,7 +151,11 @@ fn send(me: (u8, u8), seq: u32) {
         wr(mover::RECORD_STAGE + i as u64 * 4, *w);
     }
     publish();
-    tt_link(mover::RECORD_STAGE, mover::INBOX, mover::RECORD_BYTES as u32);
+    tt_link(
+        mover::RECORD_STAGE,
+        mover::INBOX,
+        mover::RECORD_BYTES as u32,
+    );
     trace(event::RECORD_SENT, seq);
     wr(mover::SENT, seq);
     publish();
@@ -158,7 +181,11 @@ fn receive(me: (u8, u8), seq: u32) {
         }
     }
     trace(event::LANDED, seq);
-    let (dx, dy, da) = (rd(mover::INBOX + 8), rd(mover::INBOX + 12), rd(mover::INBOX + 16));
+    let (dx, dy, da) = (
+        rd(mover::INBOX + 8),
+        rd(mover::INBOX + 12),
+        rd(mover::INBOX + 16),
+    );
     if dx != mover::NO_TILE {
         if da % 16 != 0 {
             fail(mover::error::ALIGNMENT);

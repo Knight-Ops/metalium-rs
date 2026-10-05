@@ -21,23 +21,22 @@ alternative; (2) automate, with a once-per-key warning that names the op, shape,
 and cost; (3) a typed, actionable error at the earliest point. Never an opaque panic or
 hang mid-model.
 
-**Status, 2026-10-04** (current code; dated comparisons below are historical):
-B0 report/strict mode done, tracing/reason attribution open; B5 rank-N storage
-and views done, unaligned slices/partial-row readback open; B6 tile-aligned
-batched matmul done, untiled shapes host-staged. B8 asynchronous submission and
-sticky errors are implemented; `Backend::sync` still uses Burn's default, so a
-backend barrier remains open. B3's stale-id hazard is closed by never-reused
-process-wide ids. B1 is partial (`EngineError(String)`, not typed `TtError`).
-B2, B4, B7 and B9–B15 remain open. Full F32 sum/mean now have resident paths
-(R1b), so the transformer gate no longer permits a host `float_mean`; it permits
-an explicit 4-byte scalar loss readback instead. Full reductions upload host
-F32 inputs and always use native arithmetic, including in exact mode; unsupported
-inputs fail explicitly. Full reductions on mesh engines execute on chip 0's
-SFPU with L1 staging and a host scalar result; both passes must fit L1/program
-capacity.
-Legacy approximate ops follow resident data at every size unless exact mode
-is selected; the old small-op thresholds are removed. B16 placement/lookahead
-policy remains a separate proposal.
+**Status, 2026-10-05** (current code; dated comparisons below are historical):
+Native execution refuses unsupported operations explicitly. Full and arbitrary-axis
+F32 sums/maxima, direct products, Boolean AND/OR reductions, rank-N argextrema,
+inclusive sums/products, full-width I32 ALU and deterministic rounding/casts
+have resident paths. The extensions pass simulator and both-card gates in `step69`–
+`step72`. LayerNorm/RMSNorm use Burn's
+native compositions, including backward gates, without new fused kernels.
+BF16 storage, casts, layout copies, packed matmul and native arithmetic adapters
+are implemented, with silicon gates for late narrowing. NCHW pooling and its
+backwards are resident; BF16 average pooling uses GAPOOL. Packed BF16 batched
+products, BF16 mesh execution and F32/BF16 pooling traces are gated. Mesh operands
+widen on device for Ethernet transport. Integer reductions are resident;
+division/remainder and integer mean remain unsupported pending domain-flag validation. See [the implementation record](tensix-next-features.md)
+and [the backend contract](../crates/burn-tt/README.md) for limitations.
+B0 reporting and B3 stale-id protection are implemented; tracing, typed errors,
+lazy discovery, conformance, fusion and placement remain separate backend work.
 
 Next backend order: typed errors and a real sync barrier (B1/B8), lazy init
 and device discovery/card locks (B2), then the Burn conformance suite (B10/B11).

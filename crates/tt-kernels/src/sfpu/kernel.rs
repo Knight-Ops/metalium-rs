@@ -196,6 +196,15 @@ pub fn roles_code(
     operands: Operands,
     math: &crate::code::Code,
 ) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    roles_code_validated(layout, operands, math, false)
+}
+
+pub(crate) fn roles_code_validated(
+    layout: &Layout,
+    operands: Operands,
+    math: &crate::code::Code,
+    checked: bool,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
     use crate::code::Loop;
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
@@ -266,6 +275,12 @@ pub fn roles_code(
             slot(layout.out_at, n) + tt_isa::dm::TILE_DATA,
             OUT_ROW,
         ));
+        if checked {
+            pack.extend(pack_tile_from_dst(
+                slot(layout.b_at.expect("domain flags"), n) + tt_isa::dm::TILE_DATA,
+                C_ROW,
+            ));
+        }
         pack.extend(sync::post_after(Unit::Packer, s.free));
     }
     unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());

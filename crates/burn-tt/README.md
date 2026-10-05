@@ -20,7 +20,7 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | `float_sum_dim` / `float_mean_dim` / `float_max_dim` | all F32 axes, including ragged rank-N views; SFPU reductions with native repacking |
 | `float_sum`, `float_mean` (rank one or more) | Native full F32 reduction, bounded column chunks followed by the chunked row sum; mean divides on the SFPU |
 | `float_transpose` / `float_swap_dims` / `float_permute` | strided views at any rank; downstream native copies use whole-tile moves or ragged word repacking |
-| `float_argmax` / `float_argmin` | native selection, first tie/NaN; rank-one/two F32, I32 indices, axes up to 2^23 |
+| `float_argmax` / `float_argmin` | native selection, first tie/NaN; rank-N F32, I32 indices, axes up to 2^23 |
 | `bool_equal` / `bool_equal_elem` | Boolean XOR/NOT or identity, native broadcasts |
 | `bool_into_float` / `bool_into_int` | exact native 0/1 conversion to F32/I32 |
 | `float_any` / `float_all` and dimensional variants | Burn defaults over comparisons, Boolean-to-F32 and supported native sums |
@@ -67,6 +67,28 @@ explicit unsupported methods are generated into `src/generated/ops.rs` by
 | `Topology::from_env` (`TT_TOPOLOGY`, `"0"` or `"0,1"`), `tiles_from_env` (`TT_TILES`, `n` or `all`) | Environment-driven choice, used by the `tt-tests` silicon harness. |
 | `tensor_traffic`, `device_traffic`, `record_transfers` | PCIe traffic accounting. |
 
+## New Tensix primitives
+
+Direct F32 `prod`/`prod_dim` support negative inputs and zero. Full products
+reduce logical axes in descending order; dimensional products use the declared
+SFPU accumulation/fold order. Boolean `any`/`all` reduce canonical bits directly.
+Inclusive F32 `cumsum`/`cumprod` traverse logical indices in order, carrying
+prefixes between tiles. Arbitrary-axis scans and arg-reductions use native word
+repacking; flip and stepped slices (including reversal) copy on the card.
+
+I32 add/sub/mul wrap modulo 2^32; signed comparisons never convert to F32.
+Bitwise shifts mask counts modulo 32, with arithmetic right shift. F32 `round`
+is ties-even; floor/ceil/trunc preserve special values and signed zeros.
+F32-to-I32 truncates and saturates, with NaN mapped to zero. These programs do
+not use SFPSTOCHRND's differing rounding/format semantics.
+
+Dedicated LayerNorm/RMSNorm gates validate existing Burn compositions without
+introducing a fused API. Gates `step69`–`step72` pass the simulator and both
+cards (`target/silicon/1791145571.log`). The pinned `Autodiff` backend still inherits
+Burn's log/exp product default, so negative-valued direct products are currently
+an eager TtBackend capability. Its cumprod backward also has Burn's documented
+zero-input limitation; nonzero scan gradients are gated natively.
+
 ## Test
 
 ```bash
@@ -83,11 +105,36 @@ The MLP and transformer gates reject host arithmetic and staged model compute.
 
 ## Dtypes and physical formats
 
-Constructors and compute currently support F32, I32 and Bool as implemented by
-the native primitives. F32 reports accelerated arithmetic; Bool reports storage
-and logic arithmetic; I32 reports storage and conversion support. Integer
-arithmetic is unsupported.
-F16, BF16, other integers and quantized tensors are unsupported.
+Constructors and compute support F32, BF16, I32 and Bool as implemented by
+the native primitives. F32/BF16 report accelerated arithmetic; Bool reports storage
+and logic arithmetic. I32 retains the conservative `Storage` capability flag
+until general integer tensor coverage is complete; its implemented native
+operations include conversion, wrapping arithmetic, bitwise ops, signed
+comparisons, shifts, wrapping sum/product and signed min/max reductions.
+Integer division/remainder and mean remain unsupported.
+F16, other integers and quantized tensors are unsupported.
+
+BF16 uses 2112-byte physical slots with two-byte datums. Raw upload/download,
+views and layout copies preserve payloads. Device casts round ties-even, quiet
+NaNs and flush BF16 subnormals to signed zero. Packed rank-two matmul reads BF16
+directly and accumulates in F32; most other floating-point operations widen on
+Tensix, compute through native F32 primitives, then narrow at the operation
+boundary. Operands must share a dtype. BF16 mesh execution uses resident Ethernet
+execution after native device widening; network operand storage is currently F32.
+Packed single-card products support K continuations, batches and broadcast views.
+Pooling geometry/index metadata is replayable, enabling F32 and BF16 pool traces.
+I32 sum/product and signed min/max reductions are native. Integer division,
+remainder and mean remain unsupported pending checked domain-flag validation.
+Burn BF16 arithmetic is silicon-gated because ttsim refuses late narrowing.
+
+Native NCHW average/adaptive pooling and max pooling with resident spatial indices
+support overlap backwards. BF16 averages use GAPOOL; F32 averages and general max
+use SFPU to retain their numerical contracts. All-padding windows fail explicitly.
+Pooling geometry constants use replayable metadata, enabling trace capture. The GMPOOL
+block API is opt-in. `step74`–`step78` cover these paths; see
+[the implementation record](../../docs/tensix-next-features.md) for runs and limits.
+BF16 currently saves storage rather than time: the first packed gather path is
+slower than TF32 on the measured MNIST GEMMs.
 
 Burn's logical dtype and shape belong to `TtTensor`; the engine owns the physical
 device layout. Host byte counts are not device allocation sizes. Tenstorrent
@@ -161,7 +208,7 @@ unparsable value as `0`.
   only: ttsim does not model the timestamper's event stream.
 - `Topology::Cards` uses resident buffers and one compute tile per card;
   `on_tiles` refuses more. Non-matmul primitives execute on chip 0.
-- Native argmax and argmin support rank-one/two F32 input, I32 output, and reduced axes
+- Native argmax and argmin support rank-N F32 input, I32 output, and reduced axes
   of at most 2^23 elements, with first-tie and first-NaN semantics.
 - Random construction uses independent host RNG streams per `TtDevice`, seeded
   through `TtBackend::seed`. Draws are reproducible on this backend; matching

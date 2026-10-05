@@ -24,6 +24,178 @@ use crate::unsupported::{context, fail};
 use crate::{TtBackend, TtDevice, TtQTensor, TtTensor};
 use tt_kernels::sfpu::ops::kind_sfpu;
 
+/// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
+/// BF16 arithmetic widens to F32 on Tensix, computes using the existing native
+/// contract, then rounds its floating-point result once at the operation boundary.
+pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
+    if tensor.dtype() == dtype {
+        return tensor;
+    }
+    if !matches!(
+        (tensor.dtype(), dtype),
+        (DType::F32, DType::BF16) | (DType::BF16, DType::F32)
+    ) || !tensor.is_storable()
+        || !crate::server::supports_dram(tensor.device)
+    {
+        fail(
+            "float_cast",
+            format_args!("{}, output={dtype:?}", context(&tensor)),
+        );
+    }
+    let source = tensor.to_dram();
+    let (id, dims) = crate::server::cast_float(
+        tensor.device,
+        source.buffer.id,
+        [source.buffer.rows, source.buffer.cols],
+        dtype == DType::BF16,
+    );
+    let mut result = device_view(tensor.device, id, dims, None, dtype)
+        .to_dram()
+        .clone();
+    result.transposed = source.transposed;
+    TtTensor::on_device(result, tensor.shape(), dtype, tensor.device)
+}
+
+pub(crate) fn float_compute_input(tensor: TtTensor) -> TtTensor {
+    if tensor.dtype() == DType::BF16 {
+        cast_native(tensor, DType::F32)
+    } else {
+        tensor
+    }
+}
+
+pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    if lhs.dtype() != DType::BF16
+        || rhs.dtype() != DType::BF16
+        || !lhs.is_storable()
+        || !rhs.is_storable()
+    {
+        return None;
+    }
+    assert_eq!(
+        lhs.device, rhs.device,
+        "BF16 matmul operands must share a device"
+    );
+    if lhs.shape().num_dims() > 2 || rhs.shape().num_dims() > 2 {
+        return bf16_batched_matmul(lhs, rhs);
+    }
+    if !lhs.is_storable_matrix() || !rhs.is_storable_matrix() {
+        return None;
+    }
+    let a = plain_dram(lhs);
+    let b = plain_dram(rhs);
+    assert_eq!(
+        a.buffer.cols, b.buffer.rows,
+        "BF16 matmul inner dimensions differ"
+    );
+    let (id, dims) = crate::server::matmul_bf16(
+        lhs.device,
+        a.buffer.id,
+        b.buffer.id,
+        [a.buffer.rows, b.buffer.cols],
+    );
+    Some(cast_native(
+        device_result(lhs.device, id, dims),
+        DType::BF16,
+    ))
+}
+
+/// Packed matrix products for each logical batch, including broadcast and
+/// strided operands. Repack copies BF16 bits; products remain F32 until the
+/// joined tensor's single BF16 boundary conversion.
+fn bf16_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
+    let rank = ls.len().max(rs.len());
+    if ls.len() < 2 || rs.len() < 2 {
+        return None;
+    }
+    let (m, k, n) = (ls[ls.len() - 2], ls[ls.len() - 1], rs[rs.len() - 1]);
+    if rs[rs.len() - 2] != k {
+        return None;
+    }
+    let lead = |shape: &[usize]| {
+        let mut out = vec![1; rank - shape.len()];
+        out.extend_from_slice(&shape[..shape.len() - 2]);
+        out
+    };
+    let (la, lb) = (lead(&ls), lead(&rs));
+    let batch = la
+        .iter()
+        .zip(&lb)
+        .map(|(&a, &b)| (a == b || a == 1 || b == 1).then_some(a.max(b)))
+        .collect::<Option<Vec<_>>>()?;
+    let count = batch.iter().try_fold(1usize, |a, &b| a.checked_mul(b))?;
+    if count == 0 || [m, k, n].contains(&0) {
+        return None;
+    }
+    let mut shape = batch.clone();
+    shape.extend([m, n]);
+    // A broadcast weight can consume all input rows in one packed product.
+    if lb.iter().all(|&d| d == 1) && ls[..ls.len() - 2].iter().product::<usize>() == count {
+        let a = repack_shape(lhs, vec![count.checked_mul(m)?, k]);
+        let b = repack_shape(rhs, vec![k, n]);
+        let out = bf16_matmul(&a, &b)?;
+        return Some(repack_shape(&out, shape));
+    }
+    let view = |t: &TtTensor| {
+        t.as_strided()
+            .unwrap_or_else(|| crate::views::Strided::of(t.to_dram(), &t.shape().to_vec()))
+    };
+    let (va, vb) = (view(lhs), view(rhs));
+    let device = lhs.device;
+    let mut outputs = Vec::with_capacity(count);
+    for batch_index in 0..count {
+        let pack = |t: &TtTensor,
+                    v: &crate::views::Strided,
+                    original: &[usize],
+                    lead: &[usize],
+                    dims: [usize; 2]| {
+            let mut index = batch_index;
+            let mut coords = vec![0; batch.len()];
+            for d in (0..batch.len()).rev() {
+                coords[d] = if lead[d] == 1 { 0 } else { index % batch[d] };
+                index /= batch[d];
+            }
+            let flat_batch = coords.iter().zip(lead).fold(0, |a, (&i, &d)| a * d + i);
+            let size = dims[0] * dims[1];
+            let sources = (0..size)
+                .map(|i| v.at(original, flat_batch * size + i))
+                .collect();
+            let (id, dims) = crate::server::repack(device, v.src.buffer.id, sources, dims);
+            device_result_shaped(t.device, id, dims, dims.into(), DType::BF16)
+        };
+        let a = pack(lhs, &va, &ls, &la, [m, k]);
+        let b = pack(rhs, &vb, &rs, &lb, [k, n]);
+        let (id, dims) = crate::server::matmul_bf16(
+            device,
+            a.to_dram().buffer.id,
+            b.to_dram().buffer.id,
+            [m, n],
+        );
+        outputs.push(device_result(device, id, dims));
+    }
+    let ids = outputs.iter().map(|t| t.to_dram().buffer.id).collect();
+    let rows = (0..count)
+        .flat_map(|b| (0..m).map(move |r| (b, r)))
+        .collect();
+    let (id, dims) = crate::server::gather_rows(device, ids, rows, n);
+    Some(cast_native(
+        device_result_shaped(device, id, dims, shape.into(), DType::F32),
+        DType::BF16,
+    ))
+}
+
+pub(crate) fn float_compute_dtype(inputs: &[&TtTensor]) -> DType {
+    let dtype = inputs[0].dtype();
+    if inputs.iter().any(|input| input.dtype() != dtype) {
+        fail(
+            "BF16 arithmetic",
+            "floating-point operands must have the same dtype",
+        );
+    }
+    dtype
+}
+
 /// A tensor moved to `device`. The same device: unchanged. Another: its host
 /// copy, retagged -- a device copy belongs to the chip that holds it.
 fn retag(tensor: TtTensor, device: &TtDevice) -> TtTensor {
@@ -73,6 +245,117 @@ fn plain_dram(tensor: &TtTensor) -> crate::tensor::DramRef {
     device_view(tensor.device, id, dims, None, tensor.dtype())
         .to_dram()
         .clone()
+}
+
+/// Put the selected logical axis in matrix columns; the host constructs addresses only.
+fn pack_axis(tensor: &TtTensor, dim: usize) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    if dim >= shape.len() || shape.contains(&0) || !tensor.is_storable() {
+        return None;
+    }
+    let view = tensor
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    let mut out = shape.clone();
+    out[dim] = 1;
+    let outputs = out.iter().try_fold(1usize, |n, &d| n.checked_mul(d))?;
+    let mut sources = Vec::with_capacity(outputs.checked_mul(shape[dim])?);
+    for output in 0..outputs {
+        let mut remaining = output;
+        let mut indices = vec![0; shape.len()];
+        for k in (0..shape.len()).rev() {
+            indices[k] = remaining % out[k];
+            remaining /= out[k];
+        }
+        for index in 0..shape[dim] {
+            indices[dim] = index;
+            let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+            sources.push(view.at(&shape, flat));
+        }
+    }
+    let (id, dims) = crate::server::repack(
+        tensor.device,
+        view.src.buffer.id,
+        sources,
+        [outputs, shape[dim]],
+    );
+    Some(device_view(tensor.device, id, dims, None, tensor.dtype()))
+}
+
+/// Retile a matrix's logical sequence into another shape without reading its data.
+fn repack_shape(tensor: &TtTensor, shape: Vec<usize>) -> TtTensor {
+    let dims = crate::tensor::stored_dims(&shape).expect("nonempty output shape");
+    let source = plain_dram(tensor);
+    let cols = source.buffer.cols;
+    let sources = (0..shape.iter().product())
+        .map(|i| [i / cols, i % cols])
+        .collect();
+    let (id, dims) = crate::server::repack(tensor.device, source.buffer.id, sources, dims);
+    device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        burn_backend::Shape::from(shape),
+        tensor.dtype(),
+    )
+}
+
+/// Copy a stepped logical slice on the card; negative steps traverse the
+/// selected interval backward, as Burn's pinned Slice contract specifies.
+fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    if !tensor.is_storable()
+        || slices.len() > shape.len()
+        || !crate::server::supports_dram(tensor.device)
+    {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    for (dim, &n) in shape.iter().enumerate() {
+        let slice = slices
+            .get(dim)
+            .cloned()
+            .unwrap_or_else(burn_backend::Slice::full);
+        let range = slice.to_range(n);
+        let step = slice.step.unsigned_abs();
+        if step == 0 {
+            return None;
+        }
+        let indices: Vec<_> = if slice.step > 0 {
+            range.step_by(step).collect()
+        } else {
+            range.rev().step_by(step).collect()
+        };
+        if indices.is_empty() {
+            return None;
+        }
+        ranges.push(indices);
+    }
+    let output: Vec<_> = ranges.iter().map(Vec::len).collect();
+    let count = output.iter().try_fold(1usize, |n, &d| n.checked_mul(d))?;
+    let view = tensor
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    let sources = (0..count)
+        .map(|mut i| {
+            let mut coords = vec![0; shape.len()];
+            for d in (0..shape.len()).rev() {
+                coords[d] = ranges[d][i % output[d]];
+                i /= output[d];
+            }
+            let flat = coords.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+            view.at(&shape, flat)
+        })
+        .collect();
+    let dims = crate::tensor::stored_dims(&output)?;
+    let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        burn_backend::Shape::from(output),
+        tensor.dtype(),
+    ))
 }
 
 /// Broadcast bytes on the device using row gathers and whole-matrix transposes.
@@ -487,7 +770,6 @@ pub mod float {
         let shape = tensor.shape().to_vec();
         if out_dtype != IntDType::I32
             || shape.is_empty()
-            || shape.len() > 2
             || dim >= shape.len()
             || shape[dim] == 0
             || shape[dim] > 8_388_608
@@ -499,6 +781,13 @@ pub mod float {
                 format_args!("{}, dim={dim}, out_dtype={out_dtype:?}", context(&tensor)),
             );
         }
+        if shape.len() > 2 {
+            let packed = pack_axis(&tensor, dim).unwrap_or_else(|| fail(op, context(&tensor)));
+            let selected = argextreme(packed, 1, out_dtype, minimum);
+            let mut output = shape;
+            output[dim] = 1;
+            return repack_shape(&selected, output);
+        }
         let tensor = if minimum { float_neg(tensor) } else { tensor };
         let axis = if shape.len() == 1 { 1 } else { dim };
         let dims = tensor.stored().expect("matrix");
@@ -509,10 +798,9 @@ pub mod float {
                 -(index as f32)
             })
             .collect::<Vec<_>>();
-        let indices = TtTensor::new(
-            HostBuffer::from_data(TensorData::new(indices, dims)),
-            tensor.device,
-        );
+        let bits = indices.into_iter().map(f32::to_bits).collect();
+        let id = crate::server::metadata(tensor.device, bits, dims, Elem::F32);
+        let indices = device_result(tensor.device, id, dims);
         let nan = device_eltwise(kind_sfpu::IS_NAN, 0.0, &tensor, None).expect("F32 predicate");
         let clean = device_eltwise(kind_sfpu::MASK_FILL, f32::NEG_INFINITY, &tensor, Some(&nan))
             .expect("mask");
@@ -559,7 +847,7 @@ pub mod float {
     }
 
     pub fn float_from_data(data: TensorData, device: &TtDevice) -> TtTensor {
-        if data.dtype != DType::F32 {
+        if !matches!(data.dtype, DType::F32 | DType::BF16) {
             fail("float_from_data", context(&data));
         }
         TtTensor::new(HostBuffer::from_data(data), *device)
@@ -570,6 +858,11 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
+        if DType::from(dtype) == DType::BF16 {
+            let mut data = TensorData::zeros::<u16, _>(shape);
+            data.dtype = DType::BF16;
+            return float_from_data(data, device);
+        }
         if DType::from(dtype) != DType::F32 {
             fail(
                 "float_empty",
@@ -585,6 +878,12 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
+        if DType::from(dtype) == DType::BF16 {
+            return cast_native(
+                float_from_data(crate::random::float(*device, shape, distribution), device),
+                DType::BF16,
+            );
+        }
         if DType::from(dtype) != DType::F32 {
             fail(
                 "float_random",
@@ -931,7 +1230,7 @@ pub mod float {
     /// moves, at any rank. A swap that leaves it a plain matrix or its 2-D
     /// transpose is that, as before.
     fn swapped_strided(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
-        if tensor.dtype() != DType::F32 || dim1 == dim2 {
+        if !matches!(tensor.dtype(), DType::F32 | DType::BF16) || dim1 == dim2 {
             return None;
         }
         let v = tensor.as_strided()?;
@@ -940,6 +1239,7 @@ pub mod float {
         Some(TtTensor::view(
             v.swapped(dim1, dim2),
             burn_backend::Shape::from(shape),
+            tensor.dtype(),
             tensor.device,
         ))
     }
@@ -951,7 +1251,7 @@ pub mod float {
     /// tensor's matrix is
     /// [`reshaped`]'s.
     fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
-        if tensor.dtype() != DType::F32 {
+        if !matches!(tensor.dtype(), DType::F32 | DType::BF16) {
             return None;
         }
         let (from, to) = (tensor.shape().to_vec(), shape.to_vec());
@@ -961,7 +1261,12 @@ pub mod float {
         }
         let v = tensor.as_strided()?;
         if let Some(r) = v.reshaped(&from, &to) {
-            return Some(TtTensor::view(r, shape.clone(), tensor.device));
+            return Some(TtTensor::view(
+                r,
+                shape.clone(),
+                tensor.dtype(),
+                tensor.device,
+            ));
         }
         let dims = crate::tensor::stored_dims(&to)?;
         let (id, dims) = if let Some(moves) = v.tile_moves(&from, &to) {
@@ -975,7 +1280,7 @@ pub mod float {
             id,
             dims,
             shape.clone(),
-            DType::F32,
+            tensor.dtype(),
         ))
     }
 
@@ -1240,6 +1545,100 @@ pub mod float {
         )
     }
 
+    pub fn float_cumsum(tensor: TtTensor, dim: usize) -> TtTensor {
+        scan_dim(
+            tensor,
+            dim,
+            tt_kernels::sfpu::scan::ScanOp::Sum,
+            "float_cumsum",
+        )
+    }
+
+    pub fn float_cumprod(tensor: TtTensor, dim: usize) -> TtTensor {
+        scan_dim(
+            tensor,
+            dim,
+            tt_kernels::sfpu::scan::ScanOp::Prod,
+            "float_cumprod",
+        )
+    }
+
+    fn scan_dim(
+        tensor: TtTensor,
+        dim: usize,
+        op: tt_kernels::sfpu::scan::ScanOp,
+        name: &str,
+    ) -> TtTensor {
+        check_reduce_dim(&tensor, dim, name);
+        let packed = pack_axis(&tensor, dim).unwrap_or_else(|| fail(name, context(&tensor)));
+        let transposed = swapped_view(&packed, 0, 1).expect("packed matrix");
+        let source = plain_dram(&transposed);
+        let (id, dims) = crate::server::scan(tensor.device, source.buffer.id, op);
+        let scanned = device_result(tensor.device, id, dims);
+        let scanned = swapped_view(&scanned, 0, 1).expect("scanned matrix");
+        let plain = plain_dram(&scanned);
+        let shape = tensor.shape().to_vec();
+        let mut out_shape = shape.clone();
+        out_shape[dim] = 1;
+        let sources = (0..shape.iter().product())
+            .map(|mut flat| {
+                let mut coords = vec![0; shape.len()];
+                for k in (0..shape.len()).rev() {
+                    coords[k] = flat % shape[k];
+                    flat /= shape[k];
+                }
+                let column = coords[dim];
+                coords[dim] = 0;
+                let row = coords
+                    .iter()
+                    .zip(&out_shape)
+                    .fold(0, |n, (&i, &d)| n * d + i);
+                [row, column]
+            })
+            .collect();
+        let dims = crate::tensor::stored_dims(&shape).expect("stored scan shape");
+        let (id, dims) = crate::server::repack(tensor.device, plain.buffer.id, sources, dims);
+        device_result_shaped(
+            tensor.device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        )
+    }
+
+    /// Direct product, including negative values and zero, on the SFPU.
+    pub fn float_prod_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        check_reduce_dim(&tensor, dim, "float_prod_dim");
+        device_reduce(&tensor, tt_kernels::sfpu::reduce::ReduceOp::Prod, dim)
+            .unwrap_or_else(|| fail("float_prod_dim", context(&tensor)))
+    }
+
+    pub fn float_prod(tensor: TtTensor) -> TtTensor {
+        reduce_all(
+            tensor,
+            tt_kernels::sfpu::reduce::ReduceOp::Prod,
+            "float_prod",
+        )
+    }
+
+    /// Reduce logical axes in descending order without flattening a strided view.
+    pub(crate) fn reduce_all(
+        mut tensor: TtTensor,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        name: &str,
+    ) -> TtTensor {
+        let rank = tensor.shape().num_dims();
+        if rank == 0 {
+            fail(name, context(&tensor));
+        }
+        for dim in (0..rank).rev() {
+            tensor =
+                device_reduce(&tensor, op, dim).unwrap_or_else(|| fail(name, context(&tensor)));
+        }
+        reshaped(tensor, burn_backend::Shape::from(vec![1]))
+    }
+
     /// The mean along `dim`: the sum, then a multiplication by the count's
     /// reciprocal -- each on the device where its operand is
     /// ([`float_sum_dim`], `float_mul_scalar`; within one rounding of Flex's
@@ -1349,7 +1748,10 @@ pub mod float {
         use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
         let device = tensor.device;
         let rank = tensor.shape().num_dims();
-        if !tensor.is_stored_f32() || !crate::server::supports_dram(device) {
+        if !tensor.is_storable()
+            || tensor.elem() != Some(op.elem())
+            || !crate::server::supports_dram(device)
+        {
             return None;
         }
         let shape = tensor.shape().to_vec();
@@ -1378,7 +1780,7 @@ pub mod float {
                 id,
                 dims,
                 burn_backend::Shape::from(out_shape),
-                DType::F32,
+                tensor.dtype(),
             ));
         }
         // Rows enumerate unreduced indices in logical order, columns the
@@ -1406,14 +1808,14 @@ pub mod float {
         }
         let (id, dims) =
             crate::server::repack(device, view.src.buffer.id, sources, [outputs, shape[dim]]);
-        let packed = device_result(device, id, dims);
+        let packed = device_view(device, id, dims, None, tensor.dtype());
         let (id, dims) = crate::server::reduce(device, packed.to_dram().buffer.id, op, Axis::Cols);
-        let reduced = device_result(device, id, dims);
+        let reduced = device_view(device, id, dims, None, tensor.dtype());
         if physical == dims {
             return Some(TtTensor::on_device(
                 reduced.to_dram().clone(),
                 burn_backend::Shape::from(out_shape),
-                DType::F32,
+                tensor.dtype(),
                 device,
             ));
         }
@@ -1428,13 +1830,25 @@ pub mod float {
             id,
             dims,
             burn_backend::Shape::from(out_shape),
-            DType::F32,
+            tensor.dtype(),
         ))
     }
 
     /// Whole tile rows, all columns, of a matrix on the device: a view of the
     /// same slots, nothing copied -- how a batch is taken from a dataset
     /// uploaded once. Unsupported inputs fail with metadata.
+    /// Reverse selected logical axes through native bit-preserving copies.
+    pub fn float_flip(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        let mut slices = vec![burn_backend::Slice::full(); tensor.shape().num_dims()];
+        for &axis in axes {
+            if axis >= slices.len() {
+                fail("float_flip", context(&tensor));
+            }
+            slices[axis] = burn_backend::Slice::with_step(0, None, -1);
+        }
+        sliced_native(&tensor, &slices).unwrap_or_else(|| fail("float_flip", context(&tensor)))
+    }
+
     pub fn float_slice(
         tensor: FloatTensor<TtBackend>,
         slices: &[burn_backend::Slice],
@@ -1442,6 +1856,9 @@ pub mod float {
         let device = tensor.device;
         if let Some(view) = row_view(&tensor, slices) {
             return view;
+        }
+        if let Some(t) = sliced_native(&tensor, slices) {
+            return t;
         }
         {
             if tensor.computed_on_device() {
@@ -1627,21 +2044,22 @@ pub mod float {
     predicate!(float_is_nan, kind_sfpu::IS_NAN);
     predicate!(float_is_inf, kind_sfpu::IS_INF);
 
-    /// `tensor`'s column index (`0..c` along the last dimension) at every
-    /// element, as F32 on the device: what a one-index-per-row gather
-    /// compares its indices with. Made on the host and uploaded per call (an
-    /// attachment-scoped cache waits on `burn-backend-parity.md` B3).
+    /// Column-index geometry as replayable raw metadata, without downloading
+    /// the tensor or uploading a temporary host tensor during capture.
     fn column_indices(tensor: &TtTensor) -> Option<TtTensor> {
         let shape = tensor.shape().to_vec();
         let c = *shape.last()?;
         let n: usize = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|i| (i % c) as f32).collect();
-        let t = TtTensor::new(
-            HostBuffer::from_data(TensorData::new(v, shape)),
+        let dims = crate::tensor::stored_dims(&shape)?;
+        let bits = (0..n).map(|i| ((i % c) as f32).to_bits()).collect();
+        let id = crate::server::metadata(tensor.device, bits, dims, Elem::F32);
+        Some(device_result_shaped(
             tensor.device,
-        );
-        t.to_dram();
-        Some(t)
+            id,
+            dims,
+            shape.into(),
+            DType::F32,
+        ))
     }
 
     /// For a gather or scatter along the last dimension with one index per
@@ -1700,6 +2118,30 @@ pub mod float {
         }
         fail(
             "float_gather",
+            format_args!(
+                "tensor=({}), indices=({})",
+                context(&tensor),
+                context(&indices)
+            ),
+        )
+    }
+
+    /// Pooling selection must preserve the selected zero sign and NaN bits.
+    /// OR folds one retained raw datum with zero bits instead of adding it.
+    pub(crate) fn float_gather_bits(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+        if let Some(ne) = index_mask(&tensor, dim, &indices, kind_sfpu::NE) {
+            if let Some(kept) =
+                device_eltwise_ungated(kind_sfpu::MASK_FILL, 0.0, &tensor, Some(&ne))
+            {
+                if let Some(output) =
+                    device_reduce_ungated(&kept, tt_kernels::sfpu::reduce::ReduceOp::BitOr, dim)
+                {
+                    return output;
+                }
+            }
+        }
+        fail(
+            "pool_value_selection",
             format_args!(
                 "tensor=({}), indices=({})",
                 context(&tensor),
@@ -2063,14 +2505,39 @@ pub mod float {
     /// cast to `F32` what already is (`hard_sigmoid`, forward and backward),
     /// and a host round trip for nothing would undo residency. Other casts are
     /// unsupported (S6).
+    pub fn float_round(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::ROUND, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("float_round", context(&tensor)))
+    }
+    pub fn float_floor(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::FLOOR, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("float_floor", context(&tensor)))
+    }
+    pub fn float_ceil(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::CEIL, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("float_ceil", context(&tensor)))
+    }
+    pub fn float_trunc(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::TRUNC, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("float_trunc", context(&tensor)))
+    }
+    pub fn float_into_int(tensor: TtTensor, out_dtype: IntDType) -> TtTensor {
+        if out_dtype == IntDType::I32 {
+            if let Some(t) = device_eltwise(kind_sfpu::F32_TO_I32, 0.0, &tensor, None) {
+                return t;
+            }
+        }
+        fail(
+            "float_into_int",
+            format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
+        )
+    }
+
     pub fn float_cast(
         tensor: FloatTensor<TtBackend>,
         dtype: burn_backend::FloatDType,
     ) -> FloatTensor<TtBackend> {
-        if DType::from(dtype) == tensor.dtype() {
-            return tensor;
-        }
-        fail("float_cast", format_args!("tensor=({})", context(&tensor)))
+        cast_native(tensor, DType::from(dtype))
     }
 
     pub fn float_device(tensor: &FloatTensor<TtBackend>) -> Device<TtBackend> {
@@ -2094,7 +2561,14 @@ pub mod float {
     }
 }
 
+#[path = "pool.rs"]
+mod pooling;
+
 pub mod module {
+    pub use super::pooling::{
+        adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
+        max_pool2d, max_pool2d_with_indices, max_pool2d_with_indices_backward,
+    };
     use super::*;
     use burn_backend::Shape;
 
@@ -2401,7 +2875,252 @@ pub mod activation {
 
 pub mod int {
     use super::*;
+    use num_traits::ToPrimitive;
 
+    pub fn int_add(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_ADD, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "int_add",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn int_add_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_ADD_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_add_scalar", context(&lhs)))
+    }
+    pub fn int_sub(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_SUB, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "int_sub",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn int_sub_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_SUB_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_sub_scalar", context(&lhs)))
+    }
+    pub fn int_mul(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_MUL, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "int_mul",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn int_mul_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_MUL_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_mul_scalar", context(&lhs)))
+    }
+    pub fn bitwise_and(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_AND, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "bitwise_and",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn bitwise_and_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_AND_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("bitwise_and_scalar", context(&lhs)))
+    }
+    pub fn bitwise_or(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_OR, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "bitwise_or",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn bitwise_or_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_OR_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("bitwise_or_scalar", context(&lhs)))
+    }
+    pub fn bitwise_xor(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_XOR, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "bitwise_xor",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn bitwise_xor_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_XOR_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("bitwise_xor_scalar", context(&lhs)))
+    }
+    pub fn bitwise_left_shift(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_SHL, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "bitwise_left_shift",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn bitwise_left_shift_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_SHL_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("bitwise_left_shift_scalar", context(&lhs)))
+    }
+    pub fn bitwise_right_shift(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_SHR, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "bitwise_right_shift",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+    pub fn bitwise_right_shift_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_SHR_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("bitwise_right_shift_scalar", context(&lhs)))
+    }
+    pub fn bitwise_not(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_NOT, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("bitwise_not", context(&tensor)))
+    }
+    pub fn int_equal(lhs: TtTensor, rhs: TtTensor, out_dtype: burn_backend::BoolDType) -> TtTensor {
+        let out = device_eltwise(kind_sfpu::INT_EQ, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("int_equal", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_equal_elem(
+        lhs: TtTensor,
+        rhs: burn_backend::Scalar,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        let out = device_eltwise(kind_sfpu::INT_EQ_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_equal_elem", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_greater(
+        lhs: TtTensor,
+        rhs: TtTensor,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let out = device_eltwise(kind_sfpu::INT_GT, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("int_greater", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_greater_elem(
+        lhs: TtTensor,
+        rhs: burn_backend::Scalar,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        let out = device_eltwise(kind_sfpu::INT_GT_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_greater_elem", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_greater_equal(
+        lhs: TtTensor,
+        rhs: TtTensor,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let out = device_eltwise(kind_sfpu::INT_GE, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("int_greater_equal", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_greater_equal_elem(
+        lhs: TtTensor,
+        rhs: burn_backend::Scalar,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        let out = device_eltwise(kind_sfpu::INT_GE_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_greater_equal_elem", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_lower(lhs: TtTensor, rhs: TtTensor, out_dtype: burn_backend::BoolDType) -> TtTensor {
+        let out = device_eltwise(kind_sfpu::INT_LT, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("int_lower", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_lower_elem(
+        lhs: TtTensor,
+        rhs: burn_backend::Scalar,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        let out = device_eltwise(kind_sfpu::INT_LT_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_lower_elem", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_lower_equal(
+        lhs: TtTensor,
+        rhs: TtTensor,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let out = device_eltwise(kind_sfpu::INT_LE, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("int_lower_equal", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    pub fn int_lower_equal_elem(
+        lhs: TtTensor,
+        rhs: burn_backend::Scalar,
+        out_dtype: burn_backend::BoolDType,
+    ) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        let out = device_eltwise(kind_sfpu::INT_LE_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("int_lower_equal_elem", context(&lhs)));
+        retyped(out, out_dtype.into())
+    }
+    fn reduce_integer(
+        tensor: TtTensor,
+        dim: Option<usize>,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+    ) -> TtTensor {
+        if let Some(dim) = dim {
+            return float::device_reduce_ungated(&tensor, op, dim)
+                .unwrap_or_else(|| fail("integer reduction", context(&tensor)));
+        }
+        let count = tensor.shape().num_elements();
+        let packed = repack_shape(&tensor, vec![1, count]);
+        let out = float::device_reduce_ungated(&packed, op, 1)
+            .unwrap_or_else(|| fail("integer reduction", context(&tensor)));
+        repack_shape(&out, vec![1])
+    }
+    pub fn int_sum(tensor: TtTensor) -> TtTensor {
+        reduce_integer(tensor, None, tt_kernels::sfpu::reduce::ReduceOp::SumI32)
+    }
+    pub fn int_sum_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        reduce_integer(
+            tensor,
+            Some(dim),
+            tt_kernels::sfpu::reduce::ReduceOp::SumI32,
+        )
+    }
+    pub fn int_prod(tensor: TtTensor) -> TtTensor {
+        reduce_integer(tensor, None, tt_kernels::sfpu::reduce::ReduceOp::ProdI32)
+    }
+    pub fn int_prod_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        reduce_integer(
+            tensor,
+            Some(dim),
+            tt_kernels::sfpu::reduce::ReduceOp::ProdI32,
+        )
+    }
+    pub fn int_min_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        reduce_integer(
+            tensor,
+            Some(dim),
+            tt_kernels::sfpu::reduce::ReduceOp::MinI32,
+        )
+    }
+    pub fn int_max_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        reduce_integer(
+            tensor,
+            Some(dim),
+            tt_kernels::sfpu::reduce::ReduceOp::MaxI32,
+        )
+    }
     pub fn int_from_data(data: TensorData, device: &TtDevice) -> TtTensor {
         if data.dtype != DType::I32 {
             fail("int_from_data", context(&data));
@@ -2452,9 +3171,9 @@ pub mod int {
         tensor: IntTensor<TtBackend>,
         out_dtype: burn_backend::FloatDType,
     ) -> FloatTensor<TtBackend> {
-        if DType::from(out_dtype) == DType::F32 {
+        if matches!(DType::from(out_dtype), DType::F32 | DType::BF16) {
             if let Some(t) = device_eltwise(kind_sfpu::I32_TO_F32, 0.0, &tensor, None) {
-                return t;
+                return cast_native(t, DType::from(out_dtype));
             }
         }
         fail(
@@ -2585,9 +3304,12 @@ pub mod bool {
 
     /// Convert device Boolean 0/1 to F32 without reading back.
     pub fn bool_into_float(tensor: TtTensor, out_dtype: burn_backend::FloatDType) -> TtTensor {
-        if out_dtype == burn_backend::FloatDType::F32 {
+        if matches!(
+            out_dtype,
+            burn_backend::FloatDType::F32 | burn_backend::FloatDType::BF16
+        ) {
             if let Some(t) = device_eltwise(kind_sfpu::BOOL_TO_F32, 0.0, &tensor, None) {
-                return t;
+                return cast_native(t, DType::from(out_dtype));
             }
         }
         fail(
@@ -2607,6 +3329,33 @@ pub mod bool {
             "bool_into_int",
             format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
         )
+    }
+
+    /// Boolean reductions preserve raw canonical 0/1 storage.
+    pub fn bool_any(tensor: TtTensor) -> TtTensor {
+        float::reduce_all(tensor, tt_kernels::sfpu::reduce::ReduceOp::Any, "bool_any")
+    }
+
+    pub fn bool_all(tensor: TtTensor) -> TtTensor {
+        float::reduce_all(tensor, tt_kernels::sfpu::reduce::ReduceOp::All, "bool_all")
+    }
+
+    pub fn bool_any_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        check_bool_reduce_dim(&tensor, dim, "bool_any_dim");
+        float::device_reduce(&tensor, tt_kernels::sfpu::reduce::ReduceOp::Any, dim)
+            .unwrap_or_else(|| fail("bool_any_dim", context(&tensor)))
+    }
+
+    pub fn bool_all_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        check_bool_reduce_dim(&tensor, dim, "bool_all_dim");
+        float::device_reduce(&tensor, tt_kernels::sfpu::reduce::ReduceOp::All, dim)
+            .unwrap_or_else(|| fail("bool_all_dim", context(&tensor)))
+    }
+
+    fn check_bool_reduce_dim(tensor: &TtTensor, dim: usize, op: &str) {
+        if dim >= tensor.shape().num_dims() || tensor.elem() != Some(Elem::Bool) {
+            fail(op, format_args!("{}, axis={dim}", context(tensor)));
+        }
     }
 
     /// Boolean equality, including the existing native broadcasts.

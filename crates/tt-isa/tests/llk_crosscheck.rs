@@ -9,7 +9,8 @@
 //! what row 38 recorded as ttsim "moving one row" -- along with the `AddrMod` of
 //! every Matrix Unit instruction LLK encodes with `addr_mode << 14`, and
 //! `ZEROACC`'s `use_32_bit_mode`. All are now measured layouts (`Bits32_BH.lua`).
-//! `GMPOOL`/`GAPOOL` keep `AddrMod` at 15 in LLK too, so their diagrams stand. The
+//! `GMPOOL`/`GAPOOL` keep `AddrMod` at 15 in LLK too; measured kernels require
+//! LLK's `instr_mod19=1`, now fixed in our measured layouts. The
 //! LLK macros are a second, independent source that runs on these chips, so every
 //! encoding the datapath emits is checked against one.
 //!
@@ -208,7 +209,7 @@ fn the_datapath_encodings_agree_with_llk() {
             op(0x09, (2 << 12) | (1 << 14)),
         ),
         // TT_OP_GMPOOL/GAPOOL(clear_dvalid<<22, instr_mod19<<19, pool_addr_mode<<15, max_pool_index_en<<14, dst):
-        // the Wormhole diagrams' `AddrMod` at 15 is right for these two.
+        // AddrMod stays at 15; the measured path selects instr_mod19=1.
         (
             "GMPOOL",
             encode::Gmpool::ZERO
@@ -218,12 +219,12 @@ fn the_datapath_encodings_agree_with_llk() {
                 .encode()
                 .unwrap()
                 .word(),
-            op(0x33, (1 << 15) | (1 << 14) | 4),
+            op(0x33, (1 << 19) | (1 << 15) | (1 << 14) | 4),
         ),
         (
             "GAPOOL",
             encode::gapool(0, 0, 1, 4).unwrap().word(),
-            op(0x34, (1 << 15) | 4),
+            op(0x34, (1 << 19) | (1 << 15) | 4),
         ),
         // TT_OP_MVMUL(clear_dvalid<<22, instr_mod19<<19, addr_mode<<14, dst)
         (
@@ -317,20 +318,25 @@ fn the_datapath_encodings_agree_with_llk() {
 
 /// LLK's Blackhole `addr_mode` is three bits at 14 in every Matrix Unit macro
 /// that has one (`TT_*_VALID`: `is_valid(addr_mode, 3)`), selecting entries 0..7.
-/// Every measured layout draws it so; the gates measured the third bit.
+/// Pooling uses LLK's distinct two-bit pool_addr_mode at 15.
 #[test]
-fn every_measured_addr_mod_is_llks_three_bits_at_14() {
+fn every_measured_addr_mod_matches_llks_matrix_or_pooling_field() {
     use tt_isa::isa::generated::ALL;
     use tt_isa::isa::Provenance;
     let measured: Vec<_> = ALL
         .iter()
         .filter(|d| matches!(d.provenance(), Provenance::Measured { .. }))
         .collect();
-    assert_eq!(measured.len(), 13);
+    assert_eq!(measured.len(), 15);
     for d in measured {
         let f = d
             .field("AddrMod")
             .unwrap_or_else(|| panic!("{} has no AddrMod", d.key()));
-        assert_eq!((f.first_bit(), f.width()), (14, 3), "{}", d.key());
+        let expected = if ["GMPOOL_BH", "GAPOOL_BH"].contains(&d.key()) {
+            (15, 2)
+        } else {
+            (14, 3)
+        };
+        assert_eq!((f.first_bit(), f.width()), expected, "{}", d.key());
     }
 }

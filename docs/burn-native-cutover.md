@@ -23,7 +23,7 @@ gate, including native scalar broadcasting and ragged transpose copies.
 
 ## Remaining operation coverage
 
-Missing convolution, FFT, sorting, quantized compute, integer arithmetic, and
+Missing convolution, FFT, sorting, quantized compute, integer division/remainder, and
 other required methods fail explicitly. Unsupported shapes of implemented
 operations also fail explicitly. Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across chips and move tile slots over Ethernet without host tensor
@@ -35,7 +35,7 @@ relayed links have native residency and numerical gates.
 `tt-mnist` trains and evaluates with native argmax and a bit-preserving I32
 column-to-vector reshape. Prediction indices are explicitly read back for
 application accuracy bookkeeping. Native argmax and argmin preserve first ties and first
-NaNs for rank-one/two F32 input with I32 output and axes up to 2^23 elements.
+NaNs for rank-N F32 input with I32 output and axes up to 2^23 elements.
 
 Boolean equality, Boolean-to-F32/I32 conversions, and I32/Boolean expansion
 run natively. Boolean-to-F32 also enables Burn's default float `any`/`all`
@@ -46,7 +46,7 @@ parity, residency and strict-mode execution and belongs to the silicon smoke
 suite. Burn's minimum defaults now compose argmin and gather, retaining the
 existing gather axes and signed-zero limitation.
 
-## General reductions and K blocking (silicon pending)
+## General reductions and K blocking
 
 F32 sum/mean/max dimensional reductions accept arbitrary axes and ragged
 rank-N views through native word repacking. Long sums/maxima carry the
@@ -54,8 +54,31 @@ unfolded accumulator between chunks. Ordinary and supported tile-aligned
 batched resident matmuls now support K beyond one L1 block by reloading
 FP32 partial accumulators in original product order. `step67`/`step68`
 validate simulator execution, residency, numerical models, autodiff and
-changed-input traces; both-card silicon and release benchmarks remain pending.
+changed-input traces; both-card silicon passed in run `1791145571`.
 Other reduction kinds and untiled batched matmul remain separate work.
+
+## Reduction and integer extensions
+
+Direct products, raw-bit Boolean reductions, rank-N arg-reductions and inclusive
+F32 scans are native (`step69`). Stepped F32 slices and flips keep scan backward
+resident. LayerNorm/RMSNorm compositions have dedicated numerical, gradient and
+residency gates (`step70`). I32 wrapping ALU/comparisons/shifts and deterministic
+F32 rounding/I32 conversion are gated by `step71`/`step72`. Both-card validation
+passed in run `1791145571`. Pinned Burn Autodiff's log/exp product default and zero-input
+cumprod backward limitation are unchanged; see the backend README.
+
+## BF16 storage and pooling (2026-10-05)
+
+BF16 physical storage, native conversion and layout copies, direct packed rank-two
+matmul, native F32 arithmetic adapters, normalization and NCHW pooling/backwards
+are implemented. BF16 averages use GAPOOL; general max retains SFPU index/NaN
+semantics. `step74`–`step78` validate resident computation on both cards; late
+BF16 narrowing is refused by pinned ttsim, so those arithmetic gates are silicon-only.
+Mesh BF16, pooling traces, compact packed gathers and packed K continuations
+are now gated; batched BF16 products and integer reductions are resident.
+Integer division/remainder remains disabled after a failing domain-flag gate.
+See `tensix-next-features.md` for the current handoff and validation evidence.
+BF16 is slower on the measured MNIST GEMMs; see `tensix-next-features.md`.
 
 ## Tenstorrent BFP formats
 

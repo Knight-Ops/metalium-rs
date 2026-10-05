@@ -27,7 +27,7 @@ use burn::nn::Linear;
 use burn::optim::{GradientsParams, Optimizer, SgdConfig};
 use burn::tensor::activation;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
+use burn::tensor::{DType, ElementConversion, FloatDType, Int, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{attach_topology, Fidelity, SrcRoute, Topology, TtBackend, TtDevice};
 
@@ -143,6 +143,7 @@ struct Init {
     l1: (TensorData, TensorData),
     l2: (TensorData, TensorData),
     act: Act,
+    dtype: DType,
 }
 
 fn init() -> Init {
@@ -166,14 +167,18 @@ fn init() -> Init {
         l1: layer(PIXELS, HIDDEN),
         l2: layer(HIDDEN, CLASSES),
         act: Act::Relu,
+        dtype: DType::F32,
     }
 }
 
 impl<B: Backend> Mlp<B> {
     fn new(init: &Init, device: &B::Device) -> Self {
         let linear = |(w, b): &(TensorData, TensorData)| Linear {
-            weight: Param::from_tensor(Tensor::from_data(w.clone(), device)),
-            bias: Some(Param::from_tensor(Tensor::from_data(b.clone(), device))),
+            weight: Param::from_tensor(Tensor::from_data(w.clone(), (device, init.dtype))),
+            bias: Some(Param::from_tensor(Tensor::from_data(
+                b.clone(),
+                (device, init.dtype),
+            ))),
         };
         Mlp {
             l1: linear(&init.l1),
@@ -229,7 +234,7 @@ fn train<B: AutodiffBackend>(
     // Uploaded once; each batch is a view of it (on the card: no copy).
     let images: Tensor<B, 2> = Tensor::from_data(
         TensorData::new(train.images[..samples * PIXELS].to_vec(), [samples, PIXELS]),
-        device,
+        (device, init.dtype),
     )
     .to_device(device);
     let preload = t0.elapsed();
@@ -245,7 +250,8 @@ fn train<B: AutodiffBackend>(
             }
             let x = images.clone().slice([from..from + BATCH, 0..PIXELS]);
             let y = labels::<B>(train, from, BATCH, device);
-            let loss = loss_fn.forward(model.forward(x), y);
+            // Keep cross-entropy in F32; cast gradients return to BF16 parameters.
+            let loss = loss_fn.forward(model.forward(x).cast(FloatDType::F32), y);
             if step % 100 == 0 {
                 let l = loss.clone().into_scalar().elem::<f32>();
                 report(step, l);
@@ -267,7 +273,7 @@ fn train<B: AutodiffBackend>(
                 test.images[from * PIXELS..(from + m) * PIXELS].to_vec(),
                 [m, PIXELS],
             ),
-            device,
+            (device, init.dtype),
         );
         // Predictions are an explicit application result readback. Accuracy
         // bookkeeping compares them with the dataset's labels on the host.
@@ -337,7 +343,7 @@ fn infer<B: Backend>(
     let n = test.n - test.n % batch;
     let images: Tensor<B, 2> = Tensor::from_data(
         TensorData::new(test.images[..n * PIXELS].to_vec(), [n, PIXELS]),
-        device,
+        (device, init.dtype),
     )
     .to_device(device);
     let preload = t0.elapsed();
@@ -405,8 +411,14 @@ fn infer_traced(
         device,
     );
     let xp = prim(x.clone());
-    let (trace, _) = burn_tt::Trace::capture(&xp, || prim(model.forward(x.clone())))
-        .unwrap_or_else(|e| panic!("capturing the forward pass: {e}"));
+    let (trace, _) = burn_tt::Trace::capture(&xp, || {
+        prim(
+            model
+                .forward(x.clone().cast(init.dtype))
+                .cast(FloatDType::F32),
+        )
+    })
+    .unwrap_or_else(|e| panic!("capturing the forward pass: {e}"));
     let classes = trace.output_dims()[1];
     let preload = t0.elapsed();
     let calls = burn_tt::device_time();
@@ -549,6 +561,7 @@ struct Args {
     activation: Act,
     /// `--model transformer`: the general-model benchmark instead of MNIST.
     transformer: bool,
+    bf16: bool,
 }
 
 const USAGE: &str = "\
@@ -562,6 +575,8 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
   --epochs E    passes over the 60 000 training images (default 1)
   --steps S     stop after S steps
   --host        also train on the host CPU (burn-flex), for comparison
+  --bf16        store MNIST weights and activations in BF16 (single card);
+                matrix accumulation, loss and trace input/output remain F32
   --infer       benchmark inference alone: no training, the forward pass over
                 the test set (untrained weights), so it profiles on its own
                 (`TT_PROFILE`)
@@ -588,6 +603,7 @@ fn args() -> Result<Args, String> {
         passes: 3,
         activation: Act::Relu,
         transformer: false,
+        bf16: false,
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -608,6 +624,7 @@ fn args() -> Result<Args, String> {
             "--epochs" => a.epochs = number(value()?)?,
             "--steps" => a.steps = number(value()?)?,
             "--host" => a.host = true,
+            "--bf16" => a.bf16 = true,
             "--infer" => a.infer = true,
             "--trace" => a.trace = true,
             "--batch" => a.batch = number(value()?)?,
@@ -641,6 +658,9 @@ fn args() -> Result<Args, String> {
     // After the loop, so `--tiles` applies whichever order it came in.
     if let Some(t) = tiles {
         a.topology = a.topology.on_tiles(t).map_err(|e| e.to_string())?;
+    }
+    if a.bf16 && (a.transformer || matches!(a.topology, Topology::Cards { .. })) {
+        return Err("--bf16 currently requires MNIST execution on one card".into());
     }
     Ok(a)
 }
@@ -691,8 +711,13 @@ fn main() {
     );
     let init = Init {
         act: a.activation,
+        dtype: if a.bf16 { DType::BF16 } else { DType::F32 },
         ..init()
     };
+    println!(
+        "  storage  {:?}; matrix accumulation and loss F32",
+        init.dtype
+    );
 
     let device = TtDevice::new(0);
     let guard = match attach_topology(

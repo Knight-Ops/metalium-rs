@@ -13,7 +13,7 @@ fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute(
     let int = TtBackend::dtype_usage(&d, DType::I32);
     assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
     assert!(TtBackend::dtype_usage(&d, DType::F16).is_empty());
-    assert!(TtBackend::dtype_usage(&d, DType::BF16).is_empty());
+    assert!(TtBackend::dtype_usage(&d, DType::BF16).contains(DTypeUsage::Accelerated));
     assert!(TtBackend::dtype_usage(&d, DType::F64).is_empty());
 }
 
@@ -155,10 +155,13 @@ fn invalid_reduction_axes_fail_with_metadata_before_device_access() {
     else {
         unreachable!()
     };
-    let cases: [(&str, Reduce); 3] = [
+    let cases: [(&str, Reduce); 6] = [
         ("float_sum_dim", TtBackend::float_sum_dim),
         ("float_mean_dim", TtBackend::float_mean_dim),
         ("float_max_dim", TtBackend::float_max_dim),
+        ("float_prod_dim", TtBackend::float_prod_dim),
+        ("float_cumsum", TtBackend::float_cumsum),
+        ("float_cumprod", TtBackend::float_cumprod),
     ];
     for (name, reduce) in cases {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -170,6 +173,30 @@ fn invalid_reduction_axes_fail_with_metadata_before_device_access() {
             message.contains(name)
                 && message.contains("[2, 3]")
                 && message.contains("F32")
+                && message.contains("axis="),
+            "{message}"
+        );
+    }
+    use burn_backend::ops::BoolTensorOps;
+    let input = Tensor::<TtBackend, 2, burn_tensor::Bool>::from_data(
+        [[true, false, true], [false, true, false]],
+        &d,
+    )
+    .into_primitive();
+    let cases: [(&str, Reduce); 2] = [
+        ("bool_any_dim", TtBackend::bool_any_dim),
+        ("bool_all_dim", TtBackend::bool_all_dim),
+    ];
+    for (name, reduce) in cases {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reduce(input.clone(), usize::MAX)
+        }))
+        .unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains(name)
+                && message.contains("[2, 3]")
+                && message.contains("Bool")
                 && message.contains("axis="),
             "{message}"
         );

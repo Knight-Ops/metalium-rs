@@ -47,6 +47,8 @@ pub struct Measured {
     pub supersedes: &'static str,
     /// Fields whose position differs from the Wormhole diagram's.
     pub moved: &'static [&'static str],
+    /// Required fixed bits measured in positions the Wormhole diagram leaves undrawn.
+    pub added_fixed: &'static [(u8, u8, u32)],
     /// Wormhole fields the Blackhole layout does not carry, each with the reason.
     /// A field whose Wormhole bits the evidence showed to hold something else on
     /// Blackhole, and whose own Blackhole position is unknown, is dropped rather
@@ -62,8 +64,33 @@ pub struct Measured {
 
 pub const MEASURED: &[Measured] = &[
     Measured {
+        key: "GMPOOL_BH",
+        supersedes: "GMPOOL",
+        moved: &[],
+        added_fixed: &[(19, 1, 1)],
+        dropped: &[],
+        widened: &[],
+        evidence: &[(
+            "crates/tt-tests/tests/step75_fpu_pooling.rs",
+            "matrix_pooling_uses_explicit_weights_and_releases_banks",
+        )],
+    },
+    Measured {
+        key: "GAPOOL_BH",
+        supersedes: "GAPOOL",
+        moved: &[],
+        added_fixed: &[(19, 1, 1)],
+        dropped: &[],
+        widened: &[],
+        evidence: &[(
+            "crates/tt-tests/tests/step75_fpu_pooling.rs",
+            "matrix_pooling_uses_explicit_weights_and_releases_banks",
+        )],
+    },
+    Measured {
         key: "MVMUL_BH",
         supersedes: "MVMUL",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -75,6 +102,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVA2D_BH",
         supersedes: "MOVA2D",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -90,6 +118,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVB2D_BH",
         supersedes: "MOVB2D",
+        added_fixed: &[],
         moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -107,6 +136,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVD2A_BH",
         supersedes: "MOVD2A",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -118,6 +148,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVD2B_BH",
         supersedes: "MOVD2B",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -129,6 +160,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVB2A_BH",
         supersedes: "MOVB2A",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -140,6 +172,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWADD_BH",
         supersedes: "ELWADD",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -151,6 +184,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWSUB_BH",
         supersedes: "ELWSUB",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -162,6 +196,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWMUL_BH",
         supersedes: "ELWMUL",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -173,6 +208,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "DOTPV_BH",
         supersedes: "DOTPV",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -184,6 +220,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVDBGA2D_BH",
         supersedes: "MOVDBGA2D",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -195,6 +232,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "SHIFTXB_BH",
         supersedes: "SHIFTXB",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
@@ -209,6 +247,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ZEROACC_BH",
         supersedes: "ZEROACC",
+        added_fixed: &[],
         moved: &["AddrMod", "UseDst32b"],
         dropped: &[(
             "Revert",
@@ -493,7 +532,25 @@ fn compare(measured: &Diagram, wh: &Diagram, m: &Measured) -> Result<(), String>
             })
             .collect()
     };
-    if fixed(measured) != fixed(wh) {
+    let mut expected_fixed = fixed(wh);
+    for &(first, width, value) in m.added_fixed {
+        if width == 0 || width >= 32 || first as u32 + width as u32 > 32 || value >= (1u32 << width)
+        {
+            return Err(format!("`{}` has an invalid added fixed field", m.key));
+        }
+        let mask = ((1u32 << width) - 1) << first;
+        if wh.undrawn() & mask != mask {
+            return Err(format!(
+                "`{}` adds a fixed field over documented bits",
+                m.key
+            ));
+        }
+        expected_fixed.push((first, width, value));
+    }
+    expected_fixed.sort_unstable();
+    let mut actual_fixed = fixed(measured);
+    actual_fixed.sort_unstable();
+    if actual_fixed != expected_fixed {
         return Err(format!(
             "`{}` changes a fixed field of `{}`; only named fields may be relocated",
             m.key, m.supersedes
@@ -614,6 +671,7 @@ local diagrams = {
     const ROW: Measured = Measured {
         key: "FOO_BH",
         supersedes: "FOO",
+        added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
         widened: &[],
@@ -661,6 +719,42 @@ local diagrams = {
     }
 
     #[test]
+    fn required_fixed_bits_need_credentials_and_undrawn_positions() {
+        let source = GOOD.replace("{20, 1, \"0\"}", "{19, 1, \"1\"},\n      {20, 1, \"0\"}");
+        rejects(
+            &source,
+            &[ROW],
+            Provenance::WormholeOnly,
+            "changes a fixed field",
+        );
+        let row = Measured {
+            added_fixed: &[(19, 1, 1)],
+            ..ROW
+        };
+        run(&source, &[row], Provenance::WormholeOnly).unwrap();
+        let row = Measured {
+            added_fixed: &[(20, 1, 1)],
+            ..ROW
+        };
+        rejects(
+            &source,
+            &[row],
+            Provenance::WormholeOnly,
+            "over documented bits",
+        );
+        let row = Measured {
+            added_fixed: &[(19, 1, 2)],
+            ..ROW
+        };
+        rejects(
+            &source,
+            &[row],
+            Provenance::WormholeOnly,
+            "invalid added fixed field",
+        );
+    }
+
+    #[test]
     fn an_override_without_credentials_is_refused() {
         rejects(
             GOOD,
@@ -676,6 +770,7 @@ local diagrams = {
         let row = Measured {
             key: "BAR_BH",
             supersedes: "BAR",
+            added_fixed: &[],
             moved: &[],
             dropped: &[],
             widened: &[],

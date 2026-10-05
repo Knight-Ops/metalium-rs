@@ -3,7 +3,7 @@
 //! A two-layer MLP's forward pass -- `relu(x @ w1 + b1) @ w2 + b2`, as Burn's
 //! `Linear` composes it -- captured on its input, then run on new inputs:
 //! each run's output is the same Burn ops run fresh on that input, bit for
-//! bit. And a capture whose closure falls back to the host is refused without
+//! bit. And a capture whose closure downloads to the host is refused without
 //! leaving the device capturing: the next capture works.
 
 use burn::tensor::{Tensor, TensorData, TensorPrimitive};
@@ -66,17 +66,20 @@ fn a_traced_forward_pass_is_the_fresh_one() {
 }
 
 #[test]
-fn a_capture_that_falls_back_to_the_host_is_refused_and_ends() {
+fn a_capture_that_downloads_to_the_host_is_refused_and_ends() {
     with_device(Config::default(), |device| {
         let x: T2 = Tensor::from_data(TensorData::new(values(1, 32 * 32), [32, 32]), &device);
         let xp = primitive(x.clone());
-        // `cumsum` has no device path: a download, which the capture refuses.
+        // Use an explicit download: cumsum now has a traceable native path.
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Trace::capture(&xp, || primitive(x.clone().cumsum(1)))
+            Trace::capture(&xp, || {
+                let _ = x.clone().into_data();
+                primitive(x.clone())
+            })
         }));
         assert!(
             refused.is_err() || refused.as_ref().is_ok_and(|r| r.is_err()),
-            "a host fallback was captured"
+            "a host download was captured"
         );
         // Not left capturing: an ordinary capture works.
         let relu = || primitive(burn::tensor::activation::relu(x.clone()));
