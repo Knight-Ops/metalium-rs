@@ -2,34 +2,145 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly full simulator regression at 03:00 UTC
+    - cron: '0 3 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  test:
-    name: Simulator suite
+  sanity:
+    name: Format, codegen & boundaries
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      # riscv32im-unknown-none-elf is a built-in target, so the firmware needs no
-      # custom target JSON. llvm-tools supplies the objcopy and objdump that
-      # crates/tt-firmware-images/build.rs uses to produce and check the
-      # firmware images.
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The specification tree is pinned in PINS.toml and checked by content digest.
+      - name: Cache the pinned specification tree
+        uses: actions/cache@v4
+        with:
+          path: vendor/tt-isa-documentation
+          key: tt-isa-docs-${{ hashFiles('PINS.toml') }}
+
+      - name: Fetch specification
+        run: cargo xtask fetch-spec
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Simulator binding stays out of shippable crates
+        run: cargo xtask check-no-sim-in-ship
+
+      - name: Burn backend is independent of Flex
+        run: cargo xtask check-no-flex-in-backend
+
+      - name: Generated config table is current
+        run: cargo xtask gen-cfg --check
+
+      - name: Generated instruction table is current
+        run: cargo xtask gen-isa --check
+
+      - name: Generated Burn operations are current
+        run: cargo xtask gen-burn-ops --check
+
+  firmware:
+    name: Firmware integrity & lints
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install toolchain
         run: |
           rustup show active-toolchain
           rustup target add riscv32im-unknown-none-elf
-          rustup component add clippy rustfmt llvm-tools
+          rustup component add clippy llvm-tools
 
       - uses: Swatinem/rust-cache@v2
 
-      # The simulator is pinned by tag and SHA-256 in PINS.toml and verified on
-      # download, so caching it is safe: a cache hit that does not match the pin
-      # is rejected by the same check.
+      # Firmware is excluded from host workspace, so lint it directly for riscv32im.
+      - name: Clippy (firmware)
+        run: cargo clippy --manifest-path crates/tt-firmware/Cargo.toml --target riscv32im-unknown-none-elf --bins --lib -- -D warnings
+
+      # Building tt-firmware-images runs its build.rs, which verifies that all
+      # compiled firmware binaries obey the Blackhole instruction blacklist.
+      - name: Instruction set blacklist gate
+        run: cargo check -p tt-firmware-images
+
+  lint-and-silicon:
+    name: Lints & Silicon compilation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add riscv32im-unknown-none-elf
+          rustup component add clippy llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (host workspace)
+        run: cargo clippy --workspace --all-targets
+
+      - name: Type-check the silicon-only suite
+        run: cargo test --workspace --features tt-tests/silicon --no-run
+
+      - name: Clippy (silicon build)
+        run: cargo clippy --workspace --all-targets --features tt-tests/silicon
+
+  unit-tests:
+    name: Host unit & doc tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add riscv32im-unknown-none-elf
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pure host unit tests: covers encodings, tilize/detilize, SFPU bounds,
+      # tensor padding/slicing, and driver ABI layouts without simulator overhead.
+      - name: Host unit tests
+        run: cargo test --workspace --exclude tt-tests
+
+      - name: Doc tests
+        run: cargo test --doc --workspace
+
+  simulator-smoke:
+    name: Simulator smoke suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add riscv32im-unknown-none-elf
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Cache the pinned simulator
         uses: actions/cache@v4
         with:
@@ -38,18 +149,45 @@ jobs:
             vendor/libttsim_bh_x2.so
           key: libttsim-${{ hashFiles('PINS.toml') }}
 
-      # The specification tree is the third pinned input. It is verified by a
-      # digest over the contents of the files the generators read, not by the
-      # tarball's hash -- GitHub does not promise source archives are byte-stable.
+      - name: Fetch simulator
+        run: cargo xtask fetch-ttsim
+
+      # Fast simulator smoke test: proves FFI binding, BAR configuration,
+      # reset, and Tensix instruction dispatch on ttsim in under a minute.
+      - name: Test (simulator smoke)
+        run: cargo test -p tt-tests --test step1_harness --test step4_tensix --test step8_eltwise
+
+  simulator-full:
+    name: Full simulator & E2E regression
+    # Run on scheduled nightly, manual trigger, or push to main
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add riscv32im-unknown-none-elf
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the pinned simulator
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/libttsim_bh.so
+            vendor/libttsim_bh_x2.so
+            vendor/libttsim_bh_x4.so
+          key: libttsim-${{ hashFiles('PINS.toml') }}
+
       - name: Cache the pinned specification tree
         uses: actions/cache@v4
         with:
           path: vendor/tt-isa-documentation
           key: tt-isa-docs-${{ hashFiles('PINS.toml') }}
 
-      # MNIST, for the Phase 7 training gate: pinned by the .gz digests and the
-      # decompressed files' own, and verified on every fetch, so a cache hit that
-      # does not match the pin is rejected by the same check.
       - name: Cache the pinned MNIST files
         uses: actions/cache@v4
         with:
@@ -59,64 +197,16 @@ jobs:
       - name: Fetch simulator
         run: cargo xtask fetch-ttsim
 
-      - name: Fetch MNIST
-        run: cargo xtask fetch-mnist
-
       - name: Fetch specification
         run: cargo xtask fetch-spec
 
-      # The backend-configuration table is generated, never transcribed. This
-      # proves the committed table still matches the pinned header, so a pin bump
-      # cannot silently diverge from the code that depends on it.
-      - name: Generated config table is current
-        run: cargo xtask gen-cfg --check
+      - name: Fetch MNIST
+        run: cargo xtask fetch-mnist
 
-      # The instruction table is generated from Bits32.lua and cross-checked against
-      # the syntax blocks on the pages that embed each diagram. This proves the
-      # committed table still matches the pinned specification, and that the two
-      # descriptions of the instruction set still agree with each other.
-      - name: Generated instruction table is current
-        run: cargo xtask gen-isa --check
+      # Full simulator gate suite across all 80+ steps
+      - name: Test (simulator all)
+        run: cargo test -p tt-tests
 
-      # Native dispatch and unsupported methods follow the pinned Burn traits.
-      - name: Generated Burn operations are current
-        run: cargo xtask gen-burn-ops --check
-
-      - name: Burn backend is independent of Flex
-        run: cargo xtask check-no-flex-in-backend
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets
-
-      # Runs the whole stack: the firmware is built for riscv32im and checked for
-      # instructions Blackhole cannot execute, then every gate runs in-process
-      # against libttsim. Deterministic -- time only advances inside
-      # libttsim_clock -- so a failure here is real, never a flake.
-      - name: Test
-        run: cargo test --workspace
-
-      # The end-to-end tier: whole training runs through Burn on the simulator,
-      # held to the golden loss curve that ttsim writes and silicon reproduces.
-      # Most of the simulator suite's time, so not in the default `cargo test`
-      # (see `e2e` in crates/tt-tests/Cargo.toml); here on every commit, so the
-      # golden cannot drift unseen.
+      # The end-to-end tier: Burn training on ttsim against the golden loss curve
       - name: Test (end-to-end)
         run: cargo test -p tt-tests --features e2e --test step12_mnist
-
-      # The silicon-gated tests cannot run here, but they must keep compiling or
-      # they rot between now and the first hardware run.
-      - name: Type-check the silicon-only suite
-        run: cargo test --workspace --features tt-tests/silicon --no-run
-
-      # Linted too, not just compiled: the silicon build cfg's out every
-      # simulator-only probe, and what that leaves dead is only visible here.
-      - name: Clippy (silicon build)
-        run: cargo clippy --workspace --all-targets --features tt-tests/silicon
-
-      # tt-ttsim binds a third-party .so. Binding it for development does not
-      # compromise the native-Rust goal; shipping it would.
-      - name: Simulator binding stays out of shippable crates
-        run: cargo xtask check-no-sim-in-ship
