@@ -1,4 +1,4 @@
-# metal-rs
+# metalium-rs
 
 A native-Rust stack for Tenstorrent Blackhole (p150a cards): bare-metal firmware
 for the baby RISC-V cores, host device access, Tensix kernels, and a Burn backend.
