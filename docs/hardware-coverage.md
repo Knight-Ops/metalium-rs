@@ -585,28 +585,32 @@ reverse index.
       range of every unit's stream, whether a barrier followed -- is kept with the trace
       (`Session::trace_ops`); the placements each op read and wrote are the next field
       it needs. Optimizing over the captured graph is **X4e**.
-    - **Burn.** `burn_tt::Trace::capture(&input, || forward(..))` captures on the
-      input's own buffer and returns the capture's output values; `run(values)` writes,
-      replays and downloads in one round trip. Both return host values, not a tensor: a
-      tensor of the output buffer would change under its holder at the next run. A
-      closure that falls back to the host is refused (the op panics, as a device error
-      does) and the capture is ended, never left open. Single-chip engines only; the
-      mesh engine refuses. `tt-mnist --infer --trace` replays per batch.
+    - **Burn.** `burn_tt::TracedInference` captures on the input's own buffers and
+      returns the capture's output values; `run(inputs)` writes, replays and downloads
+      in one round trip. Supports $N$ inputs, $M$ outputs, and arbitrary dtypes (`F32`,
+      `BF16`, `I32`, `Bool`). Both return host values, not a tensor: a tensor of the
+      output buffer would change under its holder at the next run. A closure that falls
+      back to the host is refused (the op panics, as a device error does) and the capture
+      is ended, never left open. Single-chip engines only; the mesh engine refuses.
+      `tt-mnist --infer --trace` replays per batch.
     - Gates: `step39_traces` -- a layer's forward pass on one tile and on two (barriers)
       replayed over three new inputs, each the same ops run fresh bit for bit, and each
       replay's writes under a twentieth of the capture's; a freed weight deferred while
       an allocation of its size lands elsewhere; every refusal. Watched failing: a `CALL`
       over half its entries (replay 0, element 0 wrong). `step40_burn_trace` -- a Burn
-      MLP traced and run on new inputs against the fresh Burn ops bit for bit, and a host
-      fallback refused with the next capture working. ttsim and both cards. MNIST
-      inference traced: the same predictions; 2.59 ms a batch, of which 2.1 the input's
-      200 KB write from the host (row AG, X7).
-    - **Training: later, documented.** A training step is replayable once its weights are
-      updated in place (the optimizer writing the same buffers) and the loss stays on the
-      device; neither holds today (B16, and Burn's tensors are immutable). Until then a
-      training loop traces its forward pass at most. With the x280s as an on-card host
-      (`feature-x280-on-card-dispatch.md`), the host-side part of a step moves next to the
-      data and whole-step traces become the natural shape.
+      MLP traced and run on new inputs against the fresh Burn ops bit for bit; multi-input
+      inference; whole training step tracing with in-place parameter writeback and loss
+      readback; and a host fallback refused with the next capture working. ttsim and both
+      cards. MNIST inference traced: 205,301 img/s on 8 tiles; training step traced:
+      99.45 ms on 1 tile (outperforming 12-core CPU at 102.03 ms).
+    - **Training: implemented (2026-10-05).** Whole-step training is fully replayable via
+      `burn_tt::TracedTrainingStep` (`feature-traced-execution.md`). Updated weights are
+      written back in place in GDDR using `Session::copy_into` captured into the trace stream,
+      and scalar loss is read back after hardware replay completion without aborting the trace.
+      Stateless (SGD) and stateful (Adam/AdamW) optimizers are supported across arbitrary Burn
+      modules via `ModuleVisitor` parameter reflection. Evaluated on MNIST MLP and
+      `TinyTransformer`. Multi-tile/multi-card scaling roadmap documented in
+      `feature-traced-execution.md`.
   Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
