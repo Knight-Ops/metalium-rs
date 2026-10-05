@@ -404,6 +404,22 @@ fn attach_engine(
         fn release_trace(&mut self, trace: u64) {
             self.buffers.release_trace(&mut self.session, trace)
         }
+        fn copy_into(
+            &mut self,
+            src: burn_tt::BufferId,
+            dst: burn_tt::BufferId,
+        ) -> Result<(), EngineError> {
+            self.buffers.copy_into(&mut self.session, src, dst)
+        }
+        fn run_generic_trace(
+            &mut self,
+            trace: u64,
+            inputs: &[(burn_tt::BufferId, burn_tt::InputPayload)],
+            outputs: &[(burn_tt::BufferId, burn_tt::OutputKind)],
+        ) -> Result<burn_tt::GenericTraceRun, EngineError> {
+            self.buffers
+                .run_generic_trace(&mut self.session, trace, inputs, outputs)
+        }
         fn matmul(
             &mut self,
             a: &[f32],

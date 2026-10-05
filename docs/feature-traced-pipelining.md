@@ -12,6 +12,10 @@ there, with the tests that cover them and the overlap thresholds a capture uses
 reuse but keeps NC as the writer. The legacy wave, B-only pipeline and
 two-host-queue NC schedulers are removed.
 
+For end-to-end multi-input inference, full training step tracing, and the multi-tile/multi-card scaling roadmap, see:
+[Generalized Traced Execution Architecture](feature-traced-execution.md).
+
+
 ## Original investigation (historical)
 
 For B-only pipelined traces, most of the machinery already exists. The missing work is mainly in capture bookkeeping and validation. NC-backed traces need additional protocol changes.

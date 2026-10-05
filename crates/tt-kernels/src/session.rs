@@ -3559,6 +3559,13 @@ impl<T: Transport> Session<T> {
         self.write_src(t, Src::F32(values), false)
     }
 
+    /// Overwrite `t`'s values in place as raw bits: a trace's integer, bool,
+    /// or bit-encoded input between replays.
+    pub fn write_bits(&mut self, t: &DramTensor, values: &[u32]) -> Result<(), TensorError> {
+        self.refuse_while_capturing("write")?;
+        self.write_src(t, Src::Bits(values), false)
+    }
+
     /// Free GDDR bytes on the fullest channel.
     pub fn dram_free_bytes(&self) -> u64 {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
@@ -3640,6 +3647,19 @@ impl<T: Transport> Session<T> {
             tensor::Pad::Undefined
         });
         Ok(out)
+    }
+
+    /// Copy `src`, bit for bit, into an existing allocated tensor `dst`.
+    pub fn copy_into(&mut self, src: &DramTensor, dst: &DramTensor) -> Result<(), TensorError> {
+        let units = self.units.len();
+        let work = tensor::copy_into(src, dst, units)?;
+        self.submit_jobs(work.jobs, RESET_BUDGET)?;
+        dst.set_pad(if src.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(())
     }
 
     /// Repack logical source coordinates into a new matrix on the card.

@@ -3200,6 +3200,56 @@ pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work>
     Ok(Work { out, jobs })
 }
 
+/// Copy `src`, bit for bit, into an existing allocated tensor `dst`.
+/// Both tensors must have matching dimensions and element type.
+pub fn copy_into(src: &DramTensor, dst: &DramTensor, units: usize) -> Result<Work> {
+    if (src.rows, src.cols, src.elem) != (dst.rows, dst.cols, dst.elem) {
+        return Err(TensorError::Shape(format!(
+            "copy_into mismatched shapes/elem: src [{}, {}] {:?}, dst [{}, {}] {:?}",
+            src.rows, src.cols, src.elem, dst.rows, dst.cols, dst.elem
+        )));
+    }
+    const GROUP: usize = 128;
+    let stage = staging("copy slots", GROUP)?;
+    let [rt, ct] = src.grid();
+    let (rs, ro) = (src.tensor_ref(), dst.tensor_ref());
+    let jobs = runs(rt * ct, units, GROUP)
+        .into_iter()
+        .map(|run| {
+            let (first, count) = (run.start as u32, run.len() as u32);
+            vec![Step::Transfer {
+                what: "copy_into list",
+                depth: 1,
+                batches: vec![TransferBatch {
+                    read: vec![
+                        [
+                            record::READ_RUN,
+                            first,
+                            count,
+                            stage as u32,
+                            0,
+                            ct as u32,
+                            0,
+                            0,
+                        ],
+                        rs.encode()[0],
+                        rs.encode()[1],
+                    ],
+                    write: vec![
+                        [record::WRITE_RUN, first, count, stage as u32, 0, 0, 0, 0],
+                        ro.encode()[0],
+                        ro.encode()[1],
+                    ],
+                }],
+            }]
+        })
+        .collect();
+    Ok(Work {
+        out: dst.clone(),
+        jobs,
+    })
+}
+
 /// One block a [`copy_blocks`] moves: `extent` elements of the output at
 /// `to`, from the source's block at `from` -- of the same extent, or with
 /// `transposed`, of the transposed extent, read as its transpose. Both

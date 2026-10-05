@@ -174,6 +174,57 @@ impl TtTensor {
             && self.cell.host.get().is_none()
     }
 
+    /// Ensure the tensor is uploaded and resident in the device's GDDR memory.
+    pub fn ensure_resident(&self) {
+        let _ = self.to_dram();
+    }
+
+    /// Read the tensor's current data directly from the device's GDDR buffer,
+    /// bypassing any cached initial host copy.
+    pub fn download_device(&self) -> TensorData {
+        let d = self
+            .dram()
+            .expect("a tensor to download from device must have a device copy");
+        let (r, c) = (d.buffer.rows, d.buffer.cols);
+        fn transposed<T: Copy + Default>(v: Vec<T>, t: bool, r: usize, c: usize) -> Vec<T> {
+            if !t {
+                return v;
+            }
+            let mut out = vec![T::default(); v.len()];
+            for i in 0..r {
+                for j in 0..c {
+                    out[j * r + i] = v[i * c + j];
+                }
+            }
+            out
+        }
+        let shape = self.cell.shape.clone();
+        if self.cell.dtype == DType::BF16 {
+            let bits = server::download_bf16(self.device, d.buffer.id, r, c);
+            let bits = transposed(bits, d.transposed, r, c);
+            let mut data = TensorData::new(bits, shape);
+            data.dtype = DType::BF16;
+            data
+        } else {
+            match device_elem(self.cell.dtype) {
+                Some(Elem::F32) => {
+                    let v = server::download(self.device, d.buffer.id, r, c);
+                    TensorData::new(transposed(v, d.transposed, r, c), shape)
+                }
+                Some(elem) => {
+                    let v = server::download_bits(self.device, d.buffer.id, r, c);
+                    let v = transposed(v, d.transposed, r, c);
+                    if elem == Elem::I32 {
+                        TensorData::new(v.into_iter().map(|b| b as i32).collect::<Vec<_>>(), shape)
+                    } else {
+                        TensorData::new(v.into_iter().map(|b| b != 0).collect::<Vec<_>>(), shape)
+                    }
+                }
+                None => unreachable!("device_elem supported for storable tensors"),
+            }
+        }
+    }
+
     /// The host copy, downloaded the first time it is needed.
     pub(crate) fn host(&self) -> &HostBuffer {
         self.cell.host.get_or_init(|| {
