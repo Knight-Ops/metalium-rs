@@ -39,10 +39,11 @@ pub use report::{
 };
 pub use server::{
     attach, device_traffic, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Elem,
-    Engine, EngineError, KmdEngine, MeshEngine, PowArg, Serve, TraceRun,
+    Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind,
+    OutputPayload, PowArg, Serve, TraceRun,
 };
 pub use tensor::{TtQTensor, TtTensor};
-pub use trace::Trace;
+pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};
 
 pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
 pub use traffic::{

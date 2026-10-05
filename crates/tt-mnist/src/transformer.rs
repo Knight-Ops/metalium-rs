@@ -97,10 +97,8 @@ pub fn load<B: Backend>(weights: &[TensorData], device: &B::Device) -> TinyTrans
 
 /// Step `step`'s batch: sequence `b` is an arithmetic progression mod
 /// [`VOCAB`]. The inputs, and the targets (the inputs shifted by one).
-pub fn batch<B: Backend>(
-    step: usize,
-    device: &B::Device,
-) -> (Tensor<B, 2, Int>, Tensor<B, 1, Int>) {
+/// Raw host data for step `step`: sequence `b` is an arithmetic progression mod [`VOCAB`].
+pub fn batch_data(step: usize) -> (Vec<i32>, Vec<i32>) {
     let mut x = Vec::with_capacity(BATCH * SEQ);
     let mut y = Vec::with_capacity(BATCH * SEQ);
     for b in 0..BATCH {
@@ -111,6 +109,16 @@ pub fn batch<B: Backend>(
             y.push(((start + stride * (i + 1)) % VOCAB) as i32);
         }
     }
+    (x, y)
+}
+
+/// Step `step`'s batch: sequence `b` is an arithmetic progression mod
+/// [`VOCAB`]. The inputs, and the targets (the inputs shifted by one).
+pub fn batch<B: Backend>(
+    step: usize,
+    device: &B::Device,
+) -> (Tensor<B, 2, Int>, Tensor<B, 1, Int>) {
+    let (x, y) = batch_data(step);
     (
         Tensor::from_data(TensorData::new(x, [BATCH, SEQ]), device),
         Tensor::from_data(TensorData::new(y, [BATCH * SEQ]), device),
@@ -152,4 +160,75 @@ pub fn train<B: AutodiffBackend>(weights: &[TensorData], steps: usize, device: &
         run.times.push(t0.elapsed());
     }
     run
+}
+
+/// Train `steps` steps from `weights` using hardware-traced execution (`TracedTrainingStep`).
+///
+/// The forward pass, loss calculation, backward pass, optimizer parameter updates,
+/// and in-place GDDR weight buffer updates are captured into a single hardware command stream.
+/// Subsequent steps replay the stream in hardware without host op construction.
+pub fn train_traced(
+    weights: &[TensorData],
+    steps: usize,
+    device: &burn_tt::TtDevice,
+) -> Result<Run, String> {
+    use crate::trace::{
+        collect_parameter_updates, ensure_resident, primitive_float, primitive_int,
+    };
+    use burn::backend::Autodiff;
+    use burn_tt::{InputPayload, TracedTrainingStep, TtBackend};
+
+    let model = load::<Autodiff<TtBackend>>(weights, device);
+    let mut optim = SgdConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(device);
+
+    let mut run = Run {
+        losses: Vec::with_capacity(steps),
+        times: Vec::with_capacity(steps),
+    };
+
+    if steps == 0 {
+        return Ok(run);
+    }
+
+    // Ensure parameters are resident in GDDR before capture
+    ensure_resident(&model);
+
+    // Step 0: Capture the entire training step into a hardware trace
+    let t0 = Instant::now();
+    let (x0, y0) = batch::<Autodiff<TtBackend>>(0, device);
+    let xp = primitive_int(x0.clone());
+    let yp = primitive_int(y0.clone());
+
+    let (traced_step, first_loss) = TracedTrainingStep::capture(&[&xp, &yp], || {
+        let loss = loss_fn.forward(model.forward(x0), y0);
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        let new_model = optim.step(LR, model.clone(), grads);
+        let updates = collect_parameter_updates(&model, &new_model);
+        (primitive_float(loss), updates)
+    })
+    .map_err(|e| format!("capturing transformer training trace: {e}"))?;
+
+    run.losses.push(first_loss);
+    run.times.push(t0.elapsed());
+
+    // Steps 1..steps: Stream new batch data directly to device and replay the hardware trace
+    for step in 1..steps {
+        let (x_raw, y_raw) = batch_data(step);
+        let x_payload: Vec<u32> = x_raw.into_iter().map(|v| v as u32).collect();
+        let y_payload: Vec<u32> = y_raw.into_iter().map(|v| v as u32).collect();
+
+        let t = Instant::now();
+        let timing = traced_step
+            .step(vec![
+                InputPayload::Bits(x_payload),
+                InputPayload::Bits(y_payload),
+            ])
+            .map_err(|e| format!("replaying transformer training step {step}: {e}"))?;
+
+        run.losses.push(timing.loss);
+        run.times.push(t.elapsed());
+    }
+
+    Ok(run)
 }

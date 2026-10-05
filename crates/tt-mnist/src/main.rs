@@ -32,7 +32,6 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tt::{attach_topology, Fidelity, SrcRoute, Topology, TtBackend, TtDevice};
 
 const PIXELS: usize = 28 * 28;
-const HIDDEN: usize = 128;
 const CLASSES: usize = 10;
 const BATCH: usize = 64;
 const LR: f64 = 0.1;
@@ -89,8 +88,7 @@ fn mnist() -> (Split, Split) {
 
 #[derive(Module, Debug)]
 struct Mlp<B: Backend> {
-    l1: Linear<B>,
-    l2: Linear<B>,
+    layers: Vec<Linear<B>>,
     #[module(skip)]
     act: Act,
 }
@@ -140,13 +138,12 @@ impl Act {
 /// The initial weights, drawn once so the card and the host start the same,
 /// and the activation between the layers.
 struct Init {
-    l1: (TensorData, TensorData),
-    l2: (TensorData, TensorData),
+    layers: Vec<(TensorData, TensorData)>,
     act: Act,
     dtype: DType,
 }
 
-fn init() -> Init {
+fn init(hidden: &[usize]) -> Init {
     let mut s: u64 = 0x3a15;
     let mut unit = move || {
         s = s
@@ -163,9 +160,15 @@ fn init() -> Init {
             TensorData::new(b, [d_out]),
         )
     };
+    let mut layers = Vec::new();
+    let mut prev = PIXELS;
+    for &h in hidden {
+        layers.push(layer(prev, h));
+        prev = h;
+    }
+    layers.push(layer(prev, CLASSES));
     Init {
-        l1: layer(PIXELS, HIDDEN),
-        l2: layer(HIDDEN, CLASSES),
+        layers,
         act: Act::Relu,
         dtype: DType::F32,
     }
@@ -181,14 +184,20 @@ impl<B: Backend> Mlp<B> {
             ))),
         };
         Mlp {
-            l1: linear(&init.l1),
-            l2: linear(&init.l2),
+            layers: init.layers.iter().map(linear).collect(),
             act: init.act,
         }
     }
 
-    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.l2.forward(self.act.apply(self.l1.forward(x)))
+    fn forward(&self, mut x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let n = self.layers.len();
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(x);
+            if i + 1 < n {
+                x = self.act.apply(x);
+            }
+        }
+        x
     }
 }
 
@@ -295,6 +304,130 @@ fn train<B: AutodiffBackend>(
         calls,
         losses,
         accuracy: right as f64 / test.n as f64,
+        preload,
+        train: train_time,
+        steps: step,
+    }
+}
+
+/// Train MNIST using hardware-traced execution (`TracedTrainingStep`).
+///
+/// The forward pass, cross-entropy loss, backward pass, optimizer parameter updates,
+/// and in-place GDDR weight buffer updates are captured into a single hardware command stream.
+/// Subsequent steps replay the stream in hardware without host op construction.
+fn train_traced(
+    train_split: &Split,
+    test_split: &Split,
+    init: &Init,
+    epochs: usize,
+    max_steps: usize,
+    device: &TtDevice,
+    report: impl Fn(usize, f32),
+) -> Run {
+    use burn_tt::{InputPayload, TracedTrainingStep};
+    use tt_mnist::trace::{
+        collect_parameter_updates, ensure_resident, primitive_float, primitive_int,
+    };
+
+    let t0 = Instant::now();
+    let model = Mlp::<Autodiff<TtBackend>>::new(init, device);
+    let mut optim = SgdConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(device);
+    let samples = train_split.n - train_split.n % BATCH;
+    let preload = t0.elapsed();
+    let calls = burn_tt::device_time();
+
+    let mut losses = Vec::new();
+    let mut step = 0;
+
+    // Ensure parameters are resident in GDDR before capture
+    ensure_resident(&model);
+
+    // Step 0: Capture step
+    let x0: Tensor<Autodiff<TtBackend>, 2> = Tensor::from_data(
+        TensorData::new(
+            train_split.images[..BATCH * PIXELS].to_vec(),
+            [BATCH, PIXELS],
+        ),
+        (device, init.dtype),
+    );
+    let y0 = labels::<Autodiff<TtBackend>>(train_split, 0, BATCH, device);
+    let xp = primitive_float(x0.clone());
+    let yp = primitive_int(y0.clone());
+
+    let t0_train = Instant::now();
+    let (traced_step, first_loss) = TracedTrainingStep::capture(&[&xp, &yp], || {
+        let loss = loss_fn.forward(model.forward(x0).cast(FloatDType::F32), y0);
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        let new_model = optim.step(LR, model.clone(), grads);
+        let updates = collect_parameter_updates(&model, &new_model);
+        (primitive_float(loss), updates)
+    })
+    .unwrap_or_else(|e| panic!("capturing training step: {e}"));
+
+    report(0, first_loss);
+    losses.push((0, first_loss));
+    step += 1;
+
+    // Replay remaining steps
+    'epochs: for _ in 0..epochs {
+        for from in (0..samples).step_by(BATCH) {
+            if step >= max_steps {
+                break 'epochs;
+            }
+            if step == 1 && from == 0 {
+                continue;
+            }
+            let x_data = train_split.images[from..from + BATCH * PIXELS].to_vec();
+            let y_data: Vec<u32> = train_split.labels[from..from + BATCH]
+                .iter()
+                .map(|&l| i32::from(l) as u32)
+                .collect();
+
+            let timing = traced_step
+                .step(vec![InputPayload::F32(x_data), InputPayload::Bits(y_data)])
+                .unwrap_or_else(|e| panic!("replaying training step {step}: {e}"));
+
+            if step % 100 == 0 || step == max_steps - 1 {
+                report(step, timing.loss);
+                losses.push((step, timing.loss));
+            }
+            step += 1;
+        }
+    }
+    let train_time = t0_train.elapsed();
+
+    // Accuracy evaluation on test set using the in-place trained model
+    let valid_model = model.valid();
+    let mut right = 0usize;
+    for from in (0..test_split.n).step_by(1000) {
+        let m = 1000.min(test_split.n - from);
+        let x = Tensor::<TtBackend, 2>::from_data(
+            TensorData::new(
+                test_split.images[from * PIXELS..(from + m) * PIXELS].to_vec(),
+                [m, PIXELS],
+            ),
+            (device, init.dtype),
+        );
+        let pred = valid_model
+            .forward(x)
+            .argmax(1)
+            .reshape([m])
+            .into_data()
+            .convert::<i32>()
+            .to_vec::<i32>()
+            .expect("predictions");
+        right += pred
+            .iter()
+            .zip(&test_split.labels[from..from + m])
+            .filter(|(p, l)| **p == i32::from(**l))
+            .count();
+    }
+
+    Run {
+        calls,
+        losses,
+        accuracy: right as f64 / test_split.n as f64,
         preload,
         train: train_time,
         steps: step,
@@ -411,6 +544,8 @@ fn infer_traced(
         device,
     );
     let xp = prim(x.clone());
+    // Pre-run forward pass to ensure weights/biases are resident in GDDR before capture
+    let _ = model.forward(x.clone().cast(init.dtype));
     let (trace, _) = burn_tt::Trace::capture(&xp, || {
         prim(
             model
@@ -562,12 +697,16 @@ struct Args {
     /// `--model transformer`: the general-model benchmark instead of MNIST.
     transformer: bool,
     bf16: bool,
+    /// `--train-trace`: train with hardware trace (capture step 0 and replay subsequent steps).
+    train_trace: bool,
+    /// `--hidden H1,H2,...`: hidden layer sizes.
+    hidden: Vec<usize>,
 }
 
 const USAGE: &str = "\
 usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host] [--activation A]
        tt-mnist --infer [--trace] [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
-       tt-mnist --model transformer [--steps S] [--card N] [--tiles T]
+       tt-mnist --model transformer [--steps S] [--card N] [--tiles T] [--train-trace]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
@@ -577,6 +716,8 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
   --host        also train on the host CPU (burn-flex), for comparison
   --bf16        store MNIST weights and activations in BF16 (single card);
                 matrix accumulation, loss and trace input/output remain F32
+  --hidden H    hidden layer sizes, comma-separated (default 512,256: 784-512-256-10, 535k params)
+  --train-trace train with hardware trace (capture step 0 and replay subsequent steps)
   --infer       benchmark inference alone: no training, the forward pass over
                 the test set (untrained weights), so it profiles on its own
                 (`TT_PROFILE`)
@@ -604,6 +745,8 @@ fn args() -> Result<Args, String> {
         activation: Act::Relu,
         transformer: false,
         bf16: false,
+        train_trace: false,
+        hidden: vec![512, 256],
     };
     let mut tiles = None;
     let mut it = std::env::args().skip(1);
@@ -625,6 +768,21 @@ fn args() -> Result<Args, String> {
             "--steps" => a.steps = number(value()?)?,
             "--host" => a.host = true,
             "--bf16" => a.bf16 = true,
+            "--hidden" => {
+                let v = value()?;
+                a.hidden = v
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .map_err(|_| format!("--hidden {s}: not a number\n\n{USAGE}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if a.hidden.is_empty() {
+                    return Err(format!("--hidden needs at least one layer size\n\n{USAGE}"));
+                }
+            }
+            "--train-trace" => a.train_trace = true,
             "--infer" => a.infer = true,
             "--trace" => a.trace = true,
             "--batch" => a.batch = number(value()?)?,
@@ -694,10 +852,27 @@ fn main() {
                 .join(",")
         ),
     };
-    println!("tt-mnist: a {PIXELS}-{HIDDEN}-{CLASSES} network learning MNIST, in Rust, on Tenstorrent Blackhole");
+    let layers_str = std::iter::once(PIXELS)
+        .chain(a.hidden.iter().copied())
+        .chain(std::iter::once(CLASSES))
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("-");
+    let param_count: usize = {
+        let mut total = 0;
+        let mut prev = PIXELS;
+        for &h in &a.hidden {
+            total += prev * h + h;
+            prev = h;
+        }
+        total += prev * CLASSES + CLASSES;
+        total
+    };
+    println!("tt-mnist: a {layers_str} network ({param_count} parameters) learning MNIST, in Rust, on Tenstorrent Blackhole");
     println!("  device   {cards}");
     println!(
-        "  model    Burn nn::Linear x2 + {}, cross-entropy, SGD lr {LR}, batch {BATCH}",
+        "  model    Burn nn::Linear x{} + {}, cross-entropy, SGD lr {LR}, batch {BATCH}",
+        a.hidden.len() + 1,
         a.activation.name()
     );
 
@@ -712,7 +887,7 @@ fn main() {
     let init = Init {
         act: a.activation,
         dtype: if a.bf16 { DType::BF16 } else { DType::F32 },
-        ..init()
+        ..init(&a.hidden)
     };
     println!(
         "  storage  {:?}; matrix accumulation and loss F32",
@@ -766,15 +941,28 @@ fn main() {
         return;
     }
     let before = burn_tt::tensor_traffic();
-    let card = train::<Autodiff<TtBackend>>(
-        &train_split,
-        &test_split,
-        &init,
-        a.epochs,
-        a.steps,
-        &device,
-        |step, loss| println!("  step {step:>5}   loss {loss:.4}"),
-    );
+    let card = if a.train_trace {
+        println!("training with hardware trace (step 0 capture, subsequent steps replayed):");
+        train_traced(
+            &train_split,
+            &test_split,
+            &init,
+            a.epochs,
+            a.steps,
+            &device,
+            |step, loss| println!("  step {step:>5}   loss {loss:.4}"),
+        )
+    } else {
+        train::<Autodiff<TtBackend>>(
+            &train_split,
+            &test_split,
+            &init,
+            a.epochs,
+            a.steps,
+            &device,
+            |step, loss| println!("  step {step:>5}   loss {loss:.4}"),
+        )
+    };
     let moved = burn_tt::tensor_traffic() - before;
     drop(guard);
 
@@ -879,8 +1067,14 @@ fn transformer_benchmark(a: &Args) {
     };
     let before = burn_tt::tensor_traffic();
     let calls = burn_tt::device_time();
-    let (card, report) =
-        burn_tt::with_report(|| tf::train::<Autodiff<TtBackend>>(&weights, steps, &device));
+    let (card, report) = if a.train_trace {
+        println!("training with hardware trace (step 0 capture, subsequent steps replayed):");
+        let r = tf::train_traced(&weights, steps, &device)
+            .unwrap_or_else(|e| panic!("traced transformer training failed: {e}"));
+        (r, burn_tt::Report::default())
+    } else {
+        burn_tt::with_report(|| tf::train::<Autodiff<TtBackend>>(&weights, steps, &device))
+    };
     let card_wall: Duration = card.times.iter().sum();
     let moved = burn_tt::tensor_traffic() - before;
     drop(guard);

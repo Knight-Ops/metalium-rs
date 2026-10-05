@@ -286,6 +286,70 @@ pub trait Engine {
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
+    /// Copy `src` into `dst` on the device without allocating a new buffer.
+    fn copy_into(&mut self, _src: BufferId, _dst: BufferId) -> Result<(), EngineError> {
+        Err(unsupported())
+    }
+    /// Overwrite multiple inputs, replay `trace`, and read multiple outputs back.
+    fn run_generic_trace(
+        &mut self,
+        _trace: u64,
+        _inputs: &[(BufferId, InputPayload)],
+        _outputs: &[(BufferId, OutputKind)],
+    ) -> Result<GenericTraceRun, EngineError> {
+        Err(no_traces())
+    }
+}
+
+/// Input payload to write into a trace's input buffer before replay.
+#[derive(Clone, Debug)]
+pub enum InputPayload {
+    F32(Vec<f32>),
+    Bits(Vec<u32>),
+}
+
+/// Output data kind for trace readback.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    F32,
+    Bits,
+}
+
+/// Output payload downloaded from a trace's output buffer after replay.
+#[derive(Clone, Debug)]
+pub enum OutputPayload {
+    F32(Vec<f32>),
+    Bits(Vec<u32>),
+}
+
+impl OutputPayload {
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            OutputPayload::F32(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn as_bits(&self) -> Option<&[u32]> {
+        match self {
+            OutputPayload::Bits(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn into_f32(self) -> Option<Vec<f32>> {
+        match self {
+            OutputPayload::F32(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Results and timings of a multi-tensor generic trace run.
+#[derive(Clone, Debug, Default)]
+pub struct GenericTraceRun {
+    pub outputs: Vec<OutputPayload>,
+    pub write: std::time::Duration,
+    pub replay: std::time::Duration,
+    pub read: std::time::Duration,
 }
 
 /// One [`crate::Trace::run`]: the output, and where its time went on the
@@ -469,6 +533,66 @@ impl DramBuffers {
         if let Some(id) = self.traces.remove(&trace) {
             let _ = s.release_trace(id);
         }
+    }
+
+    pub fn copy_into<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        src: BufferId,
+        dst: BufferId,
+    ) -> Result<(), EngineError> {
+        let src_t = self.get(src)?;
+        let dst_t = self.get(dst)?;
+        s.copy_into(src_t, dst_t)
+            .map_err(|e| EngineError(e.to_string()))
+    }
+
+    pub fn run_generic_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<GenericTraceRun, EngineError> {
+        use std::time::Instant;
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        s.sync().map_err(e)?;
+        let t0 = Instant::now();
+        for (input_id, payload) in inputs {
+            let t = self.get(*input_id)?;
+            match payload {
+                InputPayload::F32(v) => s.write(t, v).map_err(e)?,
+                InputPayload::Bits(v) => s.write_bits(t, v).map_err(e)?,
+            }
+        }
+        let t1 = Instant::now();
+        s.replay(id).map_err(e)?;
+        s.sync().map_err(e)?;
+        let t2 = Instant::now();
+        let mut out_data = Vec::with_capacity(outputs.len());
+        for &(output_id, kind) in outputs {
+            let t = self.get(output_id)?;
+            match kind {
+                OutputKind::F32 => {
+                    let data = s.download(t).map_err(e)?;
+                    out_data.push(OutputPayload::F32(data));
+                }
+                OutputKind::Bits => {
+                    let data = s.download_bits(t).map_err(e)?;
+                    out_data.push(OutputPayload::Bits(data));
+                }
+            }
+        }
+        Ok(GenericTraceRun {
+            outputs: out_data,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
     }
 
     pub fn upload<T: tt_device::Transport>(
@@ -1797,6 +1921,46 @@ impl Engine for KmdEngine {
             b.release_trace(&mut self.session, trace);
         }
     }
+    fn copy_into(&mut self, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.copy_into(&mut self.session, src, dst)
+    }
+    fn run_generic_trace(
+        &mut self,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<GenericTraceRun, EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.run_generic_trace(&mut self.session, trace, inputs, outputs)
+    }
+}
+
+pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        engine.copy_into(ids.get(src)?, ids.get(dst)?)
+    })
+}
+
+pub fn run_generic_trace(
+    device: TtDevice,
+    trace: u64,
+    inputs: Vec<(BufferId, InputPayload)>,
+    outputs: Vec<(BufferId, OutputKind)>,
+) -> Result<GenericTraceRun, EngineError> {
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        let mapped_inputs: Result<Vec<(BufferId, InputPayload)>, EngineError> = inputs
+            .into_iter()
+            .map(|(buf, p)| ids.get(buf).map(|b| (b, p)))
+            .collect();
+        let mapped_outputs: Result<Vec<(BufferId, OutputKind)>, EngineError> = outputs
+            .into_iter()
+            .map(|(buf, k)| ids.get(buf).map(|b| (b, k)))
+            .collect();
+        engine.run_generic_trace(trace, &mapped_inputs?, &mapped_outputs?)
+    })
 }
 
 /// Settings of the executors that were removed: refused with what replaces
