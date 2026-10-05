@@ -76,7 +76,7 @@ sha256 = "bc2636abc3ea04e6ca322923e6f2713b242857d021d8ef39b9180a14bcb1a5b8"
 #
 # Burn moves quickly and 0.21 is a restructuring: the associated `Device` now lives
 # on `BackendTypes` rather than on `Backend`. The supertrait list in
-# docs/RUST_IMPL_PLAN.md predates that, which is why Phase 7 re-verifies it against
+# docs/plans/master-roadmap.md predates that, which is why Phase 7 re-verifies it against
 # whatever version is pinned then rather than against the plan.
 #
 # Pinned exactly (`=0.21.0` in the workspace manifest) since Phase 7: burn-tt's

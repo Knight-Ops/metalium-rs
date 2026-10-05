@@ -16,7 +16,7 @@
 //! # Why FP32 only
 //!
 //! ttsim declines `UnpackToDst` for every 16-bit and block-float input format
-//! (`docs/ttsim-divergence.md` row 31), so BF16 cannot reach `Dst` through the
+//! (`docs/learnings/ttsim-divergence.md` row 31), so BF16 cannot reach `Dst` through the
 //! unpacker on the simulator at all. The BF16 kernel is silicon-only until the
 //! packer offers another route into `Dst`.
 
@@ -242,7 +242,7 @@ fn the_result_is_neither_operand() {
 
 /// Denormals flush and NaN canonicalises, and the model predicts both.
 ///
-/// `docs/ttsim-divergence.md` row D records these as SFPU behaviour, found by
+/// `docs/learnings/ttsim-divergence.md` row D records these as SFPU behaviour, found by
 /// differential testing. What is new here is that the *oracle* predicts them: if
 /// `fma_bh` did not flush denormals this gate would fail even though the hardware
 /// was right, so it checks the pair rather than the device alone.
@@ -336,7 +336,7 @@ fn the_element_pairing_matches_burn() {
     use burn_tensor::{Tensor, TensorData};
 
     // In Burn 0.21 the associated `Device` lives on `BackendTypes`, not on
-    // `Backend` — one of the restructurings `docs/RUST_IMPL_PLAN.md`'s Phase 7
+    // `Backend` — one of the restructurings `docs/plans/master-roadmap.md`'s Phase 7
     // supertrait list predates. Naming the concrete device type sidesteps it.
     type B = burn_flex::Flex;
     let device = burn_flex::FlexDevice;

@@ -127,7 +127,7 @@ fn reset_state_round_trips() {
 /// `pc` snapshots are not modelled by ttsim, so this cannot be a simulator gate.
 ///
 /// Reading `0xFFB1_3140` raises `UnimplementedFunctionality: t_tile_mmio_rd32`.
-/// See `docs/ttsim-divergence.md`. Kept compiled and ready so that it runs
+/// See `docs/learnings/ttsim-divergence.md`. Kept compiled and ready so that it runs
 /// unchanged at the first silicon gate, where it is the strongest available
 /// statement about *where* a core is executing rather than merely that it is.
 #[cfg(feature = "silicon")]

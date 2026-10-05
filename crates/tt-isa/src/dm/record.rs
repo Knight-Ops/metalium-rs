@@ -4,7 +4,7 @@
 //! A plain list entry ([`super::Entry`]) moves or computes one tile, so a list
 //! is as long as the op is big, and its bytes -- not the round trips -- were
 //! what a GDDR op spent its host time on (the host's MMIO is uncached here,
-//! `docs/ttsim-divergence.md` measurement M). A record names the tensors
+//! `docs/learnings/ttsim-divergence.md` measurement M). A record names the tensors
 //! instead ([`TensorRef`]: a handful of words for any size) and what to do with
 //! them, and [`expand`] produces the entries the host used to send, one at a
 //! time, for the mover to run as it ran them. The host expands every record

@@ -18,7 +18,7 @@
 //! these probes run first. They assert nothing but that the program ran to
 //! `DONE`; each prints `MEASURE <key> = <value>` lines, which `cargo xtask
 //! silicon` keeps in the per-test output file. The values then go into the gates'
-//! per-target corrections and into `docs/ttsim-divergence.md`.
+//! per-target corrections and into `docs/learnings/ttsim-divergence.md`.
 //!
 //! Every program here is one the simulator already runs, changed only in the
 //! variable being measured, and every configuration is one the specification

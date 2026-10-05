@@ -279,7 +279,7 @@ fn survey_the_round_trip() {
 /// assumption: the simulator evaluates the packer synchronously and cannot exhibit
 /// the race, which means **the simulator gates here are strictly weaker than the
 /// silicon ones** and the wait is carried on documentation alone until hardware
-/// says otherwise. Recorded in `docs/ttsim-divergence.md`.
+/// says otherwise. Recorded in `docs/learnings/ttsim-divergence.md`.
 ///
 /// The silicon version asserts the ordering the simulator cannot: the same round
 /// trip without the wait must be observably wrong, at least sometimes.

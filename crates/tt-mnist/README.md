@@ -39,7 +39,7 @@ BF16 subnormals flushed to signed zero on device conversion. The current packed
 gather route is slower than TF32 on MNIST's measured forward GEMMs (about
 662/81 us versus 94/18 us, one tile, release, both cards). This mode has native
 SGD and trace gates; full MNIST BF16 accuracy has not been measured. See
-[the implementation record](../../docs/tensix-next-features.md).
+[the implementation record](../../docs/plans/tensix-next-features.md).
 
 ## Build
 

@@ -355,7 +355,7 @@ pub const fn mad(
     // constraint: ttsim implements 0x86 only for `Mod1 <= 1`, while its 0x84
     // handler accepts `Mod1 <= 3`. Since the recommended negative-zero form needs
     // NEGATE_VC, a modified multiply has to be spelled SFPMAD to run on the
-    // simulator at all. See docs/ttsim-divergence.md entry 17.
+    // simulator at all. See docs/learnings/ttsim-divergence.md entry 17.
     let encoded = if vc == LREG_ZERO && mod1 == 0 {
         encode::Sfpmul::ZERO
             .va(va)
@@ -472,7 +472,7 @@ pub const DST_ODD_COLUMNS: u32 = 2;
 /// defines its functional model, conformance and scheduling entirely by reference
 /// to `SFPMAD` and says nothing the opcode changes, so the two are the same
 /// instruction; and there is precedent for preferring the general spelling —
-/// `docs/ttsim-divergence.md` row 17 records the simulator accepting `Mod1` values
+/// `docs/learnings/ttsim-divergence.md` row 17 records the simulator accepting `Mod1` values
 /// on `SFPMAD` that it rejects on the narrower `SFPMUL` opcode.
 pub const fn add(vb: u32, vc: u32, vd: u32) -> Result<Instruction, EncodeError> {
     mad(LREG_ONE, vb, vc, vd, 0)

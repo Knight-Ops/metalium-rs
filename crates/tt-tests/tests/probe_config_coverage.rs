@@ -1,6 +1,6 @@
 //! Which `Config` registers does ttsim actually model?
 //!
-//! `docs/ttsim-divergence.md` row 21 records that ttsim implements `Config` as a
+//! `docs/learnings/ttsim-divergence.md` row 21 records that ttsim implements `Config` as a
 //! `switch` over specific registers rather than as a backing array, so a legitimate
 //! word no workload has exercised is *fatal* rather than merely uninitialised. That
 //! row says "topping out around register 220", which is not precise enough to plan

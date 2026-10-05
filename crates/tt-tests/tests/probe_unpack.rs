@@ -153,7 +153,7 @@ fn unpack_config(
     // carry something.
     //
     // ttsim models `Config` as a switch over specific registers rather than as an
-    // array (`docs/ttsim-divergence.md` row 21), and it does not model words 2 and
+    // array (`docs/learnings/ttsim-divergence.md` row 21), and it does not model words 2 and
     // 3 of this span: a write to register 66 dies with `tensix_cfg_wr32: reg=66`.
     // Those words hold `WDim`, `BlobsYStart` and `DigestSize`, all of which are
     // zero here -- and zero is the intended value, because `WDim` is read as

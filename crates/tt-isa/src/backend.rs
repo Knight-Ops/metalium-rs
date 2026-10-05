@@ -316,7 +316,7 @@ pub const fn set_thread_entry(addr32: u16, value: u16) -> Result<Instruction, En
 /// Starts from a base entry value and sets fields into it, so that a `SETC16` can
 /// write several fields of one entry without clearing the rest. The base is the
 /// caller's problem: `ThreadConfig` cannot be read back by RISC-V under ttsim
-/// (`docs/ttsim-divergence.md` row 19), so simulator-bound code starts from zero and
+/// (`docs/learnings/ttsim-divergence.md` row 19), so simulator-bound code starts from zero and
 /// has to mean it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ThreadConfigEntry {
@@ -391,7 +391,7 @@ pub const MAX_CONFIG_WORDS: usize = 40;
 /// [`seeded`](Self::seed) with, which is zero unless the caller says otherwise.
 /// That is a real assumption, not a safe default: `Config` has no documented
 /// power-on value, and ttsim makes a read of a word it has not modelled fatal
-/// (`docs/ttsim-divergence.md` row 21). Seed deliberately.
+/// (`docs/learnings/ttsim-divergence.md` row 21). Seed deliberately.
 #[derive(Copy, Clone, Debug)]
 pub struct ConfigWords {
     words: [(u16, u32); MAX_CONFIG_WORDS],

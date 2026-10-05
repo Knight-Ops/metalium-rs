@@ -325,7 +325,7 @@ const _: () = assert!(TRACE_BUFFER % 16 == 0);
 /// unpacks, thread 1 does math, thread 2 packs -- and so does the role harness,
 /// because much of the coprocessor's state is per thread and some of it is tied
 /// to a role by the hardware (`UNPACR` counts with thread 0's ADCs; see
-/// `docs/ttsim-divergence.md` row 45). Each role image runs its own program and
+/// `docs/learnings/ttsim-divergence.md` row 45). Each role image runs its own program and
 /// reports through its own mailbox, laid out like the single-core one above:
 /// the same offsets, from a per-thread base.
 pub mod role {

@@ -30,7 +30,7 @@ pack mode `0x105`. Raw BF16 storage/copy, packed matmul and BF16 pooling window
 staging have simulator gates. Device conversion rounds ties-even, quiets NaNs
 while retaining sign/high payload and flushes BF16 subnormals to signed zero;
 raw storage/copies preserve every bit. See `step74`–`step78` and
-[the implementation record](../../docs/tensix-next-features.md).
+[the implementation record](../../docs/plans/tensix-next-features.md).
 
 A session with `TileChoice::Count(n)` or `All` runs one unit (resident roles + data
 mover) per surviving tile. A GDDR op is a set of independent jobs dealt round-robin
@@ -85,4 +85,4 @@ wrapping sum/product and signed min/max without F32 conversion. Hardware BF16/
 TF32 precision modes are opt-in and preserve documented Blackhole rounding
 behavior; ordinary BF16 casts retain their separate contract. Experimental
 checked integer division/remainder execution is disabled pending status-flag
-validation. See [the current handoff](../../docs/tensix-next-features.md).
+validation. See [the current handoff](../../docs/plans/tensix-next-features.md).

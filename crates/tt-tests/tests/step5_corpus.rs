@@ -191,7 +191,7 @@ fn negative_zero_survives_a_multiply_only_because_the_addend_is_negative() {
     });
 }
 
-/// `docs/ttsim-divergence.md` entry D: denormal operands and results are flushed to
+/// `docs/learnings/ttsim-divergence.md` entry D: denormal operands and results are flushed to
 /// zero, and every NaN is canonicalised to `0x7FC0_0000`. It was recorded from
 /// reading ttsim's source and noted as not yet exercised by a gate. It is now.
 #[test]

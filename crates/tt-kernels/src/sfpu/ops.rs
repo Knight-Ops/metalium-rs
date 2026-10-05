@@ -182,8 +182,8 @@ pub mod kind_sfpu {
     pub const INT_NOT: u32 = 0x17e;
     pub const INT_DIV: u32 = 0x18e;
     pub const INT_REM: u32 = 0x18f;
-    pub const INT_DIV_S: u32 = 0x190;
-    pub const INT_REM_S: u32 = 0x191;
+    pub const INT_DIV_S: u32 = 0x1a0;
+    pub const INT_REM_S: u32 = 0x1a1;
     pub const INT_ADD_S: u32 = 0x180;
     pub const INT_SUB_S: u32 = 0x181;
     pub const INT_MUL_S: u32 = 0x182;

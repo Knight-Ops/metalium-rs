@@ -2,7 +2,7 @@
 //! that survives the host dying.
 //!
 //! Every rule in here was paid for during Phase 1's bring-up
-//! (`docs/implementation-checklist.md`, "Silicon operating notes"):
+//! (`docs/learnings/silicon-operating-notes.md`):
 //!
 //! * **One test per process, one thread.** All gates share one physical card, and
 //!   window allocation is global card state. Running them one at a time is also

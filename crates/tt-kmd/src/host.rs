@@ -2,7 +2,7 @@
 //! `NOC_DMA`): the card's movers reach it through the PCIe tile at the NoC
 //! address the driver returns, as DMA. Host-to-card copies through a BAR are
 //! CPU stores, and run uncached under this machine's VM passthrough
-//! (`docs/ttsim-divergence.md` row M); a copy the card makes is a PCIe
+//! (`docs/learnings/ttsim-divergence.md` row M); a copy the card makes is a PCIe
 //! transaction of the card's, which no CPU mapping slows.
 
 use std::fs::File;

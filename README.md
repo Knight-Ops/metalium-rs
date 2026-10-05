@@ -15,13 +15,15 @@ Unsupported operations/layouts fail explicitly with operation, shape and dtype.
 `burn-tt` owns tensor storage and seed state and has no `burn-flex` dependency;
 Flex remains an external comparison backend. Core MLP and transformer gates
 require native arithmetic and explicit result readback.
-See [the native cutover and datatype backlog](docs/burn-native-cutover.md).
+See [the native cutover and datatype backlog](docs/plans/burn-native-cutover.md).
 
 | Doc | What it holds |
 |---|---|
-| [`docs/RUST_IMPL_PLAN.md`](docs/RUST_IMPL_PLAN.md) | The plan: why each layer is shaped as it is |
-| [`docs/implementation-checklist.md`](docs/implementation-checklist.md) | What is done, per phase; "Silicon operating notes" |
-| [`docs/ttsim-divergence.md`](docs/ttsim-divergence.md) | Where ttsim and silicon disagree, by row number (code cites the rows) |
+| [`docs/plans/master-roadmap.md`](docs/plans/master-roadmap.md) | The master roadmap: why each layer is shaped as it is |
+| [`docs/plans/implementation-checklist.md`](docs/plans/implementation-checklist.md) | What is done, per phase tick-list |
+| [`docs/learnings/silicon-operating-notes.md`](docs/learnings/silicon-operating-notes.md) | Silicon operating notes: hardware survival guide |
+| [`docs/learnings/ttsim-divergence.md`](docs/learnings/ttsim-divergence.md) | Where ttsim and silicon disagree, by row number (code cites the rows) |
+| [`docs/README.md`](docs/README.md) | Full 3-tier documentation index and codebase subsystem matrix |
 
 ## Getting started
 
@@ -46,7 +48,7 @@ build that depends on it. `rust-toolchain.toml` requests the
 | End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole Burn training runs on ttsim, held to `crates/tt-tests/tests/golden/mnist_reduced.txt`. Run when the arithmetic changes; CI runs it on every push. |
 | Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs. |
 | Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`, which implies `e2e`). |
-| Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current baseline is [`docs/firmware-performance.md`](docs/firmware-performance.md). |
+| Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current baseline is [`docs/learnings/firmware-performance.md`](docs/learnings/firmware-performance.md). |
 
 `cargo xtask silicon --help` lists the options (`--device N|all`, `--filter`,
 `--keep-going`, `--timeout-secs`, `--include-ignored`, `--list`). See
@@ -85,10 +87,10 @@ fails if any crate in `SHIPPABLE` (`xtask/src/ship.rs`) depends on `tt-ttsim` or
   Harvested (fused-off) tiles do not reject an access: the NoC hangs, and the
   recovery reset drops the PCIe link. `tt_kernels::session::Session` does this in the
   right order; `Device::tensix_grid` is the query. Run silicon gates one per process
-  through `cargo xtask silicon`. Details: "Silicon operating notes" in
-  `docs/implementation-checklist.md`.
+  through `cargo xtask silicon`. Details:
+  [`docs/learnings/silicon-operating-notes.md`](docs/learnings/silicon-operating-notes.md).
 - **Divergences are logged, not worked around silently**
-  ([`docs/ttsim-divergence.md`](docs/ttsim-divergence.md)). Tests that cannot pass
+  ([`docs/learnings/ttsim-divergence.md`](docs/learnings/ttsim-divergence.md)). Tests that cannot pass
   on ttsim are `#[cfg(feature = "silicon")]`, so they still compile.
 - **Upstream revisions are pinned and hash-verified in `PINS.toml`**: the
   specification, ttsim, tt-metal's `cfg_defines.h`, tt-kmd's `ioctl.h`, MNIST, Burn.
@@ -111,9 +113,9 @@ fails if any crate in `SHIPPABLE` (`xtask/src/ship.rs`) depends on `tt-ttsim` or
 Phase 10.3 is in progress: finish arbitrary-axis reductions and remaining
 reduction kinds, then K-blocked matmul, general slicing/indexing, Tensix
 transpose/norms, BF16 storage/casts and convolution/pooling/attention. See
-[`docs/hardware-coverage.md`](docs/hardware-coverage.md) for gated status.
+[`docs/plans/hardware-coverage.md`](docs/plans/hardware-coverage.md) for gated status.
 Backend typed errors, initialization/discovery and Burn conformance are in
-[`docs/burn-backend-parity.md`](docs/burn-backend-parity.md).
+[`docs/plans/burn-backend-parity.md`](docs/plans/burn-backend-parity.md).
 
 Resident multi-card meshes now pass native training gates. More than one
 compute tile per card in `Topology::Cards`, Ethernet pipelining and fusion remain open. X280 dispatch

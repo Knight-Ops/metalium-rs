@@ -180,7 +180,7 @@ const fn semi_sticky_shift_32(var: u32, amount: i32) -> u32 {
 /// `SFPMUL` is `SFPMAD` with the addend forced to the constant `LReg[9]`, and
 /// `tt_isa::sfpu::mul` negates it so the addend is `-0` rather than `+0` — without
 /// which the multiply drops the sign of a zero result (`SFPMUL.md`, and
-/// `docs/ttsim-divergence.md` row C, which found it by differential testing). The
+/// `docs/learnings/ttsim-divergence.md` row C, which found it by differential testing). The
 /// oracle has to model the same thing.
 pub const fn mul_bh(x: u32, y: u32) -> u32 {
     fma_bh(x, y, 0x8000_0000)

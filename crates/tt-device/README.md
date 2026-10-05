@@ -40,4 +40,4 @@ simulator; this crate must not.
 - Plain reads and writes refuse the local data RAM aperture (`0xFFB1_4000..0xFFB1_E000`):
   touching it with its core in reset hangs the NoC. Use `Device::local_ram_read` /
   `local_ram_write`, which check the core first.
-- See "Silicon operating notes" in `docs/implementation-checklist.md`.
+- See "Silicon operating notes" in `docs/plans/implementation-checklist.md`.

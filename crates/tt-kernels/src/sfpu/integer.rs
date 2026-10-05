@@ -9,8 +9,8 @@ pub fn operation(kind: u32) -> Option<(u32, bool)> {
         0x180..=0x18d => Some((kind - 0x180, true)),
         0x18e => Some((15, false)),
         0x18f => Some((16, false)),
-        0x190 => Some((15, true)),
-        0x191 => Some((16, true)),
+        0x1a0 => Some((15, true)),
+        0x1a1 => Some((16, true)),
         _ => None,
     }
 }

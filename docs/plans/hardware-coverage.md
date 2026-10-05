@@ -12,7 +12,7 @@ requirements below are superseded for ordinary validation.
 
 > Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
 > explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
-> below are superseded by [the current backend contract](../crates/burn-tt/README.md)
+> below are superseded by [the current backend contract](../../crates/burn-tt/README.md)
 > and [the cutover backlog](burn-native-cutover.md).
 
 The working tick-list for Phase 10 of `RUST_IMPL_PLAN.md` ("Phase 10 — Hardware
@@ -22,7 +22,7 @@ progress record: an item is ticked here or nowhere.
 
 Execution order, branches and the per-item workflow: the "Execution" section at the end.
 
-Companion guides: [`tt-metal-concepts-review.md`](tt-metal-concepts-review.md) (the
+Companion guides: [`tt-metal-concepts-review.md`](../learnings/tt-metal-concepts-review.md) (the
 Tenstorrent concepts this stack lacks, G1–G16, and the hardware sharp edges to handle in
 code) and [`burn-backend-parity.md`](burn-backend-parity.md) (the `burn-tt` surface and
 ergonomics roadmap, B0–B16). Item ids here are cited from both.
@@ -1510,7 +1510,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
 | A list's `READ_RUN` followed by its `WRITE_RUN` had no `WAIT` between: a record's moves are issued without waiting, so a write could read its staging slot before the read landed -- ordered only by timing (each group's writes start after all its reads are issued), which is why small groups were the risk and no gate saw it; ttsim's reads land at once | found reading the mover for D4 (2026-10-03) | closed: `tensor::copy` and `copy_blocks` put a `WAIT` between, as host DMA and `gather_rows` do |
-| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `docs/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
+| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `../learnings/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
