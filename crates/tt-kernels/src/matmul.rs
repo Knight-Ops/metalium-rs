@@ -1473,6 +1473,8 @@ pub enum SrcRoute {
     Bf16FromFp32,
     /// BF16 in L1, moved as is.
     Bf16FromBf16,
+    /// Packed block-float operands moved directly to Src.
+    Bfp(crate::bfp::BfpFormat),
 }
 
 impl SrcRoute {
@@ -1482,6 +1484,14 @@ impl SrcRoute {
             SrcRoute::Tf32FromFp32 => (L1Format::Fp32, TF32_CODE),
             SrcRoute::Bf16FromFp32 => (L1Format::Fp32, BF16_CODE),
             SrcRoute::Bf16FromBf16 => (L1Format::Bf16, BF16_CODE),
+            SrcRoute::Bfp(format) => (
+                format.l1_format(),
+                match format {
+                    crate::bfp::BfpFormat::Bfp8 => 6,
+                    crate::bfp::BfpFormat::Bfp4 => 7,
+                    crate::bfp::BfpFormat::Bfp2 => 15,
+                },
+            ),
         }
     }
 }

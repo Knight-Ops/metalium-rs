@@ -16,6 +16,7 @@ use std::process::Command;
 const BINARIES: &[&str] = &[
     "heartbeat",
     "sfpu_mul",
+    "prng_seed",
     "corpus",
     "corpus_t0",
     "role_t0",

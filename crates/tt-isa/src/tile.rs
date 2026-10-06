@@ -128,20 +128,22 @@ impl L1Format {
     /// under the same two codes as the *input* format and gets them back bit for
     /// bit, so the codes name the L1 formats as well as the `Src` ones.
     ///
-    /// # What is deliberately still `None`
+    /// BFP8/BFP4/BFP2 codes 6/7/15 are measured by `step92_bfp_formats`
+    /// on ttsim and both Blackhole cards (1791297768): independent physical
+    /// pack stream and all signed datum patterns through matching Src codes.
+    /// BFP `a` variants and other 8-bit codes remain unclaimed.
     ///
-    /// Every block-float and 8-bit code. Guessing them from tt-metal's `DataFormat`
-    /// enum would be transcription; they should be pinned by measurement, like
-    /// these.
-    ///
-    /// Re-derive all of it at the first silicon gate; a mismatch is a finding.
+    /// New codes require a physical conversion gate before being claimed.
     pub const fn code(self) -> Option<u32> {
         match self {
             L1Format::Fp32 => Some(0),
             L1Format::Fp16 => Some(1),
             L1Format::Tf32 => Some(4),
             L1Format::Bf16 => Some(5),
+            L1Format::Bfp8 => Some(6),
+            L1Format::Bfp4 => Some(7),
             L1Format::Int32 => Some(8),
+            L1Format::Bfp2 => Some(15),
             _ => None,
         }
     }
@@ -153,7 +155,10 @@ impl L1Format {
             1 => Some(L1Format::Fp16),
             4 => Some(L1Format::Tf32),
             5 => Some(L1Format::Bf16),
+            6 => Some(L1Format::Bfp8),
+            7 => Some(L1Format::Bfp4),
             8 => Some(L1Format::Int32),
+            15 => Some(L1Format::Bfp2),
             _ => None,
         }
     }
@@ -1327,6 +1332,9 @@ mod format_code_tests {
             L1Format::Int32,
             L1Format::Bf16,
             L1Format::Fp16,
+            L1Format::Bfp8,
+            L1Format::Bfp4,
+            L1Format::Bfp2,
         ];
         for f in claimed {
             let code = f.code().expect("claimed formats have a code");
@@ -1334,11 +1342,8 @@ mod format_code_tests {
         }
         for f in [
             L1Format::Fp8,
-            L1Format::Bfp8,
             L1Format::Bfp8a,
-            L1Format::Bfp4,
             L1Format::Bfp4a,
-            L1Format::Bfp2,
             L1Format::Bfp2a,
             L1Format::Int16,
             L1Format::Int8,

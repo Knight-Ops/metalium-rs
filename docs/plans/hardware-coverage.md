@@ -237,9 +237,9 @@ there is no backend fallback or exact mode.
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` general F32 reductions/scans and norm compositions pass both cards; pooling implemented; Tensix tensor transpose remains open |
-| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; integer division/remainder and tensor transpose remain open |
+| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; checked integer division/remainder pass step82; payload-preserving Src tensor transpose remains open |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native pooling, resident indexing, F32/BF16 convolution/attention and gradients; general Src tensor transpose and ND indexing remain partial |
-| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
+| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[~]` M1 landed (step90); BFP8/4/2 storage, packed products and Burn policies landed (step91–96); application RNG remains open |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
 here, as S1 and R2.
@@ -318,7 +318,7 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 | Configuration | `SFPCONFIG` | x | `~` `LReg[11..15]` only (`Program::constant`) | | x | x | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
-| PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | | | | | S7 |
+| PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | x (diagnostic seed) | x (reads) | x | x both (step91; reseed differs) | S7 partial |
 
 ### Matrix Unit (FPU)
 
@@ -331,7 +331,7 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 | `MOVA2D`, `MOVB2D`, `MOVD2A`, `MOVD2B`, `MOVB2A` | x (measured) | `~` (`mova2d`, `movb2d`) | | x | x | F1 |
 | `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured BH) | x (`Banks`) | x | x (F32 output) | x both | M1 |
 | `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
-| `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | | x (TF32 Src) | pending | M3 |
+| `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | x | x (TF32 Src) | x both (step87) | M3 partial |
 | `DOTPV`, `SHIFTXA`, `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 |
 
 ### Unpackers and packer
@@ -345,7 +345,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[~]` BF16 native ties-even late narrowing, both-card `step74`; FP16 open | D1 |
-| Block-float formats, exponent sharing, `CLREXPHIST` | `[ ]` -- codes are `None` (`tile.rs`) | D2 |
+| BFP8/BFP4/BFP2 storage, exponent sharing, `CLREXPHIST` | `[x]` -- step92–96; histogram reset and BFP2 packed matmul are silicon-only where ttsim refuses | D2 (delivered formats) |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
 | Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
@@ -406,7 +406,7 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [x] `ELWSUB`: Matrix-unit elementwise subtraction ($SrcA - SrcB \to Dst$). Item M1.
 - [x] `ELWMUL`: Matrix-unit elementwise multiplication ($SrcA \times SrcB \to Dst$). Item M1.
 - [ ] `DOTPV`: Vector-pair dot product on matrix unit. Item M4.
-- [ ] `TRNSPSRCB`: Native hardware matrix transpose of $SrcB$ blocks. Item M3.
+- [x] `TRNSPSRCB`: native SrcB block permutation gated on both cards (step87); M3 payload-preserving tensor transpose remains partial.
 - [ ] `SHIFTXA`: Shift $SrcA$ across lanes. Item M4.
 - [ ] `SHIFTXB`: Rotate $SrcB$ row across matrix registers. Item M4.
 - [ ] `MOVD2A`: Matrix register copy $Dst \to SrcA$.
@@ -416,7 +416,7 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
 - [ ] `ZEROSRC`: Clear source registers $SrcA$ / $SrcB$.
 - [ ] `CLEARDVALID`: Invalidate $Dst$ scoreboard without writing zeroes.
-- [ ] `CLREXPHIST`: Clear exponent history for Block Float (`BFP8`/`BFP4`) support. Item D2.
+- [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
 - [ ] `GATESRCRST`: Gate source reset.
 
 #### Vector Unit (SFPU) (40 instructions)
@@ -1316,7 +1316,7 @@ Each names the measurement it must move. The Burn-side ones are in
       modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
       `float_cast`, `float_into_int`, `int_into_float`, `float_round`, `float_floor`,
       `float_ceil`, `float_trunc`.
-- [ ] **S7 The PRNG.** Seeded per tile from `Backend::seed`. The claim is distributional
+- [~] **S7 The PRNG.** Step91 checks the seed-register write, advance and predication. WRCFG does not restart silicon's stream; direct RISC-V configuration stores with a fence and 512 NOP iterations do restart it on both cards. Simulator lane initialization has a one-lane offset. Seeded application stream semantics and quality remain unresolved. Planned: seeded per tile from `Backend::seed`. The claim is distributional
       (a stated statistical test), not bit-exact against Flex, whose generator is
       different. Burn: `float_random`, dropout.
 - [x] **S8 Lane movement.** `Program::rotate_row` (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`),
@@ -1360,9 +1360,9 @@ Each names the measurement it must move. The Burn-side ones are in
       F32/general max retains SFPU semantics, including resident indices and
       overlapping backwards (`step78`). General GMPOOL routing and performance
       remain open. Pooling traces currently refuse metadata uploads.
-- [ ] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
+- [~] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
-      transposes remain open; `float_permute` now creates native strided views
+      transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
       through dimension swaps, without a new transpose kernel (`step66`).
 - [ ] **M4 `DOTPV`, `SHIFTXA`/`SHIFTXB`.** Silicon-only (row 50). Only when a kernel
       wants them.
@@ -1464,8 +1464,7 @@ Each names the measurement it must move. The Burn-side ones are in
       actual two-card mesh execution and full MNIST accuracy are now gated.
       Mesh transport still widens to F32. Measured MNIST GEMMs are slower, not accelerated
       relative to TF32.
-- [ ] **D2 Block float (BFP8/BFP4).** Measure the codes as divergence rows G and H did,
-      then exponent sharing and `CLREXPHIST`. Prerequisite for `QTensorOps` on the device.
+- [x] **D2 Per-tensor block float (BFP8/BFP4/BFP2), delivered formats only.** Step92/94 pin physical encodings with independent f64/integer oracles, exponent groups and sub-byte order; step93 independently measures histogram reset. Resident Session conversions/readback/free, direct packed products and native Burn storage propagation, F32 training state, fusion and traces pass both cards. Full SMOKE 364/364 (`1791300502`); final conversion/control/propagation gates 28/28 (`1791301208`); release benchmarks `1791300393`. BFP2 matmul and histogram-stat probing have silicon-only arms with documented simulator refusals. Transposed/mixed/batched products widen on device through the existing scheduler. This is a backend storage extension: BFP `a` variants, INT8/UINT8, packed mesh transport and portable `QTensorOps` remain deferred. See [mixed BFP storage](mixed-bfp-storage.md).
 - [x] **D3 Integer and bool storage** (10.2b; was INT32, INT8, bool as a format).
       `tensor::Elem::{F32, I32, Bool}` on every `DramTensor`. The device moves
       every 32-bit pattern unchanged -- the FP32-coded unpack to `Dst` and pack back
@@ -1552,7 +1551,7 @@ path today, `~` when only some shapes do.
 | `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
 | `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs,  unsupported inputs fail | R1b |
 | `float_slice`, `float_flip` | x nonempty resident F32/BF16, arbitrary steps/axes via bit-preserving copies; both-card validated | D4 |
-| `float_transpose`, `float_swap_dims`, `float_permute` | `~` a view at any rank (F32: strided over the buffer); materialised by block copies, or on the host when not whole tiles | M3 |
+| `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial | M3, D2 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | | S6 |
@@ -1565,7 +1564,7 @@ path today, `~` when only some shapes do.
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
-| `float_random` | | S7 |
+| `float_random` | works through seeded per-device host tensor construction; native hardware distributions deferred | S7 partial |
 | `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
 | `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
@@ -1622,7 +1621,7 @@ path today, `~` when only some shapes do.
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
 | `bool_mask_*` | | S5 |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | `~` resident arbitrary-axis gather/select, stepped slices/assignment/cat/repeat, I32 wrapping and Boolean OR updates; ND indexing remains open | D4 |
-| `QTensorOps` | | D2 (stays Flex's until then) |
+| `QTensorOps` | explicit unsupported | Deferred; D2 is backend tensor storage, not portable quantization |
 
 ---
 

@@ -24,6 +24,91 @@ use crate::unsupported::{context, fail};
 use crate::{TtBackend, TtDevice, TtQTensor, TtTensor};
 use tt_kernels::sfpu::ops::kind_sfpu;
 
+pub(crate) fn bfp_compute_input(tensor: TtTensor) -> TtTensor {
+    if tensor.storage_format() != crate::storage::StorageFormat::F32 {
+        tensor.with_storage(crate::storage::StorageFormat::F32)
+    } else {
+        tensor
+    }
+}
+
+pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    if a.storage_format() != b.storage_format()
+        || a.storage_format() == crate::storage::StorageFormat::F32
+        || a.shape().num_dims() != 2
+        || b.shape().num_dims() != 2
+        || a.is_transposed()
+        || b.is_transposed()
+        || a.is_view()
+        || b.is_view()
+    {
+        return None;
+    }
+    assert_eq!(a.device, b.device, "BFP matmul devices differ");
+    let (aa, bb) = (a.to_dram(), b.to_dram());
+    let (id, dims) = crate::server::matmul_bfp(
+        a.device,
+        aa.buffer.id,
+        bb.buffer.id,
+        [aa.buffer.rows, bb.buffer.cols],
+    );
+    Some(device_result(a.device, id, dims).with_storage(a.storage_format()))
+}
+
+pub(crate) fn bfp_compute_result(
+    tensor: TtTensor,
+    storage: crate::storage::StorageFormat,
+) -> TtTensor {
+    if storage == crate::storage::StorageFormat::F32 {
+        tensor
+    } else {
+        tensor.with_storage(storage)
+    }
+}
+
+pub(crate) fn bfp_result_storage(op: &str, inputs: &[&TtTensor]) -> crate::storage::StorageFormat {
+    use crate::storage::StorageFormat;
+    if op.contains("backward")
+        || op.contains("pool")
+        || matches!(
+            op,
+            "attention" | "softmax" | "log_softmax" | "softmin" | "embedding"
+        )
+        || matches!(
+            op,
+            "float_sum"
+                | "float_mean"
+                | "float_sum_dim"
+                | "float_mean_dim"
+                | "float_prod"
+                | "float_prod_dim"
+                | "float_max_dim"
+                | "float_cumsum"
+                | "float_cumprod"
+                | "float_cast"
+                | "float_permute"
+                | "float_slice"
+                | "float_flip"
+                | "float_expand"
+                | "float_unfold"
+                | "unfold4d"
+                | "float_gather"
+                | "float_select"
+                | "float_slice_assign"
+                | "float_scatter_add"
+                | "float_select_add"
+        )
+    {
+        StorageFormat::F32
+    } else {
+        inputs
+            .iter()
+            .map(|t| t.storage_format())
+            .max()
+            .unwrap_or_default()
+    }
+}
+
 /// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
 /// BF16 arithmetic widens to F32 on Tensix, computes using the existing native
 /// contract, then rounds its floating-point result once at the operation boundary.
@@ -266,6 +351,11 @@ fn retag(tensor: TtTensor, device: &TtDevice) -> TtTensor {
     if tensor.device == *device {
         return tensor;
     }
+    assert_eq!(
+        tensor.storage_format(),
+        crate::storage::StorageFormat::F32,
+        "packed BFP cross-card transfer is not supported"
+    );
     TtTensor::new(tensor.into_host(), *device)
 }
 
@@ -828,6 +918,9 @@ fn device_view(
         device,
         rows: m,
         cols: n,
+        storage: parent
+            .as_ref()
+            .map_or(crate::storage::StorageFormat::F32, |p| p.storage),
         parent,
     });
     TtTensor::on_device(
@@ -1075,6 +1168,9 @@ pub(crate) fn reshaped(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor
             );
             return TtTensor::on_device(d.clone(), shape, tensor.dtype(), tensor.device);
         }
+    }
+    if tensor.storage_format() != crate::storage::StorageFormat::F32 {
+        return reshaped(bfp_compute_input(tensor), shape);
     }
     if tensor.computed_on_device() && crate::server::supports_dram(tensor.device) {
         if let (Some([r, c]), Some(target)) =
@@ -1694,6 +1790,11 @@ pub mod float {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
+        let tensor = if tensor.shape().num_dims() > 2 {
+            bfp_compute_input(tensor)
+        } else {
+            tensor
+        };
         if tensor.is_storable()
             && crate::server::is_attached(tensor.device)
             && crate::server::supports_dram(tensor.device)
@@ -1766,6 +1867,14 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
+        let tensor = if tensor.storage_format() != crate::storage::StorageFormat::F32
+            && (tensor.is_transposed()
+                || tensor.stored() != crate::tensor::stored_dims(&shape.to_vec()))
+        {
+            bfp_compute_input(tensor)
+        } else {
+            tensor
+        };
         if let Some(t) = reshaped_strided(&tensor, &shape) {
             return t;
         }

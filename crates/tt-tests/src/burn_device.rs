@@ -230,6 +230,21 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.cast_float(&mut self.session, id, bf16)
         }
+        fn cast_bfp(
+            &mut self,
+            id: burn_tt::BufferId,
+            format: Option<tt_kernels::bfp::BfpFormat>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.cast_bfp(&mut self.session, id, format)
+        }
+        fn matmul_bfp(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .matmul_bfp(&mut self.session, a, b, self.config.fidelity)
+        }
         fn supports_dram(&self) -> bool {
             true
         }

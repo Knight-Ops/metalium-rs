@@ -15,6 +15,16 @@ traces, analytic/Flex oracles and remaining acceptance gaps are recorded in
 [tensix-next-features.md](tensix-next-features.md). Historical unchecked inventory
 rows below are not evidence that these paths are absent.
 
+Current storage extension (2026-10-06): BFP8/BFP4/BFP2 store logical F32 with
+native conversions/products, identity cast backward, fusion boundaries and
+traced parameter copies. Named MNIST MLP/CNN precision policies pass both cards;
+masters, gradients and optimizer state remain F32. This does not implement
+portable Burn `QTensorOps`. Random construction already works through independent
+host RNG streams per device, seeded by `TtBackend::seed`; hardware distributions
+remain deferred. Diagnostic hardware reseeding is reproducible through RISC-V
+stores with a settling interval, while WRCFG and simulator lane initialization
+differ. See [the current storage contract](mixed-bfp-storage.md).
+
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
 with Burn's wrappers and tooling, and the developer experience, measured against the
 CubeCL backends (`burn-cuda`, `burn-wgpu`, both `burn_cubecl::CubeBackend`). It does **not**

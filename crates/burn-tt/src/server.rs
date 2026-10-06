@@ -120,6 +120,21 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    /// Explicit physical BFP storage conversion. None widens to F32.
+    fn cast_bfp(
+        &mut self,
+        _id: BufferId,
+        _format: Option<tt_kernels::bfp::BfpFormat>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    fn matmul_bfp(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     /// Put a row-major `[rows, cols]` matrix of `elem` datums on the device, as
     /// their bits (`hardware-coverage.md` D3): an `I32`'s two's complement, a
     /// `Bool`'s `0` or `1`.
@@ -416,6 +431,7 @@ pub struct DramBuffers {
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
     bf16: HashMap<BufferId, tt_kernels::bf16::Bf16Tensor>,
+    bfp: HashMap<BufferId, tt_kernels::bfp::BfpTensor>,
     next_trace: u64,
     traces: HashMap<u64, tt_kernels::trace::TraceId>,
 }
@@ -581,6 +597,43 @@ impl DramBuffers {
         }
     }
 
+    pub fn cast_bfp<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+        format: Option<tt_kernels::bfp::BfpFormat>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        if let Some(format) = format {
+            let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
+            let dims = [t.rows(), t.cols()];
+            self.next += 1;
+            self.bfp.insert(self.next, t);
+            Ok((self.next, dims))
+        } else {
+            let t = self
+                .bfp
+                .get(&id)
+                .ok_or_else(|| EngineError(format!("no BFP buffer {id}")))?;
+            let t = s.bfp_to_f32(t).map_err(error)?;
+            Ok(self.insert(t))
+        }
+    }
+
+    pub fn matmul_bfp<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        b: BufferId,
+        fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let a = self.bfp.get(&a).ok_or_else(unsupported)?;
+        let b = self.bfp.get(&b).ok_or_else(unsupported)?;
+        let out = s
+            .bfp_matmul(a, false, b, false, fidelity)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(out))
+    }
     fn insert_bf16(&mut self, t: tt_kernels::bf16::Bf16Tensor) -> (BufferId, [usize; 2]) {
         let dims = [t.rows, t.cols];
         self.next += 1;
@@ -627,7 +680,7 @@ impl DramBuffers {
         s.replay(id).map_err(e)?;
         s.sync().map_err(e)?;
         let t2 = Instant::now();
-        let output = s.download(self.get(output)?).map_err(e)?;
+        let output = self.download(s, output)?;
         Ok(TraceRun {
             output,
             write: t1 - t0,
@@ -648,6 +701,18 @@ impl DramBuffers {
         src: BufferId,
         dst: BufferId,
     ) -> Result<(), EngineError> {
+        if let Some(src_t) = self.bfp.get(&src) {
+            let dst_t = self
+                .bfp
+                .get(&dst)
+                .ok_or_else(|| EngineError("copy_into storage formats differ".into()))?;
+            return s
+                .copy_into_bfp(src_t, dst_t)
+                .map_err(|e| EngineError(e.to_string()));
+        }
+        if self.bfp.contains_key(&dst) {
+            return Err(EngineError("copy_into storage formats differ".into()));
+        }
         if let Some(src_t) = self.bf16.get(&src) {
             let dst_t = self
                 .bf16
@@ -694,14 +759,13 @@ impl DramBuffers {
         let t2 = Instant::now();
         let mut out_data = Vec::with_capacity(outputs.len());
         for &(output_id, kind) in outputs {
-            let t = self.get(output_id)?;
             match kind {
                 OutputKind::F32 => {
-                    let data = s.download(t).map_err(e)?;
+                    let data = self.download(s, output_id)?;
                     out_data.push(OutputPayload::F32(data));
                 }
                 OutputKind::Bits => {
-                    let data = s.download_bits(t).map_err(e)?;
+                    let data = s.download_bits(self.get(output_id)?).map_err(e)?;
                     out_data.push(OutputPayload::Bits(data));
                 }
             }
@@ -747,6 +811,9 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
     ) -> Result<Vec<f32>, EngineError> {
+        if let Some(t) = self.bfp.get(&id) {
+            return s.download_bfp(t).map_err(|e| EngineError(e.to_string()));
+        }
         let t = self.get(id)?;
         s.download(t).map_err(|e| EngineError(e.to_string()))
     }
@@ -804,6 +871,9 @@ impl DramBuffers {
     pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
         if let Some(t) = self.live.remove(&id) {
             let _ = s.free(t);
+        }
+        if let Some(t) = self.bfp.remove(&id) {
+            let _ = s.free_bfp(t);
         }
         if let Some(t) = self.bf16.remove(&id) {
             let _ = s.free_bf16(t);
@@ -1121,6 +1191,15 @@ impl DramBuffers {
         first: usize,
         rows: usize,
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if let Some(t) = self.bfp.get(&a) {
+            let v = t
+                .rows_view(first, rows)
+                .map_err(|e| EngineError(e.to_string()))?;
+            let dims = [v.rows(), v.cols()];
+            self.next += 1;
+            self.bfp.insert(self.next, v);
+            return Ok((self.next, dims));
+        }
         if let Some(t) = self.bf16.get(&a) {
             let v = t
                 .rows_view(first, rows)
@@ -1143,11 +1222,11 @@ impl DramBuffers {
 
     /// How many are live.
     pub fn len(&self) -> usize {
-        self.live.len() + self.bf16.len()
+        self.live.len() + self.bf16.len() + self.bfp.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty() && self.bf16.is_empty()
+        self.live.is_empty() && self.bf16.is_empty() && self.bfp.is_empty()
     }
 
     fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, EngineError> {
@@ -1580,6 +1659,36 @@ pub(crate) fn cast_float(
         dims,
         || "native floating-point storage conversion".into(),
         move |engine, ids| engine.cast_float(ids.get(id)?, bf16),
+    )
+}
+
+pub(crate) fn cast_bfp(
+    device: TtDevice,
+    id: BufferId,
+    dims: [usize; 2],
+    format: Option<tt_kernels::bfp::BfpFormat>,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "cast_bfp",
+        device,
+        dims,
+        move || format!("BFP storage {format:?}"),
+        move |engine, ids| engine.cast_bfp(ids.get(id)?, format),
+    )
+}
+
+pub(crate) fn matmul_bfp(
+    device: TtDevice,
+    a: BufferId,
+    b: BufferId,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "matmul_bfp",
+        device,
+        dims,
+        || "packed BFP matmul".into(),
+        move |engine, ids| engine.matmul_bfp(ids.get(a)?, ids.get(b)?),
     )
 }
 
@@ -2023,6 +2132,28 @@ impl Engine for KmdEngine {
             .as_mut()
             .ok_or_else(unsupported)?
             .cast_float(&mut self.session, id, bf16)
+    }
+    fn cast_bfp(
+        &mut self,
+        id: BufferId,
+        format: Option<tt_kernels::bfp::BfpFormat>,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .cast_bfp(&mut self.session, id, format)
+    }
+    fn matmul_bfp(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bfp(
+            &mut self.session,
+            a,
+            b,
+            self.fidelity,
+        )
     }
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError> {
         Ok(self

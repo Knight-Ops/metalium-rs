@@ -27,6 +27,7 @@ program cache region. The host writes a runner's whole descriptor
 (`tt_isa::mailbox::Descriptor`) before every run: L1 survives between processes on
 silicon, so a field left unwritten is the previous process's.
 | `heartbeat`, `sfpu_mul` | T0, or the corpus core | `link.x` | The step 3 and step 4 bring-up gates. |
+| `prng_seed` | T1 | `link.x` | Step91 diagnostic: direct configuration seed stores, settling interval and four lane snapshots. |
 
 `src/lib.rs` is the runtime (entry, `.bss`, status/heartbeat/panic words in the L1
 mailbox); `src/corpus.rs` is the shared body of the program runners. `build.rs`

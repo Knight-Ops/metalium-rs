@@ -13,12 +13,13 @@ on-tile and chip-to-chip data movers. Shippable; depends on `tt-isa`, `tt-device
 | `session` | `Session<T>`: owns a chip for compute. Bring-up order, per-tile reset, resident roles. `TileChoice::{Exactly, First, Count(n), All}`; `Session::open_card(index, ROLES, choice)` for silicon. `enable_dram`, `upload`/`download`/`free`, `matmul_dram`, `eltwise`, `sum_rows`. Also `matmul_on`, the reset-per-run host-staged matmul. |
 | `tensor` | `DramTensor`: row-major `[rows, cols]` FP32 stored as 32x32 tiles interleaved over the usable GDDR channels. `DramAlloc`. The GDDR matmul, element-wise and column-sum ops, built as `Work` (jobs) dealt over the session's tiles. |
 | `bf16` | `Bf16Tensor`: separate two-byte storage in 2112-byte aligned slots. Raw upload/download, native bit copies/views, device ties-even narrowing and SrcA/MOVA2D widening, compact packed gathers and K-block matmul with F32 accumulation. Allocation and trace holds retain the physical slot size. |
+| `bfp` | `BfpFormat::{Bfp8, Bfp4, Bfp2}` and distinct `BfpTensor`: shared exponents, native pack/unpack and packed K-block matmul. Format participates in cache keys and physical allocation/ownership. |
 | `fpu` | Opt-in 16×16 GMPOOL/GAPOOL block max/sum/mean, and BF16 window sums with F32 continuation and explicit mean divisors. General F32 reductions keep their SFPU semantics. |
 | `dm` | `DataMover`: the `dm_b` image (a pure GDDR reader) on RISCV B of one tile, or the `dm_nc` image (a pure writer) on RISCV NC. `read`/`write`, `run_list`/`submit_list`/`wait`, and `enqueue`, which checks a list as the mover will before writing it. Lists carry op records (`tt_isa::dm::record`), `KERNEL`/`LAUNCH` entries that drive the resident roles, and `PAIR` packets: a reader and a writer section joined by circular-buffer credits, one host commit. |
 | `runtime` | `Kernel` (three role programs + `Schedule`), `run` (stage, start, wait, collect), `Resident` (role images left running between kernels), `Profile`. |
 | `program_cache` | `ProgramCache`: the host's mirror of one tile's resident programs in `tt_isa::l1::PROGRAM_CACHE` (exact-word keys, first fit, LRU, pinned while a list names them, programs over half the region bypassed, cleared on reset). A `KERNEL` entry names each role's resident program, so one list runs kernels of any shape. `Session::program_cache_stats` gives hits, misses, uploads and evictions per tile. |
 | `l1` | The L1 planner. A kernel declares `Requirements` (buffers: scratch or circular buffers with pages and one producer/consumer; live stages; semaphores). `Requirements::plan` places them in `tt_isa::l1::DATA`, sharing bytes between buffers never live together; `check` verifies a plan independently; `Requirements::fuse` merges two kernels, unifying producer and consumer buffers. |
-| `matmul` | The Matrix Unit datapath: `Src` staging, role preludes, `Fidelity` (`Lo`, `HiFi2..4`), `SrcRoute` (`Tf32FromFp32`, `Bf16FromFp32`, `Bf16FromBf16`), chunk planning (`plan`, `chunk_fits`), `matmul_requirements`, `tilize_f32` / `detilize_packed`. |
+| `matmul` | The Matrix Unit datapath: `Src` staging, role preludes, `Fidelity` (`Lo`, `HiFi2..4`), `SrcRoute` (`Tf32FromFp32`, `Bf16FromFp32`, `Bf16FromBf16`, `Bfp(format)`), chunk planning (`plan`, `chunk_fits`), `matmul_requirements`, `tilize_f32` / `detilize_packed`. |
 | `datapath` | Unpacker/packer configuration for flat FP32 runs; thread state reset. |
 | `link` | `Link`, `Mover`, `discover`: chip-to-chip moves over Ethernet with the `eth_e1` image. |
 | `shard` | `Fabric`, `Chip`: a matmul split along `N` across cabled chips, bit-identical to one chip. |
@@ -46,8 +47,9 @@ cargo test -p tt-kernels
 ```
 
 Unit tests here: the L1 planner, op-record expansion against the list builders it
-replaced, job dealing over units, list batching, matmul planning. Device gates for everything in this crate are in
-`tt-tests` (`step8` to `step21`).
+replaced, job dealing over units, list batching, matmul planning. Device gates
+are in `tt-tests`; the BFP extension is covered by step92–96. The active
+inventory and silicon evidence are in `docs/plans/hardware-coverage.md`.
 
 ## Gotchas
 
@@ -75,14 +77,36 @@ Resident ordinary and supported tile-aligned batched matmuls automatically
 split K when necessary. Each output tile stays on one unit, with FP32 prior
 accumulators reloaded in product order. `set_matmul_k_block_limit` optionally
 forces a maximum K tile count; `None` restores automatic planning. Existing
-unsplit pipelining remains. `step67`/`step68` cover simulator execution; silicon
-validation and release performance measurements are pending.
+unsplit pipelining remains. `step67`/`step68` cover simulator and both-card
+execution (`1791145571`); BFP K reloads are covered separately by step94.
+Release BFP measurements are recorded in `docs/learnings/firmware-performance.md`.
 
 ## Current extension status
 
 Inclusive min/max scans use raw F32 total ordering. Integer reductions use
 wrapping sum/product and signed min/max without F32 conversion. Hardware BF16/
 TF32 precision modes are opt-in and preserve documented Blackhole rounding
-behavior; ordinary BF16 casts retain their separate contract. Experimental
-checked integer division/remainder execution is disabled pending status-flag
-validation. See [the current handoff](../../docs/plans/tensix-next-features.md).
+behavior; ordinary BF16 casts retain their separate contract. Checked integer
+division/remainder is enabled and validated by step82 on both cards. See
+[the current handoff](../../docs/plans/tensix-next-features.md).
+
+## Resident BFP storage
+
+After `enable_dram`, `Session::bfp_from_f32` packs an F32 `DramTensor` into
+`BfpTensor`; `bfp_to_f32` widens on device. `download_bfp` returns decoded F32,
+`download_bfp_raw` returns diagnostic physical tile images, and `free_bfp`
+preserves trace holds/deferred frees. Conversion repairs dirty input padding
+without changing a parent view's padding claim.
+
+Each 32×32 tile carries a 16-byte header and 64 exponent bytes. BFP8/4/2 image
+sizes are 1104/592/336 bytes; aligned GDDR slots are 1152/640/384 bytes. B/NC
+perform transfers only. `bfp_matmul` consumes same-format nontransposed operands
+directly, with F32 accumulation and bounded K reloads; mixed/transposed inputs
+widen on device. `copy_into_bfp` retains physical bytes and exponent groups.
+Initial execution is single-card; packed mesh transport remains deferred.
+
+Step92/94 cover independent encoding/arithmetic oracles, special values,
+ragged padding, physical sizes and changed-input replay on simulator and both
+cards. Pinned ttsim refuses direct BFP2 matmul; that arm is silicon-only. See
+[the delivered contract and validation](../../docs/plans/mixed-bfp-storage.md)
+and [conversion/matmul release medians](../../docs/learnings/firmware-performance.md).

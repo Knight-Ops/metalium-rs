@@ -29,6 +29,7 @@ mod ops;
 mod random;
 mod report;
 mod server;
+pub mod storage;
 mod tensor;
 mod topology;
 mod trace;

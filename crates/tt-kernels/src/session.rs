@@ -2013,6 +2013,115 @@ impl<T: Transport> Session<T> {
         self.free_placement(tensor.placement)
     }
 
+    /// Cast logical F32 to deterministic resident BFP storage. Zero padding
+    /// cannot influence an exponent group. A dirty view is repaired via a copy.
+    pub fn bfp_from_f32(
+        &mut self,
+        input: &DramTensor,
+        format: crate::bfp::BfpFormat,
+    ) -> Result<crate::bfp::BfpTensor, TensorError> {
+        input.expect("BFP conversion", tensor::Elem::F32)?;
+        let repaired = self.meet(input, tensor::PadNeed::Zero)?;
+        let result = (|| {
+            let (out, jobs) = crate::bfp::compress(
+                &mut self.dram_state()?.alloc,
+                repaired.as_ref().unwrap_or(input),
+                format,
+            )?;
+            if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+                self.dram_state()?.alloc.free(&out.placement);
+                return Err(error);
+            }
+            Ok(out)
+        })();
+        if let Some(repaired) = repaired {
+            let _ = self.free(repaired);
+        }
+        result
+    }
+
+    /// Decode BFP storage to resident F32 through SrcA/MOVA2D on Tensix.
+    /// Decoded subnormals normalize to zero, matching the measured Src path.
+    pub fn bfp_to_f32(&mut self, input: &crate::bfp::BfpTensor) -> Result<DramTensor, TensorError> {
+        let work = crate::bfp::expand(&mut self.dram_state()?.alloc, input)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    pub fn free_bfp(&mut self, tensor: crate::bfp::BfpTensor) -> Result<(), TensorError> {
+        self.free_placement(tensor.placement)
+    }
+
+    /// Ordinary readback returns decoded logical F32, never packed numerics.
+    pub fn download_bfp(&mut self, input: &crate::bfp::BfpTensor) -> Result<Vec<f32>, TensorError> {
+        self.refuse_while_capturing("download")?;
+        let decoded = self.bfp_to_f32(input)?;
+        let result = self.download(&decoded);
+        let free = self.free(decoded);
+        result.and_then(|values| free.map(|()| values))
+    }
+
+    /// Diagnostic physical TileImage bytes per tile. The unused header bytes
+    /// have no semantic value. Slot alignment bytes are excluded.
+    pub fn download_bfp_raw(
+        &mut self,
+        input: &crate::bfp::BfpTensor,
+    ) -> Result<Vec<Vec<u8>>, TensorError> {
+        self.refuse_while_capturing("download")?;
+        self.sync()?;
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        (0..input.tile_count())
+            .map(|tile| {
+                let slot = input.slot(tile);
+                let mut bytes = vec![0; input.format().tile_image().total_bytes()];
+                let range = slot
+                    .channel()
+                    .range(slot.offset(), bytes.len() as u64)
+                    .ok_or_else(|| TensorError::Shape("BFP diagnostic range overflow".into()))?;
+                dev.dram_read(&d.w4, range, &mut bytes)?;
+                Ok(bytes)
+            })
+            .collect()
+    }
+
+    /// Native F32 product of decoded BFP operands. Transposes, ragged edges
+    /// and K blocking follow the same scheduler as ordinary resident products.
+    pub fn bfp_matmul(
+        &mut self,
+        a: &crate::bfp::BfpTensor,
+        a_transposed: bool,
+        b: &crate::bfp::BfpTensor,
+        b_transposed: bool,
+        fidelity: Fidelity,
+    ) -> Result<DramTensor, TensorError> {
+        if !a_transposed && !b_transposed && a.format() == b.format() {
+            let limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
+            let work = crate::bfp::matmul(&mut self.dram_state()?.alloc, a, b, fidelity, limit)?;
+            return self.execute(work, RESET_BUDGET);
+        }
+        let aa = self.bfp_to_f32(a)?;
+        let result = match self.bfp_to_f32(b) {
+            Ok(bb) => {
+                let result = self.matmul_dram(
+                    &aa,
+                    a_transposed,
+                    &bb,
+                    b_transposed,
+                    SrcRoute::Tf32FromFp32,
+                    fidelity,
+                    RESET_BUDGET,
+                );
+                let _ = self.free(bb);
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let _ = self.free(aa);
+        result
+    }
+
     pub fn repack_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,
@@ -3749,6 +3858,16 @@ impl<T: Transport> Session<T> {
             tensor::Pad::Undefined
         });
         Ok(())
+    }
+
+    /// Preserve BFP exponent groups and packed bits in an existing allocation.
+    pub fn copy_into_bfp(
+        &mut self,
+        src: &crate::bfp::BfpTensor,
+        dst: &crate::bfp::BfpTensor,
+    ) -> Result<(), TensorError> {
+        let jobs = crate::bfp::copy_into(src, dst)?;
+        self.submit_jobs(jobs, RESET_BUDGET)
     }
 
     /// Copy logical BF16 payloads into an existing allocation, without conversion.

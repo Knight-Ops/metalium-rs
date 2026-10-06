@@ -1,5 +1,14 @@
 # Generalized Traced Execution Architecture for Burn on Tenstorrent: High-Performance Traced Inference & Training
 
+Current BFP extension (2026-10-06): captured conversions, compressed outputs,
+parameter copies and changed-input replay pass step94–96 on both cards. Trace
+holds and deferred frees retain physical slot sizes and exponent groups.
+Replay input buffers still require ordinary F32 physical storage; perform
+explicit BFP casts inside the captured computation. Decoded output readback
+widens on device. Training keeps gradients, masters and optimizer state F32.
+See [the current storage contract](mixed-bfp-storage.md); the motivation and
+original limitations below describe the earlier trace design.
+
 ## 1. Architectural Motivation & Scope
 
 In standard Burn backend execution, every model invocation (inference forward pass or training step) incurs substantial host-side latency:

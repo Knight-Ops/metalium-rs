@@ -196,9 +196,10 @@ slower than TF32 on the measured MNIST GEMMs.
 Burn's logical dtype and shape belong to `TtTensor`; the engine owns the physical
 device layout. Host byte counts are not device allocation sizes. Tenstorrent
 BFP2/BFP4/BFP8 and their `a` variants are separate physical tile formats with
-shared exponents, rather than aliases for Burn's scalar dtypes. Their layout and
-decoders already exist in `tt-isa::tile`, but backend storage and compute support
-need separate gates. See [the cutover and dtype backlog](../../docs/plans/burn-native-cutover.md).
+shared exponents, rather than aliases for Burn's scalar dtypes. BFP2/BFP4/BFP8
+storage and native conversions/products are implemented through the logical-F32
+storage extension documented below. The `a` variants remain deferred. See
+[the delivered contract](../../docs/plans/mixed-bfp-storage.md).
 
 ## Environment variables
 
@@ -285,4 +286,59 @@ Mesh batches dispatch each product through distributed output-column partitions.
 two-chip forward. All six attention silicon gates pass (`1791232718`), including
 BF16 resident training on card 0 and forward execution on cards 0 and 1.
 Release benchmarks and broader attention acceptance remain outstanding.
-Convolution and general resident-index routing remain unsupported.
+Native convolution and resident indexing are covered by steps 82–89.
+
+## Explicit BFP tensor storage
+
+Import `burn_tt::storage::{TensorStorageExt, StorageFormat}` to call
+`tensor.with_storage(StorageFormat::Bfp8)` (also `Bfp4`, `Bfp2`, `F32`) and
+`tensor.storage_format()`. Logical dtype remains F32. Convert logical BF16
+to F32 before entering BFP. Casts produce fresh resident tensors, invalidate
+the source-value host cache, and use deterministic hardware conversion.
+
+| Operation | Result storage |
+| --- | --- |
+| Explicit cast | Requested format |
+| Unary/scalar arithmetic | Input storage |
+| Binary arithmetic/matmul | Higher input precision: F32 > BFP8 > BFP4 > BFP2 |
+| Reductions | F32 |
+| Comparisons/index outputs | Existing Boolean/integer types |
+| Views retaining exponent groups | Shared original storage |
+| Rearrangements creating new groups | Decoded F32; explicitly cast to compress |
+
+Compound operations follow their constituent rules: F32 biases, constants or
+reduction results can promote subsequent results. Computation and accumulation
+use native F32 primitives; conversions run on Tensix and movers transfer bytes.
+Same-format ordinary matrices use direct packed operands. Other supported
+matmul layouts widen on device through the existing scheduler.
+
+Autodiff storage casts use identity backward, a straight-through approximation.
+Keep master parameters, gradients, accumulation, optimizer state and sensitive
+loss inputs in F32. Serialization/readback returns decoded F32; reapply your
+policy after loading. Fusion resolves pending work at explicit casts and retains
+separate compression boundaries for compound arithmetic. Initial BFP storage
+support is single-card; mesh requests fail explicitly. This backend extension
+does not implement portable Burn QTensorOps or a compressed-gradient policy.
+
+Shared models accept `PrecisionPolicy<B>`; use `NativeStoragePolicy` on this
+backend and explicitly choose `F32Policy` on other backends. Executable policy
+workloads are in `tt-mnist::precision::Mlp` and `Cnn::forward_with_precision`,
+validated by `step96_mixed_bfp_mnist`:
+
+```rust
+use burn_tt::storage::{NativeStoragePolicy, StorageFormat, TensorStorageExt};
+let policy = NativeStoragePolicy(|name| match name {
+    "mlp.hidden.weight" => StorageFormat::Bfp2,
+    "mlp.relu" => StorageFormat::Bfp4,
+    "mlp.head.weight" => StorageFormat::Bfp8,
+    _ => StorageFormat::F32, // biases, input and logits promote to F32
+});
+// F32 master model: casts in forward retain identity backward to its parameters.
+// let logits = model.forward(images, &policy);
+// let loss = loss_fn.forward(logits.with_storage(StorageFormat::F32), labels);
+```
+
+Use a logical F32 tensor to write trace inputs; compressed intermediates and
+outputs retain their captured storage. Packed parameter copies preserve exponent
+groups and physical bytes. Packed cross-card transfer is deferred and fails
+explicitly; decode to F32 before ordinary cross-card transfer.

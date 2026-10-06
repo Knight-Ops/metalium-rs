@@ -4,6 +4,13 @@ This plan defines the concrete specification, architecture, and verification che
 
 It tracks milestones **B12** and **B13a–B13c** from [`docs/plans/burn-backend-parity.md`](burn-backend-parity.md).
 
+Current BFP contract (2026-10-06): `StorageBackend` also supports
+`Fusion<TtBackend>`. Explicit casts resolve pending work and register a new
+handle, preserving compression boundaries. Compressed add/ReLU executes its
+constituent storage rules rather than collapsing their rounding into the F32
+fused path. Step95 gates storage propagation and residency on both cards.
+See [the delivered storage and training rules](mixed-bfp-storage.md).
+
 ---
 
 ## 1. Architectural Strategy

@@ -33,7 +33,7 @@ directly, one test per process, single-threaded.
 |---|---|
 | `--device N\|all` | Card to run on (default 0); `all` runs the selection on each card in turn. Passed as `TT_SILICON_DEVICE`. |
 | `--filter S` | Only tests whose `binary::test` name contains `S`; repeatable, run in filter order. |
-| `--smoke` | Adds the `SMOKE` filters: `step19_eltwise`, `step11_burn`, `step20_many_tiles` element-wise and column sums, and the `step12_mnist` first forward pass and reduced runs (one and four tiles). |
+| `--smoke` | Adds the current `SMOKE` filters in `src/silicon.rs`, including native model regressions and step91–96 PRNG/BFP conversion, packed-product, propagation and mixed-training gates. |
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
 | `--timeout-secs N` | Per-test wall-clock limit (default 120). |
@@ -59,6 +59,10 @@ by default the `BENCH` selection in `src/silicon.rs`:
 - `silicon_perf::pcie_*`.
 
 Every other `silicon` option applies; `--filter` replaces the default selection.
+The ignored BFP release benchmark is selected explicitly with
+`cargo xtask bench --device all --filter step94_bfp_storage::benchmark_resident_bfp_conversion_and_packed_product`.
+It validates outputs, uses two warmups/nine samples and reports host medians
+plus dataflow statistics for pack/unpack and direct packed matmul.
 Every `BENCH {json}` line the tests print is collected into
 `target/silicon/bench/<stamp>.jsonl` (one record per line, with its test) and
 `<stamp>.md` (a table). [`docs/learnings/firmware-performance.md`](../docs/learnings/firmware-performance.md) is built from one such run.

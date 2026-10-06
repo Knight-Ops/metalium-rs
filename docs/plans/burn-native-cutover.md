@@ -23,7 +23,7 @@ gate, including native scalar broadcasting and ragged transpose copies.
 
 ## Remaining operation coverage
 
-Missing convolution, FFT, sorting, quantized compute, and
+Missing FFT, sorting, portable quantized compute, and
 other required methods fail explicitly. Unsupported shapes of implemented
 operations also fail explicitly. Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across chips and move tile slots over Ethernet without host tensor
@@ -83,31 +83,32 @@ silicon gates, including BF16 resident training. Broader acceptance remains open
 See `tensix-next-features.md` for the current handoff and validation evidence.
 BF16 is slower on the measured MNIST GEMMs; see `tensix-next-features.md`.
 
-## Tenstorrent BFP formats
+## Tenstorrent BFP formats (delivered 2026-10-06)
 
-Support for BFP2/BFP4/BFP8 (often called BF2/BF4/BF8) and their `a` variants is
-a separate milestone. Logical Burn dtype is not a physical device tile format.
-The current `Cell` records logical dtype and shape; `Engine` and its device
-buffers own physical layout and allocation. `HostBuffer` contains ordinary
-row-major host bytes. Its byte size must never determine a BFP device allocation.
+BFP2/BFP4/BFP8 are explicit per-tensor storage of logical F32 through
+`TensorStorageExt::{with_storage, storage_format}`. Physical allocation derives
+from `TileImage`, never ordinary row-major host byte counts. Tensix performs
+packing/unpacking and arithmetic; B/NC transfer bytes. Same-format ordinary
+rank-two operands use packed matmul directly; mixed/transposed/batched products
+widen on device through existing native scheduling.
 
-Build on the existing `tt-isa::tile::L1Format`, `TileImage`, bit addressing,
-exponent-section layouts and decoders. Before advertising backend support:
+Unary/scalar results preserve storage, binary arithmetic/matmul use the higher
+input precision, and reductions return F32. Views preserving exponent groups
+share storage; regrouping materializes decoded F32. Casts have identity backward;
+gradients, master parameters and optimizer state remain F32. Fusion preserves
+compression boundaries; parameter copies and changed-input traces retain
+physical storage. Ordinary readback/serialization returns decoded F32.
 
-1. Add a device storage descriptor for physical format and shared exponent
-   layout, independently of the logical Burn dtype and accumulator precision.
-2. Implement packing, unpacking, staging, readback and format conversion using
-   the physical descriptor. Preserve logical shape and ragged edge semantics.
-3. Gate device allocation sizes, exponent groups, rounding, zero, extremes and
-   ragged tiles against the ISA model, then validate the same cases on silicon.
-4. Enable matmul and subsequent primitives with explicit input/storage/output
-   formats and accumulation policy. Add accuracy bounds appropriate to each
-   format and model gates using identical logical inputs.
-5. Decide the public Burn mapping separately: reduced physical storage of an
-   F32 tensor versus a quantized primitive. Burn quantization schemes must not
-   be assumed to match Tenstorrent block exponent semantics.
-
-Until those gates pass, BFP formats are not reported as supported by `burn-tt`.
+Step91–96 validate physical layouts, numerical oracles, ragged edges, K reloads,
+Burn propagation and actual MNIST MLP/CNN precision policies on both cards.
+Full SMOKE passed 364/364 (`1791300502`), final BFP controls 28/28
+(`1791301208`), and PRNG diagnostics 4/4 (`1791302401`). See
+[the contract and completed checklist](mixed-bfp-storage.md) and the
+[measured conversion costs and accuracy observations](../learnings/firmware-performance.md).
+BFP `a` variants, INT8/UINT8, packed mesh transport and portable Burn
+`QTensorOps` remain deferred. Burn random uses the existing per-device seeded
+host construction; hardware distribution generation remains deferred despite
+the now-reproducible diagnostic RISC-V seed-store path.
 
 ### Convolution and resident-index continuation (2026-10-05)
 

@@ -17,6 +17,7 @@
 //! to a device, returns [`runtime::RunError`] instead.
 
 pub mod bf16;
+pub mod bfp;
 pub mod code;
 pub mod datapath;
 pub mod dm;

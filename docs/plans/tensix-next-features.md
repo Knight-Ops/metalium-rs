@@ -481,3 +481,21 @@ generator and both shipping dependency checks pass. Logs are
 Benchmarks and matrix numerical/special-value contracts are in the learnings
 files. The opt-in permits reduced Src/alignment precision; no universal speedup
 or IEEE special-value behavior is promised.
+
+## Next tranche delivered: per-tensor BFP8/4/2 and PRNG diagnostics (2026-10-06)
+
+See [mixed BFP storage](mixed-bfp-storage.md) for the current contract. Session
+BFP pack/unpack, direct packed products and Burn storage policies retain logical
+F32 and F32 compute/accumulation. Master parameters, gradients and optimizer
+operations remain F32; casts use identity backward. Native policies for actual
+MNIST MLP/CNN, fusion, group-preserving views, parameter copies and changed-input
+traces pass both cards. Full SMOKE: 364/364 (`1791300502`); final rounding and
+negative controls: 28/28 (`1791301208`). Conversion cost and accuracy changes
+are recorded separately from the F32 golden in `firmware-performance.md`.
+
+D2 is complete for BFP8/4/2, not the deferred `a`/INT8/portable quantization/mesh
+formats. S7 remains partial: WRCFG continues the observed silicon stream,
+but direct RISC-V seed stores with a fence and conservative settling interval
+restart it on both cards (`1791302214`, 4/4). Lanes have strong initialization
+correlations and seed 0xffffffff is absorbing. Application RNG quality and
+stream semantics remain deferred; Burn random construction is unchanged.

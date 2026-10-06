@@ -111,7 +111,17 @@ impl Optimization<TtFusionRuntime> for TtOptimization {
                 let lhs_tensor = context.handles.get_float_tensor::<TtBackend>(&lhs_global);
                 let rhs_tensor = context.handles.get_float_tensor::<TtBackend>(&rhs_global);
 
-                let result = crate::ops::float::float_add_relu(lhs_tensor, rhs_tensor);
+                let result = if lhs_tensor.storage_format() != crate::storage::StorageFormat::F32
+                    || rhs_tensor.storage_format() != crate::storage::StorageFormat::F32
+                {
+                    let sum =
+                        <TtBackend as burn_backend::ops::FloatTensorOps<TtBackend>>::float_add(
+                            lhs_tensor, rhs_tensor,
+                        );
+                    <TtBackend as burn_backend::ops::ActivationOps<TtBackend>>::relu(sum)
+                } else {
+                    crate::ops::float::float_add_relu(lhs_tensor, rhs_tensor)
+                };
 
                 context
                     .handles
@@ -131,7 +141,8 @@ impl Optimization<TtFusionRuntime> for TtOptimization {
                     .unwrap_or_else(|| out.clone());
 
                 let in_tensor = context.handles.get_float_tensor::<TtBackend>(&in_global);
-                let result = crate::ops::activation::relu(in_tensor);
+                let result =
+                    <TtBackend as burn_backend::ops::ActivationOps<TtBackend>>::relu(in_tensor);
 
                 context
                     .handles

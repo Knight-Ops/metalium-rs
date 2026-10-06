@@ -71,6 +71,13 @@ use core::marker::PhantomData;
 use crate::isa::generated::{defs, encode};
 use crate::isa::{EncodeError, Instruction};
 
+/// Reset all four packer exponent histograms and their maximum-exponent state.
+/// This is unrelated to selecting a block's shared BFP exponent. Drain pack
+/// work before issuing it, then wait for the Matrix Unit before reading state.
+pub fn clear_exponent_history() -> Instruction {
+    encode::clrexphist().expect("CLREXPHIST has no operands")
+}
+
 /// `UNPACR` bit 0: claimed by no field in the specification, and required.
 ///
 /// ttsim calls it `last` and refuses the instruction without it (`tensix_unpacr:
@@ -494,6 +501,11 @@ pub mod rules {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn histogram_reset_is_the_measured_operand_free_word() {
+        assert_eq!(clear_exponent_history().word(), 0x21000000);
+    }
 
     #[test]
     fn unpack_sets_the_unpacker_the_flip_and_the_last_bit() {

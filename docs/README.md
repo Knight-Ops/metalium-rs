@@ -17,9 +17,10 @@ flowchart TD
         PL3["hardware-coverage.md (Phase 10: SFPU/FPU/MMA)"]
         PL4["tensix-next-features.md (Sprint Status & Handoff)"]
         PL5["burn-backend-parity.md (B0-B16 Roadmap)"]
-        PL6["burn-native-cutover.md (Native & BFP Roadmap)"]
+        PL6["burn-native-cutover.md (Native Cutover Record)"]
         PL7["traced-execution.md (Unified Inference & Training)"]
         PL8["kernel-fusion.md (B12 & B13a-c Burn Fusion)"]
+        PL9["mixed-bfp-storage.md (BFP8/4/2 Contract & PRNG Diagnostics)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -60,9 +61,10 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`master-roadmap.md`](plans/master-roadmap.md): Master architectural roadmap spanning Phases 0–10.
   - [`implementation-checklist.md`](plans/implementation-checklist.md): Master tick-list tracking overall stack milestones across phases.
   - [`hardware-coverage.md`](plans/hardware-coverage.md): Phase 10 tracker for Tensix tile units (SFPU, FPU, Matrix Engine), numerical tolerance contracts, and Burn op coverage.
-  - [`tensix-next-features.md`](plans/tensix-next-features.md): Active sprint handoff (2026-10-05), BF16/pooling/scan status, numerical contracts, and current task checklist.
+  - [`tensix-next-features.md`](plans/tensix-next-features.md): Current sprint handoff, native operation status, numerical contracts, and validation evidence.
   - [`burn-backend-parity.md`](plans/burn-backend-parity.md): B0–B16 roadmap for `burn-tt` to achieve full backend parity with CubeCL/CUDA.
-  - [`burn-native-cutover.md`](plans/burn-native-cutover.md): Native cutover record, retired Flex fallback, and Tenstorrent BFP physical format backlog.
+  - [`burn-native-cutover.md`](plans/burn-native-cutover.md): Native cutover record, retired Flex fallback, delivered tensor storage and deferred formats.
+  - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
 

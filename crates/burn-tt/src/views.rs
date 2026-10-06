@@ -355,6 +355,7 @@ mod tests {
             rows,
             cols,
             parent: None,
+            storage: crate::storage::StorageFormat::F32,
         });
         let v = Strided::of(
             &DramRef {

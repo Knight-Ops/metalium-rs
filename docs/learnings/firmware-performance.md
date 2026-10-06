@@ -873,3 +873,57 @@ Across warmups and samples, F32 row multiplication staging transfer packets fall
 isolates removal of coordinate transfers and expanded GDDR staging while
 preserving the bounded tile scheduler. Resident Burn views may still materialize
 before entering the kernel. SFPU remains the default.
+
+### Mixed BFP storage: measured conversion overhead (2026-10-06)
+
+Run `1791300393`, `cargo xtask bench --device all --filter
+step94_bfp_storage::benchmark_resident_bfp_conversion_and_packed_product`.
+Release `c55a447f382e+dirty`, two discovered Tensix tiles, default streaming,
+AICLK 1350 MHz, eight GDDR channels at 16000 MT/s. Counter rates measured
+1350.080 / 1350.080 MHz (cards 0 / 1). Host `Instant` timing includes completed
+submission and synchronization; uploads/downloads and validation are outside
+the samples. Two warmups, nine samples, medians below. Inputs are
+exact unit values, products validated at every repetition. Shape is
+`37x65 @ 65x35`; pack/unpack cover **both** operands, product consumes packed
+operands directly with HiFi4 and F32 accumulation/output.
+
+| Format | Slot bytes | Pack card 0 / 1 (µs) | Unpack card 0 / 1 (µs) | Packed product card 0 / 1 (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| BFP8 | 1152 | 47.936 / 46.342 | 249.233 / 251.037 | 71.568 / 71.036 |
+| BFP4 | 640 | 47.825 / 46.622 | 248.643 / 245.226 | 71.958 / 71.166 |
+| BFP2 | 384 | 48.046 / 46.833 | 243.583 / 238.293 | 72.328 / 71.326 |
+
+Each format's eleven repetitions produce 1232 scheduled batches and 924 NC
+release waits per card, with zero standalone transfer packets: packed and
+widening transfers share kernel scheduling. The bounded eight-bank widening
+path reuses output scratch only after NC release. Physical images, headers,
+exponents and 64-byte slot alignment are included in the allocations; raw
+diagnostic readback excludes alignment slack. These sizes reduce resident
+operand memory. The conversion overhead is substantial; no model speedup
+or larger-GEMM throughput improvement is claimed. Raw results and percentile
+spread are in `target/silicon/bench/1791300393.{jsonl,md}`.
+
+### Mixed-storage MNIST policy observations (2026-10-06)
+
+Both-card run `1791300035` agrees with simulator `step96_mixed_bfp_mnist`.
+Four real training images, full-batch SGD, four updates at lr=0.05; MLP
+784→16→10 with seed 23; CNN uses its existing deterministic Init. F32 master
+parameters, gradients and loss inputs; biases/input/logits are explicitly F32.
+Mixed columns name hidden/conv weight, ReLU activation and head weight formats.
+This tiny training-set diagnostic records compression effects; it does not
+establish held-out accuracy or convergence. The F32 golden remains unchanged.
+
+| Model / policy | First → fourth loss | Final training accuracy |
+| --- | --- | --- |
+| MLP F32 | 2.336746 → 2.067829 | 3/4 |
+| MLP BFP2 / BFP4 / BFP8 | 2.320056 → 2.177817 | 1/4 |
+| MLP BFP4 / BFP2 / BFP8 | 2.335825 → 2.155071 | 1/4 |
+| MLP BFP8 / BFP4 / BFP2 | 2.322205 → 2.221868 | 1/4 |
+| CNN F32 | 2.227119 → 2.173344 | 1/4 |
+| CNN BFP2 / BFP4 / BFP8 | 2.238755 → 2.192377 | 1/4 |
+| CNN BFP4 / BFP2 / BFP8 | 2.264418 → 2.229749 | 1/4 |
+| CNN BFP8 / BFP4 / BFP2 | 2.258909 → 2.228090 | 2/4 |
+
+All masters changed, tested gradients/master updates stayed F32, training had
+no intermediate downloads, and changed-image traces matched fresh execution
+bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.

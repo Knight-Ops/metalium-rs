@@ -13,6 +13,7 @@ gets the role images from a crate it can depend on, not from the test harness.
 | `ETH_E1` | The Ethernet E1 mover, loaded at `tt_isa::eth::E1_IMAGE`. |
 | `CORPUS`, `CORPUS_T0` | The single-thread program runner for T1 (ttsim) and T0 (silicon). |
 | `HEARTBEAT`, `SFPU_MUL` | Bring-up gate images, loaded at `LOAD_ADDRESS`. |
+| `PRNG_SEED` | Step91 direct RISC-V seed-store diagnostic on T1, loaded at `LOAD_ADDRESS`; includes a conservative settling interval and lane snapshots. |
 
 `Image` is `(Core, &[u8], load address)`. The ELF entry points are recorded at build
 time so each image can be checked against the core it is loaded for.

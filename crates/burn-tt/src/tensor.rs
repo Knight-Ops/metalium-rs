@@ -77,6 +77,7 @@ pub(crate) struct Buffer {
     /// parent's slots are freed only once every view of them has gone.
     #[allow(dead_code)]
     pub(crate) parent: Option<Arc<Buffer>>,
+    pub(crate) storage: crate::storage::StorageFormat,
 }
 
 impl Drop for Buffer {
@@ -174,6 +175,14 @@ impl TtTensor {
             && self.cell.host.get().is_none()
     }
 
+    pub(crate) fn physical_storage(&self) -> crate::storage::StorageFormat {
+        self.cell
+            .dram
+            .get()
+            .map(|d| d.buffer.storage)
+            .or_else(|| self.cell.strided.as_ref().map(|v| v.src.buffer.storage))
+            .unwrap_or_default()
+    }
     /// Ensure the tensor is uploaded and resident in the device's GDDR memory.
     pub fn ensure_resident(&self) {
         let _ = self.to_dram();
@@ -182,6 +191,12 @@ impl TtTensor {
     /// Read the tensor's current data directly from the device's GDDR buffer,
     /// bypassing any cached initial host copy.
     pub fn download_device(&self) -> TensorData {
+        if self.storage_format() != crate::storage::StorageFormat::F32 {
+            return self
+                .clone()
+                .with_storage(crate::storage::StorageFormat::F32)
+                .download_device();
+        }
         let d = self
             .dram()
             .expect("a tensor to download from device must have a device copy");
@@ -228,6 +243,13 @@ impl TtTensor {
     /// The host copy, downloaded the first time it is needed.
     pub(crate) fn host(&self) -> &HostBuffer {
         self.cell.host.get_or_init(|| {
+            if self.storage_format() != crate::storage::StorageFormat::F32 {
+                return self
+                    .clone()
+                    .with_storage(crate::storage::StorageFormat::F32)
+                    .host()
+                    .clone();
+            }
             if let (None, Some(v)) = (self.cell.dram.get(), &self.cell.strided) {
                 if !self.materialises_on_device(v) {
                     return self.gathered(v);
@@ -396,6 +418,7 @@ impl TtTensor {
                             rows: dims[0],
                             cols: dims[1],
                             parent: None,
+                            storage: crate::storage::StorageFormat::F32,
                         }),
                         transposed: false,
                     };
@@ -412,6 +435,7 @@ impl TtTensor {
                         rows: dims[0],
                         cols: dims[1],
                         parent: None,
+                        storage: crate::storage::StorageFormat::F32,
                     }),
                     transposed: false,
                 };
@@ -458,6 +482,7 @@ impl TtTensor {
                     rows,
                     cols,
                     parent: None,
+                    storage: crate::storage::StorageFormat::F32,
                 }),
                 transposed: false,
             }

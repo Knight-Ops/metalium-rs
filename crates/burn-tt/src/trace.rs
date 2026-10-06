@@ -67,7 +67,7 @@ impl Trace {
         f: impl FnOnce() -> TtTensor,
     ) -> Result<(Trace, Vec<f32>), EngineError> {
         let device = input.device;
-        if !input.is_stored_f32() {
+        if !input.is_stored_f32() || input.storage_format() != crate::storage::StorageFormat::F32 {
             return Err(EngineError("a trace's input is an F32 tensor".into()));
         }
         let d = input.to_dram();
@@ -172,7 +172,7 @@ impl TracedInference {
                     "all trace inputs must belong to the same device".into(),
                 ));
             }
-            if !inp.is_storable() {
+            if !inp.is_storable() || inp.storage_format() != crate::storage::StorageFormat::F32 {
                 return Err(EngineError(
                     "a trace input must be a storable tensor".into(),
                 ));
@@ -338,7 +338,7 @@ impl TracedTrainingStep {
                     "all trace inputs must belong to the same device".into(),
                 ));
             }
-            if !inp.is_storable() {
+            if !inp.is_storable() || inp.storage_format() != crate::storage::StorageFormat::F32 {
                 return Err(EngineError(
                     "a trace input must be a storable tensor".into(),
                 ));

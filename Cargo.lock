@@ -627,6 +627,7 @@ dependencies = [
 name = "burn-tt"
 version = "0.1.0"
 dependencies = [
+ "burn-autodiff",
  "burn-backend",
  "burn-fusion",
  "burn-ir",

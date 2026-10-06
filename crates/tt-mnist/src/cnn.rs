@@ -81,6 +81,45 @@ impl<B: Backend> Cnn<B> {
         }
     }
 
+    /// Named storage boundaries retain F32 master parameters. F32 biases and
+    /// pooling reductions promote results; compress activations explicitly.
+    pub fn forward_with_precision<P: burn_tt::storage::PrecisionPolicy<B>>(
+        &self,
+        images: Tensor<B, 2>,
+        policy: &P,
+    ) -> Tensor<B, 2> {
+        use burn::tensor::module::conv2d;
+        use burn::tensor::ops::ConvOptions;
+        let [batch, pixels] = images.dims();
+        assert_eq!(pixels, 28 * 28);
+        let x = policy.apply("cnn.input", images.reshape([batch, 1, 28, 28]));
+        let weight = policy.apply("cnn.conv.weight", self.conv.weight.val());
+        let bias = self
+            .conv
+            .bias
+            .as_ref()
+            .map(|b| policy.apply("cnn.conv.bias", b.val()));
+        let x = conv2d(
+            x,
+            weight,
+            bias,
+            ConvOptions::new(
+                self.conv.stride,
+                [0, 0],
+                self.conv.dilation,
+                self.conv.groups,
+            ),
+        );
+        let x = policy.apply("cnn.relu", relu(x));
+        let features = self.pool.forward(x).reshape([batch, FEATURES]);
+        let weight = policy.apply("cnn.head.weight", self.head.weight.val());
+        let mut out = features.matmul(weight);
+        if let Some(bias) = &self.head.bias {
+            out = out + policy.apply("cnn.head.bias", bias.val()).unsqueeze();
+        }
+        policy.apply("cnn.logits", out)
+    }
+
     /// Flattened dataset rows become NCHW; pooling leaves 8×3×3 features.
     pub fn forward(&self, images: Tensor<B, 2>) -> Tensor<B, 2> {
         let [batch, pixels] = images.dims();

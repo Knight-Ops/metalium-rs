@@ -110,9 +110,14 @@ fails if any crate in `SHIPPABLE` (`xtask/src/ship.rs`) depends on `tt-ttsim` or
 
 ## Next implementation work
 
-Phase 10.3 is in progress: finish arbitrary-axis reductions and remaining
-reduction kinds, then K-blocked matmul, general slicing/indexing, Tensix
-transpose/norms, BF16 storage/casts and convolution/pooling/attention. See
+Native reductions, K-blocked products, resident indexing, BF16 storage/casts,
+convolution/pooling/attention and matrix elementwise arithmetic have landed.
+BFP8/4/2 per-tensor storage, native conversions/products and mixed-storage
+training/traces are delivered; see the
+[storage contract and completed checklist](docs/plans/mixed-bfp-storage.md).
+General payload-preserving Tensix transpose, further indexing/format coverage
+and hardware Burn random distributions remain open. Burn random already works
+through seeded per-device host construction. See
 [`docs/plans/hardware-coverage.md`](docs/plans/hardware-coverage.md) for gated status.
 Backend typed errors, initialization/discovery and Burn conformance are in
 [`docs/plans/burn-backend-parity.md`](docs/plans/burn-backend-parity.md).

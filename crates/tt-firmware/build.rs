@@ -15,6 +15,7 @@ fn main() {
     let tensix = [
         ("heartbeat", "link.x"),
         ("sfpu_mul", "link.x"),
+        ("prng_seed", "link.x"),
         ("corpus", "link.x"),
         ("corpus_t0", "link.x"),
         ("role_t0", "link.x"),

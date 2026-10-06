@@ -751,6 +751,71 @@ pub fn render(
                     .filter(|((_, ty), _)| ty == "FloatTensor<B>")
                     .map(|(_, name)| *name)
                     .collect();
+                // BFP is physical storage, not dtype. This boundary is emitted
+                // before matrix dispatch so compressed IDs never reach F32 ops.
+                let optional: Vec<_> = m
+                    .args
+                    .iter()
+                    .zip(&names)
+                    .filter(|((_, ty), _)| ty == "Option<FloatTensor<B>>")
+                    .map(|(_, name)| *name)
+                    .collect();
+                if m.name == "float_slice" {
+                    impls.push_str("if tensor.storage_format() != crate::storage::StorageFormat::F32 { if let Some(view) = crate::ops::float::row_view(&tensor, slices) { return view; } }\n");
+                }
+                let keep = [
+                    "float_device",
+                    "float_into_data",
+                    "float_to_device",
+                    "float_reshape",
+                    "float_transpose",
+                    "float_swap_dims",
+                    "float_permute",
+                ];
+                if !is_future && !floats.is_empty() && !keep.contains(&m.name.as_str()) {
+                    let refs = floats.iter().map(|n| format!("&{n}")).collect::<Vec<_>>();
+                    impls.push_str(&format!(
+                        "let {}storage_inputs = {}[{}];\n",
+                        if optional.is_empty() { "" } else { "mut " },
+                        if optional.is_empty() { "" } else { "vec!" },
+                        refs.join(", ")
+                    ));
+                    let end_borrow = if optional.is_empty() {
+                        ""
+                    } else {
+                        "drop(storage_inputs);\n"
+                    };
+                    for name in &optional {
+                        impls.push_str(&format!(
+                            "if let Some(t) = &{name} {{ storage_inputs.push(t); }}\n"
+                        ));
+                    }
+                    impls.push_str(&format!("if storage_inputs.iter().any(|t| t.storage_format() != crate::storage::StorageFormat::F32) {{\nlet result_storage = crate::ops::bfp_result_storage(\"{}\", &storage_inputs);\n{end_borrow}", m.name));
+                    if m.name == "float_matmul" {
+                        impls.push_str("if let Some(output) = crate::ops::bfp_matmul(&lhs, &rhs) { return output; }\n");
+                    }
+                    for name in &floats {
+                        impls.push_str(&format!(
+                            "let {name} = crate::ops::bfp_compute_input({name});\n"
+                        ));
+                    }
+                    for name in &optional {
+                        impls.push_str(&format!(
+                            "let {name} = {name}.map(crate::ops::bfp_compute_input);\n"
+                        ));
+                    }
+                    let call = format!("<Self as {tr}<Self>>::{}({})", m.name, names.join(", "));
+                    if m.ret.as_deref() == Some("FloatTensor<B>") {
+                        impls.push_str(&format!(
+                            "return crate::ops::bfp_compute_result({call}, result_storage);\n"
+                        ));
+                    } else if m.ret.as_deref() == Some("MaxPool2dWithIndices<B>") {
+                        impls.push_str(&format!("let mut output = {call};\noutput.output = output.output.with_storage(result_storage);\nreturn output;\n"));
+                    } else {
+                        impls.push_str(&format!("let _ = result_storage;\nreturn {call};\n"));
+                    }
+                    impls.push_str(&format!("}}\n{end_borrow}"));
+                }
                 let storage = [
                     "float_cast",
                     "float_into_data",

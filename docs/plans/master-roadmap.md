@@ -988,8 +988,19 @@ for each optimization, then measure on silicon.
 model coverage. Matrix matmul, SFPU arithmetic and activations, softmax,
 int/bool storage and logic, and embedding/loss indexing now have device paths.
 B and NC are data movers; they perform no tensor arithmetic. Matrix-unit
-`ELW*`, tensor-level Tensix transpose, further integer ops and block-float
-formats remain to be implemented. BF16 storage and pooling are described below.
+elementwise `ELW*` and per-tensor BFP8/4/2 storage are implemented. General
+payload-preserving Tensix transpose remains partial. Checked integer division,
+resident indexing and native convolution/attention have landed. BF16 storage
+and pooling are described below.
+
+**Current tranche (2026-10-06):** logical-F32 BFP storage, device conversions,
+packed products, Burn propagation/autodiff/fusion/traces and MNIST precision
+policies pass both cards. D2 is complete for the delivered BFP8/4/2 formats;
+`a` variants, packed mesh and portable quantization remain deferred. S7 remains
+partial: Burn random works through seeded per-device host construction;
+hardware advancement/predication and diagnostic RISC-V reseeding are gated,
+but hardware distributions, quality and application stream semantics remain
+deferred. See [the current contract and validation](mixed-bfp-storage.md).
 
 **Current milestone (2026-10-05):** 10.0–10.2 complete; 10.3–10.5 in progress.
 Reduction/scan, norm-composition, I32 ALU and deterministic cast/rounding

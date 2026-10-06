@@ -263,3 +263,56 @@ Explicit silicon Dst base setup also reproduced row 21's `tensix_cfg_wr32: reg=6
 refusal. Matrix programs omit only that register write on simulated transports,
 whose implicit base is reset-zero; silicon retains the explicit write. No
 simulator dependency is added to shipping crates.
+
+### BFP prerequisites and seed-register writes (2026-10-06)
+
+Step91's identical WRCFG seed write repeats ttsim's lane stream within one
+program. Both Blackhole cards instead return the next value of the old stream
+(`1791297768`, 8/8 including BFP/histogram gates). Additional NOP spacing,
+RMWCIB and complementary/requested seed experiments do not restore silicon
+repetition. This is a measured disagreement for this instruction path;
+application seed initialization remains unresolved. The PRNG advancement and
+predication model agrees on both targets. Burn random construction is unchanged.
+Both-card debug readback confirms the requested seed register values landed
+(`1791298248`, 2/2); the disagreement concerns the observed PRNG stream.
+
+The histogram gate's `ENABLE_ACC_STATS_Enable` write exits pinned ttsim with
+`UnsupportedFunctionality: tensix_setc16: setc16_reg=45`. Step93 is therefore
+silicon-only and independently checks nonempty history and maximum reset with
+CLREXPHIST. The observed bin count is one per eight packed datums in the tested
+configuration, rather than the WH functional model's per-datum update.
+
+Step92 packing and raw decoding run on both targets, including the executed
+missing-exponent-section mutant. Src conversion uses the matching BFP code:
+the attempted BFP8-to-BF16 `(6,5)` and BFP4-to-BFP8 `(7,6)` pairs were refused
+by ttsim as `mismatches`; matching `(6,6)`, `(7,7)`, `(15,15)` work. Src/MOVA2D
+subnormal normalization is accounted for separately from raw BF16 decoding.
+
+### Packed BFP2 matrix multiply (2026-10-06)
+
+`step94_bfp_storage::packed_products_match_decoded_operands_through_k_reloads`
+refuses in ttsim with `tensix_matmul_op: bf16 src_a_fmt=15 src_b_fmt=15` and
+terminates the forked child. BFP8/4 direct products are modeled; BFP2 conversion
+pack/unpack works. The BFP2 matrix arm is silicon-only and passes both cards
+(`1791299490`), including ragged shapes and K accumulator reloads.
+
+### Direct RISC-V PRNG initialization (2026-10-06)
+
+Step91's `riscv_seed_store_characterization` passes inside `fork_scope` and on
+both cards (`1791302214`, 4/4 including WRCFG advancement/predication). A direct
+full-width RISC-V seed store, fence and 512 NOP-loop iterations repeats the
+32-lane stream on silicon. Without the settling interval silicon can expose
+incomplete initialization (`1791302087`); ttsim restarts immediately. The
+interval is conservative, not a measured minimum. WRCFG still has the distinct
+continuation behavior recorded above.
+
+Pinned ttsim's initial lane vector is shifted by one lane relative to silicon:
+for seed 0 its first word is 0xc5cf309e, which is silicon's lane 1; silicon's
+lane 0 is 0xf173cc27. The nonabsorbing tested seeds show this offset. The gate
+asserts repetition, changed-seed behavior, lane correlation and independent
+LFSR advancement rather than asserting identical initial vectors across
+targets. Both produce the absorbing all-ones state for seed 0xffffffff.
+
+A seed-field read-modify-write first refused in ttsim with
+`tensix_cfg_rd32: reg=186`. The field spans the complete word, so the diagnostic
+uses a full-width `sw` without a preceding unsupported configuration read.

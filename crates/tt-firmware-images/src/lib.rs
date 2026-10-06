@@ -46,6 +46,9 @@ pub const HEARTBEAT: &[u8] = include_bytes!(env!("FIRMWARE_HEARTBEAT"));
 /// bit pattern.
 pub const SFPU_MUL: &[u8] = include_bytes!(env!("FIRMWARE_SFPU_MUL"));
 
+/// RISC-V seed-register diagnostic on T1, linked at [`LOAD_ADDRESS`].
+pub const PRNG_SEED: &[u8] = include_bytes!(env!("FIRMWARE_PRNG_SEED"));
+
 /// The generic single-thread Tensix program runner, built for T1 (the one core
 /// ttsim lets read `Dst`, divergence row 12).
 pub const CORPUS: &[u8] = include_bytes!(env!("FIRMWARE_CORPUS"));
@@ -115,9 +118,10 @@ pub const ICACHE_T: [Image; 3] = [
 ];
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 16] = [
+const ENTRIES: [(&str, &str); 17] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
+    ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
     ("corpus", env!("FIRMWARE_CORPUS_ENTRY")),
     ("corpus_t0", env!("FIRMWARE_CORPUS_T0_ENTRY")),
     ("role_t0", env!("FIRMWARE_ROLE_T0_ENTRY")),
@@ -164,7 +168,7 @@ mod tests {
 
     #[test]
     fn every_other_image_is_linked_at_the_load_address() {
-        for name in ["heartbeat", "sfpu_mul", "corpus", "corpus_t0"] {
+        for name in ["heartbeat", "sfpu_mul", "prng_seed", "corpus", "corpus_t0"] {
             assert_eq!(entry(name).map(u64::from), Some(LOAD_ADDRESS), "{name}");
         }
     }

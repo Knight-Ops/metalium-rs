@@ -34,6 +34,14 @@ cargo test -p tt-isa
 `tests/llk_crosscheck.rs` checks the generated encodings against tt-metal LLK's
 Blackhole `TT_OP_*` macros.
 
+Measured BFP8/BFP4/BFP2 format codes are 6/7/15. `TileImage` describes headers,
+shared exponents and sub-byte datums; native encoding lives in `tt-kernels`
+rather than a shipping host arithmetic fallback. `matrix::clear_exponent_history`
+has an independent silicon histogram/max-reset gate. `backend::write_prng_seed`
+is a checked diagnostic WRCFG sequence: writing the register does not restart
+silicon's Vector Unit stream. The separately gated RISC-V store path with a
+settling interval does restart it. See [hardware evidence and limitations](../../docs/learnings/silicon-operating-notes.md).
+
 ## Gotchas
 
 - Never edit `src/isa/generated.rs` or `src/cfg/generated.rs`. Regenerate with

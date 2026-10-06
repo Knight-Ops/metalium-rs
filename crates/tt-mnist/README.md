@@ -104,3 +104,22 @@ versus Flex 1.040 ms/step, including preload and scalar loss reads in a single
 release run with concurrent host regression/build work. It is not a controlled
 median comparison; bounded staging and descriptor construction still need
 performance work. F32/BF16 single-card replay correctness is validated separately.
+
+## Named BFP precision policies
+
+The library provides `precision::Mlp` (784→16→10) and
+`cnn::Cnn::forward_with_precision` for shared model code that selects storage
+at named weights and activation boundaries. Use
+`burn_tt::storage::NativeStoragePolicy` on the native backend and explicitly
+select `F32Policy` on ordinary backends. This is a library API; the CLI has no
+BFP policy flag. Compiled examples live in [`src/precision.rs`](src/precision.rs).
+
+Parameters remain F32 masters; policy casts create compressed working tensors.
+F32 biases promote binary results, and sensitive loss inputs explicitly use
+F32. Gradients and optimizer state remain F32. Step96 checks four policies using
+BFP2/BFP4/BFP8/F32 on actual MNIST data, native gradients, parameter updates,
+no intermediate downloads and changed-input replay on both cards. The small
+four-image/four-step accuracy observations are diagnostics, not held-out
+accuracy or convergence measurements; existing F32 goldens are unchanged.
+See [the storage contract](../../docs/plans/mixed-bfp-storage.md) and
+[recorded accuracy and performance](../../docs/learnings/firmware-performance.md).

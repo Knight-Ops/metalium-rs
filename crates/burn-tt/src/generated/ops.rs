@@ -108,6 +108,16 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_into_int(tensor: FloatTensor<TtBackend>, out_dtype: IntDType) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("float_into_int", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_into_int", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_into_int(tensor, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -128,6 +138,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_add", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_add(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) =
             crate::ops::matrix_float_op(tt_kernels::kind::ADD, 0.0, &lhs, Some(&rhs))
         {
@@ -143,6 +166,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_add_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_add_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) = crate::ops::matrix_float_op(
             tt_kernels::kind::ADD,
             num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
@@ -163,6 +199,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_clamp_min(tensor: FloatTensor<TtBackend>, min: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp_min", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_clamp_min", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_clamp_min(tensor, min),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -175,6 +223,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_clamp_max(tensor: FloatTensor<TtBackend>, max: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp_max", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_clamp_max", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_clamp_max(tensor, max),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -191,6 +251,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         max: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_clamp", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_clamp", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_clamp(tensor, min, max),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -206,6 +278,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sub", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sub(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) =
             crate::ops::matrix_float_op(tt_kernels::kind::SUB, 0.0, &lhs, Some(&rhs))
         {
@@ -221,6 +306,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_sub_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sub_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) = crate::ops::matrix_float_op(
             tt_kernels::kind::SUB,
             num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
@@ -244,6 +342,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_mul", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mul(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) =
             crate::ops::matrix_float_op(tt_kernels::kind::MUL, 0.0, &lhs, Some(&rhs))
         {
@@ -259,6 +370,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_mul_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_mul_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mul_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
         if let Some(output) = crate::ops::matrix_float_op(
             tt_kernels::kind::MUL,
             num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
@@ -282,6 +406,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_div", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_div", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_div(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -292,6 +429,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_div_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_div_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_div_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_div_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -332,6 +482,22 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_matmul", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_matmul", &storage_inputs);
+            if let Some(output) = crate::ops::bfp_matmul(&lhs, &rhs) {
+                return output;
+            }
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_matmul(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             if let Some(output) = crate::ops::bf16_matmul(&lhs, &rhs) {
@@ -364,6 +530,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_neg(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_neg", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_neg", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_neg(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -373,6 +551,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_recip(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_recip", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_recip", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_recip(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -398,6 +588,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_flip(tensor: FloatTensor<TtBackend>, axes: &[usize]) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_flip", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_flip", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_flip(tensor, axes),
+                result_storage,
+            );
+        }
         crate::ops::float::float_flip(tensor, axes)
     }
     fn float_reshape(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
@@ -410,6 +612,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_gather", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_gather", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_gather(dim, tensor, indices),
+                result_storage,
+            );
+        }
         crate::ops::float::float_gather(dim, tensor, indices)
     }
     fn float_scatter_add(
@@ -419,6 +633,20 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_scatter_add", true);
+        let storage_inputs = [&tensor, &value];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_scatter_add", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let value = crate::ops::bfp_compute_input(value);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_scatter_add(dim, tensor, indices, value),
+                result_storage,
+            );
+        }
         crate::ops::float::float_scatter_add(dim, tensor, indices, value)
     }
     fn float_scatter_nd(
@@ -459,6 +687,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_select", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_select", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_select(tensor, dim, indices),
+                result_storage,
+            );
+        }
         crate::ops::float::float_select(tensor, dim, indices)
     }
     fn float_select_add(
@@ -468,10 +708,41 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_select_add", true);
+        let storage_inputs = [&tensor, &value];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_select_add", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let value = crate::ops::bfp_compute_input(value);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_select_add(tensor, dim, indices, value),
+                result_storage,
+            );
+        }
         crate::ops::float::float_select_add(tensor, dim, indices, value)
     }
     fn float_slice(tensor: FloatTensor<TtBackend>, slices: &[Slice]) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_slice", true);
+        if tensor.storage_format() != crate::storage::StorageFormat::F32 {
+            if let Some(view) = crate::ops::float::row_view(&tensor, slices) {
+                return view;
+            }
+        }
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_slice", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_slice(tensor, slices),
+                result_storage,
+            );
+        }
         crate::ops::float::float_slice(tensor, slices)
     }
     fn float_slice_assign(
@@ -480,6 +751,20 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_slice_assign", true);
+        let storage_inputs = [&tensor, &value];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_slice_assign", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let value = crate::ops::bfp_compute_input(value);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_slice_assign(tensor, slices, value),
+                result_storage,
+            );
+        }
         crate::ops::float::float_slice_assign(tensor, slices, value)
     }
     fn float_mask_where(
@@ -488,6 +773,20 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mask_where", true);
+        let storage_inputs = [&tensor, &value];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_mask_where", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let value = crate::ops::bfp_compute_input(value);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mask_where(tensor, mask, value),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &value]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -505,6 +804,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mask_fill", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_mask_fill", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mask_fill(tensor, mask, value),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -521,6 +832,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_equal", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_equal", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_equal(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -535,6 +857,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_not_equal", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_not_equal", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_not_equal(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -549,6 +882,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_equal_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_equal_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_equal_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -562,6 +906,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_not_equal_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_not_equal_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_not_equal_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -575,6 +930,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_greater", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_greater(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -589,6 +955,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_greater_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_greater_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -602,6 +979,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_equal", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_greater_equal", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_greater_equal(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -616,6 +1005,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_greater_equal_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_greater_equal_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_greater_equal_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -629,6 +1029,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_lower", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_lower(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -643,6 +1054,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_lower_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_lower_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -656,6 +1078,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_equal", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_lower_equal", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_lower_equal(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -670,6 +1104,17 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: BoolDType,
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_lower_equal_elem", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_lower_equal_elem", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_lower_equal_elem(lhs, rhs, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -679,6 +1124,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sum(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sum", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sum", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sum(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -688,6 +1145,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sum_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sum_dim", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sum_dim", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sum_dim(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -700,6 +1169,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_prod(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_prod", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_prod", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_prod(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -709,6 +1190,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_prod_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_prod_dim", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_prod_dim", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_prod_dim(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -721,6 +1214,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_mean(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mean", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_mean", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mean(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -730,6 +1235,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_mean_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mean_dim", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_mean_dim", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_mean_dim(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -742,6 +1259,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_cumsum(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cumsum", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cumsum", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cumsum(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -754,6 +1283,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_cumprod(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cumprod", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cumprod", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cumprod(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -788,10 +1329,34 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_cast(tensor: FloatTensor<TtBackend>, dtype: FloatDType) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cast", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cast", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cast(tensor, dtype),
+                result_storage,
+            );
+        }
         crate::ops::float::float_cast(tensor, dtype)
     }
     fn float_exp(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_exp", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_exp", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_exp(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -801,6 +1366,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_log(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_log", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_log", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_log(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -810,6 +1387,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_log1p(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_log1p", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_log1p", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_log1p(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -822,6 +1411,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_powf", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_powf(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -835,6 +1437,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powi", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_powi", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_powi(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -844,6 +1458,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_powi_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powi_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_powi_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_powi_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -856,6 +1483,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_powf_scalar(tensor: FloatTensor<TtBackend>, value: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf_scalar", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_powf_scalar", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_powf_scalar(tensor, value),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -871,6 +1511,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         value: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_powf_scalar_impl", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_powf_scalar_impl", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_powf_scalar_impl(tensor, value),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -883,6 +1536,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sqrt(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sqrt", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sqrt", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sqrt(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -892,6 +1557,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_abs(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_abs", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_abs", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_abs(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -901,6 +1578,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_cos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cos", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cos", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cos(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -910,6 +1599,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sin", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sin", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sin(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -919,6 +1620,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_tan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_tan", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_tan", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_tan(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -928,6 +1641,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_cosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cosh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cosh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cosh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -937,6 +1662,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sinh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sinh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sinh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -946,6 +1683,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_tanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_tanh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_tanh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_tanh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -955,6 +1704,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_acos(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_acos", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_acos", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_acos(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -964,6 +1725,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_acosh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_acosh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_acosh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_acosh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -973,6 +1746,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_asin(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_asin", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_asin", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_asin(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -982,6 +1767,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_asinh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_asinh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_asinh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_asinh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -991,6 +1788,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_atan(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atan", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_atan", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_atan(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1000,6 +1809,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_atanh(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atanh", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_atanh", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_atanh(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1012,6 +1833,19 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_atan2", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_atan2", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_atan2(lhs, rhs),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -1025,6 +1859,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_round(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_round", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_round", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_round(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1034,6 +1880,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_floor(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_floor", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_floor", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_floor(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1043,6 +1901,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_ceil(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_ceil", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_ceil", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_ceil(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1052,6 +1922,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_trunc(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_trunc", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_trunc", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_trunc(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1061,6 +1943,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_erf(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_erf", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_erf", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_erf(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1074,6 +1968,16 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("float_argmax", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_argmax", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_argmax(tensor, dim, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1105,6 +2009,16 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("float_argmin", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_argmin", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_argmin(tensor, dim, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1114,6 +2028,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_max_dim(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_max_dim", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_max_dim", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_max_dim(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1126,6 +2052,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sign(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sign", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sign", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sign(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1135,6 +2073,18 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_expand(tensor: FloatTensor<TtBackend>, shape: Shape) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_expand", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_expand", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_expand(tensor, shape),
+                result_storage,
+            );
+        }
         crate::ops::float::float_expand(tensor, shape)
     }
     fn float_unfold(
@@ -1144,10 +2094,32 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         step: usize,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_unfold", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_unfold", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_unfold(tensor, dim, size, step),
+                result_storage,
+            );
+        }
         crate::ops::float::float_unfold(tensor, dim, size, step)
     }
     fn float_is_nan(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_is_nan", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_is_nan", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_is_nan(tensor, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1157,6 +2129,16 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_is_inf(tensor: FloatTensor<TtBackend>, out_dtype: BoolDType) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("float_is_inf", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_is_inf", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_is_inf(tensor, out_dtype);
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -1945,6 +2927,18 @@ impl ModuleOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("embedding", true);
+        let storage_inputs = [&weights];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("embedding", &storage_inputs);
+            let weights = crate::ops::bfp_compute_input(weights);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::embedding(weights, indices),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&weights]);
         if compute_dtype == burn_backend::DType::BF16 {
             let weights = crate::ops::float_compute_input(weights);
@@ -1961,6 +2955,20 @@ impl ModuleOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("embedding_backward", true);
+        let storage_inputs = [&weights, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("embedding_backward", &storage_inputs);
+            let weights = crate::ops::bfp_compute_input(weights);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::embedding_backward(weights, output_grad, indices),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&weights, &output_grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let weights = crate::ops::float_compute_input(weights);
@@ -1977,6 +2985,20 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("linear_weight_backward", true);
+        let storage_inputs = [&x, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("linear_weight_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::linear_weight_backward(x, output_grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -1990,6 +3012,19 @@ impl ModuleOps<TtBackend> for TtBackend {
     }
     fn linear_bias_backward(output_grad: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("linear_bias_backward", true);
+        let storage_inputs = [&output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("linear_bias_backward", &storage_inputs);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::linear_bias_backward(output_grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output_grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -2007,6 +3042,25 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv2d", true);
+        let mut storage_inputs = vec![&x, &weight];
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("conv2d", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv2d(x, weight, bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
         crate::ops::module::conv2d(x, weight, bias, options)
     }
     fn conv2d_x_backward(
@@ -2016,6 +3070,21 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv2d_x_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv2d_x_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv2d_x_backward(x, weight, output_grad, options),
+                result_storage,
+            );
+        }
         crate::ops::module::conv2d_x_backward(x, weight, output_grad, options)
     }
     fn conv2d_weight_backward(
@@ -2025,6 +3094,21 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv2d_weight_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv2d_weight_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv2d_weight_backward(x, weight, output_grad, options),
+                result_storage,
+            );
+        }
         crate::ops::module::conv2d_weight_backward(x, weight, output_grad, options)
     }
     fn conv2d_bias_backward(
@@ -2033,6 +3117,21 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv2d_bias_backward", true);
+        let storage_inputs = [&x, &bias, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv2d_bias_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let bias = crate::ops::bfp_compute_input(bias);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv2d_bias_backward(x, bias, output_grad),
+                result_storage,
+            );
+        }
         crate::ops::module::conv2d_bias_backward(x, bias, output_grad)
     }
     fn deform_conv2d(
@@ -2106,6 +3205,26 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvTransposeOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv_transpose2d", true);
+        let mut storage_inputs = vec![&x, &weight];
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose2d", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose2d(x, weight, bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
         crate::ops::module::conv_transpose2d(x, weight, bias, options)
     }
     fn conv_transpose2d_x_backward(
@@ -2114,6 +3233,24 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvTransposeOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv_transpose2d_x_backward", true);
+        let storage_inputs = [&weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose2d_x_backward", &storage_inputs);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose2d_x_backward(
+                    weight,
+                    output_grad,
+                    options,
+                ),
+                result_storage,
+            );
+        }
         crate::ops::module::conv_transpose2d_x_backward(weight, output_grad, options)
     }
     fn conv_transpose2d_weight_backward(
@@ -2123,6 +3260,26 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: ConvTransposeOptions<2>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv_transpose2d_weight_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose2d_weight_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose2d_weight_backward(
+                    x,
+                    weight,
+                    output_grad,
+                    options,
+                ),
+                result_storage,
+            );
+        }
         crate::ops::module::conv_transpose2d_weight_backward(x, weight, output_grad, options)
     }
     fn conv_transpose2d_bias_backward(
@@ -2131,6 +3288,21 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("conv_transpose2d_bias_backward", true);
+        let storage_inputs = [&x, &bias, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose2d_bias_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let bias = crate::ops::bfp_compute_input(bias);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose2d_bias_backward(x, bias, output_grad),
+                result_storage,
+            );
+        }
         crate::ops::module::conv_transpose2d_bias_backward(x, bias, output_grad)
     }
     fn conv_transpose3d(
@@ -2157,6 +3329,18 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: UnfoldOptions,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("unfold4d", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("unfold4d", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::unfold4d(x, kernel_size, options),
+                result_storage,
+            );
+        }
         crate::ops::module::unfold4d(x, kernel_size, options)
     }
     fn avg_pool2d(
@@ -2168,6 +3352,25 @@ impl ModuleOps<TtBackend> for TtBackend {
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("avg_pool2d", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("avg_pool2d", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::avg_pool2d(
+                    x,
+                    kernel_size,
+                    stride,
+                    padding,
+                    count_include_pad,
+                    ceil_mode,
+                ),
+                result_storage,
+            );
+        }
         crate::ops::module::avg_pool2d(
             x,
             kernel_size,
@@ -2187,6 +3390,28 @@ impl ModuleOps<TtBackend> for TtBackend {
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("avg_pool2d_backward", true);
+        let storage_inputs = [&x, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("avg_pool2d_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::avg_pool2d_backward(
+                    x,
+                    grad,
+                    kernel_size,
+                    stride,
+                    padding,
+                    count_include_pad,
+                    ceil_mode,
+                ),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2219,6 +3444,19 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_size: [usize; 2],
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("adaptive_avg_pool2d", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("adaptive_avg_pool2d", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::adaptive_avg_pool2d(x, output_size),
+                result_storage,
+            );
+        }
         crate::ops::module::adaptive_avg_pool2d(x, output_size)
     }
     fn adaptive_avg_pool2d_backward(
@@ -2226,6 +3464,20 @@ impl ModuleOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("adaptive_avg_pool2d_backward", true);
+        let storage_inputs = [&x, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("adaptive_avg_pool2d_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::adaptive_avg_pool2d_backward(x, grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2246,6 +3498,25 @@ impl ModuleOps<TtBackend> for TtBackend {
         ceil_mode: bool,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("max_pool2d", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("max_pool2d", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::max_pool2d(
+                    x,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    ceil_mode,
+                ),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2272,6 +3543,25 @@ impl ModuleOps<TtBackend> for TtBackend {
         ceil_mode: bool,
     ) -> MaxPool2dWithIndices<TtBackend> {
         let _op = crate::report::enter("max_pool2d_with_indices", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("max_pool2d_with_indices", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let mut output = <Self as ModuleOps<Self>>::max_pool2d_with_indices(
+                x,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                ceil_mode,
+            );
+            output.output = output.output.with_storage(result_storage);
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2306,6 +3596,27 @@ impl ModuleOps<TtBackend> for TtBackend {
         indices: IntTensor<TtBackend>,
     ) -> MaxPool2dBackward<TtBackend> {
         let _op = crate::report::enter("max_pool2d_with_indices_backward", true);
+        let storage_inputs = [&x, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("max_pool2d_with_indices_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            let _ = result_storage;
+            return <Self as ModuleOps<Self>>::max_pool2d_with_indices_backward(
+                x,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                ceil_mode,
+                output_grad,
+                indices,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2377,6 +3688,26 @@ impl ModuleOps<TtBackend> for TtBackend {
         options: AttentionModuleOptions,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("attention", true);
+        let mut storage_inputs = vec![&query, &key, &value];
+        if let Some(t) = &attn_bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("attention", &storage_inputs);
+            drop(storage_inputs);
+            let query = crate::ops::bfp_compute_input(query);
+            let key = crate::ops::bfp_compute_input(key);
+            let value = crate::ops::bfp_compute_input(value);
+            let attn_bias = attn_bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::attention(query, key, value, mask, attn_bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
         crate::ops::module::attention(query, key, value, mask, attn_bias, options)
     }
     fn rfft(
@@ -2421,6 +3752,18 @@ impl ActivationOps<TtBackend> for TtBackend {
         negative_slope: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("leaky_relu", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("leaky_relu", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::leaky_relu(tensor, negative_slope),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2433,6 +3776,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn relu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("relu", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("relu", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::relu(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2445,6 +3800,19 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("relu_backward", true);
+        let storage_inputs = [&output, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("relu_backward", &storage_inputs);
+            let output = crate::ops::bfp_compute_input(output);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::relu_backward(output, grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let output = crate::ops::float_compute_input(output);
@@ -2458,6 +3826,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn gelu(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("gelu", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("gelu", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::gelu(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2470,6 +3850,19 @@ impl ActivationOps<TtBackend> for TtBackend {
         alpha: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("prelu", true);
+        let storage_inputs = [&tensor, &alpha];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("prelu", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let alpha = crate::ops::bfp_compute_input(alpha);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::prelu(tensor, alpha),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &alpha]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2486,6 +3879,19 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("gelu_backward", true);
+        let storage_inputs = [&x, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("gelu_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::gelu_backward(x, grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);
@@ -2499,6 +3905,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("sigmoid", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("sigmoid", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::sigmoid(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2511,6 +3929,20 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("sigmoid_backward", true);
+        let storage_inputs = [&output, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("sigmoid_backward", &storage_inputs);
+            let output = crate::ops::bfp_compute_input(output);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::sigmoid_backward(output, grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let output = crate::ops::float_compute_input(output);
@@ -2528,6 +3960,18 @@ impl ActivationOps<TtBackend> for TtBackend {
         beta: Scalar,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("hard_sigmoid", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("hard_sigmoid", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::hard_sigmoid(tensor, alpha, beta),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2540,6 +3984,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn log_sigmoid(tensor: FloatTensor<TtBackend>) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_sigmoid", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("log_sigmoid", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::log_sigmoid(tensor),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2552,6 +4008,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("softmax", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("softmax", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::softmax(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2564,6 +4032,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn log_softmax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_softmax", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("log_softmax", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::log_softmax(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2576,6 +4056,18 @@ impl ActivationOps<TtBackend> for TtBackend {
     }
     fn softmin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("softmin", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("softmin", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::softmin(tensor, dim),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
         if compute_dtype == burn_backend::DType::BF16 {
             let tensor = crate::ops::float_compute_input(tensor);
@@ -2591,6 +4083,20 @@ impl ActivationOps<TtBackend> for TtBackend {
         grad: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("log_sigmoid_backward", true);
+        let storage_inputs = [&x, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("log_sigmoid_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ActivationOps<Self>>::log_sigmoid_backward(x, grad),
+                result_storage,
+            );
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
         if compute_dtype == burn_backend::DType::BF16 {
             let x = crate::ops::float_compute_input(x);

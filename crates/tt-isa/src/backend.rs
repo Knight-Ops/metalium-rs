@@ -168,6 +168,25 @@ pub const fn set_gpr(gpr: u32, value: u32) -> Result<[Instruction; 2], EncodeErr
     Ok([low, high])
 }
 
+/// Write the global backend PRNG seed register.
+///
+/// Clobbers `gpr`. The caller must select the configuration bank and drain
+/// unpack, math and pack work before issuing this sequence: the register also
+/// is documented to reset the stochastic conversion generators as well as the
+/// Vector Unit. However, `step91_seeded_prng` observes a continuing Vector Unit
+/// stream after an identical WRCFG seed write within one program on both
+/// Blackhole cards. The separately gated RISC-V full-width configuration-store
+/// path, fence and settling interval does restart the stream; this WRCFG helper
+/// is a diagnostic register write, not an application RNG contract.
+pub fn write_prng_seed(gpr: u32, seed: u32) -> Result<[Instruction; 4], EncodeError> {
+    let halves = set_gpr(gpr, seed)?;
+    let write = write_word(
+        gpr,
+        crate::cfg::generated::global::PRNG_SEED_Seed_Val.addr32(),
+    )?;
+    Ok([halves[0], halves[1], write, nop()])
+}
+
 /// `WRCFG`: copy one GPR into one `Config` word of the bank the issuing thread's
 /// `CFG_STATE_ID_StateID` selects.
 ///
@@ -654,6 +673,19 @@ mod tests {
     use super::*;
     use crate::cfg::generated::{alu, thcon, thread};
     use crate::isa::generated::defs;
+
+    #[test]
+    fn diagnostic_seed_sequence_checks_the_register_and_scheduling_bubble() {
+        let [lo, hi, write, bubble] = write_prng_seed(8, 0x12345678).unwrap();
+        assert_eq!(lo.operand("NewValue"), Some(0x5678));
+        assert_eq!(hi.operand("NewValue"), Some(0x1234));
+        assert_eq!(write.operand("CfgIndex"), Some(186));
+        assert_eq!(write.operand("InputReg"), Some(8));
+        assert_eq!(bubble.def().key(), "NOP");
+        assert!(write_prng_seed(GPR_COUNT - 1, 0).is_ok());
+        assert!(write_prng_seed(GPR_COUNT, 0).is_err());
+        assert!(write_prng_seed(u32::MAX, 0).is_err());
+    }
 
     #[test]
     fn set_gpr_writes_both_halves_in_push_order() {

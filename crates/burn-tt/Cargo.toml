@@ -8,6 +8,8 @@ license.workspace = true
 # Native Burn backend. Flex and simulator comparisons live in tt-tests.
 [dependencies]
 burn-backend.workspace = true
+burn-tensor.workspace = true
+burn-autodiff = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-std = { workspace = true, optional = true }
 burn-ir = { workspace = true, optional = true }
 burn-fusion = { workspace = true, optional = true }
@@ -27,6 +29,3 @@ libc.workspace = true
 default = ["std", "fusion"]
 std = []
 fusion = ["dep:burn-std", "dep:burn-ir", "dep:burn-fusion", "dep:serde"]
-
-[dev-dependencies]
-burn-tensor.workspace = true

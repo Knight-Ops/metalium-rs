@@ -243,3 +243,119 @@ zero staging transfer packets. Expanded poisoned-padding validation for all
 RHS geometries also passes both cards (`1791256629`, 2/2). Release comparison
 `1791256590` validates all 192 results; detailed medians are in
 firmware-performance.md. No new simulator divergence was observed.
+
+### BFP and PRNG characterization (2026-10-06)
+
+Both cards pass step91–93, release isolated run `1791297768` (8/8).
+Step92 measures codes 6/7/15 for BFP8/BFP4/BFP2 with matching Src input/output
+codes. A 1024-datum image carries 16 header bytes and 64 exponent bytes; image
+sizes are 1104/592/336 bytes before slot alignment. Sixteen consecutive datums
+share each exponent; sub-byte datums occupy the low bits first. The physical
+pack stream matches an independent f64 scaling oracle: BF16 truncation,
+maximum raw exponent selection, BFP8 magnitude rounding/clamping, then BFP4/2
+truncation. Zero magnitude drops its sign; tested input subnormals pack to zero.
+Exponent-255 significands are retained in the tested late conversion, including
+signed infinities and NaNs. Src/MOVA2D flushes decoded subnormals. Raw low-exponent
+nonzero magnitudes can wrap their decoded exponent as the existing decoder
+models. These are measured conversion semantics, not IEEE payload preservation.
+The executed missing-exponent-section mutant fails the physical oracle on both
+cards and ttsim.
+
+Step93 observes exponent-127 histogram bin counts 8/16/32/64/128 for
+4/8/16/32/64 packed Dst rows: one increment per eight datums in this configuration,
+rather than the WH model's per-datum update. CLREXPHIST clears this histogram
+and packer 0's maximum exponent. The gate uses F32 packing independently of
+BFP exponent selection. Saturation and nonempty packer 1–3 histories remain
+unmeasured.
+
+The checked `backend::write_prng_seed` emits a complete register write and
+WRCFG scheduling NOP. In step91, an identical seed write within one program
+reseeds ttsim but silicon returns the next old-stream value. Sixteen extra
+NOPs, byte RMWCIB writes and a complementary/requested seed sequence did not
+make silicon repeat (`1791296771`, `1791296833`, `1791297091`). Advancement
+matches the documented LFSR; disabled lanes neither write nor advance. Initial
+lane snapshots are in the logs; independent lanes and seed initialization
+are not established. This characterizes this instruction path, not every
+RISC-V/configuration seed path. Application seeding remains unresolved; Burn
+random construction is unchanged.
+
+A follow-up debug read verifies the seed register contains 0, 1, 0x12345678
+and 0xffffffff after the tested writes on both cards (`1791298248`, 2/2).
+Thus the observed stream continuation is not a missing seed register value.
+
+### Resident BFP conversion and products (2026-10-06)
+
+`step94_bfp_storage` passes both cards (`1791299101`, conversion/replay;
+`1791299490`, conversions, direct products, K reloads). BFP8/4/2 images occupy
+1104/592/336 bytes, with GDDR slots aligned to 1152/640/384 bytes. The compact
+Src conversion uses eight 128-datum banks: each gathers eight exponent bytes
+and packed datums before MOVA2D and F32 packing. NoC reads must preserve the
+GDDR/L1 low-six-bit congruence; packed datum chunks first land in declared
+scratch and move byte-for-byte into the compact image. Exponents remain live
+through the eight conversions. NC writes and subsequent reuse pass changed-input
+trace replay and varied physical/decoded corpora. Direct same-format matmul
+reads full physical slots into declared F32-sized L1 operand slots, preserving
+original exponent groups. Existing matrix kernels consume format codes 6/7/15;
+HiFi4 products and F32 K accumulator reloads pass exact signed-unit oracles
+for ragged shapes and K=257. Padding is established before compression.
+
+`step95_burn_bfp` passes both cards (`1791299490`): unary/scalar preservation,
+higher-precision binary promotion, F32 reductions, decoded F32 rearrangements
+and identity cast backward retain residency. Master updates and gradients
+remain F32 in the tested scalar training gate. This does not establish MNIST
+accuracy or broad training/traced workload acceptance.
+
+The initial PRNG snapshots also show strong lane correlation: lanes either
+start identically or adjacent lanes share 30 bits after a two-bit left shift.
+`step91_seeded_prng` now asserts this measured structure independently of each
+lane's LFSR advance. Absolute initial words vary between runs/cards despite
+seed-register readback, so no seed-to-lane initialization formula is promised.
+
+Expanded BFP gates (`1791300035`) pass both cards: special/mixed exponent
+groups, executed wrong-exponent and reversed datum/nibble/bit stream controls,
+shared views, fusion boundaries, parameter casts, changed-input trace outputs
+and four-policy actual MNIST MLP/CNN training. The observed accuracy changes
+and conversion cost are recorded in `firmware-performance.md`.
+
+Final BFP control/sweep validation `1791301208` passes 28/28 on both cards.
+`step94` compares independent f64 scaling and integer-significand encoding
+oracles across discarded-bit thresholds, signs, exponents 1/6/126/127/128/254/255
+and mixed exponent groups. The missing-edge control supplies a false Zero
+padding claim and is rejected by the physical oracle; the lost-accumulator
+control executes only the final K tile and disagrees with the full product.
+`step95` covers checkpointed identity backward, packed parameter-copy traces,
+batched/attention routing, stale source host caches, and softmax's F32 promotion
+through reductions. No intermediate model downloads occur. Full both-card
+SMOKE `1791300502` passes 364/364; benchmark `1791300393` validates every sample.
+
+### Direct RISC-V PRNG seed stores (2026-10-06)
+
+The follow-up `prng_seed` firmware runs on T1 and writes the generated global
+seed field with a full-width RISC-V `sw`, after draining coprocessor work. A
+fence alone does not make the initialized states immediately available: the
+first probe (`1791302087`, failed restart control) observed inconsistent
+snapshots across identical and complementary seeds. Adding 512 iterations of
+a RISC-V NOP loop after the fence produces repeatable restarts on both cards
+(`1791302152`, 2/2; finalized step91 suite `1791302214`, 4/4). This is a
+validated conservative settling interval, not a measured minimum or a
+completion-status protocol. It does not change the measured WRCFG behavior.
+
+The gate uses seeds 0, 1, 0x12345678, 0x80000000, 0x55555555, 0xaaaaaaaa and
+0xffffffff. Each sequence is seed/seed/complement/seed; all 32 lanes repeat
+on identical seeds, change for the complementary seed, and advance according
+to the independent LFSR model. Adjacent lane states share 30 bits after a
+two-bit left shift. Seed 0xffffffff produces the absorbing all-ones state,
+which never advances to a different value. Thus a working restart path does
+not establish application randomness quality or independent streams.
+
+For seed 0, silicon's first two lanes are 0xf173cc27/0xc5cf309e; pinned ttsim
+starts at 0xc5cf309e/0x173cc27a. Other tested nonabsorbing seeds show the same
+one-lane offset. Absolute initialization is therefore not a common simulator
+and silicon contract. Burn random remains unchanged; S7 remains partial for
+application quality and stream semantics.
+
+Final suite `1791302401` passes 4/4 with the probe leaving a nonabsorbing
+stream for subsequent programs on the tile. Simulator gates, image entry
+checks, default/silicon workspace Clippy and firmware Clippy pass. All eight
+MNIST regression gates pass with unchanged goldens (268.05 s). The probe is
+included by SMOKE's existing step91 filter.

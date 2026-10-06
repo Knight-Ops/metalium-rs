@@ -3,3 +3,5 @@
 pub mod cnn;
 pub mod trace;
 pub mod transformer;
+
+pub mod precision;
