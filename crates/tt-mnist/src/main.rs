@@ -563,30 +563,53 @@ fn infer_traced(
     batch: usize,
     passes: usize,
     device: &TtDevice,
+    fusion: bool,
 ) -> Infer {
     use burn::tensor::TensorPrimitive;
-    let prim = |t: Tensor<TtBackend, 2>| match t.into_primitive() {
-        TensorPrimitive::Float(p) => p,
-        _ => unreachable!("a float tensor"),
-    };
-    let model = Classifier::<TtBackend>::new(init, device);
     let t0 = Instant::now();
     let n = test.n - test.n % batch;
-    let x: Tensor<TtBackend, 2> = Tensor::from_data(
-        TensorData::new(test.images[..batch * PIXELS].to_vec(), [batch, PIXELS]),
-        device,
-    );
-    let xp = prim(x.clone());
-    // Pre-run forward pass to ensure weights/biases are resident in GDDR before capture
-    let _ = model.forward(x.clone().cast(init.dtype));
-    let (trace, _) = burn_tt::Trace::capture(&xp, || {
-        prim(
-            model
-                .forward(x.clone().cast(init.dtype))
-                .cast(FloatDType::F32),
-        )
-    })
-    .unwrap_or_else(|e| panic!("capturing the forward pass: {e}"));
+    let (trace, _) = if fusion {
+        let prim = |t: Tensor<burn_tt::Tt, 2>| match t.into_primitive() {
+            TensorPrimitive::Float(p) => burn_tt::resolve_float_tensor(&p),
+            _ => unreachable!("a float tensor"),
+        };
+        let model = Classifier::<burn_tt::Tt>::new(init, device);
+        let x: Tensor<burn_tt::Tt, 2> = Tensor::from_data(
+            TensorData::new(test.images[..batch * PIXELS].to_vec(), [batch, PIXELS]),
+            device,
+        );
+        let xp = prim(x.clone());
+        let _ = prim(model.forward(x.clone().cast(init.dtype)));
+        burn_tt::Trace::capture(&xp, || {
+            prim(
+                model
+                    .forward(x.clone().cast(init.dtype))
+                    .cast(FloatDType::F32),
+            )
+        })
+        .unwrap_or_else(|e| panic!("capturing the forward pass with fusion: {e}"))
+    } else {
+        let prim = |t: Tensor<TtBackend, 2>| match t.into_primitive() {
+            TensorPrimitive::Float(p) => p,
+            _ => unreachable!("a float tensor"),
+        };
+        let model = Classifier::<TtBackend>::new(init, device);
+        let x: Tensor<TtBackend, 2> = Tensor::from_data(
+            TensorData::new(test.images[..batch * PIXELS].to_vec(), [batch, PIXELS]),
+            device,
+        );
+        let xp = prim(x.clone());
+        // Pre-run forward pass to ensure weights/biases are resident in GDDR before capture
+        let _ = model.forward(x.clone().cast(init.dtype));
+        burn_tt::Trace::capture(&xp, || {
+            prim(
+                model
+                    .forward(x.clone().cast(init.dtype))
+                    .cast(FloatDType::F32),
+            )
+        })
+        .unwrap_or_else(|e| panic!("capturing the forward pass: {e}"))
+    };
     let classes = trace.output_dims()[1];
     let preload = t0.elapsed();
     let calls = burn_tt::device_time();
@@ -733,6 +756,8 @@ struct Args {
     bf16: bool,
     /// `--train-trace`: train with hardware trace (capture step 0 and replay subsequent steps).
     train_trace: bool,
+    /// `--fusion`: enable Burn kernel fusion on device.
+    fusion: bool,
     /// `--hidden H1,H2,...`: hidden layer sizes.
     hidden: Vec<usize>,
 }
@@ -752,6 +777,7 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
                 matrix accumulation, loss and trace input/output remain F32
   --hidden H    hidden layer sizes, comma-separated (default 512,256: 784-512-256-10, 535k params)
   --train-trace train with hardware trace (capture step 0 and replay subsequent steps)
+  --fusion      enable Burn kernel fusion on device
   --infer       benchmark inference alone: no training, the forward pass over
                 the test set (untrained weights), so it profiles on its own
                 (`TT_PROFILE`)
@@ -781,6 +807,7 @@ fn args() -> Result<Args, String> {
         cnn: false,
         bf16: false,
         train_trace: false,
+        fusion: false,
         hidden: vec![512, 256],
     };
     let mut tiles = None;
@@ -818,6 +845,7 @@ fn args() -> Result<Args, String> {
                 }
             }
             "--train-trace" => a.train_trace = true,
+            "--fusion" => a.fusion = true,
             "--infer" => a.infer = true,
             "--trace" => a.trace = true,
             "--batch" => a.batch = number(value()?)?,
@@ -970,7 +998,9 @@ fn main() {
         );
         let before = burn_tt::tensor_traffic();
         let r = if a.trace {
-            infer_traced(&test_split, &init, a.batch, a.passes, &device)
+            infer_traced(&test_split, &init, a.batch, a.passes, &device, a.fusion)
+        } else if a.fusion {
+            infer::<burn_tt::Tt>(&test_split, &init, a.batch, a.passes, &device)
         } else {
             infer::<TtBackend>(&test_split, &init, a.batch, a.passes, &device)
         };
@@ -979,6 +1009,14 @@ fn main() {
         println!("\non the card:");
         print_infer(&r, a.batch);
         print_calls(&r.calls, r.first + r.rest, r.batches, "batch");
+        if a.fusion {
+            let fused_add_relu = burn_tt::fused_add_relu_count();
+            let fused_relu = burn_tt::fused_relu_count();
+            println!(
+                "  kernel fusion:                            {} add_relu, {} relu executed on device",
+                fused_add_relu, fused_relu
+            );
+        }
         println!(
             "  tensor data over PCIe, whole run          {:.1} MB up (incl. the test set), {:.2} MB down",
             moved.uploaded as f64 / 1e6,
@@ -1005,6 +1043,16 @@ fn main() {
             &device,
             |step, loss| println!("  step {step:>5}   loss {loss:.4}"),
         )
+    } else if a.fusion {
+        train::<Autodiff<burn_tt::Tt>>(
+            &train_split,
+            &test_split,
+            &init,
+            a.epochs,
+            a.steps,
+            &device,
+            |step, loss| println!("  step {step:>5}   loss {loss:.4}"),
+        )
     } else {
         train::<Autodiff<TtBackend>>(
             &train_split,
@@ -1022,6 +1070,14 @@ fn main() {
     let per = |d: Duration| d.as_secs_f64() * 1e3 / card.steps.max(1) as f64;
     println!();
     println!("on the card:");
+    if a.fusion {
+        let fused_add_relu = burn_tt::fused_add_relu_count();
+        let fused_relu = burn_tt::fused_relu_count();
+        println!(
+            "  kernel fusion:                            {} add_relu, {} relu executed on device",
+            fused_add_relu, fused_relu
+        );
+    }
     println!(
         "  model and {} images uploaded once       {:.2?}",
         train_split.n - train_split.n % BATCH,

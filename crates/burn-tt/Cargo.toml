@@ -8,6 +8,10 @@ license.workspace = true
 # Native Burn backend. Flex and simulator comparisons live in tt-tests.
 [dependencies]
 burn-backend.workspace = true
+burn-std = { workspace = true, optional = true }
+burn-ir = { workspace = true, optional = true }
+burn-fusion = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
 tt-device.workspace = true
 tt-isa.workspace = true
@@ -18,6 +22,11 @@ tt-kmd.workspace = true
 tt-firmware-images.workspace = true
 # `atexit`, for `TT_REPORT=1` (`report.rs`).
 libc.workspace = true
+
+[features]
+default = ["std", "fusion"]
+std = []
+fusion = ["dep:burn-std", "dep:burn-ir", "dep:burn-fusion", "dep:serde"]
 
 [dev-dependencies]
 burn-tensor.workspace = true

@@ -532,6 +532,336 @@ fn the_first_forward_pass_is_within_the_derived_bound() {
     });
 }
 
+#[test]
+fn the_first_forward_pass_with_fusion_is_within_the_derived_bound() {
+    let split = mnist::load(true);
+    let init = init();
+    let n = 64;
+    let x = split.images[..n * PIXELS].to_vec();
+    let (h, logits) = outside_fork(|| {
+        let host_model = Mlp::<Flex>::new(&init, &FlexDevice);
+        let (xt, _) = batch::<Flex>(&split, 0, n, &FlexDevice);
+        let h: Vec<f32> = host_model
+            .relu
+            .forward(host_model.l1.forward(xt.clone()))
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let logits: Vec<f32> = host_model.forward(xt).into_data().to_vec().unwrap();
+        (h, logits)
+    });
+
+    let w1 = init.l1.0.to_vec::<f32>().unwrap();
+    let b1 = init.l1.1.to_vec::<f32>().unwrap();
+    let w2 = init.l2.0.to_vec::<f32>().unwrap();
+    let b2 = init.l2.1.to_vec::<f32>().unwrap();
+    let per =
+        |k: usize| 2f64.powi(-9) + 5.0 * k as f64 * 2f64.powi(-23) + k as f64 * 2f64.powi(-24);
+    let bias_round = |v: f64, b: f32| 2.0 * 2f64.powi(-24) * (v + f64::from(b.abs()));
+    let beta1: Vec<f64> = (0..n * HIDDEN)
+        .map(|e| {
+            let (i, j) = (e / HIDDEN, e % HIDDEN);
+            let s: f64 = (0..PIXELS)
+                .map(|q| f64::from(x[i * PIXELS + q].abs()) * f64::from(w1[q * HIDDEN + j].abs()))
+                .sum();
+            s * per(PIXELS) + bias_round(s, b1[j])
+        })
+        .collect();
+
+    with_device(Config::default(), |d| {
+        burn_tt::reset_fusion_counters();
+        let model = Mlp::<burn_tt::Tt>::new(&init, &d);
+        let (xt, _) = batch::<burn_tt::Tt>(&split, 0, n, &d);
+        let h_tt: Vec<f32> = model
+            .relu
+            .forward(model.l1.forward(xt.clone()))
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let logits_tt: Vec<f32> = model.forward(xt).into_data().to_vec().unwrap();
+        let add_relu_count = burn_tt::fused_add_relu_count();
+        let relu_count = burn_tt::fused_relu_count();
+        eprintln!("Fusion execution counters: add_relu={add_relu_count}, relu={relu_count}");
+        assert_eq!(
+            add_relu_count, 2,
+            "both hidden layer add+relu passes must execute as fused add_relu on device"
+        );
+        for e in 0..n * HIDDEN {
+            let err = (f64::from(h_tt[e]) - f64::from(h[e])).abs();
+            assert!(err <= beta1[e], "h[{e}]: {err} > {}", beta1[e]);
+        }
+        let mut worst = 0f64;
+        for e in 0..n * CLASSES {
+            let (i, c) = (e / CLASSES, e % CLASSES);
+            let s: f64 = (0..HIDDEN)
+                .map(|j| {
+                    f64::from(h_tt[i * HIDDEN + j].abs()) * f64::from(w2[j * CLASSES + c].abs())
+                })
+                .sum();
+            let carried: f64 = (0..HIDDEN)
+                .map(|j| beta1[i * HIDDEN + j] * f64::from(w2[j * CLASSES + c].abs()))
+                .sum();
+            let limit = s * per(HIDDEN) + carried + bias_round(s, b2[c]);
+            let err = (f64::from(logits_tt[e]) - f64::from(logits[e])).abs();
+            assert!(err <= limit, "logits[{e}]: {err} > {limit}");
+            worst = worst.max(err / limit);
+        }
+        eprintln!("first forward pass with fusion: worst logit error {worst:.3} of the bound");
+        assert_ne!(
+            logits_tt, logits,
+            "the forward pass must have run on the device"
+        );
+    });
+}
+
+#[test]
+fn the_first_forward_pass_with_fusion_and_trace_is_within_the_derived_bound() {
+    let split = mnist::load(true);
+    let init = init();
+    let n = 64;
+    let x = split.images[..n * PIXELS].to_vec();
+    let (h, logits) = outside_fork(|| {
+        let host_model = Mlp::<Flex>::new(&init, &FlexDevice);
+        let (xt, _) = batch::<Flex>(&split, 0, n, &FlexDevice);
+        let h: Vec<f32> = host_model
+            .relu
+            .forward(host_model.l1.forward(xt.clone()))
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let logits: Vec<f32> = host_model.forward(xt).into_data().to_vec().unwrap();
+        (h, logits)
+    });
+
+    let w1 = init.l1.0.to_vec::<f32>().unwrap();
+    let b1 = init.l1.1.to_vec::<f32>().unwrap();
+    let w2 = init.l2.0.to_vec::<f32>().unwrap();
+    let b2 = init.l2.1.to_vec::<f32>().unwrap();
+    let per =
+        |k: usize| 2f64.powi(-9) + 5.0 * k as f64 * 2f64.powi(-23) + k as f64 * 2f64.powi(-24);
+    let bias_round = |v: f64, b: f32| 2.0 * 2f64.powi(-24) * (v + f64::from(b.abs()));
+    let beta1: Vec<f64> = (0..n * HIDDEN)
+        .map(|e| {
+            let (i, j) = (e / HIDDEN, e % HIDDEN);
+            let s: f64 = (0..PIXELS)
+                .map(|q| f64::from(x[i * PIXELS + q].abs()) * f64::from(w1[q * HIDDEN + j].abs()))
+                .sum();
+            s * per(PIXELS) + bias_round(s, b1[j])
+        })
+        .collect();
+
+    with_device(Config::default(), |d| {
+        use burn::tensor::TensorPrimitive;
+        let prim = |t: Tensor<burn_tt::Tt, 2>| match t.into_primitive() {
+            TensorPrimitive::Float(p) => burn_tt::resolve_float_tensor(&p),
+            _ => unreachable!("a float tensor"),
+        };
+        let model = Mlp::<burn_tt::Tt>::new(&init, &d);
+        let (xt, _) = batch::<burn_tt::Tt>(&split, 0, n, &d);
+        let xp = prim(xt.clone());
+        let _ = prim(model.forward(xt.clone()));
+
+        burn_tt::reset_fusion_counters();
+        let (trace, _) = burn_tt::Trace::capture(&xp, || prim(model.forward(xt.clone())))
+            .unwrap_or_else(|e| panic!("capturing fused trace: {e}"));
+
+        let captured_add_relu = burn_tt::fused_add_relu_count();
+        eprintln!("Captured fused add_relu in trace: {captured_add_relu}");
+        assert_eq!(
+            captured_add_relu, 1,
+            "hidden layer add+relu pass must be fused into the captured trace"
+        );
+
+        // Now replay the trace!
+        let run = trace
+            .run_timed(x)
+            .unwrap_or_else(|e| panic!("replaying fused trace: {e}"));
+        let logits_tt = run.output;
+
+        let mut worst = 0f64;
+        for e in 0..n * CLASSES {
+            let (i, c) = (e / CLASSES, e % CLASSES);
+            let s: f64 = (0..HIDDEN)
+                .map(|j| f64::from(h[i * HIDDEN + j].abs()) * f64::from(w2[j * CLASSES + c].abs()))
+                .sum();
+            let carried: f64 = (0..HIDDEN)
+                .map(|j| beta1[i * HIDDEN + j] * f64::from(w2[j * CLASSES + c].abs()))
+                .sum();
+            let limit = s * per(HIDDEN) + carried + bias_round(s, b2[c]);
+            let err = (f64::from(logits_tt[e]) - f64::from(logits[e])).abs();
+            assert!(err <= limit, "logits[{e}]: {err} > {limit}");
+            worst = worst.max(err / limit);
+        }
+        eprintln!("replayed fused trace: worst logit error {worst:.3} of the bound");
+        assert_ne!(logits_tt, logits, "must have run on device");
+    });
+}
+
+#[test]
+fn compare_all_four_execution_modes_latency_and_traffic() {
+    let split = mnist::load(true);
+    let init = init();
+    let n = 64;
+    let batches = 3; // 1 warmup + 2 measured batches
+    assert!(split.n >= batches * n);
+
+    with_device(Config::default(), |d| {
+        use burn::tensor::TensorPrimitive;
+
+        let prim_fused = |t: Tensor<burn_tt::Tt, 2>| match t.into_primitive() {
+            TensorPrimitive::Float(p) => burn_tt::resolve_float_tensor(&p),
+            _ => unreachable!("a float tensor"),
+        };
+        let prim_unfused = |t: Tensor<TtBackend, 2>| match t.into_primitive() {
+            TensorPrimitive::Float(p) => p,
+            _ => unreachable!("a float tensor"),
+        };
+
+        // 1. Unfused Eager
+        let model_unfused = Mlp::<TtBackend>::new(&init, &d);
+        let (x_warmup, _) = batch::<TtBackend>(&split, 0, n, &d);
+        let _ = model_unfused.forward(x_warmup).into_data();
+
+        let t0_unfused = std::time::Instant::now();
+        let traffic0_unfused = burn_tt::tensor_traffic();
+        let mut last_logits_unfused = Vec::new();
+        for b in 1..batches {
+            let (xt, _) = batch::<TtBackend>(&split, b * n, n, &d);
+            last_logits_unfused = model_unfused
+                .forward(xt)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+        }
+        let dur_unfused = t0_unfused.elapsed();
+        let traffic_unfused = burn_tt::tensor_traffic() - traffic0_unfused;
+
+        // 2. Fused Eager
+        burn_tt::reset_fusion_counters();
+        let model_fused = Mlp::<burn_tt::Tt>::new(&init, &d);
+        let (x_warmup_f, _) = batch::<burn_tt::Tt>(&split, 0, n, &d);
+        let _ = model_fused.forward(x_warmup_f).into_data();
+
+        let t0_fused = std::time::Instant::now();
+        let traffic0_fused = burn_tt::tensor_traffic();
+        let mut last_logits_fused = Vec::new();
+        for b in 1..batches {
+            let (xt, _) = batch::<burn_tt::Tt>(&split, b * n, n, &d);
+            last_logits_fused = model_fused.forward(xt).into_data().to_vec::<f32>().unwrap();
+        }
+        let dur_fused = t0_fused.elapsed();
+        let traffic_fused = burn_tt::tensor_traffic() - traffic0_fused;
+        let fused_add_relu = burn_tt::fused_add_relu_count();
+        assert!(
+            fused_add_relu >= batches,
+            "must have fused add_relu in each forward pass: got {fused_add_relu}"
+        );
+
+        // 3. Unfused Traced
+        let (xt_trace_base, _) = batch::<TtBackend>(&split, 0, n, &d);
+        let xp_trace_base = prim_unfused(xt_trace_base.clone());
+        let _ = prim_unfused(model_unfused.forward(xt_trace_base.clone()));
+        let (trace_unfused, _) = burn_tt::Trace::capture(&xp_trace_base, || {
+            prim_unfused(model_unfused.forward(xt_trace_base.clone()))
+        })
+        .unwrap();
+
+        let x_warmup_bytes = split.images[..n * PIXELS].to_vec();
+        let _ = trace_unfused.run(x_warmup_bytes).unwrap();
+
+        let t0_trace_unfused = std::time::Instant::now();
+        let mut replay_trace_unfused = std::time::Duration::ZERO;
+        let mut last_logits_trace_unfused = Vec::new();
+        for b in 1..batches {
+            let input = split.images[b * n * PIXELS..(b + 1) * n * PIXELS].to_vec();
+            let run = trace_unfused.run_timed(input).unwrap();
+            replay_trace_unfused += run.replay;
+            last_logits_trace_unfused = run.output;
+        }
+        let dur_trace_unfused = t0_trace_unfused.elapsed();
+
+        // 4. Fused Traced
+        let (xt_trace_fused_base, _) = batch::<burn_tt::Tt>(&split, 0, n, &d);
+        let xp_trace_fused_base = prim_fused(xt_trace_fused_base.clone());
+        let _ = prim_fused(model_fused.forward(xt_trace_fused_base.clone()));
+        burn_tt::reset_fusion_counters();
+        let (trace_fused, _) = burn_tt::Trace::capture(&xp_trace_fused_base, || {
+            prim_fused(model_fused.forward(xt_trace_fused_base.clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            burn_tt::fused_add_relu_count(),
+            1,
+            "trace must capture fused add_relu"
+        );
+
+        let _ = trace_fused
+            .run(split.images[..n * PIXELS].to_vec())
+            .unwrap();
+
+        let t0_trace_fused = std::time::Instant::now();
+        let mut replay_trace_fused = std::time::Duration::ZERO;
+        let mut last_logits_trace_fused = Vec::new();
+        for b in 1..batches {
+            let input = split.images[b * n * PIXELS..(b + 1) * n * PIXELS].to_vec();
+            let run = trace_fused.run_timed(input).unwrap();
+            replay_trace_fused += run.replay;
+            last_logits_trace_fused = run.output;
+        }
+        let dur_trace_fused = t0_trace_fused.elapsed();
+
+        let measured_batches = batches - 1;
+        assert_eq!(last_logits_unfused.len(), n * CLASSES);
+        assert_eq!(last_logits_fused.len(), n * CLASSES);
+        assert_eq!(last_logits_trace_unfused.len(), n * CLASSES);
+        assert_eq!(last_logits_trace_fused.len(), n * CLASSES);
+
+        for i in 0..n * CLASSES {
+            let diff_eager = (last_logits_fused[i] - last_logits_unfused[i]).abs();
+            let diff_trace_unfused = (last_logits_trace_unfused[i] - last_logits_unfused[i]).abs();
+            let diff_trace_fused = (last_logits_trace_fused[i] - last_logits_unfused[i]).abs();
+            assert!(
+                diff_eager < 1e-4,
+                "fused eager differs from unfused eager at {i}: {diff_eager}"
+            );
+            assert!(
+                diff_trace_unfused < 1e-4,
+                "unfused trace differs from unfused eager at {i}: {diff_trace_unfused}"
+            );
+            assert!(
+                diff_trace_fused < 1e-4,
+                "fused trace differs from unfused eager at {i}: {diff_trace_fused}"
+            );
+        }
+
+        eprintln!(
+            "\n=== MNIST Execution Modes Performance & Traffic Comparison ({measured_batches} batches of {n}) ==="
+        );
+        eprintln!(
+            "1. Unfused Eager : wall={dur_unfused:.2?} ({:.2} ms/batch), uploads={}, downloads={}",
+            dur_unfused.as_secs_f64() * 1e3 / measured_batches as f64,
+            traffic_unfused.uploads,
+            traffic_unfused.downloads,
+        );
+        eprintln!(
+            "2. Fused Eager   : wall={dur_fused:.2?} ({:.2} ms/batch), uploads={}, downloads={}, fused_ops={fused_add_relu}",
+            dur_fused.as_secs_f64() * 1e3 / measured_batches as f64,
+            traffic_fused.uploads,
+            traffic_fused.downloads,
+        );
+        eprintln!(
+            "3. Unfused Traced: wall={dur_trace_unfused:.2?} ({:.2} ms/batch), card replay={replay_trace_unfused:.2?} ({:.2} ms/batch)",
+            dur_trace_unfused.as_secs_f64() * 1e3 / measured_batches as f64,
+            replay_trace_unfused.as_secs_f64() * 1e3 / measured_batches as f64,
+        );
+        eprintln!(
+            "4. Fused Traced  : wall={dur_trace_fused:.2?} ({:.2} ms/batch), card replay={replay_trace_fused:.2?} ({:.2} ms/batch)",
+            dur_trace_fused.as_secs_f64() * 1e3 / measured_batches as f64,
+            replay_trace_fused.as_secs_f64() * 1e3 / measured_batches as f64,
+        );
+    });
+}
+
 /// The whole training set, one epoch, then the test set -- silicon only; the
 /// simulator gate above is the reduced run.
 #[test]

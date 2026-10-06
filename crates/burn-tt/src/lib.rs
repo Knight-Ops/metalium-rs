@@ -21,6 +21,8 @@
 //! waiting, `server::submit`), naming the op and the engine's error. The device
 //! path is never silently replaced by the host one.
 
+#[cfg(feature = "fusion")]
+pub mod fusion;
 mod generated;
 mod host;
 mod ops;
@@ -42,8 +44,19 @@ pub use server::{
     DramBuffers, Elem, Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine,
     OutputKind, OutputPayload, PowArg, Serve, TraceRun,
 };
+#[cfg(feature = "fusion")]
+pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
 pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};
+
+#[cfg(feature = "fusion")]
+pub type Tt = burn_fusion::Fusion<TtBackend>;
+#[cfg(feature = "fusion")]
+pub use fusion::{
+    fused_add_relu_count, fused_relu_count, reset_fusion_counters, resolve_float_tensor,
+};
+#[cfg(not(feature = "fusion"))]
+pub type Tt = TtBackend;
 
 pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
 pub use traffic::{

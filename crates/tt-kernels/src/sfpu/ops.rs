@@ -198,6 +198,8 @@ pub mod kind_sfpu {
     pub const INT_GE_S: u32 = 0x18b;
     pub const INT_LT_S: u32 = 0x18c;
     pub const INT_LE_S: u32 = 0x18d;
+    /// `relu(a + b)`: compound fused addition and ReLU in one SFPU pass.
+    pub const ADD_RELU: u32 = 0x1f0;
     /// End of the original contiguous activation range. Additional kinds
     /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
@@ -2298,6 +2300,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
     }
     Some(match kind {
         kind::ADD
+        | kind_sfpu::ADD_RELU
         | kind::SUB
         | kind::MUL
         | kind::RELU_BACKWARD
@@ -2398,6 +2401,7 @@ pub fn broadcasts(kind: u32) -> bool {
     matches!(
         kind,
         kind::ADD
+            | kind_sfpu::ADD_RELU
             | kind::SUB
             | kind::MUL
             | kind_sfpu::DIV
@@ -2417,7 +2421,7 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     // The exact ops of S2 move raw bits too: an FP32 store would flush a
     // denormal Flex keeps.
     let fmt = match kind {
-        kind::ADD | kind::SUB | kind::MUL | kind_sfpu::DIV => Format::Fp32,
+        kind::ADD | kind_sfpu::ADD_RELU | kind::SUB | kind::MUL | kind_sfpu::DIV => Format::Fp32,
         _ => Format::Int32,
     };
     p.load(LReg::L0, fmt, a_at);
@@ -2467,6 +2471,16 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
             p.add(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
         }
+        kind_sfpu::ADD_RELU => {
+            p.add(LReg::L0, LReg::L1, LReg::L2);
+            p.mov(LReg::ZERO, LReg::L3);
+            p.if_(Cond::Less(LReg::ZERO, LReg::L2), |p| {
+                p.if_(Cond::Less(LReg::L2, LReg::L5), |p| {
+                    p.mov(LReg::L2, LReg::L3)
+                })
+            });
+            LReg::L3
+        }
         kind::SUB => {
             p.sub(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
@@ -2497,6 +2511,9 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
 
 /// The constants [`binary_body`] needs for `kind`, loaded once.
 fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
+    if kind == kind_sfpu::ADD_RELU {
+        p.loadi_bits(LReg::L5, FIRST_NAN);
+    }
     if kind == kind_sfpu::DIV {
         p.loadi_bits(LReg::L6, f32::MAX.to_bits());
         p.loadi_bits(LReg::L7, 0x7f80_0000);
@@ -2891,6 +2908,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
     let mut p = Program::new();
     let operands = match kind {
         kind::ADD
+        | kind_sfpu::ADD_RELU
         | kind::SUB
         | kind::MUL
         | kind_sfpu::DIV
@@ -3402,6 +3420,15 @@ mod tests {
         let positive = (a as i32) > 0 && a <= 0x7f80_0000;
         let r = match kind {
             kind::ADD => (f(a) + f(b)).to_bits(),
+            kind_sfpu::ADD_RELU => {
+                let sum = (f(a) + f(b)).to_bits();
+                let sum_positive = (sum as i32) > 0 && sum <= 0x7f80_0000;
+                if sum_positive {
+                    sum
+                } else {
+                    0
+                }
+            }
             kind::SUB => (f(a) - f(b)).to_bits(),
             kind::MUL => (f(a) * f(b)).to_bits(),
             kind::MUL_SCALAR => (f(a) * s).to_bits(),
@@ -3423,7 +3450,8 @@ mod tests {
             kind::ADD_ROW => (f(a) + f(bias)).to_bits(),
             _ => unreachable!(),
         };
-        if f(r).is_nan() && !matches!(kind, kind::RELU | kind::RELU_BACKWARD) {
+        if f(r).is_nan() && !matches!(kind, kind::RELU | kind::RELU_BACKWARD | kind_sfpu::ADD_RELU)
+        {
             0x7fc0_0000
         } else {
             r
@@ -3435,6 +3463,7 @@ mod tests {
         let (a, b) = (tile(3), tile(5));
         for (k, s) in [
             (kind::ADD, 0.0),
+            (kind_sfpu::ADD_RELU, 0.0),
             (kind::SUB, 0.0),
             (kind::MUL, 0.0),
             (kind::MUL_SCALAR, -1.75),
@@ -3487,6 +3516,7 @@ mod fit {
     fn every_op_s_longest_run_fits_a_program_slot() {
         for k in [
             kind::ADD,
+            kind_sfpu::ADD_RELU,
             kind::SUB,
             kind::MUL,
             kind::MUL_SCALAR,

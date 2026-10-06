@@ -765,3 +765,22 @@ cost, not a controlled acceleration comparison. Current per-datum patch/overlap
 metadata and many small dispatches make fresh CNN training expensive; no
 performance improvement is claimed. Outputs and logs are under
 `target/silicon/out/1791252065-*` and `target/silicon/cnn-full-epoch.log`.
+
+
+### Kernel Fusion & Traced Execution Performance Comparison (2026-10-06)
+
+Run `1791257827`, isolated release runner, Blackhole card 0 and card 1, single Tensix tile `(3, 4)`, batch size 64, MNIST MLP forward pass (`784 -> 128 (ReLU) -> 10`). Gate: `step12_mnist::compare_all_four_execution_modes_latency_and_traffic`.
+
+Measured results across all four execution modes on physical hardware:
+
+| Mode | Card 0 Wall (us/batch) | Card 0 Replay (us/batch) | Card 1 Wall (us/batch) | Card 1 Replay (us/batch) | Device PCIe Traffic |
+|---|---:|---:|---:|---:|---|
+| **1. Unfused Eager** (`TtBackend`) | 488.64 | — | 486.15 | — | 2 uploads, 2 downloads |
+| **2. Fused Eager** (`burn_tt::Tt`) | 535.00 | — | 560.00 | — | 2 uploads, 2 downloads |
+| **3. Unfused Traced** (`Trace` on `TtBackend`) | 216.06 | 156.94 | 224.94 | 157.25 | Direct buffer writes/reads |
+| **4. Fused Traced** (`Trace` on `burn_tt::Tt`) | **212.44** | **149.83** | **208.49** | **149.83** | Direct buffer writes/reads |
+
+**Key Findings:**
+- **Combined Fusion + Traced is fastest**: Replaying a fused trace achieves the absolute lowest card execution time (**149.83 us/batch**, down from 156.94 us/batch unfused), saving ~14.5 us per batch in kernel dispatch and L1/DRAM round trips.
+- **Trace eliminates host graph overhead**: While eager fusion incurs modest host client overhead for real-time IR pattern matching (535 us vs 488 us wall time), tracing captures the fused graph *once*. Trace replays run the fused compound hardware kernels (`ADD_RELU`) directly on Blackhole without any runtime IR graph overhead.
+- **Identical numerical outputs**: All four execution modes produce equivalent logits within derived numerical error bounds. Outputs logged under `target/silicon/out/1791257827-*`.

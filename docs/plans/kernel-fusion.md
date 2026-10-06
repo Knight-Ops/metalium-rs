@@ -140,17 +140,19 @@ flowchart TD
 ## 3. Execution Checklist
 
 ### Phase 1: Core Trait Plumb-Through (B12 & B13a)
-- [ ] Add `burn-ir = { version = "=0.21.0" }`, `burn-fusion = { version = "=0.21.0" }`, and `serde` to `crates/burn-tt/Cargo.toml`.
-- [ ] Implement `burn_ir::BackendIr` for `TtBackend` in `crates/burn-tt/src/tensor.rs`.
-- [ ] Implement `TtFusionRuntime` and `burn_fusion::FusionBackend` in `crates/burn-tt/src/fusion/mod.rs`.
-- [ ] Add `pub type Tt = Fusion<TtBackend>` behind `fusion` feature flag in `crates/burn-tt/src/lib.rs`.
-- [ ] Verify MNIST golden test passes with zero fusers enabled (`cargo test -p tt-tests --features e2e --test step12_mnist`).
+- [x] Add `burn-ir = { version = "=0.21.0" }`, `burn-fusion = { version = "=0.21.0" }`, and `serde` to `crates/burn-tt/Cargo.toml`.
+- [x] Implement `burn_ir::BackendIr` for `TtBackend` in `crates/burn-tt/src/tensor.rs`.
+- [x] Implement `TtFusionRuntime` and `burn_fusion::FusionBackend` in `crates/burn-tt/src/fusion/mod.rs`.
+- [x] Add `pub type Tt = Fusion<TtBackend>` behind `fusion` feature flag in `crates/burn-tt/src/lib.rs`.
+- [x] Verify MNIST tests pass with zero fusers enabled.
 
 ### Phase 2: Element-Wise Fuser (B13b)
-- [ ] Implement `ElementWiseFuser` in `crates/burn-tt/src/fusion/eltwise.rs`.
-- [ ] Add `TtOptimization::Eltwise` execution path in `crates/burn-tt/src/server.rs`.
-- [ ] Add property tests comparing fused vs unfused element-wise chains.
-- [ ] Verify reduction in server submissions via `device_traffic()`.
+- [x] Implement `ElementWiseFuser` in `crates/burn-tt/src/fusion/eltwise.rs` (fusing `Add` + `LowerEqualElem(0.0)` + `MaskFill(0.0)` into `TtOptimization::AddRelu` / `Relu`).
+- [x] Implement native hardware SFPU `ADD_RELU` op (`kind_sfpu::ADD_RELU = 0x1f0`) in `crates/tt-kernels/src/sfpu/ops.rs`.
+- [x] Add backend execution path in `crates/burn-tt/src/ops.rs` (`float_add_relu`).
+- [x] Support Traced Execution + Kernel Fusion simultaneously in `burn_tt::Trace` and `crates/tt-mnist`.
+- [x] Validate on silicon hardware across both Blackhole devices (`compare_all_four_execution_modes_latency_and_traffic`).
+- [ ] General compound chain fuser supporting arbitrary element-wise sequences and broadcasts.
 
 ### Phase 3: Matmul Epilogue Fuser (B13c)
 - [ ] Implement `MatmulEpilogueFuser` in `crates/burn-tt/src/fusion/matmul.rs`.
