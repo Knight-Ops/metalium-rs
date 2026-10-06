@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use tt_kernels::tensor::{Block, BlockMove};
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
+use tt_kernels::matrix_eltwise::{ElementwiseMode, MatrixEltwiseOp, SrcPrecision};
 use tt_kernels::session::{Session, SessionError, TileChoice};
 
 use crate::TtDevice;
@@ -38,6 +39,9 @@ pub enum PowArg {
 
 /// What a device can do for the backend, on its server thread.
 pub trait Engine {
+    fn elementwise_mode(&self) -> ElementwiseMode {
+        ElementwiseMode::Sfpu
+    }
     /// `A[m, k] @ B[k, n]`, row-major.
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
 
@@ -408,6 +412,7 @@ pub type BufferId = u64;
 /// `tt-tests` -- forward their DRAM methods here.
 #[derive(Default)]
 pub struct DramBuffers {
+    elementwise: ElementwiseMode,
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
     bf16: HashMap<BufferId, tt_kernels::bf16::Bf16Tensor>,
@@ -416,6 +421,82 @@ pub struct DramBuffers {
 }
 
 impl DramBuffers {
+    /// Configure before attachment. There is no setter on an attached engine.
+    pub fn with_elementwise_mode(mut self, mode: ElementwiseMode) -> Self {
+        self.elementwise = mode;
+        self
+    }
+    pub fn elementwise_mode(&self) -> ElementwiseMode {
+        self.elementwise
+    }
+
+    fn matrix_eltwise<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        precision: SrcPrecision,
+        fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        use tt_kernels::kind;
+        let operation = match op.kind {
+            kind::ADD | kind::ADD_SCALAR => MatrixEltwiseOp::Add,
+            kind::SUB => MatrixEltwiseOp::Sub,
+            kind::MUL | kind::MUL_SCALAR => MatrixEltwiseOp::Mul,
+            _ => return Err(unsupported()),
+        };
+        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        let packed = self.bf16.contains_key(&a);
+        let scalar = if b.is_none() {
+            Some(
+                s.metadata(&[op.scalar.to_bits()], [1, 1], Elem::F32)
+                    .map_err(error)?,
+            )
+        } else {
+            None
+        };
+        let packed_scalar = if packed {
+            scalar
+                .as_ref()
+                .map(|t| s.bf16_from_f32(t).map_err(error))
+                .transpose()
+        } else {
+            Ok(None)
+        };
+        let result = (|| {
+            let packed_scalar = packed_scalar
+                .as_ref()
+                .map_err(|e| EngineError(e.0.clone()))?;
+            if packed {
+                let ta = self.bf16.get(&a).unwrap();
+                let tb = if let Some(b) = b {
+                    self.bf16.get(&b).ok_or_else(unsupported)?
+                } else {
+                    packed_scalar.as_ref().unwrap()
+                };
+                s.matrix_eltwise_bf16(operation, ta, tb, fidelity)
+                    .map_err(error)
+            } else {
+                let ta = self.get(a)?;
+                let tb = if let Some(b) = b {
+                    self.get(b)?
+                } else {
+                    scalar.as_ref().unwrap()
+                };
+                s.matrix_eltwise(operation, ta, tb, precision, fidelity)
+                    .map_err(error)
+            }
+        })();
+        if let Ok(Some(t)) = packed_scalar {
+            let _ = s.free_bf16(t);
+        }
+        if let Some(t) = scalar {
+            let _ = s.free(t);
+        }
+        Ok(self.insert(result?))
+    }
+
     pub fn pool_bf16<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -968,6 +1049,24 @@ impl DramBuffers {
         b: Option<BufferId>,
         c: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if c.is_none()
+            && matches!(
+                op.kind,
+                tt_kernels::kind::ADD
+                    | tt_kernels::kind::SUB
+                    | tt_kernels::kind::MUL
+                    | tt_kernels::kind::ADD_SCALAR
+                    | tt_kernels::kind::MUL_SCALAR
+            )
+        {
+            if let ElementwiseMode::Matrix {
+                precision,
+                fidelity,
+            } = self.elementwise
+            {
+                return self.matrix_eltwise(s, op, a, b, precision, fidelity);
+            }
+        }
         let ta = self.get(a)?.clone();
         let tb = b.map(|b| self.get(b).cloned()).transpose()?;
         let tc = c.map(|c| self.get(c).cloned()).transpose()?;
@@ -1156,14 +1255,14 @@ fn forget(id: BufferId) {
 /// Handed to an [`attach`] factory: call [`Serve::serve`] with the engine once
 /// it exists, and it runs the device's jobs until the device is detached.
 pub struct Serve {
-    ready: Sender<Result<(), EngineError>>,
+    ready: Sender<Result<ElementwiseMode, EngineError>>,
     jobs: Receiver<Job>,
 }
 
 impl Serve {
     /// Serve jobs on `engine` until the [`AttachGuard`] is dropped.
     pub fn serve(self, engine: &mut dyn Engine) {
-        let _ = self.ready.send(Ok(()));
+        let _ = self.ready.send(Ok(engine.elementwise_mode()));
         let mut ids = Ids::default();
         while let Ok(job) = self.jobs.recv() {
             job(engine, &mut ids);
@@ -1173,6 +1272,7 @@ impl Serve {
 
 struct Attached {
     jobs: Sender<Job>,
+    elementwise: ElementwiseMode,
 }
 
 static ATTACHED: Mutex<Option<HashMap<TtDevice, Attached>>> = Mutex::new(None);
@@ -1225,7 +1325,10 @@ where
     let already = with_attached(|a| match a.entry(device) {
         std::collections::hash_map::Entry::Occupied(_) => true,
         std::collections::hash_map::Entry::Vacant(v) => {
-            v.insert(Attached { jobs: jobs_tx });
+            v.insert(Attached {
+                jobs: jobs_tx,
+                elementwise: ElementwiseMode::Sfpu,
+            });
             false
         }
     });
@@ -1257,7 +1360,10 @@ where
         thread: Some(thread),
     };
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(guard),
+        Ok(Ok(mode)) => {
+            with_attached(|a| a.get_mut(&device).expect("reserved attachment").elementwise = mode);
+            Ok(guard)
+        }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(EngineError("the server thread died before serving".into())),
     }
@@ -1365,6 +1471,14 @@ pub(crate) fn full_reduce(device: TtDevice, values: Vec<f32>, dims: [usize; 2], 
         engine.full_reduce(&values, dims, mean)
     })
     .unwrap_or_else(|e| panic!("native full reduction {dims:?} on {device}: {e}"))
+}
+
+pub(crate) fn elementwise_mode(device: TtDevice) -> ElementwiseMode {
+    with_attached(|a| {
+        a.get(&device)
+            .unwrap_or_else(|| panic!("{device} is not attached"))
+            .elementwise
+    })
 }
 
 /// Does `device`'s engine keep tensors on the device? Asked once per device.
@@ -1833,7 +1947,26 @@ pub struct KmdEngine {
     pub buffers: Option<DramBuffers>,
 }
 
+impl KmdEngine {
+    /// Consuming builder for a factory, before Serve attaches this engine.
+    pub fn with_elementwise_mode(mut self, mode: ElementwiseMode) -> Result<Self, EngineError> {
+        if let Some(buffers) = self.buffers.take() {
+            self.buffers = Some(buffers.with_elementwise_mode(mode));
+        } else if mode != ElementwiseMode::Sfpu {
+            return Err(EngineError(
+                "matrix elementwise requires resident storage".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
 impl Engine for KmdEngine {
+    fn elementwise_mode(&self) -> ElementwiseMode {
+        self.buffers
+            .as_ref()
+            .map_or(ElementwiseMode::Sfpu, DramBuffers::elementwise_mode)
+    }
     fn pool_bf16(
         &mut self,
         a: BufferId,
@@ -2188,6 +2321,17 @@ pub fn kmd_engine(
     route: SrcRoute,
     fidelity: Fidelity,
 ) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
+    kmd_engine_with_elementwise(device, tile, route, fidelity, ElementwiseMode::Sfpu)
+}
+
+/// Silicon factory with an explicit immutable arithmetic selection.
+pub fn kmd_engine_with_elementwise(
+    device: TtDevice,
+    tile: TileChoice,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    elementwise: ElementwiseMode,
+) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
     move |serve| {
         let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
         // Tensors live in GDDR (Phase 9). Bit-identical to the host-staged path
@@ -2246,7 +2390,8 @@ pub fn kmd_engine(
             fidelity,
             budget: 400_000,
             buffers: Some(DramBuffers::default()),
-        };
+        }
+        .with_elementwise_mode(elementwise)?;
         serve.serve(&mut engine);
         if let Some(path) = profile_to {
             let written = engine
@@ -2279,6 +2424,15 @@ pub struct MeshEngine<T: tt_device::Transport> {
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
+    pub fn with_elementwise_mode(self, mode: ElementwiseMode) -> Result<Self, EngineError> {
+        if mode != ElementwiseMode::Sfpu {
+            return Err(EngineError(
+                "matrix elementwise mode is unsupported on mesh engines".into(),
+            ));
+        }
+        Ok(self)
+    }
+
     pub fn new(
         mut fabric: tt_kernels::shard::Fabric<T>,
         route: SrcRoute,
@@ -2739,6 +2893,52 @@ pub fn kmd_mesh_engine(
 #[cfg(test)]
 mod tests {
     use super::refuse_retired_settings;
+
+    #[test]
+    fn arithmetic_mode_is_an_attachment_snapshot_without_per_op_server_queries() {
+        use super::*;
+        struct Mock {
+            mode: ElementwiseMode,
+            queries: Arc<AtomicU64>,
+        }
+        impl Engine for Mock {
+            fn elementwise_mode(&self) -> ElementwiseMode {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.mode
+            }
+            fn matmul(
+                &mut self,
+                _a: &[f32],
+                _b: &[f32],
+                _dims: [usize; 3],
+            ) -> Result<Vec<f32>, EngineError> {
+                Err(unsupported())
+            }
+        }
+        let device = TtDevice::new(u16::MAX);
+        let mode = ElementwiseMode::Matrix {
+            precision: SrcPrecision::Tf32,
+            fidelity: Fidelity::HiFi4,
+        };
+        for mode in [mode, ElementwiseMode::Sfpu] {
+            let queries = Arc::new(AtomicU64::new(0));
+            let q = queries.clone();
+            let guard = attach(device, move |serve| {
+                serve.serve(&mut Mock { mode, queries: q });
+                Ok(())
+            })
+            .unwrap();
+            for _ in 0..3 {
+                assert_eq!(elementwise_mode(device), mode);
+            }
+            assert_eq!(
+                queries.load(Ordering::Relaxed),
+                1,
+                "configuration queries must not serialize queued arithmetic"
+            );
+            drop(guard);
+        }
+    }
 
     #[test]
     fn retired_executor_settings_are_refused_with_what_replaces_them() {

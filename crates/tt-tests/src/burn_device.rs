@@ -46,6 +46,7 @@ pub fn assert_native_model(report: &burn_tt::Report) {
 /// How the device multiplies.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    pub elementwise: burn_tt::ElementwiseMode,
     pub route: SrcRoute,
     pub fidelity: Fidelity,
     /// Simulated cycles per role per run (`tt_kernels::runtime::run`).
@@ -59,6 +60,7 @@ impl Default for Config {
     /// What a training backend runs: TF32 operands, all four fidelity phases.
     fn default() -> Self {
         Config {
+            elementwise: burn_tt::ElementwiseMode::Sfpu,
             route: SrcRoute::Tf32FromFp32,
             fidelity: Fidelity::HiFi4,
             budget: 4_000_000,
@@ -87,6 +89,11 @@ pub fn with_device(config: Config, f: impl FnOnce(TtDevice)) {
 /// build, on silicon cards `0..chips`.
 #[track_caller]
 pub fn with_mesh_device(config: Config, chips: usize, f: impl FnOnce(TtDevice)) {
+    assert_eq!(
+        config.elementwise,
+        burn_tt::ElementwiseMode::Sfpu,
+        "matrix mode is unsupported on mesh engines"
+    );
     if let Err(e) = tt_ttsim::fork_scope(|| {
         let device = TtDevice::new(0);
         let _guard = attach_mesh(device, config, chips)
@@ -178,6 +185,9 @@ fn attach_engine(
         buffers: burn_tt::DramBuffers,
     }
     impl Engine for Sim<'_> {
+        fn elementwise_mode(&self) -> burn_tt::ElementwiseMode {
+            self.config.elementwise
+        }
         fn pool_bf16(
             &mut self,
             a: burn_tt::BufferId,
@@ -483,7 +493,7 @@ fn attach_engine(
         serve.serve(&mut Sim {
             session,
             config,
-            buffers: Default::default(),
+            buffers: burn_tt::DramBuffers::default().with_elementwise_mode(config.elementwise),
         });
         Ok(())
     })
@@ -513,5 +523,11 @@ fn attach_engine(
         None => topology,
     };
     eprintln!("topology: {topology:?}");
-    burn_tt::attach_topology(device, topology, config.route, config.fidelity)
+    burn_tt::attach_topology_with_elementwise(
+        device,
+        topology,
+        config.route,
+        config.fidelity,
+        config.elementwise,
+    )
 }

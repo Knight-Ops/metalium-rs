@@ -39,6 +39,8 @@ pub struct OpStat {
     /// Bytes a host-staged matmul copied to the device and back: operands
     /// that were not resident, per batch element (`ops.rs`'s batched path).
     pub staged: u64,
+    /// Calls dispatched through the explicit matrix elementwise route.
+    pub matrix_eltwise: u64,
     /// The stored `[rows, cols]` of the first tensor this op downloaded.
     pub first_download: Option<[usize; 2]>,
 }
@@ -58,6 +60,7 @@ impl OpStat {
         self.uploads += o.uploads;
         self.uploaded += o.uploaded;
         self.staged += o.staged;
+        self.matrix_eltwise += o.matrix_eltwise;
         self.first_download = self.first_download.or(o.first_download);
     }
 }
@@ -215,6 +218,12 @@ impl Drop for OpGuard {
     }
 }
 
+pub(crate) fn matrix_eltwise() {
+    bump(current().unwrap_or(OUTSIDE), None, |s| {
+        s.matrix_eltwise += 1
+    });
+}
+
 /// A tensor was made, on the device or on the host, inside the current op.
 pub(crate) fn made(on_device: bool) {
     STACK.with(|s| {
@@ -353,6 +362,7 @@ pub fn with_report<R>(f: impl FnOnce() -> R) -> (R, Report) {
             uploads: a.uploads - b.uploads,
             uploaded: a.uploaded - b.uploaded,
             staged: a.staged - b.staged,
+            matrix_eltwise: a.matrix_eltwise - b.matrix_eltwise,
             first_download: if a.downloads > b.downloads {
                 a.first_download
             } else {

@@ -223,6 +223,122 @@ impl<A> Banks<A, Filling> {
     }
 }
 
+/// SrcB addressing within an aligned 8×16 elementwise block.
+/// ELW consumers require both loaded banks and release ownership in their types.
+///
+/// ```compile_fail
+/// use tt_isa::{matrix::{Banks,SrcBroadcast},isa::generated::encode::Elwadd};
+/// let _ = Banks::after_reset().elwadd(Elwadd::ZERO,SrcBroadcast::None);
+/// ```
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum SrcBroadcast {
+    None,
+    Row,
+    Column,
+    Scalar,
+}
+
+impl SrcBroadcast {
+    pub const fn row(self) -> u32 {
+        matches!(self, Self::Row | Self::Scalar) as u32
+    }
+    pub const fn column(self) -> u32 {
+        matches!(self, Self::Column | Self::Scalar) as u32
+    }
+    pub const fn coordinate(self, row: usize, col: usize) -> (usize, usize) {
+        (
+            if self.row() != 0 { 0 } else { row },
+            if self.column() != 0 { 0 } else { col },
+        )
+    }
+}
+
+// The caller supplies addressing/accumulation fields; ownership and broadcast
+// fields are always overwritten by the typed consumer.
+macro_rules! elw_consumer {
+    ($keep:ident, $a:ident, $b:ident, $both:ident, $encoder:ty) => {
+        impl Banks<Loaded, Loaded> {
+            pub fn $keep(
+                self,
+                base: $encoder,
+                broadcast: SrcBroadcast,
+            ) -> Result<(Instruction, Self), EncodeError> {
+                Ok((
+                    base.flip_src_a(0)
+                        .flip_src_b(0)
+                        .broadcast_src_b_row(broadcast.row())
+                        .broadcast_src_b_col0(broadcast.column())
+                        .encode()?,
+                    banks(),
+                ))
+            }
+            pub fn $a(
+                self,
+                base: $encoder,
+                broadcast: SrcBroadcast,
+            ) -> Result<(Instruction, Banks<Empty, Loaded>), EncodeError> {
+                Ok((
+                    base.flip_src_a(1)
+                        .flip_src_b(0)
+                        .broadcast_src_b_row(broadcast.row())
+                        .broadcast_src_b_col0(broadcast.column())
+                        .encode()?,
+                    banks(),
+                ))
+            }
+            pub fn $b(
+                self,
+                base: $encoder,
+                broadcast: SrcBroadcast,
+            ) -> Result<(Instruction, Banks<Loaded, Empty>), EncodeError> {
+                Ok((
+                    base.flip_src_a(0)
+                        .flip_src_b(1)
+                        .broadcast_src_b_row(broadcast.row())
+                        .broadcast_src_b_col0(broadcast.column())
+                        .encode()?,
+                    banks(),
+                ))
+            }
+            pub fn $both(
+                self,
+                base: $encoder,
+                broadcast: SrcBroadcast,
+            ) -> Result<(Instruction, Banks<Empty, Empty>), EncodeError> {
+                Ok((
+                    base.flip_src_a(1)
+                        .flip_src_b(1)
+                        .broadcast_src_b_row(broadcast.row())
+                        .broadcast_src_b_col0(broadcast.column())
+                        .encode()?,
+                    banks(),
+                ))
+            }
+        }
+    };
+}
+elw_consumer!(
+    elwadd,
+    elwadd_release_a,
+    elwadd_release_b,
+    elwadd_release_both,
+    encode::Elwadd
+);
+elw_consumer!(
+    elwsub,
+    elwsub_release_a,
+    elwsub_release_b,
+    elwsub_release_both,
+    encode::Elwsub
+);
+elw_consumer!(
+    elwmul,
+    elwmul_release_a,
+    elwmul_release_b,
+    elwmul_release_both,
+    encode::Elwmul
+);
+
 // --- Matrix Unit consumers -----------------------------------------------------
 
 impl Banks<Loaded, Loaded> {

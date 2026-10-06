@@ -15,7 +15,7 @@ With an engine that keeps tensors in GDDR (`KmdEngine`, and the ttsim engine in
 | Burn op | On the card as |
 |---|---|
 | `float_matmul` | `Session::matmul_dram` (operands may be transposed views) |
-| `float_add` / `sub` / `mul`, `float_mul_scalar` | SFPU element-wise (`tt_kernels::kind`); `add` of a `[1, n]` row broadcasts (`ADD_ROW`) |
+| `float_add` / `sub` / `mul`, `float_mul_scalar` | SFPU by default; explicit matrix mode uses `ELWADD`/`ELWSUB`/`ELWMUL` with RHS row, column or scalar broadcasts |
 | `relu`, `relu_backward` | `RELU`, `RELU_BACKWARD` |
 | `float_sum_dim` / `float_mean_dim` / `float_max_dim` | all F32 axes, including ragged rank-N views; SFPU reductions with native repacking |
 | `float_sum`, `float_mean` (rank one or more) | Native full F32 reduction, bounded column chunks followed by the chunked row sum; mean divides on the SFPU |
@@ -76,6 +76,52 @@ BF16 convolution and scatter accumulate in F32 until the output boundary.
 | `Topology`, `attach_topology` | `Single { card, tile }` or `Cards { .. }`; the one call training code makes. |
 | `Topology::from_env` (`TT_TOPOLOGY`, `"0"` or `"0,1"`), `tiles_from_env` (`TT_TILES`, `n` or `all`) | Environment-driven choice, used by the `tt-tests` silicon harness. |
 | `tensor_traffic`, `device_traffic`, `record_transfers` | PCIe traffic accounting. |
+
+## Explicit matrix elementwise mode
+
+SFPU remains the default. Configure one card before attaching its engine:
+
+```rust,no_run
+use burn_tt::{attach_topology_with_elementwise, ElementwiseMode, Fidelity,
+    SrcPrecision, SrcRoute, Topology, TtDevice};
+let device = TtDevice::new(0);
+let guard = attach_topology_with_elementwise(
+    device, Topology::single(0), SrcRoute::Tf32FromFp32, Fidelity::HiFi4,
+    ElementwiseMode::Matrix { precision: SrcPrecision::Tf32, fidelity: Fidelity::HiFi4 },
+)?;
+# Ok::<(), burn_tt::EngineError>(())
+```
+
+`kmd_engine_with_elementwise` and the consuming
+`KmdEngine::with_elementwise_mode`/`DramBuffers::with_elementwise_mode` builders
+provide the same selection for custom factories. Custom engines expose it through
+`Engine::elementwise_mode`. Attachment snapshots it once; floating arithmetic
+keeps asynchronous dispatch. Mesh opt-in fails explicitly. Configuration cannot
+be changed through an attached engine's public dispatch interface.
+
+Floating add/subtract/multiply and their scalar forms select this route before
+BF16 widening. F32 operands use TF32 or BF16 Src truncation; physical BF16 operands
+stay packed and always use BF16 Src. Scalar BF16 buffers use the standard resident
+BF16 conversion. Outputs accumulate/store F32 and a BF16 result narrows once at
+its output boundary. Integer operations and other families keep their existing
+routing. Equal shapes and RHS row/column/scalar broadcasts are supported, including
+materialized resident views; other stored geometry is refused.
+
+This mode permits reduced precision and the measured matrix special-value
+contract. Add/subtract align at a shared 10-fraction-bit quantum even with BF16 Src;
+TF32 multiply ignores SrcA's last fraction bit. Fidelity changes multiplication
+only. Tested zeros/subnormals normalize to positive zero, tested signed NaNs act
+like signed infinities against finite nonzero values, and opposite infinities
+have non-IEEE outcomes. See `docs/learnings/silicon-operating-notes.md` and step90
+for exact scope and bounds. Native RHS broadcasts read the original tile and
+select its SrcB face/row directly, without an expanded GDDR tensor. Resident
+views still use their existing materialization path. Benchmarks show large
+broadcast improvements but do not justify changing the default.
+
+`OpStat::matrix_eltwise` reports matrix dispatches. The numerical gates and the
+role-stream instruction audit establish execution; this field is not a hardware
+instruction counter. Ttsim covers packed inputs/F32 outputs; its existing PACR
+`0x105` refusal leaves BF16 result narrowing and BF16 Burn gradients silicon-only.
 
 ## New Tensix primitives
 

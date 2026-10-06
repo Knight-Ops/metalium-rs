@@ -329,7 +329,7 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 | `MVMUL`, fidelity phases `Lo`..`HiFi4` | x (measured) | x | x | x | x | done (Phases 6–7) |
 | `ZEROACC`, `ZEROSRC` | x (`ZEROACC` measured) | | x | x | x | -- |
 | `MOVA2D`, `MOVB2D`, `MOVD2A`, `MOVD2B`, `MOVB2A` | x (measured) | `~` (`mova2d`, `movb2d`) | | x | x | F1 |
-| `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured) | | | `~` encoding only | `~` | M1 |
+| `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured BH) | x (`Banks`) | x | x (F32 output) | x both | M1 |
 | `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
 | `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | | x (TF32 Src) | pending | M3 |
 | `DOTPV`, `SHIFTXA`, `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 |
@@ -393,7 +393,7 @@ Pulled in only when a kernel needs them; each says which.
 
 ### Tensix coprocessor instruction implementation checklist
 
-Complete census of all 119 Tensix coprocessor instruction encodings generated into `tt-isa` from the Blackhole/Wormhole specification: 65 are actively driven by kernels, firmware, and runtime (`[x]`); 50 are unutilized in current execution pipelines (`[ ]`); and 4 are deliberately omitted on Blackhole (`[-]`):
+Complete census of all 119 Tensix coprocessor instruction encodings generated into `tt-isa` from the Blackhole/Wormhole specification: 68 are actively driven by kernels, firmware, and runtime (`[x]`); 47 are unutilized in current execution pipelines (`[ ]`); and 4 are deliberately omitted on Blackhole (`[-]`):
 
 #### Matrix Unit (FPU) & Formats (22 instructions)
 - [x] `MVMUL`: Matrix-vector multiply (primary GEMM accumulation engine, `Session::matmul_dram`).
@@ -402,9 +402,9 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [x] `ZEROACC`: Zero accumulator registers in $Dst$.
 - [x] `SETRWC`: Set matrix read/write/column coordinate counters.
 - [x] `INCRWC`: Increment matrix read/write/column coordinate counters.
-- [ ] `ELWADD`: Matrix-unit elementwise addition ($SrcA + SrcB \to Dst$). Item M1.
-- [ ] `ELWSUB`: Matrix-unit elementwise subtraction ($SrcA - SrcB \to Dst$). Item M1.
-- [ ] `ELWMUL`: Matrix-unit elementwise multiplication ($SrcA \times SrcB \to Dst$). Item M1.
+- [x] `ELWADD`: Matrix-unit elementwise addition ($SrcA + SrcB \to Dst$). Item M1.
+- [x] `ELWSUB`: Matrix-unit elementwise subtraction ($SrcA - SrcB \to Dst$). Item M1.
+- [x] `ELWMUL`: Matrix-unit elementwise multiplication ($SrcA \times SrcB \to Dst$). Item M1.
 - [ ] `DOTPV`: Vector-pair dot product on matrix unit. Item M4.
 - [ ] `TRNSPSRCB`: Native hardware matrix transpose of $SrcB$ blocks. Item M3.
 - [ ] `SHIFTXA`: Shift $SrcA$ across lanes. Item M4.
@@ -1347,9 +1347,14 @@ Each names the measurement it must move. The Burn-side ones are in
 
 ### M — Matrix Unit beyond `MVMUL`
 
-- [ ] **M1 `ELWADD`/`ELWSUB`/`ELWMUL`** with `Src` row, column and scalar broadcast: binary
+- [x] **M1 `ELWADD`/`ELWSUB`/`ELWMUL`** with `Src` row, column and scalar broadcast: binary
       element-wise at matrix-unit throughput, at TF32/BF16 `Src` precision. Opt-in, like
-      `Fidelity`; never a silent replacement for the FP32 SFPU path.
+      `Fidelity`; never a silent replacement for the FP32 SFPU path. Typed consumers, explicit Session APIs, immutable single-card Burn opt-in,
+      packed BF16 inputs/F32 accumulation, resident geometry, traces, padding,
+      instruction-stream audit, independent bounds/mutants and release benchmarks
+      are implemented (`step90`). Final both-card targeted gates pass `1791255922`
+      (24/24), full smoke passes `1791255409` (322/322), and release medians are
+      recorded in `1791255969`. Mesh mode is explicitly refused.
 - [~] **M2 `GMPOOL`/`GAPOOL`.** Block max/sum/mean kernels gated on simulator and
       both cards (`step75`). BF16 NCHW average/adaptive pooling uses GAPOOL;
       F32/general max retains SFPU semantics, including resident indices and
@@ -1752,3 +1757,50 @@ slice oracle passes. All five existing MNIST MLP e2e regressions pass in 267.53 
 with the golden unchanged. Workspace default/silicon Clippy, formatting, Burn
 generator and both shipping dependency checks pass. Logs are
 `target/silicon/cnn-{simulator-final,slice-simulator,mlp-regression,clippy-final,default-clippy}.log`.
+
+### M1 matrix elementwise continuation (2026-10-06)
+
+- [x] Typed ELW retaining/releasing consumers and SrcB broadcast enum; generator
+      provenance updated and regenerated without changing measured bit positions.
+- [x] Fixed-size tile streaming kernels, complete ADC/RWC/fidelity setup, F32
+      Dst, final-consumer bank release and program keys containing precision,
+      fidelity, operation, broadcast, packed storage and transport model.
+- [x] Explicit F32/packed BF16 Session APIs; single-card Burn mode is selected
+      before attachment and snapshotted without per-operation server round trips.
+- [x] Independent exact-domain oracle/refusals, exponent alignment probe, finite
+      error budgets and measured special corpus; four safe instruction mutants.
+- [x] All operations/broadcasts/fidelities, ragged poisoned padding, parent views,
+      reductions/matmul consumers, one/two-tile changed-input traces/deferred frees,
+      zero intermediate downloads and analytic gradients; step90 is in SMOKE.
+- [x] Both cards: final targeted acceptance `1791255922` (24/24), including explicit
+      silicon Dst base setup, BF16 analytic gradients, alignment and finite bounds.
+- [x] Release host-timed medians with validation, warmups and dataflow_stats:
+      final baseline `1791255969`, both cards, 192 comparisons; conditions and
+      results are in firmware-performance.md.
+- [x] Workspace tests, default/silicon Clippy, silicon compilation, formatting,
+      all generator checks and both shipping dependency checks pass. Full release
+      smoke `1791255409` passes 322/322 across both cards; final targeted setup
+      passes 24/24. All five MNIST e2e regressions pass with the golden unchanged.
+      Logs: `target/silicon/m1-*.log` (workspace, MNIST, simulator, silicon
+      compilation and final checks).
+
+SFPU remains the default. Ttsim cannot narrow BF16 results (PACR 0x105) or write
+Dst base register 6; these exclusions are documented in ttsim-divergence.md.
+
+### M1 direct RHS broadcast optimization (2026-10-06)
+
+- [x] Remove F32/packed BF16 expanded RHS repacking; B reads original slots with
+      tile/face/RWC selection, checked alignment and existing bank/NC ownership.
+- [x] Simulator step90 11/11 and both-card step90 `1791256564` 22/22, including
+      changed nonconstant RHS trace replay on one/two tiles, all geometries,
+      deferred frees, analytic gradients, views and downstream consumers.
+- [x] Arithmetic gate requires zero staging transfers. Poisoned RHS padding gate
+      expanded to row/column/scalar geometry; both-card `1791256629` passes 2/2.
+- [x] Release comparison `1791256590`, both cards, 192 validated results, two
+      warmups/seven host-timed samples with dataflow_stats. Ragged row multiply
+      ~27× faster F32/~19× BF16 against the initial matrix materialization path;
+      no application speedup claimed. Firmware performance scoreboard updated.
+- [x] Final expanded padding gate and default/silicon workspace Clippy/format
+      checks pass; logs `target/silicon/m1-broadcast-*.log`.
+- [x] All five MNIST e2e regressions pass (267.70 s), golden unchanged;
+      `target/silicon/m1-broadcast-mnist.log`.

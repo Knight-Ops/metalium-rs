@@ -128,6 +128,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add", true);
+        if let Some(output) =
+            crate::ops::matrix_float_op(tt_kernels::kind::ADD, 0.0, &lhs, Some(&rhs))
+        {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -138,6 +143,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_add_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_add_scalar", true);
+        if let Some(output) = crate::ops::matrix_float_op(
+            tt_kernels::kind::ADD,
+            num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
+            &lhs,
+            None,
+        ) {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -193,6 +206,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub", true);
+        if let Some(output) =
+            crate::ops::matrix_float_op(tt_kernels::kind::SUB, 0.0, &lhs, Some(&rhs))
+        {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -203,6 +221,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_sub_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_sub_scalar", true);
+        if let Some(output) = crate::ops::matrix_float_op(
+            tt_kernels::kind::SUB,
+            num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
+            &lhs,
+            None,
+        ) {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -218,6 +244,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul", true);
+        if let Some(output) =
+            crate::ops::matrix_float_op(tt_kernels::kind::MUL, 0.0, &lhs, Some(&rhs))
+        {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);
@@ -228,6 +259,14 @@ impl FloatTensorOps<TtBackend> for TtBackend {
     }
     fn float_mul_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_mul_scalar", true);
+        if let Some(output) = crate::ops::matrix_float_op(
+            tt_kernels::kind::MUL,
+            num_traits::ToPrimitive::to_f64(&rhs).expect("a float scalar") as f32,
+            &lhs,
+            None,
+        ) {
+            return output;
+        }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
         if compute_dtype == burn_backend::DType::BF16 {
             let lhs = crate::ops::float_compute_input(lhs);

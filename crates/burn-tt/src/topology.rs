@@ -13,7 +13,9 @@
 //!   Ethernet, bit-identical to one card, with tensor slots retained in GDDR.
 //!   Other primitives and batched matmuls compute on chip 0.
 
-use crate::server::{attach, kmd_engine, kmd_mesh_engine, AttachGuard, EngineError};
+use crate::server::{
+    attach, kmd_engine_with_elementwise, kmd_mesh_engine, AttachGuard, EngineError,
+};
 use crate::{Fidelity, SrcRoute, TileChoice, TtDevice};
 
 /// The cards behind one [`TtDevice`].
@@ -130,10 +132,31 @@ pub fn attach_topology(
     route: SrcRoute,
     fidelity: Fidelity,
 ) -> Result<AttachGuard, EngineError> {
+    attach_topology_with_elementwise(
+        device,
+        topology,
+        route,
+        fidelity,
+        crate::ElementwiseMode::Sfpu,
+    )
+}
+
+pub fn attach_topology_with_elementwise(
+    device: TtDevice,
+    topology: Topology,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    mode: crate::ElementwiseMode,
+) -> Result<AttachGuard, EngineError> {
+    if matches!(topology, Topology::Cards { .. }) && mode != crate::ElementwiseMode::Sfpu {
+        return Err(EngineError(
+            "matrix elementwise mode is unsupported on mesh engines".into(),
+        ));
+    }
     match topology {
         Topology::Single { card, tile } => attach(
             device,
-            kmd_engine(TtDevice::new(card), tile, route, fidelity),
+            kmd_engine_with_elementwise(TtDevice::new(card), tile, route, fidelity, mode),
         ),
         Topology::Cards {
             cards,
@@ -149,6 +172,21 @@ pub fn attach_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_mesh_opt_in_is_refused_before_attachment() {
+        let result = attach_topology_with_elementwise(
+            TtDevice::new(0),
+            Topology::cards(&[0, 1]),
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            crate::ElementwiseMode::Matrix {
+                precision: crate::SrcPrecision::Tf32,
+                fidelity: Fidelity::HiFi4,
+            },
+        );
+        assert!(matches!(result,Err(e) if e.0.contains("unsupported on mesh")));
+    }
 
     #[test]
     fn one_card_is_single_and_several_are_sharded() {

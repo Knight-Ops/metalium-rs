@@ -135,6 +135,9 @@ pub const SMOKE: &[&str] = &[
     "step87_src_transpose::",
     "step88_mesh_module_reference::",
     "step89_mnist_cnn::",
+    "step90_matrix_eltwise::",
+    "step9_matmul::elw_broadcast_assignment_and_destination_fields",
+    "step9_matmul::elw_oracles_reject_safe_instruction_mutants",
 ];
 
 pub const USAGE: &str = "\

@@ -180,3 +180,66 @@ lifetimes. Both cards pass F32/BF16 changed-MNIST-batch trace comparisons and
 fresh convolution weight equality (`1791252026`). Trace gates explicitly use
 `download_device` to inspect mutable parameter buffers; creation-data caches
 retain the initial values and cannot serve as an oracle for in-place updates.
+
+### Matrix-unit elementwise arithmetic (2026-10-06)
+
+M1 exposes typed retaining/releasing ELW consumers and resident F32/packed BF16
+paths. Step9's broadcast/assignment/nonzero-Dst probes pass both cards
+(`1791253529`); step90's repeated final-consumer bank flips, all RHS broadcasts,
+all four multiplication fidelities, ragged shapes, freed-operand traces on
+one/two tiles, raw parent padding and downstream reductions/matmul pass
+`1791255922` (24/24 including independent instruction mutants, explicit Dst
+base setup and BF16 gradients). Full smoke passes `1791255409` (322/322).
+Final continuation verification is recorded in hardware-coverage.md.
+
+ELWADD/ELWSUB align each operand to a **shared 10-fraction-bit quantum at the
+larger exponent**, with half-up rounding of magnitude in the step90 probe.
+This holds for TF32 and BF16 Src; it is not an FP32 adder contract. The independent
+41-point probe spans exponent differences -20..20. Example: `1 + 2^-11` returns
+`1 + 2^-10`, even though the scalar FP32 sum is exact. Src conversion error plus
+two alignment quanta bounds add/subtract in the normal-domain gate. The exact
+oracle refuses inputs that lose alignment bits. Four multiplication phases
+consume 5/7-bit mantissa slices; SrcA's final TF32 bit is ignored. The finite gate
+adds conversion error, omitted phase products and a worst-case FP32 truncation
+`gamma_8` budget, and separately excludes exceptional/underflowing domains.
+Both cards pass the alignment/bound probes (`1791254333`).
+
+The 17-pair special corpus agrees with ttsim (`1791254100`) for F32 storage with
+TF32/BF16 Src. Tested signed zeros and subnormals pack to +0. Signed quiet NaNs
+against 1 produce signed infinities. `(+inf,-inf)` produces +0 for add and
+multiply, +inf for subtract; `inf*0` is +0. Max finite add/multiply overflow;
+minimum normal times one-half underflows to +0. These observations are pinned
+in step90; arbitrary NaN payloads or all exceptional operand combinations are
+not inferred from this corpus. Packed BF16 specials have their own continuation
+coverage in step90.
+
+Programs declare their three L1 buffers/semaphores with Requirements, establish
+ADCs, formats, RWC/fidelity, Dst offsets/base and bank-release enables, then pack
+F32. Silicon writes `DEST_REGW_BASE_Base=0`; ttsim's existing register-6 refusal
+requires omitting that write on simulated transports (divergence row 21).
+The target distinction is included in the role cache key. The final consumer
+releases both banks once per face, and each tile clears Dst before its eight
+output blocks. Ragged lanes are independent and output padding is undefined;
+downstream repair operates on the result, leaving parent storage/claims intact.
+
+Release performance with validated outputs and dataflow evidence is recorded in
+firmware-performance.md. No mesh route or automatic SFPU replacement is enabled.
+
+### Direct ELW RHS broadcasts (2026-10-06)
+
+The matrix kernel now reads the original RHS tile on B/NoC0. For an output tile
+at `(tr,tc)`, select RHS tile `(0,tc)` for row, `(tr,0)` for column, or `(0,0)` for
+scalar. A face index `f` selects SrcB face `f % 2` for row, `(f / 2) * 2` for
+column, or face 0 for scalar. The math SrcB RWC is zero for row/scalar and the
+current eight-row half for column. SrcA/Dst addressing, precision/fidelity,
+bank handover, NC scatter and padding contracts are unchanged. Reading a whole
+RHS slot keeps checked NoC alignment; only valid broadcast lanes are consumed.
+No expanded RHS GDDR allocation or coordinate transfer is submitted.
+
+All eleven step90 gates pass on simulator and both cards (22/22,
+`1791256564`), including nonconstant row/column/scalar RHS changes during trace
+replay on one/two tiles and F32/packed BF16. The resident arithmetic gate checks
+zero staging transfer packets. Expanded poisoned-padding validation for all
+RHS geometries also passes both cards (`1791256629`, 2/2). Release comparison
+`1791256590` validates all 192 results; detailed medians are in
+firmware-performance.md. No new simulator divergence was observed.

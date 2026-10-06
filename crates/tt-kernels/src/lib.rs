@@ -27,6 +27,7 @@ pub mod l1;
 pub mod link;
 pub mod loops;
 pub mod matmul;
+pub mod matrix_eltwise;
 pub mod profile;
 pub mod program_cache;
 pub mod runtime;

@@ -93,6 +93,8 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 
 | Target | Now | Of ceiling | Goal |
 |---|--:|--:|---|
+| Matrix ELW packed BF16 equal-shape add, 64×64, two tiles, host | 40.2 / 41.9 µs (cards 0 / 1, initial M1) | SFPU adapters 105.1 / 108.6 µs | reduce per-tile dispatch costs; SFPU remains default |
+| Matrix ELW row multiply, 65×70, two tiles, host | F32 41.6 / 42.0 µs; BF16 60.8 / 61.3 µs (cards 0 / 1) | initial materialized RHS F32 ~1129 / 1133 µs; BF16 ~1157 / 1161 µs | hold direct broadcast addressing; reduce per-tile dispatch costs |
 | GDDR6, one tile, 64 KiB entries | 81.4 GB/s | 94% NoC link | hold |
 | GDDR6, one tile, 4 KiB entries | 16.3 GB/s | 26% channel | cut per-entry cost |
 | GDDR6 reads, card, 120 tiles | 469 GB/s | 92% | 512 GB/s |
@@ -698,6 +700,8 @@ Newest first. Run = the `target/silicon/bench/<stamp>` it came from.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-06 | 1791256590 | Direct matrix RHS tile/face/RWC addressing replaces expanded resident RHS materialization. Same M1 release conditions, both cards, two tiles, validated warmups and seven host-timed samples. | Ragged row multiplication: F32 ~1.13 ms → 42 µs (27×), BF16 ~1.16 ms → 61 µs (19×); zero staging transfer packets. Equal-shape paths remain comparable. No MNIST timing claim. |
+| 2026-10-06 | 1791255969 | M1 native matrix ELW add/subtract/multiply; final explicit Dst setup, packed BF16 inputs/F32 accumulation, all RHS broadcasts. Both cards, two tiles, two warmups/seven host-timed samples, validation outside timing. | Equal-shape packed BF16 avoids widening and improves the measured adapter workload; F32 is slower and broadcast materialization dominates. 192 validated comparisons; no universal speedup. Conditions/results below. |
 | 2026-10-05 | 1791160155 (gates) | Final BF16/pooling gates include integer/Boolean casts, analytic norm derivatives, mixed F32-loss SGD, BF16 trace temporary holds, matmul-to-pooling ADC reset, partial ceil windows and exact max-pool zero/NaN value/index selection. | Both cards pass 24/24. Max pooling uses SFPU argmax plus a raw-bit OR fold; the arithmetic gather negative control changed signed zero/NaN payloads and failed. This adds correctness coverage, not a speedup. |
 | 2026-10-05 | 1791158550 | Packed BF16 versus resident F32→TF32 operands for MNIST's 64×784×128 and 64×128×10 forward GEMMs. Both p150a cards, one gate tile, HiFi4, pipeline off, role profiling off, 1350 MHz AICLK, 16000 MT/s GDDR, eight channels, SHA `0d6ba5227fdb+dirty`; one warm-up, nine completed host-timed samples, output validated every run outside timing. | Card 0: TF32 93.964/18.135 us, BF16 661.742/80.840 us. Card 1: TF32 93.102/18.294 us, BF16 663.076/82.012 us. Current per-tile BF16 gather/mask path is slower; storage savings do not establish an MNIST speedup. No full MNIST performance run. Results: `target/silicon/bench/1791158550.{jsonl,md}`. |
 | 2026-10-05 | 1791158962 (gates) | Native BF16 storage/layout/casts, packed MMA, arithmetic adapters, normalization derivatives, F32-loss/BF16 SGD, trace temporary holds and NCHW pooling/backwards. GMPOOL/GAPOOL encodings measure required bit 19 while preserving AddrMod at 15. | Both-card correctness: 22/22. BF16 narrowing refuses pinned ttsim mode `0x105`; those arithmetic gates are silicon-only. Pool window staging remains a coverage path, not a performance optimization. |
@@ -784,3 +788,88 @@ Measured results across all four execution modes on physical hardware:
 - **Combined Fusion + Traced is fastest**: Replaying a fused trace achieves the absolute lowest card execution time (**149.83 us/batch**, down from 156.94 us/batch unfused), saving ~14.5 us per batch in kernel dispatch and L1/DRAM round trips.
 - **Trace eliminates host graph overhead**: While eager fusion incurs modest host client overhead for real-time IR pattern matching (535 us vs 488 us wall time), tracing captures the fused graph *once*. Trace replays run the fused compound hardware kernels (`ADD_RELU`) directly on Blackhole without any runtime IR graph overhead.
 - **Identical numerical outputs**: All four execution modes produce equivalent logits within derived numerical error bounds. Outputs logged under `target/silicon/out/1791257827-*`.
+
+### M1 matrix elementwise comparison (2026-10-06)
+
+Initial M1 run `1791255969`, both p150a cards, two ARC-discovered compute tiles per
+card, release SHA `6d979e7c5606+dirty`. Resident inputs; default streaming/pipeline
+policy, no role timestamp profiling. F32 uses TF32 Src, packed BF16 uses BF16 Src,
+HiFi4 multiplication. Two warmups and seven completed host-timed samples per
+case; dispatch through synchronization is timed, output validation/readback and
+freeing are outside timing. Every run validates its output. Inputs are exactly
+representable constants 2 and 3, isolating execution cost from numerical error.
+Clocks were not independently sampled in this run; this is a baseline under the
+runner's existing card policy. Conditions are in the raw child outputs under
+`target/silicon/out/1791255969-*`; medians, p10/p90 and `dataflow_stats` are in
+`target/silicon/bench/1791255969.{jsonl,md}`. All 192 route/shape/operation/card
+comparisons pass, including ADD/SUB/MUL, equal/row/column/scalar RHS, F32/BF16,
+aligned 64×64 and ragged 65×70. Repeat with
+`cargo xtask bench --device all --filter matrix_vs_sfpu_release_baseline`.
+
+Representative medians (µs); each cell is SFPU / matrix:
+
+| Operation/storage/geometry | Card 0 | Card 1 |
+|---|---:|---:|
+| Add F32, equal 64×64 | 22.181 / 24.626 | 21.891 / 24.826 |
+| Mul F32, equal 64×64 | 21.990 / 24.156 | 21.810 / 24.755 |
+| Add F32, equal 65×70 | 25.817 / 42.269 | 26.198 / 42.248 |
+| Mul F32, equal 65×70 | 25.737 / 41.826 | 25.957 / 41.778 |
+| Add BF16, equal 64×64 | 105.056 / 40.204 | 108.592 / 41.878 |
+| Mul BF16, equal 64×64 | 101.708 / 40.486 | 100.575 / 40.795 |
+| Add BF16, equal 65×70 | 115.233 / 62.516 | 118.339 / 63.067 |
+| Mul BF16, equal 65×70 | 129.600 / 61.384 | 132.274 / 61.663 |
+| Mul F32, RHS row 65×70 | 29.024 / 1128.878 | 29.204 / 1132.564 |
+| Mul BF16, RHS row 65×70 | 97.691 / 1157.330 | 99.054 / 1161.196 |
+
+The BF16 SFPU baseline includes widening both packed operands, SFPU arithmetic,
+and narrowing the result; matrix includes final narrowing only. This comparison
+measures the actual selected packed-storage routes, not isolated instruction
+throughput. F32 matrix is slower here; the initial broadcasts cost roughly 1–3 ms through
+resident coordinate materialization, well above the SFPU broadcast paths. Even
+for equal shapes matrix jobs are bounded to one physical tile, and their fixed
+packet/setup costs are visible: aligned F32 add records 36 batches/18 pack waits
+versus SFPU's 18 batches/0 waits over warmups and samples. BF16 equal add records
+72 batches/36 waits versus the SFPU adapters' 126/54. These counters describe
+scheduler work, not an NC timestamp estimate. SFPU remains the default; this
+baseline establishes a packed BF16 benefit for these equal-shape workloads.
+The broadcast staging cost is addressed in the continuation below; per-tile
+dispatch remains an optimization opportunity.
+
+### Direct matrix RHS broadcast comparison (2026-10-06)
+
+Run `1791256590` repeats the M1 benchmark after removing expanded RHS tensors.
+Both p150a cards, two discovered tiles, release, TF32 Src for F32/BF16 Src for
+packed BF16, HiFi4, resident operands, two warmups/seven samples, default
+streaming policy. Host timing spans dispatch through sync; every output is
+validated outside timing, including packed output narrowing. No NC timestamps
+are used. The raw conditions contain SHA `6d979e7c5606+dirty`; clocks were not
+independently sampled. The MNIST simulator regression ran concurrently on the
+host, so the cross-run ratios are baselines, not an isolated instruction ceiling.
+All 192 ADD/SUB/MUL, geometry, storage and card comparisons pass. Artifacts:
+`target/silicon/bench/1791256590.{jsonl,md}` and raw
+`target/silicon/out/1791256590-*` (same benchmark command as above).
+
+Ragged 65×70 multiplication medians (µs), initial materialized RHS → direct RHS:
+
+| RHS / storage | Card 0 | Card 1 |
+|---|---:|---:|
+| Row / F32 | 1128.878 → 41.605 | 1132.564 → 41.988 |
+| Column / F32 | 1103.410 → 41.958 | 1103.100 → 42.728 |
+| Scalar / F32 | 1137.273 → 41.386 | 1139.826 → 42.218 |
+| Row / BF16 | 1157.330 → 60.793 | 1161.196 → 61.293 |
+| Column / BF16 | 1157.168 → 62.746 | 1166.045 → 61.804 |
+| Scalar / BF16 | 1252.574 → 62.376 | 1255.642 → 62.896 |
+
+Direct broadcasts cost about the same as equal-shape matrix arithmetic now:
+F32 equal multiply 41.186 / 41.978 µs and BF16 60.091 / 61.594 µs. In the new run,
+SFPU row/column/scalar multiply is F32 29.193 / 76.833 / 22.972 µs on card 0
+(28.883 / 77.092 / 22.952 on card 1). Matrix still loses F32 row/scalar, but wins
+this column workload. Packed BF16 matrix beats the widening/narrowing adapters
+in all three measured geometries (card 0 SFPU 123.930 / 154.085 / 93.793 µs;
+card 1 123.758 / 153.684 / 87.412). No application speedup is inferred.
+
+Across warmups and samples, F32 row multiplication staging transfer packets fall
+108 → 0; compute counters remain 18 regions, 81 batches, 63 pack waits. This
+isolates removal of coordinate transfers and expanded GDDR staging while
+preserving the bounded tile scheduler. Resident Burn views may still materialize
+before entering the kernel. SFPU remains the default.

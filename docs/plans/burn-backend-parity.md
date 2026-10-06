@@ -620,3 +620,23 @@ nothing" line in the Definition of done is checked.
    fusion) read tensor *metadata* in a way that a poisoned cell must still satisfy? Shapes
    are known, so likely fine; confirm under the conformance suite with an injected engine
    error.
+
+### M1 matrix elementwise continuation (2026-10-06)
+
+- [x] Explicit `ElementwiseMode::Matrix { precision, fidelity }` before single-card
+      attachment; constructors still default to SFPU. The mode snapshot preserves
+      asynchronous dispatch and does not survive detachment/reattachment.
+- [x] Native floating add/subtract/multiply and scalar dispatch intercept packed
+      BF16 before widening, accumulate in F32 and narrow at the output boundary.
+- [x] Equal-shape and RHS row/column/scalar geometry, resident views, ragged
+      padding, trace holds and deferred frees; unsupported geometry/mesh mode
+      fails explicitly. Integer and other operation families retain routing.
+- [x] Step90 records matrix dispatches, audits actual role instructions and checks
+      native arithmetic/analytic gradients with no intermediate downloads.
+- [x] Final continuation acceptance is recorded in hardware-coverage.md: both-card
+      targeted gates 24/24, full smoke 322/322, release baseline `1791255969`,
+      workspace/Clippy/generator/shipping checks and unchanged MNIST golden.
+
+Benchmarks and matrix numerical/special-value contracts are in the learnings
+files. The opt-in permits reduced Src/alignment precision; no universal speedup
+or IEEE special-value behavior is promised.
