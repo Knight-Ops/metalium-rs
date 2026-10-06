@@ -628,10 +628,14 @@ name = "burn-tt"
 version = "0.1.0"
 dependencies = [
  "burn-backend",
+ "burn-fusion",
+ "burn-ir",
+ "burn-std",
  "burn-tensor",
  "libc",
  "num-traits",
  "rand 0.10.3",
+ "serde",
  "tt-device",
  "tt-firmware-images",
  "tt-isa",

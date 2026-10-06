@@ -542,6 +542,103 @@ impl QTensorPrimitive for TtQTensor {
     }
 }
 
+impl TtTensor {
+    pub(crate) fn reshaped(self, shape: Shape) -> Self {
+        if self.shape() == shape {
+            self
+        } else {
+            crate::ops::reshaped(self, shape)
+        }
+    }
+}
+
+impl TtQTensor {
+    pub(crate) fn reshaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
+    }
+}
+
+#[cfg(feature = "fusion")]
+#[derive(Clone, Debug)]
+pub enum TtHandle {
+    Tensor(TtTensor),
+    Quantized(TtQTensor),
+}
+
+#[cfg(feature = "fusion")]
+impl From<TtTensor> for TtHandle {
+    fn from(t: TtTensor) -> Self {
+        TtHandle::Tensor(t)
+    }
+}
+
+#[cfg(feature = "fusion")]
+impl From<TtQTensor> for TtHandle {
+    fn from(q: TtQTensor) -> Self {
+        TtHandle::Quantized(q)
+    }
+}
+
+#[cfg(feature = "fusion")]
+impl burn_ir::BackendIr for crate::TtBackend {
+    type Handle = TtHandle;
+
+    fn float_tensor(
+        handle: burn_ir::TensorHandle<Self::Handle>,
+    ) -> burn_backend::tensor::FloatTensor<Self> {
+        match handle.handle {
+            TtHandle::Tensor(t) => t.reshaped(handle.shape),
+            _ => panic!("expected float tensor handle"),
+        }
+    }
+
+    fn int_tensor(
+        handle: burn_ir::TensorHandle<Self::Handle>,
+    ) -> burn_backend::tensor::IntTensor<Self> {
+        match handle.handle {
+            TtHandle::Tensor(t) => t.reshaped(handle.shape),
+            _ => panic!("expected int tensor handle"),
+        }
+    }
+
+    fn bool_tensor(
+        handle: burn_ir::TensorHandle<Self::Handle>,
+    ) -> burn_backend::tensor::BoolTensor<Self> {
+        match handle.handle {
+            TtHandle::Tensor(t) => t.reshaped(handle.shape),
+            _ => panic!("expected bool tensor handle"),
+        }
+    }
+
+    fn quantized_tensor(
+        handle: burn_ir::TensorHandle<Self::Handle>,
+    ) -> burn_backend::tensor::QuantizedTensor<Self> {
+        match handle.handle {
+            TtHandle::Quantized(q) => q.reshaped(handle.shape),
+            _ => panic!("expected quantized tensor handle"),
+        }
+    }
+
+    fn float_tensor_handle(tensor: burn_backend::tensor::FloatTensor<Self>) -> Self::Handle {
+        TtHandle::Tensor(tensor)
+    }
+
+    fn int_tensor_handle(tensor: burn_backend::tensor::IntTensor<Self>) -> Self::Handle {
+        TtHandle::Tensor(tensor)
+    }
+
+    fn bool_tensor_handle(tensor: burn_backend::tensor::BoolTensor<Self>) -> Self::Handle {
+        TtHandle::Tensor(tensor)
+    }
+
+    fn quantized_tensor_handle(
+        tensor: burn_backend::tensor::QuantizedTensor<Self>,
+    ) -> Self::Handle {
+        TtHandle::Quantized(tensor)
+    }
+}
+
 /// How a tensor of `shape` is laid out on the device: the matrix
 /// `[product of the leading dimensions, last dimension]`, rank 1 as one row.
 /// Row-major order is the same either way, so a reshape that keeps this

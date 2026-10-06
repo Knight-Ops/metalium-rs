@@ -1063,7 +1063,7 @@ fn swapped_view(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor>
 /// it there; else `host`'s, on the host copy -- sharing the source's
 /// device-copy slot where there is none yet, so a bias reshaped every forward
 /// pass is uploaded once.
-fn reshaped(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
+pub(crate) fn reshaped(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
     let same =
         tensor.stored().is_some() && tensor.stored() == crate::tensor::stored_dims(&shape.to_vec());
     if let Some(d) = tensor.dram().filter(|d| !d.transposed) {
@@ -1304,6 +1304,22 @@ pub mod float {
     // Within one ulp of Flex's correctly rounded quotient, not bit for bit:
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
+
+    /// Compound fused addition and ReLU (`relu(lhs + rhs)`) executed in a single SFPU pass.
+    pub fn float_add_relu(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(
+            tt_kernels::sfpu::ops::kind_sfpu::ADD_RELU,
+            0.0,
+            &lhs,
+            Some(&rhs),
+        ) {
+            return t;
+        }
+        super::activation::relu(float_add(lhs, rhs))
+    }
 
     /// `atan2(lhs, rhs)` on the device where the data is, within
     /// `ops::ATAN2_BOUND`, a denormal operand read as a zero of its sign; else
