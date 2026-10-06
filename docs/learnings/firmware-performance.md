@@ -4,6 +4,42 @@ This is the reference for how fast the firmware is: the data mover, the
 B → T0/T1/T2 path, and E1. After each optimization, run `cargo xtask bench`, update
 the Scoreboard rows it moved, and add a line to the Change log.
 
+## Native operation baselines, 2026-10-05
+
+Run `1791235277`, card 0, two Tensix tiles, release, SHA
+`83729d294e06+dirty`. Resident operands, two warmups, seven host-timed samples;
+timing includes dispatch, synchronization and final output download, with output
+validation outside timing. These are operation baselines, not comparative speedups.
+
+| Operation | Shape/conditions | Median (us) | p10/p90 (us) |
+|---|---|---:|---:|
+| Checked I32 division | [37,70] / 3 | 397.496 | 391.495 / 404.820 |
+| F32 average pooling | [1,1,9,10], kernel 4×8 | 391.053 | 385.114 / 404.509 |
+| F32 Conv2D | x [1,1,9,10], w [2,1,2,2] | 274.258 | 268.246 / 278.776 |
+| F32 attention | Q [1,1,3,32], K/V sequence 64 | 186.376 | 185.745 / 191.133 |
+
+Artifacts: `target/silicon/bench/1791235277.{md,jsonl}`; benchmark source
+`silicon_bench_tensix_ops.rs`. BF16 and distributed baselines are recorded below.
+
+## BF16 and mesh operation baselines, 2026-10-05
+
+Run `1791239400`, release SHA `83729d294e06+dirty`, resident operands, two
+warmups/seven samples. Single card 0 uses one Tensix tile; the mesh uses cards
+0+1 with one tile per card. Host timing includes dispatch through final readback;
+validation is outside timing. Every mesh case checks positive product counts on
+both cards and acknowledged Ethernet bytes. Packed mesh transport remains deferred.
+
+| Storage / cards | Conv2D median us (p10/p90) | Attention median us (p10/p90) |
+|---|---:|---:|
+| BF16 / 0 | 3140.697 (3105.041 / 3145.897) | 457.967 (449.772 / 462.185) |
+| F32 / 0+1 | 2791.860 (2762.157 / 2818.321) | 565.325 (564.574 / 569.132) |
+| BF16 / 0+1 | 3303.418 (3296.014 / 3317.463) | 838.079 (829.765 / 842.718) |
+
+Conv2D: x [1,64,2,3], w [64,64,1,1]. Attention: Q [1,1,3,64], K/V [1,1,64,64].
+The earlier single-card F32 baselines use smaller shapes and two tiles; these
+rows cannot establish a mesh speedup. Artifacts:
+`target/silicon/bench/1791239400.{jsonl,md}` (the JSONL retains both condition records).
+
 ## Packed BF16 update, 2026-10-05
 
 Run `1791162075`, card 0 p150a, one Tensix, release, SHA
@@ -711,3 +747,21 @@ warm each shape/route/fidelity, report medians with host timing and
 `dataflow_stats`, and record run IDs. Compare new general reductions with the
 existing matrix-axis paths and forced K blocks with unsplit products where
 they fit; include `[64,8192] @ [8192,64]` and fresh/traced execution.
+
+
+### Convolutional MNIST application observation (2026-10-06)
+
+Run `1791252065`, isolated release runner, card 0, one discovered Tensix tile,
+TF32 Src/F32 storage/HiFi4, native `tt_mnist::cnn::Cnn` (938 parameters): Conv2D
+1→8, 5×5 stride 4, ReLU, average pool 2×2, Linear 72→10. One epoch of 59,968
+resident images, batch 64, 937 SGD steps at lr 0.1; all 10,000 test images.
+Native accuracy 78.60%, Flex 78.66%; first/final-100-step-mean losses
+2.301632/0.595991 versus 2.301627/0.595428. Training wall time including model/data
+preload and one scalar loss per step, excluding accuracy evaluation:
+226.410 ms/step native versus 1.040 ms/step Flex. This is one full learning run,
+with no warmups or repeated median; simulator regressions and builds ran
+concurrently on the host. It establishes working classification and an initial
+cost, not a controlled acceleration comparison. Current per-datum patch/overlap
+metadata and many small dispatches make fresh CNN training expensive; no
+performance improvement is claimed. Outputs and logs are under
+`target/silicon/out/1791252065-*` and `target/silicon/cnn-full-epoch.log`.

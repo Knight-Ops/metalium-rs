@@ -127,6 +127,14 @@ pub const SMOKE: &[&str] = &[
     "step79_extremum_scans::",
     "step80_integer_reductions::",
     "step81_hardware_rounding::",
+    "step82_integer_division::",
+    "step83_attention::",
+    "step84_slice_assignment::",
+    "step85_convolution::",
+    "step86_resident_indices::",
+    "step87_src_transpose::",
+    "step88_mesh_module_reference::",
+    "step89_mnist_cnn::",
 ];
 
 pub const USAGE: &str = "\

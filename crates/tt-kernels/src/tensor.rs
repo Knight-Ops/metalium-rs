@@ -2066,20 +2066,14 @@ fn sfpu_divide(
     b: Option<&DramTensor>,
     bcast: crate::sfpu::ops::Broadcast,
 ) -> Result<Work> {
-    // Keep the experimental builder for diagnosis, but do not expose an
-    // execution path until packed status flags pass simulator and silicon.
-    const DOMAIN_FLAGS_VALIDATED: bool = false;
-    if !DOMAIN_FLAGS_VALIDATED {
-        return Err(TensorError::Shape(
-            "integer division/remainder disabled: domain flags await validation".into(),
-        ));
-    }
     use crate::sfpu::{
         kernel,
         ops::{self, Broadcast},
     };
     use tt_isa::dm::op as mover;
-    let layout = kernel::plan_layout(1, kernel::Operands::Binary)
+    // Reserve C as an independent status buffer through Requirements. The
+    // actual unary/binary role signature never gathers or unpacks a C input.
+    let layout = kernel::plan_layout(1, kernel::Operands::Ternary)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (operands, code) = ops::code2(op.kind, [op.scalar, op.scalar2]).expect("integer division");
     let (roles, loops) = kernel::roles_code_validated(&layout, operands, &code, true);
@@ -2090,7 +2084,8 @@ fn sfpu_divide(
     let ra = a.tensor_ref().encode();
     let rb = b.map(|t| t.tensor_ref().encode());
     let ro = out.tensor_ref().encode();
-    let b_at = layout.b_at.expect("packed domain flags");
+    let b_at = layout.b_at.expect("divisor operand");
+    let flags_at = layout.c_at.expect("declared domain status slots");
     let mut jobs = Vec::new();
     for tile in 0..rt * ct {
         let read = |at: u64, flags: u32, reference: [[u32; 8]; 2]| {
@@ -2153,7 +2148,7 @@ fn sfpu_divide(
                 entries: vec![
                     [
                         mover::CHECK_FLAGS,
-                        b_at as u32,
+                        flags_at as u32,
                         (a.rows - tile / ct * 32).min(32) as u32,
                         (a.cols - tile % ct * 32).min(32) as u32,
                         0,
@@ -3378,11 +3373,28 @@ pub fn repack(
     sources: &[[usize; 2]],
     [rows, cols]: [usize; 2],
 ) -> Result<Work> {
+    let mapping: Vec<_> = sources.iter().copied().map(|at| (0, at)).collect();
+    repack_many(alloc, &[t], &mapping, [rows, cols])
+}
+
+/// Assemble raw datums from multiple resident tensors using static geometry.
+pub fn repack_many(
+    alloc: &mut DramAlloc,
+    inputs: &[&DramTensor],
+    sources: &[(usize, [usize; 2])],
+    [rows, cols]: [usize; 2],
+) -> Result<Work> {
     use tt_isa::dm::{face_index, op, TILE_DATA};
-    if rows == 0
+    let t = inputs
+        .first()
+        .ok_or_else(|| TensorError::Shape("repack has no inputs".into()))?;
+    if inputs.iter().any(|x| x.elem != t.elem)
+        || rows == 0
         || cols == 0
         || rows.checked_mul(cols) != Some(sources.len())
-        || sources.iter().any(|&[r, c]| r >= t.rows || c >= t.cols)
+        || sources
+            .iter()
+            .any(|&(i, [r, c])| inputs.get(i).is_none_or(|x| r >= x.rows || c >= x.cols))
     {
         return Err(TensorError::Shape("invalid native repack mapping".into()));
     }
@@ -3398,12 +3410,13 @@ pub fn repack(
     let mut jobs = Vec::new();
     for i in 0..rt {
         for j in 0..ct {
-            let mut tiles = std::collections::BTreeMap::<usize, Vec<(usize, usize)>>::new();
+            let mut tiles =
+                std::collections::BTreeMap::<(usize, usize), Vec<(usize, usize)>>::new();
             for r in 0..32.min(rows - i * 32) {
                 for c in 0..32.min(cols - j * 32) {
-                    let [sr, sc] = sources[(i * 32 + r) * cols + j * 32 + c];
+                    let (source, [sr, sc]) = sources[(i * 32 + r) * cols + j * 32 + c];
                     tiles
-                        .entry(sr / 32 * t.grid()[1] + sc / 32)
+                        .entry((source, sr / 32 * inputs[source].grid()[1] + sc / 32))
                         .or_default()
                         .push((face_index(sr % 32, sc % 32), face_index(r, c)));
                 }
@@ -3443,7 +3456,8 @@ pub fn repack(
                     ],
                 });
             };
-            for (tile, mut words) in tiles {
+            for ((source, tile), mut words) in tiles {
+                let t = inputs[source];
                 words.sort_unstable();
                 let src = t.tile(tile / t.grid()[1], tile % t.grid()[1]);
                 let read_src = [

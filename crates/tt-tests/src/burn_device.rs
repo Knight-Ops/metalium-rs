@@ -365,6 +365,31 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.copy_blocks(&mut self.session, a, moves, dims)
         }
+        fn zeros_dram(
+            &mut self,
+            dims: [usize; 2],
+            elem: tt_kernels::tensor::Elem,
+            bf16: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.zeros(&mut self.session, dims, elem, bf16)
+        }
+        fn gather_indexed(
+            &mut self,
+            input: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .gather_indexed(&mut self.session, input, indices)
+        }
+        fn repack_many(
+            &mut self,
+            inputs: &[burn_tt::BufferId],
+            sources: &[(usize, [usize; 2])],
+            dims: [usize; 2],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers
+                .repack_many(&mut self.session, inputs, sources, dims)
+        }
         fn gather_rows(
             &mut self,
             sources: &[burn_tt::BufferId],

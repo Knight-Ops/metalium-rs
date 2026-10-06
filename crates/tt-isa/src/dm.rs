@@ -128,7 +128,11 @@ const _: () = assert!(QUEUE_SLOTS + QUEUE_LEN as u64 * 4 <= WRITE_NOC);
 /// owns (`crate::dram::DramChannel::port_for`), so no endpoint ever sees both
 /// NoCs.
 pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
-const _: () = assert!(WRITE_NOC + 4 <= MAILBOX_BASE + 0x100);
+/// Completed trace chunks (wrapping), including nested retained streams.
+/// Unlike queue completion, this advances during a long `CALL`. Only completed
+/// work counts: a stalled read or kernel must not refresh the host watchdog.
+pub const TRACE_PROGRESS: u64 = MAILBOX_BASE + 0xE4;
+const _: () = assert!(TRACE_PROGRESS + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {
@@ -184,6 +188,11 @@ pub mod op {
     /// writes a result: `[CHECK_FLAGS, slot, rows, cols, 0, ...]`.
     /// Only valid logical lanes are checked; zero reports DOMAIN.
     pub const CHECK_FLAGS: u32 = 0x48;
+    /// B selects one datum per row using resident I32 indices. All three slots
+    /// are in L1: `[INDEX_PICK, indices, source, output, bound, first, rows,
+    /// datum_bytes]`. Source holds a 32-column chunk beginning at `first`.
+    /// Indices outside `0..bound` report DOMAIN before any indexed access.
+    pub const INDEX_PICK: u32 = 0x49;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
@@ -506,6 +515,15 @@ pub enum Transform {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
+    IndexPick {
+        indices: u32,
+        source: u32,
+        output: u32,
+        bound: u32,
+        first: u32,
+        rows: u32,
+        bytes: u32,
+    },
     CopyWords {
         src: u32,
         dst: u32,
@@ -642,6 +660,39 @@ impl Entry {
                 src_stride: w[4],
                 dst_stride: w[5],
                 halfwords: width == 2,
+            });
+        }
+        if w[0] == op::INDEX_PICK {
+            if w[4] == 0
+                || w[4] > i32::MAX as u32
+                || w[5] >= w[4]
+                || w[5] % 32 != 0
+                || w[6] == 0
+                || w[6] > 32
+                || !matches!(w[7], 2 | 4)
+            {
+                return Err(error::LENGTH);
+            }
+            for (at, len) in [
+                (w[1], TILE_SLOT),
+                (w[2], if w[7] == 2 { BF16_TILE_SLOT } else { TILE_SLOT }),
+                (w[3], if w[7] == 2 { BF16_TILE_SLOT } else { TILE_SLOT }),
+            ] {
+                if at % 64 != 0
+                    || (at as u64) < crate::l1::DATA.base
+                    || at as u64 + len > crate::l1::DATA.end
+                {
+                    return Err(error::ALIGNMENT);
+                }
+            }
+            return Ok(Self::IndexPick {
+                indices: w[1],
+                source: w[2],
+                output: w[3],
+                bound: w[4],
+                first: w[5],
+                rows: w[6],
+                bytes: w[7],
             });
         }
         if w[0] == op::RELEASED {
@@ -974,6 +1025,50 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_index_selection_checks_every_slot_and_geometry() {
+        use super::*;
+        let at = crate::l1::DATA.base as u32;
+        for bytes in [2, 4] {
+            let valid = [
+                op::INDEX_PICK,
+                at,
+                at + 0x1040,
+                at + 0x2080,
+                35,
+                32,
+                32,
+                bytes,
+            ];
+            assert!(matches!(
+                Entry::decode(0xff, valid),
+                Ok(Entry::IndexPick { .. })
+            ));
+            for (field, value) in [
+                (4, 0),
+                (4, i32::MAX as u32 + 1),
+                (5, 35),
+                (5, 1),
+                (6, 0),
+                (6, 33),
+                (7, 1),
+            ] {
+                let mut invalid = valid;
+                invalid[field] = value;
+                assert_eq!(Entry::decode(0xff, invalid), Err(error::LENGTH));
+            }
+            for field in 1..=3 {
+                let mut invalid = valid;
+                invalid[field] += 1;
+                assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
+                invalid[field] = crate::l1::DATA.end as u32 - 64;
+                assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
+            }
+        }
+        assert!(Mover::B.permits(op::INDEX_PICK));
+        assert!(!Mover::NC.permits(op::INDEX_PICK));
+    }
+
     #[test]
     fn local_word_copies_are_checked_and_reader_owned() {
         use super::*;

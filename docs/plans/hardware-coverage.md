@@ -4,7 +4,10 @@ Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
 for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
 extremum scans, hardware precision modes, accuracy results and remaining work.
-Checked integer division/remainder is disabled after a failing simulator gate.
+Checked integer division/remainder and axis mean now pass `step82` in ttsim;
+card-0 silicon validation passes (`1791232718`). Native attention, ragged F32
+batches and distributed batched products pass `step83` simulator and silicon gates; the full tranche remains open.
+See the continuation acceptance checklist in `tensix-next-features.md`.
 Ordinary validation uses one card; both cards are reserved for actual mesh tests
 or device-specific investigations per the user's instruction. Historical two-card
 requirements below are superseded for ordinary validation.
@@ -104,7 +107,10 @@ round/floor/ceil/trunc and saturating F32-to-I32 (NaN to zero). These use raw-bi
 SFPU programs, not SFPSTOCHRND's bounded sign-magnitude modes. Existing I32-to-F32
 conversion is preserved. `step73_fpu_transpose` gates the typed, non-flipping
 TRNSPSRCB helper on TF32 Src data against a permutation oracle and its inverse.
-Its encoding retains Wormhole provenance; tensor integration is not enabled.
+The signed BF16 zero-transpose control, transpose and inverse also pass both
+cards (`1791233413`, 4/4); ttsim fails the BF16 copy control, so it is silicon-only.
+Its encoding retains Wormhole provenance. Step87 now gates explicit 16×16 Src
+transpose and TF32 matmul preparation; raw tensor materialization stays on copies.
 
 All new gates belong to SMOKE. Wrong product padding, omitted scan carry,
 incorrect multiplication high bits and wrong rounding mode were each watched
@@ -232,7 +238,7 @@ there is no backend fallback or exact mode.
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` general F32 reductions/scans and norm compositions pass both cards; pooling implemented; Tensix tensor transpose remains open |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; integer division/remainder and tensor transpose remain open |
-| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native NCHW pooling/backwards; convolution and attention open |
+| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native pooling, resident indexing, F32/BF16 convolution/attention and gradients; general Src tensor transpose and ND indexing remain partial |
 | 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[ ]` |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
@@ -384,6 +390,135 @@ Pulled in only when a kernel needs them; each says which.
 - `[-]` **PCIe DMA engines.** No register-level documentation (open question 5);
   residency makes bulk transfer a startup cost.
 - `[-]` **A GDB stub over the debug interface.** No Blackhole bit layouts (open question 2).
+
+### Tensix coprocessor instruction implementation checklist
+
+Complete census of all 119 Tensix coprocessor instruction encodings generated into `tt-isa` from the Blackhole/Wormhole specification: 65 are actively driven by kernels, firmware, and runtime (`[x]`); 50 are unutilized in current execution pipelines (`[ ]`); and 4 are deliberately omitted on Blackhole (`[-]`):
+
+#### Matrix Unit (FPU) & Formats (22 instructions)
+- [x] `MVMUL`: Matrix-vector multiply (primary GEMM accumulation engine, `Session::matmul_dram`).
+- [x] `GAPOOL`: General average pooling (drives BF16 pooling in `crates/tt-kernels/src/fpu.rs`).
+- [x] `MOVA2D`: Move $SrcA \to Dst$ (used in BF16 format widening and datapath staging).
+- [x] `ZEROACC`: Zero accumulator registers in $Dst$.
+- [x] `SETRWC`: Set matrix read/write/column coordinate counters.
+- [x] `INCRWC`: Increment matrix read/write/column coordinate counters.
+- [ ] `ELWADD`: Matrix-unit elementwise addition ($SrcA + SrcB \to Dst$). Item M1.
+- [ ] `ELWSUB`: Matrix-unit elementwise subtraction ($SrcA - SrcB \to Dst$). Item M1.
+- [ ] `ELWMUL`: Matrix-unit elementwise multiplication ($SrcA \times SrcB \to Dst$). Item M1.
+- [ ] `DOTPV`: Vector-pair dot product on matrix unit. Item M4.
+- [ ] `TRNSPSRCB`: Native hardware matrix transpose of $SrcB$ blocks. Item M3.
+- [ ] `SHIFTXA`: Shift $SrcA$ across lanes. Item M4.
+- [ ] `SHIFTXB`: Rotate $SrcB$ row across matrix registers. Item M4.
+- [ ] `MOVD2A`: Matrix register copy $Dst \to SrcA$.
+- [ ] `MOVD2B`: Matrix register copy $Dst \to SrcB$.
+- [ ] `MOVB2A`: Matrix register copy $SrcB \to SrcA$.
+- [ ] `MOVB2D`: Matrix register copy $SrcB \to Dst$.
+- [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
+- [ ] `ZEROSRC`: Clear source registers $SrcA$ / $SrcB$.
+- [ ] `CLEARDVALID`: Invalidate $Dst$ scoreboard without writing zeroes.
+- [ ] `CLREXPHIST`: Clear exponent history for Block Float (`BFP8`/`BFP4`) support. Item D2.
+- [ ] `GATESRCRST`: Gate source reset.
+
+#### Vector Unit (SFPU) (40 instructions)
+- [x] `SFPADD`: Lanewise floating-point addition/subtraction.
+- [x] `SFPMUL`: Lanewise floating-point multiplication.
+- [x] `SFPMAD`: Lanewise multiply-accumulate (primary driver for polynomial transcendental fits).
+- [x] `SFPARECIP`: Approximate reciprocal and exponential seed.
+- [x] `SFPMOV`: Register move and negation.
+- [x] `SFPIADD`: 32-bit two's-complement integer addition/subtraction.
+- [x] `SFPMUL24`: 24-bit integer multiplication (used for 32-bit full product reconstruction).
+- [x] `SFPABS`: Floating-point and integer absolute value.
+- [x] `SFPSETSGN`: Set sign bit or absolute value.
+- [x] `SFPGT`: Compare greater-than (signed integer and floating-point total order).
+- [x] `SFPLE`: Compare less-than-or-equal.
+- [x] `SFPLZ`: Test zero / non-zero or count leading zeros.
+- [x] `SFPSETCC`: Set condition codes from sign, zero, or comparison.
+- [x] `SFPENCC`: Enable or disable conditional execution scopes.
+- [x] `SFPPUSHC`: Push condition flags onto SIMD flag stack.
+- [x] `SFPCOMPC`: Complement condition flags for SIMD `else` branches.
+- [x] `SFPPOPC`: Pop condition flags from SIMD flag stack.
+- [x] `SFPAND`: 32-bit lanewise bitwise AND.
+- [x] `SFPOR`: 32-bit lanewise bitwise OR.
+- [x] `SFPXOR`: 32-bit lanewise bitwise XOR.
+- [x] `SFPNOT`: 32-bit lanewise bitwise NOT.
+- [x] `SFPSHFT`: In-lane 32-bit logical and arithmetic shifts.
+- [x] `SFPSHFT2`: Cross-lane lane rotation and shuffling (drives row reductions).
+- [x] `SFPTRANSP`: Cross-lane $4\times 4$ matrix transpose within columns.
+- [x] `SFPLOAD`: Load from $Dst$ into vector registers ($LReg$).
+- [x] `SFPSTORE`: Store from vector registers ($LReg$) into $Dst$.
+- [x] `SFPLOADI`: Load 16-bit or 32-bit immediates into vector registers.
+- [x] `SFPSETEXP`: Set floating-point exponent field.
+- [x] `SFPSETMAN`: Set floating-point mantissa field.
+- [x] `SFPEXEXP`: Extract floating-point exponent field.
+- [x] `SFPEXMAN`: Extract floating-point mantissa field.
+- [x] `SFPCONFIG`: Configure SFPU constant registers (`LReg[11..15]`).
+- [x] `SFPSTOCHRND`: Hardware nearest, stochastic, and toward-zero rounding (validated in `step81`).
+- [x] `SFPNOP`: Vector unit pipeline no-op.
+- [ ] `SFPLOADMACRO`: Silicon macro loader (bundles $Dst$ load with up to 4 scheduled vector micro-ops). Item S9.
+- [ ] `SFPDIVP2`: Lanewise power-of-2 division/multiplication via exponent modification.
+- [ ] `SFPSWAP`: Lanewise simultaneous min/max register swap.
+- [ ] `SFPADDI`: Vector addition with baked 16-bit BF16 immediate.
+- [ ] `SFPMULI`: Vector multiplication with baked 16-bit BF16 immediate.
+- [ ] `SFPLUT` / `SFPLUTFP32`: Fast hardware lookup-table polynomial interpolation. Item S10.
+
+#### Unpackers & Packers (16 instructions)
+- [x] `UNPACR_Regular`: Streaming unpack from L1 to $SrcA$, $SrcB$, or $Dst$.
+- [x] `PACR`: Streaming pack from $Dst$ to L1 with hardware format conversion/narrowing.
+- [x] `SETADC`: Set address counter registers for 4D tile coordinates.
+- [x] `SETADCXX`: Set address counter XX channel.
+- [x] `SETADCXY`: Set address counter XY channel.
+- [x] `SETADCZW`: Set address counter ZW channel.
+- [ ] `INCADCXY`: Increment address counter XY channel.
+- [ ] `INCADCZW`: Increment address counter ZW channel.
+- [ ] `ADDRCRXY`: Add relative coordinate offset to ADC XY.
+- [ ] `ADDRCRZW`: Add relative coordinate offset to ADC ZW.
+- [ ] `SETDVALID`: Manually override destination valid scoreboard bits.
+- [ ] `REG2FLOP_ADC`: Load configuration directly into ADC execution flops.
+- [ ] `UNPACR_NOP_SETDVALID`: Unpacker micro-mode setting DVALID.
+- [ ] `UNPACR_NOP_SETREG`: Unpacker micro-mode setting configuration registers.
+- [ ] `UNPACR_NOP_ZEROSRC`: Unpacker micro-mode zeroing source registers.
+- [ ] `PACR_SETREG`: Packer set register micro-mode.
+
+#### Frontend, Synchronization & Expanders (10 instructions)
+- [x] `REPLAY`: Hardware micro-op execution buffer for unrolled loops (Item X1).
+- [x] `MOP` / `MOP_CFG`: Macro-op instruction expander templates (Item X2).
+- [x] `SEMWAIT`: Wait on hardware semaphore between threads.
+- [x] `SEMPOST`: Post hardware semaphore to signaling unit.
+- [x] `SEMINIT`: Initialize hardware semaphores.
+- [x] `SEMGET`: Query hardware semaphore counter.
+- [x] `STALLWAIT`: Hardware pipeline barrier (blocks until unit execution drains).
+- [x] `NOP`: General backend pipeline bubble.
+- [ ] `STREAMWAIT`: Wait on hardware stream overlay.
+- [ ] `STREAMWRCFG`: Stream overlay configuration write.
+
+#### Backend Configuration (7 instructions)
+- [x] `WRCFG`: 32-bit and 128-bit backend configuration writes.
+- [x] `SETC16`: Direct 16-bit thread configuration writes.
+- [ ] `RDCFG`: Read backend configuration words to GPR.
+- [ ] `CFGSHIFTMASK`: In-place shift-and-mask on backend configuration words.
+- [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
+
+#### DMA Engine, Atomics & Registers (20 instructions)
+- [ ] `ATCAS`: Atomic Compare-and-Swap on L1 memory.
+- [ ] `ATGETM`: Atomic mutex acquire.
+- [ ] `ATRELM`: Atomic mutex release.
+- [ ] `ATSWAP`: Atomic swap on L1.
+- [ ] `ATINCGET`: Atomic fetch-and-increment on L1.
+- [ ] `ATINCGETPTR`: Atomic fetch-and-increment pointer on L1.
+- [ ] `ADDDMAREG`: Add to DMA register.
+- [ ] `SUBDMAREG`: Subtract from DMA register.
+- [ ] `MULDMAREG`: Multiply DMA register.
+- [ ] `CMPDMAREG`: Compare DMA register.
+- [ ] `SHIFTDMAREG`: Shift DMA register.
+- [ ] `BITWOPDMAREG`: Bitwise operation on DMA register.
+- [ ] `FLUSHDMA`: Flush DMA engine pipeline.
+- [ ] `LOADIND`: Indirect register-indexed load.
+- [ ] `STOREIND_L1`: Indirect store into L1 memory.
+- [ ] `STOREIND_MMIO`: Indirect store into Tensix MMIO space.
+- [ ] `LOADREG`: Indirect register load.
+- [ ] `STOREREG`: Indirect register store.
+- [ ] `XMOV`: Direct L1-to-register moves bypassing unpackers. Item D4.
+- [ ] `DMANOP`: DMA pipeline synchronization no-op.
 
 ---
 
@@ -1305,8 +1440,13 @@ Each names the measurement it must move. The Burn-side ones are in
       Dedicated forward/backward, layout and residency gates are in `step70`;
       both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
       Performance measurements remain open. Fusion is deferred.
-- [ ] **R4 `ModuleOps::attention`.** Matmul, scale, mask, softmax, matmul -- after R2 and
-      the fusion work in Phase 9.
+- [~] **R4 `ModuleOps::attention`.** Native QKᵀ, scale, positive softcap,
+      bottom-right causal/broadcast masks, bias, NaN-safe softmax and V products.
+      F32/BF16 forward, Q/K/V/bias gradients, resident training, large-K permuted
+      views and one/two-tile replay pass step83. Actual two-card products and
+      all gradients match single-card references (step88, `1791249486`), with
+      nonzero Q/K gradients on both partitions. Mesh trace capture remains unsupported.
+
 
 ### D — Formats and data movement
 
@@ -1365,32 +1505,28 @@ Each names the measurement it must move. The Burn-side ones are in
   - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
         format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
         measured beside the block-float ones `QTensorOps` needs.
-- [~] **D4 Indexing on the B mover.** Done (2026-10-03): `gather` and
-      `scatter_add` along the last dimension with one index per row (a loss's
-      targets) as SFPU compositions -- the row masked to `-0` and summed (exact
-      but for a gathered `-0`, returned `+0`: the SFPU sum's signed zero, row
-      C), `x + v` selected where the column is the index (exact);
-      `select`/`select_add` along dimension 0 and `embedding` and its backward
-      (Burn's default compositions) on the mover: `tensor::gather_rows` moves
-      each row's two 64-byte face-rows into an output tile with plain `READ`s
-      (every face-row is `TILE_DATA` mod 64, so the C64 read rule holds for any
-      row), `tensor::write_rows` writes rows in place with 64-byte `WRITE`s,
-      and `Session::rows_add` adds by index in Flex's order touching only the
-      indexed rows. Gates: `step61_burn_gather` (Flex bit for bit, residency;
-      watched failing with the mask inverted), `step62_gather_rows` (watched
-      failing with the face halves swapped and the rounds reversed); ttsim and
-      both cards. Measured: a lookup's list is two entries a row a tile
-      column, written over PCIe -- 0.3 ms for 128 rows of 64; a record
-      carrying the row indices would cut the bytes ~18x. Open: general
-      `gather` (several indices per row, other dims), unaligned `slice`,
-      `slice_assign`, `cat`, `repeat_dim`, `expand`, `flip`.
+- [~] **D4 Indexing on the B mover.** Current contract (2026-10-06): resident
+      arbitrary-axis multi-index gather/select preserves raw F32/BF16/I32/Bool
+      bits; B validates logical indices before accesses. Duplicate scatter and
+      select updates retain logical order: F32 accumulation with final BF16
+      narrowing, wrapping I32 addition and Boolean OR. Embedding and backward
+      compose these primitives without index downloads. Stepped slice assignment,
+      cat/repeat, expand and flip are native. Steps84/86 cover payloads, domains,
+      repeated indices, device-produced indices and changed-input trace replay;
+      both cards pass (`1791249159`). Historical step61/62 one-index/row routes
+      are superseded by this general geometry. ND gather/scatter remains open.
 - [~] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
       Mover `TILIZE`/`UNTILIZE`, `Session::set_tilize` and `TT_TILIZE=card`
       are implemented and gated (`step58_tile_layout`), but slower than
       host tilize at the measured sizes. Host tilize remains the default.
       Unpacker/Tensix tilize and direct reads from caller memory remain open.
-- [ ] **D6 Convolution.** `conv2d` as im2col on the mover plus the existing matmul, then
-      its three backwards, `conv1d`, `conv_transpose2d`, `unfold4d`.
+- [~] **D6 Convolution.** Bounded native im2col/matmul and deterministic col2im
+      implement grouped/depthwise conv2d, conv1d, transposed 1D/2D and unfold4d,
+      including all gradients and dilation/output padding. F32/BF16 uses F32
+      continuation and final narrowing. Step85 covers analytic/Flex oracles,
+      large K, ragged/permuted views, resident training and one/two-tile traces;
+      step88 matches all distributed gradients to single-card references
+      (`1791249486`). Conv3D/deformable convolution remain excluded.
 
 ---
 
@@ -1405,7 +1541,7 @@ path today, `~` when only some shapes do.
 
 | Methods | Device | Item |
 |---|:-:|---|
-| `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; batched over tile-aligned blocks (views included); else host-staged | P1b |
+| `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; direct aligned batches or native ragged materialization (views/broadcast included); new ragged F32 path simulator-gated | P1b |
 | `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
 | `float_sum_dim` | all F32 axes/layouts on SFPU; both-card validated; BF16 via native adapters | R1 |
 | `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
@@ -1434,10 +1570,11 @@ path today, `~` when only some shapes do.
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
 | `float_cummin`, `float_cummax` | | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
-| `float_gather`, `float_scatter_add` | `~` last dim, one index per row (SFPU; gather's `-0` returned `+0`) | D4 |
-| `float_select`, `float_select_add` | `~` dim 0 (mover rows; `select_add` in Flex's order) | D4 |
+| `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
+| `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
-| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_gather_nd`, `float_scatter_nd`, `float_unfold` | | D4, M3 |
+| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_unfold` | `~` native raw copies/compositions, step84/85 | D4, M3 |
+| `float_gather_nd`, `float_scatter_nd` | | D4 |
 | `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
 
 ### `ActivationOps`
@@ -1457,10 +1594,10 @@ path today, `~` when only some shapes do.
 |---|:-:|---|
 | `linear` and its three backwards | `~` over `float_matmul`; a rank-N input folds its batch into the rows (forward, `x` grad), `linear_{weight,bias}_backward` hand-written likewise | B6 |
 | `embedding{,_backward}` | x (Burn's default over `select`/`select_add`, on the mover) | D4 |
-| `conv1d`, `conv2d`, `conv_transpose*`, their backwards, `unfold4d` | | D6 |
+| `conv1d`, `conv2d`, `conv_transpose2d`, their backwards, `unfold4d` | `~` native F32/BF16, grouped/ragged/dilated forward/backward, trace/training/mesh gates; acceptance open | D6 |
 | `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | x NCHW 2-D and Burn's 1-D compositions; all-padding windows refused; BF16 averages use GAPOOL | M2 |
 | `layer_norm` | x Burn composition over native primitives; F32 and BF16 numerical/gradient gates | R3 |
-| `attention` | | R4 |
+| `attention` | `~` native F32/BF16 scale/softcap/masks/bias, zero masked rows, gradients/training, large-K views and replay; both-card forward/all-gradient references (`1791249486`) | R4 |
 | `conv3d`, `deform_conv2d`, `interpolate`, `ctc_loss`, `rfft`/`irfft` | | not planned until a model needs them |
 
 ### `IntTensorOps`, `BoolTensorOps`, `QTensorOps`
@@ -1470,7 +1607,8 @@ path today, `~` when only some shapes do.
 | storage on the device | x `I32`, `Bool` (any store); other int dtypes host | D3 |
 | `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*` | x I32 full-width wrapping ALU, signed comparisons, masked shifts; both-card validated | S5 |
-| `int_{div,remainder}{,_scalar}`, `int_neg`, `int_abs` | | S5 |
+| `int_{div,remainder}{,_scalar}`, `int_mean_dim` | `~` checked native I32, simulator/card-0 validated (`1791232718`) | S5 |
+| `int_neg`, `int_abs` | Burn compositions over native wrapping ALU | S5 |
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
 | `int_cast` | | S6 |
@@ -1478,7 +1616,7 @@ path today, `~` when only some shapes do.
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
 | `bool_mask_*` | | S5 |
-| indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | | D4 |
+| indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | `~` resident arbitrary-axis gather/select, stepped slices/assignment/cat/repeat, I32 wrapping and Boolean OR updates; ND indexing remains open | D4 |
 | `QTensorOps` | | D2 (stays Flex's until then) |
 
 ---
@@ -1540,3 +1678,77 @@ same commit as the code:
 
 **Order inside 10.0.** X3 (so S1's gain is measured on the device), F0, F1, F2 with X1, F5,
 F3, F4, S1, F6.
+
+### Static copy and convolution continuation (2026-10-05)
+
+`step84`: raw multi-source slice assignment, native empty initialization and
+composed cat/repeat preserve F32/BF16/I32/Bool values and slice gradients in
+ttsim and both cards (`1791233990`, 6/6). Resident dynamic indexing is covered by step86 below.
+`step85`: grouped/depthwise Conv2D, Conv1D composition, transposed Conv2D,
+unfold and gradients pass initial independent simulator and both-card gates
+(`1791234267`). Card-0 F32/BF16 traces, resident BF16 training and actual two-card
+forward/gradient tests pass (`1791234542`). BF16 boundaries narrow once from F32.
+`step86` validates resident arbitrary-axis gather/select, duplicate float additions,
+DOMAIN refusal and changed-index traces on both cards (`1791235065`). Broader
+numerical, mutant, large-K and format/layout acceptance remains open.
+
+Additional continuation gates: forced ragged K=3609 (113 tiles, plan asserts K
+is split) checks convolution forward and all gradients on both cards
+(`1791235857`, 22/22 full step85 selections). A fractional permuted input matches
+external Flex under an independently derived operand/phase accumulation bound;
+BF16 attention replays changed V across ragged heads/sequences on two tiles. Both
+cards pass these additions (`1791235944`, 4/4). Reversed convolution kernel-column
+and shifted resident-index mutants were observed failing simulator oracles.
+
+`step87` validates explicit 16×16 Src transpose, special values and changed-input
+traces; eligible TF32 matmul preparation matches the native raw-copy reference on
+both cards (`1791239869`). M3 remains partial because this route normalizes zero
+and subnormal payloads. GMPOOL ArgMax's packed path returns no index bits on both
+cards (`1791240702`), so exact max/indices stays SFPU. `step88` directly compares
+F32/BF16 module forward/all gradients against a single-card reference while
+requiring arithmetic and Ethernet activity on both cards.
+
+Step86 typed updates now include I32 wrapping scatter/select-add and Boolean
+scatter/select-OR. I32 overflow/duplicates, canonical Boolean updates and
+changed-device-index two-tile replay pass both cards (`1791249159`). Slot/geometry
+decode checks have an independent unit gate; dynamic domain checks precede datum
+addressing. The same run validates large-K permuted attention and F32/BF16
+transposed-Conv1D/unfold backward.
+
+
+### Final continuation verification (2026-10-06)
+
+The updated isolated release smoke selection passes **288/288** on cards 0 and 1
+(run `1791250791`), including step82–88, one/two-tile changed-input traces,
+resident training, checked domains and actual distributed forward/backward
+products. Direct single-card/mesh comparisons cover F32/BF16 outputs and all
+module gradients; the attention case has nonzero Q/K contributions on both
+partitions and acknowledged Ethernet traffic.
+
+The full default workspace run including doctests passes
+(`target/silicon/tranche-workspace-final.log`). Final default/silicon workspace
+Clippy, separate RISC-V firmware Clippy, formatting, silicon no-run compilation,
+all three generator checks and both shipping dependency checks pass
+(`target/silicon/tranche-checks-final.log`). The five MNIST e2e regressions pass
+in 264.20 s with the golden unchanged
+(`target/silicon/tranche-mnist-current.log`). Release operation baselines and
+conditions are recorded in `docs/learnings/firmware-performance.md`; no speedup
+guarantee is made. M3 remains partial for the measured Src payload-conversion
+limit; ND indexing and excluded convolution/attention variants are not closed.
+
+
+Convolutional application coverage (2026-10-06): `tt-mnist --model cnn` shares
+its Conv2D/ReLU/AvgPool/Linear model with step89. F32/BF16 MNIST learning,
+convolution SGD updates, scalar-only training downloads and changed-batch trace
+identity on one/two tiles pass both cards (`1791252026`). Native integer/Boolean
+slicing and strided swaps are extended for resident label/view preparation;
+packed BF16 parameter copying closes the training-capture storage-format gap.
+
+
+CNN continuation final verification: card 1 passes 15/15 slicing/index/CNN
+selections (`1791252326`), and card 0 passes the same 15/15 (`1791252404`).
+Restored step89 simulator learning/replay gates pass; the new permuted I32/Bool
+slice oracle passes. All five existing MNIST MLP e2e regressions pass in 267.53 s
+with the golden unchanged. Workspace default/silicon Clippy, formatting, Burn
+generator and both shipping dependency checks pass. Logs are
+`target/silicon/cnn-{simulator-final,slice-simulator,mlp-regression,clippy-final,default-clippy}.log`.

@@ -21,6 +21,7 @@ pub mod code;
 pub mod datapath;
 pub mod dm;
 pub mod fpu;
+mod index;
 pub mod kind;
 pub mod l1;
 pub mod link;

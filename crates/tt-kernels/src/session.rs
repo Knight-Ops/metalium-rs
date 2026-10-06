@@ -2048,6 +2048,17 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    pub(crate) fn repack_bf16_padded_into(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+        sources: &[Option<[usize; 2]>],
+        output: &crate::bf16::Bf16Tensor,
+        padding: u16,
+    ) -> Result<(), TensorError> {
+        let jobs = crate::bf16::repack_padded_into(input, sources, output, padding)?;
+        self.submit_jobs(jobs, RESET_BUDGET)
+    }
+
     /// General BF16 FPU windows, grouped into sixteen columns and continued
     /// over sixteen-datum blocks. Results remain F32 until the caller casts.
     pub fn bf16_pool_windows(
@@ -2146,6 +2157,18 @@ impl<T: Transport> Session<T> {
         op: crate::fpu::PoolOp,
     ) -> Result<DramTensor, TensorError> {
         let work = crate::fpu::block(&mut self.dram_state()?.alloc, tensor, op)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Transpose a resident 16x16 F32-storage face through an explicit Src
+    /// conversion. This operation truncates operands according to `route`;
+    /// raw tensor copies and payload-preserving transpose use repack instead.
+    pub fn transpose_src_block(
+        &mut self,
+        tensor: &DramTensor,
+        route: SrcRoute,
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::fpu::transpose_block(&mut self.dram_state()?.alloc, tensor, route)?;
         self.execute(work, RESET_BUDGET)
     }
 
@@ -3662,6 +3685,26 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
+    /// Copy logical BF16 payloads into an existing allocation, without conversion.
+    /// Parameter-update traces use this to retain the original buffer identity.
+    pub fn copy_into_bf16(
+        &mut self,
+        src: &crate::bf16::Bf16Tensor,
+        dst: &crate::bf16::Bf16Tensor,
+    ) -> Result<(), TensorError> {
+        if [src.rows, src.cols] != [dst.rows, dst.cols] {
+            return Err(TensorError::Shape("BF16 copy_into shapes differ".into()));
+        }
+        let count = src
+            .rows
+            .checked_mul(src.cols)
+            .ok_or_else(|| TensorError::Shape("BF16 copy_into shape overflow".into()))?;
+        let sources: Vec<_> = (0..count)
+            .map(|i| Some([i / src.cols, i % src.cols]))
+            .collect();
+        self.repack_bf16_padded_into(src, &sources, dst, 0)
+    }
+
     /// Repack logical source coordinates into a new matrix on the card.
     /// Preserves bits and leaves ragged output padding undefined.
     pub fn repack(
@@ -3673,6 +3716,95 @@ impl<T: Transport> Session<T> {
         let work = tensor::repack(&mut self.dram_state()?.alloc, t, sources, dims)?;
         let out = self.execute(work, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Copy raw datums from multiple resident inputs using logical geometry.
+    pub fn repack_many(
+        &mut self,
+        inputs: &[&DramTensor],
+        sources: &[(usize, [usize; 2])],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        let work = tensor::repack_many(&mut self.dram_state()?.alloc, inputs, sources, dims)?;
+        let out = self.execute(work, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Initialize physically packed BF16 zeros using replayable native fills.
+    pub fn zeros_bf16(&mut self, dims: [usize; 2]) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) = crate::bf16::zeros(&mut self.dram_state()?.alloc, dims)?;
+        if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
+    /// Raw resident selection from a matrix with at most 32 logical rows.
+    pub fn gather_indexed(
+        &mut self,
+        input: &DramTensor,
+        indices: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        let out = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, input.rows, 1, input.elem)?;
+        let result = crate::index::jobs(
+            &input.placement,
+            indices,
+            &out.placement,
+            [input.rows, input.cols],
+            4,
+        )
+        .and_then(|jobs| self.submit_jobs(jobs, RESET_BUDGET));
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        out.set_pad(tensor::Pad::Zero);
+        Ok(out)
+    }
+
+    pub fn gather_indexed_bf16(
+        &mut self,
+        input: &crate::bf16::Bf16Tensor,
+        indices: &DramTensor,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let out = crate::bf16::Bf16Tensor {
+            rows: input.rows,
+            cols: 1,
+            placement: self
+                .dram_state()?
+                .alloc
+                .alloc_slots(input.rows.div_ceil(32), tt_isa::dm::BF16_TILE_SLOT)?,
+        };
+        let result = crate::index::jobs(
+            &input.placement,
+            indices,
+            &out.placement,
+            [input.rows, input.cols],
+            2,
+        )
+        .and_then(|jobs| self.submit_jobs(jobs, RESET_BUDGET));
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
+    pub fn repack_many_bf16(
+        &mut self,
+        inputs: &[&crate::bf16::Bf16Tensor],
+        sources: &[(usize, [usize; 2])],
+        dims: [usize; 2],
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) =
+            crate::bf16::repack_many(&mut self.dram_state()?.alloc, inputs, sources, dims)?;
+        if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
         Ok(out)
     }
 
@@ -3927,6 +4059,16 @@ impl<T: Transport> Session<T> {
         // Before any padding fill: an integer tensor is refused untouched.
         a.expect("a matmul", tensor::Elem::F32)?;
         b.expect("a matmul", tensor::Elem::F32)?;
+        // A single-face TF32 operand has a validated Src transpose route.
+        // Conversion is already required by this product; arbitrary storage
+        // transpose and physically packed BF16 remain raw-copy operations.
+        if b_transposed && [b.rows, b.cols] == [16, 16] && route == SrcRoute::Tf32FromFp32 {
+            let prepared = self.transpose_src_block(b, route)?;
+            let result =
+                self.matmul_dram(a, a_transposed, &prepared, false, route, fidelity, budget);
+            let _ = self.free(prepared);
+            return result;
+        }
         let need = tensor::MatmulPadding;
         let ca = self.meet(a, need.requires(0))?;
         let cb = match self.meet(b, need.requires(1)) {

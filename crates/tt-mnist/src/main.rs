@@ -141,6 +141,7 @@ struct Init {
     layers: Vec<(TensorData, TensorData)>,
     act: Act,
     dtype: DType,
+    cnn: Option<tt_mnist::cnn::Init>,
 }
 
 fn init(hidden: &[usize]) -> Init {
@@ -171,6 +172,7 @@ fn init(hidden: &[usize]) -> Init {
         layers,
         act: Act::Relu,
         dtype: DType::F32,
+        cnn: None,
     }
 }
 
@@ -198,6 +200,35 @@ impl<B: Backend> Mlp<B> {
             }
         }
         x
+    }
+}
+
+/// Both classifiers use the same optimizer, resident dataset and trace paths.
+#[derive(Module, Debug)]
+struct Classifier<B: Backend> {
+    mlp: Option<Mlp<B>>,
+    cnn: Option<tt_mnist::cnn::Cnn<B>>,
+}
+
+impl<B: Backend> Classifier<B> {
+    fn new(init: &Init, device: &B::Device) -> Self {
+        match &init.cnn {
+            Some(cnn) => Self {
+                mlp: None,
+                cnn: Some(tt_mnist::cnn::Cnn::new(cnn, init.dtype, device)),
+            },
+            None => Self {
+                mlp: Some(Mlp::new(init, device)),
+                cnn: None,
+            },
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        match &self.cnn {
+            Some(cnn) => cnn.forward(x),
+            None => self.mlp.as_ref().expect("MLP classifier").forward(x),
+        }
     }
 }
 
@@ -236,7 +267,7 @@ fn train<B: AutodiffBackend>(
     report: impl Fn(usize, f32),
 ) -> Run {
     let t0 = Instant::now();
-    let mut model = Mlp::<B>::new(init, device);
+    let mut model = Classifier::<B>::new(init, device);
     let mut optim = SgdConfig::new().init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
     let samples = train.n - train.n % BATCH;
@@ -275,8 +306,9 @@ fn train<B: AutodiffBackend>(
 
     let model = model.valid();
     let mut right = 0usize;
-    for from in (0..test.n).step_by(1000) {
-        let m = 1000.min(test.n - from);
+    let eval_batch = if init.cnn.is_some() { BATCH } else { 1000 };
+    for from in (0..test.n).step_by(eval_batch) {
+        let m = eval_batch.min(test.n - from);
         let x = Tensor::<B::InnerBackend, 2>::from_data(
             TensorData::new(
                 test.images[from * PIXELS..(from + m) * PIXELS].to_vec(),
@@ -330,7 +362,7 @@ fn train_traced(
     };
 
     let t0 = Instant::now();
-    let model = Mlp::<Autodiff<TtBackend>>::new(init, device);
+    let model = Classifier::<Autodiff<TtBackend>>::new(init, device);
     let mut optim = SgdConfig::new().init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
     let samples = train_split.n - train_split.n % BATCH;
@@ -349,7 +381,7 @@ fn train_traced(
             train_split.images[..BATCH * PIXELS].to_vec(),
             [BATCH, PIXELS],
         ),
-        (device, init.dtype),
+        device,
     );
     let y0 = labels::<Autodiff<TtBackend>>(train_split, 0, BATCH, device);
     let xp = primitive_float(x0.clone());
@@ -357,7 +389,7 @@ fn train_traced(
 
     let t0_train = Instant::now();
     let (traced_step, first_loss) = TracedTrainingStep::capture(&[&xp, &yp], || {
-        let loss = loss_fn.forward(model.forward(x0).cast(FloatDType::F32), y0);
+        let loss = loss_fn.forward(model.forward(x0.cast(init.dtype)).cast(FloatDType::F32), y0);
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         let new_model = optim.step(LR, model.clone(), grads);
         let updates = collect_parameter_updates(&model, &new_model);
@@ -378,7 +410,7 @@ fn train_traced(
             if step == 1 && from == 0 {
                 continue;
             }
-            let x_data = train_split.images[from..from + BATCH * PIXELS].to_vec();
+            let x_data = train_split.images[from * PIXELS..(from + BATCH) * PIXELS].to_vec();
             let y_data: Vec<u32> = train_split.labels[from..from + BATCH]
                 .iter()
                 .map(|&l| i32::from(l) as u32)
@@ -400,8 +432,9 @@ fn train_traced(
     // Accuracy evaluation on test set using the in-place trained model
     let valid_model = model.valid();
     let mut right = 0usize;
-    for from in (0..test_split.n).step_by(1000) {
-        let m = 1000.min(test_split.n - from);
+    let eval_batch = if init.cnn.is_some() { BATCH } else { 1000 };
+    for from in (0..test_split.n).step_by(eval_batch) {
+        let m = eval_batch.min(test_split.n - from);
         let x = Tensor::<TtBackend, 2>::from_data(
             TensorData::new(
                 test_split.images[from * PIXELS..(from + m) * PIXELS].to_vec(),
@@ -471,7 +504,7 @@ fn infer<B: Backend>(
     passes: usize,
     device: &B::Device,
 ) -> Infer {
-    let model = Mlp::<B>::new(init, device);
+    let model = Classifier::<B>::new(init, device);
     let t0 = Instant::now();
     let n = test.n - test.n % batch;
     let images: Tensor<B, 2> = Tensor::from_data(
@@ -536,7 +569,7 @@ fn infer_traced(
         TensorPrimitive::Float(p) => p,
         _ => unreachable!("a float tensor"),
     };
-    let model = Mlp::<TtBackend>::new(init, device);
+    let model = Classifier::<TtBackend>::new(init, device);
     let t0 = Instant::now();
     let n = test.n - test.n % batch;
     let x: Tensor<TtBackend, 2> = Tensor::from_data(
@@ -696,6 +729,7 @@ struct Args {
     activation: Act,
     /// `--model transformer`: the general-model benchmark instead of MNIST.
     transformer: bool,
+    cnn: bool,
     bf16: bool,
     /// `--train-trace`: train with hardware trace (capture step 0 and replay subsequent steps).
     train_trace: bool,
@@ -727,7 +761,7 @@ usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [-
   --passes P    rounds over the test set (default 3)
   --activation A  the hidden layer's activation: relu (default), leaky-relu,
                 gelu, tanh, sigmoid, silu, hard-sigmoid
-  --model M     mnist (default), or transformer: a small Burn transformer
+  --model M     mnist (default), cnn (Conv2D/ReLU/AvgPool/Linear), or transformer: a small Burn transformer
                 (embedding, pre-norm encoder layer, Linear head) trained S
                 steps (default 50) on the card and on burn-flex, with the
                 time per step of each and burn-tt's per-op report";
@@ -744,6 +778,7 @@ fn args() -> Result<Args, String> {
         passes: 3,
         activation: Act::Relu,
         transformer: false,
+        cnn: false,
         bf16: false,
         train_trace: false,
         hidden: vec![512, 256],
@@ -797,13 +832,25 @@ fn args() -> Result<Args, String> {
                         "--activation {v}: not one of the choices\n\n{USAGE}"
                     ))?;
             }
-            "--model" => {
-                a.transformer = match value()?.as_str() {
-                    "mnist" => false,
-                    "transformer" => true,
-                    v => return Err(format!("--model {v}: not mnist or transformer\n\n{USAGE}")),
+            "--model" => match value()?.as_str() {
+                "mnist" => {
+                    a.transformer = false;
+                    a.cnn = false;
                 }
-            }
+                "cnn" => {
+                    a.transformer = false;
+                    a.cnn = true;
+                }
+                "transformer" => {
+                    a.transformer = true;
+                    a.cnn = false;
+                }
+                v => {
+                    return Err(format!(
+                        "--model {v}: not mnist, cnn or transformer\n\n{USAGE}"
+                    ))
+                }
+            },
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
@@ -868,13 +915,18 @@ fn main() {
         total += prev * CLASSES + CLASSES;
         total
     };
-    println!("tt-mnist: a {layers_str} network ({param_count} parameters) learning MNIST, in Rust, on Tenstorrent Blackhole");
-    println!("  device   {cards}");
-    println!(
-        "  model    Burn nn::Linear x{} + {}, cross-entropy, SGD lr {LR}, batch {BATCH}",
-        a.hidden.len() + 1,
-        a.activation.name()
-    );
+    if a.cnn {
+        println!("tt-mnist: CNN, Conv2D 1→8 (5×5, stride 4), ReLU, AvgPool 2×2, Linear 72→10 ({} parameters), SGD lr {LR}, batch {BATCH}", tt_mnist::cnn::PARAMETERS);
+        println!("  device   {cards}");
+    } else {
+        println!("tt-mnist: a {layers_str} network ({param_count} parameters) learning MNIST, in Rust, on Tenstorrent Blackhole");
+        println!("  device   {cards}");
+        println!(
+            "  model    Burn nn::Linear x{} + {}, cross-entropy, SGD lr {LR}, batch {BATCH}",
+            a.hidden.len() + 1,
+            a.activation.name()
+        );
+    }
 
     let t0 = Instant::now();
     let (train_split, test_split) = mnist();
@@ -886,6 +938,7 @@ fn main() {
     );
     let init = Init {
         act: a.activation,
+        cnn: a.cnn.then(tt_mnist::cnn::Init::default),
         dtype: if a.bf16 { DType::BF16 } else { DType::F32 },
         ..init(&a.hidden)
     };

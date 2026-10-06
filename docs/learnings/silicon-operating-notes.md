@@ -88,3 +88,95 @@ DMA never completed (`nvme nvme0: I/O tag 28 QID 0 timeout` → `Identify Contro
 immediately. A DRAM-less controller doing Host Memory Buffer DMA through an emulated
 vIOMMU under VFIO is fragile. Unrelated to the cards, but it cost an hour of
 misattribution.
+
+**Sandbox device visibility is not hardware discovery.** On 2026-10-05, the
+workspace sandbox exposed no `/dev/tenstorrent` directory. The elevated isolated
+runner accessed both installed cards and passed all 11 integer/attention gates
+(run `1791232718`): ordinary gates on card 0, mesh forward on cards 0 and 1.
+When device nodes are missing inside this sandbox, retry the authorized isolated
+runner with elevated access before concluding hardware is unavailable.
+
+### BF16 Src transpose control (2026-10-05)
+
+`step73` passed signed BF16 unpack→MOVB2D with zero transposes, one
+TRNSPSRCB and its inverse on both cards, run `1791233413` (4/4). The same
+zero-transpose control fails in ttsim; see its divergence record. This validates
+the probe's Src conversion/permutation, not a bit-preserving tensor transpose.
+`step81` also rejected a deliberate Nearest→TowardZero mode mutant
+(`1791233262`) and passed after restoration (`1791233389`).
+
+### Bounded pooling and raw multi-source copies (2026-10-05)
+
+Both cards pass reusable packed BF16 average staging and bounded F32 window
+batches, including changed-input two-tile traces after consumed partial frees:
+`1791233597`, 18/18. GMPOOL flushes signed zero/subnormal inputs to +0 and
+compares signed NaNs by exponent/mantissa magnitude (`1791233808`, 2/2), rather
+than Burn's first-NaN/index semantics. General max pooling keeps its SFPU route.
+Raw multi-source copies preserve BF16/F32 NaN payloads, signed zeros and
+subnormals in slice assignment, composed cat/repeat and parent views; I32/Bool
+and analytic gradients pass too (`1791233990`, 6/6).
+
+### Long trace watchdog progress (2026-10-05)
+
+Resident embedding/select-add expands transformer training into thousands of
+retained descriptors. The previous host watchdog treated one entire replay
+`CALL` as one queue completion and timed out in ttsim after 50 million cycles
+despite ongoing device work (step40, queued list 4922, last finished 4923).
+A dedicated mover `TRACE_PROGRESS` word advances only after a retained chunk
+finishes, including nested streams. The host samples it when the ordinary
+no-progress budget expires and resets the budget only if it advanced; reads and
+kernels that stall cannot refresh it. The previously failing step40 transformer
+training replay passes in ttsim (136.32 s) and isolated card-0 silicon
+(`1791235705`, 1/1). Queue/error publication and completion semantics are unchanged.
+
+Convolution's reversed-kernel-column mutant and resident selection's shifted
+source-column mutant both fail their independent simulator oracles; logs are
+`target/silicon/step85-mutant-reversed-kernel-column.log` and
+`target/silicon/step86-mutant-shifted-column.log`. Mutants were restored.
+
+### Src transpose and GMPOOL ArgMax packed-output limits (2026-10-05)
+
+Step87 uses flat SrcB unpack of 512 datums, with the 16×16 operand copied into
+SrcB rows 16..32; TRNSPSRCB leaves rows 0..16 unchanged. Selecting the wrong half
+failed the independent transpose oracle (`1791239607`); the corrected native
+block/transposed-TF32-matmul path passes both cards (`1791239869`). Its Src/pack
+path normalizes signed zeros and subnormals to positive zero and preserves the
+tested signed infinities/NaN payloads. TF32 fractional products match the native
+raw-copy-prepared reference and the existing derived phase bound; they are not
+claimed to be exact scalar F32 sums. Payload-preserving tensor copies stay raw.
+
+GMPOOL with its ArgMax bit set returns zero packed index bits for every probed
+column on both cards: unique finite winners in each first-eight row, ties, lower
+eight-row winners, signed zeros, subnormals and NaNs. Max values follow the
+existing magnitude oracle. This was observed through ordinary F32 packing and
+through an attempted integer SFPU load/store (`1791240373`); the simplified
+probe is retained (`1791240702`). These results characterize our packed output
+path; they do not prove that the internal Blackhole instruction never tracks an
+index. The explicit MaxIndexProbe returns diagnostic raw I32 words, with no index
+contract. General Burn max-with-indices remains exact SFPU selection.
+
+
+### Final resident module and typed-index acceptance (2026-10-06)
+
+Isolated release smoke run `1791250791` passes 288/288 on both cards. Convolution
+and BF16 attention changed-input traces exercise one and two Tensix tiles with
+multiple output tiles. Step88 compares all F32/BF16 forward/gradient results to
+single-card execution and independently checks nonzero Q/K gradients in both
+mesh partitions, submitted matmul counts on each card and acknowledged Ethernet
+traffic. Resident index updates preserve wrapping I32 and Boolean OR semantics;
+device-produced indices replay across face/tile boundaries without downloads.
+These results complement the Src/GMPOOL measured limitations above, rather than
+establishing a general payload-preserving Src transpose or packed ArgMax index
+contract.
+
+
+### CNN training trace parameter storage (2026-10-06)
+
+Step89's BF16 CNN training capture initially failed with `no device buffer 149`:
+`DramBuffers::copy_into` consulted only the 32-bit buffer map for packed BF16
+parameters. It now dispatches same-format BF16 updates to raw halfword repacking
+into the retained allocation, with zero padding and existing declared scratch
+lifetimes. Both cards pass F32/BF16 changed-MNIST-batch trace comparisons and
+fresh convolution weight equality (`1791252026`). Trace gates explicitly use
+`download_device` to inspect mutable parameter buffers; creation-data caches
+retain the initial values and cannot serve as an oracle for in-place updates.

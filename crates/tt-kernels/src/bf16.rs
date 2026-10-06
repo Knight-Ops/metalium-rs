@@ -284,6 +284,88 @@ pub(crate) fn repack_padded(
     [rows, cols]: [usize; 2],
     padding: u16,
 ) -> Result<(Bf16Tensor, Vec<Job>)> {
+    if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(sources.len()) {
+        return Err(TensorError::Shape("invalid BF16 repack mapping".into()));
+    }
+    let output = Bf16Tensor {
+        rows,
+        cols,
+        placement: alloc.alloc_slots(rows.div_ceil(32) * cols.div_ceil(32), TILE_SLOT)?,
+    };
+    match repack_padded_into(input, sources, &output, padding) {
+        Ok(jobs) => Ok((output, jobs)),
+        Err(error) => {
+            alloc.free(&output.placement);
+            Err(error)
+        }
+    }
+}
+
+/// Reuse a bounded staging allocation. Every output tile is initialized before
+/// copying; ordered submission preserves producer/consumer and trace lifetimes.
+pub(crate) fn repack_padded_into(
+    input: &Bf16Tensor,
+    sources: &[Option<[usize; 2]>],
+    output: &Bf16Tensor,
+    padding: u16,
+) -> Result<Vec<Job>> {
+    let mapping: Vec<_> = sources.iter().map(|x| x.map(|at| (0, at))).collect();
+    repack_many_into(&[input], &mapping, output, padding)
+}
+
+pub(crate) fn repack_many(
+    alloc: &mut DramAlloc,
+    inputs: &[&Bf16Tensor],
+    sources: &[(usize, [usize; 2])],
+    [rows, cols]: [usize; 2],
+) -> Result<(Bf16Tensor, Vec<Job>)> {
+    if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(sources.len()) {
+        return Err(TensorError::Shape("invalid BF16 repack mapping".into()));
+    }
+    let output = Bf16Tensor {
+        rows,
+        cols,
+        placement: alloc.alloc_slots(rows.div_ceil(32) * cols.div_ceil(32), TILE_SLOT)?,
+    };
+    let mapping: Vec<_> = sources.iter().copied().map(Some).collect();
+    match repack_many_into(inputs, &mapping, &output, 0) {
+        Ok(jobs) => Ok((output, jobs)),
+        Err(error) => {
+            alloc.free(&output.placement);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn zeros(
+    alloc: &mut DramAlloc,
+    [rows, cols]: [usize; 2],
+) -> Result<(Bf16Tensor, Vec<Job>)> {
+    let count = rows
+        .checked_mul(cols)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| TensorError::Shape("invalid BF16 zero shape".into()))?;
+    let output = Bf16Tensor {
+        rows,
+        cols,
+        placement: alloc.alloc_slots(rows.div_ceil(32) * cols.div_ceil(32), TILE_SLOT)?,
+    };
+    match repack_many_into(&[], &vec![None; count], &output, 0) {
+        Ok(jobs) => Ok((output, jobs)),
+        Err(error) => {
+            alloc.free(&output.placement);
+            Err(error)
+        }
+    }
+}
+
+fn repack_many_into(
+    inputs: &[&Bf16Tensor],
+    sources: &[Option<(usize, [usize; 2])>],
+    output: &Bf16Tensor,
+    padding: u16,
+) -> Result<Vec<Job>> {
+    let (rows, cols) = (output.rows, output.cols);
     use crate::tensor::TransferBatch;
     use tt_isa::dm::face_index;
     if rows == 0
@@ -292,7 +374,7 @@ pub(crate) fn repack_padded(
         || sources
             .iter()
             .flatten()
-            .any(|&[r, c]| r >= input.rows || c >= input.cols)
+            .any(|&(i, [r, c])| inputs.get(i).is_none_or(|x| r >= x.rows || c >= x.cols))
     {
         return Err(TensorError::Shape("invalid BF16 repack mapping".into()));
     }
@@ -306,22 +388,18 @@ pub(crate) fn repack_padded(
     let (src, dst) = (layout.addr(src), layout.addr(dst));
     let constant = layout.addr(constant);
     let ct = cols.div_ceil(32);
-    let output = Bf16Tensor {
-        rows,
-        cols,
-        placement: alloc.alloc_slots(rows.div_ceil(32) * ct, TILE_SLOT)?,
-    };
     let mut jobs = Vec::new();
     for tile in 0..output.tile_count() {
-        let mut by_tile = std::collections::BTreeMap::<usize, Vec<(usize, usize)>>::new();
+        let mut by_tile = std::collections::BTreeMap::<(usize, usize), Vec<(usize, usize)>>::new();
         for r in 0..32.min(rows - tile / ct * 32) {
             for c in 0..32.min(cols - tile % ct * 32) {
-                let Some([sr, sc]) = sources[(tile / ct * 32 + r) * cols + tile % ct * 32 + c]
+                let Some((source, [sr, sc])) =
+                    sources[(tile / ct * 32 + r) * cols + tile % ct * 32 + c]
                 else {
                     continue;
                 };
                 by_tile
-                    .entry(sr / 32 * input.cols.div_ceil(32) + sc / 32)
+                    .entry((source, sr / 32 * inputs[source].cols.div_ceil(32) + sc / 32))
                     .or_default()
                     .push((face_index(sr % 32, sc % 32), face_index(r, c)));
             }
@@ -352,7 +430,8 @@ pub(crate) fn repack_padded(
                 ],
             ]
         };
-        for (source_tile, pairs) in by_tile {
+        for ((source, source_tile), pairs) in by_tile {
+            let input = inputs[source];
             for chunk in pairs.chunks(200) {
                 let mut read = Vec::new();
                 if !batches.is_empty() {
@@ -396,7 +475,7 @@ pub(crate) fn repack_padded(
             batches,
         }]);
     }
-    Ok((output, jobs))
+    Ok(jobs)
 }
 
 fn gather(

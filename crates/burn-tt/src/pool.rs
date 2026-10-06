@@ -165,51 +165,55 @@ fn sfpu_forward(
     let mut indexes = Vec::new();
     let mut order = vec![(0, 0); g.windows.len()];
     for (width, ids) in groups {
-        let mapping = ids
-            .iter()
-            .flat_map(|&i| g.windows[i].iter().copied())
-            .collect();
-        let (id, dims) =
-            crate::server::repack(x.device, source.buffer.id, mapping, [ids.len(), width]);
-        let packed = device_result(x.device, id, dims);
-        // Select the value through the same first-tie/first-NaN index as the
-        // backward path. SFPU's total-order max differs for negative NaNs.
-        let local = maximum.then(|| float::float_argmax(packed.clone(), 1, IntDType::I32));
-        let mut out = if maximum {
-            float::float_gather_bits(1, packed.clone(), local.as_ref().unwrap().clone())
-        } else {
-            float::float_sum_dim(packed.clone(), 1)
-        };
-        if !maximum {
-            let count = constant(
-                x.device,
-                ids.iter().map(|&i| g.divisors[i] as f32).collect(),
-                [ids.len(), 1],
-            );
-            out = float::float_div(out, count);
-        }
-        if indices {
-            assert!(
-                g.input[2].checked_mul(g.input[3]).unwrap() <= 1 << 23,
-                "pooling spatial indices exceed exact F32 metadata range"
-            );
-            let positions = ids
+        // Bound each staging matrix while preserving window-local reduction
+        // order and the original output order through the join descriptor.
+        for ids in ids.chunks(32) {
+            let mapping = ids
                 .iter()
-                .flat_map(|&i| {
-                    g.windows[i]
-                        .iter()
-                        .map(|&[r, c]| ((r % g.input[2]) * g.input[3] + c) as f32)
-                })
+                .flat_map(|&i| g.windows[i].iter().copied())
                 .collect();
-            let positions = constant(x.device, positions, [ids.len(), width]);
-            let selected = float::float_gather(1, positions, local.unwrap());
-            indexes.push(float::float_into_int(selected, IntDType::I32));
+            let (id, dims) =
+                crate::server::repack(x.device, source.buffer.id, mapping, [ids.len(), width]);
+            let packed = device_result(x.device, id, dims);
+            // Select the value through the same first-tie/first-NaN index as the
+            // backward path. SFPU's total-order max differs for negative NaNs.
+            let local = maximum.then(|| float::float_argmax(packed.clone(), 1, IntDType::I32));
+            let mut out = if maximum {
+                float::float_gather_bits(1, packed.clone(), local.as_ref().unwrap().clone())
+            } else {
+                float::float_sum_dim(packed.clone(), 1)
+            };
+            if !maximum {
+                let count = constant(
+                    x.device,
+                    ids.iter().map(|&i| g.divisors[i] as f32).collect(),
+                    [ids.len(), 1],
+                );
+                out = float::float_div(out, count);
+            }
+            if indices {
+                assert!(
+                    g.input[2].checked_mul(g.input[3]).unwrap() <= 1 << 23,
+                    "pooling spatial indices exceed exact F32 metadata range"
+                );
+                let positions = ids
+                    .iter()
+                    .flat_map(|&i| {
+                        g.windows[i]
+                            .iter()
+                            .map(|&[r, c]| ((r % g.input[2]) * g.input[3] + c) as f32)
+                    })
+                    .collect();
+                let positions = constant(x.device, positions, [ids.len(), width]);
+                let selected = float::float_gather(1, positions, local.unwrap());
+                indexes.push(float::float_into_int(selected, IntDType::I32));
+            }
+            let group = values.len();
+            for (row, &i) in ids.iter().enumerate() {
+                order[i] = (group, row);
+            }
+            values.push(out);
         }
-        let group = values.len();
-        for (row, &i) in ids.iter().enumerate() {
-            order[i] = (group, row);
-        }
-        values.push(out);
     }
     let join = |inputs: &[TtTensor]| {
         let ids = inputs.iter().map(|t| t.to_dram().buffer.id).collect();

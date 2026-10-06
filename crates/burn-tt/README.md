@@ -46,7 +46,9 @@ a native implementation fail explicitly; Burn defaults compose our primitives.
 Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across the fabric, moving tile slots over Ethernet, directly or through
 relay tiles. Other primitives and full reductions run on chip 0, retaining
-intermediates on the device. Batched matmuls currently compute on chip 0.
+intermediates on the device. Batched matmuls also partition products across cards; convolution and attention
+reuse this path, including backward products. Elementwise work and reductions
+remain on chip 0. Distributed trace capture is unsupported.
 The two-chip and four-chip MLP gates match the native single-chip golden and
 reject intermediate host transfers and staged computation.
 
@@ -54,6 +56,14 @@ Native implementations are `OVERRIDDEN` in `xtask/src/gen_burn.rs`. Dispatch and
 explicit unsupported methods are generated into `src/generated/ops.rs` by
 `cargo xtask gen-burn-ops` (never hand-edit; CI runs `--check`).
 `cargo xtask check-no-flex-in-backend` guards dependency independence.
+
+Native Conv2D supports groups/depthwise, stride, padding, dilation, bias and
+F32/BF16 gradients. Conv1D uses Burn's singleton-spatial composition; transposed
+Conv2D supports output padding below the maximum of stride and dilation. Unfold and stepped
+slice assignment support native copies. Gather/select accept resident I32 indices
+on arbitrary axes; float scatter/select-add preserve logical duplicate ordering. I32 updates wrap
+and Boolean scatter/select-OR runs natively with resident indices.
+BF16 convolution and scatter accumulate in F32 until the output boundary.
 
 ## Key types
 
@@ -111,7 +121,8 @@ and logic arithmetic. I32 retains the conservative `Storage` capability flag
 until general integer tensor coverage is complete; its implemented native
 operations include conversion, wrapping arithmetic, bitwise ops, signed
 comparisons, shifts, wrapping sum/product and signed min/max reductions.
-Integer division/remainder and mean remain unsupported.
+Checked integer division/remainder and integer mean are native and simulator-gated;
+zero divisors report device DOMAIN errors. Card-0 silicon gates pass (`1791232718`).
 F16, other integers and quantized tensors are unsupported.
 
 BF16 uses 2112-byte physical slots with two-byte datums. Raw upload/download,
@@ -123,8 +134,8 @@ boundary. Operands must share a dtype. BF16 mesh execution uses resident Etherne
 execution after native device widening; network operand storage is currently F32.
 Packed single-card products support K continuations, batches and broadcast views.
 Pooling geometry/index metadata is replayable, enabling F32 and BF16 pool traces.
-I32 sum/product and signed min/max reductions are native. Integer division,
-remainder and mean remain unsupported pending checked domain-flag validation.
+I32 sum/product and signed min/max reductions are native. Axis integer mean
+wraps its sum before checked division by the logical count.
 Burn BF16 arithmetic is silicon-gated because ttsim refuses late narrowing.
 
 Native NCHW average/adaptive pooling and max pooling with resident spatial indices
@@ -218,3 +229,14 @@ General reductions and K-blocked resident matmul have simulator gates in
 `step67_general_reduce` and `step68_k_block_matmul`; both-card silicon validation
 is pending. K continuations reload FP32 accumulators and retain the original
 product order. Supported batched layouts retain their tile-alignment rules.
+
+Native rank-four attention preserves pinned Burn's scale/softcap, Boolean and
+bottom-right causal masks, additive bias, and zero fully-masked rows. Forward
+BF16 computes its intermediates in F32 and narrows once at the output; autodiff
+retains Burn's primitive composition. Ragged F32 batches materialize on device.
+Mesh batches dispatch each product through distributed output-column partitions.
+`step83` covers F32 simulator forward, analytic gradients, single-card traces and
+two-chip forward. All six attention silicon gates pass (`1791232718`), including
+BF16 resident training on card 0 and forward execution on cards 0 and 1.
+Release benchmarks and broader attention acceptance remain outstanding.
+Convolution and general resident-index routing remain unsupported.

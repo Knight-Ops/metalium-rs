@@ -154,18 +154,19 @@ re-deriving at the first silicon gate.
 
 ## Numerics worth knowing
 
-### Unresolved BF16 control in the FPU transpose probe (2026-10-04)
+### Signed BF16 MOVB2D control divergence (2026-10-05)
 
-`step73_fpu_transpose` currently enables only TF32 (unpacker output code 4).
-Changing its format list to `[4, 5]` exercises a BF16 control as well. With
-512 staged FP32 datums `((i as f32) - 256.0).to_bits() | 0x1fff`, even the
-zero-transpose SrcB-to-Dst copy fails: datum zero is `c3808086`, while the
-BF16 truncation/widening oracle expects `c3800000`. The older
-`probe_src::fp32_unpacks_into_src_as_truncated_bf16` still passes its smaller
-positive corpus. Dst width/layout and this larger signed control must be
-reconciled before enabling the BF16 case. This is an unresolved probe setup
-or simulator observation, not a confirmed simulator divergence or a silicon
-measurement. No BF16 transpose support or new encoding is inferred from it.
+With 512 staged FP32 datums `((i as f32) - 256.0).to_bits() | 0x1fff`,
+ttsim's zero-transpose SrcB-to-Dst copy reports datum zero as `c3808086`,
+where the BF16 truncation/widening oracle expects `c3800000`. Removing the
+entire matmul math prelude leaves the same failure. The older positive,
+32-element `probe_src` corpus still passes. The cause inside ttsim is not known.
+
+Both cards pass that exact signed zero-transpose control, one TRNSPSRCB and
+its inverse, for both Src row halves: `step73`, run `1791233413`, 4/4.
+The BF16 control is consequently silicon-only; TF32 retains simulator coverage.
+The earlier unresolved setup observation is now a measured simulator divergence.
+These instruction probes do not establish a raw-payload tensor transpose contract.
 
 ### BF16 late narrowing and FPU pooling (2026-10-05)
 
@@ -224,3 +225,22 @@ Ordinary BF16 casts retain their separate ties-even/NaN-preserving contract.
 The experimental checked integer divide's DOMAIN=11 on valid inputs is **not**
 classified as a simulator divergence. Its status packing/ownership still needs
 isolation; execution is disabled. See `tensix-next-features.md` for the handoff.
+
+### Checked integer status: current refutation of the starting observation (2026-10-05)
+
+The previous valid-divisor DOMAIN=11 observation is not reproducible in the current
+step82 gates. A small diagnostic validates C_ROW generation, subsequent packing
+and all physical face boundaries before running the complete SFPU division body.
+The full integer oracle gate also passes with the prior B-slot reuse; replacing
+that reuse with separately declared C scratch retains the passing result. This
+establishes current simulator behavior, not a root cause for the original failure.
+Logical-zero tests reject each sampled face boundary; zero ragged padding does
+not reject valid logical inputs. No new simulator divergence is established.
+
+### GMPOOL ArgMax refusal (2026-10-05)
+
+The index-mode probe exits ttsim with
+`UnsupportedFunctionality: tensix_gmpool: max_pool_index_en=1`. It therefore uses
+a silicon-only gate. Both cards return max values with no packed index bits,
+including finite unique winners; see silicon-operating-notes.md. This does not
+establish the documented nonlinear Wormhole index encoding on Blackhole.

@@ -84,7 +84,13 @@ fn src_b_transpose_matches_the_permutation_and_is_its_own_inverse() {
     let data: Vec<u32> = (0..512)
         .map(|i| ((i as f32) - 256.0).to_bits() | 0x1fff)
         .collect();
-    for format in [4] {
+    // Signed BF16 MOVB2D is mis-modelled by ttsim even with no transpose.
+    // The independent zero-transpose silicon control gates that format.
+    for format in if cfg!(feature = "silicon") {
+        vec![4, 5]
+    } else {
+        vec![4]
+    } {
         let decoded: Vec<_> = data
             .iter()
             .map(|&bits| {
@@ -111,5 +117,21 @@ fn src_b_transpose_matches_the_permutation_and_is_its_own_inverse() {
             run(&data, format, 1, base, &expected[range.clone()]);
             run(&data, format, 2, base, &decoded[range]);
         }
+    }
+}
+
+#[test]
+#[cfg(feature = "silicon")]
+fn bf16_zero_transpose_control_preserves_truncated_values() {
+    let data: Vec<u32> = (0..512)
+        .map(|i| ((i as f32) - 256.0).to_bits() | 0x1fff)
+        .collect();
+    let decoded: Vec<_> = data
+        .iter()
+        .map(|&bits| bf16_to_fp32(fp32_to_bf16_truncate(bits)))
+        .collect();
+    for base in [0, 16] {
+        let start = base as usize * 16;
+        run(&data, 5, 0, base, &decoded[start..start + 256]);
     }
 }

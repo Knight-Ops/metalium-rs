@@ -213,6 +213,7 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),
             mover.at(dm::QUEUE_ERROR_AT),
+            mover.at(dm::TRACE_PROGRESS),
         ] {
             d.write32(w, tile, word, 0)?;
         }
@@ -578,6 +579,7 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<()> {
         let simulated = d.transport().is_simulated();
         let (mut last, mut since, mut ticks) = (self.refresh(d, w)?, Instant::now(), 0u64);
+        let mut trace_progress = d.read32(w, self.tile, self.mover.at(dm::TRACE_PROGRESS))?;
         loop {
             let done = self.refresh(d, w)?;
             if (done.wrapping_sub(number) as i32) >= 0 {
@@ -592,6 +594,15 @@ impl<N: NocId> DataMover<N> {
                 since.elapsed() > self.deadline
             };
             if stuck {
+                // A replay is one queue entry, but may contain thousands of
+                // kernels and copies. Completed chunks establish progress
+                // without extending the budget for an actually stalled chunk.
+                let progress = d.read32(w, self.tile, self.mover.at(dm::TRACE_PROGRESS))?;
+                if progress != trace_progress {
+                    trace_progress = progress;
+                    (since, ticks) = (Instant::now(), 0);
+                    continue;
+                }
                 return Err(DmError::TimedOut { seq: number, done });
             }
             d.tick(CYCLES_PER_POLL);

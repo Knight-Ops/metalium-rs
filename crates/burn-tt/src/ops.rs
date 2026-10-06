@@ -77,7 +77,7 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         "BF16 matmul operands must share a device"
     );
     if lhs.shape().num_dims() > 2 || rhs.shape().num_dims() > 2 {
-        return bf16_batched_matmul(lhs, rhs);
+        return materialized_batched_matmul(lhs, rhs);
     }
     if !lhs.is_storable_matrix() || !rhs.is_storable_matrix() {
         return None;
@@ -100,10 +100,14 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     ))
 }
 
-/// Packed matrix products for each logical batch, including broadcast and
-/// strided operands. Repack copies BF16 bits; products remain F32 until the
-/// joined tensor's single BF16 boundary conversion.
-fn bf16_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+/// Materialized matrix products for each logical batch, including ragged,
+/// broadcast and strided operands. Repack preserves storage bits; products
+/// remain F32 until the joined tensor's single output boundary conversion.
+fn materialized_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    if !lhs.is_storable() || !rhs.is_storable() || !crate::server::supports_dram(lhs.device) {
+        return None;
+    }
+    let dtype = lhs.dtype();
     let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
     let rank = ls.len().max(rs.len());
     if ls.len() < 2 || rs.len() < 2 {
@@ -134,7 +138,11 @@ fn bf16_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     if lb.iter().all(|&d| d == 1) && ls[..ls.len() - 2].iter().product::<usize>() == count {
         let a = repack_shape(lhs, vec![count.checked_mul(m)?, k]);
         let b = repack_shape(rhs, vec![k, n]);
-        let out = bf16_matmul(&a, &b)?;
+        let out = if dtype == DType::BF16 {
+            bf16_matmul(&a, &b)?
+        } else {
+            float::float_matmul(a, b)
+        };
         return Some(repack_shape(&out, shape));
     }
     let view = |t: &TtTensor| {
@@ -162,16 +170,21 @@ fn bf16_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
                 .map(|i| v.at(original, flat_batch * size + i))
                 .collect();
             let (id, dims) = crate::server::repack(device, v.src.buffer.id, sources, dims);
-            device_result_shaped(t.device, id, dims, dims.into(), DType::BF16)
+            device_result_shaped(t.device, id, dims, dims.into(), dtype)
         };
         let a = pack(lhs, &va, &ls, &la, [m, k]);
         let b = pack(rhs, &vb, &rs, &lb, [k, n]);
-        let (id, dims) = crate::server::matmul_bf16(
-            device,
-            a.to_dram().buffer.id,
-            b.to_dram().buffer.id,
-            [m, n],
-        );
+        let (id, dims) = if dtype == DType::BF16 {
+            crate::server::matmul_bf16(device, a.to_dram().buffer.id, b.to_dram().buffer.id, [m, n])
+        } else {
+            crate::server::matmul_dram(
+                device,
+                a.to_dram().buffer.id,
+                false,
+                b.to_dram().buffer.id,
+                false,
+            )
+        };
         outputs.push(device_result(device, id, dims));
     }
     let ids = outputs.iter().map(|t| t.to_dram().buffer.id).collect();
@@ -181,7 +194,7 @@ fn bf16_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     let (id, dims) = crate::server::gather_rows(device, ids, rows, n);
     Some(cast_native(
         device_result_shaped(device, id, dims, shape.into(), DType::F32),
-        DType::BF16,
+        dtype,
     ))
 }
 
@@ -245,6 +258,43 @@ fn plain_dram(tensor: &TtTensor) -> crate::tensor::DramRef {
     device_view(tensor.device, id, dims, None, tensor.dtype())
         .to_dram()
         .clone()
+}
+
+fn mapped_native(
+    inputs: &[&TtTensor],
+    sources: Vec<(usize, usize)>,
+    shape: Vec<usize>,
+) -> TtTensor {
+    let device = inputs[0].device;
+    let dtype = inputs[0].dtype();
+    let views: Vec<_> = inputs
+        .iter()
+        .map(|x| {
+            assert_eq!(x.device, device);
+            assert_eq!(x.dtype(), dtype);
+            let shape = x.shape().to_vec();
+            x.as_strided()
+                .unwrap_or_else(|| crate::views::Strided::of(x.to_dram(), &shape))
+        })
+        .collect();
+    let sources = sources
+        .into_iter()
+        .map(|(i, flat)| {
+            assert!(
+                flat < inputs[i].shape().num_elements(),
+                "patch mapping out of range"
+            );
+            (i, views[i].at(&inputs[i].shape().to_vec(), flat))
+        })
+        .collect();
+    let dims = crate::tensor::stored_dims(&shape).expect("nonempty patch shape");
+    let (id, dims) = crate::server::repack_many(
+        device,
+        views.iter().map(|v| v.src.buffer.id).collect(),
+        sources,
+        dims,
+    );
+    device_result_shaped(device, id, dims, shape.into(), dtype)
 }
 
 /// Put the selected logical axis in matrix columns; the host constructs addresses only.
@@ -356,6 +406,285 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
         burn_backend::Shape::from(output),
         tensor.dtype(),
     ))
+}
+
+/// General raw resident gather. Static staging covers every legal source;
+/// B reads bounded I32 indices and rejects the domain before indexed copying.
+fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+    let shape = tensor.shape().to_vec();
+    let output = indices.shape().to_vec();
+    assert!(
+        dim < shape.len()
+            && output.len() == shape.len()
+            && shape
+                .iter()
+                .zip(&output)
+                .enumerate()
+                .all(|(d, (&a, &b))| d == dim || a == b)
+            && tensor.is_storable()
+            && indices.dtype() == DType::I32
+            && tensor.device == indices.device
+            && shape[dim] <= i32::MAX as usize,
+        "invalid native gather geometry"
+    );
+    let mut results = Vec::new();
+    for first in (0..indices.shape().num_elements()).step_by(32) {
+        let count = 32.min(indices.shape().num_elements() - first);
+        let mut sources = Vec::new();
+        for flat in first..first + count {
+            let mut index = flat;
+            let mut coordinates = vec![0; shape.len()];
+            for d in (0..shape.len()).rev() {
+                coordinates[d] = index % output[d];
+                index /= output[d];
+            }
+            for k in 0..shape[dim] {
+                coordinates[dim] = k;
+                let at = coordinates
+                    .iter()
+                    .zip(&shape)
+                    .fold(0, |n, (&i, &d)| n * d + i);
+                sources.push((0, at));
+            }
+        }
+        let staged = mapped_native(&[&tensor], sources, vec![count, shape[dim]]);
+        let index = mapped_native(
+            &[&indices],
+            (first..first + count).map(|i| (0, i)).collect(),
+            vec![count, 1],
+        );
+        let (id, dims) = crate::server::gather_indexed(
+            tensor.device,
+            staged.to_dram().buffer.id,
+            index.to_dram().buffer.id,
+            [count, 1],
+        );
+        results.push(device_result_shaped(
+            tensor.device,
+            id,
+            dims,
+            dims.into(),
+            tensor.dtype(),
+        ));
+    }
+    let sources = (0..indices.shape().num_elements())
+        .map(|i| (i / 32, i % 32))
+        .collect();
+    let refs: Vec<_> = results.iter().collect();
+    mapped_native(&refs, sources, output)
+}
+
+fn select_native(tensor: TtTensor, dim: usize, indices: TtTensor) -> TtTensor {
+    let mut shape = tensor.shape().to_vec();
+    assert!(dim < shape.len() && indices.shape().num_dims() == 1);
+    shape[dim] = indices.shape().num_elements();
+    let mut index_shape = vec![1; shape.len()];
+    index_shape[dim] = shape[dim];
+    let indices = reshaped(indices, index_shape.into());
+    let indices = expanded(&indices, shape.into(), "resident selection indices");
+    gather_native(dim, tensor, indices)
+}
+
+fn scatter_add_native(
+    dim: usize,
+    tensor: TtTensor,
+    indices: TtTensor,
+    value: TtTensor,
+) -> TtTensor {
+    assert_eq!(tensor.dtype(), value.dtype());
+    let dtype = tensor.dtype();
+    let stored = matches!(dtype, DType::I32 | DType::Bool(_));
+    if !stored {
+        float_compute_dtype(&[&tensor, &value]);
+    }
+    let shape = tensor.shape().to_vec();
+    let output = indices.shape().to_vec();
+    assert!(
+        dim < shape.len()
+            && output.len() == shape.len()
+            && output == value.shape().to_vec()
+            && shape
+                .iter()
+                .zip(&output)
+                .enumerate()
+                .all(|(d, (&a, &b))| d == dim || a == b)
+    );
+    let tensor = if stored {
+        tensor
+    } else {
+        float_compute_input(tensor)
+    };
+    let value = if stored {
+        value
+    } else {
+        float_compute_input(value)
+    };
+    let mut current = pack_axis(&tensor, dim).expect("native scatter axis");
+    let values = pack_axis(&value, dim).expect("native scatter values");
+    let indices = pack_axis(&indices, dim).expect("native scatter indices");
+    let rows = current.shape().to_vec()[0];
+    let count = output[dim];
+    let width = shape[dim];
+    // Integer column coordinates are replayable metadata, never tensor data.
+    let id = crate::server::metadata(
+        tensor.device,
+        (0..width).map(|i| i as u32).collect(),
+        [1, width],
+        Elem::I32,
+    );
+    let columns =
+        device_result_shaped(tensor.device, id, [1, width], [1, width].into(), DType::I32);
+    let columns = expanded(&columns, [rows, width].into(), "scatter columns");
+    for j in 0..count {
+        let index = mapped_native(
+            &[&indices],
+            (0..rows).map(|r| (0, r * count + j)).collect(),
+            vec![rows, 1],
+        );
+        // The checked raw gather is also the domain dependency of the update.
+        let selected = gather_native(1, current.clone(), index.clone());
+        let value = mapped_native(
+            &[&values],
+            (0..rows).map(|r| (0, r * count + j)).collect(),
+            vec![rows, 1],
+        );
+        let sum = match dtype {
+            DType::I32 => int::int_add(selected, value),
+            DType::Bool(_) => bool::bool_or(selected, value),
+            _ => float::float_add(selected, value),
+        };
+        let index = expanded(&index, [rows, width].into(), "scatter indices");
+        let mask = device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &columns, Some(&index))
+            .expect("integer scatter equality");
+        let sum = expanded(&sum, [rows, width].into(), "scatter values");
+        current = match dtype {
+            DType::I32 => {
+                let mask =
+                    int::int_mul_scalar(bool::bool_into_int(mask, IntDType::I32), (-1i32).into());
+                let old = int::bitwise_and(current, int::bitwise_not(mask.clone()));
+                int::bitwise_or(old, int::bitwise_and(sum, mask))
+            }
+            DType::Bool(_) => bool::bool_or(current, bool::bool_and(mask, sum)),
+            _ => float::float_mask_where(current, mask, sum),
+        };
+    }
+    let sources = (0..tensor.shape().num_elements())
+        .map(|mut flat| {
+            let mut coords = vec![0; shape.len()];
+            for d in (0..shape.len()).rev() {
+                coords[d] = flat % shape[d];
+                flat /= shape[d];
+            }
+            let mut row = 0;
+            for d in 0..shape.len() {
+                if d != dim {
+                    row = row * shape[d] + coords[d];
+                }
+            }
+            (0, row * width + coords[dim])
+        })
+        .collect();
+    cast_native(mapped_native(&[&current], sources, shape), dtype)
+}
+
+fn select_add_native(tensor: TtTensor, dim: usize, indices: TtTensor, value: TtTensor) -> TtTensor {
+    assert!(indices.shape().num_dims() == 1 && dim < value.shape().num_dims());
+    let shape = value.shape().to_vec();
+    assert_eq!(shape[dim], indices.shape().num_elements());
+    let mut index_shape = vec![1; shape.len()];
+    index_shape[dim] = shape[dim];
+    let indices = reshaped(indices, index_shape.into());
+    let indices = expanded(&indices, shape.into(), "resident select-add indices");
+    scatter_add_native(dim, tensor, indices, value)
+}
+
+/// Replace a logical slice using raw resident copies, including stepped views.
+fn slice_assign_native(
+    tensor: TtTensor,
+    slices: &[burn_backend::Slice],
+    value: TtTensor,
+) -> TtTensor {
+    let shape = tensor.shape().to_vec();
+    assert!(
+        tensor.is_storable()
+            && value.is_storable()
+            && tensor.dtype() == value.dtype()
+            && tensor.device == value.device
+            && slices.len() <= shape.len()
+            && crate::server::supports_dram(tensor.device),
+        "invalid native slice assignment"
+    );
+    let ranges: Vec<Vec<usize>> = shape
+        .iter()
+        .enumerate()
+        .map(|(d, &n)| {
+            let slice = slices
+                .get(d)
+                .cloned()
+                .unwrap_or_else(burn_backend::Slice::full);
+            let step = slice.step.unsigned_abs();
+            assert!(step > 0, "slice assignment step must be nonzero");
+            let range = slice.to_range(n);
+            if slice.step > 0 {
+                range.step_by(step).collect()
+            } else {
+                range.rev().step_by(step).collect()
+            }
+        })
+        .collect();
+    assert_eq!(
+        value.shape().to_vec(),
+        ranges.iter().map(Vec::len).collect::<Vec<_>>(),
+        "slice assignment value shape differs"
+    );
+    let tv = tensor
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    let vs = value.shape().to_vec();
+    let vv = value
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(value.to_dram(), &vs));
+    let count = shape
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .expect("slice assignment overflow");
+    let mut sources: Vec<_> = (0..count).map(|i| (0, tv.at(&shape, i))).collect();
+    for flat in 0..value.shape().num_elements() {
+        let mut index = flat;
+        let mut coordinates = vec![0; shape.len()];
+        for d in (0..shape.len()).rev() {
+            coordinates[d] = ranges[d][index % vs[d]];
+            index /= vs[d];
+        }
+        let dst = coordinates
+            .iter()
+            .zip(&shape)
+            .fold(0, |n, (&i, &d)| n * d + i);
+        sources[dst] = (1, vv.at(&vs, flat));
+    }
+    let dims = crate::tensor::stored_dims(&shape).expect("nonempty slice assignment");
+    let (id, dims) = crate::server::repack_many(
+        tensor.device,
+        vec![tv.src.buffer.id, vv.src.buffer.id],
+        sources,
+        dims,
+    );
+    device_result_shaped(tensor.device, id, dims, shape.into(), tensor.dtype())
+}
+
+fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> Option<TtTensor> {
+    if !crate::server::is_attached(*device) || !crate::server::supports_dram(*device) {
+        return None;
+    }
+    let elem = match dtype {
+        DType::F32 | DType::BF16 => Elem::F32,
+        DType::I32 => Elem::I32,
+        DType::Bool(_) => Elem::Bool,
+        _ => return None,
+    };
+    let dims = crate::tensor::stored_dims(&shape.to_vec())?;
+    let (id, dims) = crate::server::zeros(*device, dims, elem, dtype == DType::BF16);
+    Some(device_result_shaped(*device, id, dims, shape, dtype))
 }
 
 /// Broadcast bytes on the device using row gathers and whole-matrix transposes.
@@ -858,6 +1187,9 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
+        if let Some(out) = native_zeros(shape.clone(), device, dtype.into()) {
+            return out;
+        }
         if DType::from(dtype) == DType::BF16 {
             let mut data = TensorData::zeros::<u16, _>(shape);
             data.dtype = DType::BF16;
@@ -1076,6 +1408,9 @@ pub mod float {
         if let Some(t) = batched_matmul(&lhs, &rhs) {
             return t;
         }
+        if let Some(t) = materialized_batched_matmul(&lhs, &rhs) {
+            return t;
+        }
         let ls = lhs.shape().to_vec();
         let rs = rhs.shape().to_vec();
         let rank = ls.len().max(rs.len());
@@ -1226,11 +1561,11 @@ pub mod float {
     }
 
     /// `tensor` with dimensions `dim1` and `dim2` swapped, as a view of its
-    /// device copy, if it is F32 and has one (or is a view itself): nothing
+    /// device copy, if it is stored and has one (or is a view itself): nothing
     /// moves, at any rank. A swap that leaves it a plain matrix or its 2-D
     /// transpose is that, as before.
-    fn swapped_strided(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
-        if !matches!(tensor.dtype(), DType::F32 | DType::BF16) || dim1 == dim2 {
+    pub(crate) fn swapped_strided(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor> {
+        if !tensor.is_storable() || dim1 == dim2 {
             return None;
         }
         let v = tensor.as_strided()?;
@@ -1292,6 +1627,12 @@ pub mod float {
         dim1: usize,
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
+        if tensor.is_storable()
+            && crate::server::is_attached(tensor.device)
+            && crate::server::supports_dram(tensor.device)
+        {
+            tensor.to_dram();
+        }
         if let Some(v) = swapped_strided(&tensor, dim1, dim2) {
             return v;
         }
@@ -1849,6 +2190,47 @@ pub mod float {
         sliced_native(&tensor, &slices).unwrap_or_else(|| fail("float_flip", context(&tensor)))
     }
 
+    pub fn float_slice_assign(
+        tensor: TtTensor,
+        slices: &[burn_backend::Slice],
+        value: TtTensor,
+    ) -> TtTensor {
+        slice_assign_native(tensor, slices, value)
+    }
+
+    /// Sliding logical windows: preserve payloads and append the window axis.
+    pub fn float_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
+        let shape = tensor.shape().to_vec();
+        assert!(dim < shape.len() && size > 0 && step > 0 && size <= shape[dim]);
+        let mut output = shape.clone();
+        output[dim] = (shape[dim] - size) / step + 1;
+        output.push(size);
+        let count = output
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .expect("unfold overflow");
+        let view = tensor
+            .as_strided()
+            .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+        let sources = (0..count)
+            .map(|mut flat| {
+                let offset = flat % size;
+                flat /= size;
+                let mut indices = vec![0; shape.len()];
+                for d in (0..shape.len()).rev() {
+                    indices[d] = flat % output[d];
+                    flat /= output[d];
+                }
+                indices[dim] = indices[dim] * step + offset;
+                let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+                view.at(&shape, flat)
+            })
+            .collect();
+        let dims = crate::tensor::stored_dims(&output).unwrap();
+        let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
+        device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
+    }
+
     pub fn float_slice(
         tensor: FloatTensor<TtBackend>,
         slices: &[burn_backend::Slice],
@@ -2044,263 +2426,47 @@ pub mod float {
     predicate!(float_is_nan, kind_sfpu::IS_NAN);
     predicate!(float_is_inf, kind_sfpu::IS_INF);
 
-    /// Column-index geometry as replayable raw metadata, without downloading
-    /// the tensor or uploading a temporary host tensor during capture.
-    fn column_indices(tensor: &TtTensor) -> Option<TtTensor> {
-        let shape = tensor.shape().to_vec();
-        let c = *shape.last()?;
-        let n: usize = shape.iter().product();
-        let dims = crate::tensor::stored_dims(&shape)?;
-        let bits = (0..n).map(|i| ((i % c) as f32).to_bits()).collect();
-        let id = crate::server::metadata(tensor.device, bits, dims, Elem::F32);
-        Some(device_result_shaped(
-            tensor.device,
-            id,
-            dims,
-            shape.into(),
-            DType::F32,
-        ))
-    }
-
-    /// For a gather or scatter along the last dimension with one index per
-    /// row (`indices` `tensor`'s shape with a last of 1, as Burn's
-    /// `CrossEntropyLoss` gathers its targets): `kind` (`EQ` or `NE`) of each
-    /// element's column index and its row's index, a resident `Bool` of
-    /// `tensor`'s shape, on the device. `None` unless `tensor` is resident
-    /// F32 and the indices are `I32` (uploaded if they are on the host).
-    fn index_mask(
-        tensor: &TtTensor,
-        dim: usize,
-        indices: &TtTensor,
-        kind: u32,
-    ) -> Option<TtTensor> {
-        let (ts, is) = (tensor.shape().to_vec(), indices.shape().to_vec());
-        let rank = ts.len();
-        if rank == 0 || dim + 1 != rank || is.len() != rank || is[rank - 1] != 1 {
-            return None;
-        }
-        if ts[..rank - 1] != is[..rank - 1] || indices.dtype() != DType::I32 {
-            return None;
-        }
-        if !tensor.is_stored_f32() {
-            return None;
-        }
-        if !crate::server::supports_dram(tensor.device) || ts[rank - 1] > 1 << 24 {
-            return None;
-        }
-        indices.to_dram();
-        let idx = device_eltwise_ungated(kind_sfpu::I32_TO_F32, 0.0, indices, None)?;
-        let cols = column_indices(tensor)?;
-        device_eltwise_ungated(kind, 0.0, &cols, Some(&idx))
-    }
-
-    /// `out[.., 0] = x[.., idx[.., 0]]` along the last dimension, on the
-    /// device where `x` is: every other element masked to `-0` and the row
-    /// summed -- the gathered element in any order, since `x + -0 = x` for
-    /// every `x` (a NaN and the infinities included), but for a gathered
-    /// `-0`, which the SFPU's sum returns as `+0` (`ttsim-divergence.md` row
-    /// C; keeping the sign would take a second, max-based pass). One index
-    /// per row (a loss's targets); unsupported inputs fail.
+    /// Select raw datums on B with checked resident indices along any logical axis.
     pub fn float_gather(
         dim: usize,
         tensor: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        use tt_kernels::sfpu::reduce::ReduceOp;
-        if let Some(ne) = index_mask(&tensor, dim, &indices, kind_sfpu::NE) {
-            if let Some(kept) =
-                device_eltwise_ungated(kind_sfpu::MASK_FILL, -0.0, &tensor, Some(&ne))
-            {
-                if let Some(t) = device_reduce_ungated(&kept, ReduceOp::Sum, dim) {
-                    return t;
-                }
-            }
-        }
-        fail(
-            "float_gather",
-            format_args!(
-                "tensor=({}), indices=({})",
-                context(&tensor),
-                context(&indices)
-            ),
-        )
+        gather_native(dim, tensor, indices)
     }
 
-    /// Pooling selection must preserve the selected zero sign and NaN bits.
-    /// OR folds one retained raw datum with zero bits instead of adding it.
+    /// Pooling uses the same bit-preserving resident selection.
     pub(crate) fn float_gather_bits(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
-        if let Some(ne) = index_mask(&tensor, dim, &indices, kind_sfpu::NE) {
-            if let Some(kept) =
-                device_eltwise_ungated(kind_sfpu::MASK_FILL, 0.0, &tensor, Some(&ne))
-            {
-                if let Some(output) =
-                    device_reduce_ungated(&kept, tt_kernels::sfpu::reduce::ReduceOp::BitOr, dim)
-                {
-                    return output;
-                }
-            }
-        }
-        fail(
-            "pool_value_selection",
-            format_args!(
-                "tensor=({}), indices=({})",
-                context(&tensor),
-                context(&indices)
-            ),
-        )
+        gather_native(dim, tensor, indices)
     }
 
-    /// `out = x`, then `out[.., idx[.., 0]] += v[.., 0]` along the last
-    /// dimension -- a gather's backward -- on the device where `x` is: `x +
-    /// v` (a column broadcast) where the column is the row's index, `x`
-    /// elsewhere; the one addition Flex makes. One index per row; anything
-    /// otherwise unsupported.
+    /// Fold duplicate indices in logical axis order; additions stay on Tensix.
     pub fn float_scatter_add(
         dim: usize,
         tensor: FloatTensor<TtBackend>,
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        if value.shape() == indices.shape() && value.is_stored_f32() {
-            if let Some(eq) = index_mask(&tensor, dim, &indices, kind_sfpu::EQ) {
-                value.to_dram();
-                if let Some(sum) = device_eltwise_ungated(kind::ADD, 0.0, &tensor, Some(&value)) {
-                    let op = op2(kind_sfpu::MASK_WHERE, 0.0, 0.0);
-                    if let Some(t) = device_op_ungated(op, &tensor, Some(&eq), Some(&sum)) {
-                        return t;
-                    }
-                }
-            }
-        }
-        fail(
-            "float_scatter_add",
-            format_args!(
-                "tensor=({}), indices=({}), value=({})",
-                context(&tensor),
-                context(&indices),
-                context(&value)
-            ),
-        )
+        scatter_add_native(dim, tensor, indices, value)
     }
 
-    /// An index tensor's values, from its host copy (downloaded first if it
-    /// has none: indices are few, and an embedding's come from the host),
-    /// if every one is in `0..bound`.
-    fn index_values(indices: &TtTensor, bound: usize) -> Option<Vec<usize>> {
-        let v = indices
-            .host()
-            .clone()
-            .into_data()
-            .convert::<i64>()
-            .to_vec::<i64>()
-            .ok()?;
-        v.into_iter()
-            .map(|i| usize::try_from(i).ok().filter(|&i| i < bound))
-            .collect()
-    }
-
-    /// The rows of the matrix `tensor` is stored as that slice `i` along
-    /// dimension 0 covers: `i q .. (i + 1) q`, `q` the product of the
-    /// dimensions between the first and the last.
-    fn rows_of(shape: &[usize], idx: &[usize]) -> Vec<usize> {
-        let q: usize = shape[1..shape.len() - 1].iter().product();
-        idx.iter().flat_map(|&i| (i * q)..((i + 1) * q)).collect()
-    }
-
-    /// The slices `indices` name along dimension 0, on the device: an
-    /// embedding's lookup -- each stored row moved where it lies, two 64-byte
-    /// reads a tile column (`Session::gather_rows`), bit for bit. The table is
-    /// uploaded if it is on the host, as a matmul's operands are: a
-    /// parameter only an embedding reads would otherwise never reach the
-    /// card. Indices are read on the host. Other dimensions are unsupported.
+    /// Select slices with resident indices along any logical axis.
     pub fn float_select(
         tensor: FloatTensor<TtBackend>,
         dim: usize,
         indices: IntTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = tensor.device;
-        let shape = tensor.shape().to_vec();
-        if dim == 0
-            && shape.len() >= 2
-            && tensor.is_stored_f32()
-            && indices.shape().num_dims() == 1
-            && indices.shape().num_elements() > 0
-            && crate::server::supports_dram(device)
-        {
-            if let Some(idx) = index_values(&indices, shape[0]) {
-                if let Some(d) = Some(tensor.to_dram()).filter(|d| !d.transposed) {
-                    let rows: Vec<(usize, usize)> =
-                        rows_of(&shape, &idx).into_iter().map(|r| (0, r)).collect();
-                    let cols = shape[shape.len() - 1];
-                    let (id, dims) =
-                        crate::server::gather_rows(device, vec![d.buffer.id], rows, cols);
-                    let mut out = shape.clone();
-                    out[0] = idx.len();
-                    return device_result_shaped(
-                        device,
-                        id,
-                        dims,
-                        burn_backend::Shape::from(out),
-                        DType::F32,
-                    );
-                }
-            }
-        }
-        fail(
-            "float_select",
-            format_args!(
-                "tensor=({}), indices=({})",
-                context(&tensor),
-                context(&indices)
-            ),
-        )
+        select_native(tensor, dim, indices)
     }
 
-    /// `tensor` with `value`'s slice `i` added to its slice `indices[i]`
-    /// along dimension 0, in order -- an embedding's gradient -- on the device
-    /// where `value` is (`Session::rows_add`: only the rows the indices touch
-    /// are computed, in Flex's order of additions). Indices are read on the
-    /// host; unsupported dimensions fail explicitly.
+    /// Add selected slices in index order without downloading indices.
     pub fn float_select_add(
         tensor: FloatTensor<TtBackend>,
         dim: usize,
         indices: IntTensor<TtBackend>,
         value: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let device = tensor.device;
-        let shape = tensor.shape().to_vec();
-        let vshape = value.shape().to_vec();
-        if dim == 0
-            && shape.len() >= 2
-            && vshape.len() == shape.len()
-            && vshape[1..] == shape[1..]
-            && tensor.is_stored_f32()
-            && value.is_stored_f32()
-            && indices.shape().num_elements() == vshape[0]
-            && vshape[0] > 0
-            && crate::server::supports_dram(device)
-        {
-            if let Some(idx) = index_values(&indices, shape[0]) {
-                let t = tensor.to_dram().clone();
-                if let Some(v) = Some(value.to_dram()).filter(|d| !d.transposed).cloned() {
-                    if !t.transposed {
-                        let rows = rows_of(&shape, &idx);
-                        let (id, dims) =
-                            crate::server::rows_add(device, t.buffer.id, rows, v.buffer.id);
-                        return device_result_shaped(device, id, dims, tensor.shape(), DType::F32);
-                    }
-                }
-            }
-        }
-        fail(
-            "float_select_add",
-            format_args!(
-                "tensor=({}), indices=({}), value=({})",
-                context(&tensor),
-                context(&indices),
-                context(&value)
-            ),
-        )
+        select_add_native(tensor, dim, indices, value)
     }
 
     /// `mask ? value : x` on the device where the data is (the mask may be a
@@ -2564,13 +2730,104 @@ pub mod float {
 #[path = "pool.rs"]
 mod pooling;
 
+#[path = "conv.rs"]
+mod convolution;
+
 pub mod module {
+    pub use super::convolution::{
+        conv2d, conv2d_bias_backward, conv2d_weight_backward, conv2d_x_backward, conv_transpose2d,
+        conv_transpose2d_bias_backward, conv_transpose2d_weight_backward,
+        conv_transpose2d_x_backward, unfold4d,
+    };
     pub use super::pooling::{
         adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
         max_pool2d, max_pool2d_with_indices, max_pool2d_with_indices_backward,
     };
     use super::*;
     use burn_backend::Shape;
+
+    /// Pinned Burn's attention ordering, with replayable causal geometry.
+    /// BF16 inputs widen once; every intermediate remains F32 until the output.
+    pub fn attention(
+        query: TtTensor,
+        key: TtTensor,
+        value: TtTensor,
+        mask: Option<TtTensor>,
+        attn_bias: Option<TtTensor>,
+        options: burn_backend::ops::AttentionModuleOptions,
+    ) -> TtTensor {
+        let dtype = float_compute_dtype(&[&query, &key, &value]);
+        let qs = query.shape().to_vec();
+        let ks = key.shape().to_vec();
+        let vs = value.shape().to_vec();
+        assert!(
+            qs.len() == 4 && ks.len() == 4 && vs.len() == 4,
+            "attention requires rank four"
+        );
+        assert_eq!(qs[3], ks[3], "attention head dimensions differ");
+        assert_eq!(ks[2], vs[2], "attention key/value sequence lengths differ");
+        assert!(
+            !qs.contains(&0) && !ks.contains(&0) && !vs.contains(&0),
+            "attention requires nonempty inputs"
+        );
+        assert_eq!(query.device, key.device, "attention devices differ");
+        assert_eq!(query.device, value.device, "attention devices differ");
+        if let Some(cap) = options.softcap {
+            assert!(cap > 0.0, "softcap must be positive");
+        }
+        let device = query.device;
+        let scale = options.scale.unwrap_or_else(|| 1.0 / (qs[3] as f64).sqrt());
+        let query = float_compute_input(query);
+        let key = float_compute_input(key);
+        let value = float_compute_input(value);
+        let mut scores = float::float_mul_scalar(
+            float::float_matmul(query, float::float_transpose(key)),
+            scale.into(),
+        );
+        if let Some(cap) = options.softcap {
+            scores = float::float_mul_scalar(
+                float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                cap.into(),
+            );
+        }
+        if let Some(mask) = mask {
+            assert_eq!(device, mask.device, "attention mask device differs");
+            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
+        }
+        if options.is_causal {
+            let [sq, sk] = [qs[2], ks[2]];
+            let offset = sk as i128 - sq as i128;
+            let bits = (0..sq)
+                .flat_map(|r| (0..sk).map(move |c| u32::from(c as i128 > r as i128 + offset)))
+                .collect();
+            let id = crate::server::metadata(device, bits, [sq, sk], Elem::Bool);
+            let bool_dtype = burn_backend::get_device_settings::<TtBackend>(&device).bool_dtype;
+            let mask = device_result_shaped(
+                device,
+                id,
+                [sq, sk],
+                [1, 1, sq, sk].into(),
+                bool_dtype.into(),
+            );
+            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
+        }
+        if let Some(bias) = attn_bias {
+            assert_eq!(device, bias.device, "attention bias device differs");
+            assert_eq!(dtype, bias.dtype(), "attention bias dtype differs");
+            scores = float::float_add(scores, float_compute_input(bias));
+        }
+        let max =
+            float::float_clamp_min(float::float_max_dim(scores.clone(), 3), (-f32::MAX).into());
+        let exp = float::float_exp(float::float_sub(scores, max));
+        let sum = float::float_clamp_min(
+            float::float_sum_dim(exp.clone(), 3),
+            f32::MIN_POSITIVE.into(),
+        );
+        cast_native(
+            float::float_matmul(float::float_div(exp, sum), value),
+            dtype,
+        )
+    }
 
     /// Burn's own composition (`ModuleOps::embedding`'s default: a
     /// `select` of the table's rows, reshaped), through this backend's ops,
@@ -2875,6 +3132,29 @@ pub mod activation {
 
 pub mod int {
     use super::*;
+
+    pub fn int_gather(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+        gather_native(dim, tensor, indices)
+    }
+    pub fn int_select(tensor: TtTensor, dim: usize, indices: TtTensor) -> TtTensor {
+        select_native(tensor, dim, indices)
+    }
+    pub fn int_scatter_add(
+        dim: usize,
+        tensor: TtTensor,
+        indices: TtTensor,
+        value: TtTensor,
+    ) -> TtTensor {
+        scatter_add_native(dim, tensor, indices, value)
+    }
+    pub fn int_select_add(
+        tensor: TtTensor,
+        dim: usize,
+        indices: TtTensor,
+        value: TtTensor,
+    ) -> TtTensor {
+        select_add_native(tensor, dim, indices, value)
+    }
     use num_traits::ToPrimitive;
 
     pub fn int_add(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
@@ -2915,6 +3195,25 @@ pub mod int {
         let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
         device_eltwise(kind_sfpu::INT_MUL_S, f32::from_bits(bits), &lhs, None)
             .unwrap_or_else(|| fail("int_mul_scalar", context(&lhs)))
+    }
+
+    pub fn int_div(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_DIV, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("div(int)", context(&lhs)))
+    }
+    pub fn int_remainder(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_REM, 0.0, &lhs, Some(&rhs))
+            .unwrap_or_else(|| fail("remainder(int)", context(&lhs)))
+    }
+    pub fn int_div_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_DIV_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("div_scalar(int)", context(&lhs)))
+    }
+    pub fn int_remainder_scalar(lhs: TtTensor, rhs: burn_backend::Scalar) -> TtTensor {
+        let bits = rhs.to_i64().expect("integer scalar") as i32 as u32;
+        device_eltwise(kind_sfpu::INT_REM_S, f32::from_bits(bits), &lhs, None)
+            .unwrap_or_else(|| fail("remainder_scalar(int)", context(&lhs)))
     }
     pub fn bitwise_and(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
         device_eltwise(kind_sfpu::INT_AND, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
@@ -3097,6 +3396,11 @@ pub mod int {
             tt_kernels::sfpu::reduce::ReduceOp::SumI32,
         )
     }
+    pub fn int_mean_dim(tensor: TtTensor, dim: usize) -> TtTensor {
+        let count = i32::try_from(tensor.shape()[dim]).expect("integer mean count fits I32");
+        assert!(count > 0, "integer mean needs a nonempty axis");
+        int_div_scalar(int_sum_dim(tensor, dim), count.into())
+    }
     pub fn int_prod(tensor: TtTensor) -> TtTensor {
         reduce_integer(tensor, None, tt_kernels::sfpu::reduce::ReduceOp::ProdI32)
     }
@@ -3135,7 +3439,8 @@ pub mod int {
                 format_args!("shape={shape:?}, dtype={dtype:?}"),
             );
         }
-        int_from_data(TensorData::zeros::<i32, _>(shape), device)
+        native_zeros(shape.clone(), device, dtype.into())
+            .unwrap_or_else(|| int_from_data(TensorData::zeros::<i32, _>(shape), device))
     }
 
     pub fn int_random(
@@ -3196,12 +3501,23 @@ pub mod int {
     }
 
     /// Whole tile rows of a device matrix, a view; as `float_slice`.
+    pub fn int_slice_assign(
+        tensor: TtTensor,
+        slices: &[burn_backend::Slice],
+        value: TtTensor,
+    ) -> TtTensor {
+        slice_assign_native(tensor, slices, value)
+    }
+
     pub fn int_slice(
         tensor: IntTensor<TtBackend>,
         slices: &[burn_backend::Slice],
     ) -> IntTensor<TtBackend> {
         if let Some(v) = super::float::row_view(&tensor, slices) {
             return v;
+        }
+        if let Some(t) = sliced_native(&tensor, slices) {
+            return t;
         }
         let device = tensor.device;
         {
@@ -3218,6 +3534,9 @@ pub mod int {
         dim1: usize,
         dim2: usize,
     ) -> IntTensor<TtBackend> {
+        if let Some(v) = super::float::swapped_strided(&tensor, dim1, dim2) {
+            return v;
+        }
         if let Some(v) = swapped_view(&tensor, dim1, dim2) {
             return v;
         }
@@ -3248,6 +3567,29 @@ pub mod int {
 pub mod bool {
     use super::*;
 
+    pub fn bool_scatter_or(
+        dim: usize,
+        tensor: TtTensor,
+        indices: TtTensor,
+        value: TtTensor,
+    ) -> TtTensor {
+        scatter_add_native(dim, tensor, indices, value)
+    }
+    pub fn bool_select_or(
+        tensor: TtTensor,
+        dim: usize,
+        indices: TtTensor,
+        value: TtTensor,
+    ) -> TtTensor {
+        select_add_native(tensor, dim, indices, value)
+    }
+    pub fn bool_gather(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+        gather_native(dim, tensor, indices)
+    }
+    pub fn bool_select(tensor: TtTensor, dim: usize, indices: TtTensor) -> TtTensor {
+        select_native(tensor, dim, indices)
+    }
+
     pub fn bool_from_data(data: TensorData, device: &TtDevice) -> TtTensor {
         if !matches!(data.dtype, DType::Bool(_)) {
             fail("bool_from_data", context(&data));
@@ -3268,6 +3610,9 @@ pub mod bool {
         device: &TtDevice,
         dtype: burn_backend::BoolDType,
     ) -> TtTensor {
+        if let Some(out) = native_zeros(shape.clone(), device, dtype.into()) {
+            return out;
+        }
         bool_from_data(
             TensorData::zeros::<bool, _>(shape).convert_dtype(dtype.into()),
             device,
@@ -3395,12 +3740,23 @@ pub mod bool {
         reshaped(tensor, shape)
     }
 
+    pub fn bool_slice_assign(
+        tensor: TtTensor,
+        slices: &[burn_backend::Slice],
+        value: TtTensor,
+    ) -> TtTensor {
+        slice_assign_native(tensor, slices, value)
+    }
+
     pub fn bool_slice(
         tensor: BoolTensor<TtBackend>,
         slices: &[burn_backend::Slice],
     ) -> BoolTensor<TtBackend> {
         if let Some(v) = super::float::row_view(&tensor, slices) {
             return v;
+        }
+        if let Some(t) = sliced_native(&tensor, slices) {
+            return t;
         }
         let device = tensor.device;
         {
@@ -3416,6 +3772,9 @@ pub mod bool {
         dim1: usize,
         dim2: usize,
     ) -> BoolTensor<TtBackend> {
+        if let Some(v) = super::float::swapped_strided(&tensor, dim1, dim2) {
+            return v;
+        }
         if let Some(v) = swapped_view(&tensor, dim1, dim2) {
             return v;
         }

@@ -259,3 +259,73 @@ fn f32_pool_trace_replays_changed_inputs_and_retains_geometry() {
 fn bf16_pool_trace_replays_changed_inputs_and_retains_geometry() {
     trace_pooling(true);
 }
+
+fn batched_window_trace(bf16: bool) {
+    use burn::tensor::FloatDType;
+    with_device(
+        Config {
+            tiles: Some(burn_tt::TileChoice::Count(2)),
+            ..Config::default()
+        },
+        |d| {
+            // 36 outputs cross both batching limits; each 32-element window
+            // requires two GAPOOL blocks, with exact power-of-two division.
+            let values: Vec<_> = (0..2)
+                .flat_map(|p| {
+                    (0..9).flat_map(move |r| (0..10).map(move |c| (p * 16 + r + c) as f32))
+                })
+                .collect();
+            let input =
+                Tensor::<TtBackend, 4>::from_data(TensorData::new(values, [1, 2, 9, 10]), &d)
+                    .mul_scalar(1.0);
+            let TensorPrimitive::Float(primitive) = input.clone().into_primitive() else {
+                unreachable!()
+            };
+            let before = tensor_traffic();
+            let ((trace, first), report) = burn_tt::with_report(|| {
+                burn_tt::Trace::capture(&primitive, || {
+                    let x = if bf16 {
+                        input.clone().cast(FloatDType::BF16)
+                    } else {
+                        input.clone()
+                    };
+                    let out = module::avg_pool2d(x, [4, 8], [1, 1], [0, 0], false, false)
+                        .cast(FloatDType::F32);
+                    let TensorPrimitive::Float(out) = out.into_primitive() else {
+                        unreachable!()
+                    };
+                    out
+                })
+                .unwrap()
+            });
+            assert_native_model(&report);
+            assert_eq!(tensor_traffic().uploads, before.uploads);
+            let expected: Vec<_> = (0..2)
+                .flat_map(|p| {
+                    (0..6).flat_map(move |r| (0..3).map(move |c| (p * 16 + r + c + 5) as f32))
+                })
+                .collect();
+            assert_eq!(first, expected);
+            assert_ne!(first, vec![0.0; 36]);
+            for value in [-2.0, 4.0] {
+                assert_eq!(trace.run(vec![value; 180]).unwrap(), vec![value; 36]);
+            }
+            drop(trace);
+            assert_eq!(
+                input.sum().into_data().to_vec::<f32>().unwrap(),
+                vec![720.0]
+            );
+        },
+    );
+}
+
+#[test]
+fn f32_window_batches_trace_across_staging_boundaries() {
+    batched_window_trace(false);
+}
+
+#[cfg(feature = "silicon")]
+#[test]
+fn bf16_window_batches_trace_across_staging_boundaries() {
+    batched_window_trace(true);
+}

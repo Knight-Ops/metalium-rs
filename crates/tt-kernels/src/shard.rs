@@ -131,6 +131,15 @@ pub struct Fabric<T: Transport> {
     images: RoleImages<'static>,
     /// For each chip, the chips from 0 to it, inclusive.
     routes: Vec<Option<Vec<usize>>>,
+    execution: FabricExecution,
+}
+
+/// Completion evidence, recorded after Session compute and Ethernet mover ACKs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FabricExecution {
+    pub completed_matmuls: Vec<u64>,
+    pub acknowledged_ethernet_packets: u64,
+    pub acknowledged_ethernet_bytes: u64,
 }
 
 fn two_mut<X>(v: &mut [X], i: usize, j: usize) -> (&mut X, &mut X) {
@@ -165,11 +174,16 @@ impl<T: Transport> Fabric<T> {
             });
         }
         let routes = bfs(chips.len(), &hops);
+        let execution = FabricExecution {
+            completed_matmuls: vec![0; chips.len()],
+            ..Default::default()
+        };
         Ok(Fabric {
             chips,
             hops,
             images,
             routes,
+            execution,
         })
     }
 
@@ -179,6 +193,10 @@ impl<T: Transport> Fabric<T> {
 
     pub fn is_empty(&self) -> bool {
         self.chips.is_empty()
+    }
+
+    pub fn execution(&self) -> &FabricExecution {
+        &self.execution
     }
 
     /// Retain each chip's device in a session. Tensor payloads can then stay
@@ -389,6 +407,7 @@ impl<T: Transport> Fabric<T> {
                 let c = self.chips[peer]
                     .session()
                     .matmul_dram(&pa, false, &pb, false, route, fidelity, budget)?;
+                self.execution.completed_matmuls[peer] += 1;
                 temps.push((peer, c.clone()));
                 let c = transpose(self.chips[peer].session(), &c)?;
                 temps.push((peer, c.clone()));
@@ -443,6 +462,8 @@ impl<T: Transport> Fabric<T> {
         }
         let (dev, window) = c.parts();
         h.mover.send(dev, window, dir, src, dst, len)?;
+        self.execution.acknowledged_ethernet_packets += 1;
+        self.execution.acknowledged_ethernet_bytes += u64::from(len);
         Ok(())
     }
 

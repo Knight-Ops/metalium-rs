@@ -38,9 +38,9 @@ pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
 };
 pub use server::{
-    attach, device_traffic, kmd_engine, kmd_mesh_engine, AttachGuard, BufferId, DramBuffers, Elem,
-    Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind,
-    OutputPayload, PowArg, Serve, TraceRun,
+    attach, device_traffic, kmd_engine, kmd_mesh_engine, mesh_execution, AttachGuard, BufferId,
+    DramBuffers, Elem, Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine,
+    OutputKind, OutputPayload, PowArg, Serve, TraceRun,
 };
 pub use tensor::{TtQTensor, TtTensor};
 pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};

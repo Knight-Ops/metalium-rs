@@ -395,6 +395,36 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
     match Entry::decode(usable, w)? {
+        Entry::IndexPick { indices, source, output, bound, first, rows, bytes } => {
+            reader_only()?;
+            noc::wait(TXN);
+            publish();
+            // Validate every logical index before copying any datum. Padding
+            // indices are never read, and a chunk miss performs no access.
+            for r in 0..rows {
+                let at = dm::face_index(r as usize, 0) as u64;
+                let index = rd(indices as u64 + dm::TILE_DATA + at * 4);
+                if index >= bound { return Err(dm::error::DOMAIN); }
+            }
+            for r in 0..rows {
+                let dst = dm::face_index(r as usize, 0) as u64;
+                let index = rd(indices as u64 + dm::TILE_DATA + dst * 4);
+                if index < first || index - first >= 32 { continue; }
+                let src = dm::face_index(r as usize, (index - first) as usize) as u64;
+                let from = source as u64 + dm::TILE_DATA + src * bytes as u64;
+                let to = output as u64 + dm::TILE_DATA + dst * bytes as u64;
+                // SAFETY: decode bounds/alignment cover whole slots; r<32 and
+                // the checked chunk-relative index<32 bound both face indices.
+                unsafe {
+                    if bytes == 2 {
+                        core::ptr::write_volatile(to as *mut u16, core::ptr::read_volatile(from as *const u16));
+                    } else {
+                        core::ptr::write_volatile(to as *mut u32, core::ptr::read_volatile(from as *const u32));
+                    }
+                }
+            }
+            publish();
+        }
         Entry::CopyWords { src, dst, count, src_stride, dst_stride, halfwords } => {
             reader_only()?;
             noc::wait(TXN);
@@ -993,6 +1023,7 @@ fn call(
         }
         result?;
         done += n;
+        wr(M.at(dm::TRACE_PROGRESS), rd(M.at(dm::TRACE_PROGRESS)).wrapping_add(1));
     }
     Ok(())
 }

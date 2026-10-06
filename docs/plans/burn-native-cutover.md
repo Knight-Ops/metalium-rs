@@ -23,7 +23,7 @@ gate, including native scalar broadcasting and ragged transpose copies.
 
 ## Remaining operation coverage
 
-Missing convolution, FFT, sorting, quantized compute, integer division/remainder, and
+Missing convolution, FFT, sorting, quantized compute, and
 other required methods fail explicitly. Unsupported shapes of implemented
 operations also fail explicitly. Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across chips and move tile slots over Ethernet without host tensor
@@ -76,7 +76,10 @@ semantics. `step74`–`step78` validate resident computation on both cards; late
 BF16 narrowing is refused by pinned ttsim, so those arithmetic gates are silicon-only.
 Mesh BF16, pooling traces, compact packed gathers and packed K continuations
 are now gated; batched BF16 products and integer reductions are resident.
-Integer division/remainder remains disabled after a failing domain-flag gate.
+Checked integer division/remainder and axis mean now pass `step82` in ttsim;
+card-0 silicon gates also pass (`1791232718`). Native attention, ragged F32
+batches and actual two-chip batched products pass the `step83` simulator and
+silicon gates, including BF16 resident training. Broader acceptance remains open.
 See `tensix-next-features.md` for the current handoff and validation evidence.
 BF16 is slower on the measured MNIST GEMMs; see `tensix-next-features.md`.
 
@@ -105,3 +108,12 @@ exponent-section layouts and decoders. Before advertising backend support:
    be assumed to match Tenstorrent block exponent semantics.
 
 Until those gates pass, BFP formats are not reported as supported by `burn-tt`.
+
+### Convolution and resident-index continuation (2026-10-05)
+
+Native module convolution/unfold routes and gradients, resident arbitrary-axis
+indices and raw slice assignment are now overridden/generated. Default cat,
+repeat, Conv1D, embedding and autodiff compose these primitives. Mesh batched
+matmul now partitions products, so convolution/attention forwards and gradients
+execute on both cards. See tensix-next-features.md for gate run IDs and open
+acceptance items; this does not close the entire backend inventory.

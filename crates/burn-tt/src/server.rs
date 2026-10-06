@@ -176,6 +176,29 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
+    fn zeros_dram(
+        &mut self,
+        _dims: [usize; 2],
+        _elem: Elem,
+        _bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    fn gather_indexed(
+        &mut self,
+        _input: BufferId,
+        _indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
+    fn repack_many(
+        &mut self,
+        _inputs: &[BufferId],
+        _sources: &[(usize, [usize; 2])],
+        _dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
     /// Rows of `sources` gathered into a new buffer
     /// (`Session::gather_rows`): an embedding's lookup.
     fn gather_rows(
@@ -263,6 +286,9 @@ pub trait Engine {
     /// (`tt_device::Device::traffic`): tensors, descriptors, programs and
     /// polls alike. `None` if the engine has no single device to ask.
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
+        None
+    }
+    fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
         None
     }
     /// Start capturing a trace (`tt_kernels::trace`; [`crate::Trace`]).
@@ -541,6 +567,18 @@ impl DramBuffers {
         src: BufferId,
         dst: BufferId,
     ) -> Result<(), EngineError> {
+        if let Some(src_t) = self.bf16.get(&src) {
+            let dst_t = self
+                .bf16
+                .get(&dst)
+                .ok_or_else(|| EngineError("copy_into storage formats differ".into()))?;
+            return s
+                .copy_into_bf16(src_t, dst_t)
+                .map_err(|e| EngineError(e.to_string()));
+        }
+        if self.bf16.contains_key(&dst) {
+            return Err(EngineError("copy_into storage formats differ".into()));
+        }
         let src_t = self.get(src)?;
         let dst_t = self.get(dst)?;
         s.copy_into(src_t, dst_t)
@@ -790,6 +828,78 @@ impl DramBuffers {
             .repack(&ta, sources, dims)
             .map_err(|e| EngineError(e.to_string()))?;
         Ok(self.insert(c))
+    }
+
+    pub fn zeros<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        dims: [usize; 2],
+        elem: Elem,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if bf16 {
+            let out = s.zeros_bf16(dims).map_err(|e| EngineError(e.to_string()))?;
+            Ok(self.insert_bf16(out))
+        } else {
+            let count = dims[0]
+                .checked_mul(dims[1])
+                .ok_or_else(|| EngineError("zero shape overflow".into()))?;
+            let out = s
+                .metadata(&vec![0; count], dims, elem)
+                .map_err(|e| EngineError(e.to_string()))?;
+            Ok(self.insert(out))
+        }
+    }
+
+    pub fn gather_indexed<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let indices = self.get(indices)?.clone();
+        if let Some(t) = self.bf16.get(&input) {
+            let out = s
+                .gather_indexed_bf16(t, &indices)
+                .map_err(|e| EngineError(e.to_string()))?;
+            Ok(self.insert_bf16(out))
+        } else {
+            let out = s
+                .gather_indexed(self.get(input)?, &indices)
+                .map_err(|e| EngineError(e.to_string()))?;
+            Ok(self.insert(out))
+        }
+    }
+
+    pub fn repack_many<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        inputs: &[BufferId],
+        sources: &[(usize, [usize; 2])],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        if inputs.first().is_some_and(|a| self.bf16.contains_key(a)) {
+            let ts = inputs
+                .iter()
+                .map(|a| {
+                    self.bf16
+                        .get(a)
+                        .ok_or_else(|| EngineError("mixed repack storage".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let out = s
+                .repack_many_bf16(&ts, sources, dims)
+                .map_err(|e| EngineError(e.to_string()))?;
+            return Ok(self.insert_bf16(out));
+        }
+        let ts = inputs
+            .iter()
+            .map(|&a| self.get(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let out = s
+            .repack_many(&ts, sources, dims)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(out))
     }
 
     pub fn copy_blocks<T: tt_device::Transport>(
@@ -1077,6 +1187,10 @@ pub(crate) fn attached_count() -> usize {
     with_attached(|a| a.len())
 }
 
+pub(crate) fn is_attached(device: TtDevice) -> bool {
+    with_attached(|a| a.contains_key(&device))
+}
+
 /// Keeps `device` attached; dropping it detaches the device and drops its
 /// hardware.
 #[must_use = "dropping the guard detaches the device at once"]
@@ -1278,6 +1392,11 @@ pub(crate) fn supports_dram(device: TtDevice) -> bool {
 /// frees included, so it counts all of them.
 pub fn device_traffic(device: TtDevice) -> Option<tt_device::Traffic> {
     run(device, |engine, _| engine.device_traffic())
+}
+
+/// Wait for queued work, then report completed per-chip products and mover ACKs.
+pub fn mesh_execution(device: TtDevice) -> Option<tt_kernels::shard::FabricExecution> {
+    run(device, |engine, _| engine.mesh_execution())
 }
 
 /// Upload, panicking on a device error.
@@ -1649,6 +1768,57 @@ pub(crate) fn repack(
     )
 }
 
+pub(crate) fn zeros(
+    device: TtDevice,
+    dims: [usize; 2],
+    elem: Elem,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "zeros",
+        device,
+        dims,
+        || "native initialization".into(),
+        move |engine, _| engine.zeros_dram(dims, elem, bf16),
+    )
+}
+
+pub(crate) fn gather_indexed(
+    device: TtDevice,
+    input: BufferId,
+    indices: BufferId,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "gather_indexed",
+        device,
+        dims,
+        || "checked resident indices".into(),
+        move |engine, ids| engine.gather_indexed(ids.get(input)?, ids.get(indices)?),
+    )
+}
+
+pub(crate) fn repack_many(
+    device: TtDevice,
+    inputs: Vec<BufferId>,
+    sources: Vec<(usize, [usize; 2])>,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "repack_many",
+        device,
+        dims,
+        || "multiple resident sources".into(),
+        move |engine, ids| {
+            let inputs = inputs
+                .iter()
+                .map(|&a| ids.get(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            engine.repack_many(&inputs, &sources, dims)
+        },
+    )
+}
+
 // --- Silicon ------------------------------------------------------------------
 
 /// The silicon engine: a [`Session`] on `/dev/tenstorrent/N`.
@@ -1876,6 +2046,36 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.repack(&mut self.session, a, sources, dims)
+    }
+    fn zeros_dram(
+        &mut self,
+        dims: [usize; 2],
+        elem: Elem,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .zeros(&mut self.session, dims, elem, bf16)
+    }
+    fn gather_indexed(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .gather_indexed(&mut self.session, input, indices)
+    }
+    fn repack_many(
+        &mut self,
+        inputs: &[BufferId],
+        sources: &[(usize, [usize; 2])],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.repack_many(&mut self.session, inputs, sources, dims)
     }
     fn gather_rows(
         &mut self,
@@ -2329,17 +2529,78 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         items: &[(Block, Block)],
         mkn: [usize; 3],
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
-        let bufs = &mut self.buffers;
-        bufs.matmul_batched(
-            self.fabric.chips[0].session(),
-            a,
-            b,
-            items,
-            mkn,
-            self.route,
-            self.fidelity,
-            self.budget,
-        )
+        let [m, k, n] = mkn;
+        if items.is_empty() || mkn.contains(&0) {
+            return Err(EngineError(
+                "mesh batched matmul requires nonempty products".into(),
+            ));
+        }
+        let fits = |id, block: Block, rows, cols| -> Result<(), EngineError> {
+            let source = self.buffers.get(id)?;
+            let [rows, cols] = if block.transposed {
+                [cols, rows]
+            } else {
+                [rows, cols]
+            };
+            if block.at[0]
+                .checked_add(rows)
+                .is_none_or(|end| end > source.rows)
+                || block.at[1]
+                    .checked_add(cols)
+                    .is_none_or(|end| end > source.cols)
+            {
+                return Err(EngineError(
+                    "mesh batched matrix block is out of bounds".into(),
+                ));
+            }
+            Ok(())
+        };
+        for &(ba, bb) in items {
+            fits(a, ba, m, k)?;
+            fits(b, bb, k, n)?;
+        }
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let mut outputs = Vec::with_capacity(items.len());
+            for &(ba, bb) in items {
+                let mapping = |block: Block, rows: usize, cols: usize| {
+                    (0..rows)
+                        .flat_map(move |r| {
+                            (0..cols).map(move |c| {
+                                if block.transposed {
+                                    [block.at[0] + c, block.at[1] + r]
+                                } else {
+                                    [block.at[0] + r, block.at[1] + c]
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let (pa, _) = self.repack(a, &mapping(ba, m, k), [m, k])?;
+                temporary.push(pa);
+                let (pb, _) = self.repack(b, &mapping(bb, k, n), [k, n])?;
+                temporary.push(pb);
+                // Every batch product uses the column partitions and resident
+                // Ethernet transfers, including the backward products.
+                let (out, _) = self.matmul_dram(pa, false, pb, false)?;
+                // Retain only outputs across batches. Session defers operand
+                // frees until their queued work retires.
+                temporary.pop();
+                self.free(pb);
+                temporary.pop();
+                self.free(pa);
+                temporary.push(out);
+                outputs.push(out);
+            }
+            let rows = (0..items.len())
+                .flat_map(|batch| (0..m).map(move |r| (batch, r)))
+                .collect::<Vec<_>>();
+            self.gather_rows(&outputs, &rows, n)
+        })();
+        for id in temporary {
+            self.free(id);
+        }
+        result
     }
     fn copy_blocks(
         &mut self,
@@ -2359,6 +2620,33 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .repack(self.fabric.chips[0].session(), a, sources, dims)
     }
+    fn zeros_dram(
+        &mut self,
+        dims: [usize; 2],
+        elem: Elem,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .zeros(self.fabric.chips[0].session(), dims, elem, bf16)
+    }
+    fn gather_indexed(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .gather_indexed(self.fabric.chips[0].session(), input, indices)
+    }
+    fn repack_many(
+        &mut self,
+        inputs: &[BufferId],
+        sources: &[(usize, [usize; 2])],
+        dims: [usize; 2],
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .repack_many(self.fabric.chips[0].session(), inputs, sources, dims)
+    }
+
     fn gather_rows(
         &mut self,
         sources: &[BufferId],
@@ -2376,6 +2664,9 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
+        Some(self.fabric.execution().clone())
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.fabric.chips[0].device().traffic())

@@ -277,7 +277,7 @@ pub(crate) fn roles_code_validated(
         ));
         if checked {
             pack.extend(pack_tile_from_dst(
-                slot(layout.b_at.expect("domain flags"), n) + tt_isa::dm::TILE_DATA,
+                slot(layout.c_at.expect("domain status slots"), n) + tt_isa::dm::TILE_DATA,
                 C_ROW,
             ));
         }
