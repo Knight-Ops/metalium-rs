@@ -328,7 +328,8 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 |---|:-:|:-:|:-:|:-:|:-:|---|
 | `MVMUL`, fidelity phases `Lo`..`HiFi4` | x (measured) | x | x | x | x | done (Phases 6–7) |
 | `ZEROACC`, `ZEROSRC` | x (`ZEROACC` measured) | | x | x | x | -- |
-| `MOVA2D`, `MOVB2D`, `MOVD2A`, `MOVD2B`, `MOVB2A` | x (measured) | `~` (`mova2d`, `movb2d`) | | x | x | F1 |
+| `MOVA2D`, `MOVB2D` | x (measured) | x (`Banks`) | x (FPU transpose and source readback) | x | x | F1 |
+| `MOVD2A`, `MOVD2B`, `MOVB2A` | x (step9 measured address modifiers, including entry 4) | x (`Banks`, one/four-row, Loaded destination) | x (explicit Session chains; instruction/traffic audit) | x (step97 four-row conversion and chains) | x (step97 both cards, one/four rows, masks and exceptional data) | F1 done |
 | `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured BH) | x (`Banks`) | x | x (F32 output) | x both | M1 |
 | `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
 | `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | x | x (TF32 Src) | x both (step87) | M3 partial |
@@ -409,10 +410,10 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [x] `TRNSPSRCB`: native SrcB block permutation gated on both cards (step87); M3 payload-preserving tensor transpose remains partial.
 - [ ] `SHIFTXA`: Shift $SrcA$ across lanes. Item M4.
 - [ ] `SHIFTXB`: Rotate $SrcB$ row across matrix registers. Item M4.
-- [ ] `MOVD2A`: Matrix register copy $Dst \to SrcA$.
-- [ ] `MOVD2B`: Matrix register copy $Dst \to SrcB$.
-- [ ] `MOVB2A`: Matrix register copy $SrcB \to SrcA$.
-- [ ] `MOVB2D`: Matrix register copy $SrcB \to Dst$.
+- [x] `MOVD2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
+- [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
+- [x] `MOVB2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
+- [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
 - [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
 - [ ] `ZEROSRC`: Clear source registers $SrcA$ / $SrcB$.
 - [ ] `CLEARDVALID`: Invalidate $Dst$ scoreboard without writing zeroes.
@@ -455,11 +456,11 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [x] `SFPSTOCHRND`: Hardware nearest, stochastic, and toward-zero rounding (validated in `step81`).
 - [x] `SFPNOP`: Vector unit pipeline no-op.
 - [ ] `SFPLOADMACRO`: Silicon macro loader (bundles $Dst$ load with up to 4 scheduled vector micro-ops). Item S9.
-- [ ] `SFPDIVP2`: Lanewise power-of-2 division/multiplication via exponent modification.
-- [ ] `SFPSWAP`: Lanewise simultaneous min/max register swap.
-- [ ] `SFPADDI`: Vector addition with baked 16-bit BF16 immediate.
-- [ ] `SFPMULI`: Vector multiplication with baked 16-bit BF16 immediate.
-- [ ] `SFPLUT` / `SFPLUTFP32`: Fast hardware lookup-table polynomial interpolation. Item S10.
+- [x] `SFPDIVP2`: `Program::scale_by_pow2`, interpreter/device gate step26; wrapping immediates separately gated on both cards (divergence 66).
+- [x] `SFPSWAP`: `Program::min_max`, step26 interpreter/device comparisons and production reductions. Argmin/argmax variants are separate scope.
+- [x] `SFPADDI`: `Program::addi`, BF16-immediate interpreter/device comparison in step26.
+- [x] `SFPMULI`: `Program::muli`, BF16-immediate interpreter/device comparison in step26.
+- [ ] `SFPLUT` / `SFPLUTFP32`: delivered table forms already have step26 device gates; simulator restrictions are divergence 70. Broader lookup adoption remains Item S10; an unchecked item does not imply missing encoding/semantic evidence.
 
 #### Unpackers & Packers (16 instructions)
 - [x] `UNPACR_Regular`: Streaming unpack from L1 to $SrcA$, $SrcB$, or $Dst$.
@@ -1803,3 +1804,35 @@ Dst base register 6; these exclusions are documented in ttsim-divergence.md.
       checks pass; logs `target/silicon/m1-broadcast-*.log`.
 - [x] All five MNIST e2e regressions pass (267.70 s), golden unchanged;
       `target/silicon/m1-broadcast-mnist.log`.
+
+### F1 resident matrix register chains (2026-10-06)
+
+`Session::matrix_eltwise_chain` accepts equal-shape resident F32 operands and
+returns F32. `MatrixChainTail::{WithRhs,WithLhs,Square}` selects Dst-to-SrcA,
+Dst-to-SrcB, or Dst-to-SrcB followed by SrcB-to-SrcA. Both stages use the selected
+TF32/BF16 precision and fidelity. The intermediate is explicitly truncated to
+10/7 fraction bits; this API does not promise F32 intermediate precision.
+No Burn routing, mesh, autodiff or automatic fusion changes are included.
+
+Step97 covers every first op/tail/precision/fidelity, aligned/ragged shapes,
+one/two tiles, raw exceptional move datums, poisoned padding, parent row views,
+downstream reductions/matmul, changed-input replay and deferred operand frees.
+Independent finite-domain f64 phase/grid models and composed error bounds live
+beside the gates; raw physical-format reference ports live in `matrix::moves`.
+Safe omitted/swapped/wrong-row/stale-accumulator controls fail comparison on the
+device. Builder audits require only final GDDR allocation, two reads and one
+write per tile, the expected moves, no SFPU arithmetic and one release per bank
+per face. Output padding is undefined; parent claims are preserved.
+
+Four-row semantics/chains pass ttsim (8/8 step97); both-card step97 passes
+20/20 (`1791317039`). Unaligned row arguments and lane masks use silicon-only
+arms; one-row moves are silicon-only (divergence 37 and the step97 addendum).
+Silicon aligns read addresses but leaves Src write addresses unaligned; the
+independent reference port includes this measured correction. Production uses
+aligned addresses. Semantic gates and production instruction audits establish
+the three move completions. Full release silicon SMOKE passes on both cards
+(`1791317135`, 388/388), including expanded one-row offsets/wrapping and MNIST.
+The release benchmark passes on both cards (`1791317719`): measured cases
+improve 1.38–1.48×, with region/batch counts halved. Conditions and medians are
+recorded in firmware-performance.md; no application speedup is claimed. Encoding
+provenance is unchanged.

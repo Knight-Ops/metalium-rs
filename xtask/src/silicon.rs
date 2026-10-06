@@ -142,6 +142,7 @@ pub const SMOKE: &[&str] = &[
     "step94_bfp_storage::",
     "step95_burn_bfp::",
     "step96_mixed_bfp_mnist::",
+    "step97_matrix_register_moves::",
     "step9_matmul::elw_broadcast_assignment_and_destination_fields",
     "step9_matmul::elw_oracles_reject_safe_instruction_mutants",
 ];

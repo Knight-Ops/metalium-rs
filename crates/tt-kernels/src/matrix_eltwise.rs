@@ -30,6 +30,18 @@ impl SrcPrecision {
     }
 }
 
+/// Second stage of a resident matrix chain. Dst-to-Src conversion truncates
+/// the intermediate to TF32 (10 fraction bits) or BF16 (7 fraction bits).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum MatrixChainTail {
+    /// `op(Q(first(a, b)), b)`.
+    WithRhs(MatrixEltwiseOp),
+    /// `op(a, Q(first(a, b)))`.
+    WithLhs(MatrixEltwiseOp),
+    /// `Q(first(a, b)) * Q(first(a, b))`.
+    Square,
+}
+
 /// Immutable engine selection. SFPU preserves the existing numerical contract.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ElementwiseMode {
@@ -63,11 +75,12 @@ pub(crate) struct Config {
     pub fidelity: Fidelity,
     pub op: MatrixEltwiseOp,
     pub broadcast: SrcBroadcast,
+    pub tail: Option<MatrixChainTail>,
 }
 
 /// One physical tile, four face unpacks and eight aligned 8×16 consumers.
-/// All state is established per invocation; four releases leave bank pointers
-/// in lockstep. Dst is cleared before any multiplication phase.
+/// All state is established per invocation; each bank is released once per
+/// face, leaving bank pointers in lockstep. Multiplication starts with clear Dst.
 fn roles(
     packed: bool,
     precision: SrcPrecision,
@@ -75,6 +88,7 @@ fn roles(
     op: MatrixEltwiseOp,
     broadcast: SrcBroadcast,
     simulated: bool,
+    tail: Option<MatrixChainTail>,
 ) -> Arc<[Vec<Instruction>; 3]> {
     type Key = (
         bool,
@@ -83,12 +97,13 @@ fn roles(
         MatrixEltwiseOp,
         SrcBroadcast,
         bool,
+        Option<MatrixChainTail>,
     );
     type Cache = std::collections::HashMap<Key, Arc<[Vec<Instruction>; 3]>>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     cache
-        .entry((packed, precision, fidelity, op, broadcast, simulated))
+        .entry((packed, precision, fidelity, op, broadcast, simulated, tail))
         .or_insert_with(|| {
             let l = kernel::plan_layout(1, kernel::Operands::Binary).unwrap();
             let sems = l.sems;
@@ -110,6 +125,28 @@ fn roles(
             config
                 .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
                 .unwrap();
+            if tail.is_some() {
+                math.push(datapath::thread_entry(
+                    thread::DISABLE_IMPLIED_SRCA_FMT_Base,
+                    1,
+                ));
+                math.push(datapath::thread_entry(
+                    thread::DISABLE_IMPLIED_SRCB_FMT_Base,
+                    1,
+                ));
+                config
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcA_override, 1)
+                    .unwrap();
+                config
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcA_val, precision.code())
+                    .unwrap();
+                config
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcB_override, 1)
+                    .unwrap();
+                config
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcB_val, precision.code())
+                    .unwrap();
+            }
             math.extend(datapath::config_program(&config));
             math.extend(crate::matmul::math_prelude());
             let mut empty = Banks::after_reset();
@@ -181,35 +218,104 @@ fn roles(
                 up.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
                 up.extend(sync::post_after(Unit::Unpacker1, sems.unpacked));
                 math.extend(sync::take(sems.unpacked, Before::MATRIX));
-                for half in 0..2 {
-                    math.push(
-                        encode::Setrwc::ZERO
-                            .src_a(1)
-                            .src_a_val(half * 8)
-                            .src_b(1)
-                            .src_b_val(if broadcast.row() != 0 { 0 } else { half * 8 })
-                            .dst(1)
-                            .dst_val(0)
-                            .fidelity(1)
-                            .encode()
-                            .unwrap(),
-                    );
-                    let phases = if op == MatrixEltwiseOp::Mul {
-                        fidelity.phases()
-                    } else {
-                        1
-                    };
-                    // The last consumer below releases both banks exactly once.
-                    for _ in 0..phases - u32::from(half == 1) {
+                if let Some(tail) = tail {
+                    for half in 0..2 {
                         let dst = face as u32 * 16 + half * 8;
-                        let (i, next) = match op {
-                            MatrixEltwiseOp::Add => {
-                                banks.elwadd(encode::Elwadd::ZERO.dst_row(dst), broadcast)
+                        math.push(chain_rwc(half));
+                        banks = emit_stage(&mut math, banks, op, fidelity, dst);
+                        for row in [0, 4] {
+                            let (i, next) = match tail {
+                                MatrixChainTail::WithRhs(_) => banks.movd2a(
+                                    encode::Movd2A::ZERO
+                                        .move4_rows(1)
+                                        .src_row(row)
+                                        .dst_row(dst + row),
+                                ),
+                                _ => banks.movd2b(
+                                    encode::Movd2B::ZERO
+                                        .move4_rows(1)
+                                        .src_row(row)
+                                        .dst_row(dst + row),
+                                ),
                             }
-                            MatrixEltwiseOp::Sub => {
-                                banks.elwsub(encode::Elwsub::ZERO.dst_row(dst), broadcast)
+                            .unwrap();
+                            math.push(i);
+                            banks = next;
+                        }
+                        if tail == MatrixChainTail::Square {
+                            for row in [0, 4] {
+                                let (i, next) = banks.movb2a(row, 0, true, row).unwrap();
+                                math.push(i);
+                                banks = next;
                             }
-                            MatrixEltwiseOp::Mul => banks.elwmul(
+                        }
+                        // Only this half is cleared: earlier final rows stay live
+                        // until the packer consumes the entire tile.
+                        // Sixteen physical rows are eight FP32 rows. Avoid
+                        // one-row ZEROACC's silicon physical-address behavior
+                        // (divergence 51) while preserving earlier final halves.
+                        math.push(encode::zeroacc(1, 0, 0, dst / 8).unwrap());
+                        math.push(chain_rwc(half));
+                        let second = match tail {
+                            MatrixChainTail::WithRhs(op) | MatrixChainTail::WithLhs(op) => op,
+                            MatrixChainTail::Square => MatrixEltwiseOp::Mul,
+                        };
+                        banks = emit_stage(&mut math, banks, second, fidelity, dst);
+                    }
+                    let (i, next) = banks.release_a().unwrap();
+                    math.push(i);
+                    let (i, next) = next.release_b().unwrap();
+                    math.push(i);
+                    empty = next;
+                } else {
+                    for half in 0..2 {
+                        math.push(
+                            encode::Setrwc::ZERO
+                                .src_a(1)
+                                .src_a_val(half * 8)
+                                .src_b(1)
+                                .src_b_val(if broadcast.row() != 0 { 0 } else { half * 8 })
+                                .dst(1)
+                                .dst_val(0)
+                                .fidelity(1)
+                                .encode()
+                                .unwrap(),
+                        );
+                        let phases = if op == MatrixEltwiseOp::Mul {
+                            fidelity.phases()
+                        } else {
+                            1
+                        };
+                        // The last consumer below releases both banks exactly once.
+                        for _ in 0..phases - u32::from(half == 1) {
+                            let dst = face as u32 * 16 + half * 8;
+                            let (i, next) = match op {
+                                MatrixEltwiseOp::Add => {
+                                    banks.elwadd(encode::Elwadd::ZERO.dst_row(dst), broadcast)
+                                }
+                                MatrixEltwiseOp::Sub => {
+                                    banks.elwsub(encode::Elwsub::ZERO.dst_row(dst), broadcast)
+                                }
+                                MatrixEltwiseOp::Mul => banks.elwmul(
+                                    encode::Elwmul::ZERO
+                                        .dst_row(dst)
+                                        .addr_mod(crate::matmul::MATH_AM_PHASE),
+                                    broadcast,
+                                ),
+                            }
+                            .unwrap();
+                            math.push(i);
+                            banks = next;
+                        }
+                    }
+                    let dst = face as u32 * 16 + 8;
+                    let (i, next) =
+                        match op {
+                            MatrixEltwiseOp::Add => banks
+                                .elwadd_release_both(encode::Elwadd::ZERO.dst_row(dst), broadcast),
+                            MatrixEltwiseOp::Sub => banks
+                                .elwsub_release_both(encode::Elwsub::ZERO.dst_row(dst), broadcast),
+                            MatrixEltwiseOp::Mul => banks.elwmul_release_both(
                                 encode::Elwmul::ZERO
                                     .dst_row(dst)
                                     .addr_mod(crate::matmul::MATH_AM_PHASE),
@@ -217,28 +323,30 @@ fn roles(
                             ),
                         }
                         .unwrap();
-                        math.push(i);
-                        banks = next;
-                    }
+                    math.push(i);
+                    empty = next;
                 }
-                let dst = face as u32 * 16 + 8;
-                let (i, next) = match op {
-                    MatrixEltwiseOp::Add => {
-                        banks.elwadd_release_both(encode::Elwadd::ZERO.dst_row(dst), broadcast)
-                    }
-                    MatrixEltwiseOp::Sub => {
-                        banks.elwsub_release_both(encode::Elwsub::ZERO.dst_row(dst), broadcast)
-                    }
-                    MatrixEltwiseOp::Mul => banks.elwmul_release_both(
-                        encode::Elwmul::ZERO
-                            .dst_row(dst)
-                            .addr_mod(crate::matmul::MATH_AM_PHASE),
-                        broadcast,
-                    ),
-                }
-                .unwrap();
-                math.push(i);
-                empty = next;
+            }
+            if tail.is_some() {
+                // Subsequent ordinary kernels use unpacker's implied formats.
+                // Source ownership is already released; restore format selection
+                // without changing DVALID or bank pointers.
+                math.push(datapath::thread_entry(
+                    thread::DISABLE_IMPLIED_SRCA_FMT_Base,
+                    0,
+                ));
+                math.push(datapath::thread_entry(
+                    thread::DISABLE_IMPLIED_SRCB_FMT_Base,
+                    0,
+                ));
+                let mut defaults = ConfigWords::new();
+                defaults
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcA_override, 0)
+                    .unwrap();
+                defaults
+                    .set(alu::ALU_FORMAT_SPEC_REG_SrcB_override, 0)
+                    .unwrap();
+                math.extend(datapath::config_program(&defaults));
             }
             math.extend(sync::post_after(Unit::Matrix, sems.computed));
             let mut pack = vec![datapath::state_id()];
@@ -251,6 +359,52 @@ fn roles(
             Arc::new([up, math, pack])
         })
         .clone()
+}
+
+fn chain_rwc(half: u32) -> Instruction {
+    encode::Setrwc::ZERO
+        .src_a(1)
+        .src_a_val(half * 8)
+        .src_b(1)
+        .src_b_val(half * 8)
+        .dst(1)
+        .dst_val(0)
+        .fidelity(1)
+        .encode()
+        .unwrap()
+}
+
+fn emit_stage(
+    p: &mut Vec<Instruction>,
+    mut banks: Banks<tt_isa::matrix::Loaded, tt_isa::matrix::Loaded>,
+    op: MatrixEltwiseOp,
+    fidelity: Fidelity,
+    dst: u32,
+) -> Banks<tt_isa::matrix::Loaded, tt_isa::matrix::Loaded> {
+    for _ in 0..if op == MatrixEltwiseOp::Mul {
+        fidelity.phases()
+    } else {
+        1
+    } {
+        let (i, next) = match op {
+            MatrixEltwiseOp::Add => {
+                banks.elwadd(encode::Elwadd::ZERO.dst_row(dst), SrcBroadcast::None)
+            }
+            MatrixEltwiseOp::Sub => {
+                banks.elwsub(encode::Elwsub::ZERO.dst_row(dst), SrcBroadcast::None)
+            }
+            MatrixEltwiseOp::Mul => banks.elwmul(
+                encode::Elwmul::ZERO
+                    .dst_row(dst)
+                    .addr_mod(crate::matmul::MATH_AM_PHASE),
+                SrcBroadcast::None,
+            ),
+        }
+        .unwrap();
+        p.push(i);
+        banks = next;
+    }
+    banks
 }
 
 pub(crate) fn build(
@@ -268,10 +422,11 @@ pub(crate) fn build(
         fidelity,
         op,
         broadcast,
+        tail,
     } = config;
     let l = kernel::plan_layout(1, kernel::Operands::Binary)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let roles = roles(packed, precision, fidelity, op, broadcast, simulated);
+    let roles = roles(packed, precision, fidelity, op, broadcast, simulated, tail);
     let out = DramTensor::alloc_elem(alloc, dims[0], dims[1], Elem::F32)?;
     out.set_pad(Pad::Undefined);
     let mut jobs = vec![vec![]; units];
@@ -336,6 +491,137 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chain_streams_reuse_registers_and_submit_only_two_reads_one_write() {
+        use tt_isa::dram::Dram;
+        for first in [
+            MatrixEltwiseOp::Add,
+            MatrixEltwiseOp::Sub,
+            MatrixEltwiseOp::Mul,
+        ] {
+            for tail in [
+                MatrixChainTail::WithRhs(MatrixEltwiseOp::Add),
+                MatrixChainTail::WithLhs(MatrixEltwiseOp::Sub),
+                MatrixChainTail::Square,
+            ] {
+                for precision in [SrcPrecision::Tf32, SrcPrecision::Bf16] {
+                    for simulated in [false, true] {
+                        let program = roles(
+                            false,
+                            precision,
+                            Fidelity::HiFi4,
+                            first,
+                            SrcBroadcast::None,
+                            simulated,
+                            Some(tail),
+                        );
+                        assert!(Arc::ptr_eq(
+                            &program,
+                            &roles(
+                                false,
+                                precision,
+                                Fidelity::HiFi4,
+                                first,
+                                SrcBroadcast::None,
+                                simulated,
+                                Some(tail)
+                            )
+                        ));
+                        let math = &program[1];
+                        let count =
+                            |name| math.iter().filter(|i| i.def().mnemonic() == name).count();
+                        assert_eq!(
+                            count("MOVD2A"),
+                            if matches!(tail, MatrixChainTail::WithRhs(_)) {
+                                16
+                            } else {
+                                0
+                            }
+                        );
+                        assert_eq!(
+                            count("MOVD2B"),
+                            if matches!(tail, MatrixChainTail::WithRhs(_)) {
+                                0
+                            } else {
+                                16
+                            }
+                        );
+                        assert_eq!(
+                            count("MOVB2A"),
+                            if tail == MatrixChainTail::Square {
+                                16
+                            } else {
+                                0
+                            }
+                        );
+                        assert_eq!(count("ZEROACC"), 9);
+                        assert!(math
+                            .iter()
+                            .filter(|i| i.def().mnemonic().starts_with("ELW"))
+                            .all(|i| i.word() & (3 << 22) == 0));
+                        assert_eq!(
+                            math.iter()
+                                .filter(|i| i.def().mnemonic() == "SETRWC"
+                                    && i.word() & i.def().field("FlipSrcA").unwrap().place(1) != 0)
+                                .count(),
+                            4
+                        );
+                        assert_eq!(
+                            math.iter()
+                                .filter(|i| i.def().mnemonic() == "SETRWC"
+                                    && i.word() & i.def().field("FlipSrcB").unwrap().place(1) != 0)
+                                .count(),
+                            4
+                        );
+                        assert!(math.iter().all(|i| !i.def().mnemonic().starts_with("SFP")));
+                        let mut alloc = DramAlloc::new(&Dram::from_usable_mask(1));
+                        let a = DramTensor::alloc(&mut alloc, 37, 65).unwrap();
+                        let b = DramTensor::alloc(&mut alloc, 37, 65).unwrap();
+                        let before = alloc.free_bytes();
+                        let work = build(
+                            &mut alloc,
+                            &a.placement,
+                            &b.placement,
+                            [37, 65],
+                            Config {
+                                packed: false,
+                                simulated,
+                                precision,
+                                fidelity: Fidelity::HiFi4,
+                                op: first,
+                                broadcast: SrcBroadcast::None,
+                                tail: Some(tail),
+                            },
+                            2,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            before - alloc.free_bytes(),
+                            work.out.placement.tiles() as u64 * tt_isa::dm::TILE_SLOT
+                        );
+                        for steps in &work.jobs {
+                            for tile in steps.chunks_exact(3) {
+                                let Step::List { entries, .. } = &tile[0] else {
+                                    panic!("gather")
+                                };
+                                assert_eq!(entries.len(), 2);
+                                assert!(entries.iter().all(|e| e[0] == op::READ));
+                                assert!(matches!(tile[1], Step::Kernel { .. }));
+                                let Step::List { entries, .. } = &tile[2] else {
+                                    panic!("scatter")
+                                };
+                                assert_eq!(
+                                    entries.iter().filter(|e| e[0] == record::WRITE_RUN).count(),
+                                    1
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Audit submitted arithmetic: device numerical gates then establish
     /// execution. A route tag or absence of downloads alone is insufficient.
     #[test]
@@ -358,10 +644,10 @@ mod tests {
                         Fidelity::HiFi3,
                         Fidelity::HiFi4,
                     ] {
-                        let program = roles(false, precision, fidelity, op, broadcast, false);
+                        let program = roles(false, precision, fidelity, op, broadcast, false, None);
                         assert!(Arc::ptr_eq(
                             &program,
-                            &roles(false, precision, fidelity, op, broadcast, false)
+                            &roles(false, precision, fidelity, op, broadcast, false, None)
                         ));
                         let math = &program[1];
                         let elw: Vec<_> = math

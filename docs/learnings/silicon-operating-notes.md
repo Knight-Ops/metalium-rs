@@ -359,3 +359,44 @@ stream for subsequent programs on the tile. Simulator gates, image entry
 checks, default/silicon workspace Clippy and firmware Clippy pass. All eight
 MNIST regression gates pass with unchanged goldens (268.05 s). The probe is
 included by SMOKE's existing step91 filter.
+
+## Matrix register chains (2026-10-06)
+
+Step97 adds loaded-bank-only MOVD2A/MOVD2B/MOVB2A consumers. A destination bank
+must already belong to the Matrix Unit: Dst-to-Src moves do not establish
+ownership or wait for the destination's DVALID handover. The resident chain
+retains both banks through both stages and releases each once per face, using
+the existing unpack/math/pack synchronization. It explicitly configures format
+overrides, disables implied formats, establishes Dst base/offset/RWCs/release
+controls, resets fidelity for each stage and moves before clearing eight Dst
+rows. Format selection is restored before ordinary subsequent kernels.
+
+Both cards pass step97 (`1791317039`, 20/20), including one/four-row
+conversions, masks, exceptional datums, traces and resident-chain consumers.
+The cards are accessible through the elevated isolated runner; sandbox visibility
+is not hardware availability. Step9 retains the encoding provenance.
+
+The chain's initial one-row Dst clears reproduced the existing ZEROACC physical
+address difference (divergence 51), run `1791313486`. Use sixteen-physical-row
+mode for each aligned eight-row F32 half, with block index `dst_row/8`; previous
+final halves stay live. Both cards pass changed-input trace/reduction replay
+with the correction (`1791313617`, 2/2).
+
+Four-row register moves align their read address, but not the Src write address.
+Step97 observes effective Src row 71 writing rows 7..10 on both cards. MOVB2A
+reads aligned B rows 4..7 and writes unaligned A rows 7..10. The pinned model
+incorrectly aligns both sides; see the step97 simulator-divergence addendum.
+Mask probes must initialize actual loaded-bank datums explicitly before checking
+untouched lanes across repeated programs; do not rely on zero unpack flags or
+ZEROACC to scrub storage observed through a raw SFPU dump.
+
+Full release SMOKE `1791317135` passes 388/388 on both cards, including the
+expanded one-row summed-offset/wrapping probe and the unchanged MNIST golden.
+
+Retained step9 register-move address-modifier evidence passes on both cards
+(`1791317641`, 2/2), including the third modifier bit. No encoding correction or
+generated-output change was needed; `gen-isa --check` passes.
+
+Release chain benchmark `1791317719` passes on both cards with validated outputs,
+two warmups/seven host-timed samples and dataflow counts. See the resident chain
+record in firmware-performance.md for medians and conditions.

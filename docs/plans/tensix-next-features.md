@@ -499,3 +499,39 @@ but direct RISC-V seed stores with a fence and conservative settling interval
 restart it on both cards (`1791302214`, 4/4). Lanes have strong initialization
 correlations and seed 0xffffffff is absorbing. Application RNG quality and
 stream semantics remain deferred; Burn random construction is unchanged.
+
+### F1 resident matrix chains continuation (2026-10-06)
+
+- [x] Ownership-safe non-flipping MOVD2A/MOVD2B/MOVB2A APIs, checked encodings
+  and Empty/Filling compile-fail examples; preserve step9 measurement provenance.
+- [x] Explicit two-stage equal-shape F32 Session composition with TF32/BF16
+  intermediate truncation, existing fidelities, scheduler/traces/pins and only
+  final output allocation. Burn routing remains unchanged.
+- [x] Step97 in SMOKE: supported simulator moves, complete chain op/tail matrix,
+  composed finite error bounds, padding/views/downstream consumers, changed-input
+  replay and safe negative controls. Unit audits pin register reuse and traffic.
+- [x] Both-card step97 semantic gates: `1791317039`, 20/20; one/four-row
+  conversions, masks and summed offsets. Record the measured read-side-only
+  alignment correction; keep production row arguments aligned.
+- [x] Full release silicon SMOKE on both cards: `1791317135`, 388/388,
+  including the expanded one-row RWC/wrapping gate and MNIST regressions.
+- [x] Retained step9 move address-modifier evidence gate on both cards:
+  `1791317641`, 2/2, including modifier entry 4 (bit 2).
+- [x] Release benchmark on both cards: `1791317719`, validated outputs;
+  1.38–1.48× in measured cases, with region/batch counts halved.
+- [x] Record medians, conditions, traffic counts and complete collector artifacts
+  in `docs/learnings/firmware-performance.md`; no speedup required.
+
+DOTPV, source shifts, reset instructions, PRNG and SFPLOADMACRO remain outside
+this continuation. Instruction completion requires semantics plus production
+instruction audits, independently of measured encoding evidence.
+
+F1 host/simulator verification: `cargo test --workspace`, both workspace Clippy
+configurations (default and `tt-tests/silicon`), `cargo fmt --all --check`,
+silicon `--no-run`, `gen-isa --check`, and both shipping dependency checks pass.
+Final targeted step9/step90/step97 simulator run: 38/38 gates; step97 alone 8/8.
+The move ownership compile-fail examples pass (20 tt-isa doctests).
+`cargo test -p tt-tests --features e2e --test step12_mnist` passes 8/8; the golden
+is unchanged. `cargo xtask silicon --list --filter step97_matrix_register_moves::`
+selects the ten non-benchmark silicon gates without touching hardware. No
+firmware source changed, so the separate firmware workspace lint was not needed.

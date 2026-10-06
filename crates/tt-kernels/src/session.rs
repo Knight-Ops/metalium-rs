@@ -3732,6 +3732,49 @@ impl<T: Transport> Session<T> {
                 fidelity,
                 op,
                 broadcast,
+                tail: None,
+            },
+            units,
+        )?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Two matrix stages with an explicit truncated Src precision boundary.
+    /// Accepts equal-shape resident F32 operands; allocates only the final F32
+    /// output. Padding is undefined, as for matrix elementwise arithmetic.
+    pub fn matrix_eltwise_chain(
+        &mut self,
+        first: crate::matrix_eltwise::MatrixEltwiseOp,
+        tail: crate::matrix_eltwise::MatrixChainTail,
+        a: &DramTensor,
+        b: &DramTensor,
+        precision: crate::matrix_eltwise::SrcPrecision,
+        fidelity: Fidelity,
+    ) -> Result<DramTensor, TensorError> {
+        use crate::matrix_eltwise as m;
+        a.expect("matrix chain", tensor::Elem::F32)?;
+        b.expect("matrix chain", tensor::Elem::F32)?;
+        let dims = [a.rows, a.cols];
+        if dims != [b.rows, b.cols] {
+            return Err(TensorError::Shape(
+                "matrix chain requires equal shapes".into(),
+            ));
+        }
+        let units = self.units.len();
+        let simulated = self.dev.transport().is_simulated();
+        let work = m::build(
+            &mut self.dram_state()?.alloc,
+            &a.placement,
+            &b.placement,
+            dims,
+            m::Config {
+                packed: false,
+                simulated,
+                precision,
+                fidelity,
+                op: first,
+                broadcast: m::SrcBroadcast::None,
+                tail: Some(tail),
             },
             units,
         )?;
@@ -3763,6 +3806,7 @@ impl<T: Transport> Session<T> {
                 fidelity,
                 op,
                 broadcast,
+                tail: None,
             },
             units,
         )?;

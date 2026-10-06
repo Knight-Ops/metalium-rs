@@ -349,6 +349,39 @@ elw_consumer!(
 // --- Matrix Unit consumers -----------------------------------------------------
 
 impl Banks<Loaded, Loaded> {
+    /// Copy one or four aligned SrcB rows to SrcA, retaining both banks.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.unpack_b_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.movb2a(0, 0, true, 0);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.unpack_b(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.movb2a(0, 0, true, 0);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::Banks;
+    /// let _ = Banks::after_reset().movb2a(0, 0, false, 0);
+    /// ```
+    pub fn movb2a(
+        self,
+        src_a_row: u32,
+        addr_mod: u32,
+        four_rows: bool,
+        src_b_row: u32,
+    ) -> Result<(Instruction, Self), EncodeError> {
+        Ok((
+            encode::movb2_a(src_a_row, addr_mod, u32::from(four_rows), src_b_row)?,
+            banks(),
+        ))
+    }
+
     /// `GMPOOL`, keeping both sources for accumulation. Scaling, NaNs and
     /// partial argmax follow the matrix-unit contract, not IEEE max.
     pub fn gmpool(self, base: encode::Gmpool) -> Result<(Instruction, Self), EncodeError> {
@@ -394,6 +427,23 @@ impl Banks<Loaded, Loaded> {
 }
 
 impl<B> Banks<Loaded, B> {
+    /// Copy one or four aligned Dst rows to SrcA, retaining ownership.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.movd2a(encode::Movd2A::ZERO);
+    /// ```
+    /// The measured encoder checks row and modifier field widths.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let _ = Banks::after_reset().movd2a(encode::Movd2A::ZERO);
+    /// ```
+    pub fn movd2a(self, base: encode::Movd2A) -> Result<(Instruction, Self), EncodeError> {
+        Ok((base.encode()?, banks()))
+    }
+
     /// `MOVA2D`: copy `SrcA` rows into `Dst`. Does not flip, so the operand stays
     /// [`Loaded`] -- the step the accidental bank mix-up was missing.
     pub fn mova2d(self, base: encode::Mova2D) -> Result<(Instruction, Self), EncodeError> {
@@ -407,6 +457,22 @@ impl<B> Banks<Loaded, B> {
 }
 
 impl<A> Banks<A, Loaded> {
+    /// Copy one or four aligned Dst rows to SrcB, retaining ownership.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.movd2b(encode::Movd2B::ZERO);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let _ = Banks::after_reset().movd2b(encode::Movd2B::ZERO);
+    /// ```
+    pub fn movd2b(self, base: encode::Movd2B) -> Result<(Instruction, Self), EncodeError> {
+        Ok((base.encode()?, banks()))
+    }
+
     /// Transpose the aligned 16x16 block in SrcB rows 16..32, keeping
     /// ownership. This moves reduced-precision Src datums, not F32 words.
     /// Blackhole silicon validation is pending; the encoding retains its
@@ -575,5 +641,159 @@ mod tests {
             i.word(),
             encode::UnpacrRegular::ZERO.encode().unwrap().word() | UNPACR_LAST
         );
+    }
+}
+
+/// Independent ports of the pinned MOVD2A/MOVD2B/MOVB2A functional models,
+/// with the step97 both-card correction for unaligned Src write addresses.
+/// Inputs use physical Dst/Src bit layouts, rather than IEEE float bits.
+pub mod moves {
+    /// Destination-to-source conversion style (MOVD2B also uses SrcA's format).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum Style {
+        Bf16,
+        Fp16,
+        Tf32,
+    }
+
+    /// Blackhole row arguments plus RWC/base offsets. Only the read side
+    /// aligns a four-row block; the Src write side wraps without alignment.
+    /// Step97 on both cards corrects the pinned model's write-side alignment
+    /// (see the step97 addendum in docs/learnings/ttsim-divergence.md).
+    pub const fn rows(dst: u32, src: u32, four: bool) -> (usize, usize, usize) {
+        if four {
+            ((dst & 0x3fc) as usize, (src & 0x3f) as usize, 4)
+        } else {
+            ((dst & 0x3ff) as usize, (src & 0x3f) as usize, 1)
+        }
+    }
+
+    /// One physical Dst datum. Unsupported 16-bit/TF32 and low-half forms
+    /// return None, matching the specification's undefined behavior.
+    pub const fn dst_to_src(mut x: u32, wide: bool, low: bool, style: Style) -> Option<u32> {
+        if !wide && (low || matches!(style, Style::Tf32)) {
+            return None;
+        }
+        if wide {
+            if low {
+                x = (x << 16) | (x & 0xffff);
+            }
+            if matches!(style, Style::Tf32) {
+                if low {
+                    return Some(x & 0x1fff);
+                }
+                x >>= 13;
+                return Some((x & 0x7f800) | ((x & 7) << 8) | ((x & 0x7f8) >> 3));
+            }
+            x >>= 16;
+        }
+        Some(match style {
+            Style::Bf16 => ((x & 0xff00) << 3) | (x & 0xff),
+            Style::Fp16 => ((x & 0xffe0) << 3) | (x & 0x1f),
+            Style::Tf32 => unreachable!(),
+        })
+    }
+
+    /// Blackhole TruncateSrc is the identity for every format. MOVB2A flushes
+    /// zero-exponent datums (including signed zero) first when enabled.
+    pub const fn b_to_a(x: u32, flush_denormals: bool) -> u32 {
+        if flush_denormals && x & 0xff == 0 {
+            0
+        } else {
+            x
+        }
+    }
+
+    /// MOVB2A on raw Blackhole Src datums, with independent six-bit row
+    /// wrapping on both banks, alignment on the read side and column masks.
+    pub fn copy_b(
+        src_b: &[[u32; 16]; 64],
+        src_a: &mut [[u32; 16]; 64],
+        a_row: u32,
+        b_row: u32,
+        four: bool,
+        lane_masks: [u8; 8],
+        flush: bool,
+    ) {
+        let mask = if four { 0x3c } else { 0x3f };
+        let a = (a_row & 0x3f) as usize;
+        let b = (b_row & mask) as usize;
+        for r in 0..if four { 4 } else { 1 } {
+            for c in 0..16 {
+                if lane_masks[c / 2] & (1 << (c & 1)) == 0 {
+                    src_a[(a + r) & 63][c] = b_to_a(src_b[b + r][c], flush);
+                }
+            }
+        }
+    }
+
+    /// Apply a MOVD2A/B to a 1024-row logical Dst view and a Src bank. Each
+    /// lane pair's two mask bits inhibit the corresponding column writes.
+    pub fn copy_dst(
+        dst: &[[u32; 16]; 1024],
+        src: &mut [[u32; 16]; 64],
+        row_args: (u32, u32, bool),
+        lane_masks: [u8; 8],
+        style: Style,
+        wide: bool,
+        low: bool,
+    ) -> Option<()> {
+        let (d, s, n) = rows(row_args.0, row_args.1, row_args.2);
+        for r in 0..n {
+            for c in 0..16 {
+                if lane_masks[c / 2] & (1 << (c & 1)) == 0 {
+                    src[(s + r) & 63][c] = dst_to_src(dst[d + r][c], wide, low, style)?;
+                }
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod register_move_tests {
+    use super::*;
+    #[test]
+    fn checked_moves_keep_banks_and_measured_fields() {
+        for four in [false, true] {
+            for modifier in 0..8 {
+                let (_, b) = Banks::after_reset()
+                    .unpack_a(encode::UnpacrRegular::ZERO)
+                    .unwrap();
+                let (_, b) = b.unpack_b(encode::UnpacrRegular::ZERO).unwrap();
+                let base = encode::Movd2A::ZERO
+                    .move4_rows(u32::from(four))
+                    .src_row(63)
+                    .dst_row(1023)
+                    .addr_mod(modifier);
+                let (a, b) = b.movd2a(base).unwrap();
+                assert_eq!(a.word(), base.encode().unwrap().word());
+                assert_eq!(a.word() & (7 << 14), modifier << 14);
+                let base = encode::Movd2B::ZERO
+                    .move4_rows(u32::from(four))
+                    .src_row(63)
+                    .dst_row(1023)
+                    .addr_mod(modifier);
+                let (i, b) = b.movd2b(base).unwrap();
+                assert_eq!(i.word(), base.encode().unwrap().word());
+                let (i, b) = b.movb2a(63, modifier, four, 63).unwrap();
+                assert_eq!(
+                    i.word(),
+                    encode::movb2_a(63, modifier, u32::from(four), 63)
+                        .unwrap()
+                        .word()
+                );
+                let (_, b) = b.release_a().unwrap();
+                let _ = b.release_b().unwrap();
+            }
+        }
+        let (_, b) = Banks::after_reset()
+            .unpack_a(encode::UnpacrRegular::ZERO)
+            .unwrap();
+        assert!(b.movd2a(encode::Movd2A::ZERO.src_row(64)).is_err());
+        let (_, b) = Banks::after_reset()
+            .unpack_b(encode::UnpacrRegular::ZERO)
+            .unwrap();
+        assert!(b.movd2b(encode::Movd2B::ZERO.dst_row(1024)).is_err());
     }
 }

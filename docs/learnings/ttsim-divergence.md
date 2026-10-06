@@ -316,3 +316,50 @@ targets. Both produce the absorbing all-ones state for seed 0xffffffff.
 A seed-field read-modify-write first refused in ttsim with
 `tensix_cfg_rd32: reg=186`. The field spans the complete word, so the diagnostic
 uses a full-width `sw` without a preceding unsupported configuration read.
+
+## Step97 matrix register move surface (2026-10-06)
+
+The pinned Blackhole simulator refuses an unaligned MOVD2A immediate Dst row:
+`tensix_movd2a: dst=3` (`UnsupportedFunctionality`), before applying the documented
+RWC/base addition and four-row alignment. It also refuses nonzero
+`LaneConfig.BLOCK_DEST_MOV`: `tensix_sfpconfig: lane_config=0x200`. Step97 uses
+aligned row arguments and zero masks in ttsim; silicon arms exercise summed RWC
+and thread-offset alignment, Src wrapping and both lane mask bits. Both-card run `1791317039` passes those silicon arms. The simulator
+refusals do not establish Blackhole silicon behavior.
+
+One-row moves remain silicon-only under row 37. Four-row MOVD2A/MOVD2B/MOVB2A
+roundtrips pass for TF32/BF16 truncation boundaries, signed zeros, subnormals,
+infinities and NaN payloads. The Dst setup deliberately uses SFPSTORE INT32
+(pass-through bits with FP32 physical encoding): FP32 SFPSTORE flushes subnormals
+before a move can observe them. Blackhole's documented TruncateSrc is identity
+for MOVB2A, unlike Wormhole; its optional zero-exponent flush is separate.
+
+Step97 initially used one-row ZEROACC for eight logical F32 rows and reproduced
+row 51 on silicon (`1791313486`): earlier final rows were invalidated and later
+accumulators remained live. The chain now clears each aligned eight-F32-row
+half with sixteen-physical-row mode (`UseDst32b=0`, block `dst_row/8`). The
+changed-input trace gate passes both cards with this correction (`1791313617`,
+2/2). This preserves prior output halves and uses the already measured block
+clear behavior rather than a transport-dependent address fix.
+
+
+Step97 measured a read/write alignment difference from the pinned functional
+model on both cards (`1791317039`, 20/20). For four-row MOVD2A/B, effective Dst
+row 11 reads rows 8..11, while effective Src row 71 wraps to 7 and writes rows
+7..10, without aligning down. MOVB2A likewise writes unaligned SrcA rows 7..10,
+but reads aligned SrcB rows 4..7: when only B rows 7..10 contain one, only A row
+10 receives one. The reference port records this empirical correction separately
+in its comments; the measured encodings and generator inputs are unchanged.
+Production chains use aligned row arguments throughout.
+
+Low-level mask probes explicitly initialize loaded-bank datums with unmasked
+moves before testing preservation. Repeated zero unpacks alone did not establish
+zero raw datums in masked columns after earlier exceptional-value cases
+(`1791316783`). Gates also hold lane configuration until Matrix completion and
+initialize dump storage through INT32 SFPU stores rather than assuming ZEROACC
+scrubs bits. These are probe setup requirements, not ownership handovers.
+
+The reused-device silicon probe explicitly disables SFPU predication with
+SFPENCC(0,0,2). Ttsim refuses this form (`tensix_sfpencc: instr_mod1=2`), so
+simulator probes use the simulator's default disabled predication; this gate's
+explicit predicate control is silicon-only.

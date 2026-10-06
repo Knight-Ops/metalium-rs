@@ -93,6 +93,7 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 
 | Target | Now | Of ceiling | Goal |
 |---|--:|--:|---|
+| Resident matrix chain `(a+b)*b`, two tiles, host | 64×64: 24.6–25.6 µs; 65×70: 41.1–42.4 µs (TF32/BF16, cards 0/1; `1791317719`) | separate calls 35.5–37.1 / 57.8–58.4 µs; 1.38–1.48× | explicit Session composition; no application speedup claim |
 | Matrix ELW packed BF16 equal-shape add, 64×64, two tiles, host | 40.2 / 41.9 µs (cards 0 / 1, initial M1) | SFPU adapters 105.1 / 108.6 µs | reduce per-tile dispatch costs; SFPU remains default |
 | Matrix ELW row multiply, 65×70, two tiles, host | F32 41.6 / 42.0 µs; BF16 60.8 / 61.3 µs (cards 0 / 1) | initial materialized RHS F32 ~1129 / 1133 µs; BF16 ~1157 / 1161 µs | hold direct broadcast addressing; reduce per-tile dispatch costs |
 | GDDR6, one tile, 64 KiB entries | 81.4 GB/s | 94% NoC link | hold |
@@ -927,3 +928,38 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Resident matrix chain benchmark (2026-10-06)
+
+Release run `1791317719`, cards 0 and 1, SHA `08b300ea0fb6+dirty`, two Tensix
+tiles per card, resident F32 operands, TF32/BF16 Src precision, HiFi4, normal
+Session streaming defaults. Compare `(a+b)*b` as one resident chain against two
+matrix calls, with constant operands 2 and 3 (every output must equal 15).
+Two warmups precede seven host dispatch-through-sync samples; output downloads
+and frees are outside timing. All 144 outputs were validated (including warmups).
+No other test or benchmark ran concurrently. Medians in microseconds:
+
+| Card | Shape | Src precision | Two calls (µs) | Chain (µs) | Ratio |
+|---|---|---|---:|---:|---:|
+| 0 | 64×64 | TF32 | 35.465 | 25.568 | 1.39× |
+| 0 | 64×64 | BF16 | 36.718 | 25.537 | 1.44× |
+| 0 | 65×70 | TF32 | 57.846 | 41.096 | 1.41× |
+| 0 | 65×70 | BF16 | 58.148 | 42.148 | 1.38× |
+| 1 | 64×64 | TF32 | 36.558 | 24.637 | 1.48× |
+| 1 | 64×64 | BF16 | 37.099 | 25.077 | 1.48× |
+| 1 | 65×70 | TF32 | 58.419 | 42.409 | 1.38× |
+| 1 | 65×70 | BF16 | 58.368 | 41.928 | 1.39× |
+
+The measured cases improve 1.38–1.48×; this does not establish an application
+speedup. Across nine invocations, `dataflow_stats` reports 36 versus 18 regions,
+72 versus 36 batches for 64×64, and 162 versus 81 batches for 65×70 (separate
+calls versus chain), on both cards and at both precisions. Standalone transfer
+packets are zero for both paths; kernel gathers/scatters are not counted by that
+field. Production builder audits establish two source reads and one final write
+per output tile, only final GDDR allocation and no intermediate GDDR round trip.
+
+Artifacts: `target/silicon/bench/1791317719.{jsonl,md}` (all 16 records), with
+per-card validated logs under `target/silicon/out/`. Earlier run `1791317688`
+validated outputs but its first BENCH record shared libtest's test-name line and
+was omitted by collection. The benchmark now ends that line before reporting;
+use the complete final run above.
