@@ -162,3 +162,87 @@ flowchart LR
 | **L1 Memory Safety** | Runtime `OutOfMemoryError` or silent core hangs if allocations collide | Checked at plan construction; deterministic build-time `PlanError` |
 | **Epilogue Execution** | Fixed C++ macro sequences in LLK compute thread | Parameterized SFPU instruction sequences evaluated directly on `Dst` |
 | **Language Boundary** | Python $\to$ C++ $\to$ LLK C++ $\to$ Clang / GCC RISC-V | 100% Native Rust (`burn-tt` $\to$ `tt-kernels` $\to$ `tt-isa`) |
+
+---
+
+## 6. The Generalized Fusion Engine: Eliminating Combinatorial Recipe Explosion
+
+A common failure mode in domain-specific AI compilers is the **combinatorial recipe explosion**: hand-crafting dedicated kernels for every observed combination ($A + B = AB$, $A + B + C = ABC$, e.g. `AddRelu`, `AddGelu`, `MulAddSigmoid`, `LinearBiasGelu`). This approach is unmaintainable and constantly lags behind new model architectures.
+
+In `metalium-rs`, fusion is generalized into **three canonical dataflow classes** driven by a **unified SFPU micro-op bytecode engine**.
+
+```mermaid
+flowchart TD
+    subgraph C1 ["Class 1: Pointwise Chain (1:1 Dataflow)"]
+        In1["Inputs (A, B...)"] --> SFPU1["TRISC1: SFPU Micro-Op Bytecode (L0..L7)"]
+        SFPU1 --> Out1["Output (Packed to L1)"]
+    end
+
+    subgraph C2 ["Class 2: Contraction Epilogue (GEMM -> Pointwise)"]
+        GEMM["TRISC1: FPU GEMM into Dst"] --> SFPU2["TRISC1: SFPU Micro-Op Bytecode (Dst Rows)"]
+        SFPU2 --> Out2["Output (Packed to L1)"]
+    end
+
+    subgraph C3 ["Class 3: Reduce-Map (Pointwise -> Reduce -> Pointwise)"]
+        In3["Input (A)"] --> Pre["SFPU: Pre-Map (e.g. x - max)"]
+        Pre --> Red["SFPU: Row Reduction (Sum / Max)"]
+        Red --> Post["SFPU: Post-Map (e.g. x / sum)"]
+    end
+```
+
+### 6.1. The Three Canonical Dataflow Classes
+
+Instead of pattern matching by operation name, operations are classified strictly by their **memory and dataflow footprint**:
+
+1. **Pointwise Chains (1:1 Dataflow)**:
+   - Arithmetic: `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Abs`.
+   - Activations: `ReLU`, `GELU`, `SiLU`, `Tanh`, `Sigmoid`, `HardSigmoid`.
+   - Bounds: `Clamp`, `MaskFill`.
+   - **Invariance Rule**: Any directed acyclic graph (DAG) of pointwise operations can **always** fuse into a single kernel pass over L1 tiles, provided active live variables fit the register budget and shapes are broadcast-compatible.
+2. **Contraction Epilogues (GEMM $\to$ Pointwise)**:
+   - Matrix Multiplications (`float_matmul`) followed by any Pointwise sub-DAG (e.g., Bias Add $\to$ Activation $\to$ Scale).
+   - **Invariance Rule**: The GEMM accumulator resides in `Dst`. Any following pointwise operations evaluate directly on `Dst` before TRISC2 packs the result to L1 or GDDR.
+3. **Reduce-Map Chains ($\text{Pointwise} \to \text{Reduce} \to \text{Pointwise}$)**:
+   - `LayerNorm`, `RMSNorm`, `Softmax`.
+   - **Invariance Rule**: Reductions along tile/matrix axes form natural stage barriers. By evaluating the pre-reduction map, the reduction, and the post-reduction normalization within L1 circular buffers, intermediate values never spill to GDDR.
+
+### 6.2. The Unified SFPU Micro-Op Bytecode Engine
+
+On Tensix Blackhole, the SFPU is a 32-lane vector processor with 8 local vector registers (`L0..L7`). Rather than compiling separate binary kernels for every op combination, `tt-kernels` provides a **single parameterized SFPU kernel** that executes a compact sequence of micro-op instructions passed via the job descriptor:
+
+```rust
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SfpuMicroOp {
+    /// Load tile face row from Dst into local SFPU register
+    LoadDst { src_row: u8, dst_reg: u8 },
+    /// Store local SFPU register into Dst row
+    StoreDst { src_reg: u8, dst_row: u8 },
+    /// Arithmetic: dst = src1 + src2
+    Add { src1: u8, src2: u8, dst: u8 },
+    /// Arithmetic: dst = src1 * src2
+    Mul { src1: u8, src2: u8, dst: u8 },
+    /// Multiply-Add: dst = src1 * src2 + src3
+    Mad { src1: u8, src2: u8, src3: u8, dst: u8 },
+    /// Activation functions
+    Relu { src: u8, dst: u8 },
+    Gelu { src: u8, dst: u8 },
+    Silu { src: u8, dst: u8 },
+    Tanh { src: u8, dst: u8 },
+    Sigmoid { src: u8, dst: u8 },
+}
+```
+
+### 6.3. How the Engine Bridges FPU and SFPU
+
+Both the FPU (Matrix Unit) and SFPU share the same physical RISC-V math core (`TRISC1`) and write/read the same 512-row `Dst` register file. Consequently, the **exact same micro-op interpreter** powers both standalone element-wise fusion and GEMM epilogues:
+
+- **Standalone Pointwise**: TRISC0 unpacks L1 tiles into `Dst` rows `0..64` and `64..128`. TRISC1 executes the bytecode on `L0..L7`, storing results in `OUT_ROW`. TRISC2 packs to L1.
+- **GEMM Epilogue**: TRISC1 executes the FPU GEMM inner loops, leaving raw dot products in `Dst` rows `0..64`. Instead of packing immediately, TRISC1 seamlessly transitions to the SFPU micro-op interpreter, applying bias addition and activations directly to `Dst` rows `0..64` before TRISC2 packs.
+
+### 6.4. Compiler Invariants
+
+To guarantee safety and peak efficiency without human intervention, the Burn fuser enforces three strict compiler invariants:
+1. **The 8-Register Budget**: The SFPU provides 8 registers (`L0..L7`). A greedy linear-scan register allocator tracks live ranges across the pointwise DAG. If live variables exceed 8, the fuser cuts the chain into two kernels.
+2. **Broadcast Compatibility**: Unpackers repeat rows for rank-broadcast operands (e.g., `[1, 128]` bias into `[64, 128]` activations) without host intervention.
+3. **Single-Consumer / Fan-Out Rule**: Intermediate nodes with multiple consumers are only fused if recomputation is cheaper than GDDR writeback, or if all consumers reside within the same fused tile loop.
