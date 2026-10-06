@@ -2165,7 +2165,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
     );
 
-    /// `ELWADD_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWADD_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWADD: InstructionDef = InstructionDef::new(
         "ELWADD_BH",
         "ELWADD",
@@ -2173,11 +2173,11 @@ pub mod defs {
         &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
         0x00063c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md",
     );
 
-    /// `ELWSUB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWSUB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWSUB: InstructionDef = InstructionDef::new(
         "ELWSUB_BH",
         "ELWSUB",
@@ -2185,11 +2185,11 @@ pub mod defs {
         &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("AddDst", 21, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
         0x00063c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md",
     );
 
-    /// `ELWMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ELWMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWMUL: InstructionDef = InstructionDef::new(
         "ELWMUL_BH",
         "ELWMUL",
@@ -2197,7 +2197,7 @@ pub mod defs {
         &[Field::new("FlipSrcB", 23, 1, false, None), Field::new("FlipSrcA", 22, 1, false, None), Field::new("BroadcastSrcBRow", 20, 1, false, None), Field::new("BroadcastSrcBCol0", 19, 1, false, None), Field::new("AddrMod", 14, 3, false, None), Field::new("DstRow", 0, 10, false, None)],
         &[],
         0x00263c00,
-        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts", moved: &["AddrMod"], dropped: &[], widened: &["AddrMod"] },
         "WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md",
     );
 

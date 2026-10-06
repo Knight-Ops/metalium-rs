@@ -64,6 +64,57 @@ pub(crate) fn float_compute_input(tensor: TtTensor) -> TtTensor {
     }
 }
 
+/// Intercept floating arithmetic before the BF16 widening adapter.
+pub(crate) fn matrix_float_op(
+    kind: u32,
+    scalar: f32,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+) -> Option<TtTensor> {
+    if !matches!(
+        crate::server::elementwise_mode(a.device),
+        crate::ElementwiseMode::Matrix { .. }
+    ) {
+        return None;
+    }
+    let valid = |t: &TtTensor| {
+        t.is_storable()
+            && matches!(t.dtype(), DType::F32 | DType::BF16)
+            && t.device == a.device
+            && t.dtype() == a.dtype()
+    };
+    assert!(
+        valid(a) && b.is_none_or(valid),
+        "matrix elementwise requires resident-compatible F32/BF16 operands of one dtype"
+    );
+    if let Some(b) = b {
+        assert!(
+            broadcast_shape(&a.shape().to_vec(), &b.shape().to_vec())
+                .is_some_and(|s| s == a.shape().to_vec()),
+            "matrix elementwise supports RHS broadcasts only"
+        );
+    }
+    let (da, db) = (plain_dram(a), b.map(plain_dram));
+    let (id, dims) = crate::server::eltwise_op(
+        a.device,
+        tt_kernels::tensor::Eltwise {
+            kind,
+            scalar,
+            scalar2: 0.0,
+        },
+        da.buffer.id,
+        db.as_ref().map(|t| t.buffer.id),
+        None,
+    );
+    crate::report::matrix_eltwise();
+    let output = device_result_shaped(a.device, id, dims, a.shape(), DType::F32);
+    Some(if a.dtype() == DType::BF16 {
+        cast_native(output, DType::BF16)
+    } else {
+        output
+    })
+}
+
 pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     if lhs.dtype() != DType::BF16
         || rhs.dtype() != DType::BF16

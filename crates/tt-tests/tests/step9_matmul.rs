@@ -1250,3 +1250,172 @@ fn zeroacc_one_row_with_an_odd_addr_mod() {
         assert_eq!(zero, want, "one-row ZEROACC with addr_mod {addr_mod}");
     }
 }
+
+/// Independent exact-domain broadcast, destination and assignment probes.
+#[test]
+fn elw_broadcast_assignment_and_destination_fields() {
+    use tt_isa::{
+        matrix::SrcBroadcast,
+        numerics::{elw_reference, MatrixEltwiseOp},
+    };
+    let a: MatA = core::array::from_fn(|r| core::array::from_fn(|c| (r * 2 + c + 1) as f32));
+    let b: MatB = core::array::from_fn(|r| core::array::from_fn(|c| (r * 3 + c + 2) as f32));
+    let aa: MatB = core::array::from_fn(|r| a[r]);
+    for op in [
+        MatrixEltwiseOp::Add,
+        MatrixEltwiseOp::Sub,
+        MatrixEltwiseOp::Mul,
+    ] {
+        for broadcast in [
+            SrcBroadcast::None,
+            SrcBroadcast::Row,
+            SrcBroadcast::Column,
+            SrcBroadcast::Scalar,
+        ] {
+            let expected = elw_reference(&ZERO_DST, &aa, &b, op, broadcast, &[0]).unwrap();
+            let dst = run(
+                &a,
+                &b,
+                Box::new(move |banks, p| {
+                    let (i, _) =
+                        match op {
+                            MatrixEltwiseOp::Add => banks
+                                .elwadd_release_both(encode::Elwadd::ZERO.dst_row(8), broadcast),
+                            MatrixEltwiseOp::Sub => banks
+                                .elwsub_release_both(encode::Elwsub::ZERO.dst_row(8), broadcast),
+                            MatrixEltwiseOp::Mul => banks
+                                .elwmul_release_both(encode::Elwmul::ZERO.dst_row(8), broadcast),
+                        }
+                        .unwrap();
+                    p.push(i);
+                }),
+            );
+            assert_block(&dst, 8, &expected, &format!("{op:?} {broadcast:?}"));
+            assert_block(
+                &dst,
+                0,
+                &ZERO_DST,
+                "destination offset leaves row zero untouched",
+            );
+        }
+    }
+}
+
+#[test]
+fn elw_oracles_reject_safe_instruction_mutants() {
+    use tt_isa::{
+        matrix::SrcBroadcast as B,
+        numerics::{elw_reference, MatrixEltwiseOp as O},
+    };
+    let a: MatA =
+        core::array::from_fn(|r| core::array::from_fn(|c| 1.03125 + (r + c) as f32 / 8.0));
+    let b: MatB =
+        core::array::from_fn(|r| core::array::from_fn(|c| 1.0078125 + (r + c) as f32 / 16.0));
+    let aa: MatB = core::array::from_fn(|r| a[r]);
+    let full = elw_reference(&ZERO_DST, &aa, &b, O::Mul, B::None, &[0, 1, 2, 3]).unwrap();
+    let bad_phase = run(
+        &a,
+        &b,
+        Box::new(|banks, p| {
+            p.push(
+                banks
+                    .elwmul_release_both(encode::Elwmul::ZERO, B::None)
+                    .unwrap()
+                    .0,
+            );
+        }),
+    );
+    assert_ne!(
+        bad_phase[..128],
+        full.into_iter()
+            .flatten()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        "oracle must reject omitted phases"
+    );
+    let no_reset = run(
+        &a,
+        &b,
+        Box::new(|mut banks, p| {
+            for _ in 0..2 {
+                for phase in 0..4 {
+                    p.push(fidelity_base(phase));
+                    let (i, next) = banks.elwmul(encode::Elwmul::ZERO, B::None).unwrap();
+                    p.push(i);
+                    banks = next;
+                }
+            }
+            let (i, banks) = banks.release_a().unwrap();
+            p.push(i);
+            p.push(banks.release_b().unwrap().0);
+        }),
+    );
+    assert_ne!(
+        no_reset[..128],
+        full.into_iter()
+            .flatten()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        "oracle must reject omitted Dst reset"
+    );
+    let want = elw_reference(&ZERO_DST, &aa, &b, O::Sub, B::None, &[0]).unwrap();
+    let swapped_a: MatA = core::array::from_fn(|r| b[r % 8]);
+    let swapped_b: MatB = core::array::from_fn(|r| a[r]);
+    let swapped = run(
+        &swapped_a,
+        &swapped_b,
+        Box::new(|banks, p| {
+            p.push(
+                banks
+                    .elwsub_release_both(encode::Elwsub::ZERO, B::None)
+                    .unwrap()
+                    .0,
+            );
+        }),
+    );
+    assert_ne!(
+        swapped[..128],
+        want.into_iter()
+            .flatten()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        "oracle must reject swapped subtraction"
+    );
+    let want = elw_reference(&ZERO_DST, &aa, &b, O::Add, B::Row, &[0]).unwrap();
+    let bad_broadcast = run(
+        &a,
+        &b,
+        Box::new(|banks, p| {
+            p.push(
+                banks
+                    .elwadd_release_both(encode::Elwadd::ZERO, B::None)
+                    .unwrap()
+                    .0,
+            );
+        }),
+    );
+    assert_ne!(
+        bad_broadcast[..128],
+        want.into_iter()
+            .flatten()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        "oracle must reject wrong broadcast addressing"
+    );
+    let want = elw_reference(&ZERO_DST, &aa, &b, O::Add, B::None, &[0]).unwrap();
+    let assigned = run(
+        &a,
+        &b,
+        Box::new(|banks, p| {
+            let (i, banks) = banks.elwadd(encode::Elwadd::ZERO, B::None).unwrap();
+            p.push(i);
+            p.push(
+                banks
+                    .elwadd_release_both(encode::Elwadd::ZERO, B::None)
+                    .unwrap()
+                    .0,
+            );
+        }),
+    );
+    assert_block(&assigned, 0, &want, "addition assigns over nonzero Dst");
+}

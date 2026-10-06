@@ -244,3 +244,22 @@ The index-mode probe exits ttsim with
 a silicon-only gate. Both cards return max values with no packed index bits,
 including finite unique winners; see silicon-operating-notes.md. This does not
 establish the documented nonlinear Wormhole index encoding on Blackhole.
+
+### M1 matrix elementwise coverage (2026-10-06)
+
+Step90 models ELWADD/ELWSUB alignment separately from SFPU addition: even an
+FP32-exact sum can lose bits at the shared 10-fraction-bit alignment quantum.
+Both cards agree with ttsim in the normal-domain alignment/bound probes
+(`1791254333`) and the tested special corpus (`1791254100`); this is measured
+matrix behavior, not a new simulator disagreement. Safe swapped-subtraction,
+wrong-broadcast, missing-phase and missing-Dst-reset mutants are rejected by
+independent step9 oracles on both targets.
+
+Packed BF16 ELW inputs with F32 output, all broadcasts and fidelities, changed
+input traces and deferred frees have simulator gates. BF16 output conversion,
+Burn arithmetic and gradients remain silicon-only because the existing narrowing
+PACR `0x105` is unimplemented; a new combined Burn gate reproduced that refusal.
+Explicit silicon Dst base setup also reproduced row 21's `tensix_cfg_wr32: reg=6`
+refusal. Matrix programs omit only that register write on simulated transports,
+whose implicit base is reset-zero; silicon retains the explicit write. No
+simulator dependency is added to shipping crates.

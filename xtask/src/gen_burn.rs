@@ -781,6 +781,20 @@ pub fn render(
                     "float_scatter_add",
                     "float_select_add",
                 ];
+                let matrix_kind = match m.name.as_str() {
+                    "float_add" | "float_add_scalar" => Some("ADD"),
+                    "float_sub" | "float_sub_scalar" => Some("SUB"),
+                    "float_mul" | "float_mul_scalar" => Some("MUL"),
+                    _ => None,
+                };
+                if let Some(kind) = matrix_kind {
+                    let args = if m.name.ends_with("_scalar") {
+                        "num_traits::ToPrimitive::to_f64(&rhs).expect(\"a float scalar\") as f32, &lhs, None"
+                    } else {
+                        "0.0, &lhs, Some(&rhs)"
+                    };
+                    impls.push_str(&format!("if let Some(output) = crate::ops::matrix_float_op(tt_kernels::kind::{kind}, {args}) {{ return output; }}\n"));
+                }
                 if !is_future && !floats.is_empty() && !storage.contains(&m.name.as_str()) {
                     impls.push_str(&format!(
                         "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif compute_dtype == burn_backend::DType::BF16 {{\n",

@@ -125,3 +125,8 @@ impl Backend for TtBackend {
         }
     }
 }
+
+pub use server::kmd_engine_with_elementwise;
+pub use tt_kernels::matrix_eltwise::{ElementwiseMode, SrcPrecision};
+
+pub use topology::attach_topology_with_elementwise;

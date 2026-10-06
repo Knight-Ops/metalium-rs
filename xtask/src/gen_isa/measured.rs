@@ -176,10 +176,20 @@ pub const MEASURED: &[Measured] = &[
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
-        evidence: &[(
-            "crates/tt-tests/tests/step9_matmul.rs",
-            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
-        )],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+            ),
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "elw_broadcast_assignment_and_destination_fields",
+            ),
+            (
+                "crates/tt-tests/tests/step90_matrix_eltwise.rs",
+                "resident_matrix_arithmetic_and_rhs_broadcasts",
+            ),
+        ],
     },
     Measured {
         key: "ELWSUB_BH",
@@ -188,10 +198,20 @@ pub const MEASURED: &[Measured] = &[
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
-        evidence: &[(
-            "crates/tt-tests/tests/step9_matmul.rs",
-            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
-        )],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+            ),
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "elw_broadcast_assignment_and_destination_fields",
+            ),
+            (
+                "crates/tt-tests/tests/step90_matrix_eltwise.rs",
+                "resident_matrix_arithmetic_and_rhs_broadcasts",
+            ),
+        ],
     },
     Measured {
         key: "ELWMUL_BH",
@@ -200,10 +220,20 @@ pub const MEASURED: &[Measured] = &[
         moved: &["AddrMod"],
         dropped: &[],
         widened: &["AddrMod"],
-        evidence: &[(
-            "crates/tt-tests/tests/step9_matmul.rs",
-            "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
-        )],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole",
+            ),
+            (
+                "crates/tt-tests/tests/step9_matmul.rs",
+                "elw_broadcast_assignment_and_destination_fields",
+            ),
+            (
+                "crates/tt-tests/tests/step90_matrix_eltwise.rs",
+                "resident_matrix_arithmetic_and_rhs_broadcasts",
+            ),
+        ],
     },
     Measured {
         key: "DOTPV_BH",

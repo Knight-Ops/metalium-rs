@@ -398,3 +398,120 @@ mod tests {
         assert_eq!(out[0][0], 5.0);
     }
 }
+
+/// Matrix elementwise arithmetic; multiplication accumulates phase products.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum MatrixEltwiseOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Independent exact-domain oracle for ELW instructions with FP32 Dst.
+/// Inputs are already decoded Src values. This deliberately refuses special
+/// values, subnormal inputs/results, inexact sums/products and invalid phases:
+/// the specification's floating model is only a rough guide. It does not use
+/// the SFPU FMA model. Zero signs require separate measured characterization.
+pub fn elw_reference(
+    dst: &[[f32; 16]; 8],
+    a: &[[f32; 16]; 8],
+    b: &[[f32; 16]; 8],
+    op: MatrixEltwiseOp,
+    broadcast: crate::matrix::SrcBroadcast,
+    phases: &[u32],
+) -> Option<[[f32; 16]; 8]> {
+    if phases.is_empty()
+        || phases.iter().any(|&p| p > 3)
+        || (op != MatrixEltwiseOp::Mul && phases != [0])
+    {
+        return None;
+    }
+    let valid = |x: f32| x.is_finite() && (x == 0.0 || x.is_normal());
+    let exact = |wide: f64| {
+        let x = wide as f32;
+        (valid(x) && f64::from(x) == wide).then_some(x)
+    };
+    let mut out = *dst;
+    for i in 0..8 {
+        for j in 0..16 {
+            let (r, c) = broadcast.coordinate(i, j);
+            let (a, b) = (a[i][j], b[r][c]);
+            if !valid(a) || !valid(b) {
+                return None;
+            }
+            if op != MatrixEltwiseOp::Mul {
+                // ELWADD/SUB align both inputs at a shared 10-fraction-bit
+                // quantum (step90). Exact FP32 sums may still lose data here.
+                let exp = |x: f32| (x.to_bits() >> 23) & 255;
+                let common = exp(a).max(exp(b));
+                for x in [a, b] {
+                    if x != 0.0 {
+                        let shift = 13 + common - exp(x);
+                        if shift >= 24 || x.to_bits() & ((1u32 << shift) - 1) != 0 {
+                            return None;
+                        }
+                    }
+                }
+            }
+            out[i][j] = match op {
+                MatrixEltwiseOp::Add => exact(f64::from(a) + f64::from(b))?,
+                MatrixEltwiseOp::Sub => exact(f64::from(a) - f64::from(b))?,
+                MatrixEltwiseOp::Mul => {
+                    let mut acc = dst[i][j];
+                    if !valid(acc) {
+                        return None;
+                    }
+                    for &phase in phases {
+                        let aa = src_a_fidelity_bits(a, phase);
+                        let bb = src_b_fidelity_bits(b, phase);
+                        let product = exact(f64::from(aa) * f64::from(bb))?;
+                        acc = exact(f64::from(acc) + f64::from(product))?;
+                    }
+                    acc
+                }
+            };
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod elw_tests {
+    use super::*;
+    use crate::matrix::SrcBroadcast;
+    #[test]
+    fn exact_oracle_refuses_alignment_loss_and_exceptional_arithmetic() {
+        let zero = [[0.0; 16]; 8];
+        for a in [f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+            assert!(elw_reference(
+                &zero,
+                &[[a; 16]; 8],
+                &[[1.0; 16]; 8],
+                MatrixEltwiseOp::Add,
+                SrcBroadcast::None,
+                &[0]
+            )
+            .is_none());
+        }
+        // This sum is exact in FP32 but loses the small operand on the
+        // matrix alignment datapath. Never assert its IEEE bits on hardware.
+        assert!(elw_reference(
+            &zero,
+            &[[f32::from_bits(107u32 << 23); 16]; 8],
+            &[[1.0; 16]; 8],
+            MatrixEltwiseOp::Add,
+            SrcBroadcast::None,
+            &[0]
+        )
+        .is_none());
+        assert!(elw_reference(
+            &zero,
+            &[[1.0; 16]; 8],
+            &[[2.0; 16]; 8],
+            MatrixEltwiseOp::Mul,
+            SrcBroadcast::None,
+            &[4]
+        )
+        .is_none());
+    }
+}

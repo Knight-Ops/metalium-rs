@@ -3594,6 +3594,72 @@ impl<T: Transport> Session<T> {
         self.dram.as_ref().map_or(0, |d| d.alloc.free_bytes())
     }
 
+    /// Explicit reduced-Src matrix arithmetic; outputs accumulate/store F32.
+    /// Only RHS row, column and scalar broadcasts are accepted.
+    pub fn matrix_eltwise(
+        &mut self,
+        op: crate::matrix_eltwise::MatrixEltwiseOp,
+        a: &DramTensor,
+        b: &DramTensor,
+        precision: crate::matrix_eltwise::SrcPrecision,
+        fidelity: Fidelity,
+    ) -> Result<DramTensor, TensorError> {
+        use crate::matrix_eltwise as m;
+        a.expect("matrix elementwise", tensor::Elem::F32)?;
+        b.expect("matrix elementwise", tensor::Elem::F32)?;
+        let dims = [a.rows, a.cols];
+        let broadcast = m::broadcast(dims, [b.rows, b.cols])?;
+        let units = self.units.len();
+        let simulated = self.dev.transport().is_simulated();
+        let work = m::build(
+            &mut self.dram_state()?.alloc,
+            &a.placement,
+            &b.placement,
+            dims,
+            m::Config {
+                packed: false,
+                simulated,
+                precision,
+                fidelity,
+                op,
+                broadcast,
+            },
+            units,
+        )?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Packed BF16 operands stay packed through unpack; the result is F32.
+    pub fn matrix_eltwise_bf16(
+        &mut self,
+        op: crate::matrix_eltwise::MatrixEltwiseOp,
+        a: &crate::bf16::Bf16Tensor,
+        b: &crate::bf16::Bf16Tensor,
+        fidelity: Fidelity,
+    ) -> Result<DramTensor, TensorError> {
+        use crate::matrix_eltwise as m;
+        let dims = [a.rows, a.cols];
+        let broadcast = m::broadcast(dims, [b.rows, b.cols])?;
+        let units = self.units.len();
+        let simulated = self.dev.transport().is_simulated();
+        let work = m::build(
+            &mut self.dram_state()?.alloc,
+            &a.placement,
+            &b.placement,
+            dims,
+            m::Config {
+                packed: true,
+                simulated,
+                precision: m::SrcPrecision::Bf16,
+                fidelity,
+                op,
+                broadcast,
+            },
+            units,
+        )?;
+        self.execute(work, RESET_BUDGET)
+    }
+
     /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`]).
     /// An op with no SFPU program is refused: the data mover does no
     /// arithmetic.

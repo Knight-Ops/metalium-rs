@@ -403,11 +403,15 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
                     if widened.len() == 1 { "has" } else { "have" },
                 )
             };
+            let remaining = if matches!(e.key.as_str(), "ELWADD_BH" | "ELWSUB_BH" | "ELWMUL_BH") {
+                "Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754."
+            } else {
+                "Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon."
+            };
             format!(
                 "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
                  diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere.{widened}{dropped} \
-                 Every other field is carried from that diagram and is as unverified as it \
-                 was. Re-derive on silicon.",
+                 {remaining}",
                 ticked(moved),
                 if moved.len() == 1 { "s" } else { "" }
             )
