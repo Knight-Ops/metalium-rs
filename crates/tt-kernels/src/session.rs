@@ -3891,6 +3891,39 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Copy an F32 rectangle through unpacker XY counters and Dst, bit for bit.
+    /// Column origin and width must be multiples of sixteen; row boundaries
+    /// may be ragged. Only logical datums are read; output padding is zero.
+    pub fn copy_rect_adc(
+        &mut self,
+        source: &DramTensor,
+        origin: [usize; 2],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::adc_copy::build(&mut self.dram_state()?.alloc, source, origin, dims)?;
+        self.execute(work, RESET_BUDGET)
+    }
+
+    /// Copy complete F32 Y/X planes from a W/Z rectangle, preserving raw bits.
+    /// Source storage is `[W * Z * Y, X]`; output is `[dims[0] * dims[1] * Y, X]`.
+    /// Reads only logical datums and produces zero padding, including ragged planes.
+    pub fn copy_planes_adc(
+        &mut self,
+        source: &DramTensor,
+        shape: [usize; 4],
+        origin: [usize; 2],
+        dims: [usize; 2],
+    ) -> Result<DramTensor, TensorError> {
+        let work = crate::adc_copy::build_planes(
+            &mut self.dram_state()?.alloc,
+            source,
+            shape,
+            origin,
+            dims,
+        )?;
+        self.execute(work, RESET_BUDGET)
+    }
+
     /// Copy `src`, bit for bit, into an existing allocated tensor `dst`.
     pub fn copy_into(&mut self, src: &DramTensor, dst: &DramTensor) -> Result<(), TensorError> {
         let units = self.units.len();

@@ -396,6 +396,31 @@ Pulled in only when a kernel needs them; each says which.
 
 Complete census of all 119 Tensix coprocessor instruction encodings generated into `tt-isa` from the Blackhole/Wormhole specification: 68 are actively driven by kernels, firmware, and runtime (`[x]`); 47 are unutilized in current execution pipelines (`[ ]`); and 4 are deliberately omitted on Blackhole (`[-]`):
 
+Step98 acceptance (2026-10-06): simulator 9/9; card-0 full release SMOKE
+203/203 (`1791321817`), including nine ADC gates and the CNN state-lifetime
+regression. Eight MNIST e2e regressions pass with the golden unchanged.
+Final isolated benchmark `1791322068` preserves every output bit but costs
+23–79% more than native repack for the measured rectangles; conditions and
+dataflow counts are in `docs/learnings/firmware-performance.md`. Ordinary
+silicon acceptance uses the requested one-card policy.
+
+Burn performance restoration: the original native slice dispatch and engine
+plumbing are restored; explicit ADC copies remain available. Updated step98
+passes 9/9 simulator gates and card-0 step98 plus CNN passes 13/13
+(`1791323039`). ADC optimization and automatic Burn adoption remain deferred.
+
+Step99 acceptance (2026-10-06): explicit Session F32 plane selection uses bounded
+staging and both Z/W instructions, preserving exceptional raw bits and zero
+padding for ragged dimensions and row views. Simulator 9/9; card-0 ADC followed
+by CNN 13/13 (`1791324670`); full release SMOKE 212/212 (`1791324245`). Fresh
+copies pass under both ownership settings; changed-input traces, deferred frees
+and downstream reduction/matmul pass. Workspace tests/lints, silicon compilation,
+generator/shipping checks and all eight MNIST regressions pass, golden unchanged.
+Burn routing is inapplicable to this Session-only API. See
+[the Z/W tranche checklist](adc-plane-copy.md) and the performance record for
+validated native-repack medians. No speedup or additional instruction adoption
+is claimed.
+
 #### Matrix Unit (FPU) & Formats (22 instructions)
 - [x] `MVMUL`: Matrix-vector multiply (primary GEMM accumulation engine, `Session::matmul_dram`).
 - [x] `GAPOOL`: General average pooling (drives BF16 pooling in `crates/tt-kernels/src/fpu.rs`).
@@ -469,10 +494,10 @@ Complete census of all 119 Tensix coprocessor instruction encodings generated in
 - [x] `SETADCXX`: Set address counter XX channel.
 - [x] `SETADCXY`: Set address counter XY channel.
 - [x] `SETADCZW`: Set address counter ZW channel.
-- [ ] `INCADCXY`: Increment address counter XY channel.
-- [ ] `INCADCZW`: Increment address counter ZW channel.
-- [ ] `ADDRCRXY`: Add relative coordinate offset to ADC XY.
-- [ ] `ADDRCRZW`: Add relative coordinate offset to ADC ZW.
+- [x] `INCADCXY`: checked current-thread helper and live-counter stepping in ADC rectangle copies; step98.
+- [x] `INCADCZW`: checked current-thread Z/W helper and bounded resident plane traversal; independent state/address models and step99 simulator/card-0 gates.
+- [x] `ADDRCRXY`: checked cursor-relative helper and row-anchor restoration in ADC rectangle copies; step98.
+- [x] `ADDRCRZW`: checked Z/W cursor restoration/advance helper in resident plane copies; step99 covers all masks/targets, wide addressing, zero restoration and negative controls.
 - [ ] `SETDVALID`: Manually override destination valid scoreboard bits.
 - [ ] `REG2FLOP_ADC`: Load configuration directly into ADC execution flops.
 - [ ] `UNPACR_NOP_SETDVALID`: Unpacker micro-mode setting DVALID.

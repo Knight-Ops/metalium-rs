@@ -16,6 +16,7 @@
 //! this crate, not a condition a caller could handle. The runner, which talks
 //! to a device, returns [`runtime::RunError`] instead.
 
+pub mod adc_copy;
 pub mod bf16;
 pub mod bfp;
 pub mod code;

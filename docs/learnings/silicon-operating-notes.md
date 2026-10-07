@@ -400,3 +400,71 @@ generated-output change was needed; `gen-isa --check` passes.
 Release chain benchmark `1791317719` passes on both cards with validated outputs,
 two warmups/seven host-timed samples and dataflow counts. See the resident chain
 record in firmware-performance.md for medians and conditions.
+
+## XY-counter rectangle copies (2026-10-06) — measured, not quoted
+
+Card 0 step98 run `1791320021` validates current-thread INCADCXY/ADDRCRXY
+counter updates against an independent indexing oracle. ADDRCRXY advances
+selected cursor anchors and replaces the corresponding live values, rather
+than adding to live values. An empty coordinate mask is a no-op on this card;
+ttsim refuses it (divergence 74). Wormhole provenance remains unchanged; the
+unsupported ThreadOverride is neither offered nor probed.
+
+The ADC F32 rectangle path selects complete sixteen-datum rows into Dst and
+retains every tested raw bit: signed zeros, subnormals, infinities and quiet or
+signaling NaN payloads. Every destination tile is cleared before unpacking and
+packed only after unpack retirement. Partial-row probes reveal why full rows
+matter: clearing Dst validity does not erase its underlying data; writing part
+of a row makes the other columns' old bits visible again. Initial run
+`1791319848` incorrectly expected these untouched partial-row columns to be
+zero. The corrected gate checks written datums and wholly untouched rows, and
+the production kernel only writes complete rows. This is observed on both
+ttsim and card 0, not a simulator divergence.
+
+Counter lifetime is also observable across programs. The first full smoke run
+`1791321400` failed step89 F32 CNN learning after 149 passes; isolated run
+`1791321632` reproduced exactly the same losses. Disabling ADC slice dispatch
+made the unchanged CNN gate pass (`1791321696`). The copy left unpacker 0's
+live Y counters at its final rectangle row, which subsequent Src programs can
+inherit. Retiring the last unpack and clearing XY/ZW live counters and cursor
+anchors before handoff restores the baseline. With dispatch enabled, run
+`1791321793` passes all four CNN learning/trace gates and nine ADC gates. Step98
+also checks a copy followed by matmul on each of one/two units. This is a
+kernel state-lifetime defect and correction, not a numerical tolerance change.
+
+## Z/W counters and resident plane copies (2026-10-06)
+
+Card-0 step99 runs `1791323973` (initial 4/4) and `1791324198` (expanded 9/9)
+validate current-thread INCADCZW/ADDRCRZW against independent counter/address
+models. Cursor-relative updates advance selected anchors and replace selected
+live values; zero increments restore anchors. Unselected coordinates and other
+threads retain their values. Unpacker 1 and packer target selection are observed
+through resulting datums, not just instruction encodings. Empty ADDRCRZW masks
+are no-ops on this card and are independently refused by ttsim (divergence 75).
+
+Bounded unpack-to-Dst fixtures distinguish Blackhole Z/W counter width from
+input addressing. Adding 256 to both input and output Z (or W) with a four-byte
+output stride reads input row zero but writes Dst row sixteen. Adding 8192 wraps
+both counters to zero. Thus input addressing sees the low eight bits, while
+output observes the full thirteen-bit counter, in agreement with Blackhole
+ADCs.md. No generator correction or provenance change is needed.
+
+The resident plane kernel groups source-tile reads and copies logical words
+into a zeroed 64-row staging slab. Descriptor ZDim=8 gives input byte strides
+Z=64/W=512; explicit output Z/W strides select complete sixteen-datum Dst rows.
+INCADCZW steps Z live counters; ADDRCRZW restores Z to its zero anchor while
+advancing W anchors. Full-row unpacks preserve exceptional F32 raw bits and
+avoid the partial-row validity issue described above. Counter changes follow
+unpack retirement; XY/ZW live counters and anchors return to zero before
+handoff. Changed-input traces, deferred source frees, ragged outputs followed
+by reduction/matmul, borrowed row views and repeated copies pass on card 0.
+
+Final expanded step99 plus subsequent CNN learning/trace gates pass 13/13 on
+card 0 (`1791324670`). This includes all increments 0–7, all target combinations
+and nonempty masks, and a selection whose global W and Z counts are both nine
+(beyond the local 8×8 staging coordinates). Full release SMOKE passes 212/212
+(`1791324245`). Fresh copies also pass with `TT_PIPELINE=0` (`1791324866`) and
+`TT_BATCH=0` (`1791324883`). Release native-repack comparison `1791324901`
+validates all six records; its conditions and medians are in
+firmware-performance.md. Ordinary tranche acceptance follows the current
+card-0 policy; these results do not claim standalone step99 validation on card 1.

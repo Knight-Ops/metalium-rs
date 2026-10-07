@@ -963,3 +963,81 @@ per-card validated logs under `target/silicon/out/`. Earlier run `1791317688`
 validated outputs but its first BENCH record shared libtest's test-name line and
 was omitted by collection. The benchmark now ends that line before reporting;
 use the complete final run above.
+
+## ADC rectangle-copy instruction tranche (2026-10-06)
+
+Release card-0 scoreboard: run `1791322068`, dirty tree based on `2ca901b2d6be`,
+two surviving Tensix units, default streaming/pipeline/batch settings. Input is
+a resident 128×128 F32 matrix with values `i % 37`; origins are `[1,16]` for
+16×16 and `[15,16]` for the other rectangles. Timed from host dispatch through
+`Session::sync`, excluding input upload, output validation/download and free.
+Every invocation is validated bit-for-bit. Two warmups precede seven samples;
+the table reports medians in microseconds. No concurrent NC timestamp exports
+are used.
+
+| Rectangle | Existing native repack | ADC unpack/Dst/pack | ADC / repack |
+|---|---:|---:|---:|
+| 16×16 | 15.879 | 28.413 | 1.79× |
+| 37×48 | 53.249 | 82.733 | 1.55× |
+| 65×80 | 130.622 | 161.030 | 1.23× |
+
+The new route is **23–79% slower** in these cases. This tranche establishes
+instruction semantics and a production consumer; it does not establish a
+speedup. Automatic Burn ADC slice routing was subsequently removed at the
+user's request; float slices again use row views and the original native repack
+path. The explicit Session ADC API and instruction gates remain. Future optimization should
+reduce per-output-tile setup and per-row unpack/wait/advance issue costs.
+
+Across nine invocations, ADC dataflow `(regions, batches, transfer_packets)` is
+`(9,9,0)`, `(18,36,0)`, `(18,81,0)` respectively. Existing native repack is
+`(0,0,9)`, `(0,0,18)`, `(0,0,18)`: transfer_packets counts standalone transfers,
+not kernel gathers/scatters. Output download is outside both the timed region
+and these dataflow counters. Builder audits confirm B reads source tiles
+without element copies and NC writes each packed output tile.
+
+Collector artifacts: `target/silicon/bench/1791322068.{jsonl,md}` (six records),
+with the validated per-test output under `target/silicon/out/`. This final run
+includes counter cleanup and starts after the full smoke runner has exited.
+Earlier run `1791321354` measured 22–57% overhead before that cleanup. Run
+`1791322057` passed validation but overlapped the smoke runner's final gates;
+its timing is excluded from the scoreboard.
+
+## ADC Z/W plane-copy tranche (2026-10-06)
+
+Release card-0 run `1791324901`, dirty tree based on `2ca901b2d6be`, two
+surviving Tensix units, default pipeline/batch/streaming settings. Resident F32
+source shape is `[2,3,33,33]`, stored as 198×33, with values `i % 37`. W/Z origin
+is `[0,1]`; selected counts are `[1,1]`, `[1,2]` and `[2,2]`. Native repacking
+uses the equivalent precomputed logical indices in W-major/Z-major order.
+Host timing runs from dispatch through `Session::sync`, excluding source upload,
+index construction, output download/validation and free. Each of nine
+invocations per case is validated bit-for-bit; two warmups precede seven samples.
+No other silicon runner overlapped this run, and simulator/workspace regression
+jobs had finished. NC timestamp exports are not used.
+
+| Selected planes / output storage | Native repack median (µs) | ADC median (µs) | ADC / repack |
+|---|---:|---:|---:|
+| 1×1 / 33×33 | 48.230 | 111.066 | 2.30× |
+| 1×2 / 66×33 | 85.429 | 168.504 | 1.97× |
+| 2×2 / 132×33 | 164.877 | 282.738 | 1.71× |
+
+The explicit ADC API is **71–130% slower** for these fixtures. No speedup or
+automatic Burn routing is claimed. The fixed 64-row unpack traversal and
+per-output-tile gathers are measurable costs even for small ragged outputs.
+
+Across nine invocations, ADC `dataflow_stats` `(regions,batches,transfer_packets)`
+is `(18,36,0)`, `(18,54,0)` and `(18,90,0)` respectively. Native repack reports
+`(0,0,18)` in each case. Standalone transfer packets do not count kernel
+source gathers/output scatters; program audits separately establish NoC0 B
+reads, logical-word staging, Z/W instruction use and NoC1 NC output writes.
+
+Collector artifacts: `target/silicon/bench/1791324901.{jsonl,md}`, six validated
+records. Correctness: card-0 step99 plus subsequent CNN gates 13/13
+(`1791324670`), full release SMOKE 212/212 (`1791324245`), and fresh copies with
+`TT_PIPELINE=0` / `TT_BATCH=0` (`1791324866` / `1791324883`). MNIST e2e is 8/8
+(271.51 s), with the golden unchanged. Other instruction families and performance
+optimization remain deferred.
+
+Preliminary run `1791324740` also validates all six records, but overlapped
+simulator workspace testing on the host. Its 1.76–2.33× ratios are retained in
+the collector artifacts; the final quiet run above owns the scoreboard.

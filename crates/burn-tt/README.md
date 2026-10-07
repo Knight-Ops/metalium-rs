@@ -65,6 +65,11 @@ on arbitrary axes; float scatter/select-add preserve logical duplicate ordering.
 and Boolean scatter/select-OR runs natively with resident indices.
 BF16 convolution and scatter accumulate in F32 until the output boundary.
 
+Float slices preserve row views first, then use the existing native repack
+path. The experimental `tt_kernels::Session::copy_rect_adc` API remains
+available directly; automatic Burn routing is deferred because the measured
+ADC path is slower than native repack.
+
 ## Key types
 
 | Item | What it is |
