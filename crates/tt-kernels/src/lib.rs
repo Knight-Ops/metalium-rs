@@ -38,3 +38,5 @@ pub mod sfpu;
 pub mod shard;
 pub mod tensor;
 pub mod trace;
+
+mod local_movement;

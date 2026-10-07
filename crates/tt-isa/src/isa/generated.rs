@@ -9,9 +9,9 @@
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 26 superseded on Blackhole, 61 Wormhole-only and therefore
+//! to be identical, 26 superseded on Blackhole, 60 Wormhole-only and therefore
 //! **`UNVERIFIED`**, 15 **`MEASURED`** against ttsim where the specification
-//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 3
+//! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 4
 //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate
 //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).
 //!
@@ -1027,19 +1027,15 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/SUBDMAREG.md",
     );
 
-    /// `MULDMAREG`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/MULDMAREG.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `MULDMAREG`. **`CONFIRMED`** on Blackhole, ttsim and silicon, by `crates/tt-tests/tests/step100_scalar_config.rs::scalar_register_and_immediate_semantics`: the layout of `WormholeB0/TensixTile/TensixCoprocessor/MULDMAREG.md` (a Wormhole page; Blackhole has none), every field exercised.
     pub static MULDMAREG: InstructionDef = InstructionDef::new(
         "MULDMAREG",
         "MULDMAREG",
         0x5a,
-        &[
-            Field::new("ResultReg", 12, 6, false, None),
-            Field::new("RightReg", 6, 6, false, None),
-            Field::new("LeftReg", 0, 6, false, None),
-        ],
+        &[Field::new("ResultReg", 12, 6, false, None), Field::new("RightReg", 6, 6, false, None), Field::new("LeftReg", 0, 6, false, None)],
         &[(Field::new("", 23, 1, false, None), 0)],
         0x007c0000,
-        Provenance::WormholeOnly,
+        Provenance::Confirmed { evidence: "crates/tt-tests/tests/step100_scalar_config.rs::scalar_register_and_immediate_semantics" },
         "WormholeB0/TensixTile/TensixCoprocessor/MULDMAREG.md",
     );
 

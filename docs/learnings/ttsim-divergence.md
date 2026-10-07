@@ -89,6 +89,35 @@ the process. Each one that we hit is either routed around or deferred to a silic
 | 74 | **ADDRCRXY with an empty coordinate mask** | `UnsupportedFunctionality: tensix_addrcrxy: no-op mask: bit_mask=0` | The page's model selects no coordinates, hence a no-op. Card 0 confirms this for all seven target combinations (`step98_adc_copy::empty_cursor_mask_is_a_noop_on_silicon`, run `1791320021`). The simulator refusal has its own gate. Nonempty masks and the production rectangle kernel run on both targets. No ThreadOverride is exposed by the typed helper. |
 | 75 | **ADDRCRZW with an empty coordinate mask** | `UnsupportedFunctionality: tensix_addrcrzw: no-op mask: bit_mask=0` | Independently tested in step99 (not inferred from XY). Card-0 run `1791323973` observes no changes to unpacked output for every target selection; the simulator refusal gate catches its process exit. Nonempty masks implement cursor-relative restoration. Production plane traversal always uses a nonempty mask. |
 
+### Scalar/configuration foundation (2026-10-07)
+
+`step100_scalar_config` probes each form in its own `fork_scope` through
+`harness::survives`, with independently read surviving controls:
+
+- Register/immediate SUBDMAREG, CMPDMAREG (all three modes), SHIFTDMAREG
+  (both directions) and BITWOPDMAREG (all three modes) refuse with
+  `tensix_decode_{sub,cmp,shift,bitwop}gpr: UnsupportedFunctionality`.
+- Register MULDMAREG survives and matches low-16 unsigned multiplication;
+  immediate MULDMAREG refuses `tensix_mulgpr: op_b_is_const=1`.
+- CFGSHIFTMASK supports only the measured combination Add, Preserve, width 32,
+  rotation 0. Every scratch selector survives this combination. Widths 1, 2
+  and 8 refuse `mask_width=0/1/7`; width 32 other ALU modes refuse `operation`,
+  Replace refuses `disable_mask_on_old_val=0`, rotation 31 refuses
+  `right_cshift_amt=31`. Tests pin each refusal rather than silently skipping it.
+- Debug reads of scratch words 209–211 refuse `tensix_cfg_rd32: reg=...`;
+  bank-1 debug index 300 refuses `TENSIX_CREG_READ: data=0x12c`. The surviving
+  control reads bank-0 THCON base word 76 through the independent debug pair.
+  RDCFG itself reads both banks on all three issuing threads: tests move the
+  result to bank-0 base words for independent debug observation. Thus debug
+  refusal is not evidence of RDCFG decode refusal.
+
+The full scalar/configuration matrices and descriptor replay are silicon arms;
+supported register multiplication and configuration read/Add remain simulator
+semantic gates. Other scalar forms retain WormholeOnly encoding provenance.
+Only register MULDMAREG meets the generator's simulator-and-silicon confirmation
+contract. Hardware run IDs and the fast-publication scheduling finding are in
+`silicon-operating-notes.md`; simulator outcomes cannot establish that ordering.
+
 ## Behaviour worth knowing, not strictly divergence
 
 | # | What | Note |
@@ -366,3 +395,20 @@ The reused-device silicon probe explicitly disables SFPU predication with
 SFPENCC(0,0,2). Ttsim refuses this form (`tensix_sfpencc: instr_mod1=2`), so
 simulator probes use the simulator's default disabled predication; this gate's
 explicit predicate control is silicon-only.
+
+### L1 scalar/mover tranche (step101, 2026-10-07)
+
+Isolated fork probes refuse all four LOADIND and STOREIND_L1 widths with
+`tensix_decode_loadind` / `tensix_decode_storeind`. XMOV itself refuses
+`tensix_decode_xmov`; mover setup also refuses `tensix_cfg_wr32: reg=88`, before
+copy or zero XMOV can execute. A supported NOP
+control and DMANOP survive. Byte/GPR reference models and a separate program
+interpreter retain host test coverage; resident movement and instruction semantics
+are silicon gates. Do not skip C0/C9 waits to make a simulator path executable.
+
+Card 0's independent raw STOREIND size sweep (`1791385416`) also corrects the
+pinned Wormhole functional model: sizes 1/2 are 2/4 bytes on Blackhole, while
+LOADIND sizes 1/2 remain 4/2 bytes. This is a semantic value correction, not
+an encoding-field relocation; generated provenance is deliberately retained.
+See [operating notes](silicon-operating-notes.md#l1-scalar-movement-and-output-ownership-2026-10-07)
+for accepted instruction and resident consumer evidence (`1791389018`).

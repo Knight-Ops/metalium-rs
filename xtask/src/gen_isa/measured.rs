@@ -308,6 +308,16 @@ pub struct Confirmed {
 
 pub const CONFIRMED: &[Confirmed] = &[
     Confirmed {
+        // Immediate multiplication and the other new scalar families refuse
+        // ttsim; they retain WormholeOnly provenance despite silicon coverage.
+        key: "MULDMAREG",
+        exercised: &["ResultReg", "RightReg", "LeftReg"],
+        evidence: &[(
+            "crates/tt-tests/tests/step100_scalar_config.rs",
+            "scalar_register_and_immediate_semantics",
+        )],
+    },
+    Confirmed {
         // The register form; the six-bit immediate form (`ADDDMAREGi`) runs
         // on silicon (`adddmareg_adds_an_immediate`) but not on ttsim
         // (divergence row 67), so it is not confirmed here.

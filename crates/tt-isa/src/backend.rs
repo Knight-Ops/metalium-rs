@@ -1,4 +1,4 @@
-//! Writing Tensix backend configuration, and waiting for backend units.
+//! Reading, writing and mutating Tensix backend configuration, and unit waits.
 //!
 //! The encodings are generated — see [`crate::isa`]. What is here is the layer
 //! above, in the same split [`crate::sfpu`] uses: the generated layer encodes what
@@ -52,23 +52,54 @@ pub const THREAD_CONFIG_INDEX_LIMIT: u32 = crate::cfg::THD_STATE_SIZE;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum EncodeError {
+    /// Memory data registers must not alias address or offset registers.
+    MemoryRegisterAlias,
+    /// A quadword memory transfer silently rounds an unaligned GPR group.
+    MisalignedMemoryGroup {
+        index: u32,
+    },
+    BadMaskWidth {
+        width: u32,
+    },
+    BadRotation {
+        rotation: u32,
+    },
+    InvalidMutationTarget {
+        index: u16,
+    },
     /// A GPR index outside `0..GPR_COUNT`.
-    BadGpr { index: u32 },
+    BadGpr {
+        index: u32,
+    },
     /// A `Config` index `WRCFG` would treat as out of bounds.
-    ConfigIndexOutOfBounds { index: u32 },
+    ConfigIndexOutOfBounds {
+        index: u32,
+    },
     /// A `ThreadConfig` index `SETC16` would treat as out of bounds.
-    ThreadConfigIndexOutOfBounds { index: u32 },
+    ThreadConfigIndexOutOfBounds {
+        index: u32,
+    },
     /// A 128-bit `WRCFG` whose GPR or `Config` index is not a multiple of four.
     ///
     /// The instruction masks both with `& ~3` rather than refusing, so an
     /// unaligned request would silently write somewhere else.
-    Misaligned128 { gpr: u32, index: u32 },
+    Misaligned128 {
+        gpr: u32,
+        index: u32,
+    },
     /// A [`ConfigSpan`] that is not the four words a 128-bit `WRCFG` moves.
-    SpanNotFourWords { words: u32 },
+    SpanNotFourWords {
+        words: u32,
+    },
     /// A value too large for the field it was to be placed in.
-    ValueTooLarge { value: u32, max: u32 },
+    ValueTooLarge {
+        value: u32,
+        max: u32,
+    },
     /// More distinct `Config` words than a [`ConfigWords`] can hold.
-    TooManyWords { capacity: usize },
+    TooManyWords {
+        capacity: usize,
+    },
     /// A `WRCFG` aimed at `STATE_RESET_EN`, which would zero most of `Config`.
     WouldResetConfig,
     /// A field value too large for its bit width, as the generated layer saw it.
@@ -80,7 +111,7 @@ pub enum EncodeError {
 }
 
 impl EncodeError {
-    const fn from_isa(e: isa::EncodeError) -> Self {
+    pub(crate) const fn from_isa(e: isa::EncodeError) -> Self {
         match e {
             isa::EncodeError::FieldTooLarge {
                 field,
@@ -99,6 +130,22 @@ impl EncodeError {
 impl core::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            EncodeError::MisalignedMemoryGroup { index } => write!(
+                f,
+                "quadword memory transfer GPR {index} must be aligned to four"
+            ),
+            EncodeError::MemoryRegisterAlias => {
+                f.write_str("memory data, address and offset registers must be disjoint")
+            }
+            EncodeError::BadMaskWidth { width } => {
+                write!(f, "mask width {width} is outside 1..=32")
+            }
+            EncodeError::BadRotation { rotation } => {
+                write!(f, "rotation {rotation} is outside 0..=31")
+            }
+            EncodeError::InvalidMutationTarget { index } => {
+                write!(f, "Config word {index} is not an allowed mutation target")
+            }
             EncodeError::BadGpr { index } => {
                 write!(f, "GPR {index} does not exist; there are {GPR_COUNT}")
             }
@@ -140,7 +187,7 @@ impl core::fmt::Display for EncodeError {
     }
 }
 
-const fn check_gpr(index: u32) -> Result<(), EncodeError> {
+pub(crate) const fn check_gpr(index: u32) -> Result<(), EncodeError> {
     if index < GPR_COUNT {
         Ok(())
     } else {
@@ -611,6 +658,8 @@ impl Before {
     pub const MATRIX: Before = Before(block::MATRIX);
     pub const SFPU: Before = Before(block::SFPU);
     pub const CONFIG: Before = Before(block::CONFIG);
+    pub const SCALAR: Before = Before(block::SCALAR);
+    pub const MOVER: Before = Before(block::MOVER);
     /// Every unit: a full barrier on this thread. What the end of a program, or
     /// anything a RISC-V core or the host will read afterwards, wants.
     pub const EVERYTHING: Before = Before(
@@ -633,6 +682,18 @@ impl Before {
     pub const fn mask(self) -> u32 {
         self.0
     }
+}
+
+/// Drain this thread's scalar memory requests (Blackhole C0), blocking scalar
+/// issue and the selected consumers. This does not drain another thread.
+pub const fn wait_for_scalar(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::SCALAR | before.0, cond::SCALAR_OUTSTANDING)
+}
+
+/// Drain the shared hardware mover (Blackhole C9), blocking mover issue and
+/// selected consumers. The caller must own mover configuration until completion.
+pub const fn wait_for_mover(before: Before) -> Result<Instruction, EncodeError> {
+    stallwait(block::MOVER | before.0, cond::MOVER_OUTSTANDING)
 }
 
 /// Wait until this thread has drained unpacker 0 (C1), holding back its own
@@ -924,4 +985,96 @@ mod tests {
             "C12 is the highest condition bit"
         );
     }
+}
+
+/// CFGSHIFTMASK ALU operations, in specification order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ConfigOperation {
+    Or,
+    And,
+    Xor,
+    Add,
+    OrNot,
+    AndNot,
+    XorNot,
+    Sub,
+}
+/// Replace clears the rotated mask before applying the ALU operation;
+/// Preserve applies the operation directly to the existing destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MaskMode {
+    Replace,
+    Preserve,
+}
+/// Scratch words are global across banks. CurrentThread selects slot 0/1/2
+/// by issuing thread, not a bank-local value. Serialize shared scratch use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Scratch {
+    Slot0,
+    Slot1,
+    Slot2,
+    CurrentThread,
+}
+
+/// Read a whole Config word from the issuing thread's selected bank.
+/// The wait blocks every subsequent consumer until the Configuration Unit retires.
+/// This accepts word indices, never ThreadConfig fields.
+pub fn read_word(result_gpr: u32, addr32: u16) -> Result<[Instruction; 2], EncodeError> {
+    check_gpr(result_gpr)?;
+    if u32::from(addr32) >= CONFIG_INDEX_LIMIT {
+        return Err(EncodeError::ConfigIndexOutOfBounds {
+            index: addr32.into(),
+        });
+    }
+    Ok([
+        encode::rdcfg(result_gpr, addr32.into()).map_err(EncodeError::from_isa)?,
+        stallwait(Before::EVERYTHING.mask(), cond::CONFIG_BUSY)?,
+    ])
+}
+
+/// Mutate only scratch words or THCON_SEC0/1_REG3_Base_address.
+/// Drain active unpackers before changing base addresses. Scratch is shared
+/// across both banks and all threads, so callers must serialize its use.
+/// Width is 1–32 bits; rotation is a right rotation of 0–31 bits.
+pub fn modify_word(
+    target: u16,
+    scratch: Scratch,
+    operation: ConfigOperation,
+    mask_mode: MaskMode,
+    width: u32,
+    rotation: u32,
+) -> Result<[Instruction; 2], EncodeError> {
+    use crate::cfg::generated::{global, thcon};
+    if ![
+        global::SCRATCH_SEC0_val.addr32(),
+        global::SCRATCH_SEC1_val.addr32(),
+        global::SCRATCH_SEC2_val.addr32(),
+        thcon::THCON_SEC0_REG3_Base_address.addr32(),
+        thcon::THCON_SEC1_REG3_Base_address.addr32(),
+    ]
+    .contains(&target)
+    {
+        return Err(EncodeError::InvalidMutationTarget { index: target });
+    }
+    if !(1..=32).contains(&width) {
+        return Err(EncodeError::BadMaskWidth { width });
+    }
+    if rotation > 31 {
+        return Err(EncodeError::BadRotation { rotation });
+    }
+    Ok([
+        encode::Cfgshiftmask::ZERO
+            .cfg_index(target.into())
+            .scratch_index(scratch as u32)
+            .alu_mode(operation as u32)
+            .mask_mode(mask_mode as u32)
+            .mask_width(width - 1)
+            .rotate_amt(rotation)
+            .encode()
+            .map_err(EncodeError::from_isa)?,
+        stallwait(Before::EVERYTHING.mask(), cond::CONFIG_BUSY)?,
+    ])
 }

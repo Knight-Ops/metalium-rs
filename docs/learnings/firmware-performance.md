@@ -1041,3 +1041,49 @@ optimization remain deferred.
 Preliminary run `1791324740` also validates all six records, but overlapped
 simulator workspace testing on the host. Its 1.76–2.33× ratios are retained in
 the collector artifacts; the final quiet run above owns the scoreboard.
+
+### Explicit L1 movement APIs (step101/102, 2026-10-07)
+
+Validated release card-0 run `1791389713` (3/3 benchmarks), with no simulator
+workloads running; rustc 1.98.1, default Session bring-up/power policy, ARC
+watchdog 10, no clock override. Two warmups and seven measured samples; each
+output/guard region is validated outside the timed interval. Artifact:
+`target/silicon/bench/1791389713.{jsonl,md}`. Earlier validated exploratory run
+`1791389291` ran alongside simulator regression checks and is superseded here.
+
+Local measurements use one tile and **128 repeated transfers per sample**.
+XMOV setup is done once per resident launch, each issue drains C9; the native
+B baseline submits 128 COPY_WORDS descriptors (zero broadcasts a resident zero
+word with source stride zero). Both include their different host launch and
+completion costs, and neither includes GDDR/staging/readback. These are local
+execution costs, not a pure mover-bandwidth measurement.
+
+| Local bytes per issue | B copy, µs / 128 | XMOV copy, µs / 128 | XMOV zero, µs / 128 |
+|---|---:|---:|---:|
+| 16 | 301.210 | 17.863 | 17.753 |
+| 128 | 321.878 | 17.793 | 17.723 |
+| 4096 | 1034.564 | 40.735 | 36.970 |
+
+B's 4096-byte broadcast zero baseline is 891.167 µs per 128 issues. Local
+throughput alone does not imply a beneficial tensor route.
+
+Whole-tensor F32 measurements use two Session units and time allocation,
+build/staging/launch through sync; final download/validation/free are excluded.
+Native copy is Session::copy. Native zero is the existing metadata-immediate
+zero path (the backend's 32-bit zeros implementation), not a host upload or
+arithmetic fallback. The explicit APIs initialize destination padding.
+
+| Shape | Native copy µs | XMOV copy µs | Native zero µs | XMOV zero µs |
+|---|---:|---:|---:|---:|
+| 32×32 | 11.531 | 14.356 | 516.010 | 14.096 |
+| 256×256 | 28.353 | 242.250 | 17949.838 | 207.276 |
+| 97×99 (ragged) | 16.882 | 117.959 | 3348.486 | 62.135 |
+
+Over all nine dispatches, XMOV recorded 9/18/18 ownership regions and
+9/576/144 batches respectively, with **zero transfer-only packets**. Native
+copy recorded 9/18/18 transfer packets, and metadata zero 27/1440/225.
+Each XMOV output tile is one bounded local-movement job; the larger native copy
+amortizes launches across runs. Ragged movement additionally zeros and copies
+face-row fragments. The explicit copy is slower end to end in every measured
+shape despite the faster local engine. Keep all four APIs opt-in; automatic
+Burn routing remains unchanged, including zero routing.

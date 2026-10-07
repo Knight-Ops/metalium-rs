@@ -3891,6 +3891,86 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Copy logical datums bit for bit through the Tensix L1 mover. Output
+    /// padding is physically zero. Explicit, single-card operation; row views
+    /// are supported. B reads on NoC0 and NC writes on NoC1.
+    pub fn copy_xmov(&mut self, source: &DramTensor) -> Result<DramTensor, TensorError> {
+        self.movement_xmov(Some(source), [source.rows, source.cols], source.elem)
+    }
+
+    /// Create physically zeroed 32-bit storage through the Tensix L1 mover.
+    pub fn zeros_xmov(
+        &mut self,
+        dims: [usize; 2],
+        elem: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        self.movement_xmov(None, dims, elem)
+    }
+
+    fn movement_xmov(
+        &mut self,
+        source: Option<&DramTensor>,
+        dims: [usize; 2],
+        elem: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        crate::local_movement::geometry(dims, 4)?;
+        let out = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, dims[0], dims[1], elem)?;
+        let jobs = match crate::local_movement::jobs(
+            source.map(|s| &s.placement),
+            &out.placement,
+            dims,
+            4,
+        ) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                self.dram_state()?.alloc.free(&out.placement);
+                return Err(error);
+            }
+        };
+        out.set_pad(tensor::Pad::Zero);
+        self.execute(tensor::Work { out, jobs }, RESET_BUDGET)
+    }
+
+    /// Copy raw BF16 storage bits through Tensix, with physically zero padding.
+    pub fn copy_bf16_xmov(
+        &mut self,
+        source: &crate::bf16::Bf16Tensor,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        self.movement_bf16_xmov(Some(source), [source.rows, source.cols])
+    }
+
+    /// Create raw BF16 positive zero storage through the Tensix L1 mover.
+    pub fn zeros_bf16_xmov(
+        &mut self,
+        dims: [usize; 2],
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        self.movement_bf16_xmov(None, dims)
+    }
+
+    fn movement_bf16_xmov(
+        &mut self,
+        source: Option<&crate::bf16::Bf16Tensor>,
+        dims: [usize; 2],
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let tiles = crate::local_movement::geometry(dims, 2)?;
+        let out = crate::bf16::Bf16Tensor {
+            rows: dims[0],
+            cols: dims[1],
+            placement: self
+                .dram_state()?
+                .alloc
+                .alloc_slots(tiles, tt_isa::dm::BF16_TILE_SLOT)?,
+        };
+        let result =
+            crate::local_movement::jobs(source.map(|s| &s.placement), &out.placement, dims, 2)
+                .and_then(|jobs| self.submit_jobs(jobs, RESET_BUDGET));
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        Ok(out)
+    }
+
     /// Copy an F32 rectangle through unpacker XY counters and Dst, bit for bit.
     /// Column origin and width must be multiples of sixteen; row boundaries
     /// may be ragged. Only logical datums are read; output padding is zero.

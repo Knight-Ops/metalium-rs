@@ -26,6 +26,8 @@ pub mod mailbox;
 pub mod matrix;
 pub mod noc;
 pub mod numerics;
+/// Checked thread-local scalar register arithmetic.
+pub mod scalar;
 pub mod sfpu;
 pub mod sync;
 pub mod tensix;

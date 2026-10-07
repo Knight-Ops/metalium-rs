@@ -111,3 +111,11 @@ ragged padding, physical sizes and changed-input replay on simulator and both
 cards. Pinned ttsim refuses direct BFP2 matmul; that arm is silicon-only. See
 [the delivered contract and validation](../../docs/plans/mixed-bfp-storage.md)
 and [conversion/matmul release medians](../../docs/learnings/firmware-performance.md).
+
+`Session::copy_xmov` / `zeros_xmov` and `copy_bf16_xmov` / `zeros_bf16_xmov`
+are explicit single-card, bit-preserving Tensix L1 movement APIs. They support
+whole tile-row views and initialize all output padding to zero. B gathers,
+T0 moves (XMOV plus scalar tails), a T2 semaphore shell guards output ownership,
+and NC writes payloads. These APIs are silicon-only because ttsim refuses the
+memory instructions/setup. Native copy and automatic Burn routing are unchanged;
+large/ragged XMOV copies are slower end to end in the initial release benchmark.

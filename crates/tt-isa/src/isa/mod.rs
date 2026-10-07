@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(counts["SharedWithWormhole"], 24);
         assert_eq!(counts["SupersededOnBlackhole"], 26);
         assert_eq!(
-            counts["WormholeOnly"], 56,
+            counts["WormholeOnly"], 55,
             "half the instruction set is a hypothesis; that is the point of recording it"
         );
         assert_eq!(
@@ -520,8 +520,8 @@ mod tests {
             "MVMUL, the six MOV*, ELWADD, ELWSUB, ELWMUL, DOTPV, SHIFTXB, ZEROACC, GMPOOL, GAPOOL"
         );
         assert_eq!(
-            counts["Confirmed"], 3,
-            "MOP, MOP_CFG (step36_mop), ADDDMAREG (step38_gpr_add)"
+            counts["Confirmed"], 4,
+            "MOP, MOP_CFG (step36_mop), ADDDMAREG (step38_gpr_add), MULDMAREG (step100_scalar_config)"
         );
     }
 

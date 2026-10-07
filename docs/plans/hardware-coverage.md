@@ -372,9 +372,9 @@ Pulled in only when a kernel needs them; each says which.
 
 | Feature | Spec | State | Wanted by |
 |---|---|---|---|
-| ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` used for config staging; rest `[ ]` | F3 (per-tile parameters without reprogramming) |
+| ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` stages config; `ADDDMAREG` steps matmul addresses (step38); scalar ALU/config readback done (step100); L1 transfers step101/102 `[x]`; `FLUSHDMA` `[-]`, use STALLWAIT | F3 (per-tile parameters without reprogramming) |
 | Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[ ]` | 9.8 page FIFO, if counters move into Tensix |
-| `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[ ]` | D4 (copies without the B core) |
+| `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[x]` step101/102, explicit copy/zero | D4 (copies without the B core) |
 | NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[ ]` | weight broadcast to many tiles (9.6 follow-up) |
 | NoC atomics | BH `NoC/Atomics.md` | `[ ]` | R1 across tiles |
 | NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; interrupts `[ ]` | -- |
@@ -420,6 +420,29 @@ Burn routing is inapplicable to this Session-only API. See
 [the Z/W tranche checklist](adc-plane-copy.md) and the performance record for
 validated native-repack medians. No speedup or additional instruction adoption
 is claimed.
+
+Step100 acceptance (2026-10-07): nine isolated release card-0 gates pass
+(run `1791379895`), including every configuration ALU/mask mode, both banks,
+all issuing threads, every scratch target/selector, scalar register/immediate
+forms, aliasing, independent integer/config models and diagnostic replay.
+Simulator refusals have surviving controls; supported register multiply and
+configuration read/Add remain semantic gates. Only register MULDMAREG provenance
+is promoted. Descriptor publication needs an explicit Configuration Unit barrier
+in tight replay; see operating notes. Default tensor dispatch stays unchanged;
+Burn routing, gradients and padding are inapplicable to step100. DMANOP is now
+accepted in step101; FLUSHDMA remains deliberately excluded; use STALLWAIT.
+
+Step101/102 acceptance: twelve isolated release card-0 gates pass
+(`1791389018`). T0 performs all movement; T2 carries a declared two-semaphore
+output ownership shell, since an empty T2 cannot publish T0 output safely.
+F32/I32/Bool/raw BF16, physical zero padding, whole tile-row views, changed-input
+traces, deferred frees and downstream reductions/matmul pass. No automatic Burn
+routing, mesh/BFP/in-place/rectangle API or firmware ABI change. See operating
+notes for measured STOREIND widths and the output-credit handoff, and the
+performance scoreboard for validated release comparisons.
+[Completed checklist](../completed-plans/scalar-config-foundation.md).
+
+[Completed L1 movement checklist](../completed-plans/l1-scalar-movement.md).
 
 #### Matrix Unit (FPU) & Formats (22 instructions)
 - [x] `MVMUL`: Matrix-vector multiply (primary GEMM accumulation engine, `Session::matmul_dram`).
@@ -520,8 +543,8 @@ is claimed.
 #### Backend Configuration (7 instructions)
 - [x] `WRCFG`: 32-bit and 128-bit backend configuration writes.
 - [x] `SETC16`: Direct 16-bit thread configuration writes.
-- [ ] `RDCFG`: Read backend configuration words to GPR.
-- [ ] `CFGSHIFTMASK`: In-place shift-and-mask on backend configuration words.
+- [x] `RDCFG`: checked backend read plus full Configuration Unit wait; both banks/all threads (step100).
+- [x] `CFGSHIFTMASK`: checked eight ALU modes, mask preservation/replacement, four scratch selectors and restricted mutation targets (step100); full matrix silicon, simulator supports only unrotated full-width preserved Add.
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
 #### DMA Engine, Atomics & Registers (20 instructions)
@@ -531,20 +554,20 @@ is claimed.
 - [ ] `ATSWAP`: Atomic swap on L1.
 - [ ] `ATINCGET`: Atomic fetch-and-increment on L1.
 - [ ] `ATINCGETPTR`: Atomic fetch-and-increment pointer on L1.
-- [ ] `ADDDMAREG`: Add to DMA register.
-- [ ] `SUBDMAREG`: Subtract from DMA register.
-- [ ] `MULDMAREG`: Multiply DMA register.
-- [ ] `CMPDMAREG`: Compare DMA register.
-- [ ] `SHIFTDMAREG`: Shift DMA register.
-- [ ] `BITWOPDMAREG`: Bitwise operation on DMA register.
-- [ ] `FLUSHDMA`: Flush DMA engine pipeline.
-- [ ] `LOADIND`: Indirect register-indexed load.
-- [ ] `STOREIND_L1`: Indirect store into L1 memory.
+- [x] `ADDDMAREG`: production register-form matmul address stepping and step38; the immediate form is silicon-only (divergence 67).
+- [x] `SUBDMAREG`: checked wrapping subtraction, register/immediate forms (step100); silicon semantics, simulator refusal.
+- [x] `MULDMAREG`: checked low-16 unsigned multiplication, register/immediate forms (step100); register encoding confirmed on simulator/card 0, immediate silicon-only with WormholeOnly provenance.
+- [x] `CMPDMAREG`: checked unsigned greater/less/equal, exact 0/1 result (step100); silicon semantics, simulator refusal.
+- [x] `SHIFTDMAREG`: checked logical left/right, register low-five count and 5-bit immediate (step100); silicon semantics, simulator refusal.
+- [x] `BITWOPDMAREG`: checked AND/OR/XOR, register/immediate forms (step100); silicon semantics, simulator refusal.
+- [-] `FLUSHDMA`: occupies the shared Scalar Unit while waiting; pinned page prefers `STALLWAIT` with equivalent C0–C3 conditions and all block bits. Excluded from production support in favor of the existing barrier; not a claim that every possible use is strictly worse.
+- [x] `LOADIND`: checked widths/offset halves/increments, asynchronous read barriers and raw-bit preservation (step101, card 0).
+- [x] `STOREIND_L1`: checked L1 stores; measured Blackhole width mapping and all-thread guard gates (step101).
 - [ ] `STOREIND_MMIO`: Indirect store into Tensix MMIO space.
 - [ ] `LOADREG`: Indirect register load.
 - [ ] `STOREREG`: Indirect register store.
-- [ ] `XMOV`: Direct L1-to-register moves bypassing unpackers. Item D4.
-- [ ] `DMANOP`: DMA pipeline synchronization no-op.
+- [x] `XMOV`: checked declared L1 copy/zero, C12 setup/C9 completion and explicit resident APIs (step101/102). Item D4.
+- [x] `DMANOP`: diagnostic GPR/config/memory preservation (step101), never a completion wait.
 
 ---
 

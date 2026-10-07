@@ -12,7 +12,8 @@ build for both does not belong here.
 |---|---|
 | `isa` | The Tensix instruction set. `isa::generated` is produced by `cargo xtask gen-isa`; each encoding carries a `Provenance` (Blackhole, shared, Wormhole-only `UNVERIFIED`, or measured). Wormhole forms are in `isa::generated::defs::wormhole`. |
 | `cfg` | Backend-configuration fields. `cfg::generated` is produced by `cargo xtask gen-cfg` from `cfg_defines.h`. |
-| `backend`, `sfpu`, `matrix`, `sync` | Hand-written layers over the encodings: config writes and unit waits, SFPU hazards, `SrcA`/`SrcB` bank ownership, Tensix semaphores. |
+| `backend`, `sfpu`, `matrix`, `sync` | Hand-written layers over the encodings: checked config reads/mutations/writes and unit waits, SFPU hazards, `SrcA`/`SrcB` bank ownership, Tensix semaphores. |
+| `scalar` | Checked thread-local subtraction, low-16 multiplication, unsigned comparisons, logical shifts and bitwise operations. Register/immediate provenance and step100 simulator restrictions remain explicit. |
 | `noc` | NoC coordinate spaces (typed per NoC), NIU registers, `noc::grid::Tensix` (the surviving columns). |
 | `tensix` | Tile memory map, baby RISC-V cores (`Core`), reset PCs, soft reset. |
 | `arc` | The ARC telemetry tags: how to ask a chip what it is (harvesting, translation). |
@@ -51,3 +52,11 @@ settling interval does restart it. See [hardware evidence and limitations](../..
   fields sit one bit lower on Blackhole than Wormhole draws them; those are measured
   layouts in `xtask/src/gen_isa/Bits32_BH.lua`.
 - Constants cite their specification page. Keep that when adding one.
+
+`scalar::{TransferWidth, OffsetHalf, OffsetIncrement}` provide checked
+`load_indirect` / `store_indirect_l1` operands and diagnostic `dma_nop`.
+Quadword GPR groups must align to four; data, address and offset registers must
+be disjoint. Kernel builders must additionally check runtime addresses/extents.
+`backend::wait_for_scalar` (C0) and `wait_for_mover` (C9) take explicit consumers.
+Blackhole STOREIND widths 1/2 differ from LOADIND; the helper applies the measured
+semantic mapping while retaining the generated layout/provenance (step101).

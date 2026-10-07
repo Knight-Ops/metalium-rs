@@ -468,3 +468,73 @@ and nonempty masks, and a selection whose global W and Z counts are both nine
 validates all six records; its conditions and medians are in
 firmware-performance.md. Ordinary tranche acceptance follows the current
 card-0 policy; these results do not claim standalone step99 validation on card 1.
+
+
+### Scalar/configuration foundation and replay publication (2026-10-07)
+
+`step100_scalar_config` passed nine isolated release gates on card 0
+(`1791343719`). Scratch words 209–211 are global across configuration banks;
+all three issuing threads see the same values. RDCFG reads the selected bank,
+CFGSHIFTMASK implements all eight ALU modes, replace/preserve masks, widths
+1/32 and rotations 0/31, and scalar register/immediate arithmetic matches the
+pinned independent integer models. GPRs remain thread-local across programs.
+Only register MULDMAREG also passes ttsim and gains Confirmed provenance;
+other scalar forms retain WormholeOnly status with explicit silicon evidence.
+
+A tight replay descriptor body exposed a publication hazard. With a scalar XOR
+immediately followed by WRCFG, changed parameters produced the prior descriptor
+value (`1791330370`, aliased scalar result; `1791342637`, separate scalar result
+register published the preceding shift value 2128 instead of 2127). The same
+body unrolled passed. Final GPR snapshots showed the masked index and comparison
+were correct; this does not establish a new encoding or a general arithmetic
+failure. An explicit `STALLWAIT(Before::EVERYTHING, CONFIG_BUSY)` between final
+scalar arithmetic and WRCFG publication made both bodies agree with the independent
+oracle across changed parameters and an intervening configuration program
+(`1791343224`, then full acceptance `1791343719`). Keep that publication boundary
+in tight replay consumers in addition to the read/mutation helpers' own waits.
+
+Programs explicitly initialize GPRs 24–31 and shared scratch on every invocation.
+Their descriptors are diagnostic data, never submitted to a memory engine.
+Default tensor dispatch is unchanged. No performance claim is made, and card 1
+was not used because there was no device-specific discrepancy to investigate.
+
+Final repeat `1791379895` passed all nine gates, with the descriptor's structural
+assertion requiring a REPLAY with Load=0 (execution, beyond recording its body).
+Workspace tests, seven simulator step100 gates, both Clippy variants, silicon
+no-run, generator/shipping checks and eight MNIST regressions also pass; the
+MNIST golden is unchanged.
+
+### L1 scalar movement and output ownership (2026-10-07)
+
+Step101/102 pass twelve isolated release gates on card 0, run `1791389018`.
+LOADIND matches the pinned widths (0=16, 1=4, 2=2, 3=1 bytes), including
+preserved high bits, both offset halves and byte increments on all three roles.
+STOREIND_L1 instead uses **0=16, 1=2, 2=4, 3=1 bytes**. The raw size sweep
+`measure_indirect_widths`, run `1791385416`, independently measures each form;
+the checked helper maps semantic widths accordingly. Generated field positions
+and WormholeOnly provenance remain unchanged. XMOV copy/zero passes both config
+banks, repeated programs, role handovers, guards and immediate scalar consumers.
+Blackhole completion is C0 for scalar requests, C9 for mover requests, and C12
+for configuration setup. DMANOP is diagnostic only.
+
+An empty T2 streaming body publishes its output credit immediately; it does
+**not** join T0. The first movement consumer exposed premature NC reads and a
+copy→matmul result of 98 instead of 130 (`1791388321`). T0 also needs to wait for
+T2's output reservation before writing staging reused by NC. The accepted builder
+therefore declares two semaphores: T2 posts ready *after its runner reserves
+output*, T0 takes ready before any movement/configuration, T0 drains C0/C9 with
+full block masks before posting done, and T2 takes done before its runner
+publishes. Both semaphores return to zero each batch. T1 is empty; T2 carries
+only this ownership shell, with all memory movement on T0. This requires no
+mailbox or firmware change and preserves the existing retirement barriers.
+No production firmware/host TDMA-RISC mover issuers were found by code audit;
+bring-up finishes before local movement. Software B/NC NoC transfers are distinct.
+
+The explicit Session copy/zero APIs support 32-bit F32/I32/Bool and raw BF16,
+whole tile-row views, physically zero output padding, and changed-input traces
+on one/two tiles with deferred frees. Source padding claims and payload bits are
+preserved. Step102 poisons F32 source padding and inspects physical output slots;
+copy→reduction/matmul and packed BF16 matmul pass. T0 buffers and both handoff
+semaphores are allocated through Requirements; no arbitrary L1 addresses enter
+the public API. Mesh/BFP/in-place/rectangle movement and automatic Burn routing
+remain outside this contract.
