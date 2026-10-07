@@ -1,4 +1,4 @@
--- Blackhole instruction layouts MEASURED against ttsim, where the pinned
+-- Blackhole instruction layouts MEASURED on ttsim or silicon, where the pinned
 -- specification draws only Wormhole's.
 --
 -- Same dialect as `Diagrams/Src/Bits32.lua`, read by the same parser, so an entry
@@ -16,6 +16,24 @@
 -- is a cross-check against the document, not a substitute for it.
 
 local diagrams = {
+  UNPACR_NOP_SETDVALID_BH = function()
+    return Bits32{
+      {0, 9, "0x1e9"},
+      {23, 1, "WhichUnpacker"},
+      {24, 8, "0x43"},
+    }
+  end,
+  UNPACR_NOP_ZEROSRC_BH = function()
+    return Bits32{
+      {0, 2, "1"},
+      {2, 2, "NegativeInfSrcA"},
+      {4, 1, "BothBanks"},
+      {5, 1, "WaitLikeUnpacr"},
+      {6, 1, "0"},
+      {23, 1, "WhichUnpacker"},
+      {24, 8, "0x43"},
+    }
+  end,
   GMPOOL_BH = function()
     return Bits32{
       {0, 10, "DstRow"},

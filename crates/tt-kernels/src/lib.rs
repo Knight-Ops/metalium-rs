@@ -36,6 +36,7 @@ pub mod runtime;
 pub mod session;
 pub mod sfpu;
 pub mod shard;
+pub mod source_banks;
 pub mod tensor;
 pub mod trace;
 

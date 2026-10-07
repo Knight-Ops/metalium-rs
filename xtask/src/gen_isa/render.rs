@@ -243,7 +243,7 @@ fn header(out: &mut String, input: &Input<'_>, instructions: usize, layouts: usi
          //!\n\
          //! Provenance: {} documented for Blackhole, {} shared with Wormhole and stated\n\
          //! to be identical, {} superseded on Blackhole, {} Wormhole-only and therefore\n\
-         //! **`UNVERIFIED`**, {} **`MEASURED`** against ttsim where the specification\n\
+         //! **`UNVERIFIED`**, {} **`MEASURED`** on ttsim or silicon where the specification\n\
          //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and {}\n\
          //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate\n\
          //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).\n\
@@ -409,13 +409,20 @@ fn emit_def(out: &mut String, input: &Input<'_>, e: &Entry<'_>, name: &str, pad:
                 "Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon."
             };
             format!(
-                "**`MEASURED`** against ttsim by `{evidence}`, not documented: the only \
+                "**`MEASURED`** on ttsim or silicon by `{evidence}`, not documented: the only \
                  diagram is Wormhole's (`{page}`), and on Blackhole {} sit{} elsewhere.{widened}{dropped} \
                  {remaining}",
                 ticked(moved),
                 if moved.len() == 1 { "s" } else { "" }
             )
         }
+    };
+
+    let doc = match (prov, e.key.as_str()) {
+        (Provenance::Measured { evidence, .. }, "UNPACR_NOP_SETDVALID_BH") => format!(
+            "**`MEASURED`** on Blackhole silicon by `{evidence}`. Replaces Wormhole fixed mode 7 with the bounded non-clearing publication profile 0x1e9; only WhichUnpacker varies. C1/C2 retirement and C5/C6 ownership waits remain required. ttsim refuses this format-selector flavor."
+        ),
+        _ => doc,
     };
 
     writeln!(out, "{pad}/// `{}`. {doc}", e.key).unwrap();

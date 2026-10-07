@@ -1,4 +1,4 @@
-//! Blackhole layouts measured against ttsim, where the specification has only
+//! Blackhole layouts measured on ttsim or silicon, where the specification has only
 //! Wormhole's.
 //!
 //! The specification's `Bits32.lua` is the only encoding source this generator
@@ -40,6 +40,8 @@ use super::provenance::Provenance;
 pub const SOURCE: &str = include_str!("Bits32_BH.lua");
 
 /// One measured layout's credentials.
+type FixedBits = (u8, u8, u32);
+
 pub struct Measured {
     /// Key in [`SOURCE`], always `<supersedes>_BH`.
     pub key: &'static str,
@@ -47,6 +49,8 @@ pub struct Measured {
     pub supersedes: &'static str,
     /// Fields whose position differs from the Wormhole diagram's.
     pub moved: &'static [&'static str],
+    /// Exact (documented, measured) fixed-mode replacements, with gate evidence.
+    pub replaced_fixed: &'static [(FixedBits, FixedBits)],
     /// Required fixed bits measured in positions the Wormhole diagram leaves undrawn.
     pub added_fixed: &'static [(u8, u8, u32)],
     /// Wormhole fields the Blackhole layout does not carry, each with the reason.
@@ -64,9 +68,52 @@ pub struct Measured {
 
 pub const MEASURED: &[Measured] = &[
     Measured {
+        key: "UNPACR_NOP_SETDVALID_BH",
+        supersedes: "UNPACR_NOP_SETDVALID",
+        moved: &[],
+        // BH uses UNP_CLR_SRC, clear-to-one selection and repurposed format 3
+        // to preserve data. The WH fixed mode 7 is a stream-pop on BH.
+        replaced_fixed: &[((0, 3, 7), (0, 9, 0x1e9))],
+        added_fixed: &[],
+        dropped: &[],
+        widened: &[],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/step104_unpacker_handover.rs",
+                "llk_nonclearing_dvalid_a",
+            ),
+            (
+                "crates/tt-tests/tests/step104_unpacker_handover.rs",
+                "llk_nonclearing_dvalid_b",
+            ),
+        ],
+    },
+    Measured {
+        key: "UNPACR_NOP_ZEROSRC_BH",
+        supersedes: "UNPACR_NOP_ZEROSRC",
+        moved: &["BothBanks", "WaitLikeUnpacr"],
+        replaced_fixed: &[],
+        added_fixed: &[],
+        dropped: &[],
+        // The inherited name is historical: BH uses a two-bit clear-value
+        // code, not a negative-infinity flag. Checked APIs expose only zero.
+        widened: &["NegativeInfSrcA"],
+        evidence: &[
+            (
+                "crates/tt-tests/tests/step103_source_banks.rs",
+                "unpacr_zero_blackhole_bank_and_clear_value_fields",
+            ),
+            (
+                "crates/tt-tests/tests/step103_source_banks.rs",
+                "unpacr_zero_waits_on_current_unpacker_bank_with_matrix_bank_held",
+            ),
+        ],
+    },
+    Measured {
         key: "GMPOOL_BH",
         supersedes: "GMPOOL",
         moved: &[],
+        replaced_fixed: &[],
         added_fixed: &[(19, 1, 1)],
         dropped: &[],
         widened: &[],
@@ -79,6 +126,7 @@ pub const MEASURED: &[Measured] = &[
         key: "GAPOOL_BH",
         supersedes: "GAPOOL",
         moved: &[],
+        replaced_fixed: &[],
         added_fixed: &[(19, 1, 1)],
         dropped: &[],
         widened: &[],
@@ -90,6 +138,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MVMUL_BH",
         supersedes: "MVMUL",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -102,6 +151,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVA2D_BH",
         supersedes: "MOVA2D",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -118,6 +168,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVB2D_BH",
         supersedes: "MOVB2D",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["BroadcastCol0", "Broadcast1RowTo8", "Move4Rows", "AddrMod"],
         dropped: &[],
@@ -136,6 +187,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVD2A_BH",
         supersedes: "MOVD2A",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -148,6 +200,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVD2B_BH",
         supersedes: "MOVD2B",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -160,6 +213,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVB2A_BH",
         supersedes: "MOVB2A",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -172,6 +226,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWADD_BH",
         supersedes: "ELWADD",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -194,6 +249,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWSUB_BH",
         supersedes: "ELWSUB",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -216,6 +272,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ELWMUL_BH",
         supersedes: "ELWMUL",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -238,6 +295,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "DOTPV_BH",
         supersedes: "DOTPV",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -250,6 +308,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "MOVDBGA2D_BH",
         supersedes: "MOVDBGA2D",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -262,6 +321,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "SHIFTXB_BH",
         supersedes: "SHIFTXB",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -277,6 +337,7 @@ pub const MEASURED: &[Measured] = &[
     Measured {
         key: "ZEROACC_BH",
         supersedes: "ZEROACC",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod", "UseDst32b"],
         dropped: &[(
@@ -573,6 +634,31 @@ fn compare(measured: &Diagram, wh: &Diagram, m: &Measured) -> Result<(), String>
             .collect()
     };
     let mut expected_fixed = fixed(wh);
+    // Fixed modes can also differ between architectures. Each replacement
+    // must name an exact documented field and may occupy only its old bits or
+    // undrawn bits; carried named fields and opcode bits remain protected.
+    for &(before, after) in m.replaced_fixed {
+        let Some(index) = expected_fixed.iter().position(|f| *f == before) else {
+            return Err(format!("`{}` replaces an absent fixed field", m.key));
+        };
+        let (first, width, value) = after;
+        if width == 0 || width >= 32 || first as u32 + width as u32 > 32 || value >= (1u32 << width)
+        {
+            return Err(format!(
+                "`{}` has an invalid replacement fixed field",
+                m.key
+            ));
+        }
+        let old_mask = ((1u32 << before.1) - 1) << before.0;
+        let new_mask = ((1u32 << width) - 1) << first;
+        if before.0 >= 24 || new_mask & !(wh.undrawn() | old_mask) != 0 {
+            return Err(format!(
+                "`{}` replaces a fixed field over protected bits",
+                m.key
+            ));
+        }
+        expected_fixed[index] = after;
+    }
     for &(first, width, value) in m.added_fixed {
         if width == 0 || width >= 32 || first as u32 + width as u32 > 32 || value >= (1u32 << width)
         {
@@ -592,7 +678,7 @@ fn compare(measured: &Diagram, wh: &Diagram, m: &Measured) -> Result<(), String>
     actual_fixed.sort_unstable();
     if actual_fixed != expected_fixed {
         return Err(format!(
-            "`{}` changes a fixed field of `{}`; only named fields may be relocated",
+            "`{}` changes a fixed field of `{}` without an exact measurement credential",
             m.key, m.supersedes
         ));
     }
@@ -711,6 +797,7 @@ local diagrams = {
     const ROW: Measured = Measured {
         key: "FOO_BH",
         supersedes: "FOO",
+        replaced_fixed: &[],
         added_fixed: &[],
         moved: &["AddrMod"],
         dropped: &[],
@@ -795,6 +882,52 @@ local diagrams = {
     }
 
     #[test]
+    fn fixed_mode_replacements_require_exact_credentials_and_protected_bits() {
+        let source = GOOD.replace("{20, 1, \"0\"}", "{20, 2, \"3\"}");
+        rejects(
+            &source,
+            &[ROW],
+            Provenance::WormholeOnly,
+            "changes a fixed field",
+        );
+        let row = Measured {
+            replaced_fixed: &[((20, 1, 0), (20, 2, 3))],
+            ..ROW
+        };
+        run(&source, &[row], Provenance::WormholeOnly).unwrap();
+        let absent = Measured {
+            replaced_fixed: &[((20, 1, 1), (20, 2, 3))],
+            ..ROW
+        };
+        rejects(
+            &source,
+            &[absent],
+            Provenance::WormholeOnly,
+            "absent fixed field",
+        );
+        let protected = Measured {
+            replaced_fixed: &[((20, 1, 0), (8, 2, 3))],
+            ..ROW
+        };
+        rejects(
+            &source,
+            &[protected],
+            Provenance::WormholeOnly,
+            "protected bits",
+        );
+        let too_wide = Measured {
+            replaced_fixed: &[((20, 1, 0), (20, 1, 3))],
+            ..ROW
+        };
+        rejects(
+            &source,
+            &[too_wide],
+            Provenance::WormholeOnly,
+            "invalid replacement fixed field",
+        );
+    }
+
+    #[test]
     fn an_override_without_credentials_is_refused() {
         rejects(
             GOOD,
@@ -810,6 +943,7 @@ local diagrams = {
         let row = Measured {
             key: "BAR_BH",
             supersedes: "BAR",
+            replaced_fixed: &[],
             added_fixed: &[],
             moved: &[],
             dropped: &[],

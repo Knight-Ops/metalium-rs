@@ -6,8 +6,9 @@
 //! and the two pointers only move when an instruction says so: an `UNPACR` with
 //! `FlipSrc` hands the unpacker's bank to the Matrix Unit and moves the unpacker
 //! on (`UNPACR_Regular.md:468-474`); an `MVMUL` or `SETRWC` with `FlipSrcA`/`B`
-//! hands the Matrix Unit's bank back and moves *it* on (`MVMUL.md`, `SETRWC.md`).
-//! Nothing else moves them, and the hardware waits -- rather than faults -- on a
+//! hands the Matrix Unit's bank back and moves *it* on (`MVMUL.md`, `SETRWC.md`);
+//! checked non-reset `CLEARDVALID` releases do the same (`CLEARDVALID.md`).
+//! Clearing and shifting data do not move the pointers, and the hardware waits -- rather than faults -- on a
 //! bank the wrong client owns.
 //!
 //! So the failure modes are not faults. They are a deadlock (waiting on a bank
@@ -22,7 +23,8 @@
 //!
 //! **Lockstep.** Every bank the unpacker hands over is handed back by exactly one
 //! flipping consumer before the unpacker writes again. Under that discipline the
-//! two pointers always agree, and each operand is in one of three states:
+//! two pointers agree when empty, differ after unpacker handover, and agree
+//! again after matrix release. Each operand is in one of three states:
 //!
 //! * [`Empty`] -- the unpacker owns the current bank and nothing is staged in it.
 //! * [`Filling`] -- the unpacker has written some rows without handing the bank
@@ -51,13 +53,15 @@
 //! * `SETDVALID`: ttsim says its "interaction … with implied src format is
 //!   ill-specified (use UNPACR_NOP instead)", and on Blackhole the implied format
 //!   is how `MVMUL` learns what the bank holds. `FlipSrc` on the `UNPACR` itself is
-//!   the handover used here.
+//!   default handover; [`Banks::handover_a`] and [`Banks::handover_b`] explicitly
+//!   publish retired partial unpacks with `UNPACR_NOP_SETDVALID`.
 //! * `CLEARDVALID` with `Reset` set: "unsafe and drops SrcA/B banks"
 //!   ([tt-metal#22383](https://github.com/tenstorrent/tt-metal/issues/22383)), as
 //!   both ttsim and the hardware bug register say.
-//! * `STALLWAIT` on the bank conditions C5-C8: the hardware already waits at the
-//!   Wait Gate on the owner (`MVMUL.md`, `UNPACR_Regular.md:401,408`), so an
-//!   explicit wait adds nothing to correctness here.
+//!
+//! Regular unpack instructions wait at the ownership gate. Explicit NOP
+//! handover does not: its checked sequence drains C1/C2, then waits on C5/C6
+//! (Blackhole conditions, not the Wormhole page's C10/C11).
 //!
 //! # Where the state starts
 //!
@@ -94,8 +98,8 @@ pub struct Filling;
 #[derive(Debug)]
 pub struct Loaded;
 
-/// The ownership state of `SrcA` (`A`) and `SrcB` (`B`) for one Tensix thread's
-/// program. Zero-sized; moved through every instruction that changes it.
+/// The ownership state of `SrcA` (`A`) and `SrcB` (`B`) for one program's
+/// instruction sequences. Zero-sized; moved through every instruction that changes it.
 #[must_use = "the bank state is the only record of who owns each bank"]
 #[derive(Debug)]
 pub struct Banks<A, B> {
@@ -140,6 +144,169 @@ fn release(flip_a: bool, flip_b: bool) -> Result<Instruction, EncodeError> {
         .encode()
 }
 
+fn handover(which: u32) -> Result<[Instruction; 3], EncodeError> {
+    use crate::backend::{self, cond, Before};
+    let (busy, owner) = if which == 0 {
+        (cond::UNPACKER0_BUSY, cond::SRCA_NOT_UNPACKER)
+    } else {
+        (cond::UNPACKER1_BUSY, cond::SRCB_NOT_UNPACKER)
+    };
+    Ok([
+        backend::stallwait(Before::EVERYTHING.mask(), busy).expect("fixed Blackhole wait masks"),
+        backend::stallwait(Before::EVERYTHING.mask(), owner).expect("fixed Blackhole wait masks"),
+        encode::unpacr_nop_setdvalid(which)?,
+    ])
+}
+
+/// A bank owned by an unpacker. Only `Empty` and `Filling` implement this
+/// sealed bound; clearing discards any staged-data claim.
+pub trait UnpackerOwned: private::Sealed {}
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::Empty {}
+    impl Sealed for super::Filling {}
+}
+impl UnpackerOwned for Empty {}
+impl UnpackerOwned for Filling {}
+
+/// How SHIFTXB fills lane 15 after moving lanes 1..15 to lanes 0..14.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ShiftBMode {
+    Rotate,
+    ZeroFill,
+}
+
+fn zero_src(matrix: bool, a: bool, b: bool) -> Result<Instruction, EncodeError> {
+    encode::Zerosrc::ZERO
+        .single_bank_matrix_unit(u32::from(matrix))
+        .clear_src_a(u32::from(a))
+        .clear_src_b(u32::from(b))
+        .encode()
+}
+
+impl<A: UnpackerOwned, B> Banks<A, B> {
+    /// Zero unpacker 0's current bank, discarding staged rows. Drain unpacker
+    /// work before issuing this Matrix Unit instruction; coordinate other
+    /// issuing roles through semaphores. Neither bank pointer moves.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.zerosrc_unpacker_a();
+    /// ```
+    pub fn zerosrc_unpacker_a(self) -> Result<(Instruction, Banks<Empty, B>), EncodeError> {
+        Ok((zero_src(false, true, false)?, banks()))
+    }
+
+    /// Sequenced clear on unpacker 0's current bank. WaitLikeUnpacr=1,
+    /// BothBanks=0, clear value=0. Subsequent handover uses regular UNPACR.
+    pub fn unpacr_nop_zerosrc_a(self) -> Result<(Instruction, Banks<Empty, B>), EncodeError> {
+        Ok((encode::unpacr_nop_zerosrc(0, 1, 0, 0)?, banks()))
+    }
+}
+impl<A, B: UnpackerOwned> Banks<A, B> {
+    /// Zero unpacker 1's current bank. Same scheduling contract as the A form.
+    pub fn zerosrc_unpacker_b(self) -> Result<(Instruction, Banks<A, Empty>), EncodeError> {
+        Ok((zero_src(false, false, true)?, banks()))
+    }
+
+    /// Sequenced current-bank zero on unpacker 1; staged rows are discarded.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.unpacr_nop_zerosrc_b();
+    /// ```
+    pub fn unpacr_nop_zerosrc_b(self) -> Result<(Instruction, Banks<A, Empty>), EncodeError> {
+        Ok((encode::unpacr_nop_zerosrc(1, 1, 0, 0)?, banks()))
+    }
+}
+impl<A: UnpackerOwned, B: UnpackerOwned> Banks<A, B> {
+    /// Clear both operands' current unpacker banks, not both physical banks.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.zerosrc_unpacker_both();
+    /// ```
+    pub fn zerosrc_unpacker_both(self) -> Result<(Instruction, Banks<Empty, Empty>), EncodeError> {
+        Ok((zero_src(false, true, true)?, banks()))
+    }
+}
+impl<B> Banks<Loaded, B> {
+    /// Clear the current matrix-owned A bank without releasing it.
+    pub fn zerosrc_matrix_a(self) -> Result<(Instruction, Self), EncodeError> {
+        Ok((zero_src(true, true, false)?, banks()))
+    }
+    /// Release A and advance the matrix pointer. Reset and KeepReadingSameSrc
+    /// are fixed to zero; this does not replace the SETRWC release helper.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::Banks;
+    /// let _ = Banks::after_reset().cleardvalid_a();
+    /// ```
+    pub fn cleardvalid_a(self) -> Result<(Instruction, Banks<Empty, B>), EncodeError> {
+        Ok((encode::cleardvalid(0, 1, 0, 0)?, banks()))
+    }
+}
+impl<A> Banks<A, Loaded> {
+    /// Clear the current matrix-owned B bank without releasing it.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.zerosrc_matrix_b();
+    /// ```
+    pub fn zerosrc_matrix_b(self) -> Result<(Instruction, Self), EncodeError> {
+        Ok((zero_src(true, false, true)?, banks()))
+    }
+    /// Release B and advance the matrix pointer, without reset or retained-bank reading.
+    pub fn cleardvalid_b(self) -> Result<(Instruction, Banks<A, Empty>), EncodeError> {
+        Ok((encode::cleardvalid(1, 0, 0, 0)?, banks()))
+    }
+    /// Shift one physical SrcB row without flipping. Hardware addresses
+    /// `(src_row + RWC.SrcB) & 63`, then applies address modifier 0..7.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::{Banks, ShiftBMode};
+    /// let _ = Banks::after_reset().shiftxb(0, 0, ShiftBMode::Rotate);
+    /// ```
+    pub fn shiftxb(
+        self,
+        src_row: u32,
+        addr_mod: u32,
+        mode: ShiftBMode,
+    ) -> Result<(Instruction, Self), EncodeError> {
+        Ok((
+            encode::shiftxb(addr_mod, u32::from(mode == ShiftBMode::ZeroFill), src_row)?,
+            banks(),
+        ))
+    }
+}
+impl Banks<Loaded, Loaded> {
+    /// Clear both current matrix banks, preserving both ownership claims.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.unpack_b(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.zerosrc_matrix_both();
+    /// ```
+    pub fn zerosrc_matrix_both(self) -> Result<(Instruction, Self), EncodeError> {
+        Ok((zero_src(true, true, true)?, banks()))
+    }
+    /// Release and advance both matrix bank pointers.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a(encode::UnpacrRegular::ZERO).unwrap();
+    /// let _ = b.cleardvalid_both();
+    /// ```
+    pub fn cleardvalid_both(self) -> Result<(Instruction, Banks<Empty, Empty>), EncodeError> {
+        Ok((encode::cleardvalid(1, 1, 0, 0)?, banks()))
+    }
+}
+
 // --- Unpacker 0: `SrcA` --------------------------------------------------------
 
 impl<B> Banks<Empty, B> {
@@ -177,6 +344,39 @@ impl<B> Banks<Empty, B> {
 }
 
 impl<B> Banks<Filling, B> {
+    /// Experimental Blackhole sequence: encoding retains WormholeOnly provenance
+    /// until the isolated silicon gates pass. ttsim refuses this form.
+    ///
+    /// Publish staged A without reading more datums. Drain unpacker 0, wait
+    /// for current-bank ownership, then hand over and reset its source row.
+    /// The caller must establish CFG_STATE_ID, SRCA_SET.Base and the unpacker's
+    /// output format, and retire configuration writes before staging. `Banks`
+    /// cannot inspect externally written configuration. Retire this sequence
+    /// before publishing a semaphore to another issuing role.
+    ///
+    /// Uses the measured Blackhole non-clearing profile 0x1e9. The inherited
+    /// Wormhole fixed mode 7 is a stream-pop on Blackhole and is not used here.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::Banks;
+    /// let _ = Banks::after_reset().handover_a();
+    /// ```
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.handover_a().unwrap();
+    /// let _ = b.handover_a();
+    /// ```
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_a_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.zerosrc_unpacker_a().unwrap();
+    /// let _ = b.handover_a();
+    /// ```
+    pub fn handover_a(self) -> Result<([Instruction; 3], Banks<Loaded, B>), EncodeError> {
+        Ok((handover(0)?, banks()))
+    }
+
     /// More of the `SrcA` operand, still keeping the bank.
     pub fn unpack_a_partial(
         self,
@@ -215,6 +415,30 @@ impl<A> Banks<A, Empty> {
 }
 
 impl<A> Banks<A, Filling> {
+    /// Publish staged B. Same configuration and scheduling preconditions as
+    /// [`Banks::handover_a`], using unpacker 1, C2/C6 and SRCB_SET.Base.
+    /// Uses the same measured Blackhole profile as A, with unpacker 1 selected.
+    ///
+    /// ```compile_fail
+    /// use tt_isa::matrix::Banks;
+    /// let _ = Banks::after_reset().handover_b();
+    /// ```
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.handover_b().unwrap();
+    /// let _ = b.handover_b();
+    /// ```
+    /// ```compile_fail
+    /// use tt_isa::{matrix::Banks, isa::generated::encode};
+    /// let (_, b) = Banks::after_reset().unpack_b_partial(encode::UnpacrRegular::ZERO).unwrap();
+    /// let (_, b) = b.unpacr_nop_zerosrc_b().unwrap();
+    /// let _ = b.handover_b();
+    /// ```
+    pub fn handover_b(self) -> Result<([Instruction; 3], Banks<A, Loaded>), EncodeError> {
+        Ok((handover(1)?, banks()))
+    }
+
     pub fn unpack_b_partial(
         self,
         base: encode::UnpacrRegular,

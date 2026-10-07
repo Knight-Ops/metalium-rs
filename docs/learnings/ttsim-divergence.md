@@ -412,3 +412,42 @@ LOADIND sizes 1/2 remain 4/2 bytes. This is a semantic value correction, not
 an encoding-field relocation; generated provenance is deliberately retained.
 See [operating notes](silicon-operating-notes.md#l1-scalar-movement-and-output-ownership-2026-10-07)
 for accepted instruction and resident consumer evidence (`1791389018`).
+
+### Source-bank tranche (step103, 2026-10-07)
+
+Current-unpacker-bank ZEROSRC refuses with `tensix_zerosrc: write_mode=0` for
+A, B and both operands in isolated fork probes. Matrix-bank ZEROSRC and non-reset
+CLEARDVALID releases survive and match the physical bank model. Card-0 run
+`1791397029` accepts all supported forms. SHIFTXB remains silicon-only under
+row 50; its host permutation model runs everywhere.
+
+The initial UNPACR_NOP_ZEROSRC refusal (`bank_clr_ctrl=1`) was an **encoder
+error**, not a missing instruction: Wormhole's WaitLikeUnpacr bit 4 actually
+selects BothBanks on Blackhole. After measuring WaitLikeUnpacr at bit 5,
+BothBanks at bit 4 and the two-bit clear value at bits 2..3, current-bank zero
+survives and matches the same oracle in ttsim and silicon. The simulator gate
+retains an independently read surviving control alongside each ZEROSRC refusal.
+BF16 MOVB2D readback remains silicon-only under the signed-format divergence;
+TF32 source tests and downstream matmul/pooling execute on both targets.
+
+### Explicit healthy-bank handover simulator refusal (step104, 2026-10-07)
+
+The regular TF32 staged-bank control survives. In separate fork scopes, A's
+explicit sequence refuses UNPACR_NOP_SETDVALID with
+`UnsupportedFunctionality: tensix_unpacr_nop: unpack_pop=3`; B's sequence refuses
+the Blackhole C6 ownership wait with
+`UnimplementedFunctionality: tensix_stallwait: wait_res=0x40` before reaching the
+NOP. These are different refusal boundaries. Neither confirms Blackhole NOP
+encoding or silicon semantics. Simulator gates assert the refusals and retain a
+surviving regular control; explicit execution remains silicon-only.
+# Stage D measured Blackhole DVALID-only profile (2026-10-07)
+
+The measured non-clearing words `0x430001e9` (A) and `0x438001e9` (B) pass
+healthy-bank silicon gates; see the latest Stage D operating notes. ttsim
+refuses A with `src_clr_val_ctrl=2`; B also refuses the required C6 ownership
+wait before reaching the NOP. Isolated `fork_scope` refusal probes retain a
+surviving regular-UNPACR control. The earlier `unpack_pop=3` refusal concerns
+the rejected Wormhole word, not this measured Blackhole mode. Mode 2 is a delay
+and is not a handover; its silicon matrix consumer timed out. These remain
+silicon-only semantic gates; simulator refusal does not establish hardware
+failure.

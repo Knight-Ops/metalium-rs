@@ -4,13 +4,13 @@
 //! file matches the specification revision pinned in `PINS.toml`.
 //!
 //! Source: tt-isa-documentation `f848eb668c2aeae742a88a49a86157e24a0a20c6`,
-//! 163 instruction encodings and 19 datum layouts, each
+//! 165 instruction encodings and 19 datum layouts, each
 //! cross-checked against the `TT_*(…)` syntax block on the page that embeds
 //! its diagram — an independently written description of the same bits.
 //!
 //! Provenance: 50 documented for Blackhole, 24 shared with Wormhole and stated
-//! to be identical, 26 superseded on Blackhole, 60 Wormhole-only and therefore
-//! **`UNVERIFIED`**, 15 **`MEASURED`** against ttsim where the specification
+//! to be identical, 28 superseded on Blackhole, 58 Wormhole-only and therefore
+//! **`UNVERIFIED`**, 17 **`MEASURED`** on ttsim or silicon where the specification
 //! draws only Wormhole's layout (`xtask/src/gen_isa/Bits32_BH.lua`), and 4
 //! Wormhole-only layouts **`CONFIRMED`** unchanged on Blackhole by a gate
 //! (`xtask/src/gen_isa/measured.rs`, `CONFIRMED`).
@@ -2003,26 +2003,6 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_OverlayClear.md",
     );
 
-    /// `UNPACR_NOP_ZEROSRC`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
-    pub static UNPACR_NOP_ZEROSRC: InstructionDef = InstructionDef::new(
-        "UNPACR_NOP_ZEROSRC",
-        "UNPACR_NOP",
-        0x43,
-        &[
-            Field::new("WhichUnpacker", 23, 1, false, None),
-            Field::new("WaitLikeUnpacr", 4, 1, false, None),
-            Field::new("BothBanks", 3, 1, false, None),
-            Field::new("NegativeInfSrcA", 2, 1, false, None),
-        ],
-        &[
-            (Field::new("", 0, 2, false, None), 1),
-            (Field::new("", 6, 1, false, None), 0),
-        ],
-        0x007fffa0,
-        Provenance::WormholeOnly,
-        "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md",
-    );
-
     /// `UNPACR_NOP_Nop`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_Nop.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
     pub static UNPACR_NOP_Nop: InstructionDef = InstructionDef::new(
         "UNPACR_NOP_Nop",
@@ -2053,19 +2033,31 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETREG.md",
     );
 
-    /// `UNPACR_NOP_SETDVALID`. **`UNVERIFIED`.** `WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md` is a Wormhole page and Blackhole has none, so this layout is a hypothesis until silicon or the simulator confirms it.
+    /// `UNPACR_NOP_SETDVALID_BH`. **`MEASURED`** on Blackhole silicon by `crates/tt-tests/tests/step104_unpacker_handover.rs::llk_nonclearing_dvalid_a, crates/tt-tests/tests/step104_unpacker_handover.rs::llk_nonclearing_dvalid_b`. Replaces Wormhole fixed mode 7 with the bounded non-clearing publication profile 0x1e9; only WhichUnpacker varies. C1/C2 retirement and C5/C6 ownership waits remain required. ttsim refuses this format-selector flavor.
     pub static UNPACR_NOP_SETDVALID: InstructionDef = InstructionDef::new(
-        "UNPACR_NOP_SETDVALID",
+        "UNPACR_NOP_SETDVALID_BH",
         "UNPACR_NOP",
         0x43,
         &[Field::new("WhichUnpacker", 23, 1, false, None)],
-        &[(Field::new("", 0, 3, false, None), 7)],
-        0x007ffff8,
-        Provenance::WormholeOnly,
+        &[(Field::new("", 0, 9, false, None), 489)],
+        0x007ffe00,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step104_unpacker_handover.rs::llk_nonclearing_dvalid_a, crates/tt-tests/tests/step104_unpacker_handover.rs::llk_nonclearing_dvalid_b", moved: &[], dropped: &[], widened: &[] },
         "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md",
     );
 
-    /// `GMPOOL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `UNPACR_NOP_ZEROSRC_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step103_source_banks.rs::unpacr_zero_blackhole_bank_and_clear_value_fields, crates/tt-tests/tests/step103_source_banks.rs::unpacr_zero_waits_on_current_unpacker_bank_with_matrix_bank_held`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md`), and on Blackhole `BothBanks`, `WaitLikeUnpacr` sit elsewhere. `NegativeInfSrcA` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    pub static UNPACR_NOP_ZEROSRC: InstructionDef = InstructionDef::new(
+        "UNPACR_NOP_ZEROSRC_BH",
+        "UNPACR_NOP",
+        0x43,
+        &[Field::new("WhichUnpacker", 23, 1, false, None), Field::new("WaitLikeUnpacr", 5, 1, false, None), Field::new("BothBanks", 4, 1, false, None), Field::new("NegativeInfSrcA", 2, 2, false, None)],
+        &[(Field::new("", 0, 2, false, None), 1), (Field::new("", 6, 1, false, None), 0)],
+        0x007fff80,
+        Provenance::Measured { evidence: "crates/tt-tests/tests/step103_source_banks.rs::unpacr_zero_blackhole_bank_and_clear_value_fields, crates/tt-tests/tests/step103_source_banks.rs::unpacr_zero_waits_on_current_unpacker_bank_with_matrix_bank_held", moved: &["BothBanks", "WaitLikeUnpacr"], dropped: &[], widened: &["NegativeInfSrcA"] },
+        "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md",
+    );
+
+    /// `GMPOOL_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static GMPOOL: InstructionDef = InstructionDef::new(
         "GMPOOL_BH",
         "GMPOOL",
@@ -2077,7 +2069,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/GMPOOL.md",
     );
 
-    /// `GAPOOL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `GAPOOL_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step75_fpu_pooling.rs::matrix_pooling_uses_explicit_weights_and_releases_banks`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md`), and on Blackhole  sit elsewhere. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static GAPOOL: InstructionDef = InstructionDef::new(
         "GAPOOL_BH",
         "GAPOOL",
@@ -2089,7 +2081,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/GAPOOL.md",
     );
 
-    /// `MVMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MVMUL_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::mvmul_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MVMUL: InstructionDef = InstructionDef::new(
         "MVMUL_BH",
         "MVMUL",
@@ -2101,7 +2093,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md",
     );
 
-    /// `MOVA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVA2D_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVA2D: InstructionDef = InstructionDef::new(
         "MOVA2D_BH",
         "MOVA2D",
@@ -2113,7 +2105,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVA2D.md",
     );
 
-    /// `MOVB2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md`), and on Blackhole `BroadcastCol0`, `Broadcast1RowTo8`, `Move4Rows`, `AddrMod` sit elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVB2D_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/probe_src.rs::movb2d_move4_rows_is_bit_13_on_blackhole, crates/tt-tests/tests/probe_src.rs::mov_to_dst_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md`), and on Blackhole `BroadcastCol0`, `Broadcast1RowTo8`, `Move4Rows`, `AddrMod` sit elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVB2D: InstructionDef = InstructionDef::new(
         "MOVB2D_BH",
         "MOVB2D",
@@ -2125,7 +2117,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2D.md",
     );
 
-    /// `MOVD2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVD2A_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVD2A: InstructionDef = InstructionDef::new(
         "MOVD2A_BH",
         "MOVD2A",
@@ -2137,7 +2129,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVD2A.md",
     );
 
-    /// `MOVD2B_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVD2B_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVD2B: InstructionDef = InstructionDef::new(
         "MOVD2B_BH",
         "MOVD2B",
@@ -2149,7 +2141,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVD2B.md",
     );
 
-    /// `MOVB2A_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVB2A_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::mov_to_src_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVB2A: InstructionDef = InstructionDef::new(
         "MOVB2A_BH",
         "MOVB2A",
@@ -2161,7 +2153,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVB2A.md",
     );
 
-    /// `ELWADD_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
+    /// `ELWADD_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWADD: InstructionDef = InstructionDef::new(
         "ELWADD_BH",
         "ELWADD",
@@ -2173,7 +2165,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md",
     );
 
-    /// `ELWSUB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
+    /// `ELWSUB_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWSUB: InstructionDef = InstructionDef::new(
         "ELWSUB_BH",
         "ELWSUB",
@@ -2185,7 +2177,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/ELWSUB.md",
     );
 
-    /// `ELWMUL_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
+    /// `ELWMUL_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole, crates/tt-tests/tests/step9_matmul.rs::elw_broadcast_assignment_and_destination_fields, crates/tt-tests/tests/step90_matrix_eltwise.rs::resident_matrix_arithmetic_and_rhs_broadcasts`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Other fields are carried from that diagram. Step9 and step90 validate broadcast, assignment, Dst addressing and repeated bank release on ttsim and both Blackhole cards; see silicon run 1791254100 and silicon-operating-notes.md. Floating arithmetic is not IEEE754.
     pub static ELWMUL: InstructionDef = InstructionDef::new(
         "ELWMUL_BH",
         "ELWMUL",
@@ -2197,7 +2189,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/ELWMUL.md",
     );
 
-    /// `DOTPV_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `DOTPV_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static DOTPV: InstructionDef = InstructionDef::new(
         "DOTPV_BH",
         "DOTPV",
@@ -2209,7 +2201,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/DOTPV.md",
     );
 
-    /// `MOVDBGA2D_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `MOVDBGA2D_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::matrix_unit_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static MOVDBGA2D: InstructionDef = InstructionDef::new(
         "MOVDBGA2D_BH",
         "MOVDBGA2D",
@@ -2221,7 +2213,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/MOVDBGA2D.md",
     );
 
-    /// `SHIFTXB_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `SHIFTXB_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::shiftxb_addr_mod_sits_one_bit_lower_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md`), and on Blackhole `AddrMod` sits elsewhere. `AddrMod` has a different width on Blackhole. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static SHIFTXB: InstructionDef = InstructionDef::new(
         "SHIFTXB_BH",
         "SHIFTXB",
@@ -2233,7 +2225,7 @@ pub mod defs {
         "WormholeB0/TensixTile/TensixCoprocessor/SHIFTXB.md",
     );
 
-    /// `ZEROACC_BH`. **`MEASURED`** against ttsim by `crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md`), and on Blackhole `AddrMod`, `UseDst32b` sit elsewhere. `AddrMod` has a different width on Blackhole. `Revert` is not carried: its bits hold something else on Blackhole and its own position is unknown. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
+    /// `ZEROACC_BH`. **`MEASURED`** on ttsim or silicon by `crates/tt-tests/tests/step9_matmul.rs::zeroacc_addr_mod_and_use_dst32b_on_blackhole`, not documented: the only diagram is Wormhole's (`WormholeB0/TensixTile/TensixCoprocessor/ZEROACC.md`), and on Blackhole `AddrMod`, `UseDst32b` sit elsewhere. `AddrMod` has a different width on Blackhole. `Revert` is not carried: its bits hold something else on Blackhole and its own position is unknown. Every other field is carried from that diagram and is as unverified as it was. Re-derive on silicon.
     pub static ZEROACC: InstructionDef = InstructionDef::new(
         "ZEROACC_BH",
         "ZEROACC",
@@ -2711,6 +2703,42 @@ pub mod defs {
             },
             "WormholeB0/TensixTile/TensixCoprocessor/SFPSTOCHRND_IntInt.md",
         );
+
+        /// `UNPACR_NOP_ZEROSRC`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md`. Blackhole replaces it with `UNPACR_NOP_ZEROSRC_BH`; use that instead.
+        pub static UNPACR_NOP_ZEROSRC: InstructionDef = InstructionDef::new(
+            "UNPACR_NOP_ZEROSRC",
+            "UNPACR_NOP",
+            0x43,
+            &[
+                Field::new("WhichUnpacker", 23, 1, false, None),
+                Field::new("WaitLikeUnpacr", 4, 1, false, None),
+                Field::new("BothBanks", 3, 1, false, None),
+                Field::new("NegativeInfSrcA", 2, 1, false, None),
+            ],
+            &[
+                (Field::new("", 0, 2, false, None), 1),
+                (Field::new("", 6, 1, false, None), 0),
+            ],
+            0x007fffa0,
+            Provenance::SupersededOnBlackhole {
+                by: "UNPACR_NOP_ZEROSRC_BH",
+            },
+            "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_ZEROSRC.md",
+        );
+
+        /// `UNPACR_NOP_SETDVALID`. **Wormhole's encoding**, from `WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md`. Blackhole replaces it with `UNPACR_NOP_SETDVALID_BH`; use that instead.
+        pub static UNPACR_NOP_SETDVALID: InstructionDef = InstructionDef::new(
+            "UNPACR_NOP_SETDVALID",
+            "UNPACR_NOP",
+            0x43,
+            &[Field::new("WhichUnpacker", 23, 1, false, None)],
+            &[(Field::new("", 0, 3, false, None), 7)],
+            0x007ffff8,
+            Provenance::SupersededOnBlackhole {
+                by: "UNPACR_NOP_SETDVALID_BH",
+            },
+            "WormholeB0/TensixTile/TensixCoprocessor/UNPACR_NOP_SETDVALID.md",
+        );
     }
 }
 
@@ -2860,10 +2888,12 @@ pub static ALL: &[&InstructionDef] = &[
     &defs::UNPACR_FlushCache,
     &defs::UNPACR_NOP_OverlayClear0,
     &defs::UNPACR_NOP_OverlayClear3,
-    &defs::UNPACR_NOP_ZEROSRC,
+    &defs::wormhole::UNPACR_NOP_ZEROSRC,
     &defs::UNPACR_NOP_Nop,
     &defs::UNPACR_NOP_SETREG,
+    &defs::wormhole::UNPACR_NOP_SETDVALID,
     &defs::UNPACR_NOP_SETDVALID,
+    &defs::UNPACR_NOP_ZEROSRC,
     &defs::GMPOOL,
     &defs::GAPOOL,
     &defs::MVMUL,
@@ -10408,58 +10438,6 @@ pub mod encode {
         Ok(Instruction::new(word, def))
     }
 
-    /// `UNPACR_NOP_ZEROSRC`.
-    pub const fn unpacr_nop_zerosrc(
-        which_unpacker: u32,
-        wait_like_unpacr: u32,
-        both_banks: u32,
-        negative_inf_src_a: u32,
-    ) -> Result<Instruction, EncodeError> {
-        let def = &defs::UNPACR_NOP_ZEROSRC;
-        let mut word = def.skeleton();
-        let f = def.fields()[0];
-        if !f.fits(which_unpacker) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: which_unpacker,
-                width: f.width(),
-            });
-        }
-        word |= f.place(which_unpacker);
-        let f = def.fields()[1];
-        if !f.fits(wait_like_unpacr) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: wait_like_unpacr,
-                width: f.width(),
-            });
-        }
-        word |= f.place(wait_like_unpacr);
-        let f = def.fields()[2];
-        if !f.fits(both_banks) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: both_banks,
-                width: f.width(),
-            });
-        }
-        word |= f.place(both_banks);
-        let f = def.fields()[3];
-        if !f.fits(negative_inf_src_a) {
-            return Err(EncodeError::FieldTooLarge {
-                instruction: def.key(),
-                field: f.name(),
-                value: negative_inf_src_a,
-                width: f.width(),
-            });
-        }
-        word |= f.place(negative_inf_src_a);
-        Ok(Instruction::new(word, def))
-    }
-
     /// `UNPACR_NOP_Nop`.
     pub const fn unpacr_nop_nop(which_unpacker: u32) -> Result<Instruction, EncodeError> {
         let def = &defs::UNPACR_NOP_Nop;
@@ -10582,7 +10560,7 @@ pub mod encode {
         }
     }
 
-    /// `UNPACR_NOP_SETDVALID`.
+    /// `UNPACR_NOP_SETDVALID_BH`.
     pub const fn unpacr_nop_setdvalid(which_unpacker: u32) -> Result<Instruction, EncodeError> {
         let def = &defs::UNPACR_NOP_SETDVALID;
         let mut word = def.skeleton();
@@ -10596,6 +10574,58 @@ pub mod encode {
             });
         }
         word |= f.place(which_unpacker);
+        Ok(Instruction::new(word, def))
+    }
+
+    /// `UNPACR_NOP_ZEROSRC_BH`.
+    pub const fn unpacr_nop_zerosrc(
+        which_unpacker: u32,
+        wait_like_unpacr: u32,
+        both_banks: u32,
+        negative_inf_src_a: u32,
+    ) -> Result<Instruction, EncodeError> {
+        let def = &defs::UNPACR_NOP_ZEROSRC;
+        let mut word = def.skeleton();
+        let f = def.fields()[0];
+        if !f.fits(which_unpacker) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: which_unpacker,
+                width: f.width(),
+            });
+        }
+        word |= f.place(which_unpacker);
+        let f = def.fields()[1];
+        if !f.fits(wait_like_unpacr) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: wait_like_unpacr,
+                width: f.width(),
+            });
+        }
+        word |= f.place(wait_like_unpacr);
+        let f = def.fields()[2];
+        if !f.fits(both_banks) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: both_banks,
+                width: f.width(),
+            });
+        }
+        word |= f.place(both_banks);
+        let f = def.fields()[3];
+        if !f.fits(negative_inf_src_a) {
+            return Err(EncodeError::FieldTooLarge {
+                instruction: def.key(),
+                field: f.name(),
+                value: negative_inf_src_a,
+                width: f.width(),
+            });
+        }
+        word |= f.place(negative_inf_src_a);
         Ok(Instruction::new(word, def))
     }
 
@@ -14175,6 +14205,75 @@ pub mod encode {
                 word |= f.place(self.mod1);
                 Ok(Instruction::new(word, def))
             }
+        }
+
+        /// `UNPACR_NOP_ZEROSRC`.
+        pub const fn unpacr_nop_zerosrc(
+            which_unpacker: u32,
+            wait_like_unpacr: u32,
+            both_banks: u32,
+            negative_inf_src_a: u32,
+        ) -> Result<Instruction, EncodeError> {
+            let def = &defs::wormhole::UNPACR_NOP_ZEROSRC;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(which_unpacker) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: which_unpacker,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(which_unpacker);
+            let f = def.fields()[1];
+            if !f.fits(wait_like_unpacr) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: wait_like_unpacr,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(wait_like_unpacr);
+            let f = def.fields()[2];
+            if !f.fits(both_banks) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: both_banks,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(both_banks);
+            let f = def.fields()[3];
+            if !f.fits(negative_inf_src_a) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: negative_inf_src_a,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(negative_inf_src_a);
+            Ok(Instruction::new(word, def))
+        }
+
+        /// `UNPACR_NOP_SETDVALID`.
+        pub const fn unpacr_nop_setdvalid(which_unpacker: u32) -> Result<Instruction, EncodeError> {
+            let def = &defs::wormhole::UNPACR_NOP_SETDVALID;
+            let mut word = def.skeleton();
+            let f = def.fields()[0];
+            if !f.fits(which_unpacker) {
+                return Err(EncodeError::FieldTooLarge {
+                    instruction: def.key(),
+                    field: f.name(),
+                    value: which_unpacker,
+                    width: f.width(),
+                });
+            }
+            word |= f.place(which_unpacker);
+            Ok(Instruction::new(word, def))
         }
     }
 }

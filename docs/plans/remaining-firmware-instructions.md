@@ -2,14 +2,14 @@
 
 Review date: 2026-10-07. Source of completion status:
 [hardware-coverage.md](hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
-including the step97–100 continuations and the current working-tree code.
-This is an implementation sequence, not new hardware evidence. No new instruction
-has been executed or marked complete by this review. Five pending rows are now
+including the step97–104 acceptance and the current working-tree code.
+This is an implementation sequence; measured Stage D acceptance is recorded in
+its completed checklist and operating notes. Five pending rows are now
 deliberately excluded from support; the rationale and alternatives are below.
 
 ## Scope and findings
 
-The mnemonic checklist now contains **83 completed groups, 25 pending groups and
+The mnemonic checklist now contains **92 completed groups, 16 pending groups and
 six deliberately omitted groups** (`RMWCIB0..3`, `DOTPV`, `SHIFTXA`,
 `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`). Groups include multiple forms:
 register/immediate operands, bank selections and micro-modes must be tracked
@@ -33,7 +33,7 @@ Paths below are relative to `crates/` unless otherwise specified.
 Already delivered and excluded from this backlog: matrix ELW operations,
 `MOVD2A/MOVD2B/MOVB2A`, ADC XY/ZW increments and cursor updates, delivered LUT
 forms, `ADDDMAREG` address stepping, `CLREXPHIST`, and the seven step100 scalar/configuration
-groups. Application PRNG,
+groups, the four step101/102 L1 groups and the four step103 source-bank families. Application PRNG,
 payload-preserving tensor transpose, FP16/INT8 formats, ND indexing and broader
 Burn operation coverage remain feature work; they do not add pending mnemonics
 to this count. S7's diagnostic PRNG gates do not establish application RNG.
@@ -53,24 +53,24 @@ The unchecked inventory needs these semantic corrections:
 ## Complete pending inventory and disposition
 
 Stages refer to the sequence below. Research rows stay open until they have an
-implemented or deliberately excluded disposition. The next tranche is
-[L1 scalar access and bulk movement](../completed-plans/l1-scalar-movement.md).
+implemented or deliberately excluded disposition. Stage C is accepted in step103; see
+[source-bank clearing, release and shifting](../completed-plans/source-bank-clear-release-shift.md).
+Stage D is accepted as a separate healthy-bank handover tranche; see
+[its completed checklist](../completed-plans/explicit-unpacker-handover.md).
+Stage B is accepted in step101/102; its detailed plan is completed.
 
 | Group | Pending instructions | Next disposition |
 |---|---|---|
-| Matrix/source: 5 | `ZEROSRC`, `CLEARDVALID`, `SHIFTXB` | Stage C: checked ownership-aware forms |
-| | `MOVDBGA2D` | Diagnostic helper only; manually establish bank ownership/format |
+| Matrix/source: 2 | `MOVDBGA2D` | Diagnostic helper only; manually establish bank ownership/format |
 | | `GATESRCRST` | Diagnostic cache-invalidation helper; production use needs an observable cache-state oracle |
 | SFPU: 1 | `SFPLOADMACRO` | Stage H: macro configuration and scheduling, silicon-only |
-| Unpacker/packer: 4 | `UNPACR_NOP_ZEROSRC`, `UNPACR_NOP_SETDVALID` | Stages C/D: sequenced clear and handover |
-| | `PACR_SETREG` | Stage F: restricted, explicitly configured MMIO target |
+| Unpacker/packer: 2 | `PACR_SETREG` | Stage F: restricted, explicitly configured MMIO target |
 | | `UNPACR_NOP_SETREG` | Research: weak semantics and nonstandard TDMA-RISC address-base state |
 | Frontend: 2 | `STREAMWAIT`, `STREAMWRCFG` | Stage G, after a minimal stream-overlay lifecycle exists |
-| DMA/register/atomic: 13 | `DMANOP`, `LOADIND`, `STOREIND_L1`, `XMOV` | Stage B: state-preservation diagnostic and L1 transfers |
-| | `ATGETM`, `ATRELM`, `ATCAS`, `ATSWAP`, `ATINCGET`, `ATINCGETPTR` | Stage E |
+| DMA/register/atomic: 9 | `ATGETM`, `ATRELM`, `ATCAS`, `ATSWAP`, `ATINCGET`, `ATINCGETPTR` | Stage E |
 | | `LOADREG`, `STOREREG`, `STOREIND_MMIO` | Stage F |
 
-All 25 pending groups are accounted for. This count covers the authoritative
+All 16 pending groups are accounted for. This count covers the authoritative
 tracker's grouped rows, not every generated ISA variant or retired instruction.
 
 ## Deliberate exclusions (2026-10-07)
@@ -129,7 +129,7 @@ forms and explicit waits can preserve their useful behavior.
 ### A — Configuration readback and scalar register foundation (7 groups)
 
 Tranche implementation and acceptance: [completed tranche](../completed-plans/scalar-config-foundation.md).
-`DMANOP` state-preservation coverage is deferred to Stage B. `FLUSHDMA` is
+`DMANOP` state-preservation coverage is accepted in Stage B. `FLUSHDMA` is
 deliberately excluded in favor of STALLWAIT.
 
 Dependencies: existing `backend::set_gpr`, `write_word`, config bank selection,
@@ -159,45 +159,48 @@ Detailed execution checklist: [l1-scalar-movement.md](../completed-plans/l1-scal
 Dependencies: completed A. Add checked scalar memory helpers and kernel-side declared
 buffer/address descriptors; firmware runner changes only if required for setup.
 
-- [ ] `DMANOP`: checked fixed opcode and state-preservation diagnostic only.
+- [x] `DMANOP`: checked fixed opcode and state-preservation diagnostic only.
   Use STALLWAIT C0 for real outstanding scalar requests; never fixed bubble
   counts. FLUSHDMA remains excluded.
 
-- [ ] `LOADIND`/`STOREIND_L1`: byte/halfword/word/128-bit forms; base in 16-byte
+- [x] `LOADIND`/`STOREIND_L1`: byte/halfword/word/128-bit forms; base in 16-byte
   units, offset in bytes, half-register offset increments 0/2/4/16. Reject
   silent alignment rounding and misaligned four-GPR groups; validate the whole
   transfer range and offset wrap. Model partial loads preserving upper GPR bits.
-- [ ] Drain scalar memory requests with C0 before dependent reads or handing
+- [x] Drain scalar memory requests with C0 before dependent reads or handing
   writes to another agent. Gate host-visible readback and cross-role consumption.
-- [ ] `XMOV`: initially expose L1-to-L1 copy and zero-to-L1 only. Check aligned
+- [x] `XMOV`: initially expose L1-to-L1 copy and zero-to-L1 only. Check aligned
   source/destination/count, full extents, count-field limits and overlap policy
   (reject overlap initially). Configure THCON mover fields explicitly, drain
   conflicting configuration and wait on Blackhole C9 (`cond::MOVER_OUTSTANDING`) for completion.
   C12 (`cond::CONFIG_BUSY`) drains setup writes, not the transfer; the
   Wormhole XMOV page's C12 advice must not be copied to Blackhole.
   Leave configuration/NC instruction-RAM destinations outside the initial API.
-- [ ] Add a bounded resident copy/fill consumer with raw exceptional bits,
+- [x] Add a bounded resident copy/fill consumer with raw exceptional bits,
   guard regions, ragged tails, invalid ranges and changed-input traces. Compare
   release medians with existing B-core copies before considering routing.
 
 ### C — Source clearing, release and SrcB movement (4 groups)
 
 Dependencies: existing `matrix::Banks`; A/B supply readback and diagnostics.
+Step103 accepts all four constrained families (card-0 `1791397029`, 9/9;
+simulator 6/6). Both-physical-bank, nonzero clear and retained-bank release
+variants remain explicitly deferred in the [tranche plan](../completed-plans/source-bank-clear-release-shift.md).
 
-- [ ] `ZEROSRC`: typed A/B selection and current-bank ownership; distinguish
+- [x] `ZEROSRC`: typed A/B selection and current-bank ownership; distinguish
   unpacker-selected versus matrix-selected banks. Allow both-bank clearing only
   with a quiescent-state proof. Start with zero; characterize negative-infinity
   physical encodings/implied formats separately before exposing them.
-- [ ] `CLEARDVALID`: implement only non-reset release/flip semantics. Keep
+- [x] `CLEARDVALID`: implement only non-reset release/flip semantics. Keep
   `Reset` unavailable. A keep-reading-same-bank form must have a separate state
   model; it must not pretend to satisfy `Banks`' normal lockstep transition.
-- [ ] `UNPACR_NOP_ZEROSRC`: current unpacker bank only, `WaitLikeUnpacr` selected
+- [x] `UNPACR_NOP_ZEROSRC`: current unpacker bank only, `WaitLikeUnpacr` selected
   explicitly. Reject `BothBanks`; characterize the wider Blackhole clear-value
   field rather than copying Wormhole's negative-infinity assumptions.
-- [ ] `SHIFTXB`: loaded-B consumer with typed rotate/zero-fill variants, RWC
+- [x] `SHIFTXB`: loaded-B consumer with typed rotate/zero-fill variants, RWC
   row wrapping and address-modifier coverage including entry 4. Silicon-only
   under divergence 50; build an independent physical-row permutation oracle.
-- [ ] Gate alternating banks and programs, partial staging, final release,
+- [x] Gate alternating banks and programs, partial staging, final release,
   subsequent matmul/pooling, raw specials and changed-input replay. Use a
   wrong-row or wrong-clear-value mutant. Preserve the existing recovery path.
 
@@ -206,13 +209,14 @@ Dependencies: existing `matrix::Banks`; A/B supply readback and diagnostics.
 Dependencies: C's ownership model and the operating notes for the earlier failed
 UNPACR_NOP_SETDVALID recovery attempt that took down the host.
 
-- [ ] Implement `UNPACR_NOP_SETDVALID` for an already established, healthy
+- [x] Implement `UNPACR_NOP_SETDVALID` for an already established, healthy
   unpacker bank after partial regular UNPACRs. Explicitly configure output
   format, retire preceding reads and establish the required bank-access wait;
   this instruction does not automatically perform that wait.
-- [ ] Extend `Banks<Filling, ...>` with an explicit handover transition;
-  prevent duplicate handover, empty/unowned-bank use and incorrect format state.
-- [ ] Gate equivalence to regular UNPACR's final FlipSrc, TF32/BF16 format
+- [x] Extend `Banks<Filling, ...>` with an explicit handover transition;
+  prevent duplicate and empty/cleared-staging handover. Format correctness is
+  an explicit builder invariant and low-level precondition, not a Banks proof.
+- [x] Gate equivalence to regular UNPACR's final FlipSrc, TF32/BF16 format
   changes, alternating banks and downstream consumers. Use data mutants only.
   This is not a replacement unwedge/reset mechanism.
 
@@ -335,16 +339,35 @@ simulator divergence entries and firmware performance conditions/results.
 Move this plan to `docs/completed-plans/` only after every stage/research row has
 an accepted implemented or deliberately deferred disposition.
 
-**Recommended next tranche: Stage B.** Stage A is complete in step100. B supplies
-checked L1 loads/stores, mover copy/zero and completion boundaries for later
-diagnostics without changing tensor numerics. Follow with C/D; E/F/G and H can be
-scheduled independently once their stated dependencies hold. Research-only
-forms do not block delivery of those useful instruction families.
+**Recommended next tranche: Stage E.** Stages A–D are accepted (step100–104).
+Stage D supplies bounded explicit healthy-bank handover after partial regular
+UNPACR; recovery is unchanged. E/F/G and H retain their stated dependencies.
 
 
 L1 movement close-out (2026-10-07): step101/102 deliver checked scalar memory
 access, diagnostic DMANOP and explicit single-card tensor copy/zero. Card-0
 semantic gates pass 12/12 (`1791389018`), SMOKE 233/233 (`1791389331`) and release
 benchmarks 3/3 (`1791389713`). The completed tranche records the measured STOREIND
-width correction and the minimal T2 output-ownership shell. Historical open
-inventory entries above are superseded by this acceptance; Stage C is next.
+width correction and the minimal T2 output-ownership shell. Stage B entries
+above are reconciled with this acceptance; Stage C is also accepted below.
+
+Source-bank close-out: step103 provides typed current-bank zero/release/shift,
+independent physical ownership/data models, bounded role sequences and clean
+matmul/pooling reuse. Card-0 semantic acceptance is 9/9 (`1791397029`). The
+measured UNPACR_NOP correction is in the generator, not a handwritten encoding.
+Full card-0 release SMOKE passes 242/242 (`1791397621`); MNIST 8/8 with
+unchanged golden. Workspace tests, format/Clippy, silicon compilation/Clippy,
+generators and shipping checks pass. The accepted tranche plan is archived;
+inventory at that acceptance was 91/17/six.
+
+Explicit handover close-out: step104 measures Blackhole non-clearing mode 0x1e9
+for both unpackers and provides Filling-only helpers plus bounded diagnostics.
+Combined format/bank/replay gates pass `1791413233`; nonzero SrcB row reset and
+direct consumers pass `1791413291`, final fractional inputs `1791413841`.
+Card-0 release SMOKE passes 258/258 (`1791413478`); MNIST 8/8 retains its golden.
+Workspace tests, format/Clippy, silicon no-run/Clippy, generator and shipping
+checks pass. The old Wormhole mode 7 encoding is the isolated reboot trigger;
+the internal ARC reset mechanism remains unproven. The Stage D checklist alone
+is archived; this overall plan remains active at 92/16/six. Arbitrary disjoint
+partial placement, hidden SrcA counter observation, other NOP modes and
+production/performance/recovery adoption are deferred.

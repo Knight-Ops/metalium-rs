@@ -329,13 +329,15 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 | Feature | Enc | Helper | Kernel | Sim | Si | Item |
 |---|:-:|:-:|:-:|:-:|:-:|---|
 | `MVMUL`, fidelity phases `Lo`..`HiFi4` | x (measured) | x | x | x | x | done (Phases 6–7) |
-| `ZEROACC`, `ZEROSRC` | x (`ZEROACC` measured) | | x | x | x | -- |
+| `ZEROACC` | x (measured) | | x | x | x | -- |
+| `ZEROSRC`, `CLEARDVALID` | x (WH retained) | x (`Banks`) | x (bounded source sequences) | x (matrix clear/release; unpacker clear refuses) | x (step103 card 0) | Stage C |
 | `MOVA2D`, `MOVB2D` | x (measured) | x (`Banks`) | x (FPU transpose and source readback) | x | x | F1 |
 | `MOVD2A`, `MOVD2B`, `MOVB2A` | x (step9 measured address modifiers, including entry 4) | x (`Banks`, one/four-row, Loaded destination) | x (explicit Session chains; instruction/traffic audit) | x (step97 four-row conversion and chains) | x (step97 both cards, one/four rows, masks and exceptional data) | F1 done |
 | `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured BH) | x (`Banks`) | x | x (F32 output) | x both | M1 |
 | `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
 | `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | x | x (TF32 Src) | x both (step87) | M3 partial |
-| `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 / diagnostics |
+| `SHIFTXB` | x (measured) | x (`Banks::shiftxb`) | x (bounded source sequences) | `-` row 50; host model x | x (step103 card 0) | M4 done |
+| `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | diagnostics |
 | `DOTPV`, `SHIFTXA` | x | `-` excluded | | DOTPV: `-` row 50; SHIFTXA: not established | DOTPV: `~` encoding; SHIFTXA: not established | M4 exclusions, 2026-10-07 |
 
 ### Unpackers and packer
@@ -401,13 +403,12 @@ Remaining-work review (2026-10-07):
 [remaining-firmware-instructions.md](remaining-firmware-instructions.md)
 accounts for every pending mnemonic group, distinguishes existing encoding/probe
 evidence from missing helpers and semantic gates, and sequences implementation
-with explicit research/defer dispositions for unsupported forms. The completed tranche
-is [L1 scalar access and bulk movement](../completed-plans/l1-scalar-movement.md), following the
-completed step100 foundation. Step101/102 acceptance is recorded below; the
-remaining-work review retains its historical sequencing.
+with explicit research/defer dispositions for unsupported forms. The latest completed tranche
+is [Stage D explicit healthy-bank handover](../completed-plans/explicit-unpacker-handover.md)
+(step104), following step100–103.
 
-Mnemonic-level instruction inventory: 87 completed checklist rows (`[x]`),
-21 pending rows (`[ ]`), and six deliberately omitted groups (`[-]`,
+Mnemonic-level instruction inventory: 92 completed checklist rows (`[x]`),
+16 pending rows (`[ ]`), and six deliberately omitted groups (`[-]`,
 `RMWCIB0..3`, `DOTPV`, `SHIFTXA`, `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`).
 These are grouped mnemonic rows, not a count of generated
 encodings: generated tables also contain variants and superseded Wormhole
@@ -482,14 +483,14 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `DOTPV`: redundant with non-broadcast `MVMUL`; the pinned `DOTPV.md` explicitly prefers MVMUL. Retain step9 encoding probes, no production helper or new semantic tranche.
 - [x] `TRNSPSRCB`: native SrcB block permutation gated on both cards (step87); M3 payload-preserving tensor transpose remains partial.
 - [-] `SHIFTXA`: pinned `SHIFTXA.md` calls it unsupported: its input row depends on a preceding matrix instruction through noncontractual hardware behavior. Use explicit staging/repacking or validated SFPU lane movement; no Blackhole bug measurement is claimed by this exclusion.
-- [ ] `SHIFTXB`: Rotate $SrcB$ row across matrix registers. Item M4.
+- [x] `SHIFTXB`: checked non-flipping Loaded-B rotate/zero-fill; step103 physical permutation, row wrapping, modifiers 0/1/4 and data mutants pass card 0 (`1791397029`), silicon-only under row 50. Item M4.
 - [x] `MOVD2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
 - [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
-- [ ] `ZEROSRC`: Clear source registers $SrcA$ / $SrcB$.
-- [ ] `CLEARDVALID`: Give Src banks to unpackers, optionally flipping the matrix bank; unsafe reset form stays excluded.
+- [x] `ZEROSRC`: checked A/B/both current-unpacker and current-matrix banks; ownership/staged claims, all 64 rows and opposite-bank sentinels pass step103, card 0 (`1791397029`). Matrix-bank forms run on ttsim; unpacker-bank forms refuse. Negative-infinity and both-physical-bank forms remain deferred.
+- [x] `CLEARDVALID`: checked separate/both Loaded → Empty releases, Reset=0 and KeepReadingSameSrc=0; step103 simulator/card-0 (`1791397029`) alternating-bank and downstream reuse gates. Reset stays excluded; retained-bank reading needs a separate state model.
 - [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
 - [ ] `GATESRCRST`: Invalidate the one-slot SrcB operand cache.
 
@@ -548,9 +549,9 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `ADDRCRZW`: checked Z/W cursor restoration/advance helper in resident plane copies; step99 covers all masks/targets, wide addressing, zero restoration and negative controls.
 - [-] `SETDVALID`: Blackhole implied-format handover is explicitly unsupported in the pinned page. Use regular UNPACR's final FlipSrc; sequenced `UNPACR_NOP_SETDVALID` remains a separate gated task.
 - [-] `REG2FLOP_ADC`: pinned page declares unsupported functionality and weak model confidence. Use checked SETADC/SETADCXX/XY/ZW and descriptor reprogramming; no general GPR-to-ADC API is promised. Reopen only for a concrete runtime-value consumer and independent Blackhole evidence.
-- [ ] `UNPACR_NOP_SETDVALID`: Unpacker micro-mode setting DVALID.
+- [x] `UNPACR_NOP_SETDVALID`: measured Blackhole non-clearing mode 0x1e9; Filling-only A/B handover with C1/C2 retirement and C5/C6 ownership waits. Alternating banks, TF32/BF16, multiple partials, sentinels and replay pass `1791413233`; nonzero SrcB row reset and direct consumers pass `1791413291`, tightened fractional inputs `1791413841`. Card-0 SMOKE 258/258 (`1791413478`). Legacy Wormhole mode 7 is the isolated reboot trigger; exact ARC mechanism remains unproven. See [completed Stage D](../completed-plans/explicit-unpacker-handover.md). Other modes and production/recovery adoption are deferred.
 - [ ] `UNPACR_NOP_SETREG`: Unpacker micro-mode setting configuration registers.
-- [ ] `UNPACR_NOP_ZEROSRC`: Unpacker micro-mode zeroing source registers.
+- [x] `UNPACR_NOP_ZEROSRC`: measured BH wait/bank/clear fields, checked current-unpacker zero (WaitLikeUnpacr=1, BothBanks=0); staged claims discarded and regular UNPACR handover retained. Step103 ttsim/card-0 gates, including held-opposite-bank wait and all-row sentinel checks (`1791397029`). Wider values/both banks remain outside the checked API.
 - [ ] `PACR_SETREG`: Packer set register micro-mode.
 
 #### Frontend, Synchronization & Expanders (10 instructions)
@@ -1439,8 +1440,9 @@ Each names the measurement it must move. The Burn-side ones are in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
       through dimension swaps, without a new transpose kernel (`step66`).
-- [ ] **M4 `SHIFTXB`.** Silicon-only (row 50); checked rotate/zero-fill forms
-      when a kernel needs them (remaining-instruction Stage C). `DOTPV` and
+- [x] **M4 `SHIFTXB`.** Checked rotate/zero-fill, physical row wrapping and
+      modifier effects pass step103 card 0 (`1791397029`); silicon-only (row 50),
+      with host permutation coverage. No automatic dispatch change. `DOTPV` and
       `SHIFTXA` are deliberately excluded by the 2026-10-07 review above.
 
 ### R — Reductions and composites
@@ -1911,3 +1913,21 @@ The release benchmark passes on both cards (`1791317719`): measured cases
 improve 1.38–1.48×, with region/batch counts halved. Conditions and medians are
 recorded in firmware-performance.md; no application speedup is claimed. Encoding
 provenance is unchanged.
+
+Stage C source-bank acceptance (2026-10-07): step103 card-0 release semantic gates
+9/9 (`1791397029`), simulator 6/6. See [source-bank tranche](../completed-plans/source-bank-clear-release-shift.md)
+for the accepted checklist and restricted variants. Full card-0 release SMOKE
+passes 242/242 (`1791397621`); MNIST 8/8, golden unchanged; workspace tests,
+format/Clippy, silicon compilation/Clippy, generator and shipping checks pass. All four instruction groups have
+checked semantic implementations; recovery, Burn routing and the existing SETRWC
+release helpers are unchanged. Stage D is accepted below.
+
+Stage D acceptance (2026-10-07): measured non-clearing healthy-bank publication,
+checked transitions, independent physical oracle and bounded diagnostics.
+Card-0 step104 passes 16/16 within release SMOKE 258/258 (`1791413478`);
+the final fractional format-sensitive consumer passes `1791413841`.
+Workspace tests, format/Clippy, silicon no-run/Clippy, generator and shipping
+dependency checks pass; MNIST e2e 8/8 retains its golden. Simulator refuses the
+measured NOP and B ownership wait; regular controls survive isolated probes.
+No production routing, recovery or performance change is claimed. See
+[completed Stage D](../completed-plans/explicit-unpacker-handover.md).

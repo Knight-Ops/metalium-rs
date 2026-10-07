@@ -325,7 +325,9 @@ fn every_measured_addr_mod_matches_llks_matrix_or_pooling_field() {
     use tt_isa::isa::Provenance;
     let measured: Vec<_> = ALL
         .iter()
-        .filter(|d| matches!(d.provenance(), Provenance::Measured { .. }))
+        .filter(|d| {
+            matches!(d.provenance(), Provenance::Measured { .. }) && d.field("AddrMod").is_some()
+        })
         .collect();
     assert_eq!(measured.len(), 15);
     for d in measured {

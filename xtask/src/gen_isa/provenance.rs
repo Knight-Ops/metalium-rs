@@ -30,7 +30,7 @@ pub enum Provenance {
     /// Only a Wormhole page embeds it, and Blackhole has no such page at all.
     /// A hypothesis: `UNVERIFIED` until silicon says otherwise.
     WormholeOnly,
-    /// Not from the specification: a Blackhole layout measured against ttsim,
+    /// Not from the specification: a Blackhole layout measured on ttsim or silicon,
     /// replacing a `WormholeOnly` diagram whose `moved` fields were found
     /// elsewhere. See `super::measured`.
     Measured {
