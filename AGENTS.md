@@ -26,6 +26,7 @@ Crates live under `crates/`. When adding a host workspace crate, classify it in
 ## Read details on demand
 
 Documentation follows a **3-tier lifecycle structure** (see [`docs/README.md`](docs/README.md)):
+
 - `docs/learnings/`: Permanent empirical ground truth (hardware operating notes, simulator divergences, performance baselines). **Must be kept continuously up to date**.
 - `docs/plans/`: Actionable technical specifications and active execution checklists (`[ ]` / `[x]`).
 - `docs/proposals/`: Unscheduled design RFCs.
@@ -34,31 +35,33 @@ Docs retain superseded designs and stale checklist entries. Check current code,
 crate READMEs and current-contract sections before treating historical prose as
 an API or implementing a supposedly missing feature.
 
+Once plans are completed, they should be moved to `docs/completed-plans`
+
 Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl.h` if you need documentation about the Tenstorrent Blackhole devices.
 
-| Task                                    | Reference                                                                                                                    |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                   |
-| New kernel/op; completion criteria      | [hardware-coverage.md](docs/plans/hardware-coverage.md), [tensix-next-features.md](docs/plans/tensix-next-features.md)       |
-| Burn backend changes                    | [burn-native-cutover.md](docs/plans/burn-native-cutover.md), [burn-backend-parity.md](docs/plans/burn-backend-parity.md)     |
-| Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md) |
+| Task                                    | Reference                                                                                                                                |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                               |
+| New kernel/op; completion criteria      | [hardware-coverage.md](docs/plans/hardware-coverage.md), [tensix-next-features.md](docs/plans/tensix-next-features.md)                   |
+| Burn backend changes                    | [burn-native-cutover.md](docs/plans/burn-native-cutover.md), [burn-backend-parity.md](docs/plans/burn-backend-parity.md)                 |
+| Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
 | Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/plans/implementation-checklist.md) |
-| Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                     |
-| Performance changes                     | [firmware-performance.md](docs/learnings/firmware-performance.md)                                                           |
-| Architecture/specification rationale    | [master-roadmap.md](docs/plans/master-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)    |
+| Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                                 |
+| Performance changes                     | [firmware-performance.md](docs/learnings/firmware-performance.md)                                                                        |
+| Architecture/specification rationale    | [master-roadmap.md](docs/plans/master-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
 
 ### Codebase Subsystem $\leftrightarrow$ Documentation Matrix
 
-| Crate / Layer | Relevant Learnings (`docs/learnings/`) | Relevant Plans & Checklists (`docs/plans/`) |
-| :--- | :--- | :--- |
-| `tt-isa` | `ttsim-divergence.md`, `riscv-guide-review.md` | `master-roadmap.md`, `hardware-coverage.md` |
-| `tt-device` / `tt-kmd` | `silicon-operating-notes.md`, `ttsim-divergence.md` | `master-roadmap.md`, `implementation-checklist.md` |
-| `tt-layout` | `firmware-performance.md` | `hardware-coverage.md`, `tensix-next-features.md` |
-| `tt-firmware` | `firmware-performance.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `hardware-coverage.md`, `traced-execution.md`, `tensix-next-features.md` |
-| `tt-kernels` | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md` | `master-roadmap.md`, `traced-execution.md`, `hardware-coverage.md`, `tensix-next-features.md` |
-| `burn-tt` | `tt-metal-concepts-review.md` | `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `tensix-next-features.md` |
-| `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `firmware-performance.md` | `implementation-checklist.md`, `hardware-coverage.md` |
-| `xtask` | `silicon-operating-notes.md` | `master-roadmap.md`, `burn-backend-parity.md` |
+| Crate / Layer           | Relevant Learnings (`docs/learnings/`)                                                        | Relevant Plans & Checklists (`docs/plans/`)                                                          |
+| :---------------------- | :-------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| `tt-isa`                | `ttsim-divergence.md`, `riscv-guide-review.md`                                                | `master-roadmap.md`, `hardware-coverage.md`                                                          |
+| `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `master-roadmap.md`, `implementation-checklist.md`                                                   |
+| `tt-layout`             | `firmware-performance.md`                                                                     | `hardware-coverage.md`, `tensix-next-features.md`                                                    |
+| `tt-firmware`           | `firmware-performance.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `hardware-coverage.md`, `traced-execution.md`, `tensix-next-features.md`                             |
+| `tt-kernels`            | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `master-roadmap.md`, `traced-execution.md`, `hardware-coverage.md`, `tensix-next-features.md`        |
+| `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `tensix-next-features.md` |
+| `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `firmware-performance.md`                                              | `implementation-checklist.md`, `hardware-coverage.md`                                                |
+| `xtask`                 | `silicon-operating-notes.md`                                                                  | `master-roadmap.md`, `burn-backend-parity.md`                                                        |
 
 ## Build and check
 

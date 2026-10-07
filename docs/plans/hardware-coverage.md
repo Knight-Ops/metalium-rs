@@ -239,7 +239,7 @@ there is no backend fallback or exact mode.
 | 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` general F32 reductions/scans and norm compositions pass both cards; pooling implemented; Tensix tensor transpose remains open |
 | 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; checked integer division/remainder pass step82; payload-preserving Src tensor transpose remains open |
 | 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native pooling, resident indexing, F32/BF16 convolution/attention and gradients; general Src tensor transpose and ND indexing remain partial |
-| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `DOTPV` | D2, S7, S9, M1, M4 | `[~]` M1 landed (step90); BFP8/4/2 storage, packed products and Burn policies landed (step91–96); application RNG remains open |
+| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `SHIFTXB` | D2, S7, S9, M1, M4 | `[~]` M1 landed (step90); BFP8/4/2 storage, packed products and Burn policies landed (step91–96); application RNG remains open; DOTPV excluded as redundant |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
 here, as S1 and R2.
@@ -266,7 +266,9 @@ it, and a line that does not apply says why in the item.
      convergence, the reduction's error), never a guessed number.
 3. **A ttsim gate** in `crates/tt-tests/tests/stepNN_*.rs`, inside `fork_scope`,
    watched failing at least once (an empty kernel, a wrong constant, a swapped operand).
-4. **A silicon gate**, the same test on both cards through `cargo xtask silicon`.
+4. **A silicon gate**, the same test through `cargo xtask silicon`. Ordinary
+   validation uses one card under the current policy; mesh or device-specific
+   investigations use both.
 5. **Burn routing**: the method overridden in `burn-tt/src/ops.rs` and listed in
    `OVERRIDDEN` (then `cargo xtask gen-burn-ops` and its `--check` mode), agreeing with `burn-flex` bit for
    bit or within the item's derived bound; a residency check that the op downloads
@@ -313,7 +315,7 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | x (`SFPMUL24` with `VC` zero only; `SFPSHFT2` rotate) | `~` (`exp`, `log`, reductions) | x | x | S5 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | x (`SFPLUTFP32`'s indirect destination designed out) | `~` `SFPARECIP` | `~` (`SFPLUTFP32` only `Mod1` 2, 6: row 70) | x | S4 |
 | Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | `~` `_IntFloat` round-to-nearest | | `~` | `~` | S6 |
-| Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | | | | | S6 |
+| Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | x (checked modes) | x (explicit precision reduction) | x (step81; supported forms) | x | S6 |
 | Lane movement | `SFPSWAP`, `SFPTRANSP` | x | x (`SFPSWAP` min/max) | `~` (reductions) | x | x | S2 |
 | Configuration | `SFPCONFIG` | x | `~` `LReg[11..15]` only (`Program::constant`) | | x | x | F2 |
 | Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
@@ -333,7 +335,8 @@ Reference: WH `MatrixUnit.md` (STUB-B), WH `MVMUL.md`, WH `SrcASrcB.md`, WH `RWC
 | `ELWADD`, `ELWSUB`, `ELWMUL` (with `Src` broadcast) | x (measured BH) | x (`Banks`) | x | x (F32 output) | x both | M1 |
 | `GMPOOL`, `GAPOOL` | x (measured BH) | x (`Banks`) | x | x | x both | M2 |
 | `TRNSPSRCB` | x (WH) | x (`Banks::transpose_b`) | x | x (TF32 Src) | x both (step87) | M3 partial |
-| `DOTPV`, `SHIFTXA`, `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 |
+| `SHIFTXB`, `MOVDBGA2D` | x | | | `-` row 50 | `~` encoding | M4 / diagnostics |
+| `DOTPV`, `SHIFTXA` | x | `-` excluded | | DOTPV: `-` row 50; SHIFTXA: not established | DOTPV: `~` encoding; SHIFTXA: not established | M4 exclusions, 2026-10-07 |
 
 ### Unpackers and packer
 
@@ -394,7 +397,49 @@ Pulled in only when a kernel needs them; each says which.
 
 ### Tensix coprocessor instruction implementation checklist
 
-Complete census of all 119 Tensix coprocessor instruction encodings generated into `tt-isa` from the Blackhole/Wormhole specification: 68 are actively driven by kernels, firmware, and runtime (`[x]`); 47 are unutilized in current execution pipelines (`[ ]`); and 4 are deliberately omitted on Blackhole (`[-]`):
+Remaining-work review (2026-10-07):
+[remaining-firmware-instructions.md](remaining-firmware-instructions.md)
+accounts for every pending mnemonic group, distinguishes existing encoding/probe
+evidence from missing helpers and semantic gates, and sequences implementation
+with explicit research/defer dispositions for unsupported forms. The completed tranche
+is [L1 scalar access and bulk movement](../completed-plans/l1-scalar-movement.md), following the
+completed step100 foundation. Step101/102 acceptance is recorded below; the
+remaining-work review retains its historical sequencing.
+
+Mnemonic-level instruction inventory: 87 completed checklist rows (`[x]`),
+21 pending rows (`[ ]`), and six deliberately omitted groups (`[-]`,
+`RMWCIB0..3`, `DOTPV`, `SHIFTXA`, `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`).
+These are grouped mnemonic rows, not a count of generated
+encodings: generated tables also contain variants and superseded Wormhole
+layouts. The earlier 68/47/4 totals were stale, and SETDMAREG was missing here.
+
+Step100 acceptance (2026-10-07): nine isolated release card-0 gates pass
+(run `1791379895`), including every configuration ALU/mask mode, both banks,
+all issuing threads, every scratch target/selector, scalar register/immediate
+forms, aliasing, independent integer/config models and diagnostic replay.
+Simulator refusals have surviving controls; supported register multiply and
+configuration read/Add remain semantic gates. Only register MULDMAREG provenance
+is promoted. Descriptor publication needs an explicit Configuration Unit barrier
+in tight replay; see operating notes. Default tensor dispatch stays unchanged;
+Burn routing, gradients and padding are inapplicable to step100. DMANOP is now
+accepted in step101; FLUSHDMA remains excluded by the review above.
+
+Step101/102 acceptance: twelve isolated release card-0 gates pass
+(`1791389018`). T0 performs all movement; T2 carries a declared two-semaphore
+output ownership shell, since an empty T2 cannot publish T0 output safely.
+F32/I32/Bool/raw BF16, physical zero padding, whole tile-row views, changed-input
+traces, deferred frees and downstream reductions/matmul pass. No automatic Burn
+routing, mesh/BFP/in-place/rectangle API or firmware ABI change. See operating
+notes for measured STOREIND widths and the output-credit handoff, and the
+performance scoreboard for validated release comparisons.
+[Completed checklist](../completed-plans/scalar-config-foundation.md).
+
+Encoding, semantic evidence and production adoption are distinct. In particular,
+ADDDMAREG already drives matmul address stepping (step38), and the delivered LUT
+forms already have helpers/models/device gates (step26); broader LUT adoption
+remains S10. Step98 adds INCADCXY/ADDRCRXY helpers and an explicit ADC rectangle-copy
+kernel. Burn slices retain original native repack after the ADC performance
+comparison; automatic ADC adoption is deferred. See [the tranche checklist](adc-row-window-copy.md).
 
 Step98 acceptance (2026-10-06): simulator 9/9; card-0 full release SMOKE
 203/203 (`1791321817`), including nine ADC gates and the CNN state-lifetime
@@ -419,30 +464,10 @@ generator/shipping checks and all eight MNIST regressions pass, golden unchanged
 Burn routing is inapplicable to this Session-only API. See
 [the Z/W tranche checklist](adc-plane-copy.md) and the performance record for
 validated native-repack medians. No speedup or additional instruction adoption
-is claimed.
-
-Step100 acceptance (2026-10-07): nine isolated release card-0 gates pass
-(run `1791379895`), including every configuration ALU/mask mode, both banks,
-all issuing threads, every scratch target/selector, scalar register/immediate
-forms, aliasing, independent integer/config models and diagnostic replay.
-Simulator refusals have surviving controls; supported register multiply and
-configuration read/Add remain semantic gates. Only register MULDMAREG provenance
-is promoted. Descriptor publication needs an explicit Configuration Unit barrier
-in tight replay; see operating notes. Default tensor dispatch stays unchanged;
-Burn routing, gradients and padding are inapplicable to step100. DMANOP is now
-accepted in step101; FLUSHDMA remains deliberately excluded; use STALLWAIT.
-
-Step101/102 acceptance: twelve isolated release card-0 gates pass
-(`1791389018`). T0 performs all movement; T2 carries a declared two-semaphore
-output ownership shell, since an empty T2 cannot publish T0 output safely.
-F32/I32/Bool/raw BF16, physical zero padding, whole tile-row views, changed-input
-traces, deferred frees and downstream reductions/matmul pass. No automatic Burn
-routing, mesh/BFP/in-place/rectangle API or firmware ABI change. See operating
-notes for measured STOREIND widths and the output-credit handoff, and the
-performance scoreboard for validated release comparisons.
-[Completed checklist](../completed-plans/scalar-config-foundation.md).
-
-[Completed L1 movement checklist](../completed-plans/l1-scalar-movement.md).
+is claimed. At step99 close-out, the pending group counts were 7 matrix/source, 1 SFPU,
+6 unpacker/packer, 2 frontend, 2 configuration and 19 DMA/register/atomic rows;
+REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
+2026-10-07 exclusion review above supersede these historical counts.
 
 #### Matrix Unit (FPU) & Formats (22 instructions)
 - [x] `MVMUL`: Matrix-vector multiply (primary GEMM accumulation engine, `Session::matmul_dram`).
@@ -454,9 +479,9 @@ performance scoreboard for validated release comparisons.
 - [x] `ELWADD`: Matrix-unit elementwise addition ($SrcA + SrcB \to Dst$). Item M1.
 - [x] `ELWSUB`: Matrix-unit elementwise subtraction ($SrcA - SrcB \to Dst$). Item M1.
 - [x] `ELWMUL`: Matrix-unit elementwise multiplication ($SrcA \times SrcB \to Dst$). Item M1.
-- [ ] `DOTPV`: Vector-pair dot product on matrix unit. Item M4.
+- [-] `DOTPV`: redundant with non-broadcast `MVMUL`; the pinned `DOTPV.md` explicitly prefers MVMUL. Retain step9 encoding probes, no production helper or new semantic tranche.
 - [x] `TRNSPSRCB`: native SrcB block permutation gated on both cards (step87); M3 payload-preserving tensor transpose remains partial.
-- [ ] `SHIFTXA`: Shift $SrcA$ across lanes. Item M4.
+- [-] `SHIFTXA`: pinned `SHIFTXA.md` calls it unsupported: its input row depends on a preceding matrix instruction through noncontractual hardware behavior. Use explicit staging/repacking or validated SFPU lane movement; no Blackhole bug measurement is claimed by this exclusion.
 - [ ] `SHIFTXB`: Rotate $SrcB$ row across matrix registers. Item M4.
 - [x] `MOVD2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
@@ -464,9 +489,9 @@ performance scoreboard for validated release comparisons.
 - [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
 - [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
 - [ ] `ZEROSRC`: Clear source registers $SrcA$ / $SrcB$.
-- [ ] `CLEARDVALID`: Invalidate $Dst$ scoreboard without writing zeroes.
+- [ ] `CLEARDVALID`: Give Src banks to unpackers, optionally flipping the matrix bank; unsafe reset form stays excluded.
 - [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
-- [ ] `GATESRCRST`: Gate source reset.
+- [ ] `GATESRCRST`: Invalidate the one-slot SrcB operand cache.
 
 #### Vector Unit (SFPU) (40 instructions)
 - [x] `SFPADD`: Lanewise floating-point addition/subtraction.
@@ -508,7 +533,7 @@ performance scoreboard for validated release comparisons.
 - [x] `SFPSWAP`: `Program::min_max`, step26 interpreter/device comparisons and production reductions. Argmin/argmax variants are separate scope.
 - [x] `SFPADDI`: `Program::addi`, BF16-immediate interpreter/device comparison in step26.
 - [x] `SFPMULI`: `Program::muli`, BF16-immediate interpreter/device comparison in step26.
-- [ ] `SFPLUT` / `SFPLUTFP32`: delivered table forms already have step26 device gates; simulator restrictions are divergence 70. Broader lookup adoption remains Item S10; an unchecked item does not imply missing encoding/semantic evidence.
+- [x] `SFPLUT` / `SFPLUTFP32`: delivered table forms already have step26 device gates; simulator restrictions are divergence 70. Broader lookup adoption remains Item S10; this completion covers delivered instruction forms, while broader kernel adoption remains open.
 
 #### Unpackers & Packers (16 instructions)
 - [x] `UNPACR_Regular`: Streaming unpack from L1 to $SrcA$, $SrcB$, or $Dst$.
@@ -521,8 +546,8 @@ performance scoreboard for validated release comparisons.
 - [x] `INCADCZW`: checked current-thread Z/W helper and bounded resident plane traversal; independent state/address models and step99 simulator/card-0 gates.
 - [x] `ADDRCRXY`: checked cursor-relative helper and row-anchor restoration in ADC rectangle copies; step98.
 - [x] `ADDRCRZW`: checked Z/W cursor restoration/advance helper in resident plane copies; step99 covers all masks/targets, wide addressing, zero restoration and negative controls.
-- [ ] `SETDVALID`: Manually override destination valid scoreboard bits.
-- [ ] `REG2FLOP_ADC`: Load configuration directly into ADC execution flops.
+- [-] `SETDVALID`: Blackhole implied-format handover is explicitly unsupported in the pinned page. Use regular UNPACR's final FlipSrc; sequenced `UNPACR_NOP_SETDVALID` remains a separate gated task.
+- [-] `REG2FLOP_ADC`: pinned page declares unsupported functionality and weak model confidence. Use checked SETADC/SETADCXX/XY/ZW and descriptor reprogramming; no general GPR-to-ADC API is promised. Reopen only for a concrete runtime-value consumer and independent Blackhole evidence.
 - [ ] `UNPACR_NOP_SETDVALID`: Unpacker micro-mode setting DVALID.
 - [ ] `UNPACR_NOP_SETREG`: Unpacker micro-mode setting configuration registers.
 - [ ] `UNPACR_NOP_ZEROSRC`: Unpacker micro-mode zeroing source registers.
@@ -540,20 +565,21 @@ performance scoreboard for validated release comparisons.
 - [ ] `STREAMWAIT`: Wait on hardware stream overlay.
 - [ ] `STREAMWRCFG`: Stream overlay configuration write.
 
-#### Backend Configuration (7 instructions)
+#### Backend Configuration
 - [x] `WRCFG`: 32-bit and 128-bit backend configuration writes.
 - [x] `SETC16`: Direct 16-bit thread configuration writes.
 - [x] `RDCFG`: checked backend read plus full Configuration Unit wait; both banks/all threads (step100).
 - [x] `CFGSHIFTMASK`: checked eight ALU modes, mask preservation/replacement, four scratch selectors and restricted mutation targets (step100); full matrix silicon, simulator supports only unrotated full-width preserved Add.
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
-#### DMA Engine, Atomics & Registers (20 instructions)
+#### DMA Engine, Atomics & Registers
 - [ ] `ATCAS`: Atomic Compare-and-Swap on L1 memory.
 - [ ] `ATGETM`: Atomic mutex acquire.
 - [ ] `ATRELM`: Atomic mutex release.
 - [ ] `ATSWAP`: Atomic swap on L1.
 - [ ] `ATINCGET`: Atomic fetch-and-increment on L1.
 - [ ] `ATINCGETPTR`: Atomic fetch-and-increment pointer on L1.
+- [x] `SETDMAREG`: checked full-width GPR initialization through `backend::set_gpr`; configuration staging and matmul address stepping.
 - [x] `ADDDMAREG`: production register-form matmul address stepping and step38; the immediate form is silicon-only (divergence 67).
 - [x] `SUBDMAREG`: checked wrapping subtraction, register/immediate forms (step100); silicon semantics, simulator refusal.
 - [x] `MULDMAREG`: checked low-16 unsigned multiplication, register/immediate forms (step100); register encoding confirmed on simulator/card 0, immediate silicon-only with WormholeOnly provenance.
@@ -1359,7 +1385,7 @@ Each names the measurement it must move. The Burn-side ones are in
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
 - [~] **S6 Casts and rounding.** Deterministic F32 rounding and saturating
       I32 conversion are simulator-gated by `step72`; I32-to-F32 already runs
-      natively. Hardware SFPSTOCHRND modes and reduced storage remain open.
+      natively. Hardware SFPSTOCHRND modes are gated by step81; BF16 and BFP8/4/2 storage are delivered. FP16 and other deferred storage formats remain open.
       Historical intended instruction coverage: `SFPCAST` int ↔ float (never `SFPCAST_IntAbs`: Tier 2,
       use `SFPABS`); `SFPSTOCHRND` FP32 → BF16/FP16 in round-to-nearest and stochastic
       modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
@@ -1413,8 +1439,9 @@ Each names the measurement it must move. The Burn-side ones are in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
       through dimension swaps, without a new transpose kernel (`step66`).
-- [ ] **M4 `DOTPV`, `SHIFTXA`/`SHIFTXB`.** Silicon-only (row 50). Only when a kernel
-      wants them.
+- [ ] **M4 `SHIFTXB`.** Silicon-only (row 50); checked rotate/zero-fill forms
+      when a kernel needs them (remaining-instruction Stage C). `DOTPV` and
+      `SHIFTXA` are deliberately excluded by the 2026-10-07 review above.
 
 ### R — Reductions and composites
 
