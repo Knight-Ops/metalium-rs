@@ -1700,15 +1700,18 @@ path today, `~` when only some shapes do.
 | `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*` | x I32 full-width wrapping ALU, signed comparisons, masked shifts; both-card validated | S5 |
 | `int_{div,remainder}{,_scalar}`, `int_mean_dim` | `~` checked native I32, simulator/card-0 validated (`1791232718`) | S5 |
-| `int_neg`, `int_abs` | Burn compositions over native wrapping ALU | S5 |
+| `int_neg` | Burn composition over native wrapping ALU | S5 |
+| `int_abs` | x wrapping (`i32::MIN` stays `i32::MIN`, as Flex); card 0 (step126, run `1791560877`) | S5 (T1) |
+| `int_clamp*`, `int_sign`, `int_max_abs*` | x Burn defaults over native mask fill/abs, no downloads (step126) | S5 (T1) |
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
-| `int_cast` | | S6 |
+| `int_cast` | `~` I32→I32 native; other widths fail by name (`[-]`: the device stores I32 only) (step126) | S6 (T1) |
 | `int_sum*`, `int_max*`, `int_prod*`, `int_min*` | x I32 reductions (step80) | R1 |
 | `int_cumsum`, `int_cumprod`, `int_cummin`, `int_cummax`, `int_argmax`, `int_argmin` | x wrapping/signed resident scans and first-extreme indices (step131-132, card 0) | R1 |
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
-| `bool_mask_*` | | S5 |
+| `int_mask_where`, `int_mask_fill`, `bool_mask_where`, `bool_mask_fill` | x raw-bit selects and fills (16777217 and `i32::MIN` exact); card 0 (step126) | S5 (T1) |
+| `{int,bool}_{permute, flip, unfold}` | x dtype-generic views and copies; card 0 (step125, run `1791560886`) | D3 (T1) |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | `~` resident arbitrary-axis gather/select, stepped slices/assignment/cat/repeat, I32 wrapping and Boolean OR updates; ND indexing remains open | D4 |
 | `QTensorOps` | explicit unsupported | Deferred; D2 is backend tensor storage, not portable quantization |
 

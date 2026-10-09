@@ -38,25 +38,18 @@ The per-method Device and Item notes remain in
 
 ## IntTensorOps
 
-61 native, 32 composed, 11 unsupported.
+68 native, 32 composed, 4 unsupported.
 
 | Unsupported method | Disposition |
 |---|---|
-| `int_abs` | T1 wrapping integer ALU |
 | `int_argtopk` | T5 device sort on I32 keys |
-| `int_cast` | T1 I32 to I32 native, other widths [-] |
-| `int_flip` | T1 dtype-generic copy |
 | `int_gather_nd` | T2 flat index on the device, then gather |
-| `int_mask_fill` | T1 raw-bit scalar fill |
-| `int_mask_where` | T1 raw-bit select |
 | `int_matmul` | T2 exact modulo 2^32 composition |
-| `int_permute` | T1 dtype-generic strided view |
 | `int_scatter_nd` | T2 select_add and ordered assign |
-| `int_unfold` | T1 dtype-generic view |
 
-<details><summary>Native (61)</summary>
+<details><summary>Native (68)</summary>
 
-`bitwise_and`, `bitwise_and_scalar`, `bitwise_left_shift`, `bitwise_left_shift_scalar`, `bitwise_not`, `bitwise_or`, `bitwise_or_scalar`, `bitwise_right_shift`, `bitwise_right_shift_scalar`, `bitwise_xor`, `bitwise_xor_scalar`, `int_add`, `int_add_scalar`, `int_argmax`, `int_argmin`, `int_cummax`, `int_cummin`, `int_cumprod`, `int_cumsum`, `int_device`, `int_div`, `int_div_scalar`, `int_empty`, `int_equal`, `int_equal_elem`, `int_expand`, `int_from_data`, `int_gather`, `int_greater`, `int_greater_elem`, `int_greater_equal`, `int_greater_equal_elem`, `int_into_data`, `int_into_float`, `int_lower`, `int_lower_elem`, `int_lower_equal`, `int_lower_equal_elem`, `int_max_dim`, `int_mean_dim`, `int_min_dim`, `int_mul`, `int_mul_scalar`, `int_prod`, `int_prod_dim`, `int_random`, `int_remainder`, `int_remainder_scalar`, `int_reshape`, `int_scatter_add`, `int_select`, `int_select_add`, `int_slice`, `int_slice_assign`, `int_sub`, `int_sub_scalar`, `int_sum`, `int_sum_dim`, `int_swap_dims`, `int_to_device`, `int_transpose`
+`bitwise_and`, `bitwise_and_scalar`, `bitwise_left_shift`, `bitwise_left_shift_scalar`, `bitwise_not`, `bitwise_or`, `bitwise_or_scalar`, `bitwise_right_shift`, `bitwise_right_shift_scalar`, `bitwise_xor`, `bitwise_xor_scalar`, `int_abs`, `int_add`, `int_add_scalar`, `int_argmax`, `int_argmin`, `int_cast`, `int_cummax`, `int_cummin`, `int_cumprod`, `int_cumsum`, `int_device`, `int_div`, `int_div_scalar`, `int_empty`, `int_equal`, `int_equal_elem`, `int_expand`, `int_flip`, `int_from_data`, `int_gather`, `int_greater`, `int_greater_elem`, `int_greater_equal`, `int_greater_equal_elem`, `int_into_data`, `int_into_float`, `int_lower`, `int_lower_elem`, `int_lower_equal`, `int_lower_equal_elem`, `int_mask_fill`, `int_mask_where`, `int_max_dim`, `int_mean_dim`, `int_min_dim`, `int_mul`, `int_mul_scalar`, `int_permute`, `int_prod`, `int_prod_dim`, `int_random`, `int_remainder`, `int_remainder_scalar`, `int_reshape`, `int_scatter_add`, `int_select`, `int_select_add`, `int_slice`, `int_slice_assign`, `int_sub`, `int_sub_scalar`, `int_sum`, `int_sum_dim`, `int_swap_dims`, `int_to_device`, `int_transpose`, `int_unfold`
 
 </details>
 
@@ -68,19 +61,11 @@ The per-method Device and Item notes remain in
 
 ## BoolTensorOps
 
-30 native, 4 composed, 5 unsupported.
+35 native, 4 composed, 0 unsupported.
 
-| Unsupported method | Disposition |
-|---|---|
-| `bool_flip` | T1 dtype-generic copy |
-| `bool_mask_fill` | T1 raw-bit scalar fill |
-| `bool_mask_where` | T1 raw-bit select |
-| `bool_permute` | T1 dtype-generic strided view |
-| `bool_unfold` | T1 dtype-generic view |
+<details><summary>Native (35)</summary>
 
-<details><summary>Native (30)</summary>
-
-`bool_all`, `bool_all_dim`, `bool_and`, `bool_any`, `bool_any_dim`, `bool_argwhere`, `bool_device`, `bool_empty`, `bool_equal`, `bool_equal_elem`, `bool_expand`, `bool_from_data`, `bool_gather`, `bool_into_data`, `bool_into_float`, `bool_into_int`, `bool_not`, `bool_ones`, `bool_or`, `bool_reshape`, `bool_scatter_or`, `bool_select`, `bool_select_or`, `bool_slice`, `bool_slice_assign`, `bool_swap_dims`, `bool_to_device`, `bool_transpose`, `bool_xor`, `bool_zeros`
+`bool_all`, `bool_all_dim`, `bool_and`, `bool_any`, `bool_any_dim`, `bool_argwhere`, `bool_device`, `bool_empty`, `bool_equal`, `bool_equal_elem`, `bool_expand`, `bool_flip`, `bool_from_data`, `bool_gather`, `bool_into_data`, `bool_into_float`, `bool_into_int`, `bool_mask_fill`, `bool_mask_where`, `bool_not`, `bool_ones`, `bool_or`, `bool_permute`, `bool_reshape`, `bool_scatter_or`, `bool_select`, `bool_select_or`, `bool_slice`, `bool_slice_assign`, `bool_swap_dims`, `bool_to_device`, `bool_transpose`, `bool_unfold`, `bool_xor`, `bool_zeros`
 
 </details>
 

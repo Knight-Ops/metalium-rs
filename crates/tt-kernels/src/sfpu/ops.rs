@@ -104,6 +104,21 @@ pub mod kind_sfpu {
     pub const I32_TO_F32: u32 = 0x129;
     /// Exact nonnegative integral F32 index below 2^23 to I32 bits.
     pub const INDEX_TO_I32: u32 = 0x160;
+    // Lane T1 (`hardware-coverage-closeout.md`): integer and boolean selects.
+    // Every one moves raw 32-bit words (`Format::Int32` loads and stores): no
+    // float conversion ever sees a datum, so denormals and NaN payloads survive.
+    /// `mask ? c : a`: `I32`, `Bool`, `I32`, all one shape (ternary).
+    pub const INT_MASK_WHERE: u32 = 0x161;
+    /// `mask ? c : a`: `Bool`, `Bool`, `Bool`, all one shape (ternary).
+    pub const BOOL_MASK_WHERE: u32 = 0x162;
+    /// `mask ? scalar : a`, `a` `I32` and `scalar` the raw 32-bit pattern
+    /// (`f32::from_bits`; never a float conversion). `mask` as `MASK_FILL`'s.
+    pub const INT_MASK_FILL: u32 = 0x163;
+    /// `mask ? scalar : a`, `a` `Bool` and `scalar`'s bits `0` or `1`.
+    pub const BOOL_MASK_FILL: u32 = 0x164;
+    /// `|a|` of an `I32`, wrapping: `i32::MIN` stays `i32::MIN` (Flex's
+    /// `wrapping_abs`).
+    pub const INT_ABS: u32 = 0x165;
     /// `e^a - 1`, within [`super::EXPM1_BOUND`] (10.2e).
     pub const EXPM1: u32 = 0x12a;
     /// `1 / (1 + e^-a)` in Flex's two branches, within [`super::SIGMOID_BOUND`].
@@ -271,6 +286,11 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
         kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
+        kind_sfpu::INT_MASK_FILL => sig(&[Elem::I32, Bool], Elem::I32),
+        kind_sfpu::INT_MASK_WHERE => sig(&[Elem::I32, Bool, Elem::I32], Elem::I32),
+        kind_sfpu::BOOL_MASK_FILL => sig(&[Bool, Bool], Bool),
+        kind_sfpu::BOOL_MASK_WHERE => sig(&[Bool, Bool, Bool], Bool),
+        kind_sfpu::INT_ABS => sig(&[Elem::I32], Elem::I32),
         kind_sfpu::POW_I => sig(&[F32, Elem::I32], F32),
         kind_sfpu::I32_TO_F32 => sig(&[Elem::I32], F32),
         kind_sfpu::BOOL_TO_F32 => sig(&[Bool], F32),
@@ -2310,6 +2330,8 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::INT_MASK_FILL
+        | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU
         | kind_sfpu::POW
         | kind_sfpu::POW_I
@@ -2317,7 +2339,9 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::LOG_SIGMOID_BACKWARD
         | kind_sfpu::ATAN2 => Operands::Binary,
-        kind_sfpu::MASK_WHERE => Operands::Ternary,
+        kind_sfpu::MASK_WHERE | kind_sfpu::INT_MASK_WHERE | kind_sfpu::BOOL_MASK_WHERE => {
+            Operands::Ternary
+        }
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
         | kind::RELU
@@ -2334,6 +2358,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::INDEX_TO_I32
         | kind_sfpu::BOOL_TO_F32
         | kind_sfpu::BOOL_TO_I32
+        | kind_sfpu::INT_ABS
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
         | kind_sfpu::TANH
@@ -2408,7 +2433,12 @@ pub fn broadcasts(kind: u32) -> bool {
             | kind_sfpu::BOOL_AND
             | kind_sfpu::BOOL_OR
             | kind_sfpu::BOOL_XOR
-            | kind_sfpu::EQ..=kind_sfpu::LE | kind_sfpu::MASK_FILL | kind_sfpu::PRELU
+            | kind_sfpu::EQ
+            ..=kind_sfpu::LE
+                | kind_sfpu::MASK_FILL
+                | kind_sfpu::INT_MASK_FILL
+                | kind_sfpu::BOOL_MASK_FILL
+                | kind_sfpu::PRELU
     )
 }
 
@@ -2462,7 +2492,7 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
             LReg::L2
         }
         // `mask ? value : a`, the value in `L3` (`binary_constants`).
-        kind_sfpu::MASK_FILL => {
+        kind_sfpu::MASK_FILL | kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL => {
             p.mov(LReg::L0, LReg::L2);
             p.if_(Cond::Ne0(LReg::L1), |p| p.mov(LReg::L3, LReg::L2));
             LReg::L2
@@ -2521,7 +2551,10 @@ fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
     if compare_of(kind).is_some() || kind == kind_sfpu::PRELU {
         compare_constants(p);
     }
-    if kind == kind_sfpu::MASK_FILL {
+    if matches!(
+        kind,
+        kind_sfpu::MASK_FILL | kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL
+    ) {
         p.loadi_bits(LReg::L3, scalars[0].to_bits());
     }
 }
@@ -2594,6 +2627,16 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
         move |p: &mut Program, o: u32| p.store(out, Format::Int32, OUT_ROW + o),
     );
     match kind {
+        // Two's complement `|x|`: negate the negative lanes, wrapping, so
+        // `i32::MIN` stays itself (`i32::wrapping_abs`).
+        INT_ABS => {
+            p.for_each_row_group(64, |p, o| {
+                load(p, o);
+                p.mov(x, out);
+                p.if_(Cond::Lt0(x), |p| p.isub_from(LReg::ZERO, out));
+                store(p, o);
+            });
+        }
         NEG | ABS => {
             p.loadi_bits(mask, 0x7fff_ffff);
             p.for_each_row_group(64, |p, o| {
@@ -2770,7 +2813,9 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
                 store(p, o);
             });
         }
-        MASK_WHERE => {
+        // A predicated move of raw words, whatever the element type: the
+        // `Bool` and `I32` selects are this program under another signature.
+        MASK_WHERE | INT_MASK_WHERE | BOOL_MASK_WHERE => {
             p.for_each_row_group(64, |p, o| {
                 load(p, o);
                 p.load(LReg::L1, Format::Int32, super::kernel::B_ROW + o);
@@ -2917,6 +2962,8 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::INT_MASK_FILL
+        | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU => {
             binary_constants(&mut p, kind, scalars);
             p.for_each_row_group(64, |p, o| {
@@ -3529,7 +3576,11 @@ mod fit {
         .chain(kind_sfpu::INT_ADD..=kind_sfpu::INT_NOT)
         .chain(kind_sfpu::INT_ADD_S..=kind_sfpu::INT_LE_S)
         .chain(kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32)
-        {
+        .chain([
+            kind_sfpu::INT_MASK_FILL,
+            kind_sfpu::BOOL_MASK_FILL,
+            kind_sfpu::INT_ABS,
+        ]) {
             let bcast = if k == kind::ADD_ROW {
                 Broadcast::Row
             } else {
@@ -4852,6 +4903,7 @@ mod arity {
             .chain(0x170..=0x17e)
             .chain(0x180..=0x18d)
             .chain(0x190..=0x194)
+            .chain(0x161..=0x165)
         {
             // Scalars any kind takes: `CLAMP`'s bounds uncrossed.
             let got = program2(k, [-0.5, 0.5]).map(|(o, _)| o);
@@ -5035,3 +5087,7 @@ mod s2 {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "t1_intbool_tests.rs"]
+mod t1_intbool;

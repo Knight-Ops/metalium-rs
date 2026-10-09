@@ -3064,6 +3064,11 @@ impl Eltwise {
             EQ_S..=LE_S => !ieee_compare(kind, 0.0, s),
             MASK_FILL => b_zero || is_zero(s),
             MASK_WHERE => b_zero || c_zero,
+            // Lane T1: raw words, so zero is the all-zero word alone (the
+            // float kinds' `-0.0` is `i32::MIN` here) and `|0| = 0`.
+            INT_MASK_FILL | BOOL_MASK_FILL => b_zero || s.to_bits() == 0,
+            INT_MASK_WHERE | BOOL_MASK_WHERE => b_zero || c_zero,
+            INT_ABS => true,
             // 10.2d-f: `f(±0) = ±0`.
             SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN | ATAN | ASIN => {
                 true
@@ -3105,6 +3110,11 @@ impl OpPadding for Eltwise {
                     || (self.kind == kind_sfpu::MASK_FILL
                         && zero(0)
                         && self.scalar.to_bits() & 0x7fff_ffff == 0)
+                    || (matches!(
+                        self.kind,
+                        kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL
+                    ) && zero(0)
+                        && self.scalar.to_bits() == 0)
                     || (matches!(
                         self.kind,
                         kind::ADD

@@ -549,6 +549,91 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
     ))
 }
 
+/// Reorder dimensions as a chain of `swap`s (a dimension swap is a view). Shared by the
+/// float, integer and boolean permutes, which differ only in `swap`; invalid axes fail
+/// naming `op`.
+pub(crate) fn permute_with(
+    tensor: TtTensor,
+    axes: &[usize],
+    op: &str,
+    swap: impl Fn(TtTensor, usize, usize) -> TtTensor,
+) -> TtTensor {
+    let rank = tensor.shape().num_dims();
+    let mut seen = vec![false; rank];
+    if axes.len() != rank
+        || axes.iter().any(|&a| {
+            if a >= rank || seen[a] {
+                true
+            } else {
+                seen[a] = true;
+                false
+            }
+        })
+    {
+        fail(op, format_args!("{}, axes={axes:?}", context(&tensor)));
+    }
+    let mut order: Vec<_> = (0..rank).collect();
+    let mut tensor = tensor;
+    for (i, &axis) in axes.iter().enumerate() {
+        let j = order
+            .iter()
+            .position(|&a| a == axis)
+            .expect("validated axes");
+        if i != j {
+            tensor = swap(tensor, i, j);
+            order.swap(i, j);
+        }
+    }
+    tensor
+}
+
+/// Reverse selected logical axes through native bit-preserving copies, whatever the element
+/// type; failures name `op`.
+pub(crate) fn flip_native(tensor: TtTensor, axes: &[usize], op: &str) -> TtTensor {
+    let mut slices = vec![burn_backend::Slice::full(); tensor.shape().num_dims()];
+    for &axis in axes {
+        if axis >= slices.len() {
+            fail(op, context(&tensor));
+        }
+        slices[axis] = burn_backend::Slice::with_step(0, None, -1);
+    }
+    sliced_native(&tensor, &slices).unwrap_or_else(|| fail(op, context(&tensor)))
+}
+
+/// Sliding logical windows of any stored element type: payloads preserved, the window axis
+/// appended.
+pub(crate) fn unfold_native(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
+    let shape = tensor.shape().to_vec();
+    assert!(dim < shape.len() && size > 0 && step > 0 && size <= shape[dim]);
+    let mut output = shape.clone();
+    output[dim] = (shape[dim] - size) / step + 1;
+    output.push(size);
+    let count = output
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .expect("unfold overflow");
+    let view = tensor
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    let sources = (0..count)
+        .map(|mut flat| {
+            let offset = flat % size;
+            flat /= size;
+            let mut indices = vec![0; shape.len()];
+            for d in (0..shape.len()).rev() {
+                indices[d] = flat % output[d];
+                flat /= output[d];
+            }
+            indices[dim] = indices[dim] * step + offset;
+            let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+            view.at(&shape, flat)
+        })
+        .collect();
+    let dims = crate::tensor::stored_dims(&output).unwrap();
+    let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
+    device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
+}
+
 /// General raw resident gather. Static staging covers every legal source;
 /// B reads bounded I32 indices and rejects the domain before indexed copying.
 fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
@@ -1848,36 +1933,7 @@ pub mod float {
 
     /// Reorder dimensions as existing strided views or host staging layouts.
     pub fn float_permute(tensor: TtTensor, axes: &[usize]) -> TtTensor {
-        let rank = tensor.shape().num_dims();
-        let mut seen = vec![false; rank];
-        if axes.len() != rank
-            || axes.iter().any(|&a| {
-                if a >= rank || seen[a] {
-                    true
-                } else {
-                    seen[a] = true;
-                    false
-                }
-            })
-        {
-            fail(
-                "float_permute",
-                format_args!("{}, axes={axes:?}", context(&tensor)),
-            );
-        }
-        let mut order: Vec<_> = (0..rank).collect();
-        let mut tensor = tensor;
-        for (i, &axis) in axes.iter().enumerate() {
-            let j = order
-                .iter()
-                .position(|&a| a == axis)
-                .expect("validated axes");
-            if i != j {
-                tensor = float_swap_dims(tensor, i, j);
-                order.swap(i, j);
-            }
-        }
-        tensor
+        permute_with(tensor, axes, "float_permute", float_swap_dims)
     }
 
     /// The last two dimensions swapped; see [`float_swap_dims`].
@@ -2386,14 +2442,7 @@ pub mod float {
     /// uploaded once. Unsupported inputs fail with metadata.
     /// Reverse selected logical axes through native bit-preserving copies.
     pub fn float_flip(tensor: TtTensor, axes: &[usize]) -> TtTensor {
-        let mut slices = vec![burn_backend::Slice::full(); tensor.shape().num_dims()];
-        for &axis in axes {
-            if axis >= slices.len() {
-                fail("float_flip", context(&tensor));
-            }
-            slices[axis] = burn_backend::Slice::with_step(0, None, -1);
-        }
-        sliced_native(&tensor, &slices).unwrap_or_else(|| fail("float_flip", context(&tensor)))
+        flip_native(tensor, axes, "float_flip")
     }
 
     pub fn float_slice_assign(
@@ -2406,35 +2455,7 @@ pub mod float {
 
     /// Sliding logical windows: preserve payloads and append the window axis.
     pub fn float_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
-        let shape = tensor.shape().to_vec();
-        assert!(dim < shape.len() && size > 0 && step > 0 && size <= shape[dim]);
-        let mut output = shape.clone();
-        output[dim] = (shape[dim] - size) / step + 1;
-        output.push(size);
-        let count = output
-            .iter()
-            .try_fold(1usize, |n, &d| n.checked_mul(d))
-            .expect("unfold overflow");
-        let view = tensor
-            .as_strided()
-            .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
-        let sources = (0..count)
-            .map(|mut flat| {
-                let offset = flat % size;
-                flat /= size;
-                let mut indices = vec![0; shape.len()];
-                for d in (0..shape.len()).rev() {
-                    indices[d] = flat % output[d];
-                    flat /= output[d];
-                }
-                indices[dim] = indices[dim] * step + offset;
-                let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
-                view.at(&shape, flat)
-            })
-            .collect();
-        let dims = crate::tensor::stored_dims(&output).unwrap();
-        let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
-        device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
+        unfold_native(tensor, dim, size, step)
     }
 
     pub fn float_slice(

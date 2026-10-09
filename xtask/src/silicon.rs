@@ -153,6 +153,8 @@ pub const SMOKE: &[&str] = &[
     "step130_float_extremum_scans::",
     "step131_int_scans::",
     "step132_int_arg::",
+    "step125_int_bool_views::",
+    "step126_int_mask_abs::",
     "step9_matmul::elw_broadcast_assignment_and_destination_fields",
     "step9_matmul::elw_oracles_reject_safe_instruction_mutants",
 ];

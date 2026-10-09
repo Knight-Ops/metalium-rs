@@ -2234,32 +2234,16 @@ impl IntTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: IntTensor<TtBackend>,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_mask_where", false);
-        crate::unsupported::fail(
-            "int_mask_where",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("value={}", crate::unsupported::context(&value)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_mask_where", true);
+        crate::ops::int::int_mask_where(tensor, mask, value)
     }
     fn int_mask_fill(
         tensor: IntTensor<TtBackend>,
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_mask_fill", false);
-        crate::unsupported::fail(
-            "int_mask_fill",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("value={:?}", value),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_mask_fill", true);
+        crate::ops::int::int_mask_fill(tensor, mask, value)
     }
     fn int_gather(
         dim: usize,
@@ -2523,11 +2507,8 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_min_dim(tensor, dim)
     }
     fn int_abs(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_abs", false);
-        crate::unsupported::fail(
-            "int_abs",
-            [format!("tensor={}", crate::unsupported::context(&tensor))].join("; "),
-        )
+        let _op = crate::report::enter("int_abs", true);
+        crate::ops::int::int_abs(tensor)
     }
     fn int_transpose(tensor: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_transpose", true);
@@ -2542,26 +2523,12 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_swap_dims(tensor, dim1, dim2)
     }
     fn int_permute(tensor: IntTensor<TtBackend>, axes: &[usize]) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_permute", false);
-        crate::unsupported::fail(
-            "int_permute",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_permute", true);
+        crate::ops::int::int_permute(tensor, axes)
     }
     fn int_flip(tensor: IntTensor<TtBackend>, axes: &[usize]) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_flip", false);
-        crate::unsupported::fail(
-            "int_flip",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_flip", true);
+        crate::ops::int::int_flip(tensor, axes)
     }
     fn int_random(
         shape: Shape,
@@ -2627,15 +2594,8 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::bitwise_right_shift_scalar(lhs, rhs)
     }
     fn int_cast(tensor: IntTensor<TtBackend>, dtype: IntDType) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_cast", false);
-        crate::unsupported::fail(
-            "int_cast",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dtype={:?}", dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_cast", true);
+        crate::ops::int::int_cast(tensor, dtype)
     }
     fn int_unfold(
         tensor: IntTensor<TtBackend>,
@@ -2643,17 +2603,8 @@ impl IntTensorOps<TtBackend> for TtBackend {
         size: usize,
         step: usize,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_unfold", false);
-        crate::unsupported::fail(
-            "int_unfold",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-                format!("size={:?}", size),
-                format!("step={:?}", step),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_unfold", true);
+        crate::ops::int::int_unfold(tensor, dim, size, step)
     }
 }
 
@@ -2737,32 +2688,16 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         mask: BoolTensor<TtBackend>,
         value: BoolTensor<TtBackend>,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_mask_where", false);
-        crate::unsupported::fail(
-            "bool_mask_where",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("value={}", crate::unsupported::context(&value)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_mask_where", true);
+        crate::ops::bool::bool_mask_where(tensor, mask, value)
     }
     fn bool_mask_fill(
         tensor: BoolTensor<TtBackend>,
         mask: BoolTensor<TtBackend>,
         value: Scalar,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_mask_fill", false);
-        crate::unsupported::fail(
-            "bool_mask_fill",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("value={:?}", value),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_mask_fill", true);
+        crate::ops::bool::bool_mask_fill(tensor, mask, value)
     }
     fn bool_gather(
         dim: usize,
@@ -2835,26 +2770,12 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         crate::ops::bool::bool_swap_dims(tensor, dim1, dim2)
     }
     fn bool_permute(tensor: BoolTensor<TtBackend>, axes: &[usize]) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_permute", false);
-        crate::unsupported::fail(
-            "bool_permute",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_permute", true);
+        crate::ops::bool::bool_permute(tensor, axes)
     }
     fn bool_flip(tensor: BoolTensor<TtBackend>, axes: &[usize]) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_flip", false);
-        crate::unsupported::fail(
-            "bool_flip",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("axes={:?}", axes),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_flip", true);
+        crate::ops::bool::bool_flip(tensor, axes)
     }
     fn bool_any(tensor: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("bool_any", true);
@@ -2891,17 +2812,8 @@ impl BoolTensorOps<TtBackend> for TtBackend {
         size: usize,
         step: usize,
     ) -> BoolTensor<TtBackend> {
-        let _op = crate::report::enter("bool_unfold", false);
-        crate::unsupported::fail(
-            "bool_unfold",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-                format!("size={:?}", size),
-                format!("step={:?}", step),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("bool_unfold", true);
+        crate::ops::bool::bool_unfold(tensor, dim, size, step)
     }
 }
 

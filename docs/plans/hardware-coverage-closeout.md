@@ -137,7 +137,9 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 
 ## Tensor and Burn lanes
 
-- [ ] **T1: int and bool wiring.** `int/bool_{permute,flip,unfold}`, `int/bool_mask_{where,fill}`
+- [x] **T1: int and bool wiring** (steps 125-126; simulator and card 0 15/15, runs `1791560877`,
+  `1791560886`; four negative controls watched failing on ttsim; `int_abs` has no mutant; both-card
+  run and SMOKE entries pending integration; divergence row 94 unused). `int/bool_{permute,flip,unfold}`, `int/bool_mask_{where,fill}`
   (raw-bit scalar kind, since the f32 scalar loses bits above 2^24), `int_abs` (wrapping; check
   Flex's `i32::MIN` first), `int_cast` (I32→I32 native, other widths `[-]`). Makes `int_clamp*`,
   `int_sign`, `int_max_abs*` work. Negative control: fill through the f32 scalar must fail.
