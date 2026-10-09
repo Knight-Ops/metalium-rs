@@ -1486,10 +1486,14 @@ Each names the measurement it must move. The Burn-side ones are in
       sums and maxima over either axis (`step67`; both-card validated).
       Simulator and both-card gates (`step69`) cover direct product, native Boolean
       `any`/`all`, rank-N arg-reductions and inclusive cumsum/cumprod.
-      Remaining: Burn `float_cummin`/`float_cummax` (the kernel scans in raw total
-      order, which differs from Flex's NaN-propagating, first-wins order, so it
-      cannot be wired as it is; lane T3 in
-      [hardware-coverage-closeout.md](hardware-coverage-closeout.md)). Full maxima compose native reshape and
+      R1d (2026-10-09; step130-132, simulator and card 0 `1791560292`/`296`/`300`):
+      `float_cummin`/`float_cummax` run `ScanOp::{MinNan,MaxNan}` with Flex's
+      `is_nan() || val < acc` rule (a NaN replaces the accumulator and stays until a
+      later NaN; the earlier element is kept on equal values including ±0); the
+      total-order `Min`/`Max` remain for kernel users. `int_cumsum`/`int_cumprod` wrap
+      modulo 2^32, `int_cummin`/`int_cummax` are signed, and `int_argmax`/`int_argmin`
+      return the first index of the signed extreme by exact integer comparison, so
+      Burn's `int_{max,min}_dim_with_indices` compose over them. Full maxima compose native reshape and
       max reductions; minimum defaults retain their gather limitations.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
@@ -1656,7 +1660,7 @@ path today, `~` when only some shapes do.
 | `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
 | `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
-| `float_cummin`, `float_cummax` | unsupported stub; kernel exists (`ScanOp::{Min,Max}`, step79) but its order is not Flex's | R1 (T3) |
+| `float_cummin`, `float_cummax` | x resident Flex-order scans (NaN propagates, earlier equal element kept); both-card gates pending, card 0 passes (step130) | R1 |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
@@ -1700,7 +1704,8 @@ path today, `~` when only some shapes do.
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
 | `int_cast` | | S6 |
-| `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
+| `int_sum*`, `int_max*`, `int_prod*`, `int_min*` | x I32 reductions (step80) | R1 |
+| `int_cumsum`, `int_cumprod`, `int_cummin`, `int_cummax`, `int_argmax`, `int_argmin` | x wrapping/signed resident scans and first-extreme indices (step131-132, card 0) | R1 |
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
 | `bool_mask_*` | | S5 |

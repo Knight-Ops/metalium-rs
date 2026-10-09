@@ -150,6 +150,9 @@ pub const SMOKE: &[&str] = &[
     "step102_xmov_tensor::",
     "step103_source_banks::",
     "step104_unpacker_handover::",
+    "step130_float_extremum_scans::",
+    "step131_int_scans::",
+    "step132_int_arg::",
     "step9_matmul::elw_broadcast_assignment_and_destination_fields",
     "step9_matmul::elw_oracles_reject_safe_instruction_mutants",
 ];

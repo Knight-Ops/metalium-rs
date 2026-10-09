@@ -13,22 +13,20 @@ The per-method Device and Item notes remain in
 
 ## FloatTensorOps
 
-91 native, 25 composed, 8 unsupported.
+93 native, 25 composed, 6 unsupported.
 
 | Unsupported method | Disposition |
 |---|---|
 | `float_argtopk` | T5 device sort |
 | `float_cross` | T2 composition of slice, mul, sub and cat |
-| `float_cummax` | T3 Flex-order scan (NaN propagates, first wins) |
-| `float_cummin` | T3 Flex-order scan (NaN propagates, first wins) |
 | `float_gather_nd` | T2 flat index on the device, then gather |
 | `float_remainder` | T4 exact SFPU fmod |
 | `float_remainder_scalar` | T4 exact SFPU fmod |
 | `float_scatter_nd` | T2 select_add and ordered assign |
 
-<details><summary>Native (91)</summary>
+<details><summary>Native (93)</summary>
 
-`float_abs`, `float_acos`, `float_acosh`, `float_add`, `float_add_scalar`, `float_argmax`, `float_argmin`, `float_asin`, `float_asinh`, `float_atan`, `float_atan2`, `float_atanh`, `float_cast`, `float_ceil`, `float_clamp`, `float_clamp_max`, `float_clamp_min`, `float_cos`, `float_cosh`, `float_cumprod`, `float_cumsum`, `float_device`, `float_div`, `float_div_scalar`, `float_empty`, `float_equal`, `float_equal_elem`, `float_erf`, `float_exp`, `float_expand`, `float_flip`, `float_floor`, `float_from_data`, `float_gather`, `float_greater`, `float_greater_elem`, `float_greater_equal`, `float_greater_equal_elem`, `float_into_data`, `float_into_int`, `float_is_inf`, `float_is_nan`, `float_log`, `float_log1p`, `float_lower`, `float_lower_elem`, `float_lower_equal`, `float_lower_equal_elem`, `float_mask_fill`, `float_mask_where`, `float_matmul`, `float_max_dim`, `float_mean`, `float_mean_dim`, `float_mul`, `float_mul_scalar`, `float_neg`, `float_not_equal`, `float_not_equal_elem`, `float_permute`, `float_powf`, `float_powf_scalar`, `float_powf_scalar_impl`, `float_powi`, `float_powi_scalar`, `float_prod`, `float_prod_dim`, `float_random`, `float_recip`, `float_reshape`, `float_round`, `float_scatter_add`, `float_select`, `float_select_add`, `float_sign`, `float_sin`, `float_sinh`, `float_slice`, `float_slice_assign`, `float_sqrt`, `float_sub`, `float_sub_scalar`, `float_sum`, `float_sum_dim`, `float_swap_dims`, `float_tan`, `float_tanh`, `float_to_device`, `float_transpose`, `float_trunc`, `float_unfold`
+`float_abs`, `float_acos`, `float_acosh`, `float_add`, `float_add_scalar`, `float_argmax`, `float_argmin`, `float_asin`, `float_asinh`, `float_atan`, `float_atan2`, `float_atanh`, `float_cast`, `float_ceil`, `float_clamp`, `float_clamp_max`, `float_clamp_min`, `float_cos`, `float_cosh`, `float_cummax`, `float_cummin`, `float_cumprod`, `float_cumsum`, `float_device`, `float_div`, `float_div_scalar`, `float_empty`, `float_equal`, `float_equal_elem`, `float_erf`, `float_exp`, `float_expand`, `float_flip`, `float_floor`, `float_from_data`, `float_gather`, `float_greater`, `float_greater_elem`, `float_greater_equal`, `float_greater_equal_elem`, `float_into_data`, `float_into_int`, `float_is_inf`, `float_is_nan`, `float_log`, `float_log1p`, `float_lower`, `float_lower_elem`, `float_lower_equal`, `float_lower_equal_elem`, `float_mask_fill`, `float_mask_where`, `float_matmul`, `float_max_dim`, `float_mean`, `float_mean_dim`, `float_mul`, `float_mul_scalar`, `float_neg`, `float_not_equal`, `float_not_equal_elem`, `float_permute`, `float_powf`, `float_powf_scalar`, `float_powf_scalar_impl`, `float_powi`, `float_powi_scalar`, `float_prod`, `float_prod_dim`, `float_random`, `float_recip`, `float_reshape`, `float_round`, `float_scatter_add`, `float_select`, `float_select_add`, `float_sign`, `float_sin`, `float_sinh`, `float_slice`, `float_slice_assign`, `float_sqrt`, `float_sub`, `float_sub_scalar`, `float_sum`, `float_sum_dim`, `float_swap_dims`, `float_tan`, `float_tanh`, `float_to_device`, `float_transpose`, `float_trunc`, `float_unfold`
 
 </details>
 
@@ -40,19 +38,13 @@ The per-method Device and Item notes remain in
 
 ## IntTensorOps
 
-55 native, 32 composed, 17 unsupported.
+61 native, 32 composed, 11 unsupported.
 
 | Unsupported method | Disposition |
 |---|---|
 | `int_abs` | T1 wrapping integer ALU |
-| `int_argmax` | T3 signed arg-extreme |
-| `int_argmin` | T3 signed arg-extreme |
 | `int_argtopk` | T5 device sort on I32 keys |
 | `int_cast` | T1 I32 to I32 native, other widths [-] |
-| `int_cummax` | T3 integer scan |
-| `int_cummin` | T3 integer scan |
-| `int_cumprod` | T3 integer scan |
-| `int_cumsum` | T3 integer scan |
 | `int_flip` | T1 dtype-generic copy |
 | `int_gather_nd` | T2 flat index on the device, then gather |
 | `int_mask_fill` | T1 raw-bit scalar fill |
@@ -62,9 +54,9 @@ The per-method Device and Item notes remain in
 | `int_scatter_nd` | T2 select_add and ordered assign |
 | `int_unfold` | T1 dtype-generic view |
 
-<details><summary>Native (55)</summary>
+<details><summary>Native (61)</summary>
 
-`bitwise_and`, `bitwise_and_scalar`, `bitwise_left_shift`, `bitwise_left_shift_scalar`, `bitwise_not`, `bitwise_or`, `bitwise_or_scalar`, `bitwise_right_shift`, `bitwise_right_shift_scalar`, `bitwise_xor`, `bitwise_xor_scalar`, `int_add`, `int_add_scalar`, `int_device`, `int_div`, `int_div_scalar`, `int_empty`, `int_equal`, `int_equal_elem`, `int_expand`, `int_from_data`, `int_gather`, `int_greater`, `int_greater_elem`, `int_greater_equal`, `int_greater_equal_elem`, `int_into_data`, `int_into_float`, `int_lower`, `int_lower_elem`, `int_lower_equal`, `int_lower_equal_elem`, `int_max_dim`, `int_mean_dim`, `int_min_dim`, `int_mul`, `int_mul_scalar`, `int_prod`, `int_prod_dim`, `int_random`, `int_remainder`, `int_remainder_scalar`, `int_reshape`, `int_scatter_add`, `int_select`, `int_select_add`, `int_slice`, `int_slice_assign`, `int_sub`, `int_sub_scalar`, `int_sum`, `int_sum_dim`, `int_swap_dims`, `int_to_device`, `int_transpose`
+`bitwise_and`, `bitwise_and_scalar`, `bitwise_left_shift`, `bitwise_left_shift_scalar`, `bitwise_not`, `bitwise_or`, `bitwise_or_scalar`, `bitwise_right_shift`, `bitwise_right_shift_scalar`, `bitwise_xor`, `bitwise_xor_scalar`, `int_add`, `int_add_scalar`, `int_argmax`, `int_argmin`, `int_cummax`, `int_cummin`, `int_cumprod`, `int_cumsum`, `int_device`, `int_div`, `int_div_scalar`, `int_empty`, `int_equal`, `int_equal_elem`, `int_expand`, `int_from_data`, `int_gather`, `int_greater`, `int_greater_elem`, `int_greater_equal`, `int_greater_equal_elem`, `int_into_data`, `int_into_float`, `int_lower`, `int_lower_elem`, `int_lower_equal`, `int_lower_equal_elem`, `int_max_dim`, `int_mean_dim`, `int_min_dim`, `int_mul`, `int_mul_scalar`, `int_prod`, `int_prod_dim`, `int_random`, `int_remainder`, `int_remainder_scalar`, `int_reshape`, `int_scatter_add`, `int_select`, `int_select_add`, `int_slice`, `int_slice_assign`, `int_sub`, `int_sub_scalar`, `int_sum`, `int_sum_dim`, `int_swap_dims`, `int_to_device`, `int_transpose`
 
 </details>
 

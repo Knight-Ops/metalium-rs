@@ -23,14 +23,6 @@ const DISPOSITIONS: &[(&str, &str)] = &[
     ("float_remainder", "T4 exact SFPU fmod"),
     ("float_remainder_scalar", "T4 exact SFPU fmod"),
     ("float_cross", "T2 composition of slice, mul, sub and cat"),
-    (
-        "float_cummin",
-        "T3 Flex-order scan (NaN propagates, first wins)",
-    ),
-    (
-        "float_cummax",
-        "T3 Flex-order scan (NaN propagates, first wins)",
-    ),
     ("float_argtopk", "T5 device sort"),
     (
         "float_gather_nd",
@@ -42,12 +34,6 @@ const DISPOSITIONS: &[(&str, &str)] = &[
     ("int_gather_nd", "T2 flat index on the device, then gather"),
     ("int_scatter_nd", "T2 select_add and ordered assign"),
     ("int_matmul", "T2 exact modulo 2^32 composition"),
-    ("int_cumsum", "T3 integer scan"),
-    ("int_cumprod", "T3 integer scan"),
-    ("int_cummin", "T3 integer scan"),
-    ("int_cummax", "T3 integer scan"),
-    ("int_argmax", "T3 signed arg-extreme"),
-    ("int_argmin", "T3 signed arg-extreme"),
     ("int_argtopk", "T5 device sort on I32 keys"),
     ("int_abs", "T1 wrapping integer ALU"),
     ("int_permute", "T1 dtype-generic strided view"),

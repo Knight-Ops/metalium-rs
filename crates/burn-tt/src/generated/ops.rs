@@ -1306,26 +1306,52 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         crate::ops::float::float_cumprod(tensor, dim)
     }
     fn float_cummin(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_cummin", false);
-        crate::unsupported::fail(
-            "float_cummin",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_cummin", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cummin", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cummin(tensor, dim),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_cummin(tensor, dim),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_cummin(tensor, dim)
     }
     fn float_cummax(tensor: FloatTensor<TtBackend>, dim: usize) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_cummax", false);
-        crate::unsupported::fail(
-            "float_cummax",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_cummax", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_cummax", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_cummax(tensor, dim),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_cummax(tensor, dim),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_cummax(tensor, dim)
     }
     fn float_cast(tensor: FloatTensor<TtBackend>, dtype: FloatDType) -> FloatTensor<TtBackend> {
         let _op = crate::report::enter("float_cast", true);
@@ -2453,59 +2479,24 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_mean_dim(tensor, dim)
     }
     fn int_cumsum(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_cumsum", false);
-        crate::unsupported::fail(
-            "int_cumsum",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_cumsum", true);
+        crate::ops::int::int_cumsum(tensor, dim)
     }
     fn int_cumprod(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_cumprod", false);
-        crate::unsupported::fail(
-            "int_cumprod",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_cumprod", true);
+        crate::ops::int::int_cumprod(tensor, dim)
     }
     fn int_cummin(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_cummin", false);
-        crate::unsupported::fail(
-            "int_cummin",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_cummin", true);
+        crate::ops::int::int_cummin(tensor, dim)
     }
     fn int_cummax(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_cummax", false);
-        crate::unsupported::fail(
-            "int_cummax",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_cummax", true);
+        crate::ops::int::int_cummax(tensor, dim)
     }
     fn int_argmax(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_argmax", false);
-        crate::unsupported::fail(
-            "int_argmax",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_argmax", true);
+        crate::ops::int::int_argmax(tensor, dim)
     }
     fn int_argtopk(tensor: IntTensor<TtBackend>, dim: usize, k: usize) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_argtopk", false);
@@ -2520,15 +2511,8 @@ impl IntTensorOps<TtBackend> for TtBackend {
         )
     }
     fn int_argmin(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_argmin", false);
-        crate::unsupported::fail(
-            "int_argmin",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_argmin", true);
+        crate::ops::int::int_argmin(tensor, dim)
     }
     fn int_max_dim(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_max_dim", true);

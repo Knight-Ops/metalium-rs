@@ -4315,8 +4315,11 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    /// Inclusive sum/product or raw-total-order min/max down rows, carrying
-    /// each prefix between tiles. Min/max preserve selected datum bits.
+    /// Inclusive scan down rows, carrying each prefix between tiles: FP32
+    /// sum/product, raw-total-order or Flex-order (NaN-propagating, IEEE)
+    /// min/max -- these preserve the selected datum's bits -- or the wrapping
+    /// and signed I32 scans, which take and give an I32 tensor
+    /// ([`crate::sfpu::scan::ScanOp::elem`]).
     pub fn scan(
         &mut self,
         a: &DramTensor,

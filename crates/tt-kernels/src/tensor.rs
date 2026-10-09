@@ -2582,7 +2582,7 @@ pub fn sfpu_scan(
 ) -> Result<Work> {
     use crate::sfpu::{kernel, scan};
     use kernel::Operands;
-    a.expect("a scan", Elem::F32)?;
+    a.expect("a scan", op.elem())?;
     let [rt, ct] = a.grid();
     let first_layout =
         kernel::plan_layout(1, Operands::Unary).map_err(|e| TensorError::Shape(e.to_string()))?;
@@ -2598,7 +2598,7 @@ pub fn sfpu_scan(
         Operands::Binary,
         &scan::program(op, false),
     ));
-    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, op.elem())?;
     let read = |tensor: &DramTensor, tile: usize, at: u64| {
         vec![
             [record::READ_RUN, tile as u32, 1, at as u32, 0, 0, 0, 0],

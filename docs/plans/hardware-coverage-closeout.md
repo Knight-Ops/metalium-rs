@@ -145,7 +145,9 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   `select_add`; Assign with a stated last-writer-in-index-order contract; Mul/Min/Max `[-]`),
   `float_cross` (oracle uses the device's mul/sub rounding), `int_matmul` (exact mod 2^32; size
   budget refusal), a `prelu` weight-shape-[1] residency test.
-- [ ] **T3: scans and integer arg-extremes.** Owns `tt-kernels/src/sfpu/scan.rs`. New
+- [x] **T3: scans and integer arg-extremes** (steps 130-132; simulator 11/11; card 0 11/11, runs
+  `1791560292`, `1791560296`, `1791560300`; eight negative controls watched failing on ttsim; silicon
+  mutants not run; SMOKE entries added; divergence row 96 unused). Owns `tt-kernels/src/sfpu/scan.rs`. New
   `ScanOp::{MinNaN,MaxNaN}` with Flex semantics (NaN propagates; on equal values including ±0 the
   earlier element is kept), integer `ISum/IProd/IMin/IMax`, `int_argmax/argmin`. The existing
   total-order Min/Max must fail the new gate on `[+0,-0]` and NaN inputs.
