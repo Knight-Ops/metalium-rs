@@ -62,7 +62,7 @@ pub const ALL_BABIES_HELD: u32 = Core::B.soft_reset_mask()
 
 /// Simulated cycles each role may take in the reset program. On silicon the
 /// runner's one-second floor applies.
-const RESET_BUDGET: u64 = 400_000;
+pub(crate) const RESET_BUDGET: u64 = 400_000;
 
 /// Which of this chip's Tensix tiles a session computes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1974,6 +1974,11 @@ impl<T: Transport> Session<T> {
         self.dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
+    }
+
+    /// The GDDR allocator, for ops built outside this file (`sfpu::sort`).
+    pub(crate) fn dram_alloc(&mut self) -> Result<&mut DramAlloc, TensorError> {
+        Ok(&mut self.dram_state()?.alloc)
     }
 
     /// Allocate device storage without uploading tensor data.
@@ -4536,7 +4541,11 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    fn submit_jobs(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+    pub(crate) fn submit_jobs(
+        &mut self,
+        jobs: Vec<tensor::Job>,
+        budget: u64,
+    ) -> Result<(), TensorError> {
         if self.batching {
             return self.submit_jobs_inner(jobs, budget);
         }

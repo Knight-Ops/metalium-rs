@@ -43,7 +43,7 @@ pub use report::{
 pub use server::{
     attach, device_traffic, kmd_engine, kmd_mesh_engine, mesh_execution, AttachGuard, BufferId,
     DramBuffers, Elem, Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine,
-    OutputKind, OutputPayload, PowArg, Serve, TraceRun,
+    OutputKind, OutputPayload, PowArg, Serve, SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;

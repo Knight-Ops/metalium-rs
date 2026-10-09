@@ -35,6 +35,7 @@ pub mod ops;
 pub mod reduce;
 pub mod round;
 pub mod scan;
+pub mod sort;
 
 use tt_isa::frontend;
 use tt_isa::isa::generated::{defs, encode};

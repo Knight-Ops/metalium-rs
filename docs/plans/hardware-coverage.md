@@ -1661,7 +1661,7 @@ path today, `~` when only some shapes do.
 | `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
 | `float_cummin`, `float_cummax` | x resident Flex-order scans (NaN propagates, earlier equal element kept); both-card gates pending, card 0 passes (step130) | R1 |
-| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
+| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk`, and the `int_` equivalents | x resident bitonic sort, F32/I32, any rank and axis up to 1024, stable (ties by original index), F32 in `total_cmp` order, trace-replayable; BF16 values widen, sort and narrow (flushing BF16 subnormals); longer axes, other dtypes and empty inputs refused by name; card 0 (step135-139, runs `1791561979`-`1791567677`) | R1 (T5) |
 | `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |

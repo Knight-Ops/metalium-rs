@@ -347,6 +347,13 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.scan(&mut self.session, a, op)
         }
+        fn sort_planes(
+            &mut self,
+            a: burn_tt::BufferId,
+            spec: tt_kernels::sfpu::sort::Spec,
+        ) -> Result<burn_tt::SortedBuffers, EngineError> {
+            self.buffers.sort_planes(&mut self.session, a, spec)
+        }
         fn slice_rows(
             &mut self,
             a: burn_tt::BufferId,

@@ -2017,17 +2017,47 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         k: usize,
         out_dtype: IntDType,
     ) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("float_argtopk", false);
-        crate::unsupported::fail(
-            "float_argtopk",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-                format!("k={:?}", k),
-                format!("out_dtype={:?}", out_dtype),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_argtopk", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_argtopk", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_argtopk(tensor, dim, k, out_dtype);
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_argtopk(tensor, dim, k, out_dtype);
+        }
+        crate::ops::float::float_argtopk(tensor, dim, k, out_dtype)
+    }
+    fn float_topk(tensor: FloatTensor<TtBackend>, dim: usize, k: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_topk", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_topk", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_topk(tensor, dim, k),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_topk(tensor, dim, k),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_topk(tensor, dim, k)
     }
     fn float_argmin(
         tensor: FloatTensor<TtBackend>,
@@ -2112,6 +2142,92 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         crate::ops::float::float_expand(tensor, shape)
+    }
+    fn float_sort(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_sort", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_sort", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_sort(tensor, dim, descending),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::cast_native(
+                crate::ops::float::float_sort(tensor, dim, descending),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_sort(tensor, dim, descending)
+    }
+    fn float_sort_with_indices(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+        indices_dtype: IntDType,
+    ) -> (FloatTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("float_sort_with_indices", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_sort_with_indices", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_sort_with_indices(
+                tensor,
+                dim,
+                descending,
+                indices_dtype,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let (values, indices) =
+                crate::ops::float::float_sort_with_indices(tensor, dim, descending, indices_dtype);
+            return (crate::ops::cast_native(values, compute_dtype), indices);
+        }
+        crate::ops::float::float_sort_with_indices(tensor, dim, descending, indices_dtype)
+    }
+    fn float_argsort(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+        out_dtype: IntDType,
+    ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("float_argsort", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_argsort", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let _ = result_storage;
+            return <Self as FloatTensorOps<Self>>::float_argsort(
+                tensor, dim, descending, out_dtype,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let tensor = crate::ops::float_compute_input(tensor);
+            return crate::ops::float::float_argsort(tensor, dim, descending, out_dtype);
+        }
+        crate::ops::float::float_argsort(tensor, dim, descending, out_dtype)
     }
     fn float_unfold(
         tensor: FloatTensor<TtBackend>,
@@ -2483,16 +2599,12 @@ impl IntTensorOps<TtBackend> for TtBackend {
         crate::ops::int::int_argmax(tensor, dim)
     }
     fn int_argtopk(tensor: IntTensor<TtBackend>, dim: usize, k: usize) -> IntTensor<TtBackend> {
-        let _op = crate::report::enter("int_argtopk", false);
-        crate::unsupported::fail(
-            "int_argtopk",
-            [
-                format!("tensor={}", crate::unsupported::context(&tensor)),
-                format!("dim={:?}", dim),
-                format!("k={:?}", k),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("int_argtopk", true);
+        crate::ops::int::int_argtopk(tensor, dim, k)
+    }
+    fn int_topk(tensor: IntTensor<TtBackend>, dim: usize, k: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_topk", true);
+        crate::ops::int::int_topk(tensor, dim, k)
     }
     fn int_argmin(tensor: IntTensor<TtBackend>, dim: usize) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_argmin", true);
@@ -2542,6 +2654,30 @@ impl IntTensorOps<TtBackend> for TtBackend {
     fn int_expand(tensor: IntTensor<TtBackend>, shape: Shape) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("int_expand", true);
         crate::ops::int::int_expand(tensor, shape)
+    }
+    fn int_sort(
+        tensor: IntTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+    ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_sort", true);
+        crate::ops::int::int_sort(tensor, dim, descending)
+    }
+    fn int_sort_with_indices(
+        tensor: IntTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+    ) -> (IntTensor<TtBackend>, IntTensor<TtBackend>) {
+        let _op = crate::report::enter("int_sort_with_indices", true);
+        crate::ops::int::int_sort_with_indices(tensor, dim, descending)
+    }
+    fn int_argsort(
+        tensor: IntTensor<TtBackend>,
+        dim: usize,
+        descending: bool,
+    ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_argsort", true);
+        crate::ops::int::int_argsort(tensor, dim, descending)
     }
     fn bitwise_and(lhs: IntTensor<TtBackend>, rhs: IntTensor<TtBackend>) -> IntTensor<TtBackend> {
         let _op = crate::report::enter("bitwise_and", true);

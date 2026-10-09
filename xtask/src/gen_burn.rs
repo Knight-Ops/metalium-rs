@@ -923,6 +923,9 @@ pub fn render(
                         impls.push_str(&format!("let mut output = {call};\noutput.output = crate::ops::cast_native(output.output, compute_dtype);\nreturn output;\n"));
                     } else if m.ret.as_deref() == Some("MaxPool2dBackward<B>") {
                         impls.push_str(&format!("let mut output = {call};\noutput.x_grad = crate::ops::cast_native(output.x_grad, compute_dtype);\nreturn output;\n"));
+                    } else if m.ret.as_deref() == Some("(FloatTensor<B>, IntTensor<B>)") {
+                        // Values come back in the input's dtype; the indices are integers.
+                        impls.push_str(&format!("let (values, indices) = {call};\nreturn (crate::ops::cast_native(values, compute_dtype), indices);\n"));
                     } else {
                         impls.push_str(&format!("return {call};\n"));
                     }

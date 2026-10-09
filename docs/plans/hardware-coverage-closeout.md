@@ -157,7 +157,9 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   `((a%b)+b)%b`; exact SFPU fmod by exponent alignment and chunked integer long division. Confirm
   S1 add is IEEE round-to-nearest-even first, else the oracle uses `fma_bh`. Negative control:
   `a - b*trunc(a/b)` must fail on `1e30 % 3` and `-4 % 2`.
-- [ ] **T5: device sort family** (long pole). Orderable integer key
+- [x] **T5: device sort family** (steps 135-139; simulator and card 0 all pass; three network-mutation
+  controls watched failing on ttsim; BF16 value gate corrected to expect the documented narrowing
+  flush; performance not measured; axis bound 1024 by design). Orderable integer key
   `x ^ ((x>>31) as u32 >> 1)` reproduces `total_cmp`; bitonic network along the axis with an index
   tile; ties break on original index; sentinels sort last; explicit axis-length bound. Routes
   `float/int_sort`, `_sort_with_indices`, `_argsort`, `_argtopk`; `topk` follows through Burn's

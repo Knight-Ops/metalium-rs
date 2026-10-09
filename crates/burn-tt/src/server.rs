@@ -354,6 +354,16 @@ pub trait Engine {
     // lane:t4_rem (Engine trait): add this lane's methods below this line only.
 
     // lane:t5_sort (Engine trait): add this lane's methods below this line only.
+    /// Sort every problem of `a`, a plane matrix (`tt_kernels::sfpu::sort`),
+    /// along its axis positions: the sorted keys and, if `spec.indices`, the
+    /// original indices. Both stay on the device.
+    fn sort_planes(
+        &mut self,
+        _a: BufferId,
+        _spec: tt_kernels::sfpu::sort::Spec,
+    ) -> Result<SortedBuffers, EngineError> {
+        Err(unsupported())
+    }
 
     // lane:t6_random (Engine trait): add this lane's methods below this line only.
 
@@ -1202,6 +1212,23 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    /// Lane T5: [`Engine::sort_planes`], for engines that serve these buffers.
+    pub fn sort_planes<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        spec: tt_kernels::sfpu::sort::Spec,
+    ) -> Result<SortedBuffers, EngineError> {
+        let planes = self.get(a)?.clone();
+        let sorted = s
+            .sort_planes(&planes, spec)
+            .map_err(|e| EngineError(e.to_string()))?;
+        Ok(SortedBuffers {
+            keys: self.insert(sorted.keys),
+            indices: sorted.indices.map(|t| self.insert(t)),
+        })
+    }
+
     /// A view: freeing it frees nothing (`DramTensor::rows_view`).
     pub fn slice_rows(
         &mut self,
@@ -1251,6 +1278,65 @@ impl DramBuffers {
         self.live
             .get(&id)
             .ok_or_else(|| EngineError(format!("no device buffer {id}")))
+    }
+}
+
+/// What [`Engine::sort_planes`] made: each buffer with its `[rows, cols]`.
+pub struct SortedBuffers {
+    pub keys: (BufferId, [usize; 2]),
+    pub indices: Option<(BufferId, [usize; 2])>,
+}
+
+/// A sort of `a`'s planes on the device, without waiting (lane T5): the keys'
+/// and, if `spec.indices`, the indices' buffers are named now, both `dims`.
+pub(crate) fn sort_planes(
+    device: TtDevice,
+    a: BufferId,
+    spec: tt_kernels::sfpu::sort::Spec,
+    dims: [usize; 2],
+) -> SortedBuffers {
+    let keys = name(dims);
+    let indices = spec.indices.then(|| name(dims));
+    crate::traffic::timed("sort", || {
+        send(
+            device,
+            Box::new(move |engine, ids| {
+                let made = ids
+                    .get(a)
+                    .and_then(|a| engine.sort_planes(a, spec))
+                    .and_then(|s| {
+                        if s.keys.1 == dims && s.indices.as_ref().is_none_or(|i| i.1 == dims) {
+                            Ok(s)
+                        } else {
+                            engine.free(s.keys.0);
+                            if let Some(i) = s.indices {
+                                engine.free(i.0);
+                            }
+                            Err(EngineError(format!("sorted planes are not {dims:?}")))
+                        }
+                    });
+                match made {
+                    Ok(s) => {
+                        ids.map.insert(keys, Ok(s.keys.0));
+                        if let (Some(id), Some(i)) = (indices, s.indices) {
+                            ids.map.insert(id, Ok(i.0));
+                        }
+                    }
+                    Err(e) => {
+                        let why = Arc::<str>::from(format!("sort {spec:?} on {device}: {e}"));
+                        ids.failed.get_or_insert_with(|| why.clone());
+                        ids.map.insert(keys, Err(why.clone()));
+                        if let Some(id) = indices {
+                            ids.map.insert(id, Err(why));
+                        }
+                    }
+                }
+            }),
+        )
+    });
+    SortedBuffers {
+        keys: (keys, dims),
+        indices: indices.map(|i| (i, dims)),
     }
 }
 
@@ -2426,6 +2512,14 @@ impl Engine for KmdEngine {
     // lane:t4_rem (KmdEngine): add this lane's methods below this line only.
 
     // lane:t5_sort (KmdEngine): add this lane's methods below this line only.
+    fn sort_planes(
+        &mut self,
+        a: BufferId,
+        spec: tt_kernels::sfpu::sort::Spec,
+    ) -> Result<SortedBuffers, EngineError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.sort_planes(&mut self.session, a, spec)
+    }
 
     // lane:t6_random (KmdEngine): add this lane's methods below this line only.
 
@@ -3002,6 +3096,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     // lane:t4_rem (MeshEngine): add this lane's methods below this line only.
 
     // lane:t5_sort (MeshEngine): add this lane's methods below this line only.
+    fn sort_planes(
+        &mut self,
+        a: BufferId,
+        spec: tt_kernels::sfpu::sort::Spec,
+    ) -> Result<SortedBuffers, EngineError> {
+        self.buffers
+            .sort_planes(self.fabric.chips[0].session(), a, spec)
+    }
 
     // lane:t6_random (MeshEngine): add this lane's methods below this line only.
 
