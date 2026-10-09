@@ -1642,7 +1642,7 @@ path today, `~` when only some shapes do.
 | `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial | M3, D2 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
-| `float_remainder{,_scalar}` | | S6 |
+| `float_remainder{,_scalar}` | x exact SFPU fmod (Flex's `((a%b)+b)%b` bit for bit; NaN payload canonical); 2362 words, long division on integers; card 0 (step133-134) | S6 (T4) |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
 | `float_cast` | x same dtype or native F32↔BF16; other reduced floats refused | D1, S6 |

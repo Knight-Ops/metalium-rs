@@ -158,6 +158,8 @@ pub const SMOKE: &[&str] = &[
     "step127_nd_indexing::",
     "step128_cross_int_matmul::",
     "step129_prelu_residency::",
+    "step133_remainder::",
+    "step134_burn_remainder::",
     "step135_sort::",
     "step136_burn_sort::",
     "step137_sort_residency::",

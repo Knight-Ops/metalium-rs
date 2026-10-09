@@ -20,8 +20,6 @@ const DEST: &str = "docs/plans/burn-op-coverage.md";
 /// `docs/plans/hardware-coverage-closeout.md`; `[-]` means deliberately not
 /// supported, with the reason.
 const DISPOSITIONS: &[(&str, &str)] = &[
-    ("float_remainder", "T4 exact SFPU fmod"),
-    ("float_remainder_scalar", "T4 exact SFPU fmod"),
     ("conv3d", "[-] out of scope: no model needs it"),
     ("conv_transpose3d", "[-] out of scope: no model needs it"),
     ("deform_conv2d", "[-] out of scope: no model needs it"),

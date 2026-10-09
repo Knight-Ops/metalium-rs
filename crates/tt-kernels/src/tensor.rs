@@ -3079,6 +3079,9 @@ impl Eltwise {
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
             // `atan2(+0, +0) = +0`.
             ATAN2 => b_zero,
+            // Lane T4: `((0 % s) + s) % s` is a zero (the sign of `s`) for a
+            // finite nonzero `s`; a zero, infinite or NaN `s` gives NaN.
+            REM_S => s.is_finite() && !is_zero(s),
             _ => false,
         }
     }

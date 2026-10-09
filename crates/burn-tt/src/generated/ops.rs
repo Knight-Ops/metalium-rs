@@ -456,26 +456,55 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_remainder", false);
-        crate::unsupported::fail(
-            "float_remainder",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={}", crate::unsupported::context(&rhs)),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_remainder", true);
+        let storage_inputs = [&lhs, &rhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("float_remainder", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            let rhs = crate::ops::bfp_compute_input(rhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_remainder(lhs, rhs),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            let rhs = crate::ops::float_compute_input(rhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_remainder(lhs, rhs),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_remainder(lhs, rhs)
     }
     fn float_remainder_scalar(lhs: FloatTensor<TtBackend>, rhs: Scalar) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("float_remainder_scalar", false);
-        crate::unsupported::fail(
-            "float_remainder_scalar",
-            [
-                format!("lhs={}", crate::unsupported::context(&lhs)),
-                format!("rhs={:?}", rhs),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("float_remainder_scalar", true);
+        let storage_inputs = [&lhs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_remainder_scalar", &storage_inputs);
+            let lhs = crate::ops::bfp_compute_input(lhs);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_remainder_scalar(lhs, rhs),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let lhs = crate::ops::float_compute_input(lhs);
+            return crate::ops::cast_native(
+                crate::ops::float::float_remainder_scalar(lhs, rhs),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_remainder_scalar(lhs, rhs)
     }
     fn float_matmul(
         lhs: FloatTensor<TtBackend>,

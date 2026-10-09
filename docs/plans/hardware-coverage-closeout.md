@@ -155,7 +155,9 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   `ScanOp::{MinNaN,MaxNaN}` with Flex semantics (NaN propagates; on equal values including ±0 the
   earlier element is kept), integer `ISum/IProd/IMin/IMax`, `int_argmax/argmin`. The existing
   total-order Min/Max must fail the new gate on `[+0,-0]` and NaN inputs.
-- [ ] **T4: exact remainder** (`float_remainder{,_scalar}`). Bit-exact to Flex's
+- [x] **T4: exact remainder** (steps 133-134; simulator 11/11 and card 0 11/11; four controls watched
+  failing; deviation: `1e30 % 3` is exactly 0 so it cannot fail the trunc form, `4 % -2` and `1e30 % 7` do;
+  divergence row 97 unused) (`float_remainder{,_scalar}`). Bit-exact to Flex's
   `((a%b)+b)%b`; exact SFPU fmod by exponent alignment and chunked integer long division. Confirm
   S1 add is IEEE round-to-nearest-even first, else the oracle uses `fma_bh`. Negative control:
   `a - b*trunc(a/b)` must fail on `1e30 % 3` and `-4 % 2`.

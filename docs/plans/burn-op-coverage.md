@@ -13,16 +13,11 @@ The per-method Device and Item notes remain in
 
 ## FloatTensorOps
 
-101 native, 21 composed, 2 unsupported.
+103 native, 21 composed, 0 unsupported.
 
-| Unsupported method | Disposition |
-|---|---|
-| `float_remainder` | T4 exact SFPU fmod |
-| `float_remainder_scalar` | T4 exact SFPU fmod |
+<details><summary>Native (103)</summary>
 
-<details><summary>Native (101)</summary>
-
-`float_abs`, `float_acos`, `float_acosh`, `float_add`, `float_add_scalar`, `float_argmax`, `float_argmin`, `float_argsort`, `float_argtopk`, `float_asin`, `float_asinh`, `float_atan`, `float_atan2`, `float_atanh`, `float_cast`, `float_ceil`, `float_clamp`, `float_clamp_max`, `float_clamp_min`, `float_cos`, `float_cosh`, `float_cross`, `float_cummax`, `float_cummin`, `float_cumprod`, `float_cumsum`, `float_device`, `float_div`, `float_div_scalar`, `float_empty`, `float_equal`, `float_equal_elem`, `float_erf`, `float_exp`, `float_expand`, `float_flip`, `float_floor`, `float_from_data`, `float_gather`, `float_gather_nd`, `float_greater`, `float_greater_elem`, `float_greater_equal`, `float_greater_equal_elem`, `float_into_data`, `float_into_int`, `float_is_inf`, `float_is_nan`, `float_log`, `float_log1p`, `float_lower`, `float_lower_elem`, `float_lower_equal`, `float_lower_equal_elem`, `float_mask_fill`, `float_mask_where`, `float_matmul`, `float_max_dim`, `float_mean`, `float_mean_dim`, `float_mul`, `float_mul_scalar`, `float_neg`, `float_not_equal`, `float_not_equal_elem`, `float_permute`, `float_powf`, `float_powf_scalar`, `float_powf_scalar_impl`, `float_powi`, `float_powi_scalar`, `float_prod`, `float_prod_dim`, `float_random`, `float_recip`, `float_reshape`, `float_round`, `float_scatter_add`, `float_scatter_nd`, `float_select`, `float_select_add`, `float_sign`, `float_sin`, `float_sinh`, `float_slice`, `float_slice_assign`, `float_sort`, `float_sort_with_indices`, `float_sqrt`, `float_sub`, `float_sub_scalar`, `float_sum`, `float_sum_dim`, `float_swap_dims`, `float_tan`, `float_tanh`, `float_to_device`, `float_topk`, `float_transpose`, `float_trunc`, `float_unfold`
+`float_abs`, `float_acos`, `float_acosh`, `float_add`, `float_add_scalar`, `float_argmax`, `float_argmin`, `float_argsort`, `float_argtopk`, `float_asin`, `float_asinh`, `float_atan`, `float_atan2`, `float_atanh`, `float_cast`, `float_ceil`, `float_clamp`, `float_clamp_max`, `float_clamp_min`, `float_cos`, `float_cosh`, `float_cross`, `float_cummax`, `float_cummin`, `float_cumprod`, `float_cumsum`, `float_device`, `float_div`, `float_div_scalar`, `float_empty`, `float_equal`, `float_equal_elem`, `float_erf`, `float_exp`, `float_expand`, `float_flip`, `float_floor`, `float_from_data`, `float_gather`, `float_gather_nd`, `float_greater`, `float_greater_elem`, `float_greater_equal`, `float_greater_equal_elem`, `float_into_data`, `float_into_int`, `float_is_inf`, `float_is_nan`, `float_log`, `float_log1p`, `float_lower`, `float_lower_elem`, `float_lower_equal`, `float_lower_equal_elem`, `float_mask_fill`, `float_mask_where`, `float_matmul`, `float_max_dim`, `float_mean`, `float_mean_dim`, `float_mul`, `float_mul_scalar`, `float_neg`, `float_not_equal`, `float_not_equal_elem`, `float_permute`, `float_powf`, `float_powf_scalar`, `float_powf_scalar_impl`, `float_powi`, `float_powi_scalar`, `float_prod`, `float_prod_dim`, `float_random`, `float_recip`, `float_remainder`, `float_remainder_scalar`, `float_reshape`, `float_round`, `float_scatter_add`, `float_scatter_nd`, `float_select`, `float_select_add`, `float_sign`, `float_sin`, `float_sinh`, `float_slice`, `float_slice_assign`, `float_sort`, `float_sort_with_indices`, `float_sqrt`, `float_sub`, `float_sub_scalar`, `float_sum`, `float_sum_dim`, `float_swap_dims`, `float_tan`, `float_tanh`, `float_to_device`, `float_topk`, `float_transpose`, `float_trunc`, `float_unfold`
 
 </details>
 

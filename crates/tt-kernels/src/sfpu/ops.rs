@@ -15,6 +15,8 @@ use super::kernel::{bias_row, Operands, A_ROW, B_ROW, OUT_ROW};
 use super::{Cond, Format, LReg, Program};
 use crate::tensor::Elem;
 
+pub mod rem;
+
 /// `+inf`'s bits plus one: the first positive NaN.
 const FIRST_NAN: u32 = 0x7f80_0001;
 
@@ -174,6 +176,11 @@ pub mod kind_sfpu {
     pub const BOOL_TO_F32: u32 = 0x13f;
     /// Boolean integer 0/1 copied to a typed I32 buffer, exact.
     pub const BOOL_TO_I32: u32 = 0x140;
+    /// `((a % b) + b) % b` in `f32`, `burn-flex`'s `float_remainder`, bit for
+    /// bit (`super::rem`).
+    pub const REM: u32 = 0x141;
+    /// [`REM`] with a scalar `b` (`float_remainder_scalar`).
+    pub const REM_S: u32 = 0x142;
     pub const ROUND: u32 = 0x190;
     pub const FLOOR: u32 = 0x191;
     pub const CEIL: u32 = 0x192;
@@ -2342,6 +2349,8 @@ pub fn operands(kind: u32) -> Option<Operands> {
         kind_sfpu::MASK_WHERE | kind_sfpu::INT_MASK_WHERE | kind_sfpu::BOOL_MASK_WHERE => {
             Operands::Ternary
         }
+        kind_sfpu::REM => Operands::Binary,
+        kind_sfpu::REM_S => Operands::Unary,
         kind::MUL_SCALAR
         | kind::ADD_SCALAR
         | kind::RELU
@@ -2918,6 +2927,18 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             p.store(LReg::L2, Format::Int32, OUT_ROW + o);
         });
         return Some((Operands::Unary, p.finish_code()));
+    }
+    // lane:t4_rem: the exact remainder (`rem.rs`).
+    match kind {
+        kind_sfpu::REM => {
+            let code = rem::code(rem::Variant::Exact, rem::Divisor::Tile);
+            return Some((Operands::Binary, code));
+        }
+        kind_sfpu::REM_S => {
+            let code = rem::code(rem::Variant::Exact, rem::Divisor::Scalar(scalars[0]));
+            return Some((Operands::Unary, code));
+        }
+        _ => {}
     }
     if let Some((op, scalar)) = super::integer::operation(kind) {
         let mut p = Program::new();
