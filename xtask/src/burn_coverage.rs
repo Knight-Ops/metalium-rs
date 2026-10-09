@@ -22,15 +22,6 @@ const DEST: &str = "docs/plans/burn-op-coverage.md";
 const DISPOSITIONS: &[(&str, &str)] = &[
     ("float_remainder", "T4 exact SFPU fmod"),
     ("float_remainder_scalar", "T4 exact SFPU fmod"),
-    ("float_cross", "T2 composition of slice, mul, sub and cat"),
-    (
-        "float_gather_nd",
-        "T2 flat index on the device, then gather",
-    ),
-    ("float_scatter_nd", "T2 select_add and ordered assign"),
-    ("int_gather_nd", "T2 flat index on the device, then gather"),
-    ("int_scatter_nd", "T2 select_add and ordered assign"),
-    ("int_matmul", "T2 exact modulo 2^32 composition"),
     ("conv3d", "[-] out of scope: no model needs it"),
     ("conv_transpose3d", "[-] out of scope: no model needs it"),
     ("deform_conv2d", "[-] out of scope: no model needs it"),

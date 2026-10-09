@@ -1666,15 +1666,16 @@ path today, `~` when only some shapes do.
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
 | `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_unfold` | `~` native raw copies/compositions, step84/85 | D4, M3 |
-| `float_gather_nd`, `float_scatter_nd` | | D4 |
-| `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
+| `float_gather_nd`, `float_scatter_nd`, `int_gather_nd`, `int_scatter_nd` | x resident F32/I32 (BF16 gather_nd); every coordinate checked against its own axis (DOMAIN 11); scatter Add folds duplicates in index order, Assign is last writer; Mul/Min/Max `[-]` (Burn leaves duplicates undefined); card 0 (step127, runs `1791567843`-`1791567861`) | D4 (T2) |
+| `float_cross` | x composition of slice/mul/sub/cat, device-rounding oracle; card 0 (step128) | D4 (T2) |
+| `float_grid_sample_2d` | `[-]` out of scope: not planned until a model needs it | -- |
 
 ### `ActivationOps`
 
 | Methods | Device | Item |
 |---|:-:|---|
 | `relu`, `relu_backward` | x (SFPU) | S1 |
-| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; a one-element weight is expanded on the device by `device_op_ungated`, no residency gate yet: T2) | S2 |
+| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; a one-element weight is expanded on the device by `device_op_ungated`, residency gate step129) | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
 | `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; every supported size) | R2 |
@@ -1707,6 +1708,7 @@ path today, `~` when only some shapes do.
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
 | `int_cast` | `~` I32→I32 native; other widths fail by name (`[-]`: the device stores I32 only) (step126) | S6 (T1) |
 | `int_sum*`, `int_max*`, `int_prod*`, `int_min*` | x I32 reductions (step80) | R1 |
+| `int_matmul` | x exact modulo 2^32 composition (expand, `int_mul`, `int_sum_dim`), size budget 2^22 elements, never an f32 matmul; card 0 (step128) | S5 (T2) |
 | `int_cumsum`, `int_cumprod`, `int_cummin`, `int_cummax`, `int_argmax`, `int_argmin` | x wrapping/signed resident scans and first-extreme indices (step131-132, card 0) | R1 |
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |

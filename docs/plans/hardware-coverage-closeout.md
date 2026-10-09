@@ -143,7 +143,9 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   (raw-bit scalar kind, since the f32 scalar loses bits above 2^24), `int_abs` (wrapping; check
   Flex's `i32::MIN` first), `int_cast` (I32→I32 native, other widths `[-]`). Makes `int_clamp*`,
   `int_sign`, `int_max_abs*` work. Negative control: fill through the f32 scalar must fail.
-- [ ] **T2: indexing compositions.** `float/int_gather_nd`, `float/int_scatter_nd` (Add via
+- [x] **T2: indexing compositions** (steps 127-129; simulator 19/19 and card 0 20/20 including the first
+  silicon BF16 gather; seven negative controls watched failing on ttsim; scatter_nd Mul/Min/Max `[-]`;
+  divergence row 95 unused). `float/int_gather_nd`, `float/int_scatter_nd` (Add via
   `select_add`; Assign with a stated last-writer-in-index-order contract; Mul/Min/Max `[-]`),
   `float_cross` (oracle uses the device's mul/sub rounding), `int_matmul` (exact mod 2^32; size
   budget refusal), a `prelu` weight-shape-[1] residency test.
