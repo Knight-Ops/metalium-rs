@@ -22,13 +22,17 @@ pub mod eth;
 pub mod frontend;
 pub mod isa;
 pub mod l1;
+pub mod l1_atomic;
 pub mod mailbox;
 pub mod matrix;
+pub mod mmio_reg;
+pub mod mutex;
 pub mod noc;
 pub mod numerics;
 /// Checked thread-local scalar register arithmetic.
 pub mod scalar;
 pub mod sfpu;
+pub mod sfpu_macro;
 pub mod sync;
 pub mod tensix;
 pub mod tile;

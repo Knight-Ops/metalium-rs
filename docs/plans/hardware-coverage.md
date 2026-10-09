@@ -529,7 +529,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `SFPCONFIG`: Configure SFPU constant registers (`LReg[11..15]`).
 - [x] `SFPSTOCHRND`: Hardware nearest, stochastic, and toward-zero rounding (validated in `step81`).
 - [x] `SFPNOP`: Vector unit pipeline no-op.
-- [ ] `SFPLOADMACRO`: Silicon macro loader (bundles $Dst$ load with up to 4 scheduled vector micro-ops). Item S9.
+- [x] `SFPLOADMACRO`: checked `tt_isa::sfpu_macro` helpers (SFPCONFIG macro registers, program-key descriptor, teardown) and an independent page-derived schedule model (`tt_kernels::sfpu::macro_sched`); silicon probes s00-s13 pass on card 0 (Store, MAD, Simple, Round, `LReg16`, substituted operands, chain, pipelining, predication, forgetting, `SFPSWAP` in the Simple sub-unit; swapped template/delay mutants differ). ttsim refuses the macro (row 7). Step110. Item S9; performance adoption not claimed.
 - [x] `SFPDIVP2`: `Program::scale_by_pow2`, interpreter/device gate step26; wrapping immediates separately gated on both cards (divergence 66).
 - [x] `SFPSWAP`: `Program::min_max`, step26 interpreter/device comparisons and production reductions. Argmin/argmax variants are separate scope.
 - [x] `SFPADDI`: `Program::addi`, BF16-immediate interpreter/device comparison in step26.
@@ -550,9 +550,9 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `SETDVALID`: Blackhole implied-format handover is explicitly unsupported in the pinned page. Use regular UNPACR's final FlipSrc; sequenced `UNPACR_NOP_SETDVALID` remains a separate gated task.
 - [-] `REG2FLOP_ADC`: pinned page declares unsupported functionality and weak model confidence. Use checked SETADC/SETADCXX/XY/ZW and descriptor reprogramming; no general GPR-to-ADC API is promised. Reopen only for a concrete runtime-value consumer and independent Blackhole evidence.
 - [x] `UNPACR_NOP_SETDVALID`: measured Blackhole non-clearing mode 0x1e9; Filling-only A/B handover with C1/C2 retirement and C5/C6 ownership waits. Alternating banks, TF32/BF16, multiple partials, sentinels and replay pass `1791413233`; nonzero SrcB row reset and direct consumers pass `1791413291`, tightened fractional inputs `1791413841`. Card-0 SMOKE 258/258 (`1791413478`). Legacy Wormhole mode 7 is the isolated reboot trigger; exact ARC mechanism remains unproven. See [completed Stage D](../completed-plans/explicit-unpacker-handover.md). Other modes and production/recovery adoption are deferred.
-- [ ] `UNPACR_NOP_SETREG`: Unpacker micro-mode setting configuration registers.
+- [-] `UNPACR_NOP_SETREG`: Wormhole page says UnsupportedFunctionality with weak confidence and it uses TDMA-RISC `SetRegBase` state with no Blackhole page; ttsim refuses it (step108). Supported alternative: checked WRCFG/SETC16/RDCFG and step100/101 helpers.
 - [x] `UNPACR_NOP_ZEROSRC`: measured BH wait/bank/clear fields, checked current-unpacker zero (WaitLikeUnpacr=1, BothBanks=0); staged claims discarded and regular UNPACR handover retained. Step103 ttsim/card-0 gates, including held-opposite-bank wait and all-row sentinel checks (`1791397029`). Wider values/both banks remain outside the checked API.
-- [ ] `PACR_SETREG`: Packer set register micro-mode.
+- [-] `PACR_SETREG`: no Blackhole page; `SetRegBase`/`SetRegHiScaler` are TDMA-RISC state set only through Wormhole-documented writes into a block shared with the mover command queue; ttsim refuses it (step108). Supported alternative: `PACR` with `Last`, `STALLWAIT` on packer-busy, and the checked configuration helpers.
 
 #### Frontend, Synchronization & Expanders (10 instructions)
 - [x] `REPLAY`: Hardware micro-op execution buffer for unrolled loops (Item X1).
@@ -574,12 +574,12 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
 #### DMA Engine, Atomics & Registers
-- [ ] `ATCAS`: Atomic Compare-and-Swap on L1 memory.
-- [ ] `ATGETM`: Atomic mutex acquire.
+- [~] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); with the compare already met and with a host-freed block it passes on card 0 (step106, guarded role with a measured-rate deadline); producer-thread gate open. WormholeOnly encoding; ttsim refuses it (row 77).
+- [x] `ATGETM` / `ATRELM`: typed `Mutex` (indices 0, 2, 3, 4 only), scoped acquire/release; uncontended on all indices and threads, contended round-robin handoff for every mutex and holder, the deadline/host-release path and negative controls pass on card 0 (step105). ttsim models only index 0 (row 76).
 - [ ] `ATRELM`: Atomic mutex release.
-- [ ] `ATSWAP`: Atomic swap on L1.
-- [ ] `ATINCGET`: Atomic fetch-and-increment on L1.
-- [ ] `ATINCGETPTR`: Atomic fetch-and-increment pointer on L1.
+- [x] `ATSWAP`: four-GPR group form, all 256 masks and aligned bases on card 0 (step106); the single-register form is `[-]` (lane placement matches neither the page nor a consistent rule; the sweep diagnostic is the evidence) and is unrepresentable in the API.
+- [x] `ATINCGET`: field width 1-32, wrapping, upper bits preserved, atomic across the three threads on card 0 (step106); WormholeOnly encoding, ttsim refuses it.
+- [~] `ATINCGETPTR`: checked geometry and independent FIFO model; non-blocking FIFO through wraps passes on card 0; blocking push/pop gates open (step106).
 - [x] `SETDMAREG`: checked full-width GPR initialization through `backend::set_gpr`; configuration staging and matmul address stepping.
 - [x] `ADDDMAREG`: production register-form matmul address stepping and step38; the immediate form is silicon-only (divergence 67).
 - [x] `SUBDMAREG`: checked wrapping subtraction, register/immediate forms (step100); silicon semantics, simulator refusal.
@@ -590,9 +590,9 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `FLUSHDMA`: occupies the shared Scalar Unit while waiting; pinned page prefers `STALLWAIT` with equivalent C0–C3 conditions and all block bits. Excluded from production support in favor of the existing barrier; not a claim that every possible use is strictly worse.
 - [x] `LOADIND`: checked widths/offset halves/increments, asynchronous read barriers and raw-bit preservation (step101, card 0).
 - [x] `STOREIND_L1`: checked L1 stores; measured Blackhole width mapping and all-thread guard gates (step101).
-- [ ] `STOREIND_MMIO`: Indirect store into Tensix MMIO space.
-- [ ] `LOADREG`: Indirect register load.
-- [ ] `STOREREG`: Indirect register store.
+- [~] `STOREIND_MMIO`: allowlisted `SW_INT_PC[28..31]` PIC words only (`tt_isa::mmio_reg`), STOREIND's shifted offset modelled separately; host and ttsim gates pass (step107, ttsim refuses every form); silicon probes written, not run (unverified layouts; held for a decision).
+- [~] `LOADREG`: allowlisted PIC scratch words only; host/ttsim gates pass (step107); silicon probe written, not run.
+- [~] `STOREREG`: allowlisted PIC scratch words only; host/ttsim gates pass (step107); silicon probe written, not run.
 - [x] `XMOV`: checked declared L1 copy/zero, C12 setup/C9 completion and explicit resident APIs (step101/102). Item D4.
 - [x] `DMANOP`: diagnostic GPR/config/memory preservation (step101), never a completion wait.
 
@@ -1420,7 +1420,7 @@ Each names the measurement it must move. The Burn-side ones are in
       relative), a sweep and a device gate, and `silicon_perf` measures what each
       saves per tile against `Precise`. Burn: the mode on `TtDevice`/config;
       `accuracy()` gains the mode so exact mode still refuses both.
-- [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
+- [x] **S9 `SFPLOADMACRO`.** Helpers, schedule model and silicon probes s00-s13 pass on card 0 (step110); ttsim cannot execute it (row 7). No SFPU default changes; performance adoption not claimed.
       else here works without it.
 
 ### M — Matrix Unit beyond `MVMUL`

@@ -85,7 +85,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 
 ## Hardware/ISA lanes
 
-- [ ] **E: mutexes and L1 atomics** (`ATGETM`, `ATRELM`, `ATCAS`, `ATSWAP`, `ATINCGET`,
+- [~] **E: mutexes and L1 atomics** (steps 105-106; mutexes `[x]` on card 0 incl. contended handoff; ATINCGET and ATSWAP group form `[x]`; ATSWAP single form `[-]`; blocking ATCAS freed by the host passes; producer-thread gates for ATCAS/ATINCGETPTR open; the Full poll design hangs after its first poll on silicon, Light is the default, measured 34.7M polls/s). (`ATGETM`, `ATRELM`, `ATCAS`, `ATSWAP`, `ATINCGET`,
   `ATINCGETPTR`). Owns new `tt-isa/src/{mutex.rs,l1_atomic.rs}`, `tt-kernels/src/atomics.rs`, and
   `tt-firmware/src/corpus.rs`. Needs a bounded role-side deadline, a host-visible blocked status and
   release from another thread or the host (today `unwedge()` only posts semaphores). `Mutex` is
@@ -93,13 +93,13 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   compare already met, uncontended `ATGETM/ATRELM`, then blocking forms with the deadline active.
   The four Wormhole-only instructions are probed in isolation. Exit: an op whose isolated probe
   misbehaves becomes `[-]`; a blocking form is never exposed without the deadline path.
-- [ ] **F: restricted MMIO** (`LOADREG`, `STOREREG`, `STOREIND_MMIO`, `PACR_SETREG`,
+- [~] **F: restricted MMIO** (steps 107-108; `PACR_SETREG` and `UNPACR_NOP_SETREG` `[-]`; the MMIO trio has host and ttsim gates and allowlisted PIC targets, silicon probes written but NOT run, held for a decision). **F: restricted MMIO** (`LOADREG`, `STOREREG`, `STOREIND_MMIO`, `PACR_SETREG`,
   `UNPACR_NOP_SETREG`). Owns `tt-isa/src/{mmio_reg.rs,pack_setreg.rs}`, not `datapath.rs`.
   Research first: one documented harmless, writable, host-readable register (reject anything below
   `0xFFB11000`); targets are an allowlist enum, never raw addresses. Exit: `[-]` for the MMIO
   trio if no harmless target exists; `[-]` for `PACR_SETREG` without a documented
   `SetRegBase`/`SetRegHiScaler` path; `UNPACR_NOP_SETREG` expected `[-]`.
-- [ ] **H: `SFPLOADMACRO` (S9).** Owns `tt-isa/src/sfpu_macro.rs`,
+- [x] **H: `SFPLOADMACRO` (S9)** (step110; probes s00-s13 pass on card 0; five mutations watched failing on the host model; the early hangs were a tile wedged by an earlier aborted E gate, fixed by the harness preamble now using the session's semaphore-releasing reset). Owns `tt-isa/src/sfpu_macro.rs`,
   `tt-kernels/src/sfpu/macro_sched.rs`. Schedule model for load plus Simple/MAD/Round/Store,
   delays, LReg16, predication; rejects collisions, the VDHi coupling and `SFPSWAP` restrictions.
   Gate: bit-for-bit against the ordinary sequence in the interpreter; mutants swap template and

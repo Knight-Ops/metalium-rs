@@ -368,17 +368,15 @@ mod silicon {
     }
 
     fn reset_thread_state_on(dev: &mut Dev<'_>, tile: Option<(u8, u8)>) {
-        let program = crate::datapath::thread_state_reset();
-        // All three threads: the role harness uses each of them, and the
-        // single-thread path uses thread 0 (`harness::CORE`).
-        let roles = crate::harness::Roles {
-            unpack: &program,
-            math: &program,
-            pack: &program,
+        // The session's reset, not a plain role run: it first releases anything
+        // a failed gate left a thread blocked on a semaphore (the backend
+        // pulse does not, divergence row 65), so a gate that aborted while a
+        // thread was parked cannot wedge every later gate on this tile.
+        let coord = match tile {
+            Some((x, y)) => crate::backend::tile(dev, x, y),
+            None => crate::harness::tensix_tile(),
         };
-        let mut run = crate::harness::Run::roles(roles).dump_rows(0);
-        run.tile = tile;
-        let _ = crate::harness::run(dev, &run);
+        let _ = tt_kernels::session::reset_thread_state(dev, coord, &crate::firmware::ROLES);
     }
 
     #[track_caller]
