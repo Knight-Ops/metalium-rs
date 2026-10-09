@@ -518,6 +518,12 @@ pub mod guard {
     pub const MAX_POLLS: u32 = 1 << 30;
     /// Semaphores a release request may post: the low eight bits.
     pub const RELEASE_MASK: u32 = 0xff;
+    /// Set in a release request: before posting, the runner stores
+    /// [`Guard::poke_value`] to the L1 word at [`Guard::poke_addr`] -- a store by
+    /// this role's RISC-V core, an agent other than the host and every Tensix
+    /// thread, which is what frees an `ATCAS` or `ATINCGETPTR` that is polling
+    /// that word. The address must be a word in the data arena.
+    pub const POKE: u32 = 1 << 31;
 
     /// The guard block of one role.
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -573,6 +579,14 @@ pub mod guard {
         pub const fn mode(self) -> u64 {
             self.base + 0x24
         }
+        /// The L1 address a [`POKE`] request stores to.
+        pub const fn poke_addr(self) -> u64 {
+            self.base + 0x28
+        }
+        /// The value a [`POKE`] request stores.
+        pub const fn poke_value(self) -> u64 {
+            self.base + 0x2c
+        }
         /// The completion word of [`PollMode::L1Word`]: 16-byte aligned, so the
         /// program stores to it with a zero offset.
         pub const fn complete_word(self) -> u64 {
@@ -588,7 +602,7 @@ pub mod guard {
             grace_polls: u32,
             complete_semaphore: u32,
             mode: PollMode,
-        ) -> [(u64, u32); 11] {
+        ) -> [(u64, u32); 13] {
             [
                 (self.snapshot(), 0),
                 (self.release(), 0),
@@ -600,6 +614,8 @@ pub mod guard {
                 (self.stage(), 0),
                 (self.mode(), mode as u32),
                 (self.complete_word(), 0),
+                (self.poke_addr(), 0),
+                (self.poke_value(), 0),
                 // Last, so the runner never sees a half-written block.
                 (self.arm(), ARMED),
             ]
@@ -834,13 +850,13 @@ mod tests {
             // The arm write is last, so a half-written block is never read,
             // and every word of the block is written (nothing stale survives).
             let writes = g.arm_writes(1, 1, 7, guard::PollMode::Light);
-            assert_eq!(writes[10].0, g.arm());
+            assert_eq!(writes[12].0, g.arm());
             assert_eq!(
                 writes.iter().find(|w| w.0 == g.mode()).unwrap().1,
                 1,
                 "the mode is written"
             );
-            let mut at: [u64; 11] = core::array::from_fn(|k| writes[k].0);
+            let mut at: [u64; 13] = core::array::from_fn(|k| writes[k].0);
             at.sort_unstable();
             let mut want = [
                 g.arm(),
@@ -854,6 +870,8 @@ mod tests {
                 g.stage(),
                 g.mode(),
                 g.complete_word(),
+                g.poke_addr(),
+                g.poke_value(),
             ];
             want.sort_unstable();
             assert_eq!(at, want);

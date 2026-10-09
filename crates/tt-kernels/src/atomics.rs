@@ -107,12 +107,11 @@ impl std::error::Error for AtomicsError {}
 
 /// Role-side polls per second of a guarded run on silicon.
 ///
-/// Measured on card 0 by `step105_mutex::guard_poll_rate_calibration_light`
-/// and `_l1_word`: the Light design polls about 34.7 million times a second and
-/// the L1-word design about 32.8 million, steady over three seconds. This is
-/// rounded down so a deadline in seconds is never shorter than asked. (The
-/// Full design hangs after its first poll on silicon and is not calibrated.)
-/// ttsim counts polls in simulated cycles and ignores this.
+/// Measured on card 0 by `step105_mutex::guard_poll_rate_calibration_light`:
+/// Light 34.7 million polls a second, L1Word 32.8 million. A grace in seconds
+/// must keep `seconds * rate` under `guard::MAX_POLLS` (2^30), which this rate
+/// allows up to about 35 s. ttsim counts polls in simulated cycles and ignores
+/// this.
 pub const SILICON_POLLS_PER_SECOND: u32 = 30_000_000;
 
 /// The deadline and grace of a guarded run, in role-side polls
@@ -312,7 +311,7 @@ impl GuardedProgram {
     }
 
     /// The host writes that arm this role's next run, the arming word last.
-    pub fn arm_writes(&self) -> [(u64, u32); 11] {
+    pub fn arm_writes(&self) -> [(u64, u32); 13] {
         Guard::of(Mailbox::of(self.thread as u32)).arm_writes(
             self.spec.deadline_polls,
             self.spec.grace_polls,
@@ -642,6 +641,36 @@ impl<N: NocId> Launch<N> {
         )
     }
 
+    /// Have role `thread`'s RISC-V core store `value` to the L1 word at `addr`
+    /// (a word of the data arena, [`guard::POKE`]): an agent other than the host
+    /// and every Tensix thread. This is the producer for an `ATCAS` or
+    /// `ATINCGETPTR` parked on that word. **A Tensix thread cannot be:** the
+    /// Scalar Unit executes one instruction at a time for all three threads
+    /// (`ScalarUnit.md`), so a thread parked in either atomic keeps every other
+    /// thread's scalar instruction -- `SETDMAREG` included -- from issuing.
+    pub fn poke<T: Transport>(
+        &self,
+        dev: &mut Device<T>,
+        thread: usize,
+        addr: u64,
+        value: u32,
+        budget: Budget,
+    ) -> Result<(), AtomicsError> {
+        if addr % 4 != 0 || !tt_isa::l1::DATA.contains(addr, 4) {
+            return Err(AtomicsError::Refused(format!(
+                "poke address {addr:#x} is not a word of the data arena"
+            )));
+        }
+        let g = Guard::of(Mailbox::of(thread as u32));
+        let before = self.read32(dev, g.released())?;
+        self.write32(dev, g.poke_addr(), addr as u32)?;
+        self.write32(dev, g.poke_value(), value)?;
+        self.write32(dev, g.release(), guard::POKE)?;
+        self.wait(dev, budget, "the runner to carry out a poke", |dev, l| {
+            Ok(l.read32(dev, g.release())? == 0 && l.read32(dev, g.released())? != before)
+        })
+    }
+
     /// Poll `done` until it is true or `budget` is spent, advancing simulated
     /// time between polls.
     pub fn wait<T: Transport>(
@@ -810,7 +839,7 @@ mod tests {
         assert_eq!(w[w.len() - 1].def().mnemonic(), "SEMPOST");
         assert_eq!(w[w.len() - 1].operand("SemaphoreMask"), Some(done().mask()));
         assert_eq!(p.arm_writes()[5].1, 7, "the runner is told which semaphore");
-        assert_eq!(p.arm_writes()[10].0, p.guard().arm());
+        assert_eq!(p.arm_writes()[12].0, p.guard().arm());
     }
 
     #[test]

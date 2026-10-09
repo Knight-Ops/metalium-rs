@@ -930,6 +930,109 @@ fn arming_is_consumed_by_the_run_it_guards() {
     });
 }
 
+/// A poke is a store by the role's RISC-V core to a word of the data arena, the
+/// agent that frees an `ATCAS` or `ATINCGETPTR` polling that word (no Tensix
+/// thread can: the Scalar Unit serves one instruction at a time for all three).
+/// Runs on both targets with a role parked at a semaphore wait.
+#[test]
+fn a_poke_stores_a_word_from_the_runner_core() {
+    labelled("poke from the runner core", |dev| {
+        let l = Layout::new();
+        let body = sync::take(l.go, Before::EVERYTHING).to_vec();
+        let p = GuardedProgram::new(1, &body, guard_spec(), l.done[1]).unwrap();
+        let init = l.plan.semaphore_init();
+        let at = tt_isa::l1::DATA.base + 0x1000;
+        let launch = atomics::start(
+            dev,
+            harness::tensix_tile(),
+            &tt_tests::firmware::ROLES,
+            &Spec {
+                roles: [
+                    RoleProgram::Idle,
+                    RoleProgram::Guarded(&p),
+                    RoleProgram::Idle,
+                ],
+                semaphores: &init,
+                stage: &[(at, &[0u8; 4])],
+            },
+            budget(),
+        )
+        .unwrap();
+        let blocked = launch.wait(dev, budget(), "BLOCKED", |dev, l2| {
+            Ok(l2.state(dev, 1)? == RoleState::Blocked)
+        });
+        expect_wait(dev, &l, &launch, blocked, "waiting for BLOCKED");
+        assert_eq!(launch.read32(dev, at).unwrap(), 0);
+        let poked = launch.poke(dev, 1, at, 0xa5a5_1234, budget());
+        expect_wait(dev, &l, &launch, poked, "the poke");
+        assert_eq!(launch.read32(dev, at).unwrap(), 0xa5a5_1234);
+        // The host refuses an address outside the arena before asking.
+        assert!(launch
+            .poke(dev, 1, tt_isa::mailbox::MAILBOX_BASE, 1, budget())
+            .is_err());
+        let released = launch.release(dev, 1, 1 << l.go.index(), budget());
+        expect_wait(dev, &l, &launch, released, "the host release");
+        launch.finish(dev, budget()).unwrap();
+    });
+}
+
+/// The runner checks a poke itself: an address outside the data arena (written
+/// past the host's check) panics it with `guard::REFUSED` rather than writing
+/// a mailbox. Simulator only: the role's parked thread would stay parked on
+/// silicon.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn the_runner_refuses_a_poke_outside_the_data_arena() {
+    harness::in_device(|dev| {
+        let l = Layout::new();
+        let body = sync::take(l.go, Before::EVERYTHING).to_vec();
+        let p = GuardedProgram::new(1, &body, guard_spec(), l.done[1]).unwrap();
+        let init = l.plan.semaphore_init();
+        let launch = atomics::start(
+            dev,
+            harness::tensix_tile(),
+            &tt_tests::firmware::ROLES,
+            &Spec {
+                roles: [
+                    RoleProgram::Idle,
+                    RoleProgram::Guarded(&p),
+                    RoleProgram::Idle,
+                ],
+                semaphores: &init,
+                stage: &[],
+            },
+            budget(),
+        )
+        .unwrap();
+        launch
+            .wait(dev, budget(), "BLOCKED", |dev, l2| {
+                Ok(l2.state(dev, 1)? == RoleState::Blocked)
+            })
+            .unwrap();
+        let g = p.guard();
+        launch
+            .write32(dev, g.poke_addr(), tt_isa::mailbox::MAILBOX_BASE as u32)
+            .unwrap();
+        launch.write32(dev, g.poke_value(), 7).unwrap();
+        launch.write32(dev, g.release(), guard::POKE).unwrap();
+        let seen = launch.wait(dev, budget(), "the runner to refuse", |dev, l2| {
+            Ok(l2.state(dev, 1)? == RoleState::Done)
+        });
+        match seen {
+            Err(atomics::AtomicsError::Panicked { thread: 1, code }) => {
+                assert_eq!(code, guard::REFUSED)
+            }
+            other => panic!("expected the runner to refuse, got {other:?}"),
+        }
+        assert_ne!(
+            launch.read32(dev, tt_isa::mailbox::MAILBOX_BASE).unwrap(),
+            7,
+            "nothing was written"
+        );
+        launch.abort(dev).unwrap();
+    });
+}
+
 /// A program the guard cannot take is refused before anything is pushed: the
 /// runner panics with `guard::REFUSED` rather than pushing into a FIFO a
 /// blocked thread could fill. Likewise a completion semaphore that does not

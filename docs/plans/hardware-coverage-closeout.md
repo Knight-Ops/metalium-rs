@@ -85,7 +85,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 
 ## Hardware/ISA lanes
 
-- [~] **E: mutexes and L1 atomics** (steps 105-106; mutexes `[x]` on card 0 incl. contended handoff; ATINCGET and ATSWAP group form `[x]`; ATSWAP single form `[-]`; blocking ATCAS freed by the host passes; producer-thread gates for ATCAS/ATINCGETPTR open; the Full poll design hangs after its first poll on silicon, Light is the default, measured 34.7M polls/s). (`ATGETM`, `ATRELM`, `ATCAS`, `ATSWAP`, `ATINCGET`,
+- [x] **E: mutexes and L1 atomics** (steps 105-106; all six groups `[x]` on card 0 with ATSWAP single form `[-]`; blocking forms are freed by the host or a RISC-V poke, never by a Tensix thread, confirmed on silicon; Light is the default poll design, Full hangs after its first poll; measured 34.7M polls/s; `harness` preamble now uses the session reset).
   `ATINCGETPTR`). Owns new `tt-isa/src/{mutex.rs,l1_atomic.rs}`, `tt-kernels/src/atomics.rs`, and
   `tt-firmware/src/corpus.rs`. Needs a bounded role-side deadline, a host-visible blocked status and
   release from another thread or the host (today `unwedge()` only posts semaphores). `Mutex` is
@@ -238,22 +238,8 @@ applying `git diff` hunks of shared files with `git apply --3way`, then regenera
 `3fc9bec` E (partial), H, F (partial). Baseline before the lanes: card-0 SMOKE 258/258
 (`1791558187`).
 
-### Uncommitted in the working tree (E's final rework, NOT yet run on silicon)
-`crates/tt-isa/src/l1_atomic.rs`, `crates/tt-kernels/src/atomics.rs`,
-`crates/tt-firmware/src/corpus.rs`, `crates/tt-tests/tests/step105_mutex.rs`,
-`crates/tt-tests/tests/step106_l1_atomics.rs` (copies of lane E's worktree
-`agent-a6cf85eb1a01f9531`; ttsim 19/19 + 3/3 and lints clean there). Contents: the three
-Tensix-producer gates are replaced by "RISC-V poke" producers (`guard::POKE`,
-`Launch::poke`), plus `blocked_atomic_monopolizes_the_scalar_unit` asserting that a thread
-parked in `ATCAS`/`ATINCGETPTR` keeps other threads from issuing any Scalar Unit instruction
-(unconfirmed on Blackhole). Silicon queue to run first on restart, one at a time:
-`step105_mutex::a_poke_stores_a_word_from_the_runner_core`, then in `step106_l1_atomics::silicon_gates::`:
-`blocked_atomic_monopolizes_the_scalar_unit`, `atcas_is_freed_by_the_other_roles_risc_v_core`,
-`atincgetptr_pop_blocks_until_the_write_counter_is_poked`,
-`atincgetptr_push_blocks_until_the_read_counter_is_poked`. Then commit and add the passing ones to
-SMOKE. `SILICON_POLLS_PER_SECOND = 30_000_000` and the 30 s grace are measured/required values:
-keep them when copying files. Also uncommitted: `AGENTS.md` (the user's Scryer section plus my two
-generated-code lines).
+### Update (2026-10-09, resumed)
+E's final rework passed on card 0 and is committed; FENCE, T9, TS and MD were restarted as new agents (worktrees below are superseded by the new agents' own).
 
 ### Lane states
 | Lane | State | Where / next |

@@ -334,6 +334,8 @@ mod silicon_gates {
         results: u64,
         go: sync::Semaphore,
         done: [sync::Semaphore; 3],
+        /// Posted by a producer once it is past its `go` wait.
+        reached: sync::Semaphore,
     }
 
     const RESULT_BLOCKS: usize = 40;
@@ -349,12 +351,14 @@ mod silicon_gates {
                 req.semaphore("T1 complete", 0, 0..1),
                 req.semaphore("T2 complete", 0, 0..1),
             ];
+            let reached = req.semaphore("producer reached", 0, 0..1);
             let plan = req.plan(tt_isa::l1::DATA).unwrap();
             Mem {
                 arena: plan.addr(arena),
                 results: plan.addr(results),
                 go: plan.semaphore(go),
                 done: done.map(|s| plan.semaphore(s)),
+                reached: plan.semaphore(reached),
                 plan,
             }
         }
@@ -949,7 +953,10 @@ mod silicon_gates {
         if let Err(payload) = result {
             for role in 0..2 {
                 match launch.breadcrumbs(dev, role) {
-                    Ok(text) => eprintln!("on failure: {text}"),
+                    Ok(text) => eprintln!(
+                        "on failure: {text}; semaphores {:?}",
+                        launch.semaphores(dev, role)
+                    ),
                     Err(e) => eprintln!("on failure: role {role} unreadable: {e}"),
                 }
             }
@@ -1010,23 +1017,45 @@ mod silicon_gates {
         });
     }
 
-    /// The producer on another thread makes the compare hold: thread 1
-    /// increments the word after the host has seen thread 0 blocked.
+    /// Wait until both guarded roles are parked (the atomic's role reports
+    /// BLOCKED at its deadline, the other at its `go` wait).
+    fn both_blocked(launch: &atomics::Launch<tt_isa::noc::Noc0>, dev: &mut harness::Dev<'_>) {
+        launch
+            .wait(dev, budget(), "both roles to report BLOCKED", |dev, l| {
+                Ok(
+                    l.state(dev, 0)? == RoleState::Blocked
+                        && l.state(dev, 1)? == RoleState::Blocked,
+                )
+            })
+            .unwrap();
+    }
+
+    /// HARDWARE FINDING, asserted. A Tensix thread parked in `ATCAS` (or
+    /// `ATINCGETPTR`) keeps the Scalar Unit busy: `ScalarUnit.md` says the unit
+    /// "is executing at most one instruction at a time" for all three threads,
+    /// so until the atomic completes *no instruction from any other thread can
+    /// enter it* -- `SETDMAREG` and `STOREIND` included. A producer on another
+    /// Tensix thread that must run any scalar instruction before it can feed
+    /// the atomic therefore cannot (the first silicon runs of the producer-thread
+    /// gates: the producer stayed BLOCKED for the whole grace period).
+    ///
+    /// Thread 1 here is released past its `go` wait, posts `reached` (a Sync
+    /// Unit instruction), then needs one `SETDMAREG`. While thread 0's `ATCAS`
+    /// retries, `reached` is posted and the thread never completes; once the
+    /// host makes the word equal, both finish. If the producer completes with
+    /// the `ATCAS` still parked, this fails and the finding is refuted.
     #[test]
-    fn atcas_is_freed_by_a_producer_thread() {
-        labelled("atcas is freed by a producer thread", |dev| {
+    fn blocked_atomic_monopolizes_the_scalar_unit() {
+        labelled("a blocked atcas monopolizes the scalar unit", |dev| {
             let m = Mem::new();
             let mut cas = cas_program(&m, 9, 3, 0);
             cas.pop();
             let consumer = GuardedProgram::new(0, &cas, spec(), m.done[0]).unwrap();
-            let mut produce = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
-            produce.extend(point(ADDR, m.target()));
+            let mut produce = vec![
+                sync::wait_nonzero(m.go, Before::EVERYTHING),
+                sync::post(m.reached),
+            ];
             produce.extend(backend::set_gpr(8, 1).unwrap());
-            produce.push(
-                atomic::increment_and_get(FieldWidth::new(32).unwrap(), Word::W0, 8, ADDR).unwrap(),
-            );
-            produce.push(atomic::consume());
-            produce.extend(record(8, false, m.result(0)));
             let producer = GuardedProgram::new(1, &produce, spec(), m.done[1]).unwrap();
             let launch = launch_two(dev, &m, &consumer, &producer, word_bytes([2, 0, 0, 0]));
             let word0 = m.target().word(Word::W0);
@@ -1037,22 +1066,86 @@ mod silicon_gates {
                     let _ = launch.write32(dev, word0, 3);
                 },
                 |dev, launch| {
+                    both_blocked(launch, dev);
+                    launch.release(dev, 1, 1 << m.go.index(), budget()).unwrap();
+                    let reached = m.reached.index() as usize;
                     launch
-                        .wait(dev, budget(), "both roles to report BLOCKED", |dev, l| {
-                            Ok(l.state(dev, 0)? == RoleState::Blocked
-                                && l.state(dev, 1)? == RoleState::Blocked)
+                        .wait(
+                            dev,
+                            budget(),
+                            "the producer to pass its go wait",
+                            |dev, l| Ok(l.semaphores(dev, 1)?[reached] >= 1),
+                        )
+                        .unwrap();
+                    // Two seconds with the ATCAS still retrying.
+                    for _ in 0..20 {
+                        harness::advance(dev, 100_000_000);
+                    }
+                    let sems = launch.semaphores(dev, 1).unwrap();
+                    assert_ne!(
+                        launch.state(dev, 1).unwrap(),
+                        RoleState::Done,
+                        "the producer finished while an ATCAS was parked: the Scalar Unit is \
+                         NOT monopolized, so the finding is refuted"
+                    );
+                    assert_eq!(
+                        sems[m.done[1].index() as usize],
+                        0,
+                        "producer completion posted"
+                    );
+                    println!(
+                        "FINDING producer past go (reached={}) but stuck on its SETDMAREG while \
+                         thread 0's ATCAS retries: {}",
+                        sems[reached],
+                        launch.breadcrumbs(dev, 1).unwrap()
+                    );
+                    // The host makes the word equal: the ATCAS completes, the
+                    // Scalar Unit frees, the producer finishes.
+                    launch.write32(dev, word0, 3).unwrap();
+                    let out = launch.finish(dev, budget()).unwrap();
+                    check_guards(&out[0]);
+                    assert_eq!(le(&out[0][16..]), 9);
+                },
+            );
+        });
+    }
+
+    /// `ATCAS` freed by another agent: role 1's RISC-V core stores the compare
+    /// value (`Launch::poke`), not a Tensix thread.
+    #[test]
+    fn atcas_is_freed_by_the_other_roles_risc_v_core() {
+        labelled("atcas freed by a poke", |dev| {
+            let m = Mem::new();
+            let mut cas = cas_program(&m, 9, 3, 0);
+            cas.pop();
+            let consumer = GuardedProgram::new(0, &cas, spec(), m.done[0]).unwrap();
+            let waiter = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
+            let producer = GuardedProgram::new(1, &waiter, spec(), m.done[1]).unwrap();
+            let launch = launch_two(dev, &m, &consumer, &producer, word_bytes([2, 0, 0, 0]));
+            let word0 = m.target().word(Word::W0);
+            rescued(
+                dev,
+                &launch,
+                |dev, launch| {
+                    let _ = launch.write32(dev, word0, 3);
+                },
+                |dev, launch| {
+                    both_blocked(launch, dev);
+                    assert_eq!(launch.read32(dev, word0).unwrap(), 2);
+                    launch.poke(dev, 1, word0, 3, budget()).unwrap();
+                    launch
+                        .wait(dev, budget(), "ATCAS to complete", |dev, l| {
+                            Ok(l.state(dev, 0)? == RoleState::Done)
                         })
                         .unwrap();
-                    assert_eq!(launch.read32(dev, word0).unwrap(), 2);
                     launch.release(dev, 1, 1 << m.go.index(), budget()).unwrap();
                     let out = launch.finish(dev, budget()).unwrap();
                     check_guards(&out[0]);
                     assert_eq!(
                         le(&out[0][16..]),
                         9,
-                        "2 + 1 met the compare, the set value replaced it"
+                        "2 became 3 by the poke, the compare held, the set value replaced it"
                     );
-                    assert_eq!(le(&out[1]), 2, "the producer saw the original value");
                 },
             );
         });
@@ -1072,11 +1165,12 @@ mod silicon_gates {
         p
     }
 
-    /// A pop of an empty FIFO blocks; a push by another thread frees it, and
-    /// each gets the counter it advanced.
+    /// A pop of an empty FIFO blocks; another agent (role 1's RISC-V core)
+    /// makes it non-empty by storing the write counter, and the pop gets the
+    /// read counter it advanced.
     #[test]
-    fn atincgetptr_pop_blocks_until_a_producer_pushes() {
-        labelled("atincgetptr pop blocks until a producer pushes", |dev| {
+    fn atincgetptr_pop_blocks_until_the_write_counter_is_poked() {
+        labelled("atincgetptr pop freed by a poke", |dev| {
             let m = Mem::new();
             let g = fifo_geometry();
             let consumer = GuardedProgram::new(
@@ -1086,30 +1180,24 @@ mod silicon_gates {
                 m.done[0],
             )
             .unwrap();
-            let mut produce = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
-            produce.extend(fifo_program(&m, g, FifoSide::Push, FifoAction::Advance, 1));
-            let producer = GuardedProgram::new(1, &produce, spec(), m.done[1]).unwrap();
+            let waiter = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
+            let producer = GuardedProgram::new(1, &waiter, spec(), m.done[1]).unwrap();
             let counters = FifoCounters::new(g, 5, 5).unwrap();
             let launch = launch_two(dev, &m, &consumer, &producer, word_bytes(counters.words()));
             let write_counter = m.target().word(Word::W1);
             rescued(
                 dev,
                 &launch,
-                // Make the FIFO non-empty so the parked pop can proceed.
                 |dev, launch| {
                     let _ = launch.write32(dev, write_counter, 6);
                 },
                 |dev, launch| {
+                    both_blocked(launch, dev);
+                    launch.poke(dev, 1, write_counter, 6, budget()).unwrap();
                     launch
-                        .wait(
-                            dev,
-                            budget(),
-                            "the pop and the producer to report BLOCKED",
-                            |dev, l| {
-                                Ok(l.state(dev, 0)? == RoleState::Blocked
-                                    && l.state(dev, 1)? == RoleState::Blocked)
-                            },
-                        )
+                        .wait(dev, budget(), "the pop to complete", |dev, l| {
+                            Ok(l.state(dev, 0)? == RoleState::Done)
+                        })
                         .unwrap();
                     launch.release(dev, 1, 1 << m.go.index(), budget()).unwrap();
                     let out = launch.finish(dev, budget()).unwrap();
@@ -1117,11 +1205,9 @@ mod silicon_gates {
                     let model = FifoModel {
                         width: 3,
                         rd: 5,
-                        wr: 5,
+                        wr: 6,
                     };
-                    let (model, pushed) = model.step(true, true, 0).unwrap();
                     let (model, popped) = model.step(false, true, 0).unwrap();
-                    assert_eq!(le(&out[1][16..]), pushed, "the producer's counter");
                     assert_eq!(le(&out[1]), popped, "the consumer's counter");
                     assert_eq!(&out[0][16..32], &word_bytes([model.rd, model.wr, 0, 0]));
                 },
@@ -1129,10 +1215,11 @@ mod silicon_gates {
         });
     }
 
-    /// A push onto a full FIFO blocks; a pop by another thread frees it.
+    /// A push onto a full FIFO blocks; the other agent frees it by storing the
+    /// read counter.
     #[test]
-    fn atincgetptr_push_blocks_until_a_consumer_pops() {
-        labelled("atincgetptr push blocks until a consumer pops", |dev| {
+    fn atincgetptr_push_blocks_until_the_read_counter_is_poked() {
+        labelled("atincgetptr push freed by a poke", |dev| {
             let m = Mem::new();
             let g = fifo_geometry();
             let pusher = GuardedProgram::new(
@@ -1142,9 +1229,8 @@ mod silicon_gates {
                 m.done[0],
             )
             .unwrap();
-            let mut pop = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
-            pop.extend(fifo_program(&m, g, FifoSide::Pop, FifoAction::Advance, 1));
-            let popper = GuardedProgram::new(1, &pop, spec(), m.done[1]).unwrap();
+            let waiter = vec![sync::wait_nonzero(m.go, Before::EVERYTHING)];
+            let popper = GuardedProgram::new(1, &waiter, spec(), m.done[1]).unwrap();
             // Full, with the write counter wrapped past the read counter.
             let counters = FifoCounters::new(g, 6, 2).unwrap();
             let launch = launch_two(dev, &m, &pusher, &popper, word_bytes(counters.words()));
@@ -1152,35 +1238,28 @@ mod silicon_gates {
             rescued(
                 dev,
                 &launch,
-                // Make the FIFO not full so the parked push can proceed.
                 |dev, launch| {
                     let _ = launch.write32(dev, read_counter, 7);
                 },
                 |dev, launch| {
+                    both_blocked(launch, dev);
+                    launch.poke(dev, 1, read_counter, 7, budget()).unwrap();
                     launch
-                        .wait(
-                            dev,
-                            budget(),
-                            "the push and the popper to report BLOCKED",
-                            |dev, l| {
-                                Ok(l.state(dev, 0)? == RoleState::Blocked
-                                    && l.state(dev, 1)? == RoleState::Blocked)
-                            },
-                        )
+                        .wait(dev, budget(), "the push to complete", |dev, l| {
+                            Ok(l.state(dev, 0)? == RoleState::Done)
+                        })
                         .unwrap();
                     launch.release(dev, 1, 1 << m.go.index(), budget()).unwrap();
                     let out = launch.finish(dev, budget()).unwrap();
                     check_guards(&out[0]);
                     let model = FifoModel {
                         width: 3,
-                        rd: 6,
+                        rd: 7,
                         wr: 2,
                     };
-                    assert!(model.full());
-                    let (model, popped) = model.step(false, true, 0).unwrap();
+                    assert!(!model.full());
                     let (model, pushed) = model.step(true, true, 0).unwrap();
-                    assert_eq!(le(&out[1][16..]), popped);
-                    assert_eq!(le(&out[1]), pushed);
+                    assert_eq!(le(&out[1]), pushed, "the pusher's counter");
                     assert_eq!(&out[0][16..32], &word_bytes([model.rd, model.wr, 0, 0]));
                 },
             );

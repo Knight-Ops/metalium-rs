@@ -309,7 +309,21 @@ fn guard_wait(mb: Mailbox, run: &GuardRun) {
         }
         // SAFETY: a fixed aligned word of the guard block.
         let request = unsafe { l1_read32(g.release()) };
-        if request & guard::RELEASE_MASK != 0 {
+        if request & (guard::RELEASE_MASK | guard::POKE) != 0 {
+            if request & guard::POKE != 0 {
+                // A store by this core to an L1 word a parked `ATCAS` or
+                // `ATINCGETPTR` polls: checked to be one aligned word of the
+                // data arena, so a stale or corrupt request cannot write
+                // firmware, a mailbox or a program.
+                // SAFETY: fixed aligned words of the guard block.
+                let (at, value) = unsafe { (l1_read32(g.poke_addr()), l1_read32(g.poke_value())) };
+                if at % 4 != 0 || !tt_isa::l1::DATA.contains(at as u64, 4) {
+                    fail_in(mb, guard::REFUSED);
+                }
+                // SAFETY: inside the data arena, checked above.
+                unsafe { l1_write32(at as u64, value) };
+                publish();
+            }
             for i in 0..8u64 {
                 if request & (1 << i) != 0 {
                     // SAFETY: the semaphore window; an even store posts.

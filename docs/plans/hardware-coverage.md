@@ -574,12 +574,12 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
 #### DMA Engine, Atomics & Registers
-- [~] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); with the compare already met and with a host-freed block it passes on card 0 (step106, guarded role with a measured-rate deadline); producer-thread gate open. WormholeOnly encoding; ttsim refuses it (row 77).
+- [x] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); compare already met, blocked-until-the-host-writes-the-word and blocked-until-the-other-role's-RISC-V-core-pokes-it pass on card 0 under a guarded run with a measured-rate deadline (step106). **A Tensix thread cannot be the producer:** a thread parked in `ATCAS`/`ATINCGETPTR` keeps every other thread from issuing any Scalar Unit instruction (confirmed on card 0, `blocked_atomic_monopolizes_the_scalar_unit`), so only the host or a RISC-V core can free it. WormholeOnly encoding; ttsim refuses it (row 77).
 - [x] `ATGETM` / `ATRELM`: typed `Mutex` (indices 0, 2, 3, 4 only), scoped acquire/release; uncontended on all indices and threads, contended round-robin handoff for every mutex and holder, the deadline/host-release path and negative controls pass on card 0 (step105). ttsim models only index 0 (row 76).
 - [ ] `ATRELM`: Atomic mutex release.
 - [x] `ATSWAP`: four-GPR group form, all 256 masks and aligned bases on card 0 (step106); the single-register form is `[-]` (lane placement matches neither the page nor a consistent rule; the sweep diagnostic is the evidence) and is unrepresentable in the API.
 - [x] `ATINCGET`: field width 1-32, wrapping, upper bits preserved, atomic across the three threads on card 0 (step106); WormholeOnly encoding, ttsim refuses it.
-- [~] `ATINCGETPTR`: checked geometry and independent FIFO model; non-blocking FIFO through wraps passes on card 0; blocking push/pop gates open (step106).
+- [x] `ATINCGETPTR`: checked geometry, independent FIFO model; the FIFO through wraps and the blocking pop (write counter poked) and push (read counter poked) gates pass on card 0 (step106). Same Scalar Unit rule as `ATCAS`; WormholeOnly encoding; ttsim refuses it.
 - [x] `SETDMAREG`: checked full-width GPR initialization through `backend::set_gpr`; configuration staging and matmul address stepping.
 - [x] `ADDDMAREG`: production register-form matmul address stepping and step38; the immediate form is silicon-only (divergence 67).
 - [x] `SUBDMAREG`: checked wrapping subtraction, register/immediate forms (step100); silicon semantics, simulator refusal.
