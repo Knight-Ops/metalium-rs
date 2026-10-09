@@ -121,7 +121,7 @@ this does not establish an MNIST speedup.
 
 New silicon evidence: packed K/ragged products plus pooling traces 7/7
 (`1791162575`); batched BF16 1/1 (`1791163126`); actual two-card BF16 mesh 1/1
-(`1791163264`); extremum scans 1/1 (`1791163532`); integer reductions 1/1
+(`1791163264`); extremum scans 1/1 (kernel level only; Burn `float_cummin`/`float_cummax` remain unsupported) (`1791163532`); integer reductions 1/1
 (`1791163872`); hardware precision modes 2/2 (`1791165365`). All ordinary gates
 used card 0. Corresponding simulator gates passed where ttsim supports the mode.
 The packed-gather unit test was watched failing with the wrong slot stride.

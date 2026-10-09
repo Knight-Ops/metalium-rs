@@ -7,6 +7,7 @@
 
 use std::process::ExitCode;
 
+mod burn_coverage;
 mod fetch;
 mod gen_burn;
 mod gen_cfg;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
         Some("gen-burn-ops") => gen_burn::generate(args.any(|a| a == "--check")),
+        Some("burn-coverage") => burn_coverage::run(args.any(|a| a == "--check")),
         Some("silicon") => silicon::run(args),
         Some("bench") => silicon::bench(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
@@ -68,6 +70,11 @@ tasks:
                           regenerate burn-tt's native dispatch and unsupported
                           operations from the pinned burn-backend source;
                           --check fails if the committed file is out of date
+  burn-coverage [--check]
+                          regenerate docs/plans/burn-op-coverage.md: each Burn
+                          trait method native, composed or unsupported, with a
+                          disposition for every unsupported one; --check also
+                          fails on a missing or stale disposition
   check-isa-sources       parse the pinned Bits32.lua and report what it holds,
                           without generating anything
   check-no-flex-in-backend assert burn-tt has no Flex dependency, including tests

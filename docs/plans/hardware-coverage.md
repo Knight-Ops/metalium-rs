@@ -366,10 +366,10 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x (`CONFIRMED`) | x (`frontend::mop`, mailbox `MOP_CFG`) | (X2b) | x | x | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
-| Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
+| Op-list traces (a step's records kept in GDDR, replayed) | -- | x (`tt_kernels::trace`) | x | x | x both | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
 | Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
-| Three-thread pipelining, double buffering | -- | | | | | checklist 9.8 |
+| Three-thread pipelining, double buffering | -- | | x (resident T0/T1/T2 roles, `LAUNCH`/`KERNEL_WAIT`, `enable_dram`) | x | x both | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
 
@@ -965,8 +965,10 @@ Each names the measurement it must move. The Burn-side ones are in
         block offset dropped and with the tiles read untransposed; ttsim and
         both cards), `step59_burn_transformer`. Last-dim sum/max and mean_dim
         compositions, plus certain leading-dim sums, are done. General
-        leading-dim reductions are now simulator-gated by R1c; untiled
-        batched matmul remains open.
+        leading-dim reductions are now simulator-gated by R1c. Ragged,
+        broadcast and strided F32/BF16 batches are done too: each matrix is
+        repacked on the card and run through the 2-D product
+        (`materialized_batched_matmul`, `burn-tt/src/ops.rs`; step76, step83).
 - [~] **P2 K blocking** (concepts review G3): native FP32 Dst reload implemented
       for resident ordinary and supported batched matmuls (`step68`). Same
       accumulation order, no block-sum addition or packer L1 accumulation.
@@ -1435,7 +1437,8 @@ Each names the measurement it must move. The Burn-side ones are in
       both cards (`step75`). BF16 NCHW average/adaptive pooling uses GAPOOL;
       F32/general max retains SFPU semantics, including resident indices and
       overlapping backwards (`step78`). General GMPOOL routing and performance
-      remain open. Pooling traces currently refuse metadata uploads.
+      remain open. Pooling geometry uses replayable metadata descriptors, so pooling
+      traces replay (step78, step89).
 - [~] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
@@ -1483,7 +1486,10 @@ Each names the measurement it must move. The Burn-side ones are in
       sums and maxima over either axis (`step67`; both-card validated).
       Simulator and both-card gates (`step69`) cover direct product, native Boolean
       `any`/`all`, rank-N arg-reductions and inclusive cumsum/cumprod.
-      Remaining: both-card validation and cumulative min/max. Full maxima compose native reshape and
+      Remaining: Burn `float_cummin`/`float_cummax` (the kernel scans in raw total
+      order, which differs from Flex's NaN-propagating, first-wins order, so it
+      cannot be wired as it is; lane T3 in
+      [hardware-coverage-closeout.md](hardware-coverage-closeout.md)). Full maxima compose native reshape and
       max reductions; minimum defaults retain their gather limitations.
 - [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
@@ -1650,7 +1656,7 @@ path today, `~` when only some shapes do.
 | `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
 | `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
-| `float_cummin`, `float_cummax` | | R1 |
+| `float_cummin`, `float_cummax` | unsupported stub; kernel exists (`ScanOp::{Min,Max}`, step79) but its order is not Flex's | R1 (T3) |
 | `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
 | `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
@@ -1664,7 +1670,7 @@ path today, `~` when only some shapes do.
 | Methods | Device | Item |
 |---|:-:|---|
 | `relu`, `relu_backward` | x (SFPU) | S1 |
-| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
+| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; a one-element weight is expanded on the device by `device_op_ungated`, no residency gate yet: T2) | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
 | `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; every supported size) | R2 |

@@ -344,6 +344,24 @@ pub trait Engine {
     ) -> Result<GenericTraceRun, EngineError> {
         Err(no_traces())
     }
+
+    // lane:t1_intbool (Engine trait): add this lane's methods below this line only.
+
+    // lane:t2_index (Engine trait): add this lane's methods below this line only.
+
+    // lane:t3_scan (Engine trait): add this lane's methods below this line only.
+
+    // lane:t4_rem (Engine trait): add this lane's methods below this line only.
+
+    // lane:t5_sort (Engine trait): add this lane's methods below this line only.
+
+    // lane:t6_random (Engine trait): add this lane's methods below this line only.
+
+    // lane:t7_dtype (Engine trait): add this lane's methods below this line only.
+
+    // lane:t8_mathmode (Engine trait): add this lane's methods below this line only.
+
+    // lane:t9_mesh (Engine trait): add this lane's methods below this line only.
 }
 
 /// Input payload to write into a trace's input buffer before replay.
@@ -2398,6 +2416,24 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.run_generic_trace(&mut self.session, trace, inputs, outputs)
     }
+
+    // lane:t1_intbool (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t2_index (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t3_scan (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t4_rem (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t5_sort (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t6_random (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t7_dtype (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t8_mathmode (KmdEngine): add this lane's methods below this line only.
+
+    // lane:t9_mesh (KmdEngine): add this lane's methods below this line only.
 }
 
 pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
@@ -2956,6 +2992,24 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.fabric.chips[0].device().traffic())
     }
+
+    // lane:t1_intbool (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t2_index (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t3_scan (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t4_rem (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t5_sort (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t6_random (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t7_dtype (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t8_mathmode (MeshEngine): add this lane's methods below this line only.
+
+    // lane:t9_mesh (MeshEngine): add this lane's methods below this line only.
 }
 
 /// A factory for [`attach`] that opens every card in `cards` (the first is chip

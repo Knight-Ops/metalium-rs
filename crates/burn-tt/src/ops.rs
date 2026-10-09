@@ -1220,7 +1220,37 @@ fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
     t
 }
 
+#[path = "ops_intbool.rs"]
+mod intbool_ops;
+
+#[path = "ops_index.rs"]
+mod index_ops;
+
+#[path = "ops_scan.rs"]
+mod scan_ops;
+
+#[path = "ops_rem.rs"]
+mod rem_ops;
+
+#[path = "ops_sort.rs"]
+mod sort_ops;
+
+#[path = "ops_dtype.rs"]
+mod dtype_ops;
+
 pub mod float {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::float::*;
     use super::*;
     use burn_backend::Scalar;
     use tt_kernels::kind;
@@ -3307,6 +3337,18 @@ pub mod activation {
 }
 
 pub mod int {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::int::*;
     use super::*;
 
     pub fn int_gather(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
@@ -3741,6 +3783,18 @@ pub mod int {
 }
 
 pub mod bool {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::bool::*;
     use super::*;
 
     pub fn bool_scatter_or(

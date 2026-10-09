@@ -23,6 +23,27 @@ const TRAITS: &[(&str, &str)] = &[
     ("TransactionOps", "ops/transaction.rs"),
 ];
 
+mod overrides;
+
+/// Every override list: the base list below, then one list per work lane in
+/// `gen_burn/overrides/`. A trait may appear in several lists; a method may not.
+/// Lanes edit only their own file, so concurrent branches never conflict here.
+pub fn overridden() -> Vec<(&'static str, &'static [&'static str])> {
+    std::iter::once(OVERRIDDEN)
+        .chain(overrides::LANES.iter().map(|(_, list)| *list))
+        .flat_map(|list| list.iter().copied())
+        .collect()
+}
+
+/// The names `overridden` lists for one trait.
+fn hand_methods<'a>(overridden: &[(&str, &'a [&'a str])], tr: &str) -> Vec<&'a str> {
+    overridden
+        .iter()
+        .filter(|(t, _)| *t == tr)
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect()
+}
+
 /// Methods implemented by hand in `burn-tt/src/ops.rs`, by trait: the ones that
 /// run on the device, the ones that say which device a tensor is on or move it,
 /// and the ones returning futures.
@@ -353,6 +374,33 @@ pub struct Method {
     pub ret: Option<String>,
 }
 
+/// Every method of each op trait, as the pinned burn-backend declares it.
+pub fn all_trait_methods() -> Result<Vec<(&'static str, Vec<Method>)>, String> {
+    let root = workspace_root();
+    let src = crate_source(&root, "burn-backend")?;
+    let mut traits = Vec::new();
+    for (name, file) in TRAITS {
+        let path = src.join("src/backend").join(file);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        traits.push((*name, parse_trait(&text, name)?));
+    }
+    Ok(traits)
+}
+
+/// Whether the generator emits a placeholder for a method Burn already gives
+/// a (failing) default body.
+pub fn is_placeholder(name: &str) -> bool {
+    PLACEHOLDERS.contains(&name)
+}
+
+const PLACEHOLDERS: &[&str] = &[
+    "float_scatter_nd",
+    "float_gather_nd",
+    "int_scatter_nd",
+    "int_gather_nd",
+];
+
 pub fn generate(check_only: bool) -> Result<(), String> {
     let root = workspace_root();
     let src = crate_source(&root, "burn-backend")?;
@@ -364,8 +412,9 @@ pub fn generate(check_only: bool) -> Result<(), String> {
         let methods = parse_trait(&text, name)?;
         traits.push((*name, selected(name, methods)));
     }
-    check_overridden(&traits, OVERRIDDEN)?;
-    let rendered = render(&traits, OVERRIDDEN)?;
+    let overridden = overridden();
+    check_overridden(&traits, &overridden)?;
+    let rendered = render(&traits, &overridden)?;
     let generated = rustfmt(&rendered, &root)?;
     let dest = root.join("crates/burn-tt/src/generated/ops.rs");
     if check_only {
@@ -395,23 +444,10 @@ pub fn generate(check_only: bool) -> Result<(), String> {
 /// Emit required methods, native overrides, and defaults that are only
 /// unsupported placeholders in Burn. Other defaults compose our primitives.
 pub fn selected(tr: &str, methods: Vec<Method>) -> Vec<Method> {
-    let hand = OVERRIDDEN
-        .iter()
-        .find(|(t, _)| *t == tr)
-        .map_or(&[][..], |(_, names)| *names);
-    let placeholders = [
-        "float_scatter_nd",
-        "float_gather_nd",
-        "int_scatter_nd",
-        "int_gather_nd",
-    ];
+    let hand = hand_methods(&overridden(), tr);
     methods
         .into_iter()
-        .filter(|m| {
-            !m.defaulted
-                || hand.contains(&m.name.as_str())
-                || placeholders.contains(&m.name.as_str())
-        })
+        .filter(|m| !m.defaulted || hand.contains(&m.name.as_str()) || is_placeholder(&m.name))
         .collect()
 }
 
@@ -679,11 +715,15 @@ pub fn check_overridden(
     traits: &[(&str, Vec<Method>)],
     overridden: &[(&str, &[&str])],
 ) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
     for (tr, names) in overridden {
         let Some((_, methods)) = traits.iter().find(|(t, _)| t == tr) else {
             return Err(format!("OVERRIDDEN names `{tr}`, which is not an op trait"));
         };
         for n in names.iter() {
+            if !seen.insert((*tr, *n)) {
+                return Err(format!("`{tr}::{n}` is overridden in two lists"));
+            }
             if !methods.iter().any(|m| m.name == *n) {
                 return Err(format!(
                     "OVERRIDDEN names `{tr}::{n}`, which burn-backend {BURN_VERSION} \
@@ -702,11 +742,7 @@ pub fn render(
     let mut used = BTreeSet::new();
     let mut impls = String::new();
     for (tr, methods) in traits {
-        let hand: &[&str] = overridden
-            .iter()
-            .find(|(t, _)| t == tr)
-            .map(|(_, n)| *n)
-            .unwrap_or(&[]);
+        let hand = hand_methods(overridden, tr);
         impls.push_str(&format!("impl {tr}<TtBackend> for TtBackend {{\n"));
         for m in methods {
             for (_, ty) in &m.args {
@@ -1055,6 +1091,23 @@ pub trait FloatTensorOps<B: Backend> {
             check_overridden(&traits, &[("FloatTensorOps", &["float_nonexistent"])]).unwrap_err();
         assert!(err.contains("float_nonexistent"), "{err}");
         assert!(check_overridden(&traits, &[("FloatTensorOps", &["float_add"])]).is_ok());
+    }
+
+    #[test]
+    fn a_trait_may_repeat_across_lane_lists_but_a_method_may_not() {
+        let m = parse_trait(SAMPLE, "FloatTensorOps").unwrap();
+        let traits = [("FloatTensorOps", m)];
+        let split = [
+            ("FloatTensorOps", &["float_add"][..]),
+            ("FloatTensorOps", &["float_zeros"][..]),
+        ];
+        assert!(check_overridden(&traits, &split).is_ok());
+        let twice = [
+            ("FloatTensorOps", &["float_add"][..]),
+            ("FloatTensorOps", &["float_add"][..]),
+        ];
+        let err = check_overridden(&traits, &twice).unwrap_err();
+        assert!(err.contains("two lists"), "{err}");
     }
 
     #[test]

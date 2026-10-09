@@ -55,7 +55,8 @@ batched resident matmuls now support K beyond one L1 block by reloading
 FP32 partial accumulators in original product order. `step67`/`step68`
 validate simulator execution, residency, numerical models, autodiff and
 changed-input traces; both-card silicon passed in run `1791145571`.
-Other reduction kinds and untiled batched matmul remain separate work.
+Other reduction kinds remain separate work; ragged and strided batched matmul
+is native (`materialized_batched_matmul`).
 
 ## Reduction and integer extensions
 

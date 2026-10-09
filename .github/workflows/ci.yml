@@ -59,6 +59,9 @@ jobs:
       - name: Generated Burn operations are current
         run: cargo xtask gen-burn-ops --check
 
+      - name: Burn operation coverage is current
+        run: cargo xtask burn-coverage --check
+
   firmware:
     name: Firmware integrity & lints
     runs-on: ubuntu-24.04

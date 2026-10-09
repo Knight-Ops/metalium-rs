@@ -1,0 +1,283 @@
+//! `cargo xtask burn-coverage [--check]`: which of Burn's operation-trait
+//! methods run natively on the device, which compose native primitives, and
+//! which fail explicitly, with a disposition for every explicit failure.
+//!
+//! The status comes from the pinned burn-backend traits and the override
+//! lists in `gen_burn`, so it cannot rot. Dispositions are the one hand-written
+//! input: an unsupported method must name the work lane that will implement it
+//! or a deliberate `[-]` with its reason, and a disposition for a method that
+//! is no longer unsupported is stale and fails the check.
+
+use std::collections::BTreeMap;
+
+use crate::gen_burn::{self, Method};
+use crate::util::workspace_root;
+
+const DEST: &str = "docs/plans/burn-op-coverage.md";
+
+/// `(method, disposition)` for every method that fails explicitly. A lane id
+/// (`T3`) means the work is planned in
+/// `docs/plans/hardware-coverage-closeout.md`; `[-]` means deliberately not
+/// supported, with the reason.
+const DISPOSITIONS: &[(&str, &str)] = &[
+    ("float_remainder", "T4 exact SFPU fmod"),
+    ("float_remainder_scalar", "T4 exact SFPU fmod"),
+    ("float_cross", "T2 composition of slice, mul, sub and cat"),
+    (
+        "float_cummin",
+        "T3 Flex-order scan (NaN propagates, first wins)",
+    ),
+    (
+        "float_cummax",
+        "T3 Flex-order scan (NaN propagates, first wins)",
+    ),
+    ("float_argtopk", "T5 device sort"),
+    (
+        "float_gather_nd",
+        "T2 flat index on the device, then gather",
+    ),
+    ("float_scatter_nd", "T2 select_add and ordered assign"),
+    ("int_mask_where", "T1 raw-bit select"),
+    ("int_mask_fill", "T1 raw-bit scalar fill"),
+    ("int_gather_nd", "T2 flat index on the device, then gather"),
+    ("int_scatter_nd", "T2 select_add and ordered assign"),
+    ("int_matmul", "T2 exact modulo 2^32 composition"),
+    ("int_cumsum", "T3 integer scan"),
+    ("int_cumprod", "T3 integer scan"),
+    ("int_cummin", "T3 integer scan"),
+    ("int_cummax", "T3 integer scan"),
+    ("int_argmax", "T3 signed arg-extreme"),
+    ("int_argmin", "T3 signed arg-extreme"),
+    ("int_argtopk", "T5 device sort on I32 keys"),
+    ("int_abs", "T1 wrapping integer ALU"),
+    ("int_permute", "T1 dtype-generic strided view"),
+    ("int_flip", "T1 dtype-generic copy"),
+    ("int_cast", "T1 I32 to I32 native, other widths [-]"),
+    ("int_unfold", "T1 dtype-generic view"),
+    ("bool_mask_where", "T1 raw-bit select"),
+    ("bool_mask_fill", "T1 raw-bit scalar fill"),
+    ("bool_permute", "T1 dtype-generic strided view"),
+    ("bool_flip", "T1 dtype-generic copy"),
+    ("bool_unfold", "T1 dtype-generic view"),
+    ("conv3d", "[-] out of scope: no model needs it"),
+    ("conv_transpose3d", "[-] out of scope: no model needs it"),
+    ("deform_conv2d", "[-] out of scope: no model needs it"),
+    (
+        "deform_conv2d_backward",
+        "[-] out of scope: no model needs it",
+    ),
+    ("interpolate", "[-] out of scope: no model needs it"),
+    (
+        "interpolate_backward",
+        "[-] out of scope: no model needs it",
+    ),
+    ("rfft", "[-] out of scope: no model needs it"),
+    ("irfft", "[-] out of scope: no model needs it"),
+    (
+        "q_from_data",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "quantize",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "dequantize",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_reshape",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_expand",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_swap_dims",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_permute",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_flip",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_select",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+    (
+        "q_slice",
+        "[-] D2 is backend storage, not portable quantization",
+    ),
+];
+
+struct Row<'a> {
+    name: &'a str,
+    status: Status,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Status {
+    Native,
+    Composed,
+    Unsupported,
+}
+
+pub fn run(check_only: bool) -> Result<(), String> {
+    let traits = gen_burn::all_trait_methods()?;
+    let overridden = gen_burn::overridden();
+    let (rendered, problems) = render(&traits, &overridden);
+    if !problems.is_empty() {
+        return Err(problems.join("\n"));
+    }
+    let dest = workspace_root().join(DEST);
+    if check_only {
+        let current = std::fs::read_to_string(&dest)
+            .map_err(|e| format!("reading {}: {e}", dest.display()))?;
+        if current == rendered {
+            println!("ok: {} is up to date", dest.display());
+            Ok(())
+        } else {
+            Err(format!(
+                "{} is out of date.\nRun `cargo xtask burn-coverage` and commit the result.",
+                dest.display()
+            ))
+        }
+    } else {
+        std::fs::write(&dest, rendered).map_err(|e| format!("writing {}: {e}", dest.display()))?;
+        println!("wrote {}", dest.display());
+        Ok(())
+    }
+}
+
+fn status_of(m: &Method, hand: &[&str]) -> Status {
+    if hand.contains(&m.name.as_str()) {
+        Status::Native
+    } else if !m.defaulted || gen_burn::is_placeholder(&m.name) {
+        Status::Unsupported
+    } else {
+        Status::Composed
+    }
+}
+
+/// The coverage document, and every inconsistency between the traits and the
+/// dispositions.
+fn render(
+    traits: &[(&'static str, Vec<Method>)],
+    overridden: &[(&str, &[&str])],
+) -> (String, Vec<String>) {
+    let dispositions: BTreeMap<&str, &str> = DISPOSITIONS.iter().copied().collect();
+    let mut problems = Vec::new();
+    let mut unsupported_seen = Vec::new();
+    let mut out = String::from(
+        "<!-- Generated by `cargo xtask burn-coverage`; do not edit. -->\n\
+         # Burn operation coverage\n\n\
+         Status of every method of the pinned Burn operation traits in `burn-tt`.\n\
+         **Native** methods are listed in the override lists of `xtask/src/gen_burn.rs`\n\
+         and `xtask/src/gen_burn/overrides/` and may still refuse an unsupported dtype or\n\
+         shape. **Composed** methods are Burn's own default bodies over native primitives.\n\
+         **Unsupported** methods fail explicitly with `burn-tt: unsupported operation`; each\n\
+         carries a disposition: a work lane from\n\
+         [hardware-coverage-closeout.md](hardware-coverage-closeout.md), or `[-]` with its reason.\n\
+         The per-method Device and Item notes remain in\n\
+         [hardware-coverage.md](hardware-coverage.md#burn-op-coverage).\n\n",
+    );
+    for (tr, methods) in traits {
+        let hand: Vec<&str> = overridden
+            .iter()
+            .filter(|(t, _)| t == tr)
+            .flat_map(|(_, n)| n.iter().copied())
+            .collect();
+        let rows: Vec<Row> = methods
+            .iter()
+            .map(|m| Row {
+                name: &m.name,
+                status: status_of(m, &hand),
+            })
+            .collect();
+        let list = |status: Status| -> Vec<&str> {
+            let mut names: Vec<&str> = rows
+                .iter()
+                .filter(|r| r.status == status)
+                .map(|r| r.name)
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let (native, composed, unsupported) = (
+            list(Status::Native),
+            list(Status::Composed),
+            list(Status::Unsupported),
+        );
+        out.push_str(&format!(
+            "## {tr}\n\n{} native, {} composed, {} unsupported.\n\n",
+            native.len(),
+            composed.len(),
+            unsupported.len()
+        ));
+        if !unsupported.is_empty() {
+            out.push_str("| Unsupported method | Disposition |\n|---|---|\n");
+            for name in &unsupported {
+                unsupported_seen.push(*name);
+                match dispositions.get(name) {
+                    Some(d) => out.push_str(&format!("| `{name}` | {d} |\n")),
+                    None => {
+                        problems.push(format!(
+                            "`{tr}::{name}` fails explicitly and has no disposition"
+                        ));
+                        out.push_str(&format!("| `{name}` | **missing** |\n"));
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        for (title, names) in [("Native", &native), ("Composed", &composed)] {
+            if names.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "<details><summary>{title} ({})</summary>\n\n",
+                names.len()
+            ));
+            let joined: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+            out.push_str(&joined.join(", "));
+            out.push_str("\n\n</details>\n\n");
+        }
+    }
+    for (name, _) in DISPOSITIONS {
+        if !unsupported_seen.contains(name) {
+            problems.push(format!(
+                "`{name}` has a disposition but is no longer unsupported; remove it from \
+                 DISPOSITIONS in xtask/src/burn_coverage.rs"
+            ));
+        }
+    }
+    // One trailing newline, as the repository's end-of-file hook requires.
+    let out = format!("{}\n", out.trim_end());
+    (out, problems)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispositions_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, _) in DISPOSITIONS {
+            assert!(seen.insert(*name), "{name} has two dispositions");
+        }
+    }
+
+    #[test]
+    fn every_disposition_is_a_lane_or_a_reasoned_exclusion() {
+        for (name, d) in DISPOSITIONS {
+            let lane = d.starts_with('T') && d[1..].starts_with(|c: char| c.is_ascii_digit());
+            assert!(lane || d.starts_with("[-] "), "{name}: {d}");
+        }
+    }
+}

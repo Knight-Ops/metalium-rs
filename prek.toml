@@ -45,6 +45,9 @@ hooks = [
     # Native dispatch and unsupported methods follow the pinned Burn traits.
     # A Burn bump or a hand-edit of generated operations fails here.
     { id = "cargo-xtask-gen-burn-ops", name = "generated Burn operations are current", entry = "cargo xtask gen-burn-ops --check", language = "system", files = "^(crates/burn-tt/src/|xtask/src/|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
+    # Every unsupported Burn method needs a disposition (a work lane or a reasoned `[-]`),
+    # and a disposition for a method that now works is stale.
+    { id = "cargo-xtask-burn-coverage", name = "Burn operation coverage is current", entry = "cargo xtask burn-coverage --check", language = "system", files = "^(crates/burn-tt/src/|xtask/src/|docs/plans/burn-op-coverage\\.md|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
     { id = "cargo-xtask-no-flex", name = "Burn backend is independent of Flex", entry = "cargo xtask check-no-flex-in-backend", language = "system", files = "^(crates/burn-tt/|xtask/src/|Cargo\\.(toml|lock)|PINS\\.toml)", pass_filenames = false },
 
     { id = "cargo-xtask-gen-isa", name = "generated instruction table is current", entry = "cargo xtask gen-isa --check", language = "system", files = "^(crates/tt-isa/src/isa/|crates/tt-tests/tests/|xtask/src/|PINS\\.toml)", pass_filenames = false },
