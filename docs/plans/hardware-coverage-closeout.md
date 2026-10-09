@@ -221,3 +221,68 @@ Close-out: every coverage row `[x]` or documented `[-]`; move this file and
 - Concurrency limit: 12 cores / 62 GB. Run at most four lane agents at a time, each with its own
   worktree `target/` and `CARGO_BUILD_JOBS=3`; each worktree needs `vendor/` copied from the main
   checkout (it is git-ignored).
+
+## Restart state (paused 2026-10-09; everything stopped on request)
+
+Branch `phase10-closeout` at `3fc9bec`. Nothing was running when paused. Lane agents cannot be
+resumed after being stopped; restart a lane by starting a new agent from the notes below. Lane
+worktrees are under `.claude/worktrees/agent-<id>` (git-ignored via `.git/info/exclude`); they keep
+partial work and may start from stale bases, so integrate by copying a lane's own files and
+applying `git diff` hunks of shared files with `git apply --3way`, then regenerate
+`gen-burn-ops` / `burn-coverage` (never merge generated files). Shared brief for lane agents:
+`scratchpad/lane-preamble.md` (no silicon, no commits, report format) must be recreated from the
+"Orchestration model" rules in this file if the scratchpad is gone.
+
+### Committed (all gates pass on ttsim and card 0; SMOKE entries added)
+`dcdba64` scaffold · `7f145eb` T3 · `bcd7e8e` T1 · `69d27de` T5 · `5687d4f` T2 · `7c47b82` T4 ·
+`3fc9bec` E (partial), H, F (partial). Baseline before the lanes: card-0 SMOKE 258/258
+(`1791558187`).
+
+### Uncommitted in the working tree (E's final rework, NOT yet run on silicon)
+`crates/tt-isa/src/l1_atomic.rs`, `crates/tt-kernels/src/atomics.rs`,
+`crates/tt-firmware/src/corpus.rs`, `crates/tt-tests/tests/step105_mutex.rs`,
+`crates/tt-tests/tests/step106_l1_atomics.rs` (copies of lane E's worktree
+`agent-a6cf85eb1a01f9531`; ttsim 19/19 + 3/3 and lints clean there). Contents: the three
+Tensix-producer gates are replaced by "RISC-V poke" producers (`guard::POKE`,
+`Launch::poke`), plus `blocked_atomic_monopolizes_the_scalar_unit` asserting that a thread
+parked in `ATCAS`/`ATINCGETPTR` keeps other threads from issuing any Scalar Unit instruction
+(unconfirmed on Blackhole). Silicon queue to run first on restart, one at a time:
+`step105_mutex::a_poke_stores_a_word_from_the_runner_core`, then in `step106_l1_atomics::silicon_gates::`:
+`blocked_atomic_monopolizes_the_scalar_unit`, `atcas_is_freed_by_the_other_roles_risc_v_core`,
+`atincgetptr_pop_blocks_until_the_write_counter_is_poked`,
+`atincgetptr_push_blocks_until_the_read_counter_is_poked`. Then commit and add the passing ones to
+SMOKE. `SILICON_POLLS_PER_SECOND = 30_000_000` and the 30 s grace are measured/required values:
+keep them when copying files. Also uncommitted: `AGENTS.md` (the user's Scryer section plus my two
+generated-code lines).
+
+### Lane states
+| Lane | State | Where / next |
+|---|---|---|
+| T1 T2 T3 T4 T5 | done, committed, card 0 | none (both-card runs optional) |
+| H SFPLOADMACRO | done: probes s00-s13 pass on card 0 | committed; fill divergence row 82 text and operating notes at close-out |
+| E mutexes/atomics | mutexes, `ATINCGET`, `ATSWAP` group `[x]`; ATSWAP single `[-]`; blocking `ATCAS` host-freed passes; `ATINCGETPTR` blocking and producer gates open (see above) | worktree `agent-a6cf85eb1a01f9531`; Full poll design hangs after first poll on silicon (Light is default, measured 34.7M polls/s) |
+| F MMIO | `PACR_SETREG`, `UNPACR_NOP_SETREG` `[-]`; `LOADREG`/`STOREREG`/`STOREIND_MMIO` host+ttsim only (PIC `SW_INT_PC[28..31]` allowlist); silicon probes NOT run | held for a user decision (a mis-encoded `STOREREG` could hit reset/mover registers); probes: `step107_mmio_regs::silicon_probe_*` |
+| FENCE (X7) | stopped mid-write | worktree `agent-aa0e7fc8c97774bde` (new fenced-write API in `tt-device`, tests being written, step119) |
+| TS tag search | stopped, little/no work | worktree `agent-a7cab6e21ad47b7b2` (step120, `tt_isa::tag_search`) |
+| MD matrix diagnostics | stopped, little/no work | worktree `agent-aa4aabdd23e59d5c5` (step111, `MOVDBGA2D`, `GATESRCRST`) |
+| T9 mesh trace capture | stopped mid-implementation | worktree `agent-a49547cc5c2938d7b` (`MeshEngine::begin_trace`, step147) |
+| T6 random, T7 FP16, T8 MathMode, T10 benchmarks/dispositions | not started | briefs in "Tensor and Burn lanes" above |
+| PU packer/unpacker modes, N NoC multicast/atomics/IRQ | not started | briefs in "Hardware/ISA lanes" above |
+| G stream overlay, X6 mover fast path, P9 wait planner/`.ttinsn` | not started (wave 2/3) | likely `[-]` for G (no Blackhole overlay pages) |
+
+### Findings to carry forward (record in `docs/learnings/` at close-out)
+- A gate that aborts while a Tensix thread is parked on a semaphore wait survives the backend
+  reset and wedges every later gate on that tile (each fails at the harness preamble with
+  `harness.rs:404 ... core did not respond within 1000 ms`). `harness` backend preamble now uses
+  `session::reset_thread_state` (releases semaphores first); this is committed in `3fc9bec`.
+  The earlier "SFPLOADMACRO hang" was this wedge, not the macro.
+- Sync Unit semaphore-window polling: back-to-back loads (`PollMode::Full`) hang after the first
+  poll on silicon; consumed single loads (`Light`) and an L1-word poll work (about 34.7M and 32.8M
+  polls/s). `for_seconds` refuses more than 2^30 polls.
+- `ATSWAP` single-register form: lane placement matches no consistent rule on Blackhole; group
+  form is exact for all 256 masks.
+- BF16 narrowing flushes BF16 subnormals to signed zero (sort gate oracle corrected accordingly).
+- Not done at close-out: both-card runs, `step12_mnist` after the arithmetic lanes, full SMOKE,
+  divergence-log and operating-notes text (proposals are in the lane reports and commit messages),
+  `docs/learnings` updates, `measured.rs` promotions, moving this plan and
+  `remaining-firmware-instructions.md` to `docs/completed-plans/`.
