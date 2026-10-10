@@ -20,6 +20,7 @@ pub mod dm;
 pub mod dram;
 pub mod eth;
 pub mod frontend;
+pub mod hazard;
 pub mod isa;
 pub mod l1;
 pub mod l1_atomic;

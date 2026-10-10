@@ -367,8 +367,8 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x (`CONFIRMED`) | x (`frontend::mop`, mailbox `MOP_CFG`) | (X2b) | x | x | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | x (`tt_kernels::trace`) | x | x | x both | X4 |
-| `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
-| Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
+| `.ttinsn` fusion (four pushes per cycle) | -- | `[-]` | | | | `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate; SFPU math programs are push-bound (39 of 73 kinds, median push/backend cycle ratio 1.17, max 2.87) and shrink through replay and `SFPLOADMACRO` schedules instead (P9, step121) |
+| Hazards as data, the wait planner | -- | `[~]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
 | Three-thread pipelining, double buffering | -- | | x (resident T0/T1/T2 roles, `LAUNCH`/`KERNEL_WAIT`, `enable_dram`) | x | x both | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC

@@ -44,3 +44,6 @@ pub mod tensor;
 pub mod trace;
 
 mod local_movement;
+
+#[cfg(test)]
+mod hazard_corpus;

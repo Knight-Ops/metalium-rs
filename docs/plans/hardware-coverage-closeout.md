@@ -130,7 +130,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 - [ ] **X6: mover NIU fast path** (wave 2, after N). First gate NIU register persistence on ttsim and
   in an isolated probe. Gate: gather output byte-identical to the slow path plus release medians.
   Exit `[-]` if registers do not persist.
-- [ ] **P9: wait planner and `.ttinsn` fusion** (wave 3, after E/F/H/PU). The planner's waits must
+- [-] **P9: wait planner and `.ttinsn` fusion** (step121, host gate, no card; checker `tt_isa::hazard` over 954 builder role programs finds 0 missing waits and 1,724 redundant waits, so a planner has nothing to insert; `.ttinsn` needs a run-time code generator outside the instruction gate; seven negative controls watched failing). **P9: wait planner and `.ttinsn` fusion** (wave 3, after E/F/H/PU). The planner's waits must
   be a superset of today's hand-written `Before::` waits and keep the MNIST golden. `.ttinsn` is
   measured first; `[-]` if no measurable push bottleneck or if it weakens the build-time instruction
   gate.
