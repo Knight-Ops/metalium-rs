@@ -1,7 +1,7 @@
 # Hardware coverage close-out
 
 Active execution tracker for finishing [hardware-coverage.md](hardware-coverage.md) and
-[remaining-firmware-instructions.md](remaining-firmware-instructions.md). Started 2026-10-09.
+[remaining-firmware-instructions.md](../completed-plans/remaining-firmware-instructions.md). Started 2026-10-09.
 Done means every coverage row is `[x]` or a documented `[-]` with evidence and a supported
 alternative. A `[-]` exit is a legitimate outcome when the hardware cannot be driven safely or has no
 observable oracle; a guess presented as a result is not.
@@ -93,7 +93,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   compare already met, uncontended `ATGETM/ATRELM`, then blocking forms with the deadline active.
   The four Wormhole-only instructions are probed in isolation. Exit: an op whose isolated probe
   misbehaves becomes `[-]`; a blocking form is never exposed without the deadline path.
-- [~] **F: restricted MMIO** (steps 107-108; `PACR_SETREG` and `UNPACR_NOP_SETREG` `[-]`; the MMIO trio has host and ttsim gates and allowlisted PIC targets, silicon probes written but NOT run, held for a decision). **F: restricted MMIO** (`LOADREG`, `STOREREG`, `STOREIND_MMIO`, `PACR_SETREG`,
+- [x] **F: restricted MMIO** (steps 107-108; `PACR_SETREG` and `UNPACR_NOP_SETREG` `[-]`; the MMIO trio `[x]` on the allowlisted PIC words, host, ttsim and card-0 silicon gates pass, run one probe at a time with no reboot). **F: restricted MMIO** (`LOADREG`, `STOREREG`, `STOREIND_MMIO`, `PACR_SETREG`,
   `UNPACR_NOP_SETREG`). Owns `tt-isa/src/{mmio_reg.rs,pack_setreg.rs}`, not `datapath.rs`.
   Research first: one documented harmless, writable, host-readable register (reject anything below
   `0xFFB11000`); targets are an allowlist enum, never raw addresses. Exit: `[-]` for the MMIO
@@ -104,7 +104,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   delays, LReg16, predication; rejects collisions, the VDHi coupling and `SFPSWAP` restrictions.
   Gate: bit-for-bit against the ordinary sequence in the interpreter; mutants swap template and
   delay. Silicon-only (divergence 7). Exit: a contradicting sub-unit becomes a `[-]` sub-form.
-- [x] **MD: matrix diagnostics** (step111; `MOVDBGA2D` `[x]` for 1/8-row, formats, flush, bank ownership on card 0; `GATESRCRST` `[-]` `NoObservableOracle` after a clean isolated probe; the increment-1 `AddrMod` cases are an open shared-configuration issue also seen on the `MOVA2D` control, tests ignored). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
+- [x] **MD: matrix diagnostics** (step111; `MOVDBGA2D` `[x]` for 1/8-row, formats, flush, bank ownership on card 0; `GATESRCRST` `[-]` `NoObservableOracle` after a clean isolated probe; the increment-1 `AddrMod` cases are resolved: bit 14 widens a one-row move to four rows, the model and oracle match, and the six cases pass on card 0). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
   `GATESRCRST` needs an observable stale-versus-fresh difference with SrcB loaded through
   `MOVD2B`. Exit: `GATESRCRST` becomes `[-]` "no observable oracle" if both arms match.
 - [x] **PU: packer and unpacker modes** (steps 112-114; card 0: BF16 `UnpackToDst`, packer ReLU, edge masking, tileize all pass; unpacker transpose is not payload-preserving so M3/D5 are `[-]`; the 16-bit Dst read path preserves normals only; five negative controls watched failing on ttsim; not routed into Session/Burn ops). **PU: packer and unpacker modes.** Owns `tt-kernels/src/datapath.rs`. In order: packer ReLU,
@@ -113,7 +113,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   rebooted the host). The last sub-tranche also decides M3 and D5. Exit for M3/D5: `[-]` with the
   mover's `READ_TRANSPOSED`/repack as the payload-preserving contract and host or mover tilize as
   the alternatives.
-- [~] **N: NoC multicast, atomics, completion interrupts** (steps 115-117; host/ttsim 16/16; NoC atomics `[x]` on card 0 (21 forms); completion polling partly validated; IRQ handler `[-]`; multicast encoder/model done with ttsim 8/8 but its NoC-hang-class silicon probes are NOT run and held for a decision, so device multicast stays `[~]`). **N: NoC multicast, atomics, completion interrupts.** Owns `tt-isa/src/noc.rs` and a new
+- [x] **N: NoC multicast, atomics, completion interrupts** (steps 115-117; host/ttsim 16/16; NoC atomics `[x]` on card 0 (21 forms); completion polling `[x]` with the RTZ source sticky until cleared; IRQ handler `[-]`; multicast `[x]` on cards 0 and 1, probes run one at a time with no reboot). **N: NoC multicast, atomics, completion interrupts.** Owns `tt-isa/src/noc.rs` and a new
   probe bin; does not touch `mover.rs` until its gates pass. Multicast rectangle only from the
   ARC-discovered grid, writes only, completion by counting acknowledgements from the known
   recipients. Atomics from BH `NoC/Atomics.md`, L1 targets only. Interrupts: the
@@ -253,7 +253,7 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 
 ### Still open (updated 2026-10-10)
 1. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
-2. Moving this plan and `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1 is decided.
+2. Moving this plan to `docs/completed-plans/` once 1 is decided (`remaining-firmware-instructions.md` already moved 2026-10-10).
 
 Operational notes for whoever continues: lane agents never run silicon (the coordinator runs it,
 one test per process, UNVERIFIED encodings isolated first, a known-good gate between risky probes);

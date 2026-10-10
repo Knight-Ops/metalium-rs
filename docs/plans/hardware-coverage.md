@@ -1,6 +1,6 @@
 # Hardware coverage — Phase 10 tracker
 
-**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition, the open items (NoC multicast and MMIO silicon probes, X6) and the verification record. [Burn operation status](burn-op-coverage.md) is generated.
+**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition, the open items (mesh training traces and `copy_into`, both-card reruns of lanes validated on card 0, X7's small-transfer latency) and the verification record. NoC multicast, the MMIO trio and X6 ran on silicon on 2026-10-10. [Burn operation status](burn-op-coverage.md) is generated.
 
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
@@ -38,7 +38,11 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-05, 10.3–10.5 in progress)
+## Where things stand
+
+**As of 2026-10-10 every row in this plan is `[x]` or a documented `[-]`, except X7's small-transfer latency (`[~]`).** The prose below is the 2026-10-05 snapshot, kept as history; current status is in each row and in [hardware-coverage-closeout.md](hardware-coverage-closeout.md).
+
+### 2026-10-05 snapshot (10.3–10.5 in progress)
 
 Milestones 10.0–10.2 are complete. Since their close-out, rank-N storage and
 strided views, tile-aligned batched matmul, last-dimension reductions and some
@@ -354,7 +358,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[x]` widened readback over ~4096 sign/exponent/mantissa patterns on card 0 (step114) | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[x]` BF16 native ties-even late narrowing (step74); FP16: the raw packer truncates and saturates (matches ttsim), the rounding packer is ties-even for normals and overflows to infinity at 65520 but drops NaN payloads and flushes subnormals (`T7-MEASURE`, card 0), so shipped FP16 casts use exact SFPU programs instead (step143/144); the 16-bit Dst read path preserves normals only (zero/subnormal/NaN collapse, step114) | D1 |
 | BFP8/BFP4/BFP2 storage, exponent sharing, `CLREXPHIST` | `[x]` -- step92–96; histogram reset and BFP2 packed matmul are silicon-only where ttsim refuses | D2 (delivered formats) |
-| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
+| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[x]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 `[-]` (D3b: nothing would use an 8-bit device format) | D3, D3b |
 | Unpacker transpose / tilize modes, broadcast | tilize `[x]` payload-preserving strided gather (step113, card 0); transpose swaps the nibbles correctly but goes through SrcA and is not payload-preserving (`[-]` for M3); no unpacker broadcast mode exists | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | ReLU `[x]` (all seven modes against a raw-bit model, card 0) and edge masking `[x]` for the row-set path, partial columns, -inf fill and edge-then-ReLU order (step112); `PACR_SETREG` `[-]`; not routed into Session/Burn ops | S1 (opportunistic), D4 |
 
@@ -370,7 +374,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | x (`tt_kernels::trace`) | x | x | x both | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | `[-]` | | | | `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate; SFPU math programs are push-bound (39 of 73 kinds, median push/backend cycle ratio 1.17, max 2.87) and shrink through replay and `SFPLOADMACRO` schedules instead (P9, step121) |
-| Hazards as data, the wait planner | -- | `[~]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
+| Hazards as data, the wait planner | -- | `[-]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
 | Three-thread pipelining, double buffering | -- | | x (resident T0/T1/T2 roles, `LAUNCH`/`KERNEL_WAIT`, `enable_dram`) | x | x both | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
@@ -380,7 +384,7 @@ Pulled in only when a kernel needs them; each says which.
 | Feature | Spec | State | Wanted by |
 |---|---|---|---|
 | ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` stages config; `ADDDMAREG` steps matmul addresses (step38); scalar ALU/config readback done (step100); L1 transfers step101/102 `[x]`; `FLUSHDMA` `[-]`, use STALLWAIT | F3 (per-tile parameters without reprogramming) |
-| Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[ ]` | 9.8 page FIFO, if counters move into Tensix |
+| Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[x]` four-register `ATSWAP`; single-register form `[-]` | step106, card 0; 9.8 page FIFO |
 | `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[x]` step101/102, explicit copy/zero | D4 (copies without the B core) |
 | NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[x]` typed rectangle from the ARC-discovered grid, write-only encoder with `PATH_RESERVE`, acknowledgement counting against the known recipients, independent model (`tt_isa::noc::multicast`, step115); ttsim executes it fully (8 gates); on cards 0 and 1 the 1x2, 2x2/3x3 and full-grid probes (run one at a time, tile health checked between) deliver the payload to exactly the rectangle with guards unchanged and the one-column-wider mutant caught (2026-10-10); `NOC_BRCST_EXCLUDE` is written 0 and the VC class (buddy 0) is the choice that worked, not a documented layout | weight broadcast to many tiles (9.6 follow-up) |
 | NoC atomics | BH `NoC/Atomics.md` | `[x]` typed L1-only requests (variable-width increment, compare-and-swap, mask and indexed swap, eight Zaamo ops, six accumulate formats; `tt_isa::noc::atomic`) with independent decode-from-bits models; all 21 forms and both model mutants pass on card 0 (step116, neighbour tile, one process each); ttsim executes only the full-width increment (rows 88) | R1 across tiles |
@@ -402,16 +406,17 @@ Pulled in only when a kernel needs them; each says which.
 ### Tensix coprocessor instruction implementation checklist
 
 Remaining-work review (2026-10-07):
-[remaining-firmware-instructions.md](remaining-firmware-instructions.md)
+[remaining-firmware-instructions.md](../completed-plans/remaining-firmware-instructions.md)
 accounts for every pending mnemonic group, distinguishes existing encoding/probe
 evidence from missing helpers and semantic gates, and sequences implementation
 with explicit research/defer dispositions for unsupported forms. The latest completed tranche
 is [Stage D explicit healthy-bank handover](../completed-plans/explicit-unpacker-handover.md)
 (step104), following step100–103.
 
-Mnemonic-level instruction inventory: 92 completed checklist rows (`[x]`),
-16 pending rows (`[ ]`), and six deliberately omitted groups (`[-]`,
-`RMWCIB0..3`, `DOTPV`, `SHIFTXA`, `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`).
+Mnemonic-level instruction inventory (counted 2026-10-10): 102 completed checklist rows (`[x]`),
+no pending rows, and 11 `[-]` rows (`DOTPV`, `SHIFTXA`, `GATESRCRST`, `SETDVALID`, `REG2FLOP_ADC`,
+`UNPACR_NOP_SETREG`, `PACR_SETREG`, `STREAMWAIT`, `STREAMWRCFG`, `RMWCIB0..3`, `FLUSHDMA`). The
+single-register `ATSWAP` form and the L1 tag search accelerator are `[-]` too (see the `ATSWAP` row and the inventory table).
 These are grouped mnemonic rows, not a count of generated
 encodings: generated tables also contain variants and superseded Wormhole
 layouts. The earlier 68/47/4 totals were stale, and SETDMAREG was missing here.
@@ -578,7 +583,6 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 #### DMA Engine, Atomics & Registers
 - [x] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); compare already met, blocked-until-the-host-writes-the-word and blocked-until-the-other-role's-RISC-V-core-pokes-it pass on card 0 under a guarded run with a measured-rate deadline (step106). **A Tensix thread cannot be the producer:** a thread parked in `ATCAS`/`ATINCGETPTR` keeps every other thread from issuing any Scalar Unit instruction (confirmed on card 0, `blocked_atomic_monopolizes_the_scalar_unit`), so only the host or a RISC-V core can free it. WormholeOnly encoding; ttsim refuses it (row 77).
 - [x] `ATGETM` / `ATRELM`: typed `Mutex` (indices 0, 2, 3, 4 only), scoped acquire/release; uncontended on all indices and threads, contended round-robin handoff for every mutex and holder, the deadline/host-release path and negative controls pass on card 0 (step105). ttsim models only index 0 (row 76).
-- [ ] `ATRELM`: Atomic mutex release.
 - [x] `ATSWAP`: four-GPR group form, all 256 masks and aligned bases on card 0 (step106); the single-register form is `[-]` (lane placement matches neither the page nor a consistent rule; the sweep diagnostic is the evidence) and is unrepresentable in the API.
 - [x] `ATINCGET`: field width 1-32, wrapping, upper bits preserved, atomic across the three threads on card 0 (step106); WormholeOnly encoding, ttsim refuses it.
 - [x] `ATINCGETPTR`: checked geometry, independent FIFO model; the FIFO through wraps and the blocking pop (write counter poked) and push (read counter poked) gates pass on card 0 (step106). Same Scalar Unit rule as `ATCAS`; WormholeOnly encoding; ttsim refuses it.
@@ -658,7 +662,7 @@ reverse index.
           the same counted sum, and the lowered is under a quarter of the words
           (watched failing: one `MOP` dropped, short by exactly its five
           iterations). ttsim and both cards: a `MOP` looping a `REPLAY` on silicon.
-    - [~] **The matmul in loops** (`matmul::matmul_items`, lowered by
+    - [x] **The matmul in loops** (`matmul::matmul_items`, lowered by
           `loops::lower_with`):
       - [x] Faces in the order `fi`, `k`, `fj`: each `Dst` face still takes its
             `k = 0` product before its `k = 1` within a pair, so every datum

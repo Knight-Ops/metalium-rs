@@ -1,9 +1,9 @@
 # Remaining Tensix firmware instructions — implementation plan
 
-> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
+> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](../plans/hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
 
 Review date: 2026-10-07. Source of completion status:
-[hardware-coverage.md](hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
+[hardware-coverage.md](../plans/hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
 including the step97–104 acceptance and the current working-tree code.
 This is an implementation sequence; measured Stage D acceptance is recorded in
 its completed checklist and operating notes. Five pending rows are now
@@ -16,7 +16,7 @@ six deliberately omitted groups** (`RMWCIB0..3`, `DOTPV`, `SHIFTXA`,
 `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`). Groups include multiple forms:
 register/immediate operands, bank selections and micro-modes must be tracked
 individually during implementation. Step100 closes seven groups (card-0 run `1791379895`); see the
-[completed tranche](../completed-plans/scalar-config-foundation.md).
+[completed tranche](scalar-config-foundation.md).
 A generated encoder is not a checked API,
 semantic gate or kernel implementation.
 
@@ -56,9 +56,9 @@ The unchecked inventory needs these semantic corrections:
 
 Stages refer to the sequence below. Research rows stay open until they have an
 implemented or deliberately excluded disposition. Stage C is accepted in step103; see
-[source-bank clearing, release and shifting](../completed-plans/source-bank-clear-release-shift.md).
+[source-bank clearing, release and shifting](source-bank-clear-release-shift.md).
 Stage D is accepted as a separate healthy-bank handover tranche; see
-[its completed checklist](../completed-plans/explicit-unpacker-handover.md).
+[its completed checklist](explicit-unpacker-handover.md).
 Stage B is accepted in step101/102; its detailed plan is completed.
 
 | Group | Pending instructions | Next disposition |
@@ -130,7 +130,7 @@ forms and explicit waits can preserve their useful behavior.
 
 ### A — Configuration readback and scalar register foundation (7 groups)
 
-Tranche implementation and acceptance: [completed tranche](../completed-plans/scalar-config-foundation.md).
+Tranche implementation and acceptance: [completed tranche](scalar-config-foundation.md).
 `DMANOP` state-preservation coverage is accepted in Stage B. `FLUSHDMA` is
 deliberately excluded in favor of STALLWAIT.
 
@@ -156,7 +156,7 @@ scalar models/helpers in a new module if keeping them there obscures config APIs
 
 ### B — L1 access, local bulk movement and synchronization (4 groups)
 
-Detailed execution checklist: [l1-scalar-movement.md](../completed-plans/l1-scalar-movement.md).
+Detailed execution checklist: [l1-scalar-movement.md](l1-scalar-movement.md).
 
 Dependencies: completed A. Add checked scalar memory helpers and kernel-side declared
 buffer/address descriptors; firmware runner changes only if required for setup.
@@ -187,7 +187,7 @@ buffer/address descriptors; firmware runner changes only if required for setup.
 Dependencies: existing `matrix::Banks`; A/B supply readback and diagnostics.
 Step103 accepts all four constrained families (card-0 `1791397029`, 9/9;
 simulator 6/6). Both-physical-bank, nonzero clear and retained-bank release
-variants remain explicitly deferred in the [tranche plan](../completed-plans/source-bank-clear-release-shift.md).
+variants remain explicitly deferred in the [tranche plan](source-bank-clear-release-shift.md).
 
 - [x] `ZEROSRC`: typed A/B selection and current-bank ownership; distinguish
   unpacker-selected versus matrix-selected banks. Allow both-bank clearing only
