@@ -12,7 +12,13 @@ fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute(
     assert!(float.contains(DTypeUsage::Arithmetic) && float.contains(DTypeUsage::Accelerated));
     let int = TtBackend::dtype_usage(&d, DType::I32);
     assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
-    assert!(TtBackend::dtype_usage(&d, DType::F16).is_empty());
+    // F16 is raw storage with exact device casts, not compute (lane T7).
+    let half = TtBackend::dtype_usage(&d, DType::F16);
+    assert!(
+        half.contains(DTypeUsage::Storage)
+            && !half.contains(DTypeUsage::Arithmetic)
+            && !half.contains(DTypeUsage::Accelerated)
+    );
     assert!(TtBackend::dtype_usage(&d, DType::BF16).contains(DTypeUsage::Accelerated));
     assert!(TtBackend::dtype_usage(&d, DType::F64).is_empty());
 }
@@ -128,7 +134,7 @@ fn unsupported_boolean_conversion_dtypes_name_operation_and_input() {
         );
         let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if float {
-                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_float(tensor, FloatDType::F16)
+                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_float(tensor, FloatDType::F64)
             } else {
                 <TtBackend as BoolTensorOps<TtBackend>>::bool_into_int(tensor, IntDType::I64)
             }
