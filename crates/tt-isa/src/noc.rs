@@ -176,6 +176,10 @@ pub const fn endpoint_tile_index(endpoint_id: u32) -> u8 {
     (endpoint_id & 0xFF) as u8
 }
 
+pub mod atomic;
+pub mod multicast;
+pub mod probe;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +284,10 @@ pub mod niu {
         /// Write 1 to issue; hardware clears it once the request has a VC.
         /// Software must not touch the initiator while it reads 1.
         pub const CMD_CTRL: u64 = 0x40;
+        /// `NOC_BRCST_EXCLUDE` (`MemoryMap.md`): "for broadcast requests,
+        /// additional configuration allowing for non-rectangular broadcasts".
+        /// The page gives it no bit layout, so a broadcast writes it zero.
+        pub const BRCST_EXCLUDE: u64 = 0x2C;
     }
 
     /// `NIU_MST_REQS_OUTSTANDING_ID(id)` (`Counters.md`): back to zero once every
@@ -288,6 +296,31 @@ pub mod niu {
     pub const fn reqs_outstanding(id: TxnId) -> u64 {
         0x0200 + (16 + id.0 as u64) * 4
     }
+
+    /// `NIU_MST_ATOMIC_RESP_RECEIVED` (`Counters.md`, index 0): 32 bits, wraps.
+    pub const ATOMIC_RESP_RECEIVED: u64 = 0x0200;
+    /// `NIU_MST_WR_ACK_RECEIVED` (`Counters.md`, index 1): one per write
+    /// acknowledgement that reaches this NIU, 32 bits, wraps. A broadcast write
+    /// with `NOC_CMD_RESP_MARKED` is acknowledged by *every* recipient, so this
+    /// is the counter that sees a multicast complete ([`super::multicast::AckCount`]).
+    pub const WR_ACK_RECEIVED: u64 = 0x0204;
+    /// Write `1 << id` to zero `NIU_MST_REQS_OUTSTANDING_ID(id)`
+    /// (`Counters.md`, "Clear NIU transaction ID counters"). A broadcast with
+    /// `RESP_MARKED` leaves its ID's counter non-zero (one increment, one
+    /// decrement per recipient), so the ID is cleared after the acks are counted.
+    pub const CLEAR_OUTSTANDING: u64 = 0x0060;
+    /// `NIU_TRANS_COUNT_RTZ_CFG` (`MemoryMap.md`): bit `i` (0..16) lets a
+    /// positive-to-zero transition of ID `i`'s counter raise the NIU IRQ.
+    pub const TRANS_COUNT_RTZ_CFG: u64 = 0x0178;
+    /// `NIU_TRANS_COUNT_RTZ_CLR`: writing `X` does `SOURCE &= !X`; reads 0.
+    pub const TRANS_COUNT_RTZ_CLR: u64 = 0x017C;
+    /// `NIU_TRANS_COUNT_RTZ_NUM`: the index of one set bit of
+    /// `SOURCE & CFG[15:0]`, else 0. **Reading it clears that bit of `SOURCE`**
+    /// unless `CFG` bit 28 (`RC_DISABLE`) is set.
+    pub const TRANS_COUNT_RTZ_NUM: u64 = 0x0378;
+    /// `NIU_TRANS_COUNT_RTZ_SOURCE`: bit `i` is set (and stays set until cleared)
+    /// whenever ID `i`'s `NIU_MST_REQS_OUTSTANDING_ID` goes from positive to zero.
+    pub const TRANS_COUNT_RTZ_SOURCE: u64 = 0x037C;
 
     /// `NOC_PACKET_TRANSACTION_ID`, `0..16` (`MemoryMap.md`, `NOC_PACKET_TAG`).
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -420,7 +453,7 @@ pub mod niu {
     }
 
     impl Endpoint {
-        const fn hi(self) -> u32 {
+        pub(crate) const fn hi(self) -> u32 {
             (self.x as u32 & 0x3F) | ((self.y as u32 & 0x3F) << 6)
         }
     }
@@ -497,16 +530,16 @@ pub mod niu {
         PortNoc,
     }
 
-    const CMD_WR: u32 = 2;
-    const CMD_RD: u32 = 0;
-    const CMD_AT: u32 = 1;
+    pub(crate) const CMD_WR: u32 = 2;
+    pub(crate) const CMD_RD: u32 = 0;
+    pub(crate) const CMD_AT: u32 = 1;
     /// `NOC_AT_LEN_BE`'s opcode for an increment (`Bits32.lua`,
     /// `NOC_AT_LEN_BE_Increment`: bits 12..16 = 1).
     const AT_INCREMENT: u32 = 1 << 12;
     const WR_INLINE: u32 = 1 << 3;
-    const RESP_MARKED: u32 = 1 << 4;
+    pub(crate) const RESP_MARKED: u32 = 1 << 4;
     /// `NOC_CMD_VC_STATIC` with `NOC_CMD_STATIC_VC` = class `0b00`, buddy 1.
-    const STATIC_VC_1: u32 = (1 << 7) | (1 << 13);
+    pub(crate) const STATIC_VC_1: u32 = (1 << 7) | (1 << 13);
 
     impl Command {
         /// The initiator registers to write, in order, before `CMD_CTRL`, for
@@ -867,7 +900,7 @@ pub mod niu {
         }
     }
 
-    fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
+    pub(crate) fn check_copy(src: u32, dst: u32, len: u32) -> Result<(), RequestError> {
         if len == 0 || len > MAX_REQUEST_BYTES {
             return Err(RequestError::Length);
         }

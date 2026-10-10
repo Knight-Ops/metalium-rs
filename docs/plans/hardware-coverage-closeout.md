@@ -113,7 +113,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   rebooted the host). The last sub-tranche also decides M3 and D5. Exit for M3/D5: `[-]` with the
   mover's `READ_TRANSPOSED`/repack as the payload-preserving contract and host or mover tilize as
   the alternatives.
-- [ ] **N: NoC multicast, atomics, completion interrupts.** Owns `tt-isa/src/noc.rs` and a new
+- [~] **N: NoC multicast, atomics, completion interrupts** (steps 115-117; host/ttsim 16/16; NoC atomics `[x]` on card 0 (21 forms); completion polling partly validated; IRQ handler `[-]`; multicast encoder/model done with ttsim 8/8 but its NoC-hang-class silicon probes are NOT run and held for a decision, so device multicast stays `[~]`). **N: NoC multicast, atomics, completion interrupts.** Owns `tt-isa/src/noc.rs` and a new
   probe bin; does not touch `mover.rs` until its gates pass. Multicast rectangle only from the
   ARC-discovered grid, writes only, completion by counting acknowledgements from the known
   recipients. Atomics from BH `NoC/Atomics.md`, L1 targets only. Interrupts: the

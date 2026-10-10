@@ -105,6 +105,14 @@ pub const TAG_SEARCH_B: Image = (
     tt_isa::dm::IMAGE_BASE,
 );
 
+/// The NoC atomic, multicast and completion probe (`tt-firmware/src/bin/noc_probe_b.rs`)
+/// for RISCV B, at L1 0.
+pub const NOC_PROBE_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_NOC_PROBE_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+
 /// The instruction-cache probes for T0, T1 and T2, each at its core's
 /// default reset PC.
 pub const ICACHE_T: [Image; 3] = [
@@ -126,7 +134,7 @@ pub const ICACHE_T: [Image; 3] = [
 ];
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 18] = [
+const ENTRIES: [(&str, &str); 19] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
@@ -145,6 +153,7 @@ const ENTRIES: [(&str, &str); 18] = [
     ("icache_t1", env!("FIRMWARE_ICACHE_T1_ENTRY")),
     ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
     ("tag_search_b", env!("FIRMWARE_TAG_SEARCH_B_ENTRY")),
+    ("noc_probe_b", env!("FIRMWARE_NOC_PROBE_B_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -196,7 +205,11 @@ mod tests {
     /// T0's entry point.
     #[test]
     fn the_data_mover_is_linked_where_b_starts() {
-        for (name, (core, image, at)) in [("dm_b", DM_B), ("tag_search_b", TAG_SEARCH_B)] {
+        for (name, (core, image, at)) in [
+            ("dm_b", DM_B),
+            ("tag_search_b", TAG_SEARCH_B),
+            ("noc_probe_b", NOC_PROBE_B),
+        ] {
             assert_eq!(entry(name).map(u64::from), Some(at));
             assert_eq!(at, core.default_reset_pc() as u64);
             assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);

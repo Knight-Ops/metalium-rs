@@ -32,6 +32,7 @@ const BINARIES: &[&str] = &[
     "icache_t1",
     "icache_t2",
     "tag_search_b",
+    "noc_probe_b",
 ];
 
 const TARGET: &str = "riscv32im-unknown-none-elf";
