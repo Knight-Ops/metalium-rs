@@ -376,7 +376,7 @@ fn dst_clear(rows: u32) -> Vec<Instruction> {
     p
 }
 
-fn word_bytes(words: &[u32]) -> Vec<u8> {
+pub(crate) fn word_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 

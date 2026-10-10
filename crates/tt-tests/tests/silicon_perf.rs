@@ -959,7 +959,7 @@ fn role_push_rate() {
     });
 }
 
-/// What `MathMode::Approx` saves per tile (S10; lane T8): each transcendental
+/// What `MathMode::Approx` saves per tile (S10): each transcendental
 /// with an Approx twin, in both modes, one op's wall time on one unit by tiles
 /// and the slope, the median of seven after a warm-up -- beside the
 /// instruction counts `step145_approx_math` prints. The data is checked: each

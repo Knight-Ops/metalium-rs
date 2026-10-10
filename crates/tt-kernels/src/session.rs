@@ -102,7 +102,7 @@ pub enum SessionError {
         healthy: usize,
         wedged: Vec<(u8, u8)>,
     },
-    /// `TT_MATH` named no math mode (lane T8, `sfpu::approx::MathMode`).
+    /// `TT_MATH` named no math mode (`sfpu::approx::MathMode`).
     Math(String),
 }
 
@@ -386,7 +386,7 @@ pub struct Session<T: Transport> {
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
-    /// How the transcendentals run ([`Session::set_math_mode`]; lane T8).
+    /// How the transcendentals run ([`Session::set_math_mode`]).
     math: crate::sfpu::approx::MathMode,
     /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
     barriers: u32,
@@ -1983,7 +1983,7 @@ impl<T: Transport> Session<T> {
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
     }
 
-    /// Lane T6: whether the transport is the simulator, which picks the PRNG
+    /// Whether the transport is the simulator, which picks the PRNG
     /// model's lane initialisation (`prng::Target`).
     pub fn is_simulated(&mut self) -> bool {
         self.dev.transport().is_simulated()

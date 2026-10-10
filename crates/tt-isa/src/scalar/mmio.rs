@@ -5,7 +5,7 @@
 //! `0xFFB1_1000` undefined behaviour while the rest of the window holds the TDMA,
 //! debug, PIC, NoC and overlay registers, most of which are destructive. Blackhole
 //! has no `LOADREG`/`STOREREG`/`STOREIND` page at all (all three layouts are
-//! `UNVERIFIED`, see `docs/plans/hardware-coverage-closeout.md` lane F), so the
+//! `UNVERIFIED`, see `docs/completed-plans/hardware-coverage-closeout.md`), so the
 //! only addresses these helpers will name are an allowlist of [`Scratch`] words.
 //!
 //! # The one allowlisted target class

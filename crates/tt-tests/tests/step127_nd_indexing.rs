@@ -1,4 +1,4 @@
-//! `float/int_gather_nd` and `float/int_scatter_nd` on the device (lane T2).
+//! `float/int_gather_nd` and `float/int_scatter_nd` on the device.
 //!
 //! The oracles are independent of the implementation: a host reference built from
 //! the definition (row `sum_j i_j * stride_j` of the `[P, R]` view; sequential

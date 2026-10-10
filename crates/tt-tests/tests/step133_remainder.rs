@@ -1,4 +1,4 @@
-//! Lane T4 gate (`float_remainder`, `float_remainder_scalar`): the exact
+//! Gate (`float_remainder`, `float_remainder_scalar`): the exact
 //! remainder on the SFPU.
 //!
 //! `burn-flex` 0.21 computes `((a % b) + b) % b` in `f32`: an exact `fmod`, an

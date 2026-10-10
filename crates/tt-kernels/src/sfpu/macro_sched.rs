@@ -1,4 +1,4 @@
-//! A schedule model for `SFPLOADMACRO` (hardware-coverage S9, lane H).
+//! A schedule model for `SFPLOADMACRO` (hardware-coverage S9).
 //!
 //! ttsim does not execute `SFPLOADMACRO` (divergence row 7), so this is the only
 //! oracle for what a configured macro does. It is written from

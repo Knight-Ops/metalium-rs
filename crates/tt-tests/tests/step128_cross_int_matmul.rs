@@ -1,4 +1,4 @@
-//! `float_cross` and `int_matmul` on the device (lane T2).
+//! `float_cross` and `int_matmul` on the device.
 //!
 //! # `float_cross`
 //!

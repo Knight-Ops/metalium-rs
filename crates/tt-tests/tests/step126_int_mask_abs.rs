@@ -1,4 +1,4 @@
-//! Lane T1 gate (`hardware-coverage-closeout.md`): `int/bool_mask_{where,fill}`, `int_abs`,
+//! Gate: `int/bool_mask_{where,fill}`, `int_abs`,
 //! `int_cast`, and the Burn defaults they unblock (`int_clamp*`, `int_sign`, `int_max_abs*`).
 //!
 //! The selects and `int_abs` are raw-word SFPU programs (`kind_sfpu::INT_MASK_WHERE`,

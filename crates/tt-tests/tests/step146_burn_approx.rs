@@ -1,4 +1,4 @@
-//! Lane T8 gate (S10) through Burn: `TtDevice::set_math_mode`.
+//! Gate (S10) through Burn: `TtDevice::set_math_mode`.
 //!
 //! `burn_tt::TtDevice::set_math_mode(MathMode::Approx)` makes `exp`, `log`,
 //! `recip`, `sigmoid`, `tanh` and `gelu` run the fast programs

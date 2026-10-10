@@ -1,4 +1,4 @@
-//! Unpacker input modes (lane PU, sub-tranche 4; decides M3 and D5).
+//! Unpacker input modes (PU sub-tranche 4; decides M3 and D5).
 //!
 //! Two modes are documented for Blackhole (`UNPACR_Regular.md`, conditionalized):
 //!

@@ -1,4 +1,4 @@
-//! Lane T6 (S7), step 141: seeded random on the device -- the tile kernel and
+//! S7, step 141: seeded random on the device -- the tile kernel and
 //! the distributions built on it, against the host model of `step140`.
 //!
 //! Oracles (independent of the programs): `tt_kernels::prng`'s pure-Rust model
@@ -10,7 +10,7 @@
 //! must equal `Target::Silicon`'s, whose lane constant is PENDING MEASUREMENT
 //! (`step140::lane_initialisation_matches_the_model`, run first).
 //!
-//! Negative control (watched to fail, recorded in the lane report): remove the
+//! Negative control (watched to fail, recorded in the close-out record): remove the
 //! seed directive (`Kernel::seeded` pushing no directive) and a tile that follows
 //! another on the same core draws the stale stream, so `every_tile_restarts`
 //! fails against the model.

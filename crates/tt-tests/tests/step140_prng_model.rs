@@ -1,4 +1,4 @@
-//! Lane T6 (S7), step 140: the host model of the hardware PRNG stream, and the
+//! S7, step 140: the host model of the hardware PRNG stream, and the
 //! pinned statistical claims made on it.
 //!
 //! * `lane_initialisation_matches_the_model` is the only device arm: it restarts
@@ -13,7 +13,7 @@
 //!   stream, for both targets (a ttsim device draw equals the `Ttsim` model bit
 //!   for bit -- `step141`).
 //!
-//! Negative controls (each watched to fail, recorded in the lane report):
+//! Negative controls (each watched to fail, recorded in the close-out record):
 //! the raw LFSR words fail the pair tests; a generator with its low bits
 //! masked fails the low-bit chi-square; a weaker mixer fails the adjacent-lane
 //! pair test.

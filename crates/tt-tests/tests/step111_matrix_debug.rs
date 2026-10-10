@@ -661,7 +661,7 @@ fn simulator_mova2d_control_matches_the_debug_model() {
     });
 }
 
-/// ttsim refuses every `MOVDBGA2D` form this lane builds (divergence row 83),
+/// ttsim refuses every `MOVDBGA2D` form this module builds (divergence row 83),
 /// while an eight-row `MOVA2D` of the same shape survives each time.
 #[test]
 #[cfg(not(feature = "silicon"))]
@@ -748,7 +748,7 @@ fn simulator_runs_the_cache_experiment_arms() {
     });
 }
 
-/// `GATESRCRST` on ttsim: see the divergence row 84 text in the lane report.
+/// `GATESRCRST` on ttsim: see the divergence row 84 text in the close-out record.
 #[test]
 #[cfg(not(feature = "silicon"))]
 fn simulator_gatesrcrst_probe() {

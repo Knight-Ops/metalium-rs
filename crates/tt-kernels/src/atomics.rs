@@ -38,7 +38,7 @@
 //! `guard::ABANDONED`, and the tile must be treated as wedged.
 
 use crate::l1::{Buf, Plan, Requirements};
-use crate::runtime::{RoleImages, SemaphoreInit};
+use crate::runtime::{word_bytes, RoleImages, SemaphoreInit};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tt_device::core_control::{WaitError, CYCLES_PER_POLL};
@@ -387,10 +387,6 @@ pub struct Launch<N: NocId> {
     window: tt_device::Window,
     cores: Vec<tt_isa::tensix::Core>,
     read_back: Vec<(u64, usize)>,
-}
-
-fn word_bytes(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 /// Start `spec` on `tile`: backend released, semaphores initialised by a setup

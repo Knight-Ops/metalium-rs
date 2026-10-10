@@ -1,4 +1,4 @@
-//! `SFPLOADMACRO` (hardware-coverage S9, lane H): the macro configuration helper,
+//! `SFPLOADMACRO` (hardware-coverage S9): the macro configuration helper,
 //! a schedule model, and the silicon probes that decide whether the page is true.
 //!
 //! ttsim does not execute `SFPLOADMACRO` (divergence row 7, watched by

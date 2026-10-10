@@ -107,7 +107,7 @@ impl Cond {
             Cond::Eq0(r) => (r, 6),
             Cond::Less(a, b) => return encode::sfpgt(a.index(), b.index(), 1).unwrap(),
             // `SFPLE` holds where `VD <= VC`: `a` is `VD`, and a `VD` of 12 or
-            // more is a template load (the interpreter refuses it; lane T8).
+            // more is a template load (the interpreter refuses it).
             Cond::LessEq(a, b) => {
                 assert!(
                     a.index() < 12,

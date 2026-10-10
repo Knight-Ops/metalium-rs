@@ -1,4 +1,4 @@
-//! Lane T8 gate (S10): `MathMode::{Precise, Approx}` on the device.
+//! Gate (S10): `MathMode::{Precise, Approx}` on the device.
 //!
 //! The Approx programs (`tt_kernels::sfpu::approx`) are approximations with
 //! their own derived bounds, so held twice, as `step29_exp_log` holds the
@@ -9,7 +9,7 @@
 //! (`Session::set_math_mode`, `TT_MATH=approx`); Precise stays the default
 //! and bit-identical to today.
 //!
-//! Negative controls (watched to fail, recorded in the lane report):
+//! Negative controls (watched to fail, recorded in the close-out record):
 //! * `Approx` must break the Precise bound somewhere (`approx_breaks_...`:
 //!   mutate `MathMode::lower` to return the kind unchanged);
 //! * alternating the modes in one session must give different bits (mutate the
@@ -636,7 +636,7 @@ fn ragged_approx_outputs_into_reduction_and_matmul() {
     });
 }
 
-/// The table the lane reports: instructions per tile, Precise against
+/// The reported table: instructions per tile, Precise against
 /// Approx, from the programs the device runs.
 #[test]
 fn instruction_counts_per_tile() {

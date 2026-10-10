@@ -1,4 +1,4 @@
-//! BF16 `UnpackToDst` (lane PU, sub-tranche 3; closes the D1 inventory row).
+//! BF16 `UnpackToDst` (PU sub-tranche 3; closes the D1 inventory row).
 //!
 //! `UNPACR_Regular.md`'s `FormatConversion` sends a BF16 input converted to BF16
 //! with `UnpackToDst` to `Dst16b[Row][Col]` as `DstEncodeBF16(DatumBits)` -- a

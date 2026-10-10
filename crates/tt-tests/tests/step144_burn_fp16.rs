@@ -1,4 +1,4 @@
-//! Phase 10 gate (D1, lane T7): FP16 through Burn.
+//! Phase 10 gate (D1): FP16 through Burn.
 //!
 //! `DType::F16` is IEEE binary16 in BF16's two-byte physical slots: a storage and
 //! cast dtype. Raw views and uploads keep every bit pattern and move two bytes per

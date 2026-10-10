@@ -1,4 +1,4 @@
-//! Mesh trace capture and replay (`hardware-coverage.md` R4, lane T9).
+//! Mesh trace capture and replay (`hardware-coverage.md` R4).
 //!
 //! A two-chip [`burn_tt::MeshEngine`] captures what a distributed product or
 //! attention forward enqueues on every chip, with the Ethernet transfers

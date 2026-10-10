@@ -1,4 +1,4 @@
-//! Phase 10 gate (D1, lane T7): FP16 (IEEE binary16) tensors in GDDR.
+//! Phase 10 gate (D1): FP16 (IEEE binary16) tensors in GDDR.
 //!
 //! The stored format is IEEE binary16 in BF16's 2112-byte physical slot. The
 //! coprocessor's own FP16 differs from IEEE (no NaN, `Exp == 31` finite,

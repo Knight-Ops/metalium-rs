@@ -6,7 +6,7 @@
 //! (`WormholeB0/TensixTile/TensixCoprocessor/AT{CAS,SWAP,INCGET,INCGETPTR}.md`),
 //! the generated layouts are `WormholeOnly`, and ttsim refuses all four
 //! (divergence row 77), so nothing below is evidence until the silicon gates
-//! have run. The silicon request order is in `docs/plans/hardware-coverage-closeout.md`:
+//! have run. The silicon request order is in `docs/completed-plans/hardware-coverage-closeout.md`:
 //! `ATINCGET`, `ATSWAP`, `ATCAS` with its compare already met, then the blocking
 //! forms with a producer on another thread and the deadline active.
 //!
@@ -713,7 +713,7 @@ mod silicon_gates {
     /// Wormhole page puts `GPR8.lo`; registers 9 and 10 touched halfwords 4 and
     /// 5 only; 11 halfwords 6 and 7; 16 only halfword 1; 17 and 18 halfwords 0
     /// and 1; 19 halfword 0 plus 2 and 3), while the four-GPR form matched the
-    /// page for all 256 masks. See the run ids in the lane report.
+    /// page for all 256 masks. See the run ids in the close-out record.
     #[test]
     fn atswap_single_form_sweep_diagnostic() {
         harness::in_device(|dev| {

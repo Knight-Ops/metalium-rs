@@ -1,4 +1,4 @@
-//! Lane T4 gate, Burn level: `float_remainder` and `float_remainder_scalar`
+//! Gate, Burn level: `float_remainder` and `float_remainder_scalar`
 //! are `burn-flex`'s `((a % b) + b) % b` bit for bit, native on the device.
 //!
 //! Against Flex itself (the external oracle; the kernel-level oracles are in

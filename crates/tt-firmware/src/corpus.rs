@@ -787,7 +787,7 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    /// Lane T6: honour a seed directive (`tt_isa::dataflow::seed_directive`)
+    /// Honour a seed directive (`tt_isa::dataflow::seed_directive`)
     /// at the head of the program, and return the first word to push (past it).
     /// The coprocessor is drained, the seed goes to the PRNG seed register by a
     /// full-width RISC-V store, a fence publishes it, and the settling interval

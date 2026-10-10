@@ -370,7 +370,7 @@ mod simulator {
 }
 
 // ---------------------------------------------------------------------------
-// Silicon-only arms. Written, compiled, NOT run by the lane that wrote them.
+// Silicon-only arms. Written, compiled, not run when written.
 // Run order: the three `silicon_probe_*` tests first, one per session, then the
 // gates. Every one is isolated in `in_device`'s fork.
 // ---------------------------------------------------------------------------

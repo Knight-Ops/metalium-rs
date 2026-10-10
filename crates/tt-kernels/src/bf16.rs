@@ -64,7 +64,7 @@ impl Bf16Tensor {
     }
 }
 
-fn transfer(range: DramRange, read: bool, l1: u64, bytes: u32) -> [u32; 8] {
+pub(crate) fn transfer(range: DramRange, read: bool, l1: u64, bytes: u32) -> [u32; 8] {
     [
         if read { op::READ } else { op::WRITE },
         range.channel().index() as u32,
