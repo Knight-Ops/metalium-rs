@@ -855,3 +855,191 @@ pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
     p.extend(pack_rows(TILE_DST_ROWS));
     p
 }
+
+/// The optional packer stages of [`tt_isa::pack_modes`], staged together with
+/// the shared `Config` words they live in.
+///
+/// [`pack_config`] leaves the stages as `Config`'s reset state (ReLU off,
+/// every datum kept); this is the explicit, checked way to turn one on.
+/// **UNVERIFIED on Blackhole** (`Packers/{ReLU,EdgeMasking}.md` are
+/// Wormhole-only pages): the gate is `step112_packer_relu_edge`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PackStages {
+    pub relu: tt_isa::pack_modes::PackerRelu,
+    pub edge: tt_isa::pack_modes::EdgeMasking,
+    /// `ALU_ACC_CTRL_Zero_Flag_disabled_src`, which shares `Config` word 2 with
+    /// ReLU, so staging ReLU must say what it should be.
+    pub zero_flag_disabled_src: bool,
+    /// Write every word of the stages, including the ones ttsim refuses
+    /// (`EdgeMasking::apply_all`): silicon, so nothing is left to the last program.
+    pub exhaustive: bool,
+}
+
+impl PackStages {
+    /// Both stages off: what a whole-word write must restore after a gate.
+    pub const OFF: Self = Self {
+        relu: tt_isa::pack_modes::PackerRelu::OFF,
+        edge: tt_isa::pack_modes::EdgeMasking::OFF,
+        zero_flag_disabled_src: false,
+        exhaustive: false,
+    };
+
+    pub fn apply(&self, words: &mut ConfigWords) -> Result<(), tt_isa::pack_modes::PackModeError> {
+        self.relu.apply(words, self.zero_flag_disabled_src)?;
+        if self.exhaustive {
+            self.edge.apply_all(words)
+        } else {
+            self.edge.apply(words)
+        }
+    }
+}
+
+/// [`pack_tile_from_dst`] with `stages` on: the packer's configuration is
+/// rewritten whole, so the stages ride in the same `WRCFG` run.
+pub fn pack_tile_from_dst_staged(
+    l1_dest: u64,
+    row: u32,
+    stages: &PackStages,
+) -> Result<Vec<Instruction>, tt_isa::pack_modes::PackModeError> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
+    let mut words = ConfigWords::new();
+    pack_config(&mut words, l1_dest);
+    words
+        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap();
+    stages.apply(&mut words)?;
+    p.extend(config_program(&words));
+    p.push(
+        backend::stallwait(
+            backend::block::PACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.extend(pack_rows(TILE_DST_ROWS));
+    Ok(p)
+}
+
+// ---- BF16 into `Dst` (`UnpackToDst`, D1) -----------------------------------
+//
+// `UNPACR_Regular.md`'s `FormatConversion`: with `UnpackToDst`, a BF16 input
+// converted to BF16 is `DstEncodeBF16(DatumBits)` and goes to `Dst16b[Row][Col]`
+// (`Dst32b` is only for FP32/TF32/INT32 outputs). ttsim refuses it (divergence
+// row 31); silicon accepts it (`silicon_measure::m08_bf16_unpack_to_dst`), and
+// `step114_bf16_unpack_to_dst` is the gate.
+
+/// The `THCON_SEC*_REG*_*_data_format` code of BF16 (`L1Format::Bf16.code()`).
+pub fn bf16_code() -> u32 {
+    L1Format::Bf16.code().expect("BF16's code is measured")
+}
+
+/// A flat run of `datums` BF16 datums, as [`flat_descriptor`] is for FP32.
+pub fn bf16_flat_descriptor(datums: u32) -> TileDescriptor {
+    flat_descriptor(datums).with_in_data_format_raw(bf16_code())
+}
+
+/// A BF16 tile image of raw 16-bit patterns, header included, the way
+/// [`staged_image`] stages FP32.
+pub fn staged_bf16_image(descriptor: TileDescriptor, patterns: &[u16]) -> Vec<u8> {
+    let image = TileImage::new(descriptor, L1Format::Bf16).unwrap();
+    let mut staged = vec![0u8; image.total_bytes()];
+    for (i, &p) in patterns.iter().enumerate() {
+        let off = image.datum_bit_offset(i) / 8;
+        staged[off..off + 2].copy_from_slice(&p.to_le_bytes());
+    }
+    staged
+}
+
+/// Unpacker 0 for BF16 in, BF16 out, to `Dst` ([`unpack_config`] with the output
+/// format retargeted; `descriptor` must be a [`bf16_flat_descriptor`]).
+///
+/// The result is `Dst16b`: BF16 rows of sixteen, `Dst` row `OutAddr / 16 - 4`.
+/// A [`unpack_datums_to_dst`] after it retargets base and row as for FP32. Only
+/// the first eight of every sixteen `Dst16b` rows are visible through the
+/// firmware's FP32 dump (the 32-bit view pairs row `r` with `r + 8`).
+pub fn unpack_bf16_config(words: &mut ConfigWords, descriptor: TileDescriptor, l1_base: u64) {
+    assert_eq!(
+        descriptor.in_data_format_raw(),
+        bf16_code(),
+        "a BF16 descriptor"
+    );
+    unpack_config(words, descriptor, l1_base);
+    words
+        .set(thcon::THCON_SEC0_REG2_Out_data_format, bf16_code())
+        .unwrap();
+}
+
+/// The packer reading `Dst16b` (BF16) and writing BF16 to `l1_dest`: [`pack_config`]
+/// with the 16-bit read path -- `Read_32b_data` clear, a 32-byte `Dst` row stride,
+/// BF16 both ways, and `Fp32_enabled` clear. **UNVERIFIED on Blackhole**
+/// (`Packers/InputAddressGenerator.md` is a Wormhole page).
+pub fn pack_bf16_dst16_config(words: &mut ConfigWords, l1_dest: u64) {
+    pack_config(words, l1_dest);
+    words
+        .set(thcon::THCON_SEC0_REG1_In_data_format, bf16_code())
+        .unwrap()
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, bf16_code())
+        .unwrap()
+        .set(pack0::PCK_DEST_RD_CTRL_Read_32b_data, 0)
+        .unwrap()
+        .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride, DST_ROW_BYTES / 2)
+        .unwrap()
+        .set(alu::ALU_ACC_CTRL_Fp32_enabled, 0)
+        .unwrap();
+}
+
+/// [`pack_tile_from_dst`] for BF16 in `Dst16b`: `Dst` rows `row..row + 64` to
+/// `l1_dest` as 1024 BF16 datums, no header.
+pub fn pack_bf16_tile_from_dst16(l1_dest: u64, row: u32) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
+    let mut words = ConfigWords::new();
+    pack_bf16_dst16_config(&mut words, l1_dest);
+    words
+        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap();
+    p.extend(config_program(&words));
+    p.push(
+        backend::stallwait(
+            backend::block::PACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.extend(pack_rows(TILE_DST_ROWS));
+    p
+}
+
+// ---- unpacker input modes: tileize and transpose (M3, D5) --------------------
+//
+// `tt_isa::unpack_modes` has the checked field staging; these are the program
+// builders `step113_unpacker_modes` gates. Both are UNVERIFIED on Blackhole
+// silicon. ttsim models both (tileize with Blackhole's 32-datum input rows;
+// transpose on unpacker 0 into `SrcA`) and refuses transpose with
+// `UnpackToDst` by name.
+
+/// Unpacker 0 for FP32 into `Dst` reading `datums` datums of a row-major
+/// matrix: 32 datums from each input row, the rows `row_stride_bytes` apart
+/// (`Tileize_mode`). [`unpack_config`] with the mode staged over it.
+pub fn unpack_tileize_config(
+    words: &mut ConfigWords,
+    descriptor: TileDescriptor,
+    l1_base: u64,
+    row_stride_bytes: u32,
+) -> Result<(), tt_isa::unpack_modes::UnpackModeError> {
+    unpack_config(words, descriptor, l1_base);
+    tt_isa::unpack_modes::stage_tileize(words, row_stride_bytes, 32)
+}
+
+/// Unpacker 0 into `SrcA` ([`unpack_src_config`]) with transpose staged:
+/// each 16x16 block of `SrcA` rows is written transposed.
+pub fn unpack_src_transposed_config(
+    words: &mut ConfigWords,
+    descriptor: TileDescriptor,
+    l1_base: u64,
+    out: u32,
+) -> Result<(), tt_isa::unpack_modes::UnpackModeError> {
+    unpack_src_config(words, Unpacker::SrcA, descriptor, l1_base, out);
+    tt_isa::unpack_modes::stage_transpose(words, false)
+}

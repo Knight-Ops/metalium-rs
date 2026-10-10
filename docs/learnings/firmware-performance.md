@@ -1087,3 +1087,67 @@ amortizes launches across runs. Ragged movement additionally zeros and copies
 face-row fragments. The explicit copy is slower end to end in every measured
 shape despite the faster local engine. Keep all four APIs opt-in; automatic
 Burn routing remains unchanged, including zero routing.
+
+## P2 K-blocking and R3 norm release baselines (2026-10-10)
+
+Conditions: release silicon, isolated runner (`cargo xtask bench --device all --filter
+silicon_bench_tensix_ops::<name>`), both cards, AICLK 1350 MHz, GDDR 16000 MT/s x 8 channels, git
+`c49c2ed` (working tree with the lane commits, runs `1791593690` K-block, `1791593692` norm
+forward, `1791593699` norm forward+backward), two warmups and seven host-timed samples, median
+(p10-p90 in the run files), validation outside the timing: every K-blocked result equals the
+unsplit result bit for bit, and `[64,8192]@[8192,64]` also equals an exact oracle; every norm is
+checked against an f64 oracle and burn-flex within a derived bound before timing (F32 forward also
+bit-exact against the step70 specification model). No speedup is claimed.
+
+K-block matmul (TF32 Src, F32 storage, HiFi4, two tiles; "unsplit" is the planner's own choice),
+median us, card 0 / card 1:
+
+| Shape | unsplit | k_block=1 | 4 | 16 | 64 |
+|---|--:|--:|--:|--:|--:|
+| [64,8192]@[8192,64] | 751 / 732 | 5821 / 5880 | 1797 / 1791 | 843 / 839 | 725 / 726 |
+| [37,4097]@[4097,35] | 496 / 492 | 2935 / 2921 | 955 / 954 | 498 / 494 | 527 / 521 |
+
+A one-tile K block costs 7.7-8x the planner's choice (each block re-packs and reloads the FP32
+partial); blocks of 16 tiles or more are within about 5% of unsplit, and the planner default is at
+or near the best on both shapes.
+
+Norms (epsilon 1, gamma 1, beta 0), median ms, card 0 / card 1:
+
+| Op | dtype | Shape | forward | forward+backward |
+|---|---|---|--:|--:|
+| LayerNorm | F32 | [37,8193] | 15.64 / 15.50 | 70.8 / 71.0 |
+| LayerNorm | BF16 | [37,8193] | 78.5 / 78.0 | 307.5 / 309.3 |
+| RmsNorm | F32 | [37,8193] | 8.81 / 8.88 | 53.1 / 53.4 |
+| RmsNorm | BF16 | [37,8193] | 52.6 / 52.5 | 186.8 / 186.3 |
+| LayerNorm | F32 | [65,70] | 0.464 / 0.465 | 1.85 / 1.81 |
+| LayerNorm | BF16 | [65,70] | 1.47 / 1.48 | 4.81 / 4.69 |
+| RmsNorm | F32 | [65,70] | 0.318 / 0.327 | 1.50 / 1.46 |
+| RmsNorm | BF16 | [65,70] | 1.08 / 1.07 | 3.30 / 3.22 |
+
+The BF16 norms are 3-5x slower than F32 (each Burn op widens and narrows once); the compositions
+are unfused by design (norm fusion is deferred). Norm benchmarks record only downloads per run,
+because Burn exposes no `dataflow_stats`.
+
+## Approx transcendentals, per-tile saving (2026-10-10, card 0)
+
+`silicon_perf::approx_per_tile_saving` (lane T8, `MathMode::Approx` against `Precise`; the device
+programs equal the interpreter bit for bit): `exp` 8.08 -> 6.51 us per tile (1.24x), `log` 10.96 ->
+7.97 (1.37x), `recip` 7.82 -> 0.95 (8.24x), `sigmoid` 12.18 -> 7.40 (1.65x), `tanh` 13.09 -> 8.10
+(1.62x), `gelu` 28.46 -> 7.31 (3.89x). Interpreter instruction counts per tile: 1.51x, 2.52x, 2.12x,
+2.82x, 3.17x and 7.10x fewer. `sqrt` and `rsqrt` were measured and dropped (1.36x and 1.17x in
+instructions, with special-value handling costing as much as Precise's). SFPU math programs are
+push-bound at the runner's 2.8 cycles per word (39 of 73 kinds have a push/backend cycle ratio above
+1, median 1.17, max 2.87, taking the vector unit at one instruction per cycle as a floor); the
+matmul is backend-bound (rows AC/AD).
+
+## X6 mover NIU fast path (2026-10-10, card 0)
+
+`silicon_perf::mover_read_fast_path`, release, run `1791600377`: reads through request initiator 1 of
+NoC #0 writing only the words that change (`dm::READ_FAST`) against the path that writes every
+register of initiator 0, ABAB after three warm-up lists each, median of `REPS`, an empty list's time
+subtracted, destination bytes checked against the host's copy. 64 B x 256: 0.481 -> 0.464 us per
+entry; 2 KiB: 0.482 -> 0.464 (one port), 0.485 -> 0.471 (all channels); 4 KiB: 0.480 -> 0.462,
+0.487 -> 0.473 (3 ports), 0.484 -> 0.470 (all channels); 16 KiB: 0.485 -> 0.471. Fast/slow is
+0.961-0.972 everywhere: about 17 ns of the ~0.48 us a request costs. The request's cost is its round
+trip, not the register writes, so a gather's share of a step does not move; more requests in flight
+is the lever, not cheaper issue.

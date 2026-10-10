@@ -15,6 +15,9 @@ use crate::tlb::{
 };
 use crate::{Bar, Result, Transport, TransportError};
 
+mod fence;
+pub use fence::FencedWrite;
+
 /// A TLB window reserved for this `Device`'s use.
 ///
 /// Returned by [`Device::alloc_window`]. Dropping it returns the index to the
@@ -737,13 +740,18 @@ mod tests {
     /// authoritative version of that gate runs against ttsim; this one keeps the
     /// chunking and shadowing logic testable without a simulator.
     #[derive(Default)]
-    struct FakeTransport {
+    pub(super) struct FakeTransport {
         writes: Vec<(Bar, u64, usize)>,
         reads: Vec<(Bar, u64, usize)>,
+        /// Every data (non-config) access in order: `(is_write, tile address,
+        /// len)`. The order is what a fence is about.
+        pub(super) log: Vec<(bool, u64, usize)>,
+        /// Fail every data (non-config) write, for "no read-back after a failure".
+        pub(super) fail_data_writes: bool,
         /// Raw configuration words, indexed by window.
         tlb_cfg: BTreeMap<u16, [u32; 3]>,
         /// Tile memory, keyed by (packed coordinate, device address).
-        mem: BTreeMap<(u16, u64), u8>,
+        pub(super) mem: BTreeMap<(u16, u64), u8>,
     }
 
     impl FakeTransport {
@@ -772,6 +780,7 @@ mod tests {
                 "TLB config registers are write-only"
             );
             let (tile, addr) = self.translate(offset).expect("window is configured");
+            self.log.push((false, addr, dst.len()));
             for (i, b) in dst.iter_mut().enumerate() {
                 *b = self.mem.get(&(tile, addr + i as u64)).copied().unwrap_or(0);
             }
@@ -788,7 +797,11 @@ mod tests {
                     u32::from_le_bytes(src.try_into().unwrap());
                 return Ok(());
             }
+            if self.fail_data_writes {
+                return Err(TransportError::Io(std::io::Error::other("injected")));
+            }
             let (tile, addr) = self.translate(offset).expect("window is configured");
+            self.log.push((true, addr, src.len()));
             for (i, b) in src.iter().enumerate() {
                 self.mem.insert((tile, addr + i as u64), *b);
             }
@@ -809,11 +822,11 @@ mod tests {
         }
     }
 
-    fn device() -> Device<FakeTransport> {
+    pub(super) fn device() -> Device<FakeTransport> {
         Device::open(FakeTransport::default()).unwrap()
     }
 
-    fn c(x: u8, y: u8) -> NocCoord<Noc0> {
+    pub(super) fn c(x: u8, y: u8) -> NocCoord<Noc0> {
         NocCoord::new(x, y).unwrap()
     }
 

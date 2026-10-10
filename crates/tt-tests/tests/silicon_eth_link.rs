@@ -46,16 +46,15 @@ fn send(a: &mut Dev<'_>, b: &mut Dev<'_>, x: u8, seed: u8) {
     let wa = a.alloc_window(WindowKind::TwoMib).unwrap();
     let wb = b.alloc_window(WindowKind::TwoMib).unwrap();
     let data = pattern(seed);
-    a.write(&wa, eth(x), BUF, &data).unwrap();
-    b.write(&wb, eth(x), BUF, &vec![0xEE; LEN + 64]).unwrap();
     // Both landed before the transfer starts: the host's writes are posted,
-    // and nothing else writing the tile is ordered behind them. A read of each
-    // buffer's last word is (the same path as the writes). Without the
-    // receiver's, its sentinel landed *after* the frames now and then and
-    // overwrote the payload's tail: 3 failures in 40 runs, 6 in 60 with only
-    // the sender's read-back, 0 in 60 with both (divergence row AA).
-    let _ = a.read32(&wa, eth(x), BUF + LEN as u64 - 4).unwrap();
-    let _ = b.read32(&wb, eth(x), BUF + (LEN + 64) as u64 - 4).unwrap();
+    // and nothing else writing the tile is ordered behind them. The fenced
+    // write reads the buffer's last word back (the same path as the write).
+    // Without the receiver's, its sentinel landed *after* the frames now and
+    // then and overwrote the payload's tail: 3 failures in 40 runs, 6 in 60
+    // with only the sender's read-back, 0 in 60 with both (divergence row AA).
+    a.write_fenced(&wa, eth(x), BUF, &data).unwrap();
+    b.write_fenced(&wb, eth(x), BUF, &vec![0xEE; LEN + 64])
+        .unwrap();
 
     for (n, o) in [
         ("SEL_SW", 0x80),
@@ -255,12 +254,11 @@ mod mover {
             let wb = b.alloc_window(WindowKind::TwoMib).unwrap();
             const LEN: usize = 128 * 1024;
             let data = pattern(0x77).repeat(LEN / 4096);
-            a.write(&wa, src, 0x8_0000, &data).unwrap();
-            b.write(&wb, dst, 0x9_0000, &vec![0xEE; LEN + 256]).unwrap();
-            // Posted writes: read each back so neither the E1 pulling the source
-            // nor the link writing the destination can overtake them.
-            let _ = a.read32(&wa, src, 0x8_0000 + LEN as u64 - 4).unwrap();
-            let _ = b.read32(&wb, dst, 0x9_0000 + LEN as u64 + 252).unwrap();
+            // Posted writes, fenced: neither the E1 pulling the source nor the
+            // link writing the destination can overtake them.
+            a.write_fenced(&wa, src, 0x8_0000, &data).unwrap();
+            b.write_fenced(&wb, dst, 0x9_0000, &vec![0xEE; LEN + 256])
+                .unwrap();
             let mut m = Mover::start(a, &wa, b, &wb, l, tt_firmware_images::ETH_E1).unwrap();
             let t0 = Instant::now();
             m.send(

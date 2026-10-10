@@ -1,5 +1,7 @@
 # Hardware coverage — Phase 10 tracker
 
+**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition, the open items (NoC multicast and MMIO silicon probes, X6) and the verification record. [Burn operation status](burn-op-coverage.md) is generated.
+
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
 for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
@@ -79,13 +81,13 @@ the no-simulator-in-shipping-crates checks pass.
 
 Full reductions do not complete 10.3. R1c arbitrary axes/layouts and P2 K
 blocking pass simulator and both-card gates (below). Product/Boolean reductions,
-scans and norm compositions are also gated. Tensix tensor transpose remains open.
+scans and norm compositions are also gated. The payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack (M3 `[-]`: no Tensix route preserves payloads).
 
-**Next for model coverage:** optimize BF16 packed gathers/continuations, broaden
-BF16 conformance and validate model accuracy; finish D4 indexing and M3 tensor
-transpose, then convolution/attention and remaining integer operations.
-Backend error/setup/conformance work is
-tracked separately as B1/B2/B10. X280 dispatch remains proposed and unscheduled.
+**Remaining after the 2026-10-10 close-out:** convolution, attention, ND indexing and the integer
+operations are native; the open items are listed in
+[hardware-coverage-closeout.md](hardware-coverage-closeout.md) ("Still open"). Backend
+error/setup/conformance work is tracked separately as B1/B2/B10. X280 dispatch remains proposed and
+unscheduled.
 
 ### Reduction and ALU extensions (2026-10-04; both-card validated)
 
@@ -115,7 +117,7 @@ transpose and TF32 matmul preparation; raw tensor materialization stays on copie
 All new gates belong to SMOKE. Wrong product padding, omitted scan carry,
 incorrect multiplication high bits and wrong rounding mode were each watched
 failing. `step67`–`step73` pass both cards: 58/58, run `1791145571`.
-BF16 transpose integration remains open. See [the implementation record](tensix-next-features.md).
+BF16 payload-preserving transpose uses the mover's raw copy; the Src transpose is the explicit normalizing route (step87). See [the implementation record](tensix-next-features.md).
 
 ### BF16 and pooling (2026-10-05)
 
@@ -175,7 +177,7 @@ all fidelities, TF32/BF16 Src routes, transposes and specials, `[64,8192] @
 [8192,64]`, supported batches and resident Burn large-K against a derived
 bound. Negative controls fail when axis mapping, edge masking or accumulator
 reload is omitted. Both cards passed in run `1791145571`.
-Release-silicon benchmark medians and validation remain unrun.
+Release-silicon K-block medians with validation: `docs/learnings/firmware-performance.md`, "P2 K-blocking and R3 norm release baselines" (2026-10-10).
 
 ### 10.2 close-out (historical measurements)
 
@@ -236,10 +238,10 @@ there is no backend fallback or exact mode.
 | 10.0 | Device profiler; SFPU foundation; today's element-wise ops move from the B core to the SFPU | X3, F0–F5, X1, S1 | `[x]` (F6, optional, deferred; F2's `SFPCONFIG` prologue and F5's further models arrive with S4) |
 | 10.1 | Softmax and cross-entropy on the device; `MOP`; op-list traces | S3, S4 (`exp`, `log`), S8, R1 (`max`, `sum`), R2, X2, X4, X5 | `[x]` S3, S4a, S8, R1a, R2 (softmax, log-softmax), X2, X4, X5; cross-entropy moved to 10.5 with D4 (Burn gathers the target column, `float_gather`) |
 | 10.2 | Activation and math breadth; int and bool storage | rest of S2–S4, D3 (from 10.4), F2's `SFPCONFIG` | `[x]` 10.2a (the instructions: helpers, models, oracles, gates), 10.2b (D3: `I32` and `Bool` resident), 10.2c (S2: compare, select, sign), 10.2d (S4: `sqrt`, `log1p`, `pow`; S3 and `exp` fixed at their range ends), 10.2e (the exponential family: `expm1`, `sigmoid`, `tanh`, `erf`, `gelu`, the hyperbolics and their inverses, `log_sigmoid`, `softmin`), 10.2f (trig: `sin`, `cos`, `tan` for every finite input, `atan`, `atan2`, `asin`, `acos`) |
-| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[~]` general F32 reductions/scans and norm compositions pass both cards; pooling implemented; Tensix tensor transpose remains open |
-| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[~]` I32 ALU/rounding and native BF16 storage/compute adapters pass both cards; packed K/batched BF16 and mesh pass; checked integer division/remainder pass step82; payload-preserving Src tensor transpose remains open |
-| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[~]` native pooling, resident indexing, F32/BF16 convolution/attention and gradients; general Src tensor transpose and ND indexing remain partial |
-| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `SHIFTXB` | D2, S7, S9, M1, M4 | `[~]` M1 landed (step90); BFP8/4/2 storage, packed products and Burn policies landed (step91–96); application RNG remains open; DOTPV excluded as redundant |
+| 10.3 | Reductions over any dim, device transpose, norms | P1, M2, M3, R1, R3 | `[x]` general F32 reductions/scans, norm compositions and pooling pass both cards; the payload-preserving transpose is the mover's (M3 `[-]`, evidence in the M3 item); K-block and norm release baselines recorded 2026-10-10 |
+| 10.4 | Formats and integers | D1, S5, S6 (D3 moved to 10.2) | `[x]` I32 ALU, rounding, checked division/remainder, native BF16 and FP16 (exact SFPU casts), BFP formats, integer scans/arg-extremes/masks |
+| 10.5 | Indexing, convolution, pooling, attention | D4, D5, P2, D6, R4 | `[x]` native pooling, resident indexing including ND gather/scatter, F32/BF16 convolution/attention and gradients, mesh trace replay; D5 `[-]` (host tilize stays the default) |
+| 10.6 | The rest: block float, PRNG, `SFPLOADMACRO`, `ELW*`, `SHIFTXB` | D2, S7, S9, M1, M4 | `[x]` M1, D2, S7 (native seeded random), S9 (`SFPLOADMACRO` probes pass), M4 (`SHIFTXB`; `DOTPV`/`SHIFTXA` excluded) |
 
 Checklist items 9.9 (element-wise on the SFPU) and 9.12 (loss on the device) are tracked
 here, as S1 and R2.
@@ -349,12 +351,12 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 |---|---|---|
 | Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums, a datum sub-run of a tile (base moved) | `[x]` | -- |
 | `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
-| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
-| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[~]` BF16 native ties-even late narrowing, both-card `step74`; FP16 open | D1 |
+| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[x]` widened readback over ~4096 sign/exponent/mantissa patterns on card 0 (step114) | D1 |
+| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[x]` BF16 native ties-even late narrowing (step74); FP16: the raw packer truncates and saturates (matches ttsim), the rounding packer is ties-even for normals and overflows to infinity at 65520 but drops NaN payloads and flushes subnormals (`T7-MEASURE`, card 0), so shipped FP16 casts use exact SFPU programs instead (step143/144); the 16-bit Dst read path preserves normals only (zero/subnormal/NaN collapse, step114) | D1 |
 | BFP8/BFP4/BFP2 storage, exponent sharing, `CLREXPHIST` | `[x]` -- step92–96; histogram reset and BFP2 packed matmul are silicon-only where ttsim refuses | D2 (delivered formats) |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
-| Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
-| Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
+| Unpacker transpose / tilize modes, broadcast | tilize `[x]` payload-preserving strided gather (step113, card 0); transpose swaps the nibbles correctly but goes through SrcA and is not payload-preserving (`[-]` for M3); no unpacker broadcast mode exists | M3, D5 |
+| Packer ReLU and edge masking, `PACR_SETREG` | ReLU `[x]` (all seven modes against a raw-bit model, card 0) and edge masking `[x]` for the row-set path, partial columns, -inf fill and edge-then-ReLU order (step112); `PACR_SETREG` `[-]`; not routed into Session/Burn ops | S1 (opportunistic), D4 |
 
 ### Frontend and tracing
 
@@ -366,10 +368,10 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | `REPLAY` (record and replay, 32 entries per thread) | x | x | x (SFPU ops) | x | x | X1 |
 | `MOP` / `MOP_CFG` (MOP Expander templates) | x (`CONFIRMED`) | x (`frontend::mop`, mailbox `MOP_CFG`) | (X2b) | x | x | X2 |
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
-| Op-list traces (a step's records kept in GDDR, replayed) | -- | | | | | X4 |
-| `.ttinsn` fusion (four pushes per cycle) | -- | | | | | checklist Phase 9 |
-| Hazards as data, the wait planner | -- | | | | | `RUST_IMPL_PLAN.md` "Hazards as data"; checklist 9.8 |
-| Three-thread pipelining, double buffering | -- | | | | | checklist 9.8 |
+| Op-list traces (a step's records kept in GDDR, replayed) | -- | x (`tt_kernels::trace`) | x | x | x both | X4 |
+| `.ttinsn` fusion (four pushes per cycle) | -- | `[-]` | | | | `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate; SFPU math programs are push-bound (39 of 73 kinds, median push/backend cycle ratio 1.17, max 2.87) and shrink through replay and `SFPLOADMACRO` schedules instead (P9, step121) |
+| Hazards as data, the wait planner | -- | `[~]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
+| Three-thread pipelining, double buffering | -- | | x (resident T0/T1/T2 roles, `LAUNCH`/`KERNEL_WAIT`, `enable_dram`) | x | x both | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
 
@@ -380,10 +382,10 @@ Pulled in only when a kernel needs them; each says which.
 | ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` stages config; `ADDDMAREG` steps matmul addresses (step38); scalar ALU/config readback done (step100); L1 transfers step101/102 `[x]`; `FLUSHDMA` `[-]`, use STALLWAIT | F3 (per-tile parameters without reprogramming) |
 | Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[ ]` | 9.8 page FIFO, if counters move into Tensix |
 | `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[x]` step101/102, explicit copy/zero | D4 (copies without the B core) |
-| NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[ ]` | weight broadcast to many tiles (9.6 follow-up) |
-| NoC atomics | BH `NoC/Atomics.md` | `[ ]` | R1 across tiles |
-| NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; interrupts `[ ]` | -- |
-| `L1CacheTagSearchAccel` | BH | `[ ]` | checklist Phase 9 |
+| NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[x]` typed rectangle from the ARC-discovered grid, write-only encoder with `PATH_RESERVE`, acknowledgement counting against the known recipients, independent model (`tt_isa::noc::multicast`, step115); ttsim executes it fully (8 gates); on cards 0 and 1 the 1x2, 2x2/3x3 and full-grid probes (run one at a time, tile health checked between) deliver the payload to exactly the rectangle with guards unchanged and the one-column-wider mutant caught (2026-10-10); `NOC_BRCST_EXCLUDE` is written 0 and the VC class (buddy 0) is the choice that worked, not a documented layout | weight broadcast to many tiles (9.6 follow-up) |
+| NoC atomics | BH `NoC/Atomics.md` | `[x]` typed L1-only requests (variable-width increment, compare-and-swap, mask and indexed swap, eight Zaamo ops, six accumulate formats; `tt_isa::noc::atomic`) with independent decode-from-bits models; all 21 forms and both model mutants pass on card 0 (step116, neighbour tile, one process each); ttsim executes only the full-width increment (rows 88) | R1 across tiles |
+| NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; completion polling `[x]` (on card 0 the `NIU_TRANS_COUNT_RTZ_SOURCE` bit is set after completion, stays set across a later request without a clear and is removed by a clear; the earlier "not established" came from a mutant that could not be observed by before/after samples, replaced by ignored-clear and read-to-clear mutants; a broadcast sets the bit at its first acknowledgement so it is not a multicast completion; step117; ttsim refuses the registers); interrupt handler `[-]` (ttsim has no PIC and a mis-vectored IRQ on silicon runs arbitrary L1; the counter poll the mover uses is the delivered contract) | -- |
+| `L1CacheTagSearchAccel` | BH | `[-]` helpers, page model and B probe kept as evidence (`tt_isa::tag_search`, `tag_search_b`, step120; configured through `Config[212..=219]`, triggered by an L0-missing RISC-V B load). **On card 0 every armed trigger load hangs the baby core** (all ten scenarios stop at step 0, `LOAD_ISSUED`) and the block then stays armed across resets (the earlier passing minimal probe fails afterwards), so the silicon semantics are not established and the block is not adopted; no repo consumer; ttsim refuses the config (row 92). Silicon tests are `#[ignore]`d; a board reset clears the state | checklist Phase 9 |
 | Debug timestamper | BH (STUB-C) | `[x]` silicon; ttsim row 54 | -- |
 
 ### Out of scope, and why
@@ -488,11 +490,11 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
-- [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
+- [x] `MOVDBGA2D`: checked `tt_isa::matrix_debug` helpers (bank ownership, 1/8-row forms, format override) and an independent page model; on card 0 (step111) the eight-row 0->0 and 8->8, one-row 3->5, all four SrcA format overrides (each forced to TF32 under Fp32), flush, data mutants and reading a bank the unpacker still owns all agree with the model; ttsim refuses every form (extends row 50). The increment-1 `AddrMod` cases, which first disagreed for `MOVA2D` as well, are explained and pass: **a one-row move whose instruction bit 14 (the low bit of the `AddrMod` entry number) is set, with the eight-row bit clear, writes a four-row aligned block** (`DstRow & ~3`, `SrcRow & ~3`) on its own first move, whatever the entry's increments (an entry with both increments zero still does it); the entry's increments then apply after the move exactly as modelled, and entry *k* advancing SrcA by *k* and Dst by 7-*k* confirms the entry numbering (step111b sweeps, card 0). A one-row move that must write one row names an even entry (0, 2, 4, 6). 16-bit Dst forms are model-only.
 - [x] `ZEROSRC`: checked A/B/both current-unpacker and current-matrix banks; ownership/staged claims, all 64 rows and opposite-bank sentinels pass step103, card 0 (`1791397029`). Matrix-bank forms run on ttsim; unpacker-bank forms refuse. Negative-infinity and both-physical-bank forms remain deferred.
 - [x] `CLEARDVALID`: checked separate/both Loaded → Empty releases, Reset=0 and KeepReadingSameSrc=0; step103 simulator/card-0 (`1791397029`) alternating-bank and downstream reuse gates. Reset stays excluded; retained-bank reading needs a separate state model.
 - [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
-- [ ] `GATESRCRST`: Invalidate the one-slot SrcB operand cache.
+- [-] `GATESRCRST`: the encoding executes safely on card 0 (isolated probe) but there is no observable oracle: with SrcB rewritten through `MOVD2B`, the no-gate, operand-clear and gate arms all read fresh while the no-rewrite detector control reads stale (step111, verdict `NoObservableOracle`, as the page predicts: the instruction is needed only against invalidation-hardware bugs). Supported alternative: normal SrcB loads through the checked `Banks` helpers. The checked helper stays for diagnostics.
 
 #### Vector Unit (SFPU) (40 instructions)
 - [x] `SFPADD`: Lanewise floating-point addition/subtraction.
@@ -529,7 +531,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `SFPCONFIG`: Configure SFPU constant registers (`LReg[11..15]`).
 - [x] `SFPSTOCHRND`: Hardware nearest, stochastic, and toward-zero rounding (validated in `step81`).
 - [x] `SFPNOP`: Vector unit pipeline no-op.
-- [ ] `SFPLOADMACRO`: Silicon macro loader (bundles $Dst$ load with up to 4 scheduled vector micro-ops). Item S9.
+- [x] `SFPLOADMACRO`: checked `tt_isa::sfpu_macro` helpers (SFPCONFIG macro registers, program-key descriptor, teardown) and an independent page-derived schedule model (`tt_kernels::sfpu::macro_sched`); silicon probes s00-s13 pass on card 0 (Store, MAD, Simple, Round, `LReg16`, substituted operands, chain, pipelining, predication, forgetting, `SFPSWAP` in the Simple sub-unit; swapped template/delay mutants differ). ttsim refuses the macro (row 7). Step110. Item S9; performance adoption not claimed.
 - [x] `SFPDIVP2`: `Program::scale_by_pow2`, interpreter/device gate step26; wrapping immediates separately gated on both cards (divergence 66).
 - [x] `SFPSWAP`: `Program::min_max`, step26 interpreter/device comparisons and production reductions. Argmin/argmax variants are separate scope.
 - [x] `SFPADDI`: `Program::addi`, BF16-immediate interpreter/device comparison in step26.
@@ -550,9 +552,9 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `SETDVALID`: Blackhole implied-format handover is explicitly unsupported in the pinned page. Use regular UNPACR's final FlipSrc; sequenced `UNPACR_NOP_SETDVALID` remains a separate gated task.
 - [-] `REG2FLOP_ADC`: pinned page declares unsupported functionality and weak model confidence. Use checked SETADC/SETADCXX/XY/ZW and descriptor reprogramming; no general GPR-to-ADC API is promised. Reopen only for a concrete runtime-value consumer and independent Blackhole evidence.
 - [x] `UNPACR_NOP_SETDVALID`: measured Blackhole non-clearing mode 0x1e9; Filling-only A/B handover with C1/C2 retirement and C5/C6 ownership waits. Alternating banks, TF32/BF16, multiple partials, sentinels and replay pass `1791413233`; nonzero SrcB row reset and direct consumers pass `1791413291`, tightened fractional inputs `1791413841`. Card-0 SMOKE 258/258 (`1791413478`). Legacy Wormhole mode 7 is the isolated reboot trigger; exact ARC mechanism remains unproven. See [completed Stage D](../completed-plans/explicit-unpacker-handover.md). Other modes and production/recovery adoption are deferred.
-- [ ] `UNPACR_NOP_SETREG`: Unpacker micro-mode setting configuration registers.
+- [-] `UNPACR_NOP_SETREG`: Wormhole page says UnsupportedFunctionality with weak confidence and it uses TDMA-RISC `SetRegBase` state with no Blackhole page; ttsim refuses it (step108). Supported alternative: checked WRCFG/SETC16/RDCFG and step100/101 helpers.
 - [x] `UNPACR_NOP_ZEROSRC`: measured BH wait/bank/clear fields, checked current-unpacker zero (WaitLikeUnpacr=1, BothBanks=0); staged claims discarded and regular UNPACR handover retained. Step103 ttsim/card-0 gates, including held-opposite-bank wait and all-row sentinel checks (`1791397029`). Wider values/both banks remain outside the checked API.
-- [ ] `PACR_SETREG`: Packer set register micro-mode.
+- [-] `PACR_SETREG`: no Blackhole page; `SetRegBase`/`SetRegHiScaler` are TDMA-RISC state set only through Wormhole-documented writes into a block shared with the mover command queue; ttsim refuses it (step108). Supported alternative: `PACR` with `Last`, `STALLWAIT` on packer-busy, and the checked configuration helpers.
 
 #### Frontend, Synchronization & Expanders (10 instructions)
 - [x] `REPLAY`: Hardware micro-op execution buffer for unrolled loops (Item X1).
@@ -563,8 +565,8 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `SEMGET`: Query hardware semaphore counter.
 - [x] `STALLWAIT`: Hardware pipeline barrier (blocks until unit execution drains).
 - [x] `NOP`: General backend pipeline bubble.
-- [ ] `STREAMWAIT`: Wait on hardware stream overlay.
-- [ ] `STREAMWRCFG`: Stream overlay configuration write.
+- [-] `STREAMWAIT`: no Blackhole NoC Overlay specification is pinned (`BabyRISCV/README.md` links a non-existent `NoC/Overlay` page; `STREAMWAIT.md` defines its conditions only through `NOC_STREAM_READ_REG` with no address or layout); no controlled producer exists without NoC or overlay traffic; a wrong overlay write already rebooted the host (operating notes, stream-pop mode 3). Raw encoder and ThreadConfig fields (`STREAMWAIT_*`, `STREAM_ID_SYNC_SEC*`) retained. Alternative: L1 semaphores/credits with `SEMWAIT`/`STALLWAIT` through the streaming scheduler.
+- [-] `STREAMWRCFG`: same missing register layout; no pinned harmless stream register with a known value to read back; documented reordering bug requires `STALLWAIT` afterwards. Reopen when a Blackhole overlay register map is pinned and an isolated silicon read of an idle stream is measured. Alternative: `LOADREG`+`WRCFG` (the page's own suggestion), checked `WRCFG`/`RDCFG`.
 
 #### Backend Configuration
 - [x] `WRCFG`: 32-bit and 128-bit backend configuration writes.
@@ -574,12 +576,12 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
 #### DMA Engine, Atomics & Registers
-- [ ] `ATCAS`: Atomic Compare-and-Swap on L1 memory.
-- [ ] `ATGETM`: Atomic mutex acquire.
+- [x] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); compare already met, blocked-until-the-host-writes-the-word and blocked-until-the-other-role's-RISC-V-core-pokes-it pass on card 0 under a guarded run with a measured-rate deadline (step106). **A Tensix thread cannot be the producer:** a thread parked in `ATCAS`/`ATINCGETPTR` keeps every other thread from issuing any Scalar Unit instruction (confirmed on card 0, `blocked_atomic_monopolizes_the_scalar_unit`), so only the host or a RISC-V core can free it. WormholeOnly encoding; ttsim refuses it (row 77).
+- [x] `ATGETM` / `ATRELM`: typed `Mutex` (indices 0, 2, 3, 4 only), scoped acquire/release; uncontended on all indices and threads, contended round-robin handoff for every mutex and holder, the deadline/host-release path and negative controls pass on card 0 (step105). ttsim models only index 0 (row 76).
 - [ ] `ATRELM`: Atomic mutex release.
-- [ ] `ATSWAP`: Atomic swap on L1.
-- [ ] `ATINCGET`: Atomic fetch-and-increment on L1.
-- [ ] `ATINCGETPTR`: Atomic fetch-and-increment pointer on L1.
+- [x] `ATSWAP`: four-GPR group form, all 256 masks and aligned bases on card 0 (step106); the single-register form is `[-]` (lane placement matches neither the page nor a consistent rule; the sweep diagnostic is the evidence) and is unrepresentable in the API.
+- [x] `ATINCGET`: field width 1-32, wrapping, upper bits preserved, atomic across the three threads on card 0 (step106); WormholeOnly encoding, ttsim refuses it.
+- [x] `ATINCGETPTR`: checked geometry, independent FIFO model; the FIFO through wraps and the blocking pop (write counter poked) and push (read counter poked) gates pass on card 0 (step106). Same Scalar Unit rule as `ATCAS`; WormholeOnly encoding; ttsim refuses it.
 - [x] `SETDMAREG`: checked full-width GPR initialization through `backend::set_gpr`; configuration staging and matmul address stepping.
 - [x] `ADDDMAREG`: production register-form matmul address stepping and step38; the immediate form is silicon-only (divergence 67).
 - [x] `SUBDMAREG`: checked wrapping subtraction, register/immediate forms (step100); silicon semantics, simulator refusal.
@@ -590,9 +592,9 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `FLUSHDMA`: occupies the shared Scalar Unit while waiting; pinned page prefers `STALLWAIT` with equivalent C0–C3 conditions and all block bits. Excluded from production support in favor of the existing barrier; not a claim that every possible use is strictly worse.
 - [x] `LOADIND`: checked widths/offset halves/increments, asynchronous read barriers and raw-bit preservation (step101, card 0).
 - [x] `STOREIND_L1`: checked L1 stores; measured Blackhole width mapping and all-thread guard gates (step101).
-- [ ] `STOREIND_MMIO`: Indirect store into Tensix MMIO space.
-- [ ] `LOADREG`: Indirect register load.
-- [ ] `STOREREG`: Indirect register store.
+- [x] `STOREIND_MMIO`: allowlisted `SW_INT_PC[28..31]` PIC words only (`tt_isa::mmio_reg`), STOREIND's shifted offset modelled separately; the isolated probe, offsets/increments/halves/threads gate and the wrong-shift control pass on card 0 (2026-10-10, no reboot); ttsim refuses every form.
+- [x] `LOADREG`: allowlisted PIC scratch words only; the isolated probe and the host-staged-values gate pass on card 0 (step107).
+- [x] `STOREREG`: allowlisted PIC scratch words only; the isolated probe and the store-then-read-back gate (all targets, all threads) pass on card 0 (step107).
 - [x] `XMOV`: checked declared L1 copy/zero, C12 setup/C9 completion and explicit resident APIs (step101/102). Item D4.
 - [x] `DMANOP`: diagnostic GPR/config/memory preservation (step101), never a completion wait.
 
@@ -900,7 +902,7 @@ From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` ro
 Each names the measurement it must move. The Burn-side ones are in
 `burn-backend-parity.md` (B5, B8, B16).
 
-- [ ] **X6 A fast path for the mover's requests.** A GDDR read costs ~0.46 us an entry
+- [x] **X6 A fast path for the mover's requests** (2026-10-10: built and silicon-validated, opt-in; the gain is 3-4%, far short of the 16 KiB-entry rate this item hoped for -- see the result below). A GDDR read costs ~0.46 us an entry
       however small (row W after row Y), and a matmul gather is one entry per tile: a
       record should issue its moves straight to the NIU -- validated once per record,
       not re-encoded and decoded per tile -- and write only the NIU registers that
@@ -908,12 +910,22 @@ Each names the measurement it must move. The Burn-side ones are in
       register persistence to be checked on ttsim and in a gate first). Moves:
       `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
       the gather's share of a step (row V: 0.94 ms of 2.4).
+      **Result (card 0, release, run `1791600377`):** request initiator 1 of NoC #0 keeps its
+      registers between requests (isolated probes `silicon_x6_minimal_persistence_probe` and
+      `silicon_x6_initiator1_persistence_probe`, no hang or reboot), and the fast path
+      (`dm::READ_FAST`, `DataMover::set_read_fast`) moves byte-identical data to the slow one
+      (`silicon_x6_fast_read_path_matches_the_slow_one`; a skipped destination and a flipped
+      bit are both caught). But a request costs ~0.48 us either way and the fast path saves
+      only ~17 ns of it: fast/slow 0.96-0.97 on 64 B, 2 KiB, 4 KiB and 16 KiB entries. The
+      cost is therefore not NIU register writes; it is the request's round trip, so the
+      remaining lever is more requests in flight, not cheaper issue. Off by default.
+- [x] **X7b Posted-write fence as API** (2026-10-10): `Device::{write_fenced, write32_fenced, l1_write_fenced, eth_write_fenced}` and `FencedWrite` issue the posted writes then exactly one read-back of the dword holding the last byte, refusing misaligned, foreign-window, aperture and non-L1 targets before any write. Gated by `tt-device` unit tests and `step119` (a posted-write transport model: ttsim applies BAR writes synchronously and cannot show the race itself); card 0 `posted_then_fenced_l1_writes_read_back_exactly`; both-card Ethernet gates `silicon_eth_link::{host_driven_tt_link, mover::}` pass with `Mover::stage` and the eth test sites migrated. Hot paths whose observer is started by the host afterwards stay unfenced by design.
 - [~] **X7 Host transfers** (DMA and batching, 2026-10-03). Tensors use pinned
       host memory and the card's `HOST_READ`/`HOST_WRITE` DMA; parallel host
       tilize/detilize and run records deliver about 11 GB/s on large Session
       transfers. Gated by `step57_host_dma`; measurements in
-      `firmware-performance.md`. A Device-level posted-write fence API remains
-      open in the checklist. The following is the historical motivation:
+      `firmware-performance.md`. The Device-level posted-write fence is now API
+      (`write_fenced`, `FencedWrite`; X7 below). The following is the historical motivation:
       **Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
       a call and a download of the same ~140 us past its sync (rows Z, measurement M:
       uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
@@ -933,7 +945,7 @@ Each names the measurement it must move. The Burn-side ones are in
 
 ### P — Prerequisites pulled in when they block
 
-- [~] **P1 Rank-N tensors** (concepts review G2), minimal: a logical shape stored as
+- [x] **P1 Rank-N tensors** *(close-out 2026-10-10: P1a and P1b are done, ragged/broadcast/strided batches included.)*  (concepts review G2), minimal: a logical shape stored as
       `prod(leading)` stacked tile grids, a batch stride in `TensorRef` (0 = broadcast),
       last-dim-preserving reshapes as views. Blocks R1 over leading dims, R3, D6, R4.
   - [x] **P1a Storage and element-wise.** `burn-tt` stores an F32 tensor of any rank
@@ -949,7 +961,7 @@ Each names the measurement it must move. The Burn-side ones are in
         for bit (a NaN by class) and downloading nothing; `[6, 1, 4] + [1, 6, 1]`,
         a column by the matrices but `[6, 6, 4]` by the rule, still right (watched
         failing without the rule's check). ttsim and both cards.
-  - [~] **P1b Batch stride.** Batched matmul done (2026-10-03), not by a batch
+  - [x] **P1b Batch stride.** *(close-out: ragged, broadcast and strided batches repack on the device through `materialized_batched_matmul`.)*  Batched matmul done (2026-10-03), not by a batch
         stride but by blocks: `tensor::matmul_dram_batched` takes one `(A, B)`
         pair of tile-aligned blocks per batch element -- a `TensorRef` whose
         first tile is the block's, the parent's row stride kept, which GATHER
@@ -965,12 +977,14 @@ Each names the measurement it must move. The Burn-side ones are in
         block offset dropped and with the tiles read untransposed; ttsim and
         both cards), `step59_burn_transformer`. Last-dim sum/max and mean_dim
         compositions, plus certain leading-dim sums, are done. General
-        leading-dim reductions are now simulator-gated by R1c; untiled
-        batched matmul remains open.
-- [~] **P2 K blocking** (concepts review G3): native FP32 Dst reload implemented
+        leading-dim reductions are now simulator-gated by R1c. Ragged,
+        broadcast and strided F32/BF16 batches are done too: each matrix is
+        repacked on the card and run through the 2-D product
+        (`materialized_batched_matmul`, `burn-tt/src/ops.rs`; step76, step83).
+- [x] **P2 K blocking** *(close-out: release baselines recorded in `firmware-performance.md`; planner default is at or near the best block length.)*  (concepts review G3): native FP32 Dst reload implemented
       for resident ordinary and supported batched matmuls (`step68`). Same
       accumulation order, no block-sum addition or packer L1 accumulation.
-      Simulator and both-card gates pass (`1791145571`); release benchmarks pending.
+      Simulator and both-card gates pass (`1791145571`); release baselines recorded 2026-10-10 in `firmware-performance.md`.
       Host-staged `matmul_chunked` retains its separate arithmetic contract.
 
 ### F — SFPU foundation (blocks every S item)
@@ -1068,7 +1082,7 @@ Each names the measurement it must move. The Burn-side ones are in
       mover's FP32 unit by measurement Q's cost model; the mover does no
       arithmetic now, so every op is the SFPU's, and one with no program is
       refused.)
-- [~] **F5 Oracles.** `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
+- [x] **F5 Oracles.** *(close-out: every delivered instruction has an interpreter or page model, including `SFPLOADMACRO` (`macro_sched`).)*  `tt_kernels::sfpu::interp::Vector`: `LReg[17][32]` (a
       register nothing has established is `None`, and reading it is refused), per-lane
       `LaneFlags`, `UseLaneFlagsForLaneEnable` and flag stack, the `Dst` row counter
       and address modifiers, the replay buffer (`REPLAY` expanded by its own model),
@@ -1095,7 +1109,7 @@ Each names the measurement it must move. The Burn-side ones are in
       unrolled, the device tile equal to the interpreter's bit for bit on ttsim and
       both cards; `LReg[8]` measured (row P). Watched failing with a wrong `SFPABS`
       model (silicon refuses it at the negative-NaN datum).
-- [ ] **F6 (optional) A Burn coverage generator.** `cargo xtask burn-coverage --check`,
+- [x] **F6 (optional) A Burn coverage generator.** *(delivered 2026-10-09 as `cargo xtask burn-coverage [--check]`, generating `burn-op-coverage.md` and failing on an unsupported method without a disposition.)*  `cargo xtask burn-coverage --check`,
       reading `OVERRIDDEN` and the pinned traits, so the table below cannot rot.
 
 ### S — SFPU operations
@@ -1381,10 +1395,10 @@ Each names the measurement it must move. The Burn-side ones are in
         `float_asin`, `float_acos`, with Burn's autodiff (`g/sqrt(1 - x^2)`);
         `step46` watched failing with `acos`'s `pi - 2v` dropped. Cost per
         tile (row AL): `atan` 15.0 us, `asin` 17.8, `acos` 17.0, `tan` 28.0.
-- [~] **S5 Integer ALU on INT32** (format code 8, measured): `SFPIADD`, `SFPMUL24`,
+- [x] **S5 Integer ALU on INT32** *(close-out: wrapping and checked I32 arithmetic, comparisons, shifts, division/remainder, scans, arg-extremes, masks and abs are all native.)*  (format code 8, measured): `SFPIADD`, `SFPMUL24`,
       `SFPAND`/`SFPOR`/`SFPXOR`/`SFPNOT`, `SFPSHFT`, `SFPLZ`. The first `IntTensorOps` on
       the device: `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*`, shifts.
-- [~] **S6 Casts and rounding.** Deterministic F32 rounding and saturating
+- [x] **S6 Casts and rounding.** *(close-out: rounding, saturating I32, BF16 and FP16 casts are native; `int_cast` to other widths is `[-]` because the device stores I32 only.)*  Deterministic F32 rounding and saturating
       I32 conversion are simulator-gated by `step72`; I32-to-F32 already runs
       natively. Hardware SFPSTOCHRND modes are gated by step81; BF16 and BFP8/4/2 storage are delivered. FP16 and other deferred storage formats remain open.
       Historical intended instruction coverage: `SFPCAST` int ↔ float (never `SFPCAST_IntAbs`: Tier 2,
@@ -1392,7 +1406,8 @@ Each names the measurement it must move. The Burn-side ones are in
       modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
       `float_cast`, `float_into_int`, `int_into_float`, `float_round`, `float_floor`,
       `float_ceil`, `float_trunc`.
-- [~] **S7 The PRNG.** Step91 checks the seed-register write, advance and predication. WRCFG does not restart silicon's stream; direct RISC-V configuration stores with a fence and 512 NOP iterations do restart it on both cards. Simulator lane initialization has a one-lane offset. Seeded application stream semantics and quality remain unresolved. Planned: seeded per tile from `Backend::seed`. The claim is distributional
+- [x] **S7 The PRNG** (2026-10-10, steps 140-142, lane T6; cards 0 and 1): a host model of the per-lane stream (`advance^(98-2i)(seed)` on silicon, measured for 8 seeds x 32 lanes on both cards; ttsim's `advance^(96-2i)`), a per-tile seed directive honoured by the role firmware (RISC-V store + fence + 512 NOPs), a decorrelated generator (33 reads per slot plus a bijective ARX mixer), native Bernoulli, uniform, normal (Box-Muller over the S4 programs) and `int_random` (multiply-shift, range at most 2^23) with derived bounds, resident Burn `float_random`/`int_random`, dropout composed with no uploads; random inside a trace is refused (replay would repeat the seeds). Entropy is 32 bits per tile and the mixer is an empirical decorrelator, not a statistical-suite generator. Earlier text follows.
+  ** Step91 checks the seed-register write, advance and predication. WRCFG does not restart silicon's stream; direct RISC-V configuration stores with a fence and 512 NOP iterations do restart it on both cards. Simulator lane initialization has a one-lane offset. Seeded application stream semantics and quality remain unresolved. Planned: seeded per tile from `Backend::seed`. The claim is distributional
       (a stated statistical test), not bit-exact against Flex, whose generator is
       different. Burn: `float_random`, dropout.
 - [x] **S8 Lane movement.** `Program::rotate_row` (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`),
@@ -1400,7 +1415,7 @@ Each names the measurement it must move. The Burn-side ones are in
       for lane masks; interpreter models of all four held to silicon in
       `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
       transpose then add). First user: R1's in-tile folds.
-- [ ] **S10 A fast, approximate mode for the transcendentals** (asked for during 10.2e;
+- [x] **S10 A fast, approximate mode for the transcendentals** (2026-10-10, step145-146, lane T8): `MathMode::{Precise, Approx}` (`TT_MATH=approx`, `Session::set_math_mode`, `TtDevice::set_math_mode`); Approx twins (kinds 0x1d0-0x1d5) for `exp`, `log`, `recip`, `sigmoid`, `tanh`, `gelu` with derived bounds (exp 8.2e-5, log 5.2e-5, recip 3.2e-5, sigmoid 1.13e-4, tanh 5.2e-5 relative; gelu |x|(2.5e-4) absolute), device programs equal the interpreter bit for bit on card 0, mode is in the program cache key. Measured per tile on card 0: exp 8.08 -> 6.51 us (1.24x), log 10.96 -> 7.97 (1.37x), recip 7.82 -> 0.95 (8.24x), sigmoid 12.18 -> 7.40 (1.65x), tanh 13.09 -> 8.10 (1.62x), gelu 28.46 -> 7.31 (3.89x) (`silicon_perf::approx_per_tile_saving`). `sqrt`/`rsqrt` measured and dropped (the saving is not real); fused softmax/norms and backward ops stay Precise. Original text follows. (asked for during 10.2e;
       concepts review G10's `math_approx_mode`). Today every S3/S4 op is built for a
       derived bound of a few ulps (`EXP_BOUND`, `ERF_BOUND`, ...), and that costs
       instructions on the device -- degree-16 Chebyshev fits evaluated by Clenshaw,
@@ -1418,7 +1433,7 @@ Each names the measurement it must move. The Burn-side ones are in
       relative), a sweep and a device gate, and `silicon_perf` measures what each
       saves per tile against `Precise`. Burn: the mode on `TtDevice`/config;
       `accuracy()` gains the mode so exact mode still refuses both.
-- [ ] **S9 `SFPLOADMACRO`.** Silicon-only (row 7); a performance item, after everything
+- [x] **S9 `SFPLOADMACRO`.** Helpers, schedule model and silicon probes s00-s13 pass on card 0 (step110); ttsim cannot execute it (row 7). No SFPU default changes; performance adoption not claimed.
       else here works without it.
 
 ### M — Matrix Unit beyond `MVMUL`
@@ -1431,12 +1446,13 @@ Each names the measurement it must move. The Burn-side ones are in
       are implemented (`step90`). Final both-card targeted gates pass `1791255922`
       (24/24), full smoke passes `1791255409` (322/322), and release medians are
       recorded in `1791255969`. Mesh mode is explicitly refused.
-- [~] **M2 `GMPOOL`/`GAPOOL`.** Block max/sum/mean kernels gated on simulator and
+- [-] **M2 `GMPOOL`/`GAPOOL`.** *Closed 2026-10-10: GAPOOL averages route (BF16 NCHW); GMPOOL is diagnostic-only because its packed ArgMax returns no index bits on both cards (runs `1791240702`, `1791240373`); max pooling stays on the exact SFPU selection (step78).* Original text: Block max/sum/mean kernels gated on simulator and
       both cards (`step75`). BF16 NCHW average/adaptive pooling uses GAPOOL;
       F32/general max retains SFPU semantics, including resident indices and
       overlapping backwards (`step78`). General GMPOOL routing and performance
-      remain open. Pooling traces currently refuse metadata uploads.
-- [~] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
+      remain open. Pooling geometry uses replayable metadata descriptors, so pooling
+      traces replay (step78, step89).
+- [-] **M3 Transpose on the Tensix** *(closed 2026-10-10: the payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack; `TRNSPSRCB` remains the explicit TF32/BF16 Src route that normalizes signed zeros and subnormals (step73, step87); the unpacker transpose mode swaps rows and columns correctly (step113, card 0) but goes through the 19-bit SrcA datum, and the plain SrcA path itself normalizes -0, subnormals and low mantissa bits (`MEASURE src.plain`), so no Tensix route preserves payloads)* (`TRNSPSRCB`, or the unpacker's transpose mode) in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
       through dimension swaps, without a new transpose kernel (`step66`).
@@ -1447,7 +1463,7 @@ Each names the measurement it must move. The Burn-side ones are in
 
 ### R — Reductions and composites
 
-- [~] **R1 Reductions over any dim.** Done (R1a): `sum` and `max` over either dim of
+- [x] **R1 Reductions over any dim.** *(close-out: also Flex-order cummin/cummax, integer scans, I32 arg-extremes and the device sort family.)*  Done (R1a): `sum` and `max` over either dim of
       a matrix (`Session::reduce`, `sfpu::reduce`): a reduce kernel -- many input tiles
       into one output tile, four semaphores numbered compatibly with the matmul's and
       the element-wise kernel's -- that accumulates lanewise in `Dst`, masks a ragged
@@ -1483,9 +1499,16 @@ Each names the measurement it must move. The Burn-side ones are in
       sums and maxima over either axis (`step67`; both-card validated).
       Simulator and both-card gates (`step69`) cover direct product, native Boolean
       `any`/`all`, rank-N arg-reductions and inclusive cumsum/cumprod.
-      Remaining: both-card validation and cumulative min/max. Full maxima compose native reshape and
+      R1d (2026-10-09; step130-132, simulator and card 0 `1791560292`/`296`/`300`):
+      `float_cummin`/`float_cummax` run `ScanOp::{MinNan,MaxNan}` with Flex's
+      `is_nan() || val < acc` rule (a NaN replaces the accumulator and stays until a
+      later NaN; the earlier element is kept on equal values including ±0); the
+      total-order `Min`/`Max` remain for kernel users. `int_cumsum`/`int_cumprod` wrap
+      modulo 2^32, `int_cummin`/`int_cummax` are signed, and `int_argmax`/`int_argmin`
+      return the first index of the signed extreme by exact integer comparison, so
+      Burn's `int_{max,min}_dim_with_indices` compose over them. Full maxima compose native reshape and
       max reductions; minimum defaults retain their gather limitations.
-- [~] **R2's groundwork: broadcasts.** `sfpu::ops::Broadcast::{None, Row, Col}` for
+- [x] **R2's groundwork: broadcasts.** *(close-out: done, see R2.)*  `sfpu::ops::Broadcast::{None, Row, Col}` for
       `ADD`, `SUB`, `MUL`, `DIV` (`ADD_ROW` is now `ADD` with a row broadcast): a row
       laid into `Dst` by sub-run unpacks, a column made into a whole tile by the mover
       (`tt_isa::dm::op::READ_BROADCAST_COL`, `READ_RUN` flag bit 1, `Transform` on
@@ -1510,30 +1533,31 @@ Each names the measurement it must move. The Burn-side ones are in
       were removed 2026-10-03: approximate operations follow resident data
       at every size. The old placement measurements remain in
       `firmware-performance.md`'s change log.
-      **Exact mode** (`burn_tt::set_exact`, `TT_EXACT=1`): legacy approximate
-      ops use Flex. Full `sum`/`mean` always use native arithmetic within their
-      derived bounds, including in this mode. Gates: `step32_burn_softmax`
+      **Exact mode (retired):** `burn_tt::set_exact`, `TT_EXACT` and Flex
+      placement no longer exist; every op is native within its derived bound, and
+      full `sum`/`mean` always used native arithmetic. Gates: `step32_burn_softmax`
       (every step resident, both dims, three shapes; a two-tile tensor on the host and
       bit-identical); the MNIST golden in exact mode. Was: **R2 Softmax, log-softmax,
       cross-entropy on the device** (was checklist 9.12): max,
       subtract, `exp`, sum, reciprocal. General ops gated against Flex; MNIST's
       per-step logits download goes away as a consequence, not as the goal. Burn:
       `softmax`, `log_softmax`, `softmin`.
-- [~] **R3 Norms.** Burn LayerNorm and RMSNorm already compose native primitives.
+- [x] **R3 Norms.** *(close-out: release baselines recorded; fusion stays deliberately unbuilt.)*  Burn LayerNorm and RMSNorm already compose native primitives.
       Dedicated forward/backward, layout and residency gates are in `step70`;
       both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
-      Performance measurements remain open. Fusion is deferred.
-- [~] **R4 `ModuleOps::attention`.** Native QKᵀ, scale, positive softcap,
+      Release baselines recorded 2026-10-10 in `firmware-performance.md`. Fusion is deferred.
+- [x] **R4d Mesh trace capture/replay** (2026-10-10, step147): `MeshEngine` captures one session trace per chip between the host-run Ethernet transfers and replays them in order (sync both chips, re-run the transfer, continue), refusing with `UnheldTransfer` any capture whose transfer endpoints no stored trace holds. Changed-input replays of a distributed product chain and an attention forward equal fresh runs bit for bit with no host uploads; card 0/1 gates pass. Mesh training traces and `copy_into` on a mesh remain unsupported.
+- [x] **R4 `ModuleOps::attention`.** *(close-out: mesh trace capture/replay is supported, see R4d.)*  Native QKᵀ, scale, positive softcap,
       bottom-right causal/broadcast masks, bias, NaN-safe softmax and V products.
       F32/BF16 forward, Q/K/V/bias gradients, resident training, large-K permuted
       views and one/two-tile replay pass step83. Actual two-card products and
       all gradients match single-card references (step88, `1791249486`), with
-      nonzero Q/K gradients on both partitions. Mesh trace capture remains unsupported.
+      nonzero Q/K gradients on both partitions. Mesh trace capture and replay: ttsim step147 and card 0/1 gates pass (R4d, below).
 
 
 ### D — Formats and data movement
 
-- [~] **D1 BF16 tensors in GDDR.** Separate `Bf16Tensor`/2112-byte physical slots,
+- [x] **D1 BF16 and FP16 tensors in GDDR.** *Close-out 2026-10-10: FP16 follows BF16's raw two-byte path with exact SFPU widening/narrowing (step143-144, card 0, all 65,536 patterns); BF16 into Dst measured (step114); F64 and F16 arithmetic are explicit `[-]`.* Separate `Bf16Tensor`/2112-byte physical slots,
       raw transfers/views/repack, native ties-even pack and SrcA/MOVA2D widening,
       packed rank-two MMA and native Burn compute adapters. `step74`, `step76`,
       `step77` pass both cards; narrowing is silicon-only (ttsim mode `0x105`
@@ -1587,7 +1611,7 @@ Each names the measurement it must move. The Burn-side ones are in
   - [-] **D3b INT8/UINT8 codes.** Deferred to D2: nothing would use an 8-bit device
         format yet (Burn's int is `i32`, bools ride INT32), and the codes are best
         measured beside the block-float ones `QTensorOps` needs.
-- [~] **D4 Indexing on the B mover.** Current contract (2026-10-06): resident
+- [x] **D4 Indexing on the B mover.** *(close-out: ND gather/scatter are native (step127); scatter_nd Mul/Min/Max are `[-]`.)*  Current contract (2026-10-06): resident
       arbitrary-axis multi-index gather/select preserves raw F32/BF16/I32/Bool
       bits; B validates logical indices before accesses. Duplicate scatter and
       select updates retain logical order: F32 accumulation with final BF16
@@ -1597,12 +1621,12 @@ Each names the measurement it must move. The Burn-side ones are in
       repeated indices, device-produced indices and changed-input trace replay;
       both cards pass (`1791249159`). Historical step61/62 one-index/row routes
       are superseded by this general geometry. ND gather/scatter remains open.
-- [~] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
+- [-] **D5 Tilize and untilize on the device** *(closed 2026-10-10: unpacker tileize is a payload-preserving strided row gather on card 0 (step113) but reads 32-datum rows, so a face-ordered tile needs extra passes and no benefit over host or mover tilize is shown; host tilize stays the default, mover `TILIZE` opt-in)* (overlaps checklist 9.10).
       Mover `TILIZE`/`UNTILIZE`, `Session::set_tilize` and `TT_TILIZE=card`
       are implemented and gated (`step58_tile_layout`), but slower than
       host tilize at the measured sizes. Host tilize remains the default.
       Unpacker/Tensix tilize and direct reads from caller memory remain open.
-- [~] **D6 Convolution.** Bounded native im2col/matmul and deterministic col2im
+- [x] **D6 Convolution.** *(close-out: conv3d, transposed conv3d and deformable convolution are `[-]` with an explicit failure.)*  Bounded native im2col/matmul and deterministic col2im
       implement grouped/depthwise conv2d, conv1d, transposed 1D/2D and unfold4d,
       including all gradients and dilation/output padding. F32/BF16 uses F32
       continuation and final narrowing. Step85 covers analytic/Flex oracles,
@@ -1632,7 +1656,7 @@ path today, `~` when only some shapes do.
 | `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial | M3, D2 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
-| `float_remainder{,_scalar}` | | S6 |
+| `float_remainder{,_scalar}` | x exact SFPU fmod (Flex's `((a%b)+b)%b` bit for bit; NaN payload canonical); 2362 words, long division on integers; card 0 (step133-134) | S6 (T4) |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
 | `float_cast` | x same dtype or native F32↔BF16; other reduced floats refused | D1, S6 |
@@ -1642,7 +1666,7 @@ path today, `~` when only some shapes do.
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
-| `float_random` | works through seeded per-device host tensor construction; native hardware distributions deferred | S7 partial |
+| `float_random`, `int_random` | x native seeded resident draws (Default, Uniform, Bernoulli, Normal); host construction only for a device with no GDDR; F16/F64 fail explicitly; refused inside a trace; cards 0 and 1 (step142) | S7 |
 | `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
 | `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
@@ -1650,21 +1674,22 @@ path today, `~` when only some shapes do.
 | `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
 | `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
-| `float_cummin`, `float_cummax` | | R1 |
-| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk` | | R1 (late) |
+| `float_cummin`, `float_cummax` | x resident Flex-order scans (NaN propagates, earlier equal element kept); both-card gates pending, card 0 passes (step130) | R1 |
+| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk`, and the `int_` equivalents | x resident bitonic sort, F32/I32, any rank and axis up to 1024, stable (ties by original index), F32 in `total_cmp` order, trace-replayable; BF16 values widen, sort and narrow (flushing BF16 subnormals); longer axes, other dtypes and empty inputs refused by name; card 0 (step135-139, runs `1791561979`-`1791567677`) | R1 (T5) |
 | `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
 | `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_unfold` | `~` native raw copies/compositions, step84/85 | D4, M3 |
-| `float_gather_nd`, `float_scatter_nd` | | D4 |
-| `float_cross`, `float_grid_sample_2d` | | not planned until a model needs them |
+| `float_gather_nd`, `float_scatter_nd`, `int_gather_nd`, `int_scatter_nd` | x resident F32/I32 (BF16 gather_nd); every coordinate checked against its own axis (DOMAIN 11); scatter Add folds duplicates in index order, Assign is last writer; Mul/Min/Max `[-]` (Burn leaves duplicates undefined); card 0 (step127, runs `1791567843`-`1791567861`) | D4 (T2) |
+| `float_cross` | x composition of slice/mul/sub/cat, device-rounding oracle; card 0 (step128) | D4 (T2) |
+| `float_grid_sample_2d` | `[-]` out of scope: not planned until a model needs it | -- |
 
 ### `ActivationOps`
 
 | Methods | Device | Item |
 |---|:-:|---|
 | `relu`, `relu_backward` | x (SFPU) | S1 |
-| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; `prelu` with one weight on the host) | S2 |
+| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; a one-element weight is expanded on the device by `device_op_ungated`, residency gate step129) | S2 |
 | `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
 | `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
 | `softmax`, `log_softmax` | x (device composition, derived bound; every supported size) | R2 |
@@ -1690,14 +1715,19 @@ path today, `~` when only some shapes do.
 | `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
 | `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*` | x I32 full-width wrapping ALU, signed comparisons, masked shifts; both-card validated | S5 |
 | `int_{div,remainder}{,_scalar}`, `int_mean_dim` | `~` checked native I32, simulator/card-0 validated (`1791232718`) | S5 |
-| `int_neg`, `int_abs` | Burn compositions over native wrapping ALU | S5 |
+| `int_neg` | Burn composition over native wrapping ALU | S5 |
+| `int_abs` | x wrapping (`i32::MIN` stays `i32::MIN`, as Flex); card 0 (step126, run `1791560877`) | S5 (T1) |
+| `int_clamp*`, `int_sign`, `int_max_abs*` | x Burn defaults over native mask fill/abs, no downloads (step126) | S5 (T1) |
 | `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
 | `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
-| `int_cast` | | S6 |
-| `int_sum*`, `int_max*`, `int_argmax`.. | | R1 |
+| `int_cast` | `~` I32→I32 native; other widths fail by name (`[-]`: the device stores I32 only) (step126) | S6 (T1) |
+| `int_sum*`, `int_max*`, `int_prod*`, `int_min*` | x I32 reductions (step80) | R1 |
+| `int_matmul` | x exact modulo 2^32 composition (expand, `int_mul`, `int_sum_dim`), size budget 2^22 elements, never an f32 matmul; card 0 (step128) | S5 (T2) |
+| `int_cumsum`, `int_cumprod`, `int_cummin`, `int_cummax`, `int_argmax`, `int_argmin` | x wrapping/signed resident scans and first-extreme indices (step131-132, card 0) | R1 |
 | `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
 | `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
-| `bool_mask_*` | | S5 |
+| `int_mask_where`, `int_mask_fill`, `bool_mask_where`, `bool_mask_fill` | x raw-bit selects and fills (16777217 and `i32::MIN` exact); card 0 (step126) | S5 (T1) |
+| `{int,bool}_{permute, flip, unfold}` | x dtype-generic views and copies; card 0 (step125, run `1791560886`) | D3 (T1) |
 | indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | `~` resident arbitrary-axis gather/select, stepped slices/assignment/cat/repeat, I32 wrapping and Boolean OR updates; ND indexing remains open | D4 |
 | `QTensorOps` | explicit unsupported | Deferred; D2 is backend tensor storage, not portable quantization |
 
@@ -1725,7 +1755,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
 | Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
-| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
+| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; closed as API: the `write_fenced` family (X7, step119) -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
@@ -1772,7 +1802,7 @@ unfold and gradients pass initial independent simulator and both-card gates
 forward/gradient tests pass (`1791234542`). BF16 boundaries narrow once from F32.
 `step86` validates resident arbitrary-axis gather/select, duplicate float additions,
 DOMAIN refusal and changed-index traces on both cards (`1791235065`). Broader
-numerical, mutant, large-K and format/layout acceptance remains open.
+numerical, mutant and format/layout acceptance is covered by the later lane gates; large-K is gated (`step68`, `1791145571`; `step83`; `1791249159`).
 
 Additional continuation gates: forced ragged K=3609 (113 tiles, plan asserts K
 is split) checks convolution forward and all gradients on both cards

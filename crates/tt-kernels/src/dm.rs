@@ -209,6 +209,7 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::THROTTLE_STALLS),
             mover.at(dm::THROTTLE_CYCLES),
             mover.at(dm::WRITE_NOC),
+            mover.at(dm::READ_FAST),
             mover.at(dm::QUEUE_HEAD),
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),
@@ -276,6 +277,29 @@ impl<N: NocId> DataMover<N> {
         cap: u32,
     ) -> Result<()> {
         d.write32(w, self.tile, self.mover.at(dm::IN_FLIGHT_CAP), cap)?;
+        Ok(())
+    }
+
+    /// Issue this mover's GDDR reads through the fast path from its next list
+    /// (`tt_isa::dm::READ_FAST`), or back through the path that writes every
+    /// initiator register per request. Off at start. Only RISCV B reads: NC's
+    /// image ignores it.
+    ///
+    /// The fast path is `noc_async_read_set_state` / `_with_state` on request
+    /// initiator 1 of NoC #0 (`NoC/MemoryMap.md`, "NIU Request Initiators"): the
+    /// words that do not change between reads are written once per list and
+    /// each request writes only the address words and what changed. Its output
+    /// is gated byte-identical to the other path's on the simulator and on card
+    /// 0 (`step118_mover_fast_path`: initiator 1 keeps its registers). It saves
+    /// about 17 ns of the ~0.48 us a request costs, 3-4% on every shape
+    /// (`silicon_perf::mover_read_fast_path`), so it stays opt-in.
+    pub fn set_read_fast<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        fast: bool,
+    ) -> Result<()> {
+        d.write32(w, self.tile, self.mover.at(dm::READ_FAST), u32::from(fast))?;
         Ok(())
     }
 

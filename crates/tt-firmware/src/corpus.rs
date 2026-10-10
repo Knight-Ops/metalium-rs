@@ -14,6 +14,7 @@ use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::role::Mailbox;
+use tt_isa::l1_atomic::guard::{self, Guard};
 use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
@@ -103,6 +104,272 @@ fn unwedge() {
     }
 }
 
+/// What a guarded run was armed with (`tt_isa::l1_atomic::guard`).
+struct GuardRun {
+    deadline: u32,
+    grace: u32,
+    complete: u32,
+    mode: u32,
+}
+
+/// Record how far a guarded run got, where the host can read it
+/// ([`Guard::stage`]). Fenced, so the breadcrumb is visible even if the very
+/// next step hangs this core.
+fn crumb(g: Guard, stage: u32) {
+    // SAFETY: a fixed aligned word of this role's guard block.
+    unsafe { l1_write32(g.stage(), stage) };
+    publish();
+}
+
+/// One load of Tensix semaphore `i`, its result consumed (`andi`) before the
+/// function returns, so no later load starts while this one is outstanding
+/// (`ManualTTSync.md`: loads in `PC_BUF_BASE..+0xFFFF` must not overlap).
+fn semaphore_load(i: u64) -> u32 {
+    // SAFETY: the documented semaphore window of this core; a load reads the
+    // value and has no side effect.
+    let mut v = unsafe { l1_read32(tt_isa::tensix::SEMAPHORE_ACCESS + 4 * i) };
+    // SAFETY: an ALU instruction on a register.
+    unsafe { core::arch::asm!("andi {v}, {v}, 15", v = inout(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// All eight semaphores as one packed word, one nibble each. `raw` loads them
+/// back to back, as the first guarded design did; otherwise each is consumed
+/// before the next. With `first`, a breadcrumb names the load about to start.
+fn semaphore_snapshot(g: Guard, raw: bool, first: bool) -> u32 {
+    let mut snapshot = 0u32;
+    for i in 0..8u64 {
+        if first {
+            crumb(g, guard::stage::FIRST_LOAD + i as u32);
+        }
+        let v = if raw {
+            // SAFETY: as `semaphore_load`, without consuming the result.
+            unsafe { l1_read32(tt_isa::tensix::SEMAPHORE_ACCESS + 4 * i) & 0xf }
+        } else {
+            semaphore_load(i)
+        };
+        snapshot |= v << (4 * i);
+    }
+    snapshot
+}
+
+/// Whether the host armed this run as **guarded** (`tt_isa::l1_atomic::guard`),
+/// consuming the arming word so a stale one cannot guard a later, unrelated run.
+///
+/// A guarded program may park its Tensix thread in a Wait Gate (a held mutex, a
+/// retrying `ATCAS`, a full or empty `ATINCGETPTR` FIFO). The ordinary
+/// end-of-program `wait_for_coprocessor` is a load that stalls inside the
+/// memory subsystem until the thread drains, with no way for this core to time
+/// it out -- so for these runs it is replaced by [`guard_wait`].
+fn guard_armed(mb: Mailbox) -> bool {
+    let g = Guard::of(mb);
+    // SAFETY: fixed aligned words of the role mailbox's guard block.
+    unsafe {
+        if l1_read32(g.arm()) != guard::ARMED {
+            return false;
+        }
+        l1_write32(g.arm(), 0);
+    }
+    crumb(g, guard::stage::ARM_SEEN);
+    true
+}
+
+/// Read and check an armed run's parameters and clear what a previous run could
+/// have left that would read as this program's completion.
+fn guard_begin(
+    mb: Mailbox,
+    streamed: bool,
+    looped: bool,
+    dump_rows: u32,
+    program_len: u32,
+) -> GuardRun {
+    let g = Guard::of(mb);
+    // SAFETY: fixed aligned words of this role's guard block.
+    let run = unsafe {
+        GuardRun {
+            deadline: l1_read32(g.deadline()),
+            grace: l1_read32(g.grace()),
+            complete: l1_read32(g.complete_semaphore()),
+            mode: l1_read32(g.mode()),
+        }
+    };
+    if streamed
+        || looped
+        || dump_rows != 0
+        || program_len > guard::MAX_WORDS
+        || run.deadline == 0
+        || run.deadline > guard::MAX_POLLS
+        || run.grace == 0
+        || run.grace > guard::MAX_POLLS
+        || run.complete >= 8
+        || run.mode > guard::PollMode::L1Word as u32
+    {
+        fail_in(mb, guard::REFUSED);
+    }
+    crumb(g, guard::stage::PARAMS_OK);
+    if run.mode == guard::PollMode::L1Word as u32 {
+        // SAFETY: a fixed aligned word of the guard block.
+        unsafe { l1_write32(g.complete_word(), 0) };
+    } else {
+        // A post left over from an earlier run would read as this program's
+        // completion: take every one down first (an odd store is a `SEMGET`).
+        let at = tt_isa::tensix::SEMAPHORE_ACCESS + 4 * run.complete as u64;
+        for _ in 0..16 {
+            if semaphore_load(run.complete as u64) == 0 {
+                break;
+            }
+            // SAFETY: the semaphore window of this core.
+            unsafe { l1_write32(at, 1) };
+        }
+    }
+    crumb(g, guard::stage::CLEARED);
+    run
+}
+
+/// Publish `snapshot` if it differs from the last one shown.
+fn show(g: Guard, snapshot: u32, shown: &mut u32) {
+    if snapshot != *shown {
+        *shown = snapshot;
+        // SAFETY: a fixed aligned word of the guard block.
+        unsafe { l1_write32(g.snapshot(), snapshot) };
+        publish();
+    }
+}
+
+/// Wait for a guarded program's completion with a bounded poll.
+///
+/// How completion is seen depends on the armed [`guard::PollMode`]: the
+/// program's last instruction posts a semaphore, which this core reads (every
+/// poll all eight, publishing them as one packed word the host can read
+/// ([`Guard::snapshot`]); or only the completion semaphore, with the full set
+/// every [`guard::LIGHT_SNAPSHOT_EVERY`] polls), or stores a token to an L1 word
+/// that this core polls. The semaphore is taken down again once seen (an odd
+/// store is a `SEMGET`).
+///
+/// After `deadline` polls without it the role reports [`guard::BLOCKED`] in its
+/// status word, where the host can see it, and keeps polling for up to `grace`
+/// more. Every poll also honours the host's release request: the semaphores in
+/// the low eight bits of [`Guard::release`] are posted from this core (a store
+/// to the semaphore window, which queues behind nothing the blocked thread
+/// holds), and the request is cleared and counted. Once the grace runs out the
+/// role gives up with [`guard::ABANDONED`] -- *without* ever issuing the
+/// coprocessor-drain load that would hang this core behind the stuck thread.
+///
+/// The count is polls rather than `mcycle`, which ttsim does not model
+/// (divergence row 71). The running total is written to [`Guard::polls`] every
+/// 16 polls, so a host that sees it frozen knows the loop is not turning.
+fn guard_wait(mb: Mailbox, run: &GuardRun) {
+    use guard::{stage, PollMode};
+    use tt_isa::tensix::SEMAPHORE_ACCESS;
+    let g = Guard::of(mb);
+    crumb(g, stage::POLL_ENTERED);
+    let complete = run.complete as u64;
+    let (mut total, mut polls, mut blocked, mut released) = (0u32, 0u32, false, 0u32);
+    let (mut shown, mut finishing) = (u32::MAX, false);
+    loop {
+        publish();
+        let first = total == 0;
+        if finishing {
+            // One more full pass: the semaphores are read one after another, so
+            // a post that preceded the completion may not be in the last one.
+            let s = semaphore_snapshot(g, false, false);
+            show(g, s, &mut shown);
+            break;
+        }
+        let done = if run.mode == PollMode::L1Word as u32 {
+            // SAFETY: a fixed aligned word of the guard block.
+            unsafe { l1_read32(g.complete_word()) == guard::COMPLETE_TOKEN }
+        } else if run.mode == PollMode::Light as u32 {
+            if first {
+                crumb(g, stage::FIRST_LOAD + run.complete);
+            }
+            let done = semaphore_load(complete) != 0;
+            if done || first || total & (guard::LIGHT_SNAPSHOT_EVERY - 1) == 0 {
+                let s = semaphore_snapshot(g, false, false);
+                show(g, s, &mut shown);
+            }
+            done
+        } else {
+            let s = semaphore_snapshot(g, true, first);
+            show(g, s, &mut shown);
+            (s >> (4 * run.complete)) & 0xf != 0
+        };
+        if first {
+            crumb(g, stage::FIRST_POLL_DONE);
+        }
+        if done {
+            if run.mode == PollMode::L1Word as u32 {
+                break;
+            }
+            // SAFETY: the semaphore window of this core; an odd store is a
+            // SEMGET.
+            unsafe { l1_write32(SEMAPHORE_ACCESS + 4 * complete, 1) };
+            finishing = true;
+            continue;
+        }
+        // SAFETY: a fixed aligned word of the guard block.
+        let request = unsafe { l1_read32(g.release()) };
+        if request & (guard::RELEASE_MASK | guard::POKE) != 0 {
+            if request & guard::POKE != 0 {
+                // A store by this core to an L1 word a parked `ATCAS` or
+                // `ATINCGETPTR` polls: checked to be one aligned word of the
+                // data arena, so a stale or corrupt request cannot write
+                // firmware, a mailbox or a program.
+                // SAFETY: fixed aligned words of the guard block.
+                let (at, value) = unsafe { (l1_read32(g.poke_addr()), l1_read32(g.poke_value())) };
+                if at % 4 != 0 || !tt_isa::l1::DATA.contains(at as u64, 4) {
+                    fail_in(mb, guard::REFUSED);
+                }
+                // SAFETY: inside the data arena, checked above.
+                unsafe { l1_write32(at as u64, value) };
+                publish();
+            }
+            for i in 0..8u64 {
+                if request & (1 << i) != 0 {
+                    // SAFETY: the semaphore window; an even store posts.
+                    unsafe { l1_write32(SEMAPHORE_ACCESS + 4 * i, 0) };
+                }
+            }
+            released += 1;
+            // SAFETY: as above; the count first, so a host that sees the
+            // request cleared finds it counted.
+            unsafe {
+                l1_write32(g.released(), released);
+                l1_write32(g.release(), 0);
+            }
+            publish();
+        }
+        total = total.saturating_add(1);
+        polls = polls.saturating_add(1);
+        if total & 0xf == 0 {
+            // SAFETY: a fixed aligned word of the guard block.
+            unsafe { l1_write32(g.polls(), total) };
+            publish();
+        }
+        if !blocked {
+            if polls >= run.deadline {
+                blocked = true;
+                polls = 0;
+                // SAFETY: fixed aligned mailbox word.
+                unsafe { l1_write32(mb.status(), guard::BLOCKED) };
+                crumb(g, stage::BLOCKED);
+            }
+        } else if polls >= run.grace {
+            // SAFETY: as above.
+            unsafe { l1_write32(g.polls(), total) };
+            fail_in(mb, guard::ABANDONED);
+        }
+    }
+    // SAFETY: as above.
+    unsafe { l1_write32(g.polls(), total) };
+    crumb(g, stage::POLL_DONE);
+    // Every blocking instruction has completed; what follows the post is a
+    // program epilogue of instructions that cannot block (the builder in
+    // `tt_kernels::atomics` puts the post last).
+    wait_for_coprocessor();
+    crumb(g, stage::DRAINED);
+}
+
 fn run_in<Riscv, Thread>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
@@ -175,12 +442,24 @@ where
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
     let tracing = unsafe { l1_read32(mb.trace()) } != 0;
-    let push_window = unsafe { l1_read32(mb.push_window()) };
+    let mut push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
     // SAFETY: as above.
     if unsafe { l1_read32(mb.unwedge()) } != 0 {
         unwedge();
     }
+
+    // A guarded run (`guard_armed`): the program is short enough that its pushes
+    // cannot fill a blocked thread's FIFO, is neither streamed, looped nor
+    // dumping, and carries its own bounds. Checked before anything is pushed;
+    // the window drain is off because it is a coprocessor-drain load too.
+    let guarded = guard_armed(mb);
+    let guard_run = if guarded {
+        push_window = 0;
+        Some(guard_begin(mb, streamed, looped, dump_rows, program_len))
+    } else {
+        None
+    };
 
     // Bounds are checked here rather than trusted, because a runaway length would
     // push whatever happens to be in L1 into the coprocessor.
@@ -310,13 +589,18 @@ where
         until_drain: push_window,
         _p: core::marker::PhantomData,
     };
-    push.span(0, code_len, &loops[..n]);
+    push.span(push.start(code_len), code_len, &loops[..n]);
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
 
     // The pushes above have only reached a FIFO. Wait for them to retire before
     // looking at Dst.
-    wait_for_coprocessor();
+    if let Some(run) = &guard_run {
+        crumb(Guard::of(mb), guard::stage::PUSHED);
+        guard_wait(mb, run);
+    } else {
+        wait_for_coprocessor();
+    }
     trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
 
     let mut row = 0;
@@ -412,7 +696,7 @@ where
         until_drain: push_window,
         _p: core::marker::PhantomData,
     };
-    push.span(0, code_len, &loops[..count as usize]);
+    push.span(push.start(code_len), code_len, &loops[..count as usize]);
     trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
     wait_for_coprocessor();
     Ok(())
@@ -503,6 +787,41 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
+    /// Lane T6: honour a seed directive (`tt_isa::dataflow::seed_directive`)
+    /// at the head of the program, and return the first word to push (past it).
+    /// The coprocessor is drained, the seed goes to the PRNG seed register by a
+    /// full-width RISC-V store, a fence publishes it, and the settling interval
+    /// elapses before anything that reads the generator is pushed: the restart
+    /// procedure `step91_seeded_prng` validates on both cards (a `WRCFG` seed
+    /// write does not restart silicon's stream).
+    fn start(&self, code_len: u32) -> u32 {
+        use tt_isa::dataflow::{SEED_DIRECTIVE, SEED_SETTLE_NOPS, SEED_WORDS};
+        // SAFETY: the first words of the staged program, whose length the
+        // caller checked.
+        if code_len < SEED_WORDS || unsafe { l1_read32(self.program) } != SEED_DIRECTIVE {
+            return 0;
+        }
+        // SAFETY: as above.
+        let seed = unsafe { l1_read32(self.program + 4) };
+        wait_for_coprocessor();
+        // SAFETY: the coprocessor is drained; only the generated full-width
+        // seed field is written, and the fence follows before anything
+        // dependent on it is pushed.
+        unsafe {
+            core::ptr::write_volatile(
+                tt_isa::cfg::generated::global::PRNG_SEED_Seed_Val.riscv_address(ConfigBank::Bank0)
+                    as *mut u32,
+                seed,
+            );
+        }
+        publish();
+        for _ in 0..SEED_SETTLE_NOPS {
+            // SAFETY: an ordinary RISC-V NOP, which the instruction gate allows.
+            unsafe { core::arch::asm!("nop", options(nomem, nostack)) };
+        }
+        SEED_WORDS
+    }
+
     /// Words `[lo, hi)`, each block repeat inside them its `count` times --
     /// the next one being the first, not yet passed, that lies inside and is
     /// not the span itself; the ones inside it its own call's.

@@ -37,13 +37,14 @@ mod traffic;
 mod unsupported;
 mod views;
 
+pub use random::Draw;
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
 };
 pub use server::{
     attach, device_traffic, kmd_engine, kmd_mesh_engine, mesh_execution, AttachGuard, BufferId,
     DramBuffers, Elem, Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine,
-    OutputKind, OutputPayload, PowArg, Serve, TraceRun,
+    OutputKind, OutputPayload, PowArg, Serve, SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;
@@ -85,6 +86,30 @@ pub struct TtDevice {
 impl TtDevice {
     pub const fn new(chip: u16) -> Self {
         TtDevice { chip }
+    }
+
+    /// Run this device's transcendentals (`exp`, `log`, `recip`, `sigmoid`,
+    /// `tanh`, `gelu`) in `mode` from the next op on: [`MathMode::Precise`],
+    /// the default, or the fast [`MathMode::Approx`] programs with their
+    /// looser derived bounds (`tt_kernels::sfpu::approx`). `TT_MATH=approx`
+    /// chooses it when the device attaches. Not the retired exact mode, which
+    /// asked for the host's bits; this asks how many ulps. Fused programs
+    /// (softmax, log-softmax, norms) are Precise either way.
+    ///
+    /// # Panics
+    ///
+    /// If the device is not attached.
+    pub fn set_math_mode(&self, mode: MathMode) -> Result<(), EngineError> {
+        server::run(*self, move |engine, _| engine.set_math_mode(mode))
+    }
+
+    /// The mode [`TtDevice::set_math_mode`] set.
+    ///
+    /// # Panics
+    ///
+    /// If the device is not attached.
+    pub fn math_mode(&self) -> MathMode {
+        server::run(*self, |engine, _| engine.math_mode())
     }
 }
 
@@ -134,7 +159,9 @@ impl Backend for TtBackend {
         match dtype {
             DType::F32 | DType::BF16 => DTypeUsage::general() | DTypeUsage::Accelerated,
             DType::Bool(_) => DTypeUsage::general(),
-            DType::I32 => DTypeUsage::Storage.into(),
+            // FP16 (IEEE binary16): stored and cast on Tensix (lane T7); arithmetic is
+            // not claimed, F64 stays unsupported.
+            DType::I32 | DType::F16 => DTypeUsage::Storage.into(),
             _ => DTypeUsageSet::empty(),
         }
     }
@@ -142,5 +169,6 @@ impl Backend for TtBackend {
 
 pub use server::kmd_engine_with_elementwise;
 pub use tt_kernels::matrix_eltwise::{ElementwiseMode, SrcPrecision};
+pub use tt_kernels::sfpu::approx::MathMode;
 
 pub use topology::attach_topology_with_elementwise;

@@ -17,11 +17,13 @@
 //! to a device, returns [`runtime::RunError`] instead.
 
 pub mod adc_copy;
+pub mod atomics;
 pub mod bf16;
 pub mod bfp;
 pub mod code;
 pub mod datapath;
 pub mod dm;
+pub mod fp16;
 pub mod fpu;
 mod index;
 pub mod kind;
@@ -30,6 +32,8 @@ pub mod link;
 pub mod loops;
 pub mod matmul;
 pub mod matrix_eltwise;
+pub mod mesh_trace;
+pub mod prng;
 pub mod profile;
 pub mod program_cache;
 pub mod runtime;
@@ -41,3 +45,6 @@ pub mod tensor;
 pub mod trace;
 
 mod local_movement;
+
+#[cfg(test)]
+mod hazard_corpus;

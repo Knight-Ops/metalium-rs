@@ -116,6 +116,10 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
     if tensor.dtype() == dtype {
         return tensor;
     }
+    // FP16 casts are lane T7's (`ops_dtype.rs`); any other pair falls through.
+    if let Some(converted) = dtype_ops::cast_f16(&tensor, dtype) {
+        return converted;
+    }
     if !matches!(
         (tensor.dtype(), dtype),
         (DType::F32, DType::BF16) | (DType::BF16, DType::F32)
@@ -549,6 +553,91 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
     ))
 }
 
+/// Reorder dimensions as a chain of `swap`s (a dimension swap is a view). Shared by the
+/// float, integer and boolean permutes, which differ only in `swap`; invalid axes fail
+/// naming `op`.
+pub(crate) fn permute_with(
+    tensor: TtTensor,
+    axes: &[usize],
+    op: &str,
+    swap: impl Fn(TtTensor, usize, usize) -> TtTensor,
+) -> TtTensor {
+    let rank = tensor.shape().num_dims();
+    let mut seen = vec![false; rank];
+    if axes.len() != rank
+        || axes.iter().any(|&a| {
+            if a >= rank || seen[a] {
+                true
+            } else {
+                seen[a] = true;
+                false
+            }
+        })
+    {
+        fail(op, format_args!("{}, axes={axes:?}", context(&tensor)));
+    }
+    let mut order: Vec<_> = (0..rank).collect();
+    let mut tensor = tensor;
+    for (i, &axis) in axes.iter().enumerate() {
+        let j = order
+            .iter()
+            .position(|&a| a == axis)
+            .expect("validated axes");
+        if i != j {
+            tensor = swap(tensor, i, j);
+            order.swap(i, j);
+        }
+    }
+    tensor
+}
+
+/// Reverse selected logical axes through native bit-preserving copies, whatever the element
+/// type; failures name `op`.
+pub(crate) fn flip_native(tensor: TtTensor, axes: &[usize], op: &str) -> TtTensor {
+    let mut slices = vec![burn_backend::Slice::full(); tensor.shape().num_dims()];
+    for &axis in axes {
+        if axis >= slices.len() {
+            fail(op, context(&tensor));
+        }
+        slices[axis] = burn_backend::Slice::with_step(0, None, -1);
+    }
+    sliced_native(&tensor, &slices).unwrap_or_else(|| fail(op, context(&tensor)))
+}
+
+/// Sliding logical windows of any stored element type: payloads preserved, the window axis
+/// appended.
+pub(crate) fn unfold_native(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
+    let shape = tensor.shape().to_vec();
+    assert!(dim < shape.len() && size > 0 && step > 0 && size <= shape[dim]);
+    let mut output = shape.clone();
+    output[dim] = (shape[dim] - size) / step + 1;
+    output.push(size);
+    let count = output
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .expect("unfold overflow");
+    let view = tensor
+        .as_strided()
+        .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    let sources = (0..count)
+        .map(|mut flat| {
+            let offset = flat % size;
+            flat /= size;
+            let mut indices = vec![0; shape.len()];
+            for d in (0..shape.len()).rev() {
+                indices[d] = flat % output[d];
+                flat /= output[d];
+            }
+            indices[dim] = indices[dim] * step + offset;
+            let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
+            view.at(&shape, flat)
+        })
+        .collect();
+    let dims = crate::tensor::stored_dims(&output).unwrap();
+    let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
+    device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
+}
+
 /// General raw resident gather. Static staging covers every legal source;
 /// B reads bounded I32 indices and rejects the domain before indexed copying.
 fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
@@ -818,14 +907,43 @@ fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> 
         return None;
     }
     let elem = match dtype {
-        DType::F32 | DType::BF16 => Elem::F32,
+        DType::F32 | DType::BF16 | DType::F16 => Elem::F32,
         DType::I32 => Elem::I32,
         DType::Bool(_) => Elem::Bool,
         _ => return None,
     };
     let dims = crate::tensor::stored_dims(&shape.to_vec())?;
-    let (id, dims) = crate::server::zeros(*device, dims, elem, dtype == DType::BF16);
+    let (id, dims) = crate::server::zeros(*device, dims, elem, crate::tensor::is_half(dtype));
     Some(device_result_shaped(*device, id, dims, shape, dtype))
+}
+
+/// lane:t6_random: a resident tensor drawn by the seeded tile kernel
+/// (`tt_kernels::prng`). `None` only where the device has no resident buffers
+/// (unattached, or an engine without GDDR) or the shape is empty: the caller
+/// then builds host construction data. On an attached GDDR device a failed
+/// draw is an error at use, never a host retry.
+fn native_random(
+    shape: &burn_backend::Shape,
+    draw: crate::random::Draw,
+    device: &TtDevice,
+    dtype: DType,
+) -> Option<TtTensor> {
+    if !crate::server::is_attached(*device) || !crate::server::supports_dram(*device) {
+        return None;
+    }
+    let dims = crate::tensor::stored_dims(&shape.to_vec())?;
+    if dims.contains(&0) {
+        return None;
+    }
+    let base = crate::random::next_base(*device);
+    let (id, dims) = crate::server::random(*device, dims, draw, base);
+    Some(device_result_shaped(
+        *device,
+        id,
+        dims,
+        shape.clone(),
+        dtype,
+    ))
 }
 
 /// Broadcast bytes on the device using row gathers and whole-matrix transposes.
@@ -1220,7 +1338,37 @@ fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
     t
 }
 
+#[path = "ops_intbool.rs"]
+mod intbool_ops;
+
+#[path = "ops_index.rs"]
+mod index_ops;
+
+#[path = "ops_scan.rs"]
+mod scan_ops;
+
+#[path = "ops_rem.rs"]
+mod rem_ops;
+
+#[path = "ops_sort.rs"]
+mod sort_ops;
+
+#[path = "ops_dtype.rs"]
+mod dtype_ops;
+
 pub mod float {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::float::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::float::*;
     use super::*;
     use burn_backend::Scalar;
     use tt_kernels::kind;
@@ -1323,7 +1471,7 @@ pub mod float {
     }
 
     pub fn float_from_data(data: TensorData, device: &TtDevice) -> TtTensor {
-        if !matches!(data.dtype, DType::F32 | DType::BF16) {
+        if !matches!(data.dtype, DType::F32 | DType::BF16 | DType::F16) {
             fail("float_from_data", context(&data));
         }
         TtTensor::new(HostBuffer::from_data(data), *device)
@@ -1357,19 +1505,33 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
-        if DType::from(dtype) == DType::BF16 {
-            return cast_native(
-                float_from_data(crate::random::float(*device, shape, distribution), device),
-                DType::BF16,
-            );
-        }
-        if DType::from(dtype) != DType::F32 {
+        if !matches!(DType::from(dtype), DType::F32 | DType::BF16) {
             fail(
                 "float_random",
-                format_args!("shape={shape:?}, dtype={dtype:?}"),
+                format_args!("shape={shape:?}, dtype={dtype:?}, distribution={distribution:?}"),
             );
         }
-        float_from_data(crate::random::float(*device, shape, distribution), device)
+        // lane:t6_random: drawn on the device (`crate::random`); BF16 is the
+        // device's F32 draw cast on the device.
+        if let Some(out) = native_random(
+            &shape,
+            crate::random::float_draw(distribution),
+            device,
+            DType::F32,
+        ) {
+            return if DType::from(dtype) == DType::BF16 {
+                cast_native(out, DType::BF16)
+            } else {
+                out
+            };
+        }
+        // No resident buffers on this device: host construction data, as `from_data`.
+        let host = float_from_data(crate::random::float(*device, shape, distribution), device);
+        if DType::from(dtype) == DType::BF16 {
+            cast_native(host, DType::BF16)
+        } else {
+            host
+        }
     }
 
     pub fn float_expand(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
@@ -1749,7 +1911,7 @@ pub mod float {
     /// tensor's matrix is
     /// [`reshaped`]'s.
     fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
-        if !matches!(tensor.dtype(), DType::F32 | DType::BF16) {
+        if !matches!(tensor.dtype(), DType::F32 | DType::BF16 | DType::F16) {
             return None;
         }
         let (from, to) = (tensor.shape().to_vec(), shape.to_vec());
@@ -1818,36 +1980,7 @@ pub mod float {
 
     /// Reorder dimensions as existing strided views or host staging layouts.
     pub fn float_permute(tensor: TtTensor, axes: &[usize]) -> TtTensor {
-        let rank = tensor.shape().num_dims();
-        let mut seen = vec![false; rank];
-        if axes.len() != rank
-            || axes.iter().any(|&a| {
-                if a >= rank || seen[a] {
-                    true
-                } else {
-                    seen[a] = true;
-                    false
-                }
-            })
-        {
-            fail(
-                "float_permute",
-                format_args!("{}, axes={axes:?}", context(&tensor)),
-            );
-        }
-        let mut order: Vec<_> = (0..rank).collect();
-        let mut tensor = tensor;
-        for (i, &axis) in axes.iter().enumerate() {
-            let j = order
-                .iter()
-                .position(|&a| a == axis)
-                .expect("validated axes");
-            if i != j {
-                tensor = float_swap_dims(tensor, i, j);
-                order.swap(i, j);
-            }
-        }
-        tensor
+        permute_with(tensor, axes, "float_permute", float_swap_dims)
     }
 
     /// The last two dimensions swapped; see [`float_swap_dims`].
@@ -2356,14 +2489,7 @@ pub mod float {
     /// uploaded once. Unsupported inputs fail with metadata.
     /// Reverse selected logical axes through native bit-preserving copies.
     pub fn float_flip(tensor: TtTensor, axes: &[usize]) -> TtTensor {
-        let mut slices = vec![burn_backend::Slice::full(); tensor.shape().num_dims()];
-        for &axis in axes {
-            if axis >= slices.len() {
-                fail("float_flip", context(&tensor));
-            }
-            slices[axis] = burn_backend::Slice::with_step(0, None, -1);
-        }
-        sliced_native(&tensor, &slices).unwrap_or_else(|| fail("float_flip", context(&tensor)))
+        flip_native(tensor, axes, "float_flip")
     }
 
     pub fn float_slice_assign(
@@ -2376,35 +2502,7 @@ pub mod float {
 
     /// Sliding logical windows: preserve payloads and append the window axis.
     pub fn float_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
-        let shape = tensor.shape().to_vec();
-        assert!(dim < shape.len() && size > 0 && step > 0 && size <= shape[dim]);
-        let mut output = shape.clone();
-        output[dim] = (shape[dim] - size) / step + 1;
-        output.push(size);
-        let count = output
-            .iter()
-            .try_fold(1usize, |n, &d| n.checked_mul(d))
-            .expect("unfold overflow");
-        let view = tensor
-            .as_strided()
-            .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
-        let sources = (0..count)
-            .map(|mut flat| {
-                let offset = flat % size;
-                flat /= size;
-                let mut indices = vec![0; shape.len()];
-                for d in (0..shape.len()).rev() {
-                    indices[d] = flat % output[d];
-                    flat /= output[d];
-                }
-                indices[dim] = indices[dim] * step + offset;
-                let flat = indices.iter().zip(&shape).fold(0, |n, (&i, &d)| n * d + i);
-                view.at(&shape, flat)
-            })
-            .collect();
-        let dims = crate::tensor::stored_dims(&output).unwrap();
-        let (id, dims) = crate::server::repack(tensor.device, view.src.buffer.id, sources, dims);
-        device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
+        unfold_native(tensor, dim, size, step)
     }
 
     pub fn float_slice(
@@ -3307,6 +3405,18 @@ pub mod activation {
 }
 
 pub mod int {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::int::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::int::*;
     use super::*;
 
     pub fn int_gather(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
@@ -3631,6 +3741,14 @@ pub mod int {
                 format_args!("shape={shape:?}, dtype={dtype:?}"),
             );
         }
+        if let Some(out) = native_random(
+            &shape,
+            crate::random::int_draw(distribution),
+            device,
+            DType::I32,
+        ) {
+            return out;
+        }
         int_from_data(crate::random::int(*device, shape, distribution), device)
     }
 
@@ -3652,7 +3770,10 @@ pub mod int {
         tensor: IntTensor<TtBackend>,
         out_dtype: burn_backend::FloatDType,
     ) -> FloatTensor<TtBackend> {
-        if matches!(DType::from(out_dtype), DType::F32 | DType::BF16) {
+        if matches!(
+            DType::from(out_dtype),
+            DType::F32 | DType::BF16 | DType::F16
+        ) {
             if let Some(t) = device_eltwise(kind_sfpu::I32_TO_F32, 0.0, &tensor, None) {
                 return cast_native(t, DType::from(out_dtype));
             }
@@ -3741,6 +3862,18 @@ pub mod int {
 }
 
 pub mod bool {
+    #[allow(unused_imports)]
+    pub use super::dtype_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::index_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::intbool_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::rem_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::scan_ops::bool::*;
+    #[allow(unused_imports)]
+    pub use super::sort_ops::bool::*;
     use super::*;
 
     pub fn bool_scatter_or(
@@ -3827,7 +3960,9 @@ pub mod bool {
     pub fn bool_into_float(tensor: TtTensor, out_dtype: burn_backend::FloatDType) -> TtTensor {
         if matches!(
             out_dtype,
-            burn_backend::FloatDType::F32 | burn_backend::FloatDType::BF16
+            burn_backend::FloatDType::F32
+                | burn_backend::FloatDType::BF16
+                | burn_backend::FloatDType::F16
         ) {
             if let Some(t) = device_eltwise(kind_sfpu::BOOL_TO_F32, 0.0, &tensor, None) {
                 return cast_native(t, DType::from(out_dtype));

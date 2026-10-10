@@ -62,7 +62,7 @@ pub const ALL_BABIES_HELD: u32 = Core::B.soft_reset_mask()
 
 /// Simulated cycles each role may take in the reset program. On silicon the
 /// runner's one-second floor applies.
-const RESET_BUDGET: u64 = 400_000;
+pub(crate) const RESET_BUDGET: u64 = 400_000;
 
 /// Which of this chip's Tensix tiles a session computes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +102,8 @@ pub enum SessionError {
         healthy: usize,
         wedged: Vec<(u8, u8)>,
     },
+    /// `TT_MATH` named no math mode (lane T8, `sfpu::approx::MathMode`).
+    Math(String),
 }
 
 impl From<TransportError> for SessionError {
@@ -135,6 +137,7 @@ impl std::fmt::Display for SessionError {
                  {wedged:?} are wedged, which software cannot clear; reset the board \
                  (`tt-smi -r`, or a power cycle)"
             ),
+            SessionError::Math(e) => write!(f, "{e}"),
         }
     }
 }
@@ -383,15 +386,17 @@ pub struct Session<T: Transport> {
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
+    /// How the transcendentals run ([`Session::set_math_mode`]; lane T8).
+    math: crate::sfpu::approx::MathMode,
     /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
     barriers: u32,
     /// Placements freed while lists that may read them are queued: given back
     /// at the next sync.
     pending_frees: Vec<tensor::Placement>,
     /// The trace being captured ([`Session::begin_trace`]).
-    capture: Option<trace::Capture>,
+    pub(crate) capture: Option<trace::Capture>,
     /// Finished traces, by number.
-    traces: std::collections::HashMap<u64, trace::Trace>,
+    pub(crate) traces: std::collections::HashMap<u64, trace::Trace>,
     next_trace: u64,
     /// Moves on whenever a tile's state is lost -- a reset, a mover restart --
     /// which every trace captured before is [`TraceError::Stale`] against.
@@ -1634,6 +1639,7 @@ impl<T: Transport> Session<T> {
                 });
             }
         }
+        let math = crate::sfpu::approx::MathMode::from_env().map_err(SessionError::Math)?;
         let mut session = Session {
             dataflow: DataflowStats::default(),
             dev,
@@ -1656,6 +1662,7 @@ impl<T: Transport> Session<T> {
             dram: None,
             profiling: None,
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
+            math,
             barriers: 0,
             pending_frees: Vec::new(),
             capture: None,
@@ -1974,6 +1981,17 @@ impl<T: Transport> Session<T> {
         self.dram
             .as_mut()
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
+    }
+
+    /// Lane T6: whether the transport is the simulator, which picks the PRNG
+    /// model's lane initialisation (`prng::Target`).
+    pub fn is_simulated(&mut self) -> bool {
+        self.dev.transport().is_simulated()
+    }
+
+    /// The GDDR allocator, for ops built outside this file (`sfpu::sort`).
+    pub(crate) fn dram_alloc(&mut self) -> Result<&mut DramAlloc, TensorError> {
+        Ok(&mut self.dram_state()?.alloc)
     }
 
     /// Allocate device storage without uploading tensor data.
@@ -3835,6 +3853,9 @@ impl<T: Transport> Session<T> {
         c: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
+        // The session's math mode picks the program: an Approx twin has a kind
+        // of its own, so every memo and cache key below carries the mode.
+        let op = op.in_mode(self.math);
         let units = self.units.len();
         let overlap = self.overlap();
         let alloc = &mut self.dram_state()?.alloc;
@@ -4315,8 +4336,11 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    /// Inclusive sum/product or raw-total-order min/max down rows, carrying
-    /// each prefix between tiles. Min/max preserve selected datum bits.
+    /// Inclusive scan down rows, carrying each prefix between tiles: FP32
+    /// sum/product, raw-total-order or Flex-order (NaN-propagating, IEEE)
+    /// min/max -- these preserve the selected datum's bits -- or the wrapping
+    /// and signed I32 scans, which take and give an I32 tensor
+    /// ([`crate::sfpu::scan::ScanOp::elem`]).
     pub fn scan(
         &mut self,
         a: &DramTensor,
@@ -4533,7 +4557,11 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
-    fn submit_jobs(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+    pub(crate) fn submit_jobs(
+        &mut self,
+        jobs: Vec<tensor::Job>,
+        budget: u64,
+    ) -> Result<(), TensorError> {
         if self.batching {
             return self.submit_jobs_inner(jobs, budget);
         }
@@ -4657,6 +4685,20 @@ impl<T: Transport> Session<T> {
     /// `None` lets the resident planner choose the block length.
     pub fn set_matmul_k_block_limit(&mut self, limit: Option<std::num::NonZeroUsize>) {
         self.matmul_k_block_limit = limit;
+    }
+
+    /// How the transcendentals run from the next element-wise op on
+    /// (`sfpu::approx::MathMode`, S10; `TT_MATH=approx` sets it at open).
+    /// `Precise`, the default, is the full-accuracy programs; `Approx` runs
+    /// the fast ones, within their own looser bounds, for the ops that have
+    /// one. Traces captured before the change keep the mode they recorded.
+    pub fn set_math_mode(&mut self, mode: crate::sfpu::approx::MathMode) {
+        self.math = mode;
+    }
+
+    /// The mode [`Session::set_math_mode`] set.
+    pub fn math_mode(&self) -> crate::sfpu::approx::MathMode {
+        self.math
     }
 
     /// Double-buffer GDDR matmuls from the next op on (checklist 9.15; on by

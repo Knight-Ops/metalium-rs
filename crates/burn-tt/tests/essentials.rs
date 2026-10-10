@@ -12,7 +12,13 @@ fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute(
     assert!(float.contains(DTypeUsage::Arithmetic) && float.contains(DTypeUsage::Accelerated));
     let int = TtBackend::dtype_usage(&d, DType::I32);
     assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
-    assert!(TtBackend::dtype_usage(&d, DType::F16).is_empty());
+    // F16 is raw storage with exact device casts, not compute (lane T7).
+    let half = TtBackend::dtype_usage(&d, DType::F16);
+    assert!(
+        half.contains(DTypeUsage::Storage)
+            && !half.contains(DTypeUsage::Arithmetic)
+            && !half.contains(DTypeUsage::Accelerated)
+    );
     assert!(TtBackend::dtype_usage(&d, DType::BF16).contains(DTypeUsage::Accelerated));
     assert!(TtBackend::dtype_usage(&d, DType::F64).is_empty());
 }
@@ -63,16 +69,17 @@ fn seeded_streams_repeat_and_are_independent_between_devices() {
 #[test]
 fn unsupported_methods_name_operation_shape_and_dtype() {
     let d = TtDevice::new(303);
-    let tensor = Tensor::<TtBackend, 2>::ones([2, 3], &d);
+    // `rfft` is out of scope by design (`out_of_scope.rs`): a stable example.
+    let signal = match Tensor::<TtBackend, 2>::ones([2, 3], &d).into_primitive() {
+        burn_backend::TensorPrimitive::Float(t) => t,
+        burn_backend::TensorPrimitive::QFloat(_) => unreachable!("ones is a float tensor"),
+    };
     let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tensor.remainder_scalar(2.0)
+        <TtBackend as burn_backend::ops::ModuleOps<TtBackend>>::rfft(signal, 1, None)
     }))
     .unwrap_err();
     let message = message.downcast_ref::<String>().unwrap();
-    assert!(
-        message.contains("unsupported operation float_remainder_scalar"),
-        "{message}"
-    );
+    assert!(message.contains("unsupported operation rfft"), "{message}");
     assert!(message.contains("[2, 3]"), "{message}");
     assert!(message.contains("F32"), "{message}");
     // Dtype rejection must report the input metadata, before attaching hardware.
@@ -127,7 +134,7 @@ fn unsupported_boolean_conversion_dtypes_name_operation_and_input() {
         );
         let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if float {
-                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_float(tensor, FloatDType::F16)
+                <TtBackend as BoolTensorOps<TtBackend>>::bool_into_float(tensor, FloatDType::F64)
             } else {
                 <TtBackend as BoolTensorOps<TtBackend>>::bool_into_int(tensor, IntDType::I64)
             }

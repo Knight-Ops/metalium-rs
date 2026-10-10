@@ -101,6 +101,22 @@ impl<T: Transport> Device<T> {
         self.write(window, tile.coord(), address, data)
     }
 
+    /// [`Device::eth_write`], then one read-back of the dword holding the last
+    /// byte written: returns once the bytes have landed. For a buffer another
+    /// agent -- the E1 mover, a link transfer -- acts on next. Any byte range;
+    /// firmware L1 is refused before anything is written, and a failed write
+    /// reads nothing back.
+    pub fn eth_write_fenced(
+        &mut self,
+        window: &Window,
+        tile: EthTile,
+        address: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        refuse_firmware_l1(address, data.len())?;
+        self.write_range_fenced(window, tile.coord(), address, data)
+    }
+
     /// What the tile's base firmware says about its link. Reads only
     /// [`eth::BOOT_RESULTS`], which base firmware publishes for exactly this.
     pub fn eth_link_state(&mut self, window: &Window, tile: EthTile) -> Result<LinkState> {

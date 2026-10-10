@@ -397,10 +397,9 @@ fn mover_integrity() {
         for rep in 0..200u32 {
             let size = [16usize, 4096, 4112, 65536, 131072][rep as usize % 5];
             let data = pattern(size, rep * 7 + 1);
-            a.write(&wa, ta, 0x8_0000, &data).unwrap();
-            b.write(&wb, tb, 0x8_0000, &vec![0xEE; size + 64]).unwrap();
-            let _ = a.read32(&wa, ta, 0x8_0000 + size as u64 - 4).unwrap();
-            let _ = b.read32(&wb, tb, 0x8_0000 + size as u64 + 60).unwrap();
+            a.write_fenced(&wa, ta, 0x8_0000, &data).unwrap();
+            b.write_fenced(&wb, tb, 0x8_0000, &vec![0xEE; size + 64])
+                .unwrap();
             m.send(
                 a,
                 &wa,

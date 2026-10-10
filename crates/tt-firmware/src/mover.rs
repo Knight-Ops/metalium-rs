@@ -121,19 +121,32 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
     // The whole descriptor checked once; each request then only encoded.
     let mv = DramMove::new(d.range, port, d.l1, d.op != op::READ, me, TXN, niu)
         .map_err(|_| dm::error::ALIGNMENT)?;
+    // B's reads on NoC #0 only, and only when the host chose the fast path
+    // (`dm::READ_FAST`): each request then writes just the initiator words
+    // that changed (`noc::issue_read`). One loop either way, so the image
+    // holds one copy of the move's checks and encoding.
+    let fast = !NOC1 && !IS_NC && noc::read_fast();
     for r in mv.words() {
-        noc::issue_dram_on::<NOC1>(
-            r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
-        );
+        if fast {
+            noc::room_for_read(TXN);
+            noc::issue_read(
+                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
+            );
+        } else {
+            noc::issue_dram_on::<NOC1>(
+                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
+            );
+        }
     }
     Ok(())
 }
 
-/// What the host may change between lists: the in-flight cap and, on NC, the
-/// NIU the writes go out on.
+/// What the host may change between lists: the in-flight cap, on B the read
+/// path (`dm::READ_FAST`) and, on NC, the NIU the writes go out on.
 fn list_settings() {
     noc::set_cap(TXN, rd(M.at(dm::IN_FLIGHT_CAP)));
     if !IS_NC {
+        noc::set_read_path(rd(M.at(dm::READ_FAST)) != 0);
         return;
     }
     let mode = rd(M.at(dm::WRITE_NOC));

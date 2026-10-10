@@ -132,7 +132,17 @@ pub const WRITE_NOC: u64 = MAILBOX_BASE + 0xE0;
 /// Unlike queue completion, this advances during a long `CALL`. Only completed
 /// work counts: a stalled read or kernel must not refresh the host watchdog.
 pub const TRACE_PROGRESS: u64 = MAILBOX_BASE + 0xE4;
-const _: () = assert!(TRACE_PROGRESS + 4 <= MAILBOX_BASE + 0x100);
+/// Host -> mover: non-zero, RISCV B issues its GDDR reads through the fast path
+/// (X6): request initiator 1 of NoC #0 keeps every register whose value does not
+/// change from one request to the next (the return coordinate, tag, control word
+/// and, until they change, the target coordinate and length), so a request writes
+/// only the address words, the words that changed and the command. Zero (the
+/// default) is the path that writes every register of initiator 0 per request.
+/// Read at the start of every list, so the host may switch between lists; NC
+/// ignores it (its writes are not on this path).
+pub const READ_FAST: u64 = MAILBOX_BASE + 0xE8;
+const _: () = assert!(TRACE_PROGRESS + 4 <= READ_FAST);
+const _: () = assert!(READ_FAST + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {

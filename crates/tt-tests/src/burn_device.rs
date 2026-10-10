@@ -188,6 +188,13 @@ fn attach_engine(
         fn elementwise_mode(&self) -> burn_tt::ElementwiseMode {
             self.config.elementwise
         }
+        fn math_mode(&self) -> burn_tt::MathMode {
+            self.session.math_mode()
+        }
+        fn set_math_mode(&mut self, mode: burn_tt::MathMode) -> Result<(), EngineError> {
+            self.session.set_math_mode(mode);
+            Ok(())
+        }
         fn pool_bf16(
             &mut self,
             a: burn_tt::BufferId,
@@ -229,6 +236,13 @@ fn attach_engine(
             bf16: bool,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.cast_float(&mut self.session, id, bf16)
+        }
+        fn cast_f16(
+            &mut self,
+            id: burn_tt::BufferId,
+            to_f16: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.cast_f16(&mut self.session, id, to_f16)
         }
         fn cast_bfp(
             &mut self,
@@ -347,6 +361,13 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.scan(&mut self.session, a, op)
         }
+        fn sort_planes(
+            &mut self,
+            a: burn_tt::BufferId,
+            spec: tt_kernels::sfpu::sort::Spec,
+        ) -> Result<burn_tt::SortedBuffers, EngineError> {
+            self.buffers.sort_planes(&mut self.session, a, spec)
+        }
         fn slice_rows(
             &mut self,
             a: burn_tt::BufferId,
@@ -397,6 +418,14 @@ fn attach_engine(
             bf16: bool,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.zeros(&mut self.session, dims, elem, bf16)
+        }
+        fn random_dram(
+            &mut self,
+            dims: [usize; 2],
+            draw: burn_tt::Draw,
+            base: u64,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.random(&mut self.session, dims, draw, base)
         }
         fn gather_indexed(
             &mut self,

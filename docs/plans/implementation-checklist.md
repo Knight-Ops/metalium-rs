@@ -1532,11 +1532,11 @@ tiles, done in turn. The slices from there:
       accuracy is 0.9195 against one card's 0.9196.
 - [-] **9.12 Loss on the device** -- moved to Phase 10 (R2, milestone 10.1).
 
-- [ ] A `Device` write fence as API, rather than read-backs at call sites
+- [x] A `Device` write fence as API, rather than read-backs at call sites (`write_fenced` family, step119; `Mover::stage` and the Ethernet test sites migrated)
       (Phase 8: posted writes race other agents).
 - [-] `MOP`/`REPLAY` expansion -- moved to Phase 10 (`hardware-coverage.md` X1, X2).
 - [ ] NoC multicast for operands many tiles share (matmul `in0`/`in1`).
-- [ ] `.ttinsn` fusion — up to four adjacent pushes per cycle. Deferred from the
+- [-] `.ttinsn` fusion (closed 2026-10-10, P9): `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate. Up to four adjacent pushes per cycle, originally: Deferred from the
       baseline because fused words disassemble as garbage and the instruction-set
       gate would have to stop rejecting undecodable instructions.
 - [ ] `L1CacheTagSearchAccel` — Blackhole-only, RISCV B only.

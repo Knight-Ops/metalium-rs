@@ -2582,7 +2582,7 @@ pub fn sfpu_scan(
 ) -> Result<Work> {
     use crate::sfpu::{kernel, scan};
     use kernel::Operands;
-    a.expect("a scan", Elem::F32)?;
+    a.expect("a scan", op.elem())?;
     let [rt, ct] = a.grid();
     let first_layout =
         kernel::plan_layout(1, Operands::Unary).map_err(|e| TensorError::Shape(e.to_string()))?;
@@ -2598,7 +2598,7 @@ pub fn sfpu_scan(
         Operands::Binary,
         &scan::program(op, false),
     ));
-    let out = DramTensor::alloc(alloc, a.rows, a.cols)?;
+    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, op.elem())?;
     let read = |tensor: &DramTensor, tile: usize, at: u64| {
         vec![
             [record::READ_RUN, tile as u32, 1, at as u32, 0, 0, 0, 0],
@@ -3064,16 +3064,26 @@ impl Eltwise {
             EQ_S..=LE_S => !ieee_compare(kind, 0.0, s),
             MASK_FILL => b_zero || is_zero(s),
             MASK_WHERE => b_zero || c_zero,
+            // Lane T1: raw words, so zero is the all-zero word alone (the
+            // float kinds' `-0.0` is `i32::MIN` here) and `|0| = 0`.
+            INT_MASK_FILL | BOOL_MASK_FILL => b_zero || s.to_bits() == 0,
+            INT_MASK_WHERE | BOOL_MASK_WHERE => b_zero || c_zero,
+            INT_ABS => true,
             // 10.2d-f: `f(±0) = ±0`.
             SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN | ATAN | ASIN => {
                 true
             }
+            // Lane T8: the Approx twins of `tanh` and `gelu`.
+            crate::sfpu::approx::kind::TANH | crate::sfpu::approx::kind::GELU => true,
             // `0^s = 0` for `s > 0`.
             POW_S => s > 0.0,
             // `g (1/2)` and `g 0 1`: zero with the gradient's padding.
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
             // `atan2(+0, +0) = +0`.
             ATAN2 => b_zero,
+            // Lane T4: `((0 % s) + s) % s` is a zero (the sign of `s`) for a
+            // finite nonzero `s`; a zero, infinite or NaN `s` gives NaN.
+            REM_S => s.is_finite() && !is_zero(s),
             _ => false,
         }
     }
@@ -3105,6 +3115,11 @@ impl OpPadding for Eltwise {
                     || (self.kind == kind_sfpu::MASK_FILL
                         && zero(0)
                         && self.scalar.to_bits() & 0x7fff_ffff == 0)
+                    || (matches!(
+                        self.kind,
+                        kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL
+                    ) && zero(0)
+                        && self.scalar.to_bits() == 0)
                     || (matches!(
                         self.kind,
                         kind::ADD

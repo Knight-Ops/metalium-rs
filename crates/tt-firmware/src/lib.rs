@@ -638,6 +638,125 @@ pub mod noc {
         in_flight(niu, txn).after_issue();
     }
 
+    /// What request initiator 1 of NoC #0 holds for the fast read path
+    /// ([`set_read_path`], [`issue_read`]): whether the path is on, and the
+    /// two registers that change from request to request but usually not --
+    /// the target coordinate and the length -- as one key, `targ_hi | len << 12`,
+    /// as last written, or [`UNKNOWN`]. In local data RAM, as the rest of this
+    /// module's state is; `set_read_path` writes it before any request reads
+    /// it (the mover calls it at the start of every list), since ttsim does not
+    /// zero the RAM (divergence row 25).
+    #[derive(Copy, Clone)]
+    struct ReadPath {
+        fast: bool,
+        key: u32,
+    }
+
+    /// An impossible key (`targ_hi` is 12 bits, `len` at most 16 KiB): "not
+    /// known", so the next request writes every register of the initiator.
+    const UNKNOWN: u32 = u32::MAX;
+
+    #[link_section = ".local"]
+    static mut READ_PATH: ReadPath = ReadPath {
+        fast: false,
+        key: UNKNOWN,
+    };
+
+    fn read_path() -> &'static mut ReadPath {
+        // SAFETY: as `in_flight`.
+        unsafe { &mut *core::ptr::addr_of_mut!(READ_PATH) }
+    }
+
+    /// Whether GDDR reads go through [`issue_read`].
+    #[inline(always)]
+    pub fn read_fast() -> bool {
+        read_path().fast
+    }
+
+    /// Choose the read path for the lists from now on: `false` for the path that
+    /// writes every register of initiator 0 per request ([`issue_dram_on`]),
+    /// `true` for the fast one ([`issue_read`]). Either way the next request on
+    /// the fast path finds the initiator's contents unknown and writes all of
+    /// it, so nothing an earlier list, process or program left there is relied
+    /// on: silicon keeps NIU state between programs.
+    #[inline(always)]
+    pub fn set_read_path(on: bool) {
+        *read_path() = ReadPath {
+            fast: on,
+            key: UNKNOWN,
+        };
+    }
+
+    /// Wait for room under `txn`'s in-flight cap on NoC #0, as
+    /// [`issue_dram_on`] does before it writes anything: the check the caller
+    /// of [`issue_read`] makes before each request.
+    #[inline(always)]
+    pub fn room_for_read(txn: TxnId) {
+        if in_flight(Niu::Noc0, txn).at_cap() {
+            make_room(Niu::Noc0, txn);
+        }
+    }
+
+    /// Request initiator 1's offset from initiator 0.
+    const INITIATOR_1: u64 = initiator::STRIDE;
+
+    /// One request of a GDDR read through the fast path -- the arguments of
+    /// [`issue_dram_on`] -- tt-metal's `noc_async_read_set_state` and
+    /// `_with_state` on one initiator. Initiator 1 (`NIU_BASE + 0x800`) is this
+    /// path's alone, so nothing else changes what it holds, and the page keeps
+    /// every one of its words as software wrote it (`MemoryMap.md`,
+    /// `NOC_CMD_CTRL`: Blackhole does not even write translated coordinates
+    /// back) except `NOC_CTRL`'s reserved bits, which hardware may change.
+    /// So: the first request after [`set_read_path`] writes every register (the
+    /// set-state); a later one writes the target and return addresses, the
+    /// target coordinate and length only when either differs from the last
+    /// request's, `NOC_CTRL`, and the command. The return coordinate and tag
+    /// are the same in every read of a move and of a list (`DramMove`), which
+    /// `tt_isa::noc::niu` gates. The accounting is [`issue_dram_on`]'s, except
+    /// that the caller makes room under `txn`'s cap first ([`room_for_read`]),
+    /// so that this stays a leaf with no frame to save the request in: the
+    /// issue is counted after, and `CMD_CTRL` read back.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_read(
+        targ: u32,
+        targ_hi: u32,
+        ret: u32,
+        ret_hi: u32,
+        tag: u32,
+        ctrl: u32,
+        len: u32,
+        txn: TxnId,
+    ) {
+        use initiator::*;
+        let niu = Niu::Noc0;
+        let p = read_path();
+        let key = targ_hi | len << 12;
+        // SAFETY: initiator 1's registers, MMIO in every Tensix and Ethernet tile,
+        // written once it reads free.
+        unsafe {
+            while read_volatile(reg(niu, INITIATOR_1 + CMD_CTRL)) & 1 != 0 {}
+            if p.key != key {
+                if p.key == UNKNOWN {
+                    write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_MID), 0);
+                    write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_MID), 0);
+                    write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_HI), ret_hi);
+                    write_volatile(reg(niu, INITIATOR_1 + PACKET_TAG), tag);
+                    write_volatile(reg(niu, INITIATOR_1 + AT_DATA), 0);
+                }
+                write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_HI), targ_hi);
+                write_volatile(reg(niu, INITIATOR_1 + AT_LEN_BE), len);
+                p.key = key;
+            }
+            write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_LO), targ);
+            write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_LO), ret);
+            write_volatile(reg(niu, INITIATOR_1 + CTRL), ctrl);
+            write_volatile(reg(niu, INITIATOR_1 + CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, INITIATOR_1 + CMD_CTRL));
+        }
+        in_flight(niu, txn).after_issue();
+    }
+
     /// One request of a `tt_isa::noc::niu::HostMove` through NoC #0, under
     /// `txn`: [`issue_dram_on`] with the high address words a host address
     /// needs. Cold: host moves are not the per-tile path.

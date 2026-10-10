@@ -32,6 +32,13 @@ pub(crate) fn device_elem(dtype: DType) -> Option<Elem> {
         _ => None,
     }
 }
+
+/// Dtypes stored as raw two-byte physical slots (`Bf16Tensor`'s layout): BF16
+/// and IEEE binary16. Movement and views treat them alike; only conversions
+/// and arithmetic care which one it is (lane T7).
+pub(crate) fn is_half(dtype: DType) -> bool {
+    matches!(dtype, DType::BF16 | DType::F16)
+}
 use crate::TtDevice;
 
 /// Float, int and bool tensors share owned bytes and device buffer references.
@@ -109,7 +116,7 @@ impl TtTensor {
     /// `dtype` -- one [`device_elem`] stores.
     pub(crate) fn on_device(dram: DramRef, shape: Shape, dtype: DType, device: TtDevice) -> Self {
         debug_assert!(
-            dtype == DType::BF16 || device_elem(dtype).is_some(),
+            is_half(dtype) || device_elem(dtype).is_some(),
             "{dtype:?} is not stored on the device"
         );
         crate::report::made(true);
@@ -214,11 +221,11 @@ impl TtTensor {
             out
         }
         let shape = self.cell.shape.clone();
-        if self.cell.dtype == DType::BF16 {
+        if is_half(self.cell.dtype) {
             let bits = server::download_bf16(self.device, d.buffer.id, r, c);
             let bits = transposed(bits, d.transposed, r, c);
             let mut data = TensorData::new(bits, shape);
-            data.dtype = DType::BF16;
+            data.dtype = self.cell.dtype;
             data
         } else {
             match device_elem(self.cell.dtype) {
@@ -280,12 +287,12 @@ impl TtTensor {
                 out
             }
             let shape = self.cell.shape.clone();
-            let data = if self.cell.dtype == DType::BF16 {
+            let data = if is_half(self.cell.dtype) {
                 let bits = server::download_bf16(self.device, d.buffer.id, r, c);
                 let bits = transposed(bits, d.transposed, r, c);
                 // Construct typed bytes; explicit readback performs no arithmetic.
                 let mut data = TensorData::new(bits, shape);
-                data.dtype = DType::BF16;
+                data.dtype = self.cell.dtype;
                 data
             } else {
                 match device_elem(self.cell.dtype) {
@@ -441,10 +448,10 @@ impl TtTensor {
                 };
             }
             let data = self.host().clone().into_data();
-            let id = if self.cell.dtype == DType::BF16 {
+            let id = if is_half(self.cell.dtype) {
                 let mut data = data;
                 data.dtype = DType::U16;
-                let bits = data.to_vec::<u16>().expect("BF16 storage bits");
+                let bits = data.to_vec::<u16>().expect("two-byte storage bits");
                 server::upload_bf16(self.device, bits, rows, cols)
             } else {
                 match device_elem(self.cell.dtype) {
@@ -499,13 +506,13 @@ impl TtTensor {
     /// A tensor of any dtype the device stores ([`device_elem`]), of any rank
     /// but zero and not empty: what views and residency take.
     pub(crate) fn is_storable(&self) -> bool {
-        (self.cell.dtype == DType::BF16 || device_elem(self.cell.dtype).is_some())
+        (is_half(self.cell.dtype) || device_elem(self.cell.dtype).is_some())
             && stored_dims(&self.cell.shape.to_vec()).is_some_and(|[r, c]| r > 0 && c > 0)
     }
 
     /// A rank-2 tensor of a stored dtype.
     pub(crate) fn is_storable_matrix(&self) -> bool {
-        (self.cell.dtype == DType::BF16 || device_elem(self.cell.dtype).is_some())
+        (is_half(self.cell.dtype) || device_elem(self.cell.dtype).is_some())
             && self.cell.shape.num_dims() == 2
     }
 

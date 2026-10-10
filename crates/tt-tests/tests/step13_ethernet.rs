@@ -52,8 +52,9 @@ fn send(a: &mut Dev<'_>, b: &mut Dev<'_>, from: u8, to: u8, data: &[u8]) -> (Vec
     let wa = a.alloc_window(WindowKind::TwoMib).unwrap();
     let wb = b.alloc_window(WindowKind::TwoMib).unwrap();
     let (src, dst) = (eth::BUFFERS.start, eth::BUFFERS.start + 0x1_0000);
-    a.eth_write(&wa, tile(from), src, data).unwrap();
-    b.eth_write(&wb, tile(to), dst, &vec![0xEE; data.len() + 64])
+    // Fenced: the link must not land before the sentinel does (divergence row AA).
+    a.eth_write_fenced(&wa, tile(from), src, data).unwrap();
+    b.eth_write_fenced(&wb, tile(to), dst, &vec![0xEE; data.len() + 64])
         .unwrap();
     a.eth_tt_link_write(&wa, tile(from), src, dst, data.len())
         .unwrap()
@@ -135,6 +136,12 @@ fn firmware_l1_and_misalignment_are_refused_before_anything_is_sent() {
         let w = a.alloc_window(WindowKind::TwoMib).unwrap();
         let t = tile(2);
         assert!(a.eth_write(&w, t, eth::BOOT_RESULTS, &[0; 4]).is_err());
+        // The fenced write refuses the same range, before any traffic.
+        let before = a.traffic();
+        assert!(a
+            .eth_write_fenced(&w, t, eth::BOOT_RESULTS, &[0; 4])
+            .is_err());
+        assert_eq!(a.traffic(), before);
         assert!(a
             .eth_tt_link_write(&w, t, eth::BUFFERS.start, eth::BOOT_PARAMS, 16)
             .is_err());
@@ -244,8 +251,9 @@ mod mover {
             let (src, dst) = (tensix(3, 4), tensix(6, 7));
             const LEN: usize = 64 * 1024;
             let data = pattern(LEN, 0x42);
-            a.write(&wa, src, 0x8_0000, &data).unwrap();
-            b.write(&wb, dst, 0x9_0000, &vec![0xEE; LEN + 256]).unwrap();
+            a.write_fenced(&wa, src, 0x8_0000, &data).unwrap();
+            b.write_fenced(&wb, dst, 0x9_0000, &vec![0xEE; LEN + 256])
+                .unwrap();
             let mut m = Mover::start(a, &wa, b, &wb, link(), tt_firmware_images::ETH_E1).unwrap();
             // From here to the read-back, only chip 0 is accessed.
             m.send(

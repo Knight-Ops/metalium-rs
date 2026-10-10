@@ -738,6 +738,140 @@ fn mover_read_shapes() {
     });
 }
 
+/// X6: the mover's fast read path (`dm::READ_FAST`, request initiator 1 of NoC
+/// #0 writing only the words that change) against the path that writes every
+/// register of initiator 0, by the shapes of `mover_read_shapes`, plus a
+/// 2 KiB-entry gather. Each case is run on both paths in alternation (ABAB), after
+/// three untimed warm-up lists on each, and timed as `mover_read_shapes` times:
+/// host clock around `submit_list`/`wait`, less an empty list's time, median of
+/// `REPS`. Every timed list's bytes are checked against the host's copy of the
+/// channels after the last repetition, so a path that is fast because it moves
+/// the wrong bytes fails instead of winning.
+///
+/// Run only after `step118_mover_fast_path`'s silicon persistence probes
+/// have passed on the card: it writes request initiator 1, which no code
+/// here has driven on silicon before.
+#[test]
+#[ignore = "benchmark"]
+fn mover_read_fast_path() {
+    use tt_isa::dm::op;
+    use tt_kernels::dm::DataMover;
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+        const L1: u32 = 0x2_0000;
+        const L1_SPAN: u32 = 0x4_0000;
+        const TOTAL: u32 = 1 << 20;
+        let chans: Vec<_> = dram.channels().collect();
+        let base = 64u64 << 20;
+        let datas: Vec<Vec<u8>> = chans
+            .iter()
+            .map(|ch| {
+                let data = pattern(TOTAL as usize, 7 + ch.index() as u32);
+                d.dram_write(&w4, ch.range(base, TOTAL as u64).unwrap(), &data)
+                    .unwrap();
+                data
+            })
+            .collect();
+        let n = chans.len();
+        let entry = |ch: usize, port: u32, off: u32, l1: u32, len: u32| {
+            [
+                op::READ,
+                chans[ch].index() as u32,
+                port,
+                (base as u32) + off,
+                l1,
+                len,
+                0,
+                0,
+            ]
+        };
+        let shape = |len: u32, ch_of: &dyn Fn(u32) -> usize, port_of: &dyn Fn(u32) -> u32| {
+            (0..TOTAL / len)
+                .map(|i| entry(ch_of(i), port_of(i), i * len, L1 + (i * len) % L1_SPAN, len))
+                .collect::<Vec<_>>()
+        };
+        let time = |d: &mut Dev<'_>, m: &mut DataMover<tt_isa::noc::Noc0>, list: &[[u32; 8]]| {
+            let t0 = Instant::now();
+            m.submit_list(d, &w, list).unwrap();
+            m.wait(d, &w).unwrap();
+            t0.elapsed()
+        };
+        m.set_read_fast(d, &w, false).unwrap();
+        let empty = median(
+            (0..REPS)
+                .map(|_| time(d, &mut m, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]))
+                .collect(),
+        );
+        println!("MEASURE mover_read_fast empty list {empty:?}");
+        let cases: Vec<(&str, Vec<[u32; 8]>)> = vec![
+            (
+                "64 B x 256",
+                (0..256u32)
+                    .map(|i| entry(0, 0, i * 64, L1 + i * 64, 64))
+                    .collect(),
+            ),
+            ("2 KiB one port", shape(2048, &|_| 0, &|_| 0)),
+            ("2 KiB all chans", shape(2048, &|i| i as usize % n, &|_| 0)),
+            ("4 KiB one port", shape(4096, &|_| 0, &|_| 0)),
+            ("4 KiB 3 ports", shape(4096, &|_| 0, &|i| i % 3)),
+            ("4 KiB all chans", shape(4096, &|i| i as usize % n, &|_| 0)),
+            ("16 KiB one port", shape(16384, &|_| 0, &|_| 0)),
+        ];
+        for (name, list) in &cases {
+            let mut slow = vec![];
+            let mut fast = vec![];
+            for path in [false, true] {
+                m.set_read_fast(d, &w, path).unwrap();
+                for _ in 0..3 {
+                    time(d, &mut m, list);
+                }
+            }
+            for _ in 0..REPS {
+                for path in [false, true] {
+                    m.set_read_fast(d, &w, path).unwrap();
+                    let dt = time(d, &mut m, list).saturating_sub(empty);
+                    if path { &mut fast } else { &mut slow }.push(dt);
+                }
+            }
+            // The bytes of the last list's last L1_SPAN (the later entries overwrite
+            // the earlier in the cycling destination), from the host's copy.
+            let mut back = vec![0u8; L1_SPAN as usize];
+            d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+            // Only entries within one trip of the destination cycle survive: a
+            // 16 KiB entry is overwritten by the one 16 entries after it.
+            let survivors = (L1_SPAN / list[0][5]).min(24) as usize;
+            let landed = list.iter().rev().take(survivors).all(|e| {
+                let (ch, off, at, len) = (
+                    chans.iter().position(|c| c.index() as u32 == e[1]).unwrap(),
+                    e[3] - base as u32,
+                    e[4],
+                    e[5] as usize,
+                );
+                let tail = &back[(at - L1) as usize..][..len.min((L1 + L1_SPAN - at) as usize)];
+                tail == &datas[ch][off as usize..][..tail.len()]
+            });
+            assert!(landed, "{name}: the fast path's reads did not land");
+            let (slow, fast) = (median(slow), median(fast));
+            println!(
+                "MEASURE mover_read_fast {name:<16} {:>4} entries slow {:>9.1?} {:>6.3} us/entry, fast {:>9.1?} {:>6.3} us/entry, fast/slow {:.3}",
+                list.len(),
+                slow,
+                slow.as_secs_f64() * 1e6 / list.len() as f64,
+                fast,
+                fast.as_secs_f64() * 1e6 / list.len() as f64,
+                fast.as_secs_f64() / slow.as_secs_f64()
+            );
+        }
+        m.set_read_fast(d, &w, false).unwrap();
+        m.stop(d, &w).unwrap();
+    });
+}
+
 /// Is a kernel bound by its runners pushing instructions, or by the backend
 /// executing them? Each role's `START -> PUSHED` and `PUSHED -> RETIRED`, in
 /// cycles, for a program of NOPs (the runner's push rate: the backend takes a
@@ -823,4 +957,102 @@ fn role_push_rate() {
             }
         }
     });
+}
+
+/// What `MathMode::Approx` saves per tile (S10; lane T8): each transcendental
+/// with an Approx twin, in both modes, one op's wall time on one unit by tiles
+/// and the slope, the median of seven after a warm-up -- beside the
+/// instruction counts `step145_approx_math` prints. The data is checked: each
+/// mode's output is the interpreter's program for the kind it runs, bit for
+/// bit, so a number is never for the wrong program.
+#[test]
+#[ignore = "benchmark"]
+fn approx_per_tile_saving() {
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::sfpu::approx::{MathMode, TWINS};
+    use tt_kernels::sfpu::ops::reference;
+    use tt_kernels::tensor::Eltwise;
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        for (precise, approx) in TWINS {
+            let op = Eltwise {
+                kind: precise,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            // Positive and moderate, in every op's range.
+            let data = |n: usize| -> Vec<f32> {
+                pattern_f32(n, 3)
+                    .into_iter()
+                    .map(|v| v.abs() + 0.05)
+                    .collect()
+            };
+            let mut slope = [0.0f64; 2];
+            for (k, mode) in [MathMode::Precise, MathMode::Approx]
+                .into_iter()
+                .enumerate()
+            {
+                s.set_math_mode(mode);
+                let mut at = Vec::new();
+                for tiles in [1usize, 4, 16, 64] {
+                    let (r, c) = (32 * tiles, 32);
+                    let v = data(r * c);
+                    let x = s.upload(&v, r, c).unwrap();
+                    let o = s.eltwise(op, &x, None).unwrap();
+                    s.sync().unwrap();
+                    // The program the mode runs, bit for bit.
+                    let run_kind = if mode == MathMode::Approx {
+                        approx
+                    } else {
+                        precise
+                    };
+                    let want = reference(run_kind, 0.0, &v, None, r, c);
+                    let got = s.download(&o).unwrap();
+                    assert!(
+                        got.iter()
+                            .zip(&want)
+                            .all(|(g, w)| g.to_bits() == w.to_bits()),
+                        "{precise:#x} {mode:?} {tiles} tiles: not the program's bits"
+                    );
+                    s.free(o).unwrap();
+                    let mut t = Vec::new();
+                    for _ in 0..7 {
+                        let start = Instant::now();
+                        let o = s.eltwise(op, &x, None).unwrap();
+                        s.sync().unwrap();
+                        t.push(start.elapsed());
+                        s.free(o).unwrap();
+                    }
+                    s.free(x).unwrap();
+                    at.push((tiles, median(t).as_secs_f64() * 1e6));
+                }
+                // The slope between the 4- and 64-tile runs: per tile.
+                slope[k] = (at[3].1 - at[1].1) / 60.0;
+                let line: Vec<String> = at
+                    .iter()
+                    .map(|(t, us)| format!("{t}: {us:.1} us"))
+                    .collect();
+                println!(
+                    "MEASURE approx {precise:#06x} {mode:?}: {}",
+                    line.join(", ")
+                );
+            }
+            println!(
+                "MEASURE approx {precise:#06x} per tile: precise {:.2} us, approx {:.2} us, saved {:.2}x",
+                slope[0],
+                slope[1],
+                slope[0] / slope[1]
+            );
+        }
+        s.set_math_mode(MathMode::Precise);
+    }) {
+        panic!("{e}");
+    }
 }

@@ -81,7 +81,7 @@ General model coverage continues in `hardware-coverage.md`.
 | `memory_cleanup`, `memory_persistent_allocations`, `staging` | pool cleanup, persistent pool, pinned staging (`backend.rs:76-100`) | defaults (no-op) | cleanup = flush frees + allocator compaction; persistent = weights region | P2 |
 | Readback | `tr_execute` batches every read into one copy (`reg:burn-cubecl-0.21.0/src/ops/transaction.rs:18`) | downloads happen *before* the future is returned (`ops.rs:359-363`), one round trip per tensor (`convert.rs:211-221`) | one server job per transaction; real futures | P1 |
 | Rank / shape | any rank, any stride | device path only for rank-2 F32 (`tensor.rs:299-301`); rank-1 biases, rank>2 activations, `reshape` all on the host | rank-N stored as `[prod(lead), last]`; reshape views | **P0** |
-| Batched matmul | one kernel | per-batch host-staged `Engine::matmul` (`ops.rs:176-237`) | resident batched path | P1 |
+| Batched matmul | one kernel | resident `matmul_dram_batched` for tile-aligned blocks; ragged, broadcast and strided batches repack on the device (`materialized_batched_matmul`) | resident batched path | P1 |
 | Fusion | `Cuda = Fusion<CubeBackend<..>>` by default (`reg:burn-cuda-0.21.0/src/lib.rs`), four fusers (`reg:burn-cubecl-0.21.0/src/fusion.rs:147-154`) | none | `BackendIr` + `FusionBackend`; zero-fuser first, then Tensix fusers | P2 |
 | Router / remote | via `BackendIr` (`reg:burn-router-0.21.0/src/types.rs:33`; `gh:crates/burn-remote/src/server/base.rs:171-178`) | no `BackendIr` | same impl as fusion step 1 | P2 |
 | Distributed / DDP | `DistributedBackend` (`reg:burn-cubecl-0.21.0/src/ops/distributed.rs:12`) | none; enabling Burn's `distributed` feature anywhere makes `Autodiff<TtBackend>` stop being an `AutodiffBackend` (`reg:burn-autodiff-0.21.0/src/backend.rs:155-156`) | implement it (host all-reduce first) | P1 |
@@ -378,10 +378,10 @@ once-per-key warning, **(3)** typed early error.
 | 6 | Rank-1 tensors (biases, `[n]` params) | host; uploaded on every use as SGD updates them (checklist 9.5: the six tensors per step) | store rank-1 as `[1, n]` (B5) | 1 |
 | 7 | Rank > 2 (`[b, s, d]` activations) | every op host, incl. element-wise | store as `[prod(lead), last]`; same-shape eltwise on device (B5) | 1 |
 | 8 | `reshape`/`unsqueeze`/`flatten` | generated delegate -> download (`generated/delegate.rs:336-342`) | view when the last dim is kept; otherwise device copy (D4) or download, reported | 1/2 |
-| 9 | Batched matmul | per-batch host-staged `Engine::matmul`, operands copied every call (`ops.rs:176-237`) | resident batched path (B6) | 1 |
+| 9 | Batched matmul | resident `matmul_dram_batched` for tile-aligned blocks; ragged, broadcast and strided batches repack on the device (`materialized_batched_matmul`) -- done | resident batched path (B6) | 1 |
 | 10 | Shapes not a multiple of 32 | already invisible: `DramTensor` zero-pads and crops (`tt-kernels/src/tensor.rs:7,237`) | report padding overhead (e.g. `[64,10]` is 3.2x) at info level | 1 |
 | 11 | Host<->device ping-pong (device op between host ops) | each crossing is a download + upload; can be slower than Flex | report bytes per op; cost-aware placement (B16, Q3) | 2 |
-| 12 | Transposed view into eltwise/sum/slice | host fallback (`ops.rs:89-91,283,317`); eltwise uploads the other operand *before* checking (`ops.rs:88`) | materialise the transpose on device (M3) or report; check before upload | 2 |
+| 12 | Transposed view into eltwise/sum/slice | native strided views and device materialization, no host fallback (P1a; step66/step84) -- done | materialise the transpose on device (M3) or report; check before upload | 2 |
 | 13 | Slice not on whole tile rows | full download of the parent (`ops.rs:331`) -- for a preloaded dataset, the whole dataset | partial download of the rows the slice reaches (small downloads already read only what they touch, checklist 9.4b) then upload; D4 does it on device | 2 |
 | 14 | Broadcasts other than `[1,n]` (`[m,1]`, scalars as tensors, rank-N) | host (`ops.rs:80-87`) | report; kernels in S1/D4 | 2 |
 | 15 | `sum_dim(1)`, mean, max, softmax, ... | host | report; R1/R2 | 2 |
@@ -478,8 +478,7 @@ with teeth.
 Some device ops are approximations held to derived bounds rather than to Flex's bits
 (`hardware-coverage.md` S3, S4, R1, R2): division and the reciprocal (one ulp), `exp`,
 `log` and the rest of S4's transcendentals (10.2d-f, trigonometry included), sums over
-columns (tree order), softmax. `burn_tt::set_exact(true)` or
-`TT_EXACT=1` sends legacy approximate ops to Flex. Full `sum`/`mean` are native
+columns (tree order), softmax. (Historical: the exact mode, `burn_tt::set_exact` and `TT_EXACT`, was retired; ops are native within derived bounds.) Full `sum`/`mean` are native
 only and retain their device arithmetic in this mode, within derived bounds
 rather than guaranteeing Flex's bits. The MNIST device golden pins that policy.
 Which legacy ops are which is data:
