@@ -223,15 +223,11 @@ impl Mover {
             return Err(LinkError::Invalid("more than one transfer's worth"));
         }
         let t = self.end(dir).0;
-        d.eth_write(w, t, mover::TX_STAGE, data)?;
         // Host writes are posted: without a read back, E1 can be told to send
         // before the last of them has landed, and would send stale bytes. This
         // is the silicon hazard `silicon_eth_bench::raw_no_receiver_polling`
         // measured (57 of 480 transfers with a late tail, 0 of 480 fenced).
-        if let Some(last) = data.len().checked_sub(4) {
-            let mut word = [0u8; 4];
-            d.eth_read(w, t, mover::TX_STAGE + last as u64, &mut word)?;
-        }
+        d.eth_write_fenced(w, t, mover::TX_STAGE, data)?;
         Ok(())
     }
 

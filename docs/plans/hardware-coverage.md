@@ -908,12 +908,13 @@ Each names the measurement it must move. The Burn-side ones are in
       register persistence to be checked on ttsim and in a gate first). Moves:
       `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
       the gather's share of a step (row V: 0.94 ms of 2.4).
+- [x] **X7b Posted-write fence as API** (2026-10-10): `Device::{write_fenced, write32_fenced, l1_write_fenced, eth_write_fenced}` and `FencedWrite` issue the posted writes then exactly one read-back of the dword holding the last byte, refusing misaligned, foreign-window, aperture and non-L1 targets before any write. Gated by `tt-device` unit tests and `step119` (a posted-write transport model: ttsim applies BAR writes synchronously and cannot show the race itself); card 0 `posted_then_fenced_l1_writes_read_back_exactly`; both-card Ethernet gates `silicon_eth_link::{host_driven_tt_link, mover::}` pass with `Mover::stage` and the eth test sites migrated. Hot paths whose observer is started by the host afterwards stay unfenced by design.
 - [~] **X7 Host transfers** (DMA and batching, 2026-10-03). Tensors use pinned
       host memory and the card's `HOST_READ`/`HOST_WRITE` DMA; parallel host
       tilize/detilize and run records deliver about 11 GB/s on large Session
       transfers. Gated by `step57_host_dma`; measurements in
-      `firmware-performance.md`. A Device-level posted-write fence API remains
-      open in the checklist. The following is the historical motivation:
+      `firmware-performance.md`. The Device-level posted-write fence is now API
+      (`write_fenced`, `FencedWrite`; X7 below). The following is the historical motivation:
       **Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
       a call and a download of the same ~140 us past its sync (rows Z, measurement M:
       uncached 4-byte MMIO reads, and `dram_write`'s per-port read-back on each channel
@@ -1741,7 +1742,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | `Config` and per-thread state survive between programs | divergence rows 47, 49 | F3 |
 | Overwriting a program a queued list will run corrupts the tile | X4c (found on silicon) | X4c -- closed: no eviction while lists are queued |
 | A host GDDR write is not yet visible to a mover reading through another port | divergence row T | X4c -- closed: `dram_write` reads back through every port |
-| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; open as an API rule -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
+| A host L1 write is not ordered against another agent writing the same L1 (an Ethernet transfer landing, a mover) | divergence row AA | closed in `silicon_eth_link` by a read-back fence; closed as API: the `write_fenced` family (X7, step119) -- `Device::write` is posted, and a write another agent may race needs its read-back (X7) |
 | The barrier counter in unit 0's L1 keeps an earlier session's count, so every barrier passes at once and multi-unit ops overlap | X4c (found on silicon, once P1 removed the per-step syncs that hid it) | X4c -- closed: zeroed with the session's barrier number whenever unit 0's mover starts (`step34_batching::barriers_count_from_zero_whatever_an_earlier_session_left`) |
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |

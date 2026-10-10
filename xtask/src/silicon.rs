@@ -185,6 +185,7 @@ pub const SMOKE: &[&str] = &[
     "step110_sfploadmacro::s0",
     "step110_sfploadmacro::s1",
     "step110_sfploadmacro::s_restore",
+    "step119_device_write_fence::silicon_gates::posted_then_fenced_l1_writes_read_back_exactly",
     "step135_sort::",
     "step136_burn_sort::",
     "step137_sort_residency::",

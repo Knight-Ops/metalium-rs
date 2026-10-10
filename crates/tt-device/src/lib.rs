@@ -16,7 +16,7 @@ pub mod tlb;
 pub mod trace;
 pub mod transport;
 
-pub use device::{Device, PowerPolicy, Tile, Traffic, Window};
+pub use device::{Device, FencedWrite, PowerPolicy, Tile, Traffic, Window};
 pub use transport::{
     Bar, ConfigOffset, HostMemory, Result, Transport, TransportError, DEVICE_ID_BLACKHOLE,
     VENDOR_ID_TENSTORRENT,
