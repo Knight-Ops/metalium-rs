@@ -30,6 +30,7 @@ pub mod mmio_reg;
 pub mod mutex;
 pub mod noc;
 pub mod numerics;
+pub mod pack_modes;
 /// Checked thread-local scalar register arithmetic.
 pub mod scalar;
 pub mod sfpu;
@@ -38,3 +39,4 @@ pub mod sync;
 pub mod tag_search;
 pub mod tensix;
 pub mod tile;
+pub mod unpack_modes;

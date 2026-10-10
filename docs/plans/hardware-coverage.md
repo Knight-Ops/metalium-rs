@@ -349,12 +349,12 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 |---|---|---|
 | Flat FP32 run, `Src` tile path (TF32/BF16), `UnpackToDst` 128 datums, a datum sub-run of a tile (base moved) | `[x]` | -- |
 | `UnpackToDst` of a whole 32×32 tile, and the whole tile packed back | `[x]` FP32 (`step25_dst_tile`) | F1 |
-| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[ ]` | D1 |
-| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[~]` BF16 native ties-even late narrowing, both-card `step74`; FP16 open | D1 |
+| BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[x]` widened readback over ~4096 sign/exponent/mantissa patterns on card 0 (step114) | D1 |
+| Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[x]` BF16 native ties-even late narrowing (step74); FP16: the raw packer truncates and saturates (matches ttsim), the rounding packer is ties-even for normals and overflows to infinity at 65520 but drops NaN payloads and flushes subnormals (`T7-MEASURE`, card 0), so shipped FP16 casts use exact SFPU programs instead (step143/144); the 16-bit Dst read path preserves normals only (zero/subnormal/NaN collapse, step114) | D1 |
 | BFP8/BFP4/BFP2 storage, exponent sharing, `CLREXPHIST` | `[x]` -- step92–96; histogram reset and BFP2 packed matmul are silicon-only where ttsim refuses | D2 (delivered formats) |
 | Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
-| Unpacker transpose / tilize modes, broadcast | `[ ]` | M3, D5 |
-| Packer ReLU and edge masking, `PACR_SETREG` | `[ ]` | S1 (opportunistic), D4 |
+| Unpacker transpose / tilize modes, broadcast | tilize `[x]` payload-preserving strided gather (step113, card 0); transpose swaps the nibbles correctly but goes through SrcA and is not payload-preserving (`[-]` for M3); no unpacker broadcast mode exists | M3, D5 |
+| Packer ReLU and edge masking, `PACR_SETREG` | ReLU `[x]` (all seven modes against a raw-bit model, card 0) and edge masking `[x]` for the row-set path, partial columns, -inf fill and edge-then-ReLU order (step112); `PACR_SETREG` `[-]`; not routed into Session/Burn ops | S1 (opportunistic), D4 |
 
 ### Frontend and tracing
 
@@ -1403,7 +1403,7 @@ Each names the measurement it must move. The Burn-side ones are in
       for lane masks; interpreter models of all four held to silicon in
       `step26_sfpu_isa` (a three-step rotation, a full row reduction by rotations, a
       transpose then add). First user: R1's in-tile folds.
-- [ ] **S10 A fast, approximate mode for the transcendentals** (asked for during 10.2e;
+- [x] **S10 A fast, approximate mode for the transcendentals** (2026-10-10, step145-146, lane T8): `MathMode::{Precise, Approx}` (`TT_MATH=approx`, `Session::set_math_mode`, `TtDevice::set_math_mode`); Approx twins (kinds 0x1d0-0x1d5) for `exp`, `log`, `recip`, `sigmoid`, `tanh`, `gelu` with derived bounds (exp 8.2e-5, log 5.2e-5, recip 3.2e-5, sigmoid 1.13e-4, tanh 5.2e-5 relative; gelu |x|(2.5e-4) absolute), device programs equal the interpreter bit for bit on card 0, mode is in the program cache key. Measured per tile on card 0: exp 8.08 -> 6.51 us (1.24x), log 10.96 -> 7.97 (1.37x), recip 7.82 -> 0.95 (8.24x), sigmoid 12.18 -> 7.40 (1.65x), tanh 13.09 -> 8.10 (1.62x), gelu 28.46 -> 7.31 (3.89x) (`silicon_perf::approx_per_tile_saving`). `sqrt`/`rsqrt` measured and dropped (the saving is not real); fused softmax/norms and backward ops stay Precise. Original text follows. (asked for during 10.2e;
       concepts review G10's `math_approx_mode`). Today every S3/S4 op is built for a
       derived bound of a few ulps (`EXP_BOUND`, `ERF_BOUND`, ...), and that costs
       instructions on the device -- degree-16 Chebyshev fits evaluated by Clenshaw,
@@ -1434,13 +1434,13 @@ Each names the measurement it must move. The Burn-side ones are in
       are implemented (`step90`). Final both-card targeted gates pass `1791255922`
       (24/24), full smoke passes `1791255409` (322/322), and release medians are
       recorded in `1791255969`. Mesh mode is explicitly refused.
-- [~] **M2 `GMPOOL`/`GAPOOL`.** Block max/sum/mean kernels gated on simulator and
+- [-] **M2 `GMPOOL`/`GAPOOL`.** *Closed 2026-10-10: GAPOOL averages route (BF16 NCHW); GMPOOL is diagnostic-only because its packed ArgMax returns no index bits on both cards (runs `1791240702`, `1791240373`); max pooling stays on the exact SFPU selection (step78).* Original text: Block max/sum/mean kernels gated on simulator and
       both cards (`step75`). BF16 NCHW average/adaptive pooling uses GAPOOL;
       F32/general max retains SFPU semantics, including resident indices and
       overlapping backwards (`step78`). General GMPOOL routing and performance
       remain open. Pooling geometry uses replayable metadata descriptors, so pooling
       traces replay (step78, step89).
-- [~] **M3 Transpose on the Tensix** (`TRNSPSRCB`, or the unpacker's transpose mode) in
+- [-] **M3 Transpose on the Tensix** *(closed 2026-10-10: the payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack; `TRNSPSRCB` remains the explicit TF32/BF16 Src route that normalizes signed zeros and subnormals (step73, step87); the unpacker transpose mode swaps rows and columns correctly (step113, card 0) but goes through the 19-bit SrcA datum, and the plain SrcA path itself normalizes -0, subnormals and low mantissa bits (`MEASURE src.plain`), so no Tensix route preserves payloads)* (`TRNSPSRCB`, or the unpacker's transpose mode) in
       place of the B core's face transpose (`READ_TRANSPOSED`). Materialised
       transposes remain partial: step87 gates the Src permutation and transposed TF32 products on both cards, but normalizes signed zero/subnormal payloads. `float_permute` creates native strided views
       through dimension swaps, without a new transpose kernel (`step66`).
@@ -1545,7 +1545,7 @@ Each names the measurement it must move. The Burn-side ones are in
 
 ### D — Formats and data movement
 
-- [~] **D1 BF16 tensors in GDDR.** Separate `Bf16Tensor`/2112-byte physical slots,
+- [x] **D1 BF16 and FP16 tensors in GDDR.** *Close-out 2026-10-10: FP16 follows BF16's raw two-byte path with exact SFPU widening/narrowing (step143-144, card 0, all 65,536 patterns); BF16 into Dst measured (step114); F64 and F16 arithmetic are explicit `[-]`.* Separate `Bf16Tensor`/2112-byte physical slots,
       raw transfers/views/repack, native ties-even pack and SrcA/MOVA2D widening,
       packed rank-two MMA and native Burn compute adapters. `step74`, `step76`,
       `step77` pass both cards; narrowing is silicon-only (ttsim mode `0x105`
@@ -1609,7 +1609,7 @@ Each names the measurement it must move. The Burn-side ones are in
       repeated indices, device-produced indices and changed-input trace replay;
       both cards pass (`1791249159`). Historical step61/62 one-index/row routes
       are superseded by this general geometry. ND gather/scatter remains open.
-- [~] **D5 Tilize and untilize on the device** (overlaps checklist 9.10).
+- [-] **D5 Tilize and untilize on the device** *(closed 2026-10-10: unpacker tileize is a payload-preserving strided row gather on card 0 (step113) but reads 32-datum rows, so a face-ordered tile needs extra passes and no benefit over host or mover tilize is shown; host tilize stays the default, mover `TILIZE` opt-in)* (overlaps checklist 9.10).
       Mover `TILIZE`/`UNTILIZE`, `Session::set_tilize` and `TT_TILIZE=card`
       are implemented and gated (`step58_tile_layout`), but slower than
       host tilize at the measured sizes. Host tilize remains the default.

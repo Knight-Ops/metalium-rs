@@ -102,6 +102,8 @@ pub enum SessionError {
         healthy: usize,
         wedged: Vec<(u8, u8)>,
     },
+    /// `TT_MATH` named no math mode (lane T8, `sfpu::approx::MathMode`).
+    Math(String),
 }
 
 impl From<TransportError> for SessionError {
@@ -135,6 +137,7 @@ impl std::fmt::Display for SessionError {
                  {wedged:?} are wedged, which software cannot clear; reset the board \
                  (`tt-smi -r`, or a power cycle)"
             ),
+            SessionError::Math(e) => write!(f, "{e}"),
         }
     }
 }
@@ -383,6 +386,8 @@ pub struct Session<T: Transport> {
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
+    /// How the transcendentals run ([`Session::set_math_mode`]; lane T8).
+    math: crate::sfpu::approx::MathMode,
     /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
     barriers: u32,
     /// Placements freed while lists that may read them are queued: given back
@@ -1634,6 +1639,7 @@ impl<T: Transport> Session<T> {
                 });
             }
         }
+        let math = crate::sfpu::approx::MathMode::from_env().map_err(SessionError::Math)?;
         let mut session = Session {
             dataflow: DataflowStats::default(),
             dev,
@@ -1656,6 +1662,7 @@ impl<T: Transport> Session<T> {
             dram: None,
             profiling: None,
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
+            math,
             barriers: 0,
             pending_frees: Vec::new(),
             capture: None,
@@ -3840,6 +3847,9 @@ impl<T: Transport> Session<T> {
         c: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
+        // The session's math mode picks the program: an Approx twin has a kind
+        // of its own, so every memo and cache key below carries the mode.
+        let op = op.in_mode(self.math);
         let units = self.units.len();
         let overlap = self.overlap();
         let alloc = &mut self.dram_state()?.alloc;
@@ -4669,6 +4679,20 @@ impl<T: Transport> Session<T> {
     /// `None` lets the resident planner choose the block length.
     pub fn set_matmul_k_block_limit(&mut self, limit: Option<std::num::NonZeroUsize>) {
         self.matmul_k_block_limit = limit;
+    }
+
+    /// How the transcendentals run from the next element-wise op on
+    /// (`sfpu::approx::MathMode`, S10; `TT_MATH=approx` sets it at open).
+    /// `Precise`, the default, is the full-accuracy programs; `Approx` runs
+    /// the fast ones, within their own looser bounds, for the ops that have
+    /// one. Traces captured before the change keep the mode they recorded.
+    pub fn set_math_mode(&mut self, mode: crate::sfpu::approx::MathMode) {
+        self.math = mode;
+    }
+
+    /// The mode [`Session::set_math_mode`] set.
+    pub fn math_mode(&self) -> crate::sfpu::approx::MathMode {
+        self.math
     }
 
     /// Double-buffer GDDR matmuls from the next op on (checklist 9.15; on by

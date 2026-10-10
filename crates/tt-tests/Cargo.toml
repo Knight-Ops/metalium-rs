@@ -64,3 +64,5 @@ burn-tensor.workspace = true
 burn.workspace = true
 # The general-model gate trains the model `tt-mnist --model transformer` times.
 tt-mnist = { path = "../tt-mnist" }
+# step145: the f64 oracle for `gelu` (`erfc`), independent of the programs.
+libm.workspace = true

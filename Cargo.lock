@@ -4874,6 +4874,7 @@ dependencies = [
  "burn-flex",
  "burn-tensor",
  "burn-tt",
+ "libm",
  "tt-device",
  "tt-firmware-images",
  "tt-isa",

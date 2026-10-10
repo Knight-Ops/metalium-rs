@@ -116,6 +116,10 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
     if tensor.dtype() == dtype {
         return tensor;
     }
+    // FP16 casts are lane T7's (`ops_dtype.rs`); any other pair falls through.
+    if let Some(converted) = dtype_ops::cast_f16(&tensor, dtype) {
+        return converted;
+    }
     if !matches!(
         (tensor.dtype(), dtype),
         (DType::F32, DType::BF16) | (DType::BF16, DType::F32)
@@ -903,13 +907,13 @@ fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> 
         return None;
     }
     let elem = match dtype {
-        DType::F32 | DType::BF16 => Elem::F32,
+        DType::F32 | DType::BF16 | DType::F16 => Elem::F32,
         DType::I32 => Elem::I32,
         DType::Bool(_) => Elem::Bool,
         _ => return None,
     };
     let dims = crate::tensor::stored_dims(&shape.to_vec())?;
-    let (id, dims) = crate::server::zeros(*device, dims, elem, dtype == DType::BF16);
+    let (id, dims) = crate::server::zeros(*device, dims, elem, crate::tensor::is_half(dtype));
     Some(device_result_shaped(*device, id, dims, shape, dtype))
 }
 
@@ -1438,7 +1442,7 @@ pub mod float {
     }
 
     pub fn float_from_data(data: TensorData, device: &TtDevice) -> TtTensor {
-        if !matches!(data.dtype, DType::F32 | DType::BF16) {
+        if !matches!(data.dtype, DType::F32 | DType::BF16 | DType::F16) {
             fail("float_from_data", context(&data));
         }
         TtTensor::new(HostBuffer::from_data(data), *device)
@@ -1864,7 +1868,7 @@ pub mod float {
     /// tensor's matrix is
     /// [`reshaped`]'s.
     fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
-        if !matches!(tensor.dtype(), DType::F32 | DType::BF16) {
+        if !matches!(tensor.dtype(), DType::F32 | DType::BF16 | DType::F16) {
             return None;
         }
         let (from, to) = (tensor.shape().to_vec(), shape.to_vec());
@@ -3715,7 +3719,10 @@ pub mod int {
         tensor: IntTensor<TtBackend>,
         out_dtype: burn_backend::FloatDType,
     ) -> FloatTensor<TtBackend> {
-        if matches!(DType::from(out_dtype), DType::F32 | DType::BF16) {
+        if matches!(
+            DType::from(out_dtype),
+            DType::F32 | DType::BF16 | DType::F16
+        ) {
             if let Some(t) = device_eltwise(kind_sfpu::I32_TO_F32, 0.0, &tensor, None) {
                 return cast_native(t, DType::from(out_dtype));
             }
@@ -3902,7 +3909,9 @@ pub mod bool {
     pub fn bool_into_float(tensor: TtTensor, out_dtype: burn_backend::FloatDType) -> TtTensor {
         if matches!(
             out_dtype,
-            burn_backend::FloatDType::F32 | burn_backend::FloatDType::BF16
+            burn_backend::FloatDType::F32
+                | burn_backend::FloatDType::BF16
+                | burn_backend::FloatDType::F16
         ) {
             if let Some(t) = device_eltwise(kind_sfpu::BOOL_TO_F32, 0.0, &tensor, None) {
                 return cast_native(t, DType::from(out_dtype));

@@ -824,3 +824,101 @@ fn role_push_rate() {
         }
     });
 }
+
+/// What `MathMode::Approx` saves per tile (S10; lane T8): each transcendental
+/// with an Approx twin, in both modes, one op's wall time on one unit by tiles
+/// and the slope, the median of seven after a warm-up -- beside the
+/// instruction counts `step145_approx_math` prints. The data is checked: each
+/// mode's output is the interpreter's program for the kind it runs, bit for
+/// bit, so a number is never for the wrong program.
+#[test]
+#[ignore = "benchmark"]
+fn approx_per_tile_saving() {
+    use tt_kernels::session::{Session, TileChoice};
+    use tt_kernels::sfpu::approx::{MathMode, TWINS};
+    use tt_kernels::sfpu::ops::reference;
+    use tt_kernels::tensor::Eltwise;
+    let card = std::env::var("TT_SILICON_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::Count(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        for (precise, approx) in TWINS {
+            let op = Eltwise {
+                kind: precise,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            // Positive and moderate, in every op's range.
+            let data = |n: usize| -> Vec<f32> {
+                pattern_f32(n, 3)
+                    .into_iter()
+                    .map(|v| v.abs() + 0.05)
+                    .collect()
+            };
+            let mut slope = [0.0f64; 2];
+            for (k, mode) in [MathMode::Precise, MathMode::Approx]
+                .into_iter()
+                .enumerate()
+            {
+                s.set_math_mode(mode);
+                let mut at = Vec::new();
+                for tiles in [1usize, 4, 16, 64] {
+                    let (r, c) = (32 * tiles, 32);
+                    let v = data(r * c);
+                    let x = s.upload(&v, r, c).unwrap();
+                    let o = s.eltwise(op, &x, None).unwrap();
+                    s.sync().unwrap();
+                    // The program the mode runs, bit for bit.
+                    let run_kind = if mode == MathMode::Approx {
+                        approx
+                    } else {
+                        precise
+                    };
+                    let want = reference(run_kind, 0.0, &v, None, r, c);
+                    let got = s.download(&o).unwrap();
+                    assert!(
+                        got.iter()
+                            .zip(&want)
+                            .all(|(g, w)| g.to_bits() == w.to_bits()),
+                        "{precise:#x} {mode:?} {tiles} tiles: not the program's bits"
+                    );
+                    s.free(o).unwrap();
+                    let mut t = Vec::new();
+                    for _ in 0..7 {
+                        let start = Instant::now();
+                        let o = s.eltwise(op, &x, None).unwrap();
+                        s.sync().unwrap();
+                        t.push(start.elapsed());
+                        s.free(o).unwrap();
+                    }
+                    s.free(x).unwrap();
+                    at.push((tiles, median(t).as_secs_f64() * 1e6));
+                }
+                // The slope between the 4- and 64-tile runs: per tile.
+                slope[k] = (at[3].1 - at[1].1) / 60.0;
+                let line: Vec<String> = at
+                    .iter()
+                    .map(|(t, us)| format!("{t}: {us:.1} us"))
+                    .collect();
+                println!(
+                    "MEASURE approx {precise:#06x} {mode:?}: {}",
+                    line.join(", ")
+                );
+            }
+            println!(
+                "MEASURE approx {precise:#06x} per tile: precise {:.2} us, approx {:.2} us, saved {:.2}x",
+                slope[0],
+                slope[1],
+                slope[0] / slope[1]
+            );
+        }
+        s.set_math_mode(MathMode::Precise);
+    }) {
+        panic!("{e}");
+    }
+}

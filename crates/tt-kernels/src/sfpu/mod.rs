@@ -28,6 +28,7 @@
 //! computed, never hand-derived. It is checked instruction by instruction
 //! against ttsim and both cards (`step26_sfpu_isa`).
 
+pub mod approx;
 pub mod integer;
 pub mod interp;
 pub mod kernel;
@@ -105,8 +106,17 @@ impl Cond {
             Cond::Gte0(r) => (r, 4),
             Cond::Eq0(r) => (r, 6),
             Cond::Less(a, b) => return encode::sfpgt(a.index(), b.index(), 1).unwrap(),
-            // `SFPLE` holds where `VD <= VC`.
-            Cond::LessEq(a, b) => return encode::sfple(b.index(), a.index(), 1).unwrap(),
+            // `SFPLE` holds where `VD <= VC`: `a` is `VD`, and a `VD` of 12 or
+            // more is a template load (the interpreter refuses it; lane T8).
+            Cond::LessEq(a, b) => {
+                assert!(
+                    a.index() < 12,
+                    "LessEq({a:?}, ..): SFPLE reads its first operand as VD, and VD >= 12 \
+                     is an SFPLOADMACRO template load; put a config LReg second (or compare \
+                     with Less)"
+                );
+                return encode::sfple(b.index(), a.index(), 1).unwrap();
+            }
         };
         encode::sfpsetcc(0, vc.index(), 0, mod1).unwrap()
     }

@@ -269,6 +269,10 @@ pub struct Sig {
 pub fn elems(kind: u32) -> Sig {
     use Elem::{Bool, F32};
     let sig = |inputs, out| Sig { inputs, out };
+    // Lane T8: the Approx programs (`approx.rs`) are unary, `F32` to `F32`.
+    if super::approx::is_approx(kind) {
+        return sig(&[F32], F32);
+    }
     if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
         return sig(&[F32], F32);
     }
@@ -321,6 +325,10 @@ pub enum Accuracy {
 
 /// [`Accuracy`] of `kind`.
 pub fn accuracy(kind: u32) -> Accuracy {
+    // Lane T8: the Approx programs are approximations, held to their bounds.
+    if super::approx::is_approx(kind) {
+        return Accuracy::Approximate;
+    }
     match kind {
         kind_sfpu::RECIP
         | kind_sfpu::DIV
@@ -2312,6 +2320,9 @@ pub fn pow_fix(p: &mut Program) {
 
 /// What operands `kind` takes, if the SFPU has it.
 pub fn operands(kind: u32) -> Option<Operands> {
+    if super::approx::is_approx(kind) {
+        return Some(Operands::Unary);
+    }
     if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
         return Some(Operands::Unary);
     }
@@ -2891,6 +2902,10 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
 
 /// [`program2`] as a role's slot holds it ([`code_for`]).
 pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Code)> {
+    // Lane T8: the Approx twin of a transcendental (`approx.rs`).
+    if let Some(code) = super::approx::code(kind) {
+        return Some((Operands::Unary, code));
+    }
     if (kind_sfpu::HARDWARE_ROUND..kind_sfpu::HARDWARE_ROUND + 6).contains(&kind) {
         use tt_isa::numerics::stochastic::{Precision, Rounding};
         let offset = kind - kind_sfpu::HARDWARE_ROUND;

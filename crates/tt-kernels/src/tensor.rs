@@ -3073,6 +3073,8 @@ impl Eltwise {
             SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN | ATAN | ASIN => {
                 true
             }
+            // Lane T8: the Approx twins of `tanh` and `gelu`.
+            crate::sfpu::approx::kind::TANH | crate::sfpu::approx::kind::GELU => true,
             // `0^s = 0` for `s > 0`.
             POW_S => s > 0.0,
             // `g (1/2)` and `g 0 1`: zero with the gradient's padding.

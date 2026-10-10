@@ -23,6 +23,7 @@ pub mod bfp;
 pub mod code;
 pub mod datapath;
 pub mod dm;
+pub mod fp16;
 pub mod fpu;
 mod index;
 pub mod kind;

@@ -107,7 +107,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 - [x] **MD: matrix diagnostics** (step111; `MOVDBGA2D` `[x]` for 1/8-row, formats, flush, bank ownership on card 0; `GATESRCRST` `[-]` `NoObservableOracle` after a clean isolated probe; the increment-1 `AddrMod` cases are an open shared-configuration issue also seen on the `MOVA2D` control, tests ignored). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
   `GATESRCRST` needs an observable stale-versus-fresh difference with SrcB loaded through
   `MOVD2B`. Exit: `GATESRCRST` becomes `[-]` "no observable oracle" if both arms match.
-- [ ] **PU: packer and unpacker modes.** Owns `tt-kernels/src/datapath.rs`. In order: packer ReLU,
+- [x] **PU: packer and unpacker modes** (steps 112-114; card 0: BF16 `UnpackToDst`, packer ReLU, edge masking, tileize all pass; unpacker transpose is not payload-preserving so M3/D5 are `[-]`; the 16-bit Dst read path preserves normals only; five negative controls watched failing on ttsim; not routed into Session/Burn ops). **PU: packer and unpacker modes.** Owns `tt-kernels/src/datapath.rs`. In order: packer ReLU,
   edge masking, BF16 `UnpackToDst` (silicon-only, row 31; closes the D1 row), then unpacker
   transpose/tilize/broadcast with every new mode value isolated first (the Wormhole mode-7 precedent
   rebooted the host). The last sub-tranche also decides M3 and D5. Exit for M3/D5: `[-]` with the
@@ -172,14 +172,14 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   and 512 NOPs (step91). Bit-exact host model of the hardware stream; pinned χ² and
   Kolmogorov–Smirnov tests; Bernoulli, uniform, normal (Box–Muller over the S4 programs),
   `int_random`. Replay advances a GDDR seed buffer or random is refused inside traces.
-- [ ] **T7: FP16 (D1).** `Elem::F16` and `StorageFormat::F16`, packing to `L1Format::Fp16`; measure
+- [x] **T7: FP16 (D1)** (steps 143-144; ttsim 7+6 and card 0 gates pass; shipped casts are exact SFPU programs, the packer's own FP16 conversion is measured and not used; `native_conversions_match_the_measured_model` still has its `measured::SILICON` constants to fill from the recorded `T7-MEASURE` lines). **T7: FP16 (D1).** `Elem::F16` and `StorageFormat::F16`, packing to `L1Format::Fp16`; measure
   packer rounding/overflow/subnormal behaviour on both cards; `float_cast` F32/BF16↔F16; F64 `[-]`.
-- [ ] **T8: `MathMode::{Precise, Approx}` (S10).** Session setting `TT_MATH=approx`, in the program
+- [x] **T8: `MathMode::{Precise, Approx}` (S10)** (steps 145-146; ttsim and card 0 10/10; six ops 1.24x-8.24x per tile). **T8: `MathMode::{Precise, Approx}` (S10).** Session setting `TT_MATH=approx`, in the program
   memo keys, Precise default. Bounds derived beside each gate. Negative controls: Approx must break
   the Precise bound somewhere; alternating modes must give different bits.
 - [x] **T9: mesh trace capture (R4)** (step147; ttsim 5/5 and card 0/1 silicon 3/3; per-chip session traces between host-run Ethernet transfers, `UnheldTransfer` refusal; two negative controls watched failing; mesh training traces and `copy_into` on a mesh still unsupported). **T9: mesh trace capture (R4).** `MeshEngine::begin_trace`; changed-input replay matches a
   fresh run with no uploads. Both cards.
-- [ ] **T10: benchmarks and dispositions.** Release K-block and norm benchmarks (P2/R3); M2 `[-]`
+- [~] **T10: benchmarks and dispositions** (K-block and norm release benchmarks written in `silicon_bench_tensix_ops.rs`, NOT yet run: `cargo xtask bench --device all --filter silicon_bench_tensix_ops::{k_block_matmul_baselines,norm_forward_baselines,norm_backward_baselines}`; M2/M3/D5 dispositions applied above; stale-statement audit list is in the lane report). **T10: benchmarks and dispositions.** Release K-block and norm benchmarks (P2/R3); M2 `[-]`
   GMPOOL diagnostic-only (packed ArgMax index bits missing on both cards, run `1791240702`); record
   PU's M3/D5 dispositions.
 

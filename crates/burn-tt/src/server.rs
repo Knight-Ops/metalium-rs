@@ -42,6 +42,22 @@ pub trait Engine {
     fn elementwise_mode(&self) -> ElementwiseMode {
         ElementwiseMode::Sfpu
     }
+    /// How this engine's transcendentals run (`MathMode`, S10; lane T8):
+    /// `Precise` unless [`Engine::set_math_mode`] (or `TT_MATH=approx` when
+    /// its session opened) chose `Approx`.
+    fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
+        tt_kernels::sfpu::approx::MathMode::Precise
+    }
+    /// Run the transcendentals in `mode` from the next op on. An engine with
+    /// no device-resident element-wise ops refuses, rather than ignoring it.
+    fn set_math_mode(
+        &mut self,
+        mode: tt_kernels::sfpu::approx::MathMode,
+    ) -> Result<(), EngineError> {
+        Err(EngineError(format!(
+            "this engine has no math modes (asked for {mode:?})"
+        )))
+    }
     /// `A[m, k] @ B[k, n]`, row-major.
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
 
@@ -368,6 +384,16 @@ pub trait Engine {
     // lane:t6_random (Engine trait): add this lane's methods below this line only.
 
     // lane:t7_dtype (Engine trait): add this lane's methods below this line only.
+
+    /// Convert between resident F32 and physically packed IEEE binary16
+    /// (`to_f16`), on Tensix. FP16 buffers share BF16's raw two-byte storage.
+    fn cast_f16(
+        &mut self,
+        _id: BufferId,
+        _to_f16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
 
     // lane:t8_mathmode (Engine trait): add this lane's methods below this line only.
 
@@ -2180,6 +2206,16 @@ impl Engine for KmdEngine {
             .as_ref()
             .map_or(ElementwiseMode::Sfpu, DramBuffers::elementwise_mode)
     }
+    fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
+        self.session.math_mode()
+    }
+    fn set_math_mode(
+        &mut self,
+        mode: tt_kernels::sfpu::approx::MathMode,
+    ) -> Result<(), EngineError> {
+        self.session.set_math_mode(mode);
+        Ok(())
+    }
     fn pool_bf16(
         &mut self,
         a: BufferId,
@@ -2525,6 +2561,17 @@ impl Engine for KmdEngine {
 
     // lane:t7_dtype (KmdEngine): add this lane's methods below this line only.
 
+    fn cast_f16(
+        &mut self,
+        id: BufferId,
+        to_f16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .cast_f16(&mut self.session, id, to_f16)
+    }
+
     // lane:t8_mathmode (KmdEngine): add this lane's methods below this line only.
 
     // lane:t9_mesh (KmdEngine): add this lane's methods below this line only.
@@ -2682,6 +2729,8 @@ pub struct MeshEngine<T: tt_device::Transport> {
     pub fidelity: Fidelity,
     pub budget: u64,
     buffers: DramBuffers,
+    /// The math mode every chip's session runs in ([`Engine::set_math_mode`]).
+    mode: tt_kernels::sfpu::approx::MathMode,
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
@@ -2703,17 +2752,32 @@ impl<T: tt_device::Transport> MeshEngine<T> {
         fabric
             .enable_resident(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .map_err(|e| EngineError(e.to_string()))?;
+        let mode = fabric.chips[0].session().math_mode();
         Ok(Self {
             fabric,
             route,
             fidelity,
             budget,
             buffers: DramBuffers::default(),
+            mode,
         })
     }
 }
 
 impl<T: tt_device::Transport> Engine for MeshEngine<T> {
+    fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
+        self.mode
+    }
+    fn set_math_mode(
+        &mut self,
+        mode: tt_kernels::sfpu::approx::MathMode,
+    ) -> Result<(), EngineError> {
+        for chip in &mut self.fabric.chips {
+            chip.session().set_math_mode(mode);
+        }
+        self.mode = mode;
+        Ok(())
+    }
     fn matmul(
         &mut self,
         a: &[f32],
@@ -3109,6 +3173,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
 
     // lane:t7_dtype (MeshEngine): add this lane's methods below this line only.
 
+    fn cast_f16(
+        &mut self,
+        id: BufferId,
+        to_f16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .cast_f16(self.fabric.chips[0].session(), id, to_f16)
+    }
+
     // lane:t8_mathmode (MeshEngine): add this lane's methods below this line only.
 
     // lane:t9_mesh (MeshEngine): add this lane's methods below this line only.
@@ -3269,6 +3342,47 @@ pub fn kmd_mesh_engine(
         serve.serve(&mut engine);
         Ok(())
     }
+}
+
+// lane:t7_dtype (DramBuffers and submit wrappers): FP16 storage shares the raw
+// two-byte `bf16` map, since movement and views never look at the element
+// format; only the conversions below do.
+impl DramBuffers {
+    pub fn cast_f16<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+        to_f16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        if to_f16 {
+            let t = s.fp16_from_f32(self.get(id)?).map_err(error)?;
+            Ok(self.insert_bf16(t.as_raw()))
+        } else {
+            let raw = self
+                .bf16
+                .get(&id)
+                .ok_or_else(|| EngineError(format!("no FP16 buffer {id}")))?;
+            let t = tt_kernels::fp16::Fp16Tensor::from_raw(raw.clone());
+            let wide = s.fp16_to_f32(&t).map_err(error)?;
+            Ok(self.insert(wide))
+        }
+    }
+}
+
+pub(crate) fn cast_f16(
+    device: TtDevice,
+    id: BufferId,
+    dims: [usize; 2],
+    to_f16: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "cast_f16",
+        device,
+        dims,
+        || "native FP16 storage conversion".into(),
+        move |engine, ids| engine.cast_f16(ids.get(id)?, to_f16),
+    )
 }
 
 #[cfg(test)]
