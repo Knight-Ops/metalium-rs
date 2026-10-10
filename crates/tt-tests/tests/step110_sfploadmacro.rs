@@ -1,4 +1,4 @@
-//! `SFPLOADMACRO` (hardware-coverage S9, lane H): the macro configuration helper,
+//! `SFPLOADMACRO` (hardware-coverage S9): the macro configuration helper,
 //! a schedule model, and the silicon probes that decide whether the page is true.
 //!
 //! ttsim does not execute `SFPLOADMACRO` (divergence row 7, watched by
@@ -6,7 +6,7 @@
 //! can only be judged against a model. Three independent things are checked
 //! here, none against itself:
 //!
-//! * `tt_isa::sfpu_macro` (checked helper, writes the configuration words) is
+//! * `tt_isa::sfpu::load_macro` (checked helper, writes the configuration words) is
 //!   read back by `tt_kernels::sfpu::macro_sched` (a model written from the
 //!   page's functional model that re-reads the raw words), so a wrongly placed
 //!   bit disagrees rather than agrees;
@@ -44,10 +44,10 @@
 
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
-use tt_isa::sfpu::{self, mod0_fmt};
-use tt_isa::sfpu_macro::{
+use tt_isa::sfpu::load_macro::{
     drain, MacroConfig, MacroError, MacroLoad, Misc, Sequence, Slot, Source, SubUnit, Template,
 };
+use tt_isa::sfpu::{self, mod0_fmt};
 use tt_kernels::sfpu::interp::Vector;
 use tt_kernels::sfpu::macro_sched::{Machine, SchedError, Unit};
 #[cfg(feature = "silicon")]

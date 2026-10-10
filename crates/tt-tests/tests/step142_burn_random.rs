@@ -1,4 +1,4 @@
-//! Lane T6 (S7), step 142: Burn's `float_random` / `int_random` are drawn on the
+//! S7, step 142: Burn's `float_random` / `int_random` are drawn on the
 //! device by the seeded tile kernel, resident, with no upload; dropout composes
 //! native Bernoulli with the mask multiply; a failed or unsupported draw is an
 //! explicit failure, never a host retry; a trace refuses to capture a draw.
@@ -11,7 +11,7 @@
 //! splitmix64(n))` (`n` the draws since `Backend::seed`), so the expected bits
 //! are a function of `(seed, n)` the test recomputes.
 //!
-//! Negative controls (watched to fail, recorded in the lane report): (1) the
+//! Negative controls (watched to fail, recorded in the close-out record): (1) the
 //! host `StdRng` path substituted for an attached device draw would upload
 //! (`uploads` rises) and fail the model comparison; (2) a draw that ignores the
 //! per-call counter repeats the previous tensor (`consecutive draws differ`).

@@ -1,4 +1,4 @@
-//! Native seeded random on the device (hardware-coverage S7, close-out lane T6).
+//! Native seeded random on the device (hardware-coverage S7).
 //!
 //! # What the hardware gives
 //!

@@ -42,7 +42,7 @@ pub trait Engine {
     fn elementwise_mode(&self) -> ElementwiseMode {
         ElementwiseMode::Sfpu
     }
-    /// How this engine's transcendentals run (`MathMode`, S10; lane T8):
+    /// How this engine's transcendentals run (`MathMode`, S10):
     /// `Precise` unless [`Engine::set_math_mode`] (or `TT_MATH=approx` when
     /// its session opened) chose `Approx`.
     fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
@@ -361,15 +361,6 @@ pub trait Engine {
         Err(no_traces())
     }
 
-    // lane:t1_intbool (Engine trait): add this lane's methods below this line only.
-
-    // lane:t2_index (Engine trait): add this lane's methods below this line only.
-
-    // lane:t3_scan (Engine trait): add this lane's methods below this line only.
-
-    // lane:t4_rem (Engine trait): add this lane's methods below this line only.
-
-    // lane:t5_sort (Engine trait): add this lane's methods below this line only.
     /// Sort every problem of `a`, a plane matrix (`tt_kernels::sfpu::sort`),
     /// along its axis positions: the sorted keys and, if `spec.indices`, the
     /// original indices. Both stay on the device.
@@ -381,7 +372,6 @@ pub trait Engine {
         Err(unsupported())
     }
 
-    // lane:t6_random (Engine trait): add this lane's methods below this line only.
     /// A `dims` tensor drawn on the device by the seeded tile kernel
     /// (`tt_kernels::prng`), resident, with no upload.
     fn random_dram(
@@ -393,8 +383,6 @@ pub trait Engine {
         Err(unsupported())
     }
 
-    // lane:t7_dtype (Engine trait): add this lane's methods below this line only.
-
     /// Convert between resident F32 and physically packed IEEE binary16
     /// (`to_f16`), on Tensix. FP16 buffers share BF16's raw two-byte storage.
     fn cast_f16(
@@ -404,10 +392,6 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), EngineError> {
         Err(unsupported())
     }
-
-    // lane:t8_mathmode (Engine trait): add this lane's methods below this line only.
-
-    // lane:t9_mesh (Engine trait): add this lane's methods below this line only.
 }
 
 /// Input payload to write into a trace's input buffer before replay.
@@ -810,6 +794,27 @@ impl DramBuffers {
         let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
         s.sync().map_err(e)?;
         let t0 = Instant::now();
+        self.write_trace_inputs(s, inputs)?;
+        let t1 = Instant::now();
+        s.replay(id).map_err(e)?;
+        s.sync().map_err(e)?;
+        let t2 = Instant::now();
+        let out_data = self.read_trace_outputs(s, outputs)?;
+        Ok(GenericTraceRun {
+            outputs: out_data,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
+    }
+
+    /// Write each of a generic trace's inputs into its buffer.
+    pub fn write_trace_inputs<T: tt_device::Transport>(
+        &self,
+        s: &mut Session<T>,
+        inputs: &[(BufferId, InputPayload)],
+    ) -> Result<(), EngineError> {
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
         for (input_id, payload) in inputs {
             let t = self.get(*input_id)?;
             match payload {
@@ -817,29 +822,27 @@ impl DramBuffers {
                 InputPayload::Bits(v) => s.write_bits(t, v).map_err(e)?,
             }
         }
-        let t1 = Instant::now();
-        s.replay(id).map_err(e)?;
-        s.sync().map_err(e)?;
-        let t2 = Instant::now();
+        Ok(())
+    }
+
+    /// Download each of a generic trace's outputs as it asks.
+    pub fn read_trace_outputs<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<Vec<OutputPayload>, EngineError> {
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
         let mut out_data = Vec::with_capacity(outputs.len());
         for &(output_id, kind) in outputs {
             match kind {
-                OutputKind::F32 => {
-                    let data = self.download(s, output_id)?;
-                    out_data.push(OutputPayload::F32(data));
-                }
+                OutputKind::F32 => out_data.push(OutputPayload::F32(self.download(s, output_id)?)),
                 OutputKind::Bits => {
                     let data = s.download_bits(self.get(output_id)?).map_err(e)?;
                     out_data.push(OutputPayload::Bits(data));
                 }
             }
         }
-        Ok(GenericTraceRun {
-            outputs: out_data,
-            write: t1 - t0,
-            replay: t2 - t1,
-            read: t2.elapsed(),
-        })
+        Ok(out_data)
     }
 
     pub fn upload<T: tt_device::Transport>(
@@ -1248,7 +1251,7 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
-    /// Lane T5: [`Engine::sort_planes`], for engines that serve these buffers.
+    /// [`Engine::sort_planes`], for engines that serve these buffers.
     pub fn sort_planes<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1263,6 +1266,60 @@ impl DramBuffers {
             keys: self.insert(sorted.keys),
             indices: sorted.indices.map(|t| self.insert(t)),
         })
+    }
+
+    /// [`Engine::random_dram`], for engines that serve these buffers.
+    pub fn random<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        dims: [usize; 2],
+        draw: crate::random::Draw,
+        base: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        use crate::random::Draw;
+        use tt_kernels::prng::{role, Output};
+        let drawn = match draw {
+            Draw::Unit => s.random_tiles(dims, Output::Unit, base, role::UNIT),
+            Draw::Uniform(lo, hi) => s.random_uniform(dims, base, lo, hi),
+            Draw::Bernoulli { p, int } => s.random_bernoulli(dims, base, p, int),
+            Draw::Normal {
+                mean,
+                std,
+                int: false,
+            } => s.random_normal(dims, base, mean, std),
+            Draw::Normal {
+                mean,
+                std,
+                int: true,
+            } => s.random_normal_int(dims, base, mean, std),
+            Draw::IntRange(lo, hi) => s.random_int_range(dims, base, lo, hi),
+            Draw::IntWords => s.random_int_words(dims, base),
+        }
+        .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(drawn))
+    }
+
+    /// FP16 storage shares the raw two-byte `bf16` map, since movement and views
+    /// never look at the element format; only these conversions do.
+    pub fn cast_f16<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+        to_f16: bool,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        if to_f16 {
+            let t = s.fp16_from_f32(self.get(id)?).map_err(error)?;
+            Ok(self.insert_bf16(t.as_raw()))
+        } else {
+            let raw = self
+                .bf16
+                .get(&id)
+                .ok_or_else(|| EngineError(format!("no FP16 buffer {id}")))?;
+            let t = tt_kernels::fp16::Fp16Tensor::from_raw(raw.clone());
+            let wide = s.fp16_to_f32(&t).map_err(error)?;
+            Ok(self.insert(wide))
+        }
     }
 
     /// A view: freeing it frees nothing (`DramTensor::rows_view`).
@@ -1323,7 +1380,7 @@ pub struct SortedBuffers {
     pub indices: Option<(BufferId, [usize; 2])>,
 }
 
-/// A sort of `a`'s planes on the device, without waiting (lane T5): the keys'
+/// A sort of `a`'s planes on the device, without waiting: the keys'
 /// and, if `spec.indices`, the indices' buffers are named now, both `dims`.
 pub(crate) fn sort_planes(
     device: TtDevice,
@@ -1374,6 +1431,36 @@ pub(crate) fn sort_planes(
         keys: (keys, dims),
         indices: indices.map(|i| (i, dims)),
     }
+}
+
+pub(crate) fn random(
+    device: TtDevice,
+    dims: [usize; 2],
+    draw: crate::random::Draw,
+    base: u64,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "random",
+        device,
+        dims,
+        move || format!("native random {draw:?}"),
+        move |engine, _| engine.random_dram(dims, draw, base),
+    )
+}
+
+pub(crate) fn cast_f16(
+    device: TtDevice,
+    id: BufferId,
+    dims: [usize; 2],
+    to_f16: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "cast_f16",
+        device,
+        dims,
+        || "native FP16 storage conversion".into(),
+        move |engine, ids| engine.cast_f16(ids.get(id)?, to_f16),
+    )
 }
 
 /// Why an engine could not start or finish a job.
@@ -2549,15 +2636,6 @@ impl Engine for KmdEngine {
         bufs.run_generic_trace(&mut self.session, trace, inputs, outputs)
     }
 
-    // lane:t1_intbool (KmdEngine): add this lane's methods below this line only.
-
-    // lane:t2_index (KmdEngine): add this lane's methods below this line only.
-
-    // lane:t3_scan (KmdEngine): add this lane's methods below this line only.
-
-    // lane:t4_rem (KmdEngine): add this lane's methods below this line only.
-
-    // lane:t5_sort (KmdEngine): add this lane's methods below this line only.
     fn sort_planes(
         &mut self,
         a: BufferId,
@@ -2567,7 +2645,6 @@ impl Engine for KmdEngine {
         bufs.sort_planes(&mut self.session, a, spec)
     }
 
-    // lane:t6_random (KmdEngine): add this lane's methods below this line only.
     fn random_dram(
         &mut self,
         dims: [usize; 2],
@@ -2580,8 +2657,6 @@ impl Engine for KmdEngine {
             .random(&mut self.session, dims, draw, base)
     }
 
-    // lane:t7_dtype (KmdEngine): add this lane's methods below this line only.
-
     fn cast_f16(
         &mut self,
         id: BufferId,
@@ -2592,10 +2667,6 @@ impl Engine for KmdEngine {
             .ok_or_else(unsupported)?
             .cast_f16(&mut self.session, id, to_f16)
     }
-
-    // lane:t8_mathmode (KmdEngine): add this lane's methods below this line only.
-
-    // lane:t9_mesh (KmdEngine): add this lane's methods below this line only.
 }
 
 pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
@@ -3172,15 +3243,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         Some(self.fabric.chips[0].device().traffic())
     }
 
-    // lane:t1_intbool (MeshEngine): add this lane's methods below this line only.
-
-    // lane:t2_index (MeshEngine): add this lane's methods below this line only.
-
-    // lane:t3_scan (MeshEngine): add this lane's methods below this line only.
-
-    // lane:t4_rem (MeshEngine): add this lane's methods below this line only.
-
-    // lane:t5_sort (MeshEngine): add this lane's methods below this line only.
     fn sort_planes(
         &mut self,
         a: BufferId,
@@ -3190,7 +3252,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
             .sort_planes(self.fabric.chips[0].session(), a, spec)
     }
 
-    // lane:t6_random (MeshEngine): add this lane's methods below this line only.
     fn random_dram(
         &mut self,
         dims: [usize; 2],
@@ -3201,8 +3262,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
             .random(self.fabric.chips[0].session(), dims, draw, base)
     }
 
-    // lane:t7_dtype (MeshEngine): add this lane's methods below this line only.
-
     fn cast_f16(
         &mut self,
         id: BufferId,
@@ -3212,9 +3271,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
             .cast_f16(self.fabric.chips[0].session(), id, to_f16)
     }
 
-    // lane:t8_mathmode (MeshEngine): add this lane's methods below this line only.
-
-    // lane:t9_mesh (MeshEngine): add this lane's methods below this line only.
     /// Capture a mesh trace (`tt_kernels::mesh_trace`): one session trace per
     /// chip per stretch between Ethernet transfers, and the transfers
     /// themselves, replayed in the capture's order.
@@ -3269,35 +3325,16 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
         self.fabric.chips[0].session().sync().map_err(e)?;
         let t0 = Instant::now();
-        for (input_id, payload) in inputs {
-            let t = self.buffers.get(*input_id)?;
-            let session = self.fabric.chips[0].session();
-            match payload {
-                InputPayload::F32(v) => session.write(t, v).map_err(e)?,
-                InputPayload::Bits(v) => session.write_bits(t, v).map_err(e)?,
-            }
-        }
+        self.buffers
+            .write_trace_inputs(self.fabric.chips[0].session(), inputs)?;
         let t1 = Instant::now();
         self.fabric
             .replay_mesh_trace(trace)
             .map_err(mesh_trace_error)?;
         let t2 = Instant::now();
-        let mut out_data = Vec::with_capacity(outputs.len());
-        for &(output_id, kind) in outputs {
-            match kind {
-                OutputKind::F32 => {
-                    let data = self
-                        .buffers
-                        .download(self.fabric.chips[0].session(), output_id)?;
-                    out_data.push(OutputPayload::F32(data));
-                }
-                OutputKind::Bits => {
-                    let t = self.buffers.get(output_id)?;
-                    let data = self.fabric.chips[0].session().download_bits(t).map_err(e)?;
-                    out_data.push(OutputPayload::Bits(data));
-                }
-            }
-        }
+        let out_data = self
+            .buffers
+            .read_trace_outputs(self.fabric.chips[0].session(), outputs)?;
         Ok(GenericTraceRun {
             outputs: out_data,
             write: t1 - t0,
@@ -3372,95 +3409,6 @@ pub fn kmd_mesh_engine(
         serve.serve(&mut engine);
         Ok(())
     }
-}
-
-// lane:t6_random (DramBuffers and submit wrappers): device draws.
-impl DramBuffers {
-    pub fn random<T: tt_device::Transport>(
-        &mut self,
-        s: &mut Session<T>,
-        dims: [usize; 2],
-        draw: crate::random::Draw,
-        base: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
-        use crate::random::Draw;
-        use tt_kernels::prng::{role, Output};
-        let drawn = match draw {
-            Draw::Unit => s.random_tiles(dims, Output::Unit, base, role::UNIT),
-            Draw::Uniform(lo, hi) => s.random_uniform(dims, base, lo, hi),
-            Draw::Bernoulli { p, int } => s.random_bernoulli(dims, base, p, int),
-            Draw::Normal {
-                mean,
-                std,
-                int: false,
-            } => s.random_normal(dims, base, mean, std),
-            Draw::Normal {
-                mean,
-                std,
-                int: true,
-            } => s.random_normal_int(dims, base, mean, std),
-            Draw::IntRange(lo, hi) => s.random_int_range(dims, base, lo, hi),
-            Draw::IntWords => s.random_int_words(dims, base),
-        }
-        .map_err(|e| EngineError(e.to_string()))?;
-        Ok(self.insert(drawn))
-    }
-}
-
-pub(crate) fn random(
-    device: TtDevice,
-    dims: [usize; 2],
-    draw: crate::random::Draw,
-    base: u64,
-) -> (BufferId, [usize; 2]) {
-    submit(
-        "random",
-        device,
-        dims,
-        move || format!("native random {draw:?}"),
-        move |engine, _| engine.random_dram(dims, draw, base),
-    )
-}
-
-// lane:t7_dtype (DramBuffers and submit wrappers): FP16 storage shares the raw
-// two-byte `bf16` map, since movement and views never look at the element
-// format; only the conversions below do.
-impl DramBuffers {
-    pub fn cast_f16<T: tt_device::Transport>(
-        &mut self,
-        s: &mut Session<T>,
-        id: BufferId,
-        to_f16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
-        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
-        if to_f16 {
-            let t = s.fp16_from_f32(self.get(id)?).map_err(error)?;
-            Ok(self.insert_bf16(t.as_raw()))
-        } else {
-            let raw = self
-                .bf16
-                .get(&id)
-                .ok_or_else(|| EngineError(format!("no FP16 buffer {id}")))?;
-            let t = tt_kernels::fp16::Fp16Tensor::from_raw(raw.clone());
-            let wide = s.fp16_to_f32(&t).map_err(error)?;
-            Ok(self.insert(wide))
-        }
-    }
-}
-
-pub(crate) fn cast_f16(
-    device: TtDevice,
-    id: BufferId,
-    dims: [usize; 2],
-    to_f16: bool,
-) -> (BufferId, [usize; 2]) {
-    submit(
-        "cast_f16",
-        device,
-        dims,
-        || "native FP16 storage conversion".into(),
-        move |engine, ids| engine.cast_f16(ids.get(id)?, to_f16),
-    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Unpacker input modes (lane PU, sub-tranche 4; decides M3 and D5).
+//! Unpacker input modes (PU sub-tranche 4; decides M3 and D5).
 //!
 //! Two modes are documented for Blackhole (`UNPACR_Regular.md`, conditionalized):
 //!
@@ -362,8 +362,8 @@ fn ttsim_refuses_transpose_to_dst() {
     assert!(run(false), "UnpackToDst without transpose is the control");
     assert!(!run(true), "unpack_to_dst cannot be used with haloize");
     assert_eq!(
-        tt_isa::unpack_modes::stage_transpose(&mut ConfigWords::new(), true),
-        Err(tt_isa::unpack_modes::UnpackModeError::TransposeToDst)
+        tt_isa::unpacker::stage_transpose(&mut ConfigWords::new(), true),
+        Err(tt_isa::unpacker::UnpackModeError::TransposeToDst)
     );
 }
 

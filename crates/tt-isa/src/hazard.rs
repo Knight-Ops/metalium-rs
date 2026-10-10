@@ -1,6 +1,6 @@
 //! Hazards as data: which unit runs each instruction, which waits hold it, and a
 //! checker that replays a thread's instruction stream against those facts
-//! (`implementation-checklist.md`, "Hazards as data"; `hardware-coverage-closeout.md`, P9).
+//! (`implementation-checklist.md`, "Hazards as data"; `hardware-coverage.md`, P9).
 //!
 //! Every wait in the repository's Tensix programs is placed by hand through
 //! `backend::Before` and `sync::post_after`. This module states the *reasons*

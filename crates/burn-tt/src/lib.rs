@@ -159,7 +159,7 @@ impl Backend for TtBackend {
         match dtype {
             DType::F32 | DType::BF16 => DTypeUsage::general() | DTypeUsage::Accelerated,
             DType::Bool(_) => DTypeUsage::general(),
-            // FP16 (IEEE binary16): stored and cast on Tensix (lane T7); arithmetic is
+            // FP16 (IEEE binary16): stored and cast on Tensix; arithmetic is
             // not claimed, F64 stays unsupported.
             DType::I32 | DType::F16 => DTypeUsage::Storage.into(),
             _ => DTypeUsageSet::empty(),

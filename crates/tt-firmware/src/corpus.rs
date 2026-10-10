@@ -13,8 +13,8 @@ use crate::cfg::write_config_field;
 use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor};
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
+use tt_isa::mailbox::guard::{self, Guard};
 use tt_isa::mailbox::role::Mailbox;
-use tt_isa::l1_atomic::guard::{self, Guard};
 use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
@@ -104,7 +104,7 @@ fn unwedge() {
     }
 }
 
-/// What a guarded run was armed with (`tt_isa::l1_atomic::guard`).
+/// What a guarded run was armed with (`tt_isa::mailbox::guard`).
 struct GuardRun {
     deadline: u32,
     grace: u32,
@@ -153,7 +153,7 @@ fn semaphore_snapshot(g: Guard, raw: bool, first: bool) -> u32 {
     snapshot
 }
 
-/// Whether the host armed this run as **guarded** (`tt_isa::l1_atomic::guard`),
+/// Whether the host armed this run as **guarded** (`tt_isa::mailbox::guard`),
 /// consuming the arming word so a stale one cannot guard a later, unrelated run.
 ///
 /// A guarded program may park its Tensix thread in a Wait Gate (a held mutex, a
@@ -787,7 +787,7 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    /// Lane T6: honour a seed directive (`tt_isa::dataflow::seed_directive`)
+    /// Honour a seed directive (`tt_isa::dataflow::seed_directive`)
     /// at the head of the program, and return the first word to push (past it).
     /// The coprocessor is drained, the seed goes to the PRNG seed register by a
     /// full-width RISC-V store, a fence publishes it, and the settling interval

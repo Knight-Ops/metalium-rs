@@ -35,7 +35,7 @@ pub(crate) fn device_elem(dtype: DType) -> Option<Elem> {
 
 /// Dtypes stored as raw two-byte physical slots (`Bf16Tensor`'s layout): BF16
 /// and IEEE binary16. Movement and views treat them alike; only conversions
-/// and arithmetic care which one it is (lane T7).
+/// and arithmetic care which one it is.
 pub(crate) fn is_half(dtype: DType) -> bool {
     matches!(dtype, DType::BF16 | DType::F16)
 }

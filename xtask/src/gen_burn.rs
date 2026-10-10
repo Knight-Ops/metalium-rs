@@ -23,20 +23,13 @@ const TRAITS: &[(&str, &str)] = &[
     ("TransactionOps", "ops/transaction.rs"),
 ];
 
-mod overrides;
-
-/// Every override list: the base list below, then one list per work lane in
-/// `gen_burn/overrides/`. A trait may appear in several lists; a method may not.
-/// Lanes edit only their own file, so concurrent branches never conflict here.
-pub fn overridden() -> Vec<(&'static str, &'static [&'static str])> {
-    std::iter::once(OVERRIDDEN)
-        .chain(overrides::LANES.iter().map(|(_, list)| *list))
-        .flat_map(|list| list.iter().copied())
-        .collect()
+/// The override list: every method implemented by hand in `burn-tt/src/ops.rs`.
+pub fn overridden() -> &'static [(&'static str, &'static [&'static str])] {
+    OVERRIDDEN
 }
 
 /// The names `overridden` lists for one trait.
-fn hand_methods<'a>(overridden: &[(&str, &'a [&'a str])], tr: &str) -> Vec<&'a str> {
+pub(crate) fn hand_methods<'a>(overridden: &[(&str, &'a [&'a str])], tr: &str) -> Vec<&'a str> {
     overridden
         .iter()
         .filter(|(t, _)| *t == tr)
@@ -142,6 +135,18 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_atan2",
             "float_asin",
             "float_acos",
+            "float_gather_nd",
+            "float_scatter_nd",
+            "float_cross",
+            "float_cummin",
+            "float_cummax",
+            "float_remainder",
+            "float_remainder_scalar",
+            "float_sort",
+            "float_sort_with_indices",
+            "float_argsort",
+            "float_argtopk",
+            "float_topk",
         ],
     ),
     (
@@ -202,6 +207,27 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "int_select",
             "int_swap_dims",
             "int_transpose",
+            "int_abs",
+            "int_cast",
+            "int_flip",
+            "int_mask_fill",
+            "int_mask_where",
+            "int_permute",
+            "int_unfold",
+            "int_gather_nd",
+            "int_scatter_nd",
+            "int_matmul",
+            "int_cumsum",
+            "int_cumprod",
+            "int_cummin",
+            "int_cummax",
+            "int_argmax",
+            "int_argmin",
+            "int_sort",
+            "int_sort_with_indices",
+            "int_argsort",
+            "int_argtopk",
+            "int_topk",
         ],
     ),
     (
@@ -237,6 +263,11 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "bool_expand",
             "bool_into_float",
             "bool_into_int",
+            "bool_flip",
+            "bool_mask_fill",
+            "bool_mask_where",
+            "bool_permute",
+            "bool_unfold",
         ],
     ),
     (
@@ -403,18 +434,13 @@ const PLACEHOLDERS: &[&str] = &[
 
 pub fn generate(check_only: bool) -> Result<(), String> {
     let root = workspace_root();
-    let src = crate_source(&root, "burn-backend")?;
-    let mut traits = Vec::new();
-    for (name, file) in TRAITS {
-        let path = src.join("src/backend").join(file);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let methods = parse_trait(&text, name)?;
-        traits.push((*name, selected(name, methods)));
-    }
     let overridden = overridden();
-    check_overridden(&traits, &overridden)?;
-    let rendered = render(&traits, &overridden)?;
+    let traits: Vec<_> = all_trait_methods()?
+        .into_iter()
+        .map(|(name, methods)| (name, selected(name, methods)))
+        .collect();
+    check_overridden(&traits, overridden)?;
+    let rendered = render(&traits, overridden)?;
     let generated = rustfmt(&rendered, &root)?;
     let dest = root.join("crates/burn-tt/src/generated/ops.rs");
     if check_only {
@@ -444,7 +470,7 @@ pub fn generate(check_only: bool) -> Result<(), String> {
 /// Emit required methods, native overrides, and defaults that are only
 /// unsupported placeholders in Burn. Other defaults compose our primitives.
 pub fn selected(tr: &str, methods: Vec<Method>) -> Vec<Method> {
-    let hand = hand_methods(&overridden(), tr);
+    let hand = hand_methods(overridden(), tr);
     methods
         .into_iter()
         .filter(|m| !m.defaulted || hand.contains(&m.name.as_str()) || is_placeholder(&m.name))
@@ -1097,7 +1123,7 @@ pub trait FloatTensorOps<B: Backend> {
     }
 
     #[test]
-    fn a_trait_may_repeat_across_lane_lists_but_a_method_may_not() {
+    fn a_trait_may_repeat_across_lists_but_a_method_may_not() {
         let m = parse_trait(SAMPLE, "FloatTensorOps").unwrap();
         let traits = [("FloatTensorOps", m)];
         let split = [

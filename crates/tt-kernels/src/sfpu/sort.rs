@@ -1,5 +1,4 @@
-//! Device sort along an axis, stable and deterministic (hardware-coverage
-//! close-out lane T5).
+//! Device sort along an axis, stable and deterministic (`hardware-coverage.md` R1).
 //!
 //! # Contract
 //!

@@ -24,6 +24,13 @@ on-tile and chip-to-chip data movers. Shippable; depends on `tt-isa`, `tt-device
 | `datapath` | Unpacker/packer configuration for flat FP32 runs; thread state reset. |
 | `link` | `Link`, `Mover`, `discover`: chip-to-chip moves over Ethernet with the `eth_e1` image. |
 | `shard` | `Fabric`, `Chip`: a matmul split along `N` across cabled chips, bit-identical to one chip. |
+| `sfpu` | SFPU program builders and the interpreter (`sfpu::interp`): element-wise `ops` (including exact `rem`), `scan`, `reduce`, `round`, device `sort`, `approx` (`MathMode::{Precise, Approx}`), and the `SFPLOADMACRO` schedule model `macro_sched`. |
+| `fp16` | `Fp16Tensor`: IEEE binary16 in BF16's two-byte slots, with exact SFPU casts to and from F32 and the packer's own conversion kept only as a measurement. |
+| `prng` | Seeded random on the device: the host model of the hardware stream, the tile kernels and `Session::random_*`. |
+| `atomics` | The guarded runner for mutexes and L1 atomics: bounded deadline, blocked status and host release. |
+| `mesh_trace` | Capture and replay of a trace across chips, with the Ethernet transfers replayed in capture order. |
+
+A feature module adds its own `impl Session` block (`fp16`, `prng`, `mesh_trace`, `sfpu::sort`); `session.rs` keeps the core bring-up and the BF16 methods.
 
 ## Many tiles
 

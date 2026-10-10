@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod bench;
 pub mod burn_device;
+pub mod data;
 pub mod harness;
 pub mod mnist;
 #[cfg(not(feature = "silicon"))]

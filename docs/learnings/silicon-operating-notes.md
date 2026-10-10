@@ -772,7 +772,7 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   a one-row move naming an odd `AddrMod` entry (instruction bit 14 set, eight-row bit clear) writes a
   four-row aligned block on its own first move, for `MOVA2D` and `MOVDBGA2D` alike and whatever the
   entry's increments; the increments then apply as modelled (entry *k* = SrcA +*k*, Dst +7-*k* in the
-  sweep), so a one-row move that must write one row names an even entry (step111b). `GATESRCRST` executes safely but has no
+  sweep), so a one-row move that must write one row names an even entry (`probe_addr_mod_sweep`). `GATESRCRST` executes safely but has no
   observable effect against a SrcB rewritten through `MOVD2B`.
 - **NoC.** All 21 NoC atomic forms (variable-width increment, CAS, mask and indexed swaps, eight
   Zaamo ops, six accumulate formats) match the page models against a neighbouring tile's L1. The
@@ -785,3 +785,21 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   cards); the seed directive in the role firmware (RISC-V store, fence, 512 NOPs) reproduces the
   model bit for bit under T0 unpack and T2 pack concurrency.
 - **Release baselines** for K-blocking and the norm compositions are in `firmware-performance.md`.
+
+## Handling silicon runs
+
+Rules that held through the Phase 10 close-out; follow them for any new probe.
+
+- **Risk order.** Documented behaviour first, then measured, then UNVERIFIED or Wormhole-only
+  encodings (always an isolated minimal probe first, after a ttsim pass or a recorded refusal), then
+  the NoC-hang class (one probe per session, nothing queued behind it). Keep a known-good gate between
+  risky probes.
+- **A hang is fixed in the API, never retried.** A probe that wedges a core or the NoC becomes a checked
+  refusal or a `[-]` with the evidence, not a retry loop.
+- **Run silicon one test per process** through `cargo xtask silicon`; agents that edit code do not run
+  it concurrently with another run, because a gate that aborts with a parked thread wedges the tile
+  until the next session reset.
+- **Do not wait on a process with `until ! pgrep -f <pattern>`.** The loop's own command line matches
+  the pattern, so it never ends and leaks shells; wait on the run's log or exit status instead.
+- **A worktree needs `vendor/`.** It is git-ignored, so copy it from the main checkout before building
+  there (`cargo xtask fetch-ttsim`/`fetch-spec` also work).

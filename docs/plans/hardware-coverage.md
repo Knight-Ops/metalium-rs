@@ -1,6 +1,6 @@
 # Hardware coverage — Phase 10 tracker
 
-**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition, the open items (NoC multicast and MMIO silicon probes, X6) and the verification record. [Burn operation status](burn-op-coverage.md) is generated.
+**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md) "Final state" for each lane's disposition and the verification record. The open items are listed under "Where things stand". NoC multicast, the MMIO trio and X6 ran on silicon on 2026-10-10. [Burn operation status](burn-op-coverage.md) is generated.
 
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
@@ -38,7 +38,20 @@ reason given.
 
 ---
 
-## Where things stand (2026-10-05, 10.3–10.5 in progress)
+## Where things stand
+
+**As of 2026-10-10 every row in this plan is `[x]` or a documented `[-]`, except X7's small-transfer latency (`[~]`).** The prose below is the 2026-10-05 snapshot, kept as history; current status is in each row and in [hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md).
+
+**Still open:**
+1. Mesh training traces and `copy_into` on a mesh (mesh trace capture and replay of inference work, R4d).
+2. Both-card runs of the lanes validated on card 0 only, including the cummin/cummax gates (`step130`).
+3. X7: small-transfer latency (`[~]`).
+4. FP16: `step143`'s `measured::SILICON` constants, to be filled from the recorded `T7-MEASURE` lines
+   (the packer behaviour itself is recorded in the silicon operating notes).
+5. `probe_addr_mod_sweep` and the long-axis and residency sort gates (now modules of `step136_burn_sort`) keep
+   their earlier step numbers in the evidence cited above.
+
+### 2026-10-05 snapshot (10.3–10.5 in progress)
 
 Milestones 10.0–10.2 are complete. Since their close-out, rank-N storage and
 strided views, tile-aligned batched matmul, last-dimension reductions and some
@@ -85,7 +98,8 @@ scans and norm compositions are also gated. The payload-preserving transpose is 
 
 **Remaining after the 2026-10-10 close-out:** convolution, attention, ND indexing and the integer
 operations are native; the open items are listed in
-[hardware-coverage-closeout.md](hardware-coverage-closeout.md) ("Still open"). Backend
+[hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md) ("Still open" is
+carried above). Backend
 error/setup/conformance work is tracked separately as B1/B2/B10. X280 dispatch remains proposed and
 unscheduled.
 
@@ -354,7 +368,7 @@ Reference: WH `UNPACR_Regular.md` (conditionalized, authoritative), WH `Unpacker
 | BF16 into `Dst` (`UnpackToDst` on silicon; ttsim refuses, row 31) | `[x]` widened readback over ~4096 sign/exponent/mantissa patterns on card 0 (step114) | D1 |
 | Packer output format conversion (FP32 `Dst` → BF16/FP16 L1) | `[x]` BF16 native ties-even late narrowing (step74); FP16: the raw packer truncates and saturates (matches ttsim), the rounding packer is ties-even for normals and overflows to infinity at 65520 but drops NaN payloads and flushes subnormals (`T7-MEASURE`, card 0), so shipped FP16 casts use exact SFPU programs instead (step143/144); the 16-bit Dst read path preserves normals only (zero/subnormal/NaN collapse, step114) | D1 |
 | BFP8/BFP4/BFP2 storage, exponent sharing, `CLREXPHIST` | `[x]` -- step92–96; histogram reset and BFP2 packed matmul are silicon-only where ttsim refuses | D2 (delivered formats) |
-| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[~]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 with D2 | D3, D2 |
+| Integer formats (INT32 code 8 measured; INT8/UINT8 not) | `[x]` 32-bit integers and bools stored as raw bits through the FP32-coded path (D3); INT8/UINT8 `[-]` (D3b: nothing would use an 8-bit device format) | D3, D3b |
 | Unpacker transpose / tilize modes, broadcast | tilize `[x]` payload-preserving strided gather (step113, card 0); transpose swaps the nibbles correctly but goes through SrcA and is not payload-preserving (`[-]` for M3); no unpacker broadcast mode exists | M3, D5 |
 | Packer ReLU and edge masking, `PACR_SETREG` | ReLU `[x]` (all seven modes against a raw-bit model, card 0) and edge masking `[x]` for the row-set path, partial columns, -inf fill and edge-then-ReLU order (step112); `PACR_SETREG` `[-]`; not routed into Session/Burn ops | S1 (opportunistic), D4 |
 
@@ -370,7 +384,7 @@ Reference: WH `REPLAY.md`, BH `MOPExpander.md`, WH `MOP.md`/`MOP_CFG.md`, BH
 | Debug timestamper event stream | -- | x (`tt_device::trace`, `tt_kernels::profile`) | x mover and role events | `-` row 54 | x | X3 |
 | Op-list traces (a step's records kept in GDDR, replayed) | -- | x (`tt_kernels::trace`) | x | x | x both | X4 |
 | `.ttinsn` fusion (four pushes per cycle) | -- | `[-]` | | | | `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate; SFPU math programs are push-bound (39 of 73 kinds, median push/backend cycle ratio 1.17, max 2.87) and shrink through replay and `SFPLOADMACRO` schedules instead (P9, step121) |
-| Hazards as data, the wait planner | -- | `[~]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
+| Hazards as data, the wait planner | -- | `[-]` `tt_isa::hazard` table and checker (instruction block bits compared with `STALLWAIT.md`) | x over 954 builder role programs | | | checker `[x]`: 0 missing waits and 1,724 redundant waits (0.15% of backend words); a planner has nothing to insert `[-]` (P9, step121) |
 | Three-thread pipelining, double buffering | -- | | x (resident T0/T1/T2 roles, `LAUNCH`/`KERNEL_WAIT`, `enable_dram`) | x | x both | checklist 9.8 |
 
 ### Scalar unit, mover, atomics, NoC
@@ -380,7 +394,7 @@ Pulled in only when a kernel needs them; each says which.
 | Feature | Spec | State | Wanted by |
 |---|---|---|---|
 | ThCon `SETDMAREG`, `ADDDMAREG`.., `LOADIND`/`STOREIND`, `FLUSHDMA` | WH `ScalarUnit.md` + pages | `SETDMAREG` stages config; `ADDDMAREG` steps matmul addresses (step38); scalar ALU/config readback done (step100); L1 transfers step101/102 `[x]`; `FLUSHDMA` `[-]`, use STALLWAIT | F3 (per-tile parameters without reprogramming) |
-| Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[ ]` | 9.8 page FIFO, if counters move into Tensix |
+| Tensix atomics `ATCAS`, `ATINCGET`, `ATINCGETPTR`, `ATSWAP` | WH | `[x]` four-register `ATSWAP`; single-register form `[-]` | step106, card 0; 9.8 page FIFO |
 | `XMOV` (Tensix mover, L1 → L1) | WH `XMOV.md` | `[x]` step101/102, explicit copy/zero | D4 (copies without the B core) |
 | NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[x]` typed rectangle from the ARC-discovered grid, write-only encoder with `PATH_RESERVE`, acknowledgement counting against the known recipients, independent model (`tt_isa::noc::multicast`, step115); ttsim executes it fully (8 gates); on cards 0 and 1 the 1x2, 2x2/3x3 and full-grid probes (run one at a time, tile health checked between) deliver the payload to exactly the rectangle with guards unchanged and the one-column-wider mutant caught (2026-10-10); `NOC_BRCST_EXCLUDE` is written 0 and the VC class (buddy 0) is the choice that worked, not a documented layout | weight broadcast to many tiles (9.6 follow-up) |
 | NoC atomics | BH `NoC/Atomics.md` | `[x]` typed L1-only requests (variable-width increment, compare-and-swap, mask and indexed swap, eight Zaamo ops, six accumulate formats; `tt_isa::noc::atomic`) with independent decode-from-bits models; all 21 forms and both model mutants pass on card 0 (step116, neighbour tile, one process each); ttsim executes only the full-width increment (rows 88) | R1 across tiles |
@@ -402,16 +416,17 @@ Pulled in only when a kernel needs them; each says which.
 ### Tensix coprocessor instruction implementation checklist
 
 Remaining-work review (2026-10-07):
-[remaining-firmware-instructions.md](remaining-firmware-instructions.md)
+[remaining-firmware-instructions.md](../completed-plans/remaining-firmware-instructions.md)
 accounts for every pending mnemonic group, distinguishes existing encoding/probe
 evidence from missing helpers and semantic gates, and sequences implementation
 with explicit research/defer dispositions for unsupported forms. The latest completed tranche
 is [Stage D explicit healthy-bank handover](../completed-plans/explicit-unpacker-handover.md)
 (step104), following step100–103.
 
-Mnemonic-level instruction inventory: 92 completed checklist rows (`[x]`),
-16 pending rows (`[ ]`), and six deliberately omitted groups (`[-]`,
-`RMWCIB0..3`, `DOTPV`, `SHIFTXA`, `SETDVALID`, `REG2FLOP_ADC`, `FLUSHDMA`).
+Mnemonic-level instruction inventory (counted 2026-10-10): 102 completed checklist rows (`[x]`),
+no pending rows, and 11 `[-]` rows (`DOTPV`, `SHIFTXA`, `GATESRCRST`, `SETDVALID`, `REG2FLOP_ADC`,
+`UNPACR_NOP_SETREG`, `PACR_SETREG`, `STREAMWAIT`, `STREAMWRCFG`, `RMWCIB0..3`, `FLUSHDMA`). The
+single-register `ATSWAP` form and the L1 tag search accelerator are `[-]` too (see the `ATSWAP` row and the inventory table).
 These are grouped mnemonic rows, not a count of generated
 encodings: generated tables also contain variants and superseded Wormhole
 layouts. The earlier 68/47/4 totals were stale, and SETDMAREG was missing here.
@@ -442,7 +457,7 @@ ADDDMAREG already drives matmul address stepping (step38), and the delivered LUT
 forms already have helpers/models/device gates (step26); broader LUT adoption
 remains S10. Step98 adds INCADCXY/ADDRCRXY helpers and an explicit ADC rectangle-copy
 kernel. Burn slices retain original native repack after the ADC performance
-comparison; automatic ADC adoption is deferred. See [the tranche checklist](adc-row-window-copy.md).
+comparison; automatic ADC adoption is deferred. See [the tranche checklist](../completed-plans/adc-row-window-copy.md).
 
 Step98 acceptance (2026-10-06): simulator 9/9; card-0 full release SMOKE
 203/203 (`1791321817`), including nine ADC gates and the CNN state-lifetime
@@ -465,7 +480,7 @@ copies pass under both ownership settings; changed-input traces, deferred frees
 and downstream reduction/matmul pass. Workspace tests/lints, silicon compilation,
 generator/shipping checks and all eight MNIST regressions pass, golden unchanged.
 Burn routing is inapplicable to this Session-only API. See
-[the Z/W tranche checklist](adc-plane-copy.md) and the performance record for
+[the Z/W tranche checklist](../completed-plans/adc-plane-copy.md) and the performance record for
 validated native-repack medians. No speedup or additional instruction adoption
 is claimed. At step99 close-out, the pending group counts were 7 matrix/source, 1 SFPU,
 6 unpacker/packer, 2 frontend, 2 configuration and 19 DMA/register/atomic rows;
@@ -490,7 +505,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
-- [x] `MOVDBGA2D`: checked `tt_isa::matrix_debug` helpers (bank ownership, 1/8-row forms, format override) and an independent page model; on card 0 (step111) the eight-row 0->0 and 8->8, one-row 3->5, all four SrcA format overrides (each forced to TF32 under Fp32), flush, data mutants and reading a bank the unpacker still owns all agree with the model; ttsim refuses every form (extends row 50). The increment-1 `AddrMod` cases, which first disagreed for `MOVA2D` as well, are explained and pass: **a one-row move whose instruction bit 14 (the low bit of the `AddrMod` entry number) is set, with the eight-row bit clear, writes a four-row aligned block** (`DstRow & ~3`, `SrcRow & ~3`) on its own first move, whatever the entry's increments (an entry with both increments zero still does it); the entry's increments then apply after the move exactly as modelled, and entry *k* advancing SrcA by *k* and Dst by 7-*k* confirms the entry numbering (step111b sweeps, card 0). A one-row move that must write one row names an even entry (0, 2, 4, 6). 16-bit Dst forms are model-only.
+- [x] `MOVDBGA2D`: checked `tt_isa::matrix::debug` helpers (bank ownership, 1/8-row forms, format override) and an independent page model; on card 0 (step111) the eight-row 0->0 and 8->8, one-row 3->5, all four SrcA format overrides (each forced to TF32 under Fp32), flush, data mutants and reading a bank the unpacker still owns all agree with the model; ttsim refuses every form (extends row 50). The increment-1 `AddrMod` cases, which first disagreed for `MOVA2D` as well, are explained and pass: **a one-row move whose instruction bit 14 (the low bit of the `AddrMod` entry number) is set, with the eight-row bit clear, writes a four-row aligned block** (`DstRow & ~3`, `SrcRow & ~3`) on its own first move, whatever the entry's increments (an entry with both increments zero still does it); the entry's increments then apply after the move exactly as modelled, and entry *k* advancing SrcA by *k* and Dst by 7-*k* confirms the entry numbering (`probe_addr_mod_sweep`, card 0). A one-row move that must write one row names an even entry (0, 2, 4, 6). 16-bit Dst forms are model-only.
 - [x] `ZEROSRC`: checked A/B/both current-unpacker and current-matrix banks; ownership/staged claims, all 64 rows and opposite-bank sentinels pass step103, card 0 (`1791397029`). Matrix-bank forms run on ttsim; unpacker-bank forms refuse. Negative-infinity and both-physical-bank forms remain deferred.
 - [x] `CLEARDVALID`: checked separate/both Loaded → Empty releases, Reset=0 and KeepReadingSameSrc=0; step103 simulator/card-0 (`1791397029`) alternating-bank and downstream reuse gates. Reset stays excluded; retained-bank reading needs a separate state model.
 - [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
@@ -531,7 +546,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `SFPCONFIG`: Configure SFPU constant registers (`LReg[11..15]`).
 - [x] `SFPSTOCHRND`: Hardware nearest, stochastic, and toward-zero rounding (validated in `step81`).
 - [x] `SFPNOP`: Vector unit pipeline no-op.
-- [x] `SFPLOADMACRO`: checked `tt_isa::sfpu_macro` helpers (SFPCONFIG macro registers, program-key descriptor, teardown) and an independent page-derived schedule model (`tt_kernels::sfpu::macro_sched`); silicon probes s00-s13 pass on card 0 (Store, MAD, Simple, Round, `LReg16`, substituted operands, chain, pipelining, predication, forgetting, `SFPSWAP` in the Simple sub-unit; swapped template/delay mutants differ). ttsim refuses the macro (row 7). Step110. Item S9; performance adoption not claimed.
+- [x] `SFPLOADMACRO`: checked `tt_isa::sfpu::load_macro` helpers (SFPCONFIG macro registers, program-key descriptor, teardown) and an independent page-derived schedule model (`tt_kernels::sfpu::macro_sched`); silicon probes s00-s13 pass on card 0 (Store, MAD, Simple, Round, `LReg16`, substituted operands, chain, pipelining, predication, forgetting, `SFPSWAP` in the Simple sub-unit; swapped template/delay mutants differ). ttsim refuses the macro (row 7). Step110. Item S9; performance adoption not claimed.
 - [x] `SFPDIVP2`: `Program::scale_by_pow2`, interpreter/device gate step26; wrapping immediates separately gated on both cards (divergence 66).
 - [x] `SFPSWAP`: `Program::min_max`, step26 interpreter/device comparisons and production reductions. Argmin/argmax variants are separate scope.
 - [x] `SFPADDI`: `Program::addi`, BF16-immediate interpreter/device comparison in step26.
@@ -576,9 +591,8 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `RMWCIB0..3`: Read-Modify-Write Configuration Immediate Byte (`libttsim_bh.so` has no handler; whole-word `WRCFG` used instead).
 
 #### DMA Engine, Atomics & Registers
-- [x] `ATCAS`: checked 4-bit compare/set (`tt_isa::l1_atomic`); compare already met, blocked-until-the-host-writes-the-word and blocked-until-the-other-role's-RISC-V-core-pokes-it pass on card 0 under a guarded run with a measured-rate deadline (step106). **A Tensix thread cannot be the producer:** a thread parked in `ATCAS`/`ATINCGETPTR` keeps every other thread from issuing any Scalar Unit instruction (confirmed on card 0, `blocked_atomic_monopolizes_the_scalar_unit`), so only the host or a RISC-V core can free it. WormholeOnly encoding; ttsim refuses it (row 77).
+- [x] `ATCAS`: checked 4-bit compare/set (`tt_isa::scalar::atomic`); compare already met, blocked-until-the-host-writes-the-word and blocked-until-the-other-role's-RISC-V-core-pokes-it pass on card 0 under a guarded run with a measured-rate deadline (step106). **A Tensix thread cannot be the producer:** a thread parked in `ATCAS`/`ATINCGETPTR` keeps every other thread from issuing any Scalar Unit instruction (confirmed on card 0, `blocked_atomic_monopolizes_the_scalar_unit`), so only the host or a RISC-V core can free it. WormholeOnly encoding; ttsim refuses it (row 77).
 - [x] `ATGETM` / `ATRELM`: typed `Mutex` (indices 0, 2, 3, 4 only), scoped acquire/release; uncontended on all indices and threads, contended round-robin handoff for every mutex and holder, the deadline/host-release path and negative controls pass on card 0 (step105). ttsim models only index 0 (row 76).
-- [ ] `ATRELM`: Atomic mutex release.
 - [x] `ATSWAP`: four-GPR group form, all 256 masks and aligned bases on card 0 (step106); the single-register form is `[-]` (lane placement matches neither the page nor a consistent rule; the sweep diagnostic is the evidence) and is unrepresentable in the API.
 - [x] `ATINCGET`: field width 1-32, wrapping, upper bits preserved, atomic across the three threads on card 0 (step106); WormholeOnly encoding, ttsim refuses it.
 - [x] `ATINCGETPTR`: checked geometry, independent FIFO model; the FIFO through wraps and the blocking pop (write counter poked) and push (read counter poked) gates pass on card 0 (step106). Same Scalar Unit rule as `ATCAS`; WormholeOnly encoding; ttsim refuses it.
@@ -592,7 +606,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [-] `FLUSHDMA`: occupies the shared Scalar Unit while waiting; pinned page prefers `STALLWAIT` with equivalent C0–C3 conditions and all block bits. Excluded from production support in favor of the existing barrier; not a claim that every possible use is strictly worse.
 - [x] `LOADIND`: checked widths/offset halves/increments, asynchronous read barriers and raw-bit preservation (step101, card 0).
 - [x] `STOREIND_L1`: checked L1 stores; measured Blackhole width mapping and all-thread guard gates (step101).
-- [x] `STOREIND_MMIO`: allowlisted `SW_INT_PC[28..31]` PIC words only (`tt_isa::mmio_reg`), STOREIND's shifted offset modelled separately; the isolated probe, offsets/increments/halves/threads gate and the wrong-shift control pass on card 0 (2026-10-10, no reboot); ttsim refuses every form.
+- [x] `STOREIND_MMIO`: allowlisted `SW_INT_PC[28..31]` PIC words only (`tt_isa::scalar::mmio`), STOREIND's shifted offset modelled separately; the isolated probe, offsets/increments/halves/threads gate and the wrong-shift control pass on card 0 (2026-10-10, no reboot); ttsim refuses every form.
 - [x] `LOADREG`: allowlisted PIC scratch words only; the isolated probe and the host-staged-values gate pass on card 0 (step107).
 - [x] `STOREREG`: allowlisted PIC scratch words only; the isolated probe and the store-then-read-back gate (all targets, all threads) pass on card 0 (step107).
 - [x] `XMOV`: checked declared L1 copy/zero, C12 setup/C9 completion and explicit resident APIs (step101/102). Item D4.
@@ -658,7 +672,7 @@ reverse index.
           the same counted sum, and the lowered is under a quarter of the words
           (watched failing: one `MOP` dropped, short by exactly its five
           iterations). ttsim and both cards: a `MOP` looping a `REPLAY` on silicon.
-    - [~] **The matmul in loops** (`matmul::matmul_items`, lowered by
+    - [x] **The matmul in loops** (`matmul::matmul_items`, lowered by
           `loops::lower_with`):
       - [x] Faces in the order `fi`, `k`, `fj`: each `Dst` face still takes its
             `k = 0` product before its `k = 1` within a pair, so every datum
@@ -1675,7 +1689,7 @@ path today, `~` when only some shapes do.
 | `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
 | `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
 | `float_cummin`, `float_cummax` | x resident Flex-order scans (NaN propagates, earlier equal element kept); both-card gates pending, card 0 passes (step130) | R1 |
-| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk`, and the `int_` equivalents | x resident bitonic sort, F32/I32, any rank and axis up to 1024, stable (ties by original index), F32 in `total_cmp` order, trace-replayable; BF16 values widen, sort and narrow (flushing BF16 subnormals); longer axes, other dtypes and empty inputs refused by name; card 0 (step135-139, runs `1791561979`-`1791567677`) | R1 (T5) |
+| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk`, and the `int_` equivalents | x resident bitonic sort, F32/I32, any rank and axis up to 1024, stable (ties by original index), F32 in `total_cmp` order, trace-replayable; BF16 values widen, sort and narrow (flushing BF16 subnormals); longer axes, other dtypes and empty inputs refused by name; card 0 (step135 and step136, runs `1791561979`-`1791567677`) | R1 (T5) |
 | `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
 | `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
 | `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |

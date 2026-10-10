@@ -1,4 +1,4 @@
-//! Lane T8 gate (S10) through Burn: `TtDevice::set_math_mode`.
+//! Gate (S10) through Burn: `TtDevice::set_math_mode`.
 //!
 //! `burn_tt::TtDevice::set_math_mode(MathMode::Approx)` makes `exp`, `log`,
 //! `recip`, `sigmoid`, `tanh` and `gelu` run the fast programs
@@ -28,6 +28,7 @@ use tt_kernels::sfpu::approx::{
 };
 use tt_kernels::sfpu::ops::{kind_sfpu, reference};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
+use tt_tests::data::lcg;
 
 type T2 = Tensor<TtBackend, 2>;
 
@@ -110,13 +111,6 @@ const OPS: [Op; 6] = [
         },
     },
 ];
-
-fn lcg(s: &mut u64) -> u64 {
-    *s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *s >> 33
-}
 
 /// `n` finite inputs of `op`'s range (a log-uniform draw for the positive ops).
 fn inputs(op: &Op, seed: u64, n: usize) -> Vec<f32> {

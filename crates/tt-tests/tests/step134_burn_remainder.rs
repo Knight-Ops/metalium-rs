@@ -1,4 +1,4 @@
-//! Lane T4 gate, Burn level: `float_remainder` and `float_remainder_scalar`
+//! Gate, Burn level: `float_remainder` and `float_remainder_scalar`
 //! are `burn-flex`'s `((a % b) + b) % b` bit for bit, native on the device.
 //!
 //! Against Flex itself (the external oracle; the kernel-level oracles are in
@@ -16,16 +16,7 @@ use burn::tensor::{Tensor, TensorData, TensorPrimitive};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, InputPayload, TracedInference, TtBackend};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
-
-fn xorshift(seed: u64) -> impl FnMut() -> u64 {
-    let mut s = seed | 1;
-    move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    }
-}
+use tt_tests::data::xorshift;
 
 /// Bits from every region the algorithm treats differently.
 fn corpus(seed: u64, n: usize) -> Vec<f32> {

@@ -6,15 +6,15 @@
 //! (`WormholeB0/TensixTile/TensixCoprocessor/AT{CAS,SWAP,INCGET,INCGETPTR}.md`),
 //! the generated layouts are `WormholeOnly`, and ttsim refuses all four
 //! (divergence row 77), so nothing below is evidence until the silicon gates
-//! have run. The silicon request order is in `docs/plans/hardware-coverage-closeout.md`:
+//! have run. The silicon request order is in `docs/completed-plans/hardware-coverage-closeout.md`:
 //! `ATINCGET`, `ATSWAP`, `ATCAS` with its compare already met, then the blocking
 //! forms with a producer on another thread and the deadline active.
 //!
 //! The models below are written from the page text and share nothing with
-//! `tt_isa::l1_atomic`.
+//! `tt_isa::scalar::atomic`.
 #[cfg(feature = "silicon")]
-use tt_isa::l1_atomic::Region16;
-use tt_isa::{backend, isa::Instruction, l1_atomic as atomic};
+use tt_isa::scalar::atomic::Region16;
+use tt_isa::{backend, isa::Instruction, scalar::atomic};
 #[cfg(feature = "silicon")]
 use tt_isa::{backend::Before, sync};
 use tt_tests::harness;
@@ -700,7 +700,7 @@ mod silicon_gates {
 
     /// DIAGNOSTIC, asserts nothing. **This is the recorded evidence for the
     /// `[-]` exclusion of `ATSWAP`'s single-register form**: the checked API
-    /// (`tt_isa::l1_atomic::masked_store`) offers only the four-GPR form, and
+    /// (`tt_isa::scalar::atomic::masked_store`) offers only the four-GPR form, and
     /// the single form is built here through the raw generated encoder
     /// (`SingleDataReg` = 1) alone.
     ///
@@ -713,7 +713,7 @@ mod silicon_gates {
     /// Wormhole page puts `GPR8.lo`; registers 9 and 10 touched halfwords 4 and
     /// 5 only; 11 halfwords 6 and 7; 16 only halfword 1; 17 and 18 halfwords 0
     /// and 1; 19 halfword 0 plus 2 and 3), while the four-GPR form matched the
-    /// page for all 256 masks. See the run ids in the lane report.
+    /// page for all 256 masks. See the run ids in the close-out record.
     #[test]
     fn atswap_single_form_sweep_diagnostic() {
         harness::in_device(|dev| {
@@ -920,10 +920,10 @@ mod silicon_gates {
         }
     }
 
-    /// [`harness::in_device`] whose failure names the gate. `in_device` runs a
-    /// plain role reset (`harness::run`, a 1 s floor, no unwedge) before the
-    /// body, so a tile an earlier run left with a parked Tensix thread fails
-    /// *there* with a bare role timeout; the label says which gate was starting.
+    /// [`harness::in_device`] whose failure names the gate. `in_device` resets
+    /// the tile and the gate thread's Tensix state (the session's reset, which first
+    /// releases a thread an earlier run left parked) before the body, so a failure
+    /// there is named by the label as the gate that was starting.
     fn labelled(label: &str, f: impl FnOnce(&mut harness::Dev<'_>)) {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness::in_device(f)));

@@ -12,7 +12,7 @@ fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute(
     assert!(float.contains(DTypeUsage::Arithmetic) && float.contains(DTypeUsage::Accelerated));
     let int = TtBackend::dtype_usage(&d, DType::I32);
     assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
-    // F16 is raw storage with exact device casts, not compute (lane T7).
+    // F16 is raw storage with exact device casts, not compute.
     let half = TtBackend::dtype_usage(&d, DType::F16);
     assert!(
         half.contains(DTypeUsage::Storage)

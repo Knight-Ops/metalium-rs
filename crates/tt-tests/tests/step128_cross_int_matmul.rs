@@ -1,4 +1,4 @@
-//! `float_cross` and `int_matmul` on the device (lane T2).
+//! `float_cross` and `int_matmul` on the device.
 //!
 //! # `float_cross`
 //!
@@ -25,13 +25,7 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, InputPayload, TileChoice, TracedInference, TtBackend, TtDevice};
 use tt_isa::numerics;
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
-
-fn lcg(s: &mut u64) -> u64 {
-    *s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *s >> 33
-}
+use tt_tests::data::{float_data, lcg, panic_message};
 
 fn assert_resident(report: &burn_tt::Report, name: &str) {
     assert_native_model(report);
@@ -54,15 +48,6 @@ fn assert_parts_on_device(report: &burn_tt::Report, parts: &[&str]) {
         assert!(op.on_device > 0, "{part} did no device work");
         assert_eq!((op.downloads, op.staged, op.on_host), (0, 0, 0), "{part}");
     }
-}
-
-fn panic_message(f: impl FnOnce()) -> String {
-    let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .expect_err("the operation must refuse");
-    e.downcast_ref::<String>()
-        .cloned()
-        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- cross
@@ -101,10 +86,6 @@ fn words(n: usize, seed: u64, specials: bool) -> Vec<u32> {
             }
         })
         .collect()
-}
-
-fn float_data(bits: &[u32]) -> Vec<f32> {
-    bits.iter().map(|&b| f32::from_bits(b)).collect()
 }
 
 fn read_bits<B: burn::tensor::backend::Backend, const D: usize>(t: Tensor<B, D>) -> Vec<u32> {

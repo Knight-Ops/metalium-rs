@@ -48,7 +48,7 @@ columns across the fabric, moving tile slots over Ethernet, directly or through
 relay tiles. Other primitives and full reductions run on chip 0, retaining
 intermediates on the device. Batched matmuls also partition products across cards; convolution and attention
 reuse this path, including backward products. Elementwise work and reductions
-remain on chip 0. Distributed trace capture is unsupported.
+remain on chip 0. Mesh trace capture and changed-input replay of inference work (`step147`); mesh training traces and `copy_into` on a mesh are unsupported.
 The two-chip and four-chip MLP gates match the native single-chip golden and
 reject intermediate host transfers and staged computation.
 
@@ -174,7 +174,7 @@ operations include conversion, wrapping arithmetic, bitwise ops, signed
 comparisons, shifts, wrapping sum/product and signed min/max reductions.
 Checked integer division/remainder and integer mean are native and simulator-gated;
 zero divisors report device DOMAIN errors. Card-0 silicon gates pass (`1791232718`).
-F16, other integers and quantized tensors are unsupported.
+F16 is storage with exact device casts and no arithmetic; other integers and quantized tensors are unsupported.
 
 BF16 uses 2112-byte physical slots with two-byte datums. Raw upload/download,
 views and layout copies preserve payloads. Device casts round ties-even, quiet
@@ -209,7 +209,7 @@ storage extension documented below. The `a` variants remain deferred. See
 ## Environment variables
 
 Every variable the workspace reads, by who reads it. burn-tt's own switches
-(`TT_PIPELINE`, `TT_HOST_DMA`, `TT_TILIZE`, `TT_TOPOLOGY`, `TT_TILES`) refuse a
+(`TT_PIPELINE`, `TT_HOST_DMA`, `TT_TILIZE`, `TT_TOPOLOGY`, `TT_TILES`, `TT_MATH`) refuse a
 value they do not accept, with an error naming it; `TT_BATCH` treats anything but
 `0` as on, and `TT_SILICON_DEVICE` an
 unparsable value as `0`.
@@ -223,6 +223,7 @@ unparsable value as `0`.
 | `TT_SCATTER` | must be unset | Retired: NC owns compute-region output writes on NoC1, even with `TT_PIPELINE=0`. Set, it is refused with migration guidance. |
 | `TT_HOST_DMA` | `1`, `0` | Tensors cross PCIe by the card's own DMA through a pinned 1 GiB hugepage (`Session::set_host_dma`), or with `0` by the host's stores and loads through a BAR -- uncached under VM passthrough, ~100x slower. Without a free 1 GiB hugepage the session uses the BAR and says so once. |
 | `TT_TILIZE` | `host`, `card` | Where tensors take the tile layout on their way to the card's GDDR and lose it on the way back (`Session::set_tilize`): the host's cores, or each tile's data mover. Burn sees row-major data either way, with the same bits. `host` is faster at every size measured: the host copies the rows into pinned memory either way, at about the cost of tilizing them, and a mover tilizes ~2.6 us a tile. |
+| `TT_MATH` | `precise`, `approx` | How transcendentals run (`Session::set_math_mode`, S10): `approx` selects the faster approximate programs, held to bounds derived beside each gate; any other value is refused at open. |
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
 | `TT_EXACT` | must be unset | Retired with the Flex cutover. Native numerical bounds apply; unset this variable. |
 | `TT_PROFILE` | unset, a path | Records a device-side profile of everything an attachment runs and writes it as Chrome trace JSON on detach (`{chip}` in the path becomes the card). Silicon only. |
@@ -273,9 +274,11 @@ unparsable value as `0`.
   `on_tiles` refuses more. Non-matmul primitives execute on chip 0.
 - Native argmax and argmin support rank-N F32 input, I32 output, and reduced axes
   of at most 2^23 elements, with first-tie and first-NaN semantics.
-- Random construction uses independent host RNG streams per `TtDevice`, seeded
-  through `TtBackend::seed`. Draws are reproducible on this backend; matching
-  Flex's random sequence is not required. Unseeded streams start at seed 0.
+- Random draws run on the device (seeded tile kernels: uniform, Bernoulli, normal and
+  integer ranges; host construction only for a device with no GDDR), seeded through
+  `TtBackend::seed`. Draws are reproducible per target (the simulator and silicon differ);
+  matching Flex's random sequence is not required. Unseeded streams start at seed 0.
+  Random is refused inside a trace rather than repeating a seed.
 
 General reductions and K-blocked resident matmul have simulator gates in
 `step67_general_reduce` and `step68_k_block_matmul`; both-card silicon validation

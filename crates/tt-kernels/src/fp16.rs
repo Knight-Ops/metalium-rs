@@ -116,19 +116,7 @@ pub enum Widening {
     SrcRaw,
 }
 
-fn transfer(range: DramRange, read: bool, l1: u64, bytes: u32) -> [u32; 8] {
-    [
-        if read { op::READ } else { op::WRITE },
-        range.channel().index() as u32,
-        0,
-        (range.offset() + if read { 0 } else { TILE_DATA }) as u32,
-        (l1 + if read { 0 } else { TILE_DATA }) as u32,
-        bytes,
-        0,
-        0,
-    ]
-}
-
+use crate::bf16::transfer;
 /// FP32 bits (in `Dst` rows, read as `Int32`) to the FP32 value whose FP16
 /// encoding is the binary16 rounding of the input, ties to even; a measurement
 /// variant, see [`Narrowing::Rounded`]:

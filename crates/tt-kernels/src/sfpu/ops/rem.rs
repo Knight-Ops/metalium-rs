@@ -1,5 +1,5 @@
 //! Exact floating-point remainder, `burn-flex`'s `((a % b) + b) % b` bit for
-//! bit (lane T4 of `hardware-coverage-closeout.md`).
+//! bit.
 //!
 //! # What Flex computes
 //!

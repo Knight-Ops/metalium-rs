@@ -1,4 +1,4 @@
-//! Matrix diagnostics: `MOVDBGA2D` and `GATESRCRST` (`tt_isa::matrix_debug`).
+//! Matrix diagnostics: `MOVDBGA2D` and `GATESRCRST` (`tt_isa::matrix::debug`).
 //!
 //! Both are diagnostic surfaces, so there is no Burn routing, gradient or tensor
 //! padding to establish: the gates below move `SrcA` rows through the Matrix Unit
@@ -25,14 +25,16 @@
 //! comparison alone proves nothing about invalidation.
 // The silicon-only gates share helpers the simulator build does not call.
 #![cfg_attr(not(feature = "silicon"), allow(dead_code))]
+mod matrix_debug_support;
+use matrix_debug_support::{a_bits, eight, entry1, one, rows16};
 use tt_isa::{
     backend::{self, Before},
     isa::{generated::encode, Instruction},
-    matrix::{Banks, Empty, Filling, Loaded},
-    matrix_debug::{
-        self, model, AddrModEntry, AddrModTable, CacheArm, CacheOutcome, CacheVerdict, DebugFormat,
-        DebugMode, DebugMove, Rows, SrcAFormat,
+    matrix::debug::{
+        self as matrix_debug, model, AddrModTable, CacheArm, CacheOutcome, CacheVerdict,
+        DebugFormat, DebugMode, DebugMove, Rows, SrcAFormat,
     },
+    matrix::{Banks, Empty, Filling, Loaded},
     numerics::mvmul_reference,
 };
 use tt_tests::datapath::{config_program, set_adc_x, Unpacker, STAGE};
@@ -112,45 +114,6 @@ fn run_on(
 
 // ---------------------------------------------------------------- the data
 
-/// `SrcA` as FP32 bits, rows 0..16: specials first, then a deterministic spread.
-/// Every value is finite (the unpacker's NaN/infinity behavior on silicon is not what
-/// this gate measures; the host model test covers them).
-fn a_bits() -> Vec<u32> {
-    let mut bits = vec![
-        0x0000_0000, // +0
-        0x8000_0000, // -0: flushed to +0 by the move
-        0x0000_0001, // smallest subnormal
-        0x807f_ffff, // largest negative subnormal
-        0x0080_0000, // smallest normal
-        0x8080_0000,
-        0x7f7f_ffff, // largest finite: truncation keeps it finite
-        0xff7f_ffff,
-        0x3f80_1fff, // low 13 mantissa bits set: truncated, not rounded
-        0xbf80_1fff,
-        0x3fff_ffff,
-        0xbfff_ffff,
-        0x3f80_0000,
-        0xbf80_0000,
-        0x4048_f5c3,
-        0xc0c9_0fdb,
-    ];
-    let mut x = 0x1234_5678u32;
-    while bits.len() < 256 {
-        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let exp = 100 + (x >> 24) % 40;
-        bits.push((x & 0x8000_0000) ^ (exp << 23) ^ (x.rotate_left(7) & 0x007f_ffff));
-    }
-    bits
-}
-
-fn rows16(bits: &[u32]) -> MatA {
-    let mut m = [[0f32; 16]; 16];
-    for (i, &b) in bits.iter().enumerate() {
-        m[i / 16][i % 16] = f32::from_bits(b);
-    }
-    m
-}
-
 fn zero_b() -> MatB {
     [[0f32; 16]; 8]
 }
@@ -183,28 +146,6 @@ struct Case {
     table: AddrModTable,
 }
 
-/// Entry 1 advances `SrcA` by `src` rows and `Dst` by `dst`; every other entry
-/// (and every other field of every entry) is zero.
-fn entry1(src: u32, dst: u32) -> AddrModTable {
-    AddrModTable::ZERO
-        .with(
-            1,
-            AddrModEntry {
-                src_a_incr: src,
-                dst_incr: dst,
-            },
-        )
-        .unwrap()
-}
-
-fn one(src_row: u32, dst_row: u32) -> Rows {
-    Rows::One { src_row, dst_row }
-}
-
-fn eight(src_row: u32, dst_row: u32) -> Rows {
-    Rows::Eight { src_row, dst_row }
-}
-
 /// `Dst` rows 0..16 after `case`, from the model, cross-checked against [`direct`]
 /// with a separate counter walk. The model takes the table as input.
 fn expected(bits: &[u32], case: &Case, format: DebugFormat) -> Vec<u32> {
@@ -228,7 +169,7 @@ fn expected(bits: &[u32], case: &Case, format: DebugFormat) -> Vec<u32> {
     let (mut src_rwc, mut dst_rwc) = (0u32, 0u32);
     for &(rows, addr_mod) in &case.moves {
         let (s, d, n) = match rows {
-            // Measured on card 0 (step111b): instruction bit 14, the low bit of the entry
+            // Measured on card 0 (probe_addr_mod_sweep): instruction bit 14, the low bit of the entry
             // number, widens a one-row move to a four-row aligned block.
             Rows::One { src_row, dst_row } if addr_mod & 1 == 1 => {
                 ((src_row + src_rwc) & 0x3c, (dst_row + dst_rwc) & 0x3fc, 4)
@@ -661,7 +602,7 @@ fn simulator_mova2d_control_matches_the_debug_model() {
     });
 }
 
-/// ttsim refuses every `MOVDBGA2D` form this lane builds (divergence row 83),
+/// ttsim refuses every `MOVDBGA2D` form this module builds (divergence row 83),
 /// while an eight-row `MOVA2D` of the same shape survives each time.
 #[test]
 #[cfg(not(feature = "silicon"))]
@@ -748,7 +689,7 @@ fn simulator_runs_the_cache_experiment_arms() {
     });
 }
 
-/// `GATESRCRST` on ttsim: see the divergence row 84 text in the lane report.
+/// `GATESRCRST` on ttsim: see the divergence row 84 text in the close-out record.
 #[test]
 #[cfg(not(feature = "silicon"))]
 fn simulator_gatesrcrst_probe() {

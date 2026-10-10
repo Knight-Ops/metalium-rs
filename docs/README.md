@@ -2,7 +2,7 @@
 
 Welcome to the native Rust software stack documentation for Tenstorrent Blackhole (p100/p150a/p300).
 
-Documentation in this repository is strictly organized into a **3-tier lifecycle structure** to separate permanent empirical knowledge from active implementation plans and unscheduled feature proposals:
+Documentation in this repository is organized into a **3-tier lifecycle structure** (finished plans are then archived in `docs/completed-plans/`) to separate permanent empirical knowledge from active implementation plans and unscheduled feature proposals:
 
 ```mermaid
 flowchart TD
@@ -33,9 +33,14 @@ flowchart TD
         L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
     end
 
+    subgraph Done["docs/completed-plans/ (archive)"]
+        D1["hardware-coverage-closeout.md<br>remaining-firmware-instructions.md<br><i>(closed checklists, kept as a record)</i>"]
+    end
+
     Tier3 --"Approval & Scheduling"--> Tier2
     Tier2 --"Empirical Findings & Benchmarks"--> Tier1
     Tier2 --"Graduation of Core Architecture"--> Tier1
+    Tier2 --"Closed checklists"--> Done
 ```
 
 ---
@@ -58,6 +63,7 @@ Permanent, cumulative empirical realities discovered through silicon execution, 
 Actionable technical specifications, interface contracts, and execution checklists (`[ ]` / `[x]`) for active and long-running engineering milestones.
 - **Contract**: Checked off as gates pass on simulator and silicon. Contains all information required to implement and verify features.
 - **Contents**:
+  - [`burn-op-coverage.md`](plans/burn-op-coverage.md): Generated (`cargo xtask burn-coverage`) status of every Burn operation-trait method: native, composed or explicitly unsupported with its `[-]` reason.
   - [`master-roadmap.md`](plans/master-roadmap.md): Master architectural roadmap spanning Phases 0–10.
   - [`implementation-checklist.md`](plans/implementation-checklist.md): Master tick-list tracking overall stack milestones across phases.
   - [`hardware-coverage.md`](plans/hardware-coverage.md): Phase 10 tracker for Tensix tile units (SFPU, FPU, Matrix Engine), numerical tolerance contracts, and Burn op coverage.
@@ -74,6 +80,9 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
 - **Contents**:
   - [`x280-on-card-dispatch.md`](proposals/x280-on-card-dispatch.md): RFC proposing use of on-card SiFive X280 RISC-V cores for on-card host orchestration.
   - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
+
+### Completed plans: `docs/completed-plans/`
+Plans whose checklists are closed move here as a record, with their evidence. They are not updated; current behaviour lives in `docs/learnings/` and the active plans. Examples: [`hardware-coverage-closeout.md`](completed-plans/hardware-coverage-closeout.md) (the Phase 10 close-out), [`remaining-firmware-instructions.md`](completed-plans/remaining-firmware-instructions.md), and the ADC copy, source-bank and scalar-movement plans.
 
 ---
 

@@ -10,7 +10,7 @@
 //! hold the cores and report a failure, leaving the Tensix thread parked.
 //!
 //! A blocking program is therefore only ever run as a [`GuardedProgram`], which
-//! has three parts (`tt_isa::l1_atomic::guard`):
+//! has three parts (`tt_isa::mailbox::guard`):
 //!
 //! * **a role-side deadline.** The role firmware polls a completion word that
 //!   the program's own last instructions store, for a bounded number of polls,
@@ -28,17 +28,17 @@
 //! thread's instruction FIFO is never filled by the runner's own pushes (a push
 //! into a full FIFO stalls the core with no timeout). A mutex a thread holds
 //! can only be released by that thread, so a [`GuardedProgram`] must release
-//! every mutex it takes ([`tt_isa::mutex::check_scope`]); a program parked
+//! every mutex it takes ([`tt_isa::sync::mutex::check_scope`]); a program parked
 //! *while holding* a mutex is let go by posting the semaphore it waits on.
 //!
 //! What this cannot do: free a thread parked on something the host cannot
 //! satisfy -- an `ATGETM` of an index that does not exist (those cannot be
-//! built: [`tt_isa::mutex::Mutex`]) or an `ATCAS` whose compare value the host
+//! built: [`tt_isa::sync::mutex::Mutex`]) or an `ATCAS` whose compare value the host
 //! never writes. The grace period then expires, the role reports
 //! `guard::ABANDONED`, and the tile must be treated as wedged.
 
 use crate::l1::{Buf, Plan, Requirements};
-use crate::runtime::{RoleImages, SemaphoreInit};
+use crate::runtime::{word_bytes, RoleImages, SemaphoreInit};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tt_device::core_control::{WaitError, CYCLES_PER_POLL};
@@ -46,11 +46,11 @@ use tt_device::tlb::WindowKind;
 use tt_device::{Device, Transport, TransportError};
 use tt_isa::backend::{self, Before};
 use tt_isa::isa::Instruction;
-use tt_isa::l1_atomic::guard::{self, Guard, PollMode};
-use tt_isa::l1_atomic::{self as atomic, AtomicError, Region16};
+use tt_isa::mailbox::guard::{self, Guard, PollMode};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{self, status};
 use tt_isa::noc::{NocCoord, NocId};
+use tt_isa::scalar::atomic::{self as atomic, AtomicError, Region16};
 use tt_isa::scalar::{self, OffsetHalf, OffsetIncrement, TransferWidth};
 use tt_isa::sync::{self, Semaphore};
 
@@ -222,7 +222,7 @@ impl GuardedProgram {
     /// post down again.
     ///
     /// Refused: a body that holds a mutex at its end or takes one twice
-    /// ([`tt_isa::mutex::check_scope`]); one that names `complete`; one too
+    /// ([`tt_isa::sync::mutex::check_scope`]); one that names `complete`; one too
     /// long for `guard::MAX_WORDS` with the epilogue; or a bad thread.
     pub fn new(
         thread: usize,
@@ -235,7 +235,7 @@ impl GuardedProgram {
                 "thread {thread} is not 0..3"
             )));
         }
-        tt_isa::mutex::check_scope(body)
+        tt_isa::sync::mutex::check_scope(body)
             .map_err(|e| AtomicsError::Refused(format!("mutex scope: {e:?}")))?;
         if let Some(bad) = body.iter().find(|i| touches_semaphore(**i, complete)) {
             return Err(AtomicsError::Refused(format!(
@@ -387,10 +387,6 @@ pub struct Launch<N: NocId> {
     window: tt_device::Window,
     cores: Vec<tt_isa::tensix::Core>,
     read_back: Vec<(u64, usize)>,
-}
-
-fn word_bytes(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 /// Start `spec` on `tile`: backend released, semaphores initialised by a setup
@@ -793,7 +789,7 @@ pub fn drain() -> Instruction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tt_isa::mutex::{self, Mutex};
+    use tt_isa::sync::mutex::{self, Mutex};
 
     fn spec() -> GuardSpec {
         GuardSpec::new(100, 100).unwrap()

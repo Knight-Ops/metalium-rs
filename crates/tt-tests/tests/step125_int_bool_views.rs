@@ -1,4 +1,4 @@
-//! Lane T1 gate (`hardware-coverage-closeout.md`): `int/bool_{permute,flip,unfold}`.
+//! Gate: `int/bool_{permute,flip,unfold}`.
 //!
 //! Integer and boolean views are the float views' dtype-generic bodies: strided views of the
 //! device buffer and native copies that move raw words. Held here, against an independent host

@@ -1,13 +1,12 @@
-//! Packer ReLU and edge masking (lane PU, sub-tranches 1 and 2).
+//! Packer ReLU and edge masking (PU sub-tranches 1 and 2).
 //!
 //! A whole FP32 tile goes L1 -> `Dst` (raw bits, `UnpackToDst`) and back out
 //! through the packer with one optional stage on, and every datum is compared
 //! with an independent raw-bit model of `Packers/ReLU.md` / `EdgeMasking.md`
-//! written here, on integers, sharing nothing with `tt_isa::pack_modes`.
+//! written here, on integers, sharing nothing with `tt_isa::packer`.
 //! `Packers/*` is a Wormhole page and `PACR.md` on Blackhole is "basic", so the
 //! behaviour is UNVERIFIED on Blackhole: the simulator arms pin what ttsim does
-//! (divergence rows 85 and 86), and the `silicon` arms, which this lane has not
-//! run, measure the chip against the page.
+//! (divergence rows 85 and 86), and the `silicon` arms measure the chip against the page.
 //!
 //! Silicon order (documented/measured first, isolated probes before gates):
 //! `silicon_probe_relu_zero_isolated`, `silicon_probe_edge_partial_mask_isolated`,
@@ -16,7 +15,7 @@
 //! `silicon_edge_partial_columns_and_negative_infinity`,
 //! `silicon_edge_then_relu_order`.
 use tt_isa::backend::{self, Before, ConfigWords};
-use tt_isa::pack_modes::{EdgeFill, EdgeMasking, PackerRelu, PlaneRows, ThresholdFormat};
+use tt_isa::packer::{EdgeFill, EdgeMasking, PackerRelu, PlaneRows, ThresholdFormat};
 use tt_isa::tile::{L1Format, TileImage};
 use tt_kernels::datapath::{
     config_program, pack_tile_from_dst_staged, state_id, thread_config, tile_descriptor,
@@ -394,7 +393,7 @@ fn relu_unspecified_classes() {
 
 // ---- independent raw-bit oracle: edge masking ------------------------------
 
-/// The edge-masking test vector, as plain integers: no `tt_isa::pack_modes` type
+/// The edge-masking test vector, as plain integers: no `tt_isa::packer` type
 /// in the oracle's inputs.
 #[derive(Copy, Clone)]
 struct Edge {
@@ -544,7 +543,7 @@ fn ttsim_refuses_partial_masks_and_negative_infinity() {
     );
 }
 
-// ---- silicon-only arms (written, not run by the lane) ----------------------
+// ---- silicon-only arms (written, not run) ----------------------
 
 /// Isolated first contact: ReLU zero mode on one tile, nothing asserted but that
 /// the program completes. Risk: UNVERIFIED (Wormhole page; Blackhole's

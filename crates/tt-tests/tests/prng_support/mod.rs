@@ -1,4 +1,4 @@
-//! Shared by `step140`-`step142` (lane T6): the pinned statistical tests and
+//! Shared by `step140`-`step142`: the pinned statistical tests and
 //! the special functions their p-values need. Nothing here touches the code
 //! under test.
 //!

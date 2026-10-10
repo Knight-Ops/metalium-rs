@@ -1,7 +1,9 @@
-//! Diagnostics for the open `MOVDBGA2D` / `MOVA2D` increment-1 `AddrMod` finding
-//! (hardware-coverage.md, `MOVDBGA2D`). **These assert nothing.** Each silicon test
-//! runs a handful of tiny programs and prints what the hardware did, decoded as
-//! "row r holds source row s", so the evidence can be read without a model.
+//! Diagnostics behind the `MOVDBGA2D` / `MOVA2D` increment-1 `AddrMod` finding
+//! (`hardware-coverage.md`, `MOVDBGA2D`), which is now explained and encoded in
+//! `tt_isa::matrix::debug::model`; kept as the evidence. **These assert nothing.**
+//! Each silicon test runs a handful of tiny programs and prints what the hardware
+//! did, decoded as "row r holds source row s", so the evidence can be read without
+//! a model.
 //!
 //! # What step111 already shows (card 0, `target/silicon/out/17915924*`)
 //!
@@ -20,11 +22,11 @@
 //! * The `AddrMod 0` cases and the two-block case (`Move8Rows` set, bits 13 and 14
 //!   both set) are exact, which is why they never saw it.
 //!
-//! The working hypothesis is therefore that on Blackhole bit 14 of `MOVA2D` and
-//! `MOVDBGA2D`, with `Move8Rows` (bit 13) clear, is not a pure `AddrMod` bit: it also
-//! widens the move to four rows. The sweeps below separate that from the other
-//! hypotheses (a) increment units, (b) a shifted entry, (c) misplaced table words,
-//! (d) a leftover RWC base.
+//! The finding is that on Blackhole bit 14 of `MOVA2D` and `MOVDBGA2D`, with
+//! `Move8Rows` (bit 13) clear, is not a pure `AddrMod` bit: it also widens the move
+//! to four rows. The sweeps below separated that from the other hypotheses (a)
+//! increment units, (b) a shifted entry, (c) misplaced table words, (d) a leftover
+//! RWC base.
 //!
 //! # How to read the output
 //!
@@ -43,13 +45,15 @@
 //! divergence rows 37 and 83); the one simulator test checks the host side
 //! (program builder, decoder) with the eight-row `MOVA2D` ttsim does run.
 #![cfg_attr(not(feature = "silicon"), allow(dead_code))]
+mod matrix_debug_support;
+use matrix_debug_support::{a_bits, eight, entry1, one, rows16};
 use tt_isa::{
     backend::{self, Before},
     isa::{generated::encode, Instruction},
-    matrix::{Banks, Loaded},
-    matrix_debug::{
+    matrix::debug::{
         AddrModEntry, AddrModTable, DebugFormat, DebugMode, DebugMove, Rows, SrcAFormat,
     },
+    matrix::{Banks, Loaded},
 };
 use tt_tests::datapath::{set_adc_x, Unpacker, STAGE};
 use tt_tests::harness::{self, Roles, Run};
@@ -58,50 +62,10 @@ use tt_tests::matmul::{self, stage_operand, ROW, SRC_A_ROW, SRC_B_ROW, TF32_CODE
 const STAGE_A: u64 = STAGE;
 const STAGE_B: u64 = STAGE + 0x2000;
 
-type MatA = [[f32; 16]; 16];
 type MatB = [[f32; 16]; 8];
 type Pair = (Vec<Instruction>, Vec<Instruction>);
 
 // ---------------------------------------------------------------- the data
-
-/// Sixteen distinct source rows of FP32: row `r` is recognisable by value alone.
-/// Row 0 carries zeros and subnormals (flushed in part), the rest a spread; no
-/// two rows are equal after the TF32 truncation and the flush.
-fn a_bits() -> Vec<u32> {
-    let mut bits = vec![
-        0x0000_0000,
-        0x8000_0000,
-        0x0000_0001,
-        0x807f_ffff,
-        0x0080_0000,
-        0x8080_0000,
-        0x7f7f_ffff,
-        0xff7f_ffff,
-        0x3f80_1fff,
-        0xbf80_1fff,
-        0x3fff_ffff,
-        0xbfff_ffff,
-        0x3f80_0000,
-        0xbf80_0000,
-        0x4048_f5c3,
-        0xc0c9_0fdb,
-    ];
-    let mut x = 0x1234_5678u32;
-    while bits.len() < 256 {
-        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let exp = 100 + (x >> 24) % 40;
-        bits.push((x & 0x8000_0000) ^ (exp << 23) ^ (x.rotate_left(7) & 0x007f_ffff));
-    }
-    bits
-}
-
-fn rows16(bits: &[u32]) -> MatA {
-    let mut m = [[0f32; 16]; 16];
-    for (i, &b) in bits.iter().enumerate() {
-        m[i / 16][i % 16] = f32::from_bits(b);
-    }
-    m
-}
 
 /// The IEEE bits a TF32 `Src` datum moves to FP32 `Dst` as, denormals flushed.
 fn direct(bits: u32) -> u32 {
@@ -335,27 +299,6 @@ fn entry_table() -> AddrModTable {
             .unwrap();
     }
     t
-}
-
-/// Entry 1 alone advances (`src`, `dst`) rows; every other entry is zero.
-fn entry1(src: u32, dst: u32) -> AddrModTable {
-    AddrModTable::ZERO
-        .with(
-            1,
-            AddrModEntry {
-                src_a_incr: src,
-                dst_incr: dst,
-            },
-        )
-        .unwrap()
-}
-
-fn one(src_row: u32, dst_row: u32) -> Rows {
-    Rows::One { src_row, dst_row }
-}
-
-fn eight(src_row: u32, dst_row: u32) -> Rows {
-    Rows::Eight { src_row, dst_row }
 }
 
 // ---------------------------------------------------------------- the sweeps

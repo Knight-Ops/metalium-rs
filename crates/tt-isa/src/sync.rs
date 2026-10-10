@@ -30,6 +30,8 @@
 //! * A `SEMWAIT` with no condition is `UndefinedBehavior`; the helpers always set
 //!   one.
 
+pub mod mutex;
+
 use crate::backend::{self, Before, EncodeError};
 use crate::isa::generated::encode;
 use crate::isa::Instruction;

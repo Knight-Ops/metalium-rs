@@ -19,11 +19,9 @@ Current storage extension (2026-10-06): BFP8/BFP4/BFP2 store logical F32 with
 native conversions/products, identity cast backward, fusion boundaries and
 traced parameter copies. Named MNIST MLP/CNN precision policies pass both cards;
 masters, gradients and optimizer state remain F32. This does not implement
-portable Burn `QTensorOps`. Random construction already works through independent
-host RNG streams per device, seeded by `TtBackend::seed`; hardware distributions
-remain deferred. Diagnostic hardware reseeding is reproducible through RISC-V
-stores with a settling interval, while WRCFG and simulator lane initialization
-differ. See [the current storage contract](mixed-bfp-storage.md).
+portable Burn `QTensorOps`. Random draws run on the device (S7, step140-142), seeded per
+device by `TtBackend::seed`; the RISC-V seed store needs a settling interval, and
+WRCFG and simulator lane initialization differ from silicon. See [the current storage contract](mixed-bfp-storage.md).
 
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
 with Burn's wrappers and tooling, and the developer experience, measured against the

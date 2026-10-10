@@ -23,8 +23,8 @@ gate, including native scalar broadcasting and ragged transpose copies.
 
 ## Remaining operation coverage
 
-Missing FFT, sorting, portable quantized compute, and
-other required methods fail explicitly. Unsupported shapes of implemented
+FFT (`rfft`, `irfft`), portable quantized compute and the other methods
+marked `[-]` in [burn-op-coverage.md](burn-op-coverage.md) fail explicitly; sorting is native. Unsupported shapes of implemented
 operations also fail explicitly. Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across chips and move tile slots over Ethernet without host tensor
 staging. Distributed batched products and F32/BF16 module gradients are gated (step83/step88); the remaining training primitives execute on chip 0. The
@@ -80,7 +80,7 @@ are now gated; batched BF16 products and integer reductions are resident.
 Checked integer division/remainder and axis mean now pass `step82` in ttsim;
 card-0 silicon gates also pass (`1791232718`). Native attention, ragged F32
 batches and actual two-chip batched products pass the `step83` simulator and
-silicon gates, including BF16 resident training. The remaining items are listed in `hardware-coverage-closeout.md`.
+silicon gates, including BF16 resident training. The remaining items are listed in `hardware-coverage.md` ("Where things stand").
 See `tensix-next-features.md` for the current handoff and validation evidence.
 BF16 is slower on the measured MNIST GEMMs; see `tensix-next-features.md`.
 
@@ -107,9 +107,9 @@ Full SMOKE passed 364/364 (`1791300502`), final BFP controls 28/28
 [the contract and completed checklist](mixed-bfp-storage.md) and the
 [measured conversion costs and accuracy observations](../learnings/firmware-performance.md).
 BFP `a` variants, INT8/UINT8, packed mesh transport and portable Burn
-`QTensorOps` remain deferred. Burn random uses the existing per-device seeded
-host construction; hardware distribution generation remains deferred despite
-the now-reproducible diagnostic RISC-V seed-store path.
+`QTensorOps` remain deferred. Burn random draws on the device (S7, step142): the seeded
+tile kernels' uniform, Bernoulli and normal distributions, with host construction only for a device
+with no GDDR.
 
 ### Convolution and resident-index continuation (2026-10-05)
 

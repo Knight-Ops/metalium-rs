@@ -3064,7 +3064,7 @@ impl Eltwise {
             EQ_S..=LE_S => !ieee_compare(kind, 0.0, s),
             MASK_FILL => b_zero || is_zero(s),
             MASK_WHERE => b_zero || c_zero,
-            // Lane T1: raw words, so zero is the all-zero word alone (the
+            // Raw words, so zero is the all-zero word alone (the
             // float kinds' `-0.0` is `i32::MIN` here) and `|0| = 0`.
             INT_MASK_FILL | BOOL_MASK_FILL => b_zero || s.to_bits() == 0,
             INT_MASK_WHERE | BOOL_MASK_WHERE => b_zero || c_zero,
@@ -3073,7 +3073,7 @@ impl Eltwise {
             SQRT | EXPM1 | TANH | ERF | GELU | SINH | ASINH | ATANH | SIN | TAN | ATAN | ASIN => {
                 true
             }
-            // Lane T8: the Approx twins of `tanh` and `gelu`.
+            // The Approx twins of `tanh` and `gelu`.
             crate::sfpu::approx::kind::TANH | crate::sfpu::approx::kind::GELU => true,
             // `0^s = 0` for `s > 0`.
             POW_S => s > 0.0,
@@ -3081,7 +3081,7 @@ impl Eltwise {
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
             // `atan2(+0, +0) = +0`.
             ATAN2 => b_zero,
-            // Lane T4: `((0 % s) + s) % s` is a zero (the sign of `s`) for a
+            // `((0 % s) + s) % s` is a zero (the sign of `s`) for a
             // finite nonzero `s`; a zero, infinite or NaN `s` gives NaN.
             REM_S => s.is_finite() && !is_zero(s),
             _ => false,

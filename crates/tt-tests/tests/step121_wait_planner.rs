@@ -12,7 +12,7 @@
 //! pass. Host only: no simulator, no device.
 //!
 //! Redundant waits are counted and listed, not failed: they are the cost a
-//! planner would remove (`hardware-coverage-closeout.md`, P9).
+//! planner would remove (`hardware-coverage.md`, P9).
 
 use std::collections::BTreeMap;
 

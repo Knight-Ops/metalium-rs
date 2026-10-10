@@ -1,6 +1,6 @@
 //! `PACR_SETREG` and `UNPACR_NOP_SETREG`: research closure, simulator refusal only.
 //!
-//! Both are `[-]` (see `docs/plans/hardware-coverage-closeout.md`, lane F). The
+//! Both are `[-]` (see `docs/completed-plans/hardware-coverage-closeout.md`). The
 //! address of their write is `SetRegBase[AddrSel] + (AddrMid << 12)`, and
 //! `SetRegBase`/`SetRegHiScaler` are TDMA-RISC state that only the Wormhole
 //! `TDMA-RISC.md` page documents (`0xFFB1_1038` -> `SetPackRegAddr`,

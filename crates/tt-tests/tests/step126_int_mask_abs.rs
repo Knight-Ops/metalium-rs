@@ -1,4 +1,4 @@
-//! Lane T1 gate (`hardware-coverage-closeout.md`): `int/bool_mask_{where,fill}`, `int_abs`,
+//! Gate: `int/bool_mask_{where,fill}`, `int_abs`,
 //! `int_cast`, and the Burn defaults they unblock (`int_clamp*`, `int_sign`, `int_max_abs*`).
 //!
 //! The selects and `int_abs` are raw-word SFPU programs (`kind_sfpu::INT_MASK_WHERE`,
@@ -605,49 +605,14 @@ fn traced_selects_and_abs_replay_on_changed_inputs() {
     });
 }
 
-#[cfg(not(feature = "silicon"))]
-fn with_session(f: impl FnOnce(&mut tt_kernels::session::Session<tt_ttsim::LibTtsim<'_>>)) {
-    use tt_kernels::session::{Session, TileChoice};
-    if let Err(e) = tt_ttsim::fork_scope(|| {
-        let mut sim = tt_ttsim::Simulator::open().unwrap();
-        let dev = tt_device::Device::open(sim.transport()).unwrap();
-        let mut s = Session::open(
-            dev,
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(
-                tt_tests::backend::GATE_TILE.0,
-                tt_tests::backend::GATE_TILE.1,
-            ),
-            |_, _| Ok(None),
-        )
-        .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
-}
-
-#[cfg(feature = "silicon")]
-fn with_session(f: impl FnOnce(&mut tt_kernels::session::Session<tt_kmd::Kmd>)) {
-    use tt_kernels::session::{Session, TileChoice};
-    if let Err(e) = tt_ttsim::fork_scope(|| {
-        let mut s = Session::open_card(
-            tt_tests::backend::device_index(),
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(
-                tt_tests::backend::GATE_TILE.0,
-                tt_tests::backend::GATE_TILE.1,
-            ),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
+fn with_session(f: impl FnOnce(&mut tt_tests::backend::Sess<'_>)) {
+    tt_tests::backend::with_session(
+        tt_kernels::session::TileChoice::Exactly(
+            tt_tests::backend::GATE_TILE.0,
+            tt_tests::backend::GATE_TILE.1,
+        ),
+        f,
+    );
 }
 
 /// What each op says its padding holds, it holds: a claimed `Pad::Zero` is checked against the

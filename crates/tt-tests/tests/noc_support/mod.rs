@@ -1,5 +1,5 @@
-//! Shared by `step115_noc_multicast`, `step116_noc_atomics` and
-//! `step117_niu_completion`: stage requests for the NoC probe image
+//! Shared by `step115_noc_multicast`, `step116_noc_atomics`,
+//! `step117_niu_completion` and `step118_mover_fast_path`: stage requests for the NoC probe image
 //! (`tt-firmware/src/bin/noc_probe_b.rs`), run it on RISCV B of one tile, read
 //! back what it recorded.
 //!

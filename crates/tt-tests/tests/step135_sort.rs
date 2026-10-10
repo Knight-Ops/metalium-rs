@@ -8,6 +8,7 @@ use tt_kernels::{
     sfpu::sort::{plane_coord, plane_dims, reference, Spec},
     tensor::Elem,
 };
+use tt_tests::data::lcg_word;
 
 /// The session of a gate: ttsim by default, a card with `silicon`.
 macro_rules! session {
@@ -34,13 +35,6 @@ macro_rules! session {
         $s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
     };
-}
-
-fn lcg(seed: &mut u64) -> u32 {
-    *seed = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (*seed >> 32) as u32
 }
 
 /// F32 words that stress `total_cmp`: both zeros, subnormals, NaNs of both
@@ -96,9 +90,9 @@ fn problems(elem: Elem, count: usize, n: usize, seed: u64) -> Vec<Vec<u32>> {
                 .map(|e| match q % 4 {
                     0 => specials[(e * 5 + q) % specials.len()],
                     // Few distinct values: ties throughout.
-                    1 => specials[(lcg(&mut s) % 3) as usize],
-                    2 => lcg(&mut s),
-                    _ => specials[lcg(&mut s) as usize % specials.len()],
+                    1 => specials[(lcg_word(&mut s) % 3) as usize],
+                    2 => lcg_word(&mut s),
+                    _ => specials[lcg_word(&mut s) as usize % specials.len()],
                 })
                 .collect()
         })
@@ -139,7 +133,7 @@ fn the_sort_kernel_is_stable_and_exact_on_the_device() {
                             descending,
                             indices,
                         };
-                        let cols = problems(elem, 70, n, lcg(&mut seed) as u64);
+                        let cols = problems(elem, 70, n, lcg_word(&mut seed) as u64);
                         let (bits, [rows, ncols]) = planes(&cols, n, 0xdead_beef);
                         let input = s.upload_bits(&bits, rows, ncols, elem).unwrap();
                         let out = s.sort_planes(&input, spec).unwrap();

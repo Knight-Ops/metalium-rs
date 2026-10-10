@@ -10,6 +10,9 @@
 //! `Before::EVERYTHING` and `cond::CONFIG_BUSY`. Step100's descriptor gate
 //! observes stale publication without this boundary on Blackhole; this does
 //! not change scalar arithmetic or the register aliasing contract.
+pub mod atomic;
+pub mod mmio;
+
 use crate::{
     backend::EncodeError,
     isa::{generated::encode, Instruction},
