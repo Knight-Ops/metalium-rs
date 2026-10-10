@@ -383,7 +383,7 @@ Pulled in only when a kernel needs them; each says which.
 | NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[ ]` | weight broadcast to many tiles (9.6 follow-up) |
 | NoC atomics | BH `NoC/Atomics.md` | `[ ]` | R1 across tiles |
 | NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; interrupts `[ ]` | -- |
-| `L1CacheTagSearchAccel` | BH | `[~]` helpers, model and B probe (`tt_isa::tag_search`, `tag_search_b`, step120); configured through `Config[212..=219]`, triggered by an L0-missing RISC-V B load; minimal probe passes on card 0, the multi-scenario semantic gate is open; ttsim refuses the block (row 92); no repo consumer | checklist Phase 9 |
+| `L1CacheTagSearchAccel` | BH | `[-]` helpers, page model and B probe kept as evidence (`tt_isa::tag_search`, `tag_search_b`, step120; configured through `Config[212..=219]`, triggered by an L0-missing RISC-V B load). **On card 0 every armed trigger load hangs the baby core** (all ten scenarios stop at step 0, `LOAD_ISSUED`) and the block then stays armed across resets (the earlier passing minimal probe fails afterwards), so the silicon semantics are not established and the block is not adopted; no repo consumer; ttsim refuses the config (row 92). Silicon tests are `#[ignore]`d; a board reset clears the state | checklist Phase 9 |
 | Debug timestamper | BH (STUB-C) | `[x]` silicon; ttsim row 54 | -- |
 
 ### Out of scope, and why

@@ -66,6 +66,54 @@ pub mod probe {
     pub const DATA: u64 = 0x3_0000;
     /// Nops between the last `Config` store and the load it should trigger.
     pub const SETTLE_NOPS: u32 = 64;
+    /// Progress breadcrumb, one word: `(step << 8) | phase`. The probe publishes
+    /// it (with a fence) before each phase, so after a hang the last value shows
+    /// which phase of which step never completed.
+    pub const STAGE: u64 = 0x2_2800;
+
+    /// Phases of one step, in order, then the run-level ones.
+    pub mod phase {
+        /// Step started, no `Config` store issued yet.
+        pub const STEP_BEGIN: u32 = 1;
+        /// All the step's `Config` stores issued and fenced.
+        pub const CONFIG_WRITTEN: u32 = 2;
+        /// `Config[212..=219]` read back into the result record.
+        pub const READBACK_DONE: u32 = 3;
+        /// Settle nops done and L0 flushed.
+        pub const SETTLED: u32 = 4;
+        /// About to execute the trigger load: if this is the last phase, the
+        /// load never returned.
+        pub const LOAD_ISSUED: u32 = 5;
+        /// The load returned and its value is in the result record.
+        pub const LOAD_RETURNED: u32 = 6;
+        /// All steps done and the block disarmed (step field = step count).
+        pub const DISARMED: u32 = 7;
+        /// The script was invalid; the block was disarmed before failing.
+        pub const BAD_SCRIPT: u32 = 8;
+        /// The opening disarm is about to run / has run (step field 0).
+        pub const PROLOGUE: u32 = 9;
+
+        /// A name for messages.
+        pub const fn name(p: u32) -> &'static str {
+            match p {
+                STEP_BEGIN => "STEP_BEGIN",
+                CONFIG_WRITTEN => "CONFIG_WRITTEN",
+                READBACK_DONE => "READBACK_DONE",
+                SETTLED => "SETTLED",
+                LOAD_ISSUED => "LOAD_ISSUED",
+                LOAD_RETURNED => "LOAD_RETURNED",
+                DISARMED => "DISARMED",
+                BAD_SCRIPT => "BAD_SCRIPT",
+                PROLOGUE => "PROLOGUE",
+                _ => "?",
+            }
+        }
+    }
+
+    /// Encode a breadcrumb.
+    pub const fn stage(step: u32, phase: u32) -> u32 {
+        (step << 8) | phase
+    }
 }
 
 /// Bytes per address granule: every `*_Addr` field counts 16-byte units.

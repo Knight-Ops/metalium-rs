@@ -188,7 +188,6 @@ pub const SMOKE: &[&str] = &[
     "step119_device_write_fence::silicon_gates::posted_then_fenced_l1_writes_read_back_exactly",
     "step147_mesh_trace::",
     "step111_matrix_debug::probe_movdbga2d_minimal_survives",
-    "step120_tag_search::silicon::silicon_tag_search_minimal_probe",
     "step135_sort::",
     "step136_burn_sort::",
     "step137_sort_residency::",

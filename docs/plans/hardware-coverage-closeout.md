@@ -122,7 +122,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   stays `[~]` host-TLB only if the 1×2 probe is not clean.
 - [x] **FENCE: X7 posted-write fence** (step119; unit 11 + ttsim 5; probe on card 0 and both-card Ethernet gates pass; three negative controls watched failing; `silicon_eth_link` gates need both cards so they are not in SMOKE). Owns `tt-device/src/device.rs`. A `FencedWrite` API bundling
   posted writes with one read-back; migrate call sites that race another agent.
-- [~] **TS: `L1CacheTagSearchAccel`** (step120; host/ttsim 8/8, helper and model mutants watched failing; silicon: minimal probe passes, the multi-scenario probe did not finish, being split per scenario; ttsim refuses `Config[212..=219]`, row 92). **TS: `L1CacheTagSearchAccel`.** Owns `tt-isa/src/tag_search.rs` and a probe bin. Done when
+- [-] **TS: `L1CacheTagSearchAccel`** (step120; host/ttsim 8/8; silicon: every armed trigger load hangs the baby core and leaves the block armed across resets (all ten scenarios stop at step 0 LOAD_ISSUED, and the earlier passing minimal probe fails afterwards) — `[-]` with that evidence; silicon tests `#[ignore]`d). **TS: `L1CacheTagSearchAccel`.** Owns `tt-isa/src/tag_search.rs` and a probe bin. Done when
   search, invalidate-all and the bit-vector query are gated; adoption not required.
 - [ ] **G: stream overlay** (`STREAMWAIT`, `STREAMWRCFG`; wave 2, after F's register research).
   Likely `[-]`: Blackhole has no NoC Overlay documentation pinned, and Wormhole offsets are not

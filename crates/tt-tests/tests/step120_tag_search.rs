@@ -788,9 +788,58 @@ const NORMAL: Mode = Mode {
     keep: false,
 };
 
+/// Host wait budget for one probe run, in simulated cycles (on silicon the
+/// device layer converts it with a one second floor). Finite: a hung probe is an
+/// error with a diagnosis, not a stuck test.
+const PROBE_BUDGET: u64 = 4_000_000;
+
+/// Read the breadcrumb and the stuck step's readback, as text.
+fn diagnosis(
+    dev: &mut Dev<'_>,
+    w: &tt_device::Window,
+    tile: tt_isa::noc::NocCoord<tt_isa::noc::Noc0>,
+    why: &str,
+) -> String {
+    let mut word = |at: u64| dev.read32(w, tile, at).unwrap_or(0xDEAD_DEAD);
+    let stage = word(probe::STAGE);
+    let (step, phase) = (stage >> 8, stage & 0xFF);
+    let rec = probe::RESULTS + u64::from(step) * probe::RESULT_STRIDE;
+    let cfg: Vec<u32> = (0..8).map(|i| word(rec + 4 + 4 * i)).collect();
+    let panic = word(mailbox::PANIC_CODE);
+    format!(
+        "{why}: last stage step {step} phase {} ({phase}), panic code {panic}, \
+         Config[212..=219] readback of that step {cfg:#x?}, its load result {:#x}",
+        probe::phase::name(phase),
+        word(rec)
+    )
+}
+
 /// Stage `s` and its script, run the probe on RISCV B, and read everything back.
-/// `None` if the firmware did not finish.
-fn run_on_device(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Option<Observed> {
+///
+/// On a hang or panic the error names the last breadcrumb and the `Config`
+/// readback, and (unless `mode.keep`) a disarm-only run first resets B and clears
+/// the block's trigger bits, so a failed gate does not leave it armed.
+fn run_on_device(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Result<Observed, String> {
+    let r = run_once(dev, s, mode);
+    if r.is_err() && !mode.keep {
+        let cleanup = Scenario {
+            name: "disarm",
+            stage: vec![],
+            steps: vec![(Do::Raw(vec![], probe::DATA + 0x2000), Expect::Word(0))],
+            memory: vec![],
+        };
+        let c = run_once(dev, &cleanup, NORMAL);
+        return r.map_err(|e| {
+            format!(
+                "{e}; disarm-only cleanup run: {}",
+                c.map_or_else(|e| e, |_| "ok".into())
+            )
+        });
+    }
+    r
+}
+
+fn run_once(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Result<Observed, String> {
     let tile = harness::tensix_tile();
     let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
     // Config is only reachable with the Tensix backend out of reset.
@@ -798,6 +847,7 @@ fn run_on_device(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Option<Observed
     for (at, bytes) in &s.stage {
         dev.write(&w, tile, *at, bytes).unwrap();
     }
+    dev.write32(&w, tile, probe::STAGE, 0).unwrap();
     dev.write32(&w, tile, probe::SCRIPT, s.steps.len() as u32)
         .unwrap();
     dev.write32(&w, tile, probe::SCRIPT + 4, u32::from(mode.blind))
@@ -823,10 +873,13 @@ fn run_on_device(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Option<Observed
     let (core, image, at) = tt_firmware_images::TAG_SEARCH_B;
     dev.load_and_start(&w, tile, core, image, at).unwrap();
     let done = dev
-        .wait_for_status(&w, tile, 4_000_000, |x| x == status::DONE)
+        .wait_for_status(&w, tile, PROBE_BUDGET, |x| x == status::DONE)
         .unwrap();
-    if done.is_err() {
-        return None;
+    if let Err(e) = done {
+        let msg = diagnosis(dev, &w, tile, &format!("{}: {e}", s.name));
+        // Hold B (a stuck load does not release on its own) before returning.
+        let _ = dev.set_core_reset(&w, tile, core, true);
+        return Err(msg);
     }
     let mut loads = vec![];
     let mut readback = vec![];
@@ -854,7 +907,7 @@ fn run_on_device(dev: &mut Dev<'_>, s: &Scenario, mode: Mode) -> Option<Observed
         })
         .collect();
     dev.set_core_reset(&w, tile, core, true).unwrap();
-    Some(Observed {
+    Ok(Observed {
         loads,
         readback,
         memory,
@@ -924,48 +977,89 @@ fn simulator_does_not_implement_the_block() {
 
 /// Risk class: documented (BlackholeA0 page), UNVERIFIED on silicon. The probe
 /// only stores to `Config` words 212..=219, loads one L1 word of a staged tag
-/// array, and disarms. First run: `silicon_tag_search_minimal_probe`.
+/// array, and disarms. First run: `silicon_tag_search_minimal_probe`. Every
+/// scenario is its own test and its own child process, so a hang in one is
+/// isolated and reports the last probe stage reached.
 #[cfg(feature = "silicon")]
 mod silicon {
     use super::*;
 
+    fn scenario(name: &str) -> Scenario {
+        scenarios().into_iter().find(|s| s.name == name).unwrap()
+    }
+
+    /// Run `name` in a fresh child; a hang or panic names its last stage.
+    fn run_checked(name: &str) {
+        let s = scenario(name);
+        harness::in_device(|dev| match run_on_device(dev, &s, NORMAL) {
+            Ok(o) => {
+                println!("SILICON {name} loads {:#x?}", o.loads);
+                check_expectations(&s, &o).unwrap();
+                readback_matches(&s, &o).unwrap();
+            }
+            Err(e) => {
+                eprintln!("SILICON FAILURE {e}");
+                panic!("{e}");
+            }
+        });
+    }
+
     #[test]
+    #[ignore = "hangs the baby core on card 0 (hardware finding, see hardware-coverage.md L1CacheTagSearchAccel) and leaves the block armed; do not run"]
     fn silicon_tag_search_minimal_probe() {
         // One search over four tags, one load, disarm. Hung core or dead NoC
         // fails the child, not the host.
-        let all = scenarios();
-        let s = all.iter().find(|s| s.name == "width32").unwrap();
+        let s = scenario("width32");
         assert!(harness::survives(|dev| {
-            let o = run_on_device(dev, s, NORMAL).expect("the probe finished");
+            let o = run_on_device(dev, &s, NORMAL).expect("the probe finished");
             println!("SILICON minimal probe loads {:#x?}", o.loads);
         }));
     }
 
-    #[test]
-    fn silicon_tag_search_semantics_match_the_model() {
+    macro_rules! per_scenario {
+        ($($test:ident => $name:literal),* $(,)?) => {
+            $( #[test] #[ignore = "hangs the baby core on card 0 (hardware finding, see hardware-coverage.md L1CacheTagSearchAccel) and leaves the block armed; do not run"] fn $test() { run_checked($name); } )*
+        };
+    }
+    per_scenario! {
+        silicon_tag_search_search32 => "search32",
+        silicon_tag_search_alloc_random => "alloc_random",
+        silicon_tag_search_alloc_second_word => "alloc_second_word",
+        silicon_tag_search_width8 => "width8",
+        silicon_tag_search_width16 => "width16",
+        silicon_tag_search_width32 => "width32",
+        silicon_tag_search_width64 => "width64",
+        silicon_tag_search_invalidate_all => "invalidate_all",
+        silicon_tag_search_bit_query => "bit_query",
+        silicon_tag_search_latch_follows_triggers_only => "latch_follows_triggers_only",
+    }
+
+    /// The model mutant must disagree with silicon in the scenario its
+    /// expectation check rejects it in.
+    fn mutant_diverges(mutant: Mutant, name: &str) {
+        let s = scenario(name);
         harness::in_device(|dev| {
-            for s in scenarios() {
-                let o = run_on_device(dev, &s, NORMAL).expect("the probe finished");
-                check_expectations(&s, &o).unwrap();
-                readback_matches(&s, &o).unwrap();
-            }
+            let o = run_on_device(dev, &s, NORMAL).unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                check_expectations(&s, &o).is_ok(),
+                "silicon disagrees with the page"
+            );
+            assert!(
+                check_expectations(&s, &run_model(&s, mutant)).is_err(),
+                "{mutant:?} agrees with silicon in {name}"
+            );
         });
     }
 
-    /// The model mutants must disagree with silicon in the same scenarios the
-    /// expectations reject them in.
     #[test]
-    fn silicon_rejects_the_mutants() {
-        harness::in_device(|dev| {
-            for mutant in [Mutant::TagCompareLowByte, Mutant::InvalidateAllFirstWord] {
-                let mut diverged = false;
-                for s in scenarios() {
-                    let o = run_on_device(dev, &s, NORMAL).expect("the probe finished");
-                    diverged |= check_expectations(&s, &run_model(&s, mutant)).is_err()
-                        && check_expectations(&s, &o).is_ok();
-                }
-                assert!(diverged, "{mutant:?} agrees with silicon everywhere");
-            }
-        });
+    #[ignore = "hangs the baby core on card 0 (hardware finding, see hardware-coverage.md L1CacheTagSearchAccel) and leaves the block armed; do not run"]
+    fn silicon_rejects_the_tag_compare_mutant() {
+        mutant_diverges(Mutant::TagCompareLowByte, "width16");
+    }
+
+    #[test]
+    #[ignore = "hangs the baby core on card 0 (hardware finding, see hardware-coverage.md L1CacheTagSearchAccel) and leaves the block armed; do not run"]
+    fn silicon_rejects_the_invalidate_scope_mutant() {
+        mutant_diverges(Mutant::InvalidateAllFirstWord, "invalidate_all");
     }
 }
