@@ -419,6 +419,14 @@ fn attach_engine(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
             self.buffers.zeros(&mut self.session, dims, elem, bf16)
         }
+        fn random_dram(
+            &mut self,
+            dims: [usize; 2],
+            draw: burn_tt::Draw,
+            base: u64,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+            self.buffers.random(&mut self.session, dims, draw, base)
+        }
         fn gather_indexed(
             &mut self,
             input: burn_tt::BufferId,

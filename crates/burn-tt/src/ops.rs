@@ -917,6 +917,35 @@ fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> 
     Some(device_result_shaped(*device, id, dims, shape, dtype))
 }
 
+/// lane:t6_random: a resident tensor drawn by the seeded tile kernel
+/// (`tt_kernels::prng`). `None` only where the device has no resident buffers
+/// (unattached, or an engine without GDDR) or the shape is empty: the caller
+/// then builds host construction data. On an attached GDDR device a failed
+/// draw is an error at use, never a host retry.
+fn native_random(
+    shape: &burn_backend::Shape,
+    draw: crate::random::Draw,
+    device: &TtDevice,
+    dtype: DType,
+) -> Option<TtTensor> {
+    if !crate::server::is_attached(*device) || !crate::server::supports_dram(*device) {
+        return None;
+    }
+    let dims = crate::tensor::stored_dims(&shape.to_vec())?;
+    if dims.contains(&0) {
+        return None;
+    }
+    let base = crate::random::next_base(*device);
+    let (id, dims) = crate::server::random(*device, dims, draw, base);
+    Some(device_result_shaped(
+        *device,
+        id,
+        dims,
+        shape.clone(),
+        dtype,
+    ))
+}
+
 /// Broadcast bytes on the device using row gathers and whole-matrix transposes.
 /// No arithmetic or host readback is involved, including for scalar tensors.
 fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor {
@@ -1476,19 +1505,33 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
-        if DType::from(dtype) == DType::BF16 {
-            return cast_native(
-                float_from_data(crate::random::float(*device, shape, distribution), device),
-                DType::BF16,
-            );
-        }
-        if DType::from(dtype) != DType::F32 {
+        if !matches!(DType::from(dtype), DType::F32 | DType::BF16) {
             fail(
                 "float_random",
-                format_args!("shape={shape:?}, dtype={dtype:?}"),
+                format_args!("shape={shape:?}, dtype={dtype:?}, distribution={distribution:?}"),
             );
         }
-        float_from_data(crate::random::float(*device, shape, distribution), device)
+        // lane:t6_random: drawn on the device (`crate::random`); BF16 is the
+        // device's F32 draw cast on the device.
+        if let Some(out) = native_random(
+            &shape,
+            crate::random::float_draw(distribution),
+            device,
+            DType::F32,
+        ) {
+            return if DType::from(dtype) == DType::BF16 {
+                cast_native(out, DType::BF16)
+            } else {
+                out
+            };
+        }
+        // No resident buffers on this device: host construction data, as `from_data`.
+        let host = float_from_data(crate::random::float(*device, shape, distribution), device);
+        if DType::from(dtype) == DType::BF16 {
+            cast_native(host, DType::BF16)
+        } else {
+            host
+        }
     }
 
     pub fn float_expand(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor {
@@ -3697,6 +3740,14 @@ pub mod int {
                 "int_random",
                 format_args!("shape={shape:?}, dtype={dtype:?}"),
             );
+        }
+        if let Some(out) = native_random(
+            &shape,
+            crate::random::int_draw(distribution),
+            device,
+            DType::I32,
+        ) {
+            return out;
         }
         int_from_data(crate::random::int(*device, shape, distribution), device)
     }

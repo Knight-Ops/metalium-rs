@@ -37,6 +37,7 @@ mod traffic;
 mod unsupported;
 mod views;
 
+pub use random::Draw;
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
 };

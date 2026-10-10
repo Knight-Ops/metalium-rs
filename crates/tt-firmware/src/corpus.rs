@@ -589,7 +589,7 @@ where
         until_drain: push_window,
         _p: core::marker::PhantomData,
     };
-    push.span(0, code_len, &loops[..n]);
+    push.span(push.start(code_len), code_len, &loops[..n]);
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
 
@@ -696,7 +696,7 @@ where
         until_drain: push_window,
         _p: core::marker::PhantomData,
     };
-    push.span(0, code_len, &loops[..count as usize]);
+    push.span(push.start(code_len), code_len, &loops[..count as usize]);
     trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
     wait_for_coprocessor();
     Ok(())
@@ -787,6 +787,41 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
+    /// Lane T6: honour a seed directive (`tt_isa::dataflow::seed_directive`)
+    /// at the head of the program, and return the first word to push (past it).
+    /// The coprocessor is drained, the seed goes to the PRNG seed register by a
+    /// full-width RISC-V store, a fence publishes it, and the settling interval
+    /// elapses before anything that reads the generator is pushed: the restart
+    /// procedure `step91_seeded_prng` validates on both cards (a `WRCFG` seed
+    /// write does not restart silicon's stream).
+    fn start(&self, code_len: u32) -> u32 {
+        use tt_isa::dataflow::{SEED_DIRECTIVE, SEED_SETTLE_NOPS, SEED_WORDS};
+        // SAFETY: the first words of the staged program, whose length the
+        // caller checked.
+        if code_len < SEED_WORDS || unsafe { l1_read32(self.program) } != SEED_DIRECTIVE {
+            return 0;
+        }
+        // SAFETY: as above.
+        let seed = unsafe { l1_read32(self.program + 4) };
+        wait_for_coprocessor();
+        // SAFETY: the coprocessor is drained; only the generated full-width
+        // seed field is written, and the fence follows before anything
+        // dependent on it is pushed.
+        unsafe {
+            core::ptr::write_volatile(
+                tt_isa::cfg::generated::global::PRNG_SEED_Seed_Val.riscv_address(ConfigBank::Bank0)
+                    as *mut u32,
+                seed,
+            );
+        }
+        publish();
+        for _ in 0..SEED_SETTLE_NOPS {
+            // SAFETY: an ordinary RISC-V NOP, which the instruction gate allows.
+            unsafe { core::arch::asm!("nop", options(nomem, nostack)) };
+        }
+        SEED_WORDS
+    }
+
     /// Words `[lo, hi)`, each block repeat inside them its `count` times --
     /// the next one being the first, not yet passed, that lies inside and is
     /// not the span itself; the ones inside it its own call's.

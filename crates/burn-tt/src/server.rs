@@ -382,6 +382,16 @@ pub trait Engine {
     }
 
     // lane:t6_random (Engine trait): add this lane's methods below this line only.
+    /// A `dims` tensor drawn on the device by the seeded tile kernel
+    /// (`tt_kernels::prng`), resident, with no upload.
+    fn random_dram(
+        &mut self,
+        _dims: [usize; 2],
+        _draw: crate::random::Draw,
+        _base: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        Err(unsupported())
+    }
 
     // lane:t7_dtype (Engine trait): add this lane's methods below this line only.
 
@@ -2558,6 +2568,17 @@ impl Engine for KmdEngine {
     }
 
     // lane:t6_random (KmdEngine): add this lane's methods below this line only.
+    fn random_dram(
+        &mut self,
+        dims: [usize; 2],
+        draw: crate::random::Draw,
+        base: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .random(&mut self.session, dims, draw, base)
+    }
 
     // lane:t7_dtype (KmdEngine): add this lane's methods below this line only.
 
@@ -3170,6 +3191,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     }
 
     // lane:t6_random (MeshEngine): add this lane's methods below this line only.
+    fn random_dram(
+        &mut self,
+        dims: [usize; 2],
+        draw: crate::random::Draw,
+        base: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        self.buffers
+            .random(self.fabric.chips[0].session(), dims, draw, base)
+    }
 
     // lane:t7_dtype (MeshEngine): add this lane's methods below this line only.
 
@@ -3342,6 +3372,54 @@ pub fn kmd_mesh_engine(
         serve.serve(&mut engine);
         Ok(())
     }
+}
+
+// lane:t6_random (DramBuffers and submit wrappers): device draws.
+impl DramBuffers {
+    pub fn random<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        dims: [usize; 2],
+        draw: crate::random::Draw,
+        base: u64,
+    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+        use crate::random::Draw;
+        use tt_kernels::prng::{role, Output};
+        let drawn = match draw {
+            Draw::Unit => s.random_tiles(dims, Output::Unit, base, role::UNIT),
+            Draw::Uniform(lo, hi) => s.random_uniform(dims, base, lo, hi),
+            Draw::Bernoulli { p, int } => s.random_bernoulli(dims, base, p, int),
+            Draw::Normal {
+                mean,
+                std,
+                int: false,
+            } => s.random_normal(dims, base, mean, std),
+            Draw::Normal {
+                mean,
+                std,
+                int: true,
+            } => s.random_normal_int(dims, base, mean, std),
+            Draw::IntRange(lo, hi) => s.random_int_range(dims, base, lo, hi),
+            Draw::IntWords => s.random_int_words(dims, base),
+        }
+        .map_err(|e| EngineError(e.to_string()))?;
+        Ok(self.insert(drawn))
+    }
+}
+
+pub(crate) fn random(
+    device: TtDevice,
+    dims: [usize; 2],
+    draw: crate::random::Draw,
+    base: u64,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "random",
+        device,
+        dims,
+        move || format!("native random {draw:?}"),
+        move |engine, _| engine.random_dram(dims, draw, base),
+    )
 }
 
 // lane:t7_dtype (DramBuffers and submit wrappers): FP16 storage shares the raw

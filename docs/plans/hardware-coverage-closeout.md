@@ -168,7 +168,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   tile; ties break on original index; sentinels sort last; explicit axis-length bound. Routes
   `float/int_sort`, `_sort_with_indices`, `_argsort`, `_argtopk`; `topk` follows through Burn's
   default. Negative controls: a dropped stage; a missing tie-break.
-- [ ] **T6: native random and dropout (S7).** Per-tile seeding through a RISC-V config store, fence
+- [x] **T6: native random and dropout (S7)** (steps 140-142; ttsim 9+6+8 and cards 0/1: lane model 8 seeds x 32 lanes exact, kernel 6/6, Burn 8/8; three negative controls plus three statistical controls watched failing; traces refuse random rather than repeat seeds; divergence rows 99-100 proposed in the lane report: lane offset 96 vs 98 and the settle interval). **T6: native random and dropout (S7).** Per-tile seeding through a RISC-V config store, fence
   and 512 NOPs (step91). Bit-exact host model of the hardware stream; pinned χ² and
   Kolmogorov–Smirnov tests; Bernoulli, uniform, normal (Box–Muller over the S4 programs),
   `int_random`. Replay advances a GDDR seed buffer or random is refused inside traces.

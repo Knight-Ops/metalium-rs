@@ -1983,6 +1983,12 @@ impl<T: Transport> Session<T> {
             .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))
     }
 
+    /// Lane T6: whether the transport is the simulator, which picks the PRNG
+    /// model's lane initialisation (`prng::Target`).
+    pub fn is_simulated(&mut self) -> bool {
+        self.dev.transport().is_simulated()
+    }
+
     /// The GDDR allocator, for ops built outside this file (`sfpu::sort`).
     pub(crate) fn dram_alloc(&mut self) -> Result<&mut DramAlloc, TensorError> {
         Ok(&mut self.dram_state()?.alloc)

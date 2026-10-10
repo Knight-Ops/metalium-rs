@@ -1395,7 +1395,8 @@ Each names the measurement it must move. The Burn-side ones are in
       modes, matching the documented (biased) behaviour rather than "fixing" it. Burn:
       `float_cast`, `float_into_int`, `int_into_float`, `float_round`, `float_floor`,
       `float_ceil`, `float_trunc`.
-- [~] **S7 The PRNG.** Step91 checks the seed-register write, advance and predication. WRCFG does not restart silicon's stream; direct RISC-V configuration stores with a fence and 512 NOP iterations do restart it on both cards. Simulator lane initialization has a one-lane offset. Seeded application stream semantics and quality remain unresolved. Planned: seeded per tile from `Backend::seed`. The claim is distributional
+- [x] **S7 The PRNG** (2026-10-10, steps 140-142, lane T6; cards 0 and 1): a host model of the per-lane stream (`advance^(98-2i)(seed)` on silicon, measured for 8 seeds x 32 lanes on both cards; ttsim's `advance^(96-2i)`), a per-tile seed directive honoured by the role firmware (RISC-V store + fence + 512 NOPs), a decorrelated generator (33 reads per slot plus a bijective ARX mixer), native Bernoulli, uniform, normal (Box-Muller over the S4 programs) and `int_random` (multiply-shift, range at most 2^23) with derived bounds, resident Burn `float_random`/`int_random`, dropout composed with no uploads; random inside a trace is refused (replay would repeat the seeds). Entropy is 32 bits per tile and the mixer is an empirical decorrelator, not a statistical-suite generator. Earlier text follows.
+  ** Step91 checks the seed-register write, advance and predication. WRCFG does not restart silicon's stream; direct RISC-V configuration stores with a fence and 512 NOP iterations do restart it on both cards. Simulator lane initialization has a one-lane offset. Seeded application stream semantics and quality remain unresolved. Planned: seeded per tile from `Backend::seed`. The claim is distributional
       (a stated statistical test), not bit-exact against Flex, whose generator is
       different. Burn: `float_random`, dropout.
 - [x] **S8 Lane movement.** `Program::rotate_row` (`SFPSHFT2_MOD1_SUBVEC_SHFLROR1`),
@@ -1654,7 +1655,7 @@ path today, `~` when only some shapes do.
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
-| `float_random` | works through seeded per-device host tensor construction; native hardware distributions deferred | S7 partial |
+| `float_random`, `int_random` | x native seeded resident draws (Default, Uniform, Bernoulli, Normal); host construction only for a device with no GDDR; F16/F64 fail explicitly; refused inside a trace; cards 0 and 1 (step142) | S7 |
 | `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
 | `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |

@@ -18,6 +18,26 @@ pub const STREAMED: u32 = 1 << 30;
 pub const LENGTH_MASK: u32 = !(STREAMED | mailbox::loops::LOOPED);
 pub const VERSION: u32 = 1;
 pub const STEP_WORDS: u32 = 4;
+
+/// Lane T6: a role program may open with a two-word *seed directive*
+/// (`seed_directive`): the role firmware does not push them, it stores the
+/// second word to the PRNG seed register with a full-width RISC-V store, fences,
+/// and waits [`SEED_SETTLE_NOPS`] NOP iterations -- the one restart procedure
+/// that restarts silicon's per-lane streams (`step91_seeded_prng`; a `WRCFG`
+/// does not). Its opcode byte (0xF5) is one no Tensix instruction uses
+/// (`seed_directive_opcode_is_unused`), so no program can contain it by accident.
+pub const SEED_DIRECTIVE: u32 = 0xF500_5EED;
+/// NOP iterations after the seed store (`step91`'s validated, conservative
+/// settling interval; not a measured minimum).
+pub const SEED_SETTLE_NOPS: u32 = 512;
+/// Words a seed directive takes at the head of a program.
+pub const SEED_WORDS: u32 = 2;
+
+/// The two program words that restart the PRNG from `seed` before anything
+/// after them runs.
+pub const fn seed_directive(seed: u32) -> [u32; 2] {
+    [SEED_DIRECTIVE, seed]
+}
 pub const INPUT: u64 = dm::nc::MAILBOX_BASE + 0x100;
 pub const OUTPUT: u64 = INPUT + 8;
 pub const ABORT: u64 = OUTPUT + 8;
@@ -214,6 +234,14 @@ pub fn packet_length(header: [u32; 8]) -> Result<usize, u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn seed_directive_opcode_is_unused() {
+        let opcode = (SEED_DIRECTIVE >> 24) as u8;
+        assert!(crate::isa::generated::ALL
+            .iter()
+            .all(|def| def.opcode() != opcode));
+        assert_eq!(seed_directive(7), [SEED_DIRECTIVE, 7]);
+    }
     #[test]
     fn counters_wrap_and_support_large_rings() {
         for capacity in [1u16, 2, 16, 192, 32767] {
