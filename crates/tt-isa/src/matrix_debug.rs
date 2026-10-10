@@ -291,6 +291,10 @@ impl AddrModTable {
     /// 24 `SETC16`s: the `AB`, `DST` and `BIAS` word of each entry, every field
     /// not named above zero (including the bias, which would otherwise step
     /// the page's `ExtraAddrModBit`).
+    /// It does not write the Blackhole `ADDR_MOD_AB2_SECk` words (`ThreadConfig`
+    /// 20..27: bit 0 `SrcAIncr`, bit 1 `SrcBIncr`), so those keep whatever an earlier
+    /// program left; both bits lie above the 6-bit counters and no measured case
+    /// depends on them.
     pub fn setup(&self) -> Result<[Instruction; 24], DebugError> {
         use thread::*;
         let a = [
@@ -702,7 +706,11 @@ pub mod model {
                 Rows::One { src_row, dst_row } => (src_row, dst_row, false),
                 Rows::Eight { src_row, dst_row } => (src_row, dst_row, true),
             };
-            move_rows(src, state, s, d, eight, use_dst32b_lo, &mut sink)?;
+            // Measured on card 0 (step111b): with the eight-row bit clear, instruction
+            // bit 14 (the low bit of the `AddrMod` entry number) also widens the move
+            // to a FOUR-row aligned block, whatever the entry's increments are.
+            let four = !eight && addr_mod & 1 == 1;
+            move_rows_impl(src, state, s, d, eight, four, use_dst32b_lo, &mut sink)?;
             apply_addr_mod(&mut state, table, addr_mod);
         }
         Ok(())
@@ -719,6 +727,31 @@ pub mod model {
         src_row: u32,
         dst_row: u32,
         move8_rows: bool,
+        use_dst32b_lo: bool,
+        sink: impl FnMut(Write),
+    ) -> Result<(), &'static str> {
+        move_rows_impl(
+            src,
+            state,
+            src_row,
+            dst_row,
+            move8_rows,
+            false,
+            use_dst32b_lo,
+            sink,
+        )
+    }
+
+    /// [`move_rows`] with the four-row widening (`move4_rows`: instruction bit 14
+    /// set with the eight-row bit clear; see [`run_moves`]).
+    #[allow(clippy::too_many_arguments)]
+    fn move_rows_impl(
+        src: &[[u32; 16]; 64],
+        state: State,
+        src_row: u32,
+        dst_row: u32,
+        move8_rows: bool,
+        move4_rows: bool,
         use_dst32b_lo: bool,
         mut sink: impl FnMut(Write),
     ) -> Result<(), &'static str> {
@@ -740,6 +773,10 @@ pub mod model {
             dst &= 0x3f8;
             src_r &= 0x38;
             8
+        } else if move4_rows {
+            dst &= 0x3fc;
+            src_r &= 0x3c;
+            4
         } else {
             dst &= 0x3ff;
             src_r &= 0x3f;
@@ -1171,8 +1208,12 @@ mod tests {
             }
         })
         .unwrap();
-        // The first move is unshifted; the entry then advances SrcA by 1 and Dst by 2.
-        assert_eq!(rows, [(4, 3), (6, 4)]);
+        // The first move names entry 1, whose number has instruction bit 14 set, so
+        // with the eight-row bit clear it writes a FOUR-row aligned block (source
+        // rows 0..3 to Dst rows 4..7; measured on card 0, step111b). The entry then
+        // advances SrcA by 1 and Dst by 2, so the second move (entry 0) reads source
+        // row 3 and writes row 6.
+        assert_eq!(rows, [(4, 1), (5, 2), (6, 3), (7, 4), (6, 4)]);
     }
 
     #[test]

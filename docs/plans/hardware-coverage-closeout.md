@@ -240,7 +240,7 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 | T10 benchmarks and dispositions | `[x]` benchmarks and baselines recorded; M2/M3/D5 `[-]`; the lane's stale-statement audit for `burn-native-cutover.md` and `burn-backend-parity.md` is NOT applied |
 | E mutexes/atomics | `[x]` card 0 (ATSWAP single form `[-]`) |
 | H SFPLOADMACRO | `[x]` card 0 |
-| MD matrix diagnostics | `[x]` MOVDBGA2D; GATESRCRST `[-]`; increment-1 `AddrMod` cases open (shared with `MOVA2D`) |
+| MD matrix diagnostics | `[x]` MOVDBGA2D (incl. the `AddrMod` cases: bit 14 widens a one-row move to four rows, now in the model); GATESRCRST `[-]` |
 | PU packer/unpacker modes | `[x]` ReLU, edge masking, BF16 `UnpackToDst`, tileize; unpacker transpose `[-]` (M3); not routed into Session/Burn ops |
 | FENCE (X7) | `[x]` card 0 and both-card Ethernet gates |
 | N NoC | atomics `[x]`; completion polling `[x]`; IRQ `[-]`; **multicast `[x]`** (cards 0 and 1, run one probe at a time, no reboot) |
@@ -252,7 +252,6 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 
 ### Still open (updated 2026-10-10)
 1. X6 (mover fast path): agent in progress.
-2. The increment-1 `AddrMod` cases (shared with the `MOVA2D` control): a diagnostic sweep is being written.
 3. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
 4. Moving this plan and `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1 and 2 are decided.
 

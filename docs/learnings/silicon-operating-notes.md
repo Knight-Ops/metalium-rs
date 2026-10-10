@@ -769,8 +769,10 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   payloads (`0x7e00`) and flushes subnormals.
 - **Matrix diagnostics.** `MOVDBGA2D` one/eight-row moves, all four SrcA format overrides (forced to
   TF32 under Fp32), flush and reading a bank the unpacker still owns agree with the page model;
-  the increment-1 `AddrMod` advance cases disagree for the `MOVA2D` control too (increments of 8
-  agree), so they are an open shared configuration issue. `GATESRCRST` executes safely but has no
+  a one-row move naming an odd `AddrMod` entry (instruction bit 14 set, eight-row bit clear) writes a
+  four-row aligned block on its own first move, for `MOVA2D` and `MOVDBGA2D` alike and whatever the
+  entry's increments; the increments then apply as modelled (entry *k* = SrcA +*k*, Dst +7-*k* in the
+  sweep), so a one-row move that must write one row names an even entry (step111b). `GATESRCRST` executes safely but has no
   observable effect against a SrcB rewritten through `MOVD2B`.
 - **NoC.** All 21 NoC atomic forms (variable-width increment, CAS, mask and indexed swaps, eight
   Zaamo ops, six accumulate formats) match the page models against a neighbouring tile's L1. The

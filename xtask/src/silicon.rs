@@ -215,6 +215,8 @@ pub const SMOKE: &[&str] = &[
     "step146_burn_approx::",
     "step147_mesh_trace::",
     "step111_matrix_debug::probe_movdbga2d_minimal_survives",
+    "step111_matrix_debug::movdbga2d_addr_mod_",
+    "step111_matrix_debug::mova2d_control_addr_mod_",
     "step111_matrix_debug::movdbga2d_eight_rows",
     "step111_matrix_debug::movdbga2d_one_row",
     "step111_matrix_debug::movdbga2d_addr_mod_1_two_blocks",

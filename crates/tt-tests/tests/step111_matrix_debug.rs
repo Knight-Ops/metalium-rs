@@ -228,6 +228,11 @@ fn expected(bits: &[u32], case: &Case, format: DebugFormat) -> Vec<u32> {
     let (mut src_rwc, mut dst_rwc) = (0u32, 0u32);
     for &(rows, addr_mod) in &case.moves {
         let (s, d, n) = match rows {
+            // Measured on card 0 (step111b): instruction bit 14, the low bit of the entry
+            // number, widens a one-row move to a four-row aligned block.
+            Rows::One { src_row, dst_row } if addr_mod & 1 == 1 => {
+                ((src_row + src_rwc) & 0x3c, (dst_row + dst_rwc) & 0x3fc, 4)
+            }
             Rows::One { src_row, dst_row } => {
                 ((src_row + src_rwc) & 0x3f, (dst_row + dst_rwc) & 0x3ff, 1)
             }
@@ -841,7 +846,6 @@ macro_rules! debug_case_open {
     ($name:ident, $case:expr) => {
         #[test]
         #[cfg(feature = "silicon")]
-        #[ignore = "open: the increment-1 address-modifier cases disagree with the model for the MOVA2D control as well as MOVDBGA2D on card 0 (shared configuration, not MOVDBGA2D); see hardware-coverage.md"]
         fn $name() {
             harness::assert_on_silicon();
             check_case(Mover::Movdbga2d, $case, stringify!($name));
@@ -891,7 +895,6 @@ debug_case!(
 /// index is being shifted up by four (the Wormhole page's `ExtraAddrModBit`), and
 /// the entry the instruction reaches is not entry 1.
 #[test]
-#[ignore = "open: the increment-1 address-modifier cases disagree with the model for the MOVA2D control as well as MOVDBGA2D on card 0 (shared configuration, not MOVDBGA2D); see hardware-coverage.md"]
 #[cfg(feature = "silicon")]
 fn movdbga2d_addr_mod_1_two_rows_with_mirrored_upper_entries() {
     harness::assert_on_silicon();
@@ -910,7 +913,6 @@ fn mova2d_control_one_row_3_to_5() {
 }
 
 #[test]
-#[ignore = "open: the increment-1 address-modifier cases disagree with the model for the MOVA2D control as well as MOVDBGA2D on card 0 (shared configuration, not MOVDBGA2D); see hardware-coverage.md"]
 #[cfg(feature = "silicon")]
 fn mova2d_control_addr_mod_1_two_rows_src_and_dst_advance() {
     harness::assert_on_silicon();
