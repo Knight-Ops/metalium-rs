@@ -228,7 +228,7 @@ Branch `phase10-closeout`. Verification at the final commit: the whole default w
 passes, workspace Clippy (default and `tt-tests/silicon`), firmware Clippy, `fmt`, `gen-burn-ops
 --check`, `burn-coverage --check`, `check-no-sim-in-ship` and `check-no-flex-in-backend` pass, the
 eight MNIST end-to-end regressions pass with the golden unchanged (265 s), and the release card-0
-smoke tier passes (see the closing line). Baseline before this effort: 258/258 (`1791558187`).
+smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258/258, `1791558187`).
 
 ### Disposition of every lane
 | Lane | Outcome |
