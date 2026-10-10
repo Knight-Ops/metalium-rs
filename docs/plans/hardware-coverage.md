@@ -175,7 +175,7 @@ all fidelities, TF32/BF16 Src routes, transposes and specials, `[64,8192] @
 [8192,64]`, supported batches and resident Burn large-K against a derived
 bound. Negative controls fail when axis mapping, edge masking or accumulator
 reload is omitted. Both cards passed in run `1791145571`.
-Release-silicon benchmark medians and validation remain unrun.
+Release-silicon K-block medians with validation: `docs/learnings/firmware-performance.md`, "P2 K-blocking and R3 norm release baselines" (2026-10-10).
 
 ### 10.2 close-out (historical measurements)
 
@@ -973,7 +973,7 @@ Each names the measurement it must move. The Burn-side ones are in
 - [~] **P2 K blocking** (concepts review G3): native FP32 Dst reload implemented
       for resident ordinary and supported batched matmuls (`step68`). Same
       accumulation order, no block-sum addition or packer L1 accumulation.
-      Simulator and both-card gates pass (`1791145571`); release benchmarks pending.
+      Simulator and both-card gates pass (`1791145571`); release baselines recorded 2026-10-10 in `firmware-performance.md`.
       Host-staged `matmul_chunked` retains its separate arithmetic contract.
 
 ### F — SFPU foundation (blocks every S item)
@@ -1533,7 +1533,7 @@ Each names the measurement it must move. The Burn-side ones are in
 - [~] **R3 Norms.** Burn LayerNorm and RMSNorm already compose native primitives.
       Dedicated forward/backward, layout and residency gates are in `step70`;
       both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
-      Performance measurements remain open. Fusion is deferred.
+      Release baselines recorded 2026-10-10 in `firmware-performance.md`. Fusion is deferred.
 - [x] **R4d Mesh trace capture/replay** (2026-10-10, step147): `MeshEngine` captures one session trace per chip between the host-run Ethernet transfers and replays them in order (sync both chips, re-run the transfer, continue), refusing with `UnheldTransfer` any capture whose transfer endpoints no stored trace holds. Changed-input replays of a distributed product chain and an attention forward equal fresh runs bit for bit with no host uploads; card 0/1 gates pass. Mesh training traces and `copy_into` on a mesh remain unsupported.
 - [~] **R4 `ModuleOps::attention`.** Native QKᵀ, scale, positive softcap,
       bottom-right causal/broadcast masks, bias, NaN-safe softmax and V products.

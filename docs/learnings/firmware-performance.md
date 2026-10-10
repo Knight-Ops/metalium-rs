@@ -1087,3 +1087,43 @@ amortizes launches across runs. Ragged movement additionally zeros and copies
 face-row fragments. The explicit copy is slower end to end in every measured
 shape despite the faster local engine. Keep all four APIs opt-in; automatic
 Burn routing remains unchanged, including zero routing.
+
+## P2 K-blocking and R3 norm release baselines (2026-10-10)
+
+Conditions: release silicon, isolated runner (`cargo xtask bench --device all --filter
+silicon_bench_tensix_ops::<name>`), both cards, AICLK 1350 MHz, GDDR 16000 MT/s x 8 channels, git
+`c49c2ed` (working tree with the lane commits, runs `1791593690` K-block, `1791593692` norm
+forward, `1791593699` norm forward+backward), two warmups and seven host-timed samples, median
+(p10-p90 in the run files), validation outside the timing: every K-blocked result equals the
+unsplit result bit for bit, and `[64,8192]@[8192,64]` also equals an exact oracle; every norm is
+checked against an f64 oracle and burn-flex within a derived bound before timing (F32 forward also
+bit-exact against the step70 specification model). No speedup is claimed.
+
+K-block matmul (TF32 Src, F32 storage, HiFi4, two tiles; "unsplit" is the planner's own choice),
+median us, card 0 / card 1:
+
+| Shape | unsplit | k_block=1 | 4 | 16 | 64 |
+|---|--:|--:|--:|--:|--:|
+| [64,8192]@[8192,64] | 751 / 732 | 5821 / 5880 | 1797 / 1791 | 843 / 839 | 725 / 726 |
+| [37,4097]@[4097,35] | 496 / 492 | 2935 / 2921 | 955 / 954 | 498 / 494 | 527 / 521 |
+
+A one-tile K block costs 7.7-8x the planner's choice (each block re-packs and reloads the FP32
+partial); blocks of 16 tiles or more are within about 5% of unsplit, and the planner default is at
+or near the best on both shapes.
+
+Norms (epsilon 1, gamma 1, beta 0), median ms, card 0 / card 1:
+
+| Op | dtype | Shape | forward | forward+backward |
+|---|---|---|--:|--:|
+| LayerNorm | F32 | [37,8193] | 15.64 / 15.50 | 70.8 / 71.0 |
+| LayerNorm | BF16 | [37,8193] | 78.5 / 78.0 | 307.5 / 309.3 |
+| RmsNorm | F32 | [37,8193] | 8.81 / 8.88 | 53.1 / 53.4 |
+| RmsNorm | BF16 | [37,8193] | 52.6 / 52.5 | 186.8 / 186.3 |
+| LayerNorm | F32 | [65,70] | 0.464 / 0.465 | 1.85 / 1.81 |
+| LayerNorm | BF16 | [65,70] | 1.47 / 1.48 | 4.81 / 4.69 |
+| RmsNorm | F32 | [65,70] | 0.318 / 0.327 | 1.50 / 1.46 |
+| RmsNorm | BF16 | [65,70] | 1.08 / 1.07 | 3.30 / 3.22 |
+
+The BF16 norms are 3-5x slower than F32 (each Burn op widens and narrows once); the compositions
+are unfused by design (norm fusion is deferred). Norm benchmarks record only downloads per run,
+because Burn exposes no `dataflow_stats`.

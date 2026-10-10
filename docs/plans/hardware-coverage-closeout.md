@@ -179,7 +179,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   the Precise bound somewhere; alternating modes must give different bits.
 - [x] **T9: mesh trace capture (R4)** (step147; ttsim 5/5 and card 0/1 silicon 3/3; per-chip session traces between host-run Ethernet transfers, `UnheldTransfer` refusal; two negative controls watched failing; mesh training traces and `copy_into` on a mesh still unsupported). **T9: mesh trace capture (R4).** `MeshEngine::begin_trace`; changed-input replay matches a
   fresh run with no uploads. Both cards.
-- [~] **T10: benchmarks and dispositions** (K-block and norm release benchmarks written in `silicon_bench_tensix_ops.rs`, NOT yet run: `cargo xtask bench --device all --filter silicon_bench_tensix_ops::{k_block_matmul_baselines,norm_forward_baselines,norm_backward_baselines}`; M2/M3/D5 dispositions applied above; stale-statement audit list is in the lane report). **T10: benchmarks and dispositions.** Release K-block and norm benchmarks (P2/R3); M2 `[-]`
+- [x] **T10: benchmarks and dispositions** (K-block and norm release benchmarks run on both cards, runs `1791593690`/`92`/`99`, validated, recorded in `firmware-performance.md`; M2/M3/D5 dispositions applied; the lane's stale-statement audit list for `burn-native-cutover.md` and `burn-backend-parity.md` is not yet applied). **T10: benchmarks and dispositions.** Release K-block and norm benchmarks (P2/R3); M2 `[-]`
   GMPOOL diagnostic-only (packed ArgMax index bits missing on both cards, run `1791240702`); record
   PU's M3/D5 dispositions.
 
