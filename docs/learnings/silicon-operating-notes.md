@@ -776,8 +776,11 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   observable effect against a SrcB rewritten through `MOVD2B`.
 - **NoC.** All 21 NoC atomic forms (variable-width increment, CAS, mask and indexed swaps, eight
   Zaamo ops, six accumulate formats) match the page models against a neighbouring tile's L1. The
-  `NIU_TRANS_COUNT_RTZ_SOURCE` read follows completion; its stickiness is not established.
-  Multicast probes were not run.
+  `NIU_TRANS_COUNT_RTZ_SOURCE` read follows completion and the bit is sticky until cleared. Multicast
+  writes reach every recipient of a 1x2 and a larger rectangle and no non-recipient (cards 0 and 1, one
+  probe per process, no hang or reboot). Request initiator 1 of NoC #0 keeps its registers between
+  requests, so `set_state`/`with_state` style issue works (X6, `step118_mover_fast_path`); it is only 3-4%
+  faster than rewriting initiator 0's registers (`firmware-performance.md`).
 - **PRNG.** Silicon lane `i` after a restart is `advance^(98-2i)(seed)` (8 seeds x 32 lanes, both
   cards); the seed directive in the role firmware (RISC-V store, fence, 512 NOPs) reproduces the
   model bit for bit under T0 unpack and T2 pack concurrency.

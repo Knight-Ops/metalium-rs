@@ -1139,3 +1139,15 @@ instructions, with special-value handling costing as much as Precise's). SFPU ma
 push-bound at the runner's 2.8 cycles per word (39 of 73 kinds have a push/backend cycle ratio above
 1, median 1.17, max 2.87, taking the vector unit at one instruction per cycle as a floor); the
 matmul is backend-bound (rows AC/AD).
+
+## X6 mover NIU fast path (2026-10-10, card 0)
+
+`silicon_perf::mover_read_fast_path`, release, run `1791600377`: reads through request initiator 1 of
+NoC #0 writing only the words that change (`dm::READ_FAST`) against the path that writes every
+register of initiator 0, ABAB after three warm-up lists each, median of `REPS`, an empty list's time
+subtracted, destination bytes checked against the host's copy. 64 B x 256: 0.481 -> 0.464 us per
+entry; 2 KiB: 0.482 -> 0.464 (one port), 0.485 -> 0.471 (all channels); 4 KiB: 0.480 -> 0.462,
+0.487 -> 0.473 (3 ports), 0.484 -> 0.470 (all channels); 16 KiB: 0.485 -> 0.471. Fast/slow is
+0.961-0.972 everywhere: about 17 ns of the ~0.48 us a request costs. The request's cost is its round
+trip, not the register writes, so a gather's share of a step does not move; more requests in flight
+is the lever, not cheaper issue.

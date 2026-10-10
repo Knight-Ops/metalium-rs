@@ -842,7 +842,10 @@ fn mover_read_fast_path() {
             // the earlier in the cycling destination), from the host's copy.
             let mut back = vec![0u8; L1_SPAN as usize];
             d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
-            let landed = list.iter().rev().take(24).all(|e| {
+            // Only entries within one trip of the destination cycle survive: a
+            // 16 KiB entry is overwritten by the one 16 entries after it.
+            let survivors = (L1_SPAN / list[0][5]).min(24) as usize;
+            let landed = list.iter().rev().take(survivors).all(|e| {
                 let (ch, off, at, len) = (
                     chans.iter().position(|c| c.index() as u32 == e[1]).unwrap(),
                     e[3] - base as u32,

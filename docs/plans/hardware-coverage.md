@@ -902,7 +902,7 @@ From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` ro
 Each names the measurement it must move. The Burn-side ones are in
 `burn-backend-parity.md` (B5, B8, B16).
 
-- [ ] **X6 A fast path for the mover's requests.** A GDDR read costs ~0.46 us an entry
+- [x] **X6 A fast path for the mover's requests** (2026-10-10: built and silicon-validated, opt-in; the gain is 3-4%, far short of the 16 KiB-entry rate this item hoped for -- see the result below). A GDDR read costs ~0.46 us an entry
       however small (row W after row Y), and a matmul gather is one entry per tile: a
       record should issue its moves straight to the NIU -- validated once per record,
       not re-encoded and decoded per tile -- and write only the NIU registers that
@@ -910,6 +910,15 @@ Each names the measurement it must move. The Burn-side ones are in
       register persistence to be checked on ttsim and in a gate first). Moves:
       `silicon_perf::mover_read_shapes` 4 KiB entries toward the 16 KiB-entry rate, and
       the gather's share of a step (row V: 0.94 ms of 2.4).
+      **Result (card 0, release, run `1791600377`):** request initiator 1 of NoC #0 keeps its
+      registers between requests (isolated probes `silicon_x6_minimal_persistence_probe` and
+      `silicon_x6_initiator1_persistence_probe`, no hang or reboot), and the fast path
+      (`dm::READ_FAST`, `DataMover::set_read_fast`) moves byte-identical data to the slow one
+      (`silicon_x6_fast_read_path_matches_the_slow_one`; a skipped destination and a flipped
+      bit are both caught). But a request costs ~0.48 us either way and the fast path saves
+      only ~17 ns of it: fast/slow 0.96-0.97 on 64 B, 2 KiB, 4 KiB and 16 KiB entries. The
+      cost is therefore not NIU register writes; it is the request's round trip, so the
+      remaining lever is more requests in flight, not cheaper issue. Off by default.
 - [x] **X7b Posted-write fence as API** (2026-10-10): `Device::{write_fenced, write32_fenced, l1_write_fenced, eth_write_fenced}` and `FencedWrite` issue the posted writes then exactly one read-back of the dword holding the last byte, refusing misaligned, foreign-window, aperture and non-L1 targets before any write. Gated by `tt-device` unit tests and `step119` (a posted-write transport model: ttsim applies BAR writes synchronously and cannot show the race itself); card 0 `posted_then_fenced_l1_writes_read_back_exactly`; both-card Ethernet gates `silicon_eth_link::{host_driven_tt_link, mover::}` pass with `Mover::stage` and the eth test sites migrated. Hot paths whose observer is started by the host afterwards stay unfenced by design.
 - [~] **X7 Host transfers** (DMA and batching, 2026-10-03). Tensors use pinned
       host memory and the card's `HOST_READ`/`HOST_WRITE` DMA; parallel host

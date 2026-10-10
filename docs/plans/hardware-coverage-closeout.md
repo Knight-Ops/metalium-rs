@@ -127,9 +127,10 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 - [-] **G: stream overlay** (research complete 2026-10-10: no pinned Blackhole overlay register map, no controlled producer, host-reboot precedent; `STREAMWAIT` and `STREAMWRCFG` are `[-]` with the missing facts listed in `hardware-coverage.md`; steps 109 and rows 80-81 unused). **G: stream overlay** (`STREAMWAIT`, `STREAMWRCFG`; wave 2, after F's register research).
   Likely `[-]`: Blackhole has no NoC Overlay documentation pinned, and Wormhole offsets are not
   adopted.
-- [ ] **X6: mover NIU fast path** (wave 2, after N). First gate NIU register persistence on ttsim and
-  in an isolated probe. Gate: gather output byte-identical to the slow path plus release medians.
-  Exit `[-]` if registers do not persist.
+- [x] **X6: mover NIU fast path** (step118; ttsim and card 0, persistence probes then gate then both
+  controls one at a time, no reboot; release medians run `1791600377`: fast/slow 0.96-0.97 on every
+  shape, ~17 ns of ~0.48 us per request, so opt-in and not the default). The registers persist; the gain
+  is small because the request's round trip, not its register writes, is the cost.
 - [-] **P9: wait planner and `.ttinsn` fusion** (step121, host gate, no card; checker `tt_isa::hazard` over 954 builder role programs finds 0 missing waits and 1,724 redundant waits, so a planner has nothing to insert; `.ttinsn` needs a run-time code generator outside the instruction gate; seven negative controls watched failing). **P9: wait planner and `.ttinsn` fusion** (wave 3, after E/F/H/PU). The planner's waits must
   be a superset of today's hand-written `Before::` waits and keep the MNIST golden. `.ttinsn` is
   measured first; `[-]` if no measurable push bottleneck or if it weakens the build-time instruction
@@ -248,12 +249,11 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 | TS tag search | `[-]` (armed trigger load hangs the baby core, block stays armed) |
 | G stream overlay | `[-]` (no pinned Blackhole register map) |
 | P9 planner, `.ttinsn` | `[-]` (checker shows 0 missing waits; fusion needs a run-time code generator) |
-| **X6 mover NIU fast path** | agent working (2026-10-10); Phase 1 is whether NIU command-buffer registers persist between requests |
+| **X6 mover NIU fast path** | `[x]` card 0; persistence holds, byte-identical, 3-4% faster, opt-in |
 
 ### Still open (updated 2026-10-10)
-1. X6 (mover fast path): agent in progress.
-3. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
-4. Moving this plan and `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1 and 2 are decided.
+1. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
+2. Moving this plan and `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1 is decided.
 
 Operational notes for whoever continues: lane agents never run silicon (the coordinator runs it,
 one test per process, UNVERIFIED encodings isolated first, a known-good gate between risky probes);
