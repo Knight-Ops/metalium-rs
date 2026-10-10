@@ -738,6 +738,137 @@ fn mover_read_shapes() {
     });
 }
 
+/// X6: the mover's fast read path (`dm::READ_FAST`, request initiator 1 of NoC
+/// #0 writing only the words that change) against the path that writes every
+/// register of initiator 0, by the shapes of `mover_read_shapes`, plus a
+/// 2 KiB-entry gather. Each case is run on both paths in alternation (ABAB), after
+/// three untimed warm-up lists on each, and timed as `mover_read_shapes` times:
+/// host clock around `submit_list`/`wait`, less an empty list's time, median of
+/// `REPS`. Every timed list's bytes are checked against the host's copy of the
+/// channels after the last repetition, so a path that is fast because it moves
+/// the wrong bytes fails instead of winning.
+///
+/// Run only after `step118_mover_fast_path`'s silicon persistence probes
+/// have passed on the card: it writes request initiator 1, which no code
+/// here has driven on silicon before.
+#[test]
+#[ignore = "benchmark"]
+fn mover_read_fast_path() {
+    use tt_isa::dm::op;
+    use tt_kernels::dm::DataMover;
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+        const L1: u32 = 0x2_0000;
+        const L1_SPAN: u32 = 0x4_0000;
+        const TOTAL: u32 = 1 << 20;
+        let chans: Vec<_> = dram.channels().collect();
+        let base = 64u64 << 20;
+        let datas: Vec<Vec<u8>> = chans
+            .iter()
+            .map(|ch| {
+                let data = pattern(TOTAL as usize, 7 + ch.index() as u32);
+                d.dram_write(&w4, ch.range(base, TOTAL as u64).unwrap(), &data)
+                    .unwrap();
+                data
+            })
+            .collect();
+        let n = chans.len();
+        let entry = |ch: usize, port: u32, off: u32, l1: u32, len: u32| {
+            [
+                op::READ,
+                chans[ch].index() as u32,
+                port,
+                (base as u32) + off,
+                l1,
+                len,
+                0,
+                0,
+            ]
+        };
+        let shape = |len: u32, ch_of: &dyn Fn(u32) -> usize, port_of: &dyn Fn(u32) -> u32| {
+            (0..TOTAL / len)
+                .map(|i| entry(ch_of(i), port_of(i), i * len, L1 + (i * len) % L1_SPAN, len))
+                .collect::<Vec<_>>()
+        };
+        let time = |d: &mut Dev<'_>, m: &mut DataMover<tt_isa::noc::Noc0>, list: &[[u32; 8]]| {
+            let t0 = Instant::now();
+            m.submit_list(d, &w, list).unwrap();
+            m.wait(d, &w).unwrap();
+            t0.elapsed()
+        };
+        m.set_read_fast(d, &w, false).unwrap();
+        let empty = median(
+            (0..REPS)
+                .map(|_| time(d, &mut m, &[[op::WAIT, 0, 0, 0, 0, 0, 0, 0]]))
+                .collect(),
+        );
+        println!("MEASURE mover_read_fast empty list {empty:?}");
+        let cases: Vec<(&str, Vec<[u32; 8]>)> = vec![
+            (
+                "64 B x 256",
+                (0..256u32)
+                    .map(|i| entry(0, 0, i * 64, L1 + i * 64, 64))
+                    .collect(),
+            ),
+            ("2 KiB one port", shape(2048, &|_| 0, &|_| 0)),
+            ("2 KiB all chans", shape(2048, &|i| i as usize % n, &|_| 0)),
+            ("4 KiB one port", shape(4096, &|_| 0, &|_| 0)),
+            ("4 KiB 3 ports", shape(4096, &|_| 0, &|i| i % 3)),
+            ("4 KiB all chans", shape(4096, &|i| i as usize % n, &|_| 0)),
+            ("16 KiB one port", shape(16384, &|_| 0, &|_| 0)),
+        ];
+        for (name, list) in &cases {
+            let mut slow = vec![];
+            let mut fast = vec![];
+            for path in [false, true] {
+                m.set_read_fast(d, &w, path).unwrap();
+                for _ in 0..3 {
+                    time(d, &mut m, list);
+                }
+            }
+            for _ in 0..REPS {
+                for path in [false, true] {
+                    m.set_read_fast(d, &w, path).unwrap();
+                    let dt = time(d, &mut m, list).saturating_sub(empty);
+                    if path { &mut fast } else { &mut slow }.push(dt);
+                }
+            }
+            // The bytes of the last list's last L1_SPAN (the later entries overwrite
+            // the earlier in the cycling destination), from the host's copy.
+            let mut back = vec![0u8; L1_SPAN as usize];
+            d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+            let landed = list.iter().rev().take(24).all(|e| {
+                let (ch, off, at, len) = (
+                    chans.iter().position(|c| c.index() as u32 == e[1]).unwrap(),
+                    e[3] - base as u32,
+                    e[4],
+                    e[5] as usize,
+                );
+                let tail = &back[(at - L1) as usize..][..len.min((L1 + L1_SPAN - at) as usize)];
+                tail == &datas[ch][off as usize..][..tail.len()]
+            });
+            assert!(landed, "{name}: the fast path's reads did not land");
+            let (slow, fast) = (median(slow), median(fast));
+            println!(
+                "MEASURE mover_read_fast {name:<16} {:>4} entries slow {:>9.1?} {:>6.3} us/entry, fast {:>9.1?} {:>6.3} us/entry, fast/slow {:.3}",
+                list.len(),
+                slow,
+                slow.as_secs_f64() * 1e6 / list.len() as f64,
+                fast,
+                fast.as_secs_f64() * 1e6 / list.len() as f64,
+                fast.as_secs_f64() / slow.as_secs_f64()
+            );
+        }
+        m.set_read_fast(d, &w, false).unwrap();
+        m.stop(d, &w).unwrap();
+    });
+}
+
 /// Is a kernel bound by its runners pushing instructions, or by the backend
 /// executing them? Each role's `START -> PUSHED` and `PUSHED -> RETIRED`, in
 /// cycles, for a program of NOPs (the runner's push rate: the backend takes a

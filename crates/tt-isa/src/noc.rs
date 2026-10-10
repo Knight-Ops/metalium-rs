@@ -1051,6 +1051,42 @@ pub mod niu {
             assert_eq!(reg(&r, initiator::CTRL), CMD_RD | RESP_MARKED | STATIC_VC_1);
         }
 
+        /// The mover's fast read path writes the return coordinate and tag once
+        /// per list and the control word with every request, and the target
+        /// coordinate and length only when they change: across every request of
+        /// a read, on any channel and port, the return coordinate, tag and
+        /// control word must be the same, and `AT_DATA` and both address-middle
+        /// words zero.
+        #[test]
+        fn every_request_of_a_dram_read_shares_its_constant_words() {
+            let me = (3, 4);
+            let (ret_hi, tag, ctrl) = (3 | (4 << 6), 3 << 10, CMD_RD | RESP_MARKED | STATIC_VC_1);
+            for ch in crate::dram::Dram::FULL.channels() {
+                for port in 0..crate::dram::PORTS {
+                    for (off, len) in [(0u64, 64u64), (64, 4096), (4096, 40_000), (128, 16384)] {
+                        let l1 = (off % 64) as u32 + 0x2_0000;
+                        let mv = DramMove::new(
+                            ch.range(off, len).unwrap(),
+                            ch.port_for(Niu::Noc0, port),
+                            l1,
+                            false,
+                            me,
+                            T,
+                            Niu::Noc0,
+                        )
+                        .unwrap();
+                        for r in mv.words() {
+                            assert_eq!((r.ret_hi, r.tag, r.ctrl), (ret_hi, tag, ctrl));
+                            let regs = r.registers();
+                            assert_eq!(reg(&regs, initiator::AT_DATA), 0);
+                            assert_eq!(reg(&regs, initiator::TARG_ADDR_MID), 0);
+                            assert_eq!(reg(&regs, initiator::RET_ADDR_MID), 0);
+                        }
+                    }
+                }
+            }
+        }
+
         #[test]
         fn a_dram_read_targets_the_translated_endpoint_and_needs_c64() {
             let ch = crate::dram::Dram::FULL.channel(1).unwrap();

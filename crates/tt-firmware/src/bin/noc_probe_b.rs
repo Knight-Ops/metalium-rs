@@ -18,6 +18,10 @@
 //!    (`NIU_BASE + 0x60`),
 //! 5. records the counters it saw.
 //!
+//! With `flag::PARTIAL` step 3 writes only the registers `word::MASK` selects and
+//! the ten initiator words are read back into `probe::SNAPSHOTS` after completion:
+//! the persistence probe of `step118_mover_fast_path`.
+//!
 //! With `flag::RTZ` it records `NIU_TRANS_COUNT_RTZ_SOURCE` before and after
 //! (with `RTZ_CLEAR`, after first clearing the ID's bit): the polling form of the
 //! completion interrupt. It never sets `NIU_TRANS_COUNT_RTZ_CFG` or the PIC's
@@ -112,6 +116,13 @@ pub extern "Rust" fn firmware_main() -> ! {
         } else {
             Niu::Noc0
         };
+        // The request initiator: 0, or 1 (`NIU_BASE + 0x800`) for the mover
+        // fast path's own (`flag::INITIATOR_1`).
+        let ini = if flags & flag::INITIATOR_1 != 0 {
+            initiator::STRIDE
+        } else {
+            0
+        };
         let multicast = k_kind == kind::MULTICAST;
         if k_kind > kind::MULTICAST {
             put(res, result::STATUS, status::BAD_RECORD);
@@ -122,7 +133,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         let mut free = false;
         for _ in 0..budget {
             // SAFETY: the initiator's `CMD_CTRL`, MMIO in every Tensix tile.
-            if unsafe { read_volatile(reg(niu, initiator::CMD_CTRL)) } & 1 == 0 {
+            if unsafe { read_volatile(reg(niu, ini + initiator::CMD_CTRL)) } & 1 == 0 {
                 free = true;
                 break;
             }
@@ -154,16 +165,21 @@ pub extern "Rust" fn firmware_main() -> ! {
         put(res, result::ACK_BEFORE, acks_before);
 
         let count = if multicast { 11 } else { 10 };
+        let partial = flags & flag::PARTIAL != 0;
+        let mask = if partial { get(rec, word::MASK) } else { u32::MAX };
         for (i, &offset) in probe::REGISTERS.iter().take(count).enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
             let v = get(rec, word::REGISTERS + 4 * i as u64);
             // SAFETY: initiator 0's registers, written while it reads free.
-            unsafe { write_volatile(reg(niu, offset), v) };
+            unsafe { write_volatile(reg(niu, ini + offset), v) };
         }
         stage(k, phase::REGISTERS_WRITTEN);
         // SAFETY: the same initiator; the read-back orders later counter reads.
         unsafe {
-            write_volatile(reg(niu, initiator::CMD_CTRL), 1);
-            let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
+            write_volatile(reg(niu, ini + initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, ini + initiator::CMD_CTRL));
         }
         stage(k, phase::ISSUED);
 
@@ -204,7 +220,27 @@ pub extern "Rust" fn firmware_main() -> ! {
                     reg(niu, niu::CLEAR_OUTSTANDING),
                     tt_isa::noc::multicast::clear_outstanding(txn),
                 );
-                let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
+                let _ = read_volatile(reg(niu, ini + initiator::CMD_CTRL));
+            }
+        }
+        if partial && done {
+            // The initiator is free again once `CMD_CTRL`'s low bit has cleared;
+            // read the words back to see which kept their value.
+            let mut free = false;
+            for _ in 0..budget {
+                // SAFETY: the initiator's `CMD_CTRL`, MMIO in every Tensix tile.
+                if unsafe { read_volatile(reg(niu, ini + initiator::CMD_CTRL)) } & 1 == 0 {
+                    free = true;
+                    break;
+                }
+            }
+            if free {
+                let snap = probe::SNAPSHOTS + u64::from(k) * probe::SNAPSHOT_STRIDE;
+                for (i, &offset) in probe::REGISTERS.iter().take(10).enumerate() {
+                    // SAFETY: initiator 0's registers, read while it reads free.
+                    let v = unsafe { read_volatile(reg(niu, ini + offset)) };
+                    put(snap, 4 * i as u64, v);
+                }
             }
         }
         put(

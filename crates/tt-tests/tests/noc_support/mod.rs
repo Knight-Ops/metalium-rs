@@ -23,6 +23,9 @@ pub struct Req {
     pub txn: u32,
     pub expected_acks: u32,
     pub regs: Vec<u32>,
+    /// With `probe::flag::PARTIAL`: the registers the image writes
+    /// (`probe::word::MASK`).
+    pub mask: u32,
 }
 
 /// What the probe recorded for one request.
@@ -61,6 +64,18 @@ pub fn unicast(regs: &[(u64, u32)], txn: u32, flags: u32) -> Req {
         txn,
         expected_acks: 0,
         regs: values(regs),
+        mask: u32::MAX,
+    }
+}
+
+/// A unicast that writes only the registers `mask` selects (bit `i` is
+/// `probe::REGISTERS[i]`) and leaves the rest as the previous request left them,
+/// with `PARTIAL` set so the image snapshots the initiator afterwards. `regs`
+/// still holds all ten values: the unselected ones are not written.
+pub fn partial(regs: &[(u64, u32)], mask: u32, txn: u32, flags: u32) -> Req {
+    Req {
+        mask,
+        ..unicast(regs, txn, flags | probe::flag::PARTIAL)
     }
 }
 
@@ -72,6 +87,7 @@ pub fn multicast(regs: &[(u64, u32)], txn: u32, flags: u32, acks: u32) -> Req {
         txn,
         expected_acks: acks,
         regs: values(regs),
+        mask: u32::MAX,
     }
 }
 
@@ -98,6 +114,8 @@ pub fn run_probe(
         let at = probe::REQUESTS + k as u64 * probe::REQUEST_STRIDE;
         let mut words = vec![r.kind, r.flags, r.txn, r.expected_acks];
         words.extend(&r.regs);
+        words.resize((probe::word::MASK / 4) as usize, 0);
+        words.push(r.mask);
         let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
         dev.write(&w, tile, at, &bytes).unwrap();
         // Poison the record so an unwritten result cannot pass for a zero.
@@ -155,4 +173,20 @@ pub fn read_bytes(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, at: u64, len: usize) 
 pub fn write_bytes(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, at: u64, bytes: &[u8]) {
     let w = dev.alloc_window(WindowKind::TwoMib).unwrap();
     dev.write(&w, tile, at, bytes).unwrap();
+}
+
+/// The initiator's ten words as the probe read them back after request `k`
+/// (`probe::flag::PARTIAL` requests only), in `probe::REGISTERS` order.
+pub fn snapshot(dev: &mut Dev<'_>, tile: NocCoord<Noc0>, k: usize) -> [u32; 10] {
+    let bytes = read_bytes(
+        dev,
+        tile,
+        probe::SNAPSHOTS + k as u64 * probe::SNAPSHOT_STRIDE,
+        40,
+    );
+    let mut out = [0u32; 10];
+    for (o, c) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *o = u32::from_le_bytes(c.try_into().unwrap());
+    }
+    out
 }

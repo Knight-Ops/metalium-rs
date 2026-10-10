@@ -23,6 +23,10 @@ SECTIONS
     /* The write path's NIU choice (`issue_write` in mover.rs): taken by every
      * write, kept off the reads' stretch above. */
     *(.text.warm .text.warm.*)
+    /* The fast read path's NoC issue (X6: `noc::issue_read`, which `issue_via`
+     * in mover.rs calls when the host chose it), after the slow path's code so
+     * that adding it moves nothing in the stretch above. */
+    *(.text.*11tt_firmware3noc10issue_read*)
     *(.text .text.*)
   } > L1
 

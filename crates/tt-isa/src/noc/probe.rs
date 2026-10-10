@@ -28,6 +28,13 @@ pub const RESULT_STRIDE: u64 = 0x20;
 /// One breadcrumb word, `(request << 8) | phase`, published with a fence before
 /// each phase: after a hang it names the phase that never finished.
 pub const STAGE: u64 = 0x2_1800;
+/// Register snapshots, one per request, taken only for a [`flag::PARTIAL`]
+/// request: the ten initiator words ([`REGISTERS`] order) read back once the
+/// request has completed, so a host gate can say which registers kept the value
+/// software wrote (`step118`).
+pub const SNAPSHOTS: u64 = 0x2_1900;
+/// Bytes per snapshot record.
+pub const SNAPSHOT_STRIDE: u64 = 0x40;
 /// Where the host stages source data and atomic response words, per probe.
 pub const DATA: u64 = 0x2_2000;
 
@@ -56,6 +63,10 @@ pub mod word {
     pub const TXN: u64 = 8;
     pub const EXPECTED_ACKS: u64 = 12;
     pub const REGISTERS: u64 = 16;
+    /// With [`super::flag::PARTIAL`]: bit `i` set writes register `i` of
+    /// [`super::REGISTERS`] and clear leaves it as it is. In the last word of
+    /// the record, after the eleventh register.
+    pub const MASK: u64 = 60;
 }
 
 pub mod kind {
@@ -82,6 +93,14 @@ pub mod flag {
     /// left at `1 - recipients`, which is only acceptable on a simulator that is
     /// about to be discarded.
     pub const NO_CLEAR: u32 = 1 << 2;
+    /// Write only the registers `word::MASK` selects, and record the initiator's
+    /// ten words in `SNAPSHOTS` after completion: the set-state / with-state
+    /// persistence probe (`step118`). The initiator is otherwise left as the
+    /// previous request left it.
+    pub const PARTIAL: u32 = 1 << 4;
+    /// Use request initiator 1 (`NIU_BASE + 0x800`, `initiator::STRIDE`) instead
+    /// of initiator 0: where the mover's fast read path keeps its own registers.
+    pub const INITIATOR_1: u32 = 1 << 5;
 }
 
 /// Result record words (bytes, from `RESULTS + k * RESULT_STRIDE`).
@@ -135,7 +154,9 @@ pub mod phase {
     }
 }
 
-const _: () = assert!(word::REGISTERS + 11 * 4 <= REQUEST_STRIDE);
+const _: () = assert!(word::REGISTERS + 11 * 4 <= word::MASK);
+const _: () = assert!(word::MASK + 4 <= REQUEST_STRIDE);
+const _: () = assert!(10 * 4 <= SNAPSHOT_STRIDE);
 const _: () = assert!(result::OUTSTANDING_BEFORE + 4 <= RESULT_STRIDE);
 
 pub const fn stage(request: u32, phase: u32) -> u32 {
@@ -152,6 +173,7 @@ mod tests {
             (SCRIPT, REQUESTS + MAX_REQUESTS as u64 * REQUEST_STRIDE),
             (RESULTS, RESULTS + MAX_REQUESTS as u64 * RESULT_STRIDE),
             (STAGE, STAGE + 4),
+            (SNAPSHOTS, SNAPSHOTS + MAX_REQUESTS as u64 * SNAPSHOT_STRIDE),
             (DATA, DATA + 0x1000),
         ];
         for (i, a) in regions.iter().enumerate() {
