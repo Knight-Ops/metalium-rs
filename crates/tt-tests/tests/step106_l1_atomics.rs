@@ -920,10 +920,10 @@ mod silicon_gates {
         }
     }
 
-    /// [`harness::in_device`] whose failure names the gate. `in_device` runs a
-    /// plain role reset (`harness::run`, a 1 s floor, no unwedge) before the
-    /// body, so a tile an earlier run left with a parked Tensix thread fails
-    /// *there* with a bare role timeout; the label says which gate was starting.
+    /// [`harness::in_device`] whose failure names the gate. `in_device` resets
+    /// the tile and the gate thread's Tensix state (the session's reset, which first
+    /// releases a thread an earlier run left parked) before the body, so a failure
+    /// there is named by the label as the gate that was starting.
     fn labelled(label: &str, f: impl FnOnce(&mut harness::Dev<'_>)) {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness::in_device(f)));

@@ -110,39 +110,8 @@ fn matrix(rows: usize, cols: usize, seed: u64) -> Vec<u32> {
     m
 }
 
-#[cfg(not(feature = "silicon"))]
-fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
-    tt_ttsim::fork_scope(|| {
-        let mut sim = tt_ttsim::Simulator::open().unwrap();
-        let dev = tt_device::Device::open(sim.transport()).unwrap();
-        let mut s = Session::open(
-            dev,
-            tt_firmware_images::ROLES,
-            TileChoice::Count(2),
-            |_, _| Ok(None),
-        )
-        .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    })
-    .unwrap();
-}
-
-#[cfg(feature = "silicon")]
-fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
-    tt_ttsim::fork_scope(|| {
-        let mut s = Session::open_card(
-            tt_tests::backend::device_index(),
-            tt_firmware_images::ROLES,
-            TileChoice::Count(2),
-        )
-        .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    })
-    .unwrap();
+fn with_session(f: impl FnOnce(&mut tt_tests::backend::Sess<'_>)) {
+    tt_tests::backend::with_session(TileChoice::Count(2), f);
 }
 
 /// The device results of `ops` over `bits`, a `rows x cols` matrix, as words.

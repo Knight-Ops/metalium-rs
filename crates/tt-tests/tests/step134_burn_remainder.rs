@@ -16,16 +16,7 @@ use burn::tensor::{Tensor, TensorData, TensorPrimitive};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, InputPayload, TracedInference, TtBackend};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
-
-fn xorshift(seed: u64) -> impl FnMut() -> u64 {
-    let mut s = seed | 1;
-    move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    }
-}
+use tt_tests::data::xorshift;
 
 /// Bits from every region the algorithm treats differently.
 fn corpus(seed: u64, n: usize) -> Vec<f32> {

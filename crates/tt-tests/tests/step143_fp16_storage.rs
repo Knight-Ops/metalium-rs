@@ -38,50 +38,15 @@ use tt_kernels::fp16::{Narrowing, Widening};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
 use tt_tests::backend::GATE_TILE;
-use tt_ttsim::fork_scope;
 
-#[cfg(not(feature = "silicon"))]
-fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
-    if let Err(e) = fork_scope(|| {
-        let mut sim = tt_ttsim::Simulator::open().unwrap();
-        let dev = tt_device::Device::open(sim.transport()).unwrap();
-        let mut s = Session::open(
-            dev,
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
-            |_, _| Ok(None),
-        )
-        .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
-}
-
-#[cfg(feature = "silicon")]
-fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
-    if let Err(e) = fork_scope(|| {
-        let mut s = Session::open_card(
-            tt_tests::backend::device_index(),
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
+fn with_session(f: impl FnOnce(&mut tt_tests::backend::Sess<'_>)) {
+    tt_tests::backend::with_session(TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1), f);
 }
 
 // ---------------------------------------------------------------- oracles
 
-#[path = "fp16_oracle/mod.rs"]
-mod oracle;
-use oracle::{f32_corpus, oracle_to_f16, oracle_to_f32, truncating_to_f16};
+mod fp16_support;
+use fp16_support::{f32_corpus, oracle_to_f16, oracle_to_f32, truncating_to_f16};
 
 // ---------------------------------------------------------------- model gates (host)
 

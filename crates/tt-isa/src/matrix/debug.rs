@@ -706,7 +706,7 @@ pub mod model {
                 Rows::One { src_row, dst_row } => (src_row, dst_row, false),
                 Rows::Eight { src_row, dst_row } => (src_row, dst_row, true),
             };
-            // Measured on card 0 (step111b): with the eight-row bit clear, instruction
+            // Measured on card 0 (probe_addr_mod_sweep): with the eight-row bit clear, instruction
             // bit 14 (the low bit of the `AddrMod` entry number) also widens the move
             // to a FOUR-row aligned block, whatever the entry's increments are.
             let four = !eight && addr_mod & 1 == 1;
@@ -1210,7 +1210,7 @@ mod tests {
         .unwrap();
         // The first move names entry 1, whose number has instruction bit 14 set, so
         // with the eight-row bit clear it writes a FOUR-row aligned block (source
-        // rows 0..3 to Dst rows 4..7; measured on card 0, step111b). The entry then
+        // rows 0..3 to Dst rows 4..7; measured on card 0, probe_addr_mod_sweep). The entry then
         // advances SrcA by 1 and Dst by 2, so the second move (entry 0) reads source
         // row 3 and writes row 6.
         assert_eq!(rows, [(4, 1), (5, 2), (6, 3), (7, 4), (6, 4)]);

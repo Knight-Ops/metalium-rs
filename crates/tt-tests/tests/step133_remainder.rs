@@ -35,7 +35,7 @@ use tt_kernels::sfpu::ops::rem::{self, Divisor, Variant};
 use tt_kernels::sfpu::ops::{kind_sfpu, reference};
 use tt_kernels::tensor::Eltwise;
 use tt_tests::backend::GATE_TILE;
-use tt_ttsim::fork_scope;
+use tt_tests::data::xorshift;
 
 /// `(a, b, a % b)` as bits, from exact rational arithmetic.
 const HAND: &[(u32, u32, u32)] = &[
@@ -107,16 +107,6 @@ fn same(got: u32, want: f32) -> bool {
         f32::from_bits(got).is_nan()
     } else {
         got == want.to_bits()
-    }
-}
-
-fn xorshift(seed: u64) -> impl FnMut() -> u64 {
-    let mut s = seed | 1;
-    move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
     }
 }
 
@@ -359,41 +349,8 @@ fn the_program_fits_a_role_slot() {
     }
 }
 
-#[cfg(not(feature = "silicon"))]
-fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
-    if let Err(e) = fork_scope(|| {
-        let mut sim = tt_ttsim::Simulator::open().unwrap();
-        let dev = tt_device::Device::open(sim.transport()).unwrap();
-        let mut s = Session::open(
-            dev,
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
-            |_, _| Ok(None),
-        )
-        .unwrap();
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
-}
-
-#[cfg(feature = "silicon")]
-fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
-    if let Err(e) = fork_scope(|| {
-        let mut s = Session::open_card(
-            tt_tests::backend::device_index(),
-            tt_firmware_images::ROLES,
-            TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .unwrap();
-        f(&mut s);
-    }) {
-        panic!("{e}");
-    }
+fn with_session(f: impl FnOnce(&mut tt_tests::backend::Sess<'_>)) {
+    tt_tests::backend::with_session(TileChoice::Exactly(GATE_TILE.0, GATE_TILE.1), f);
 }
 
 /// The scalars of the scalar form: a normal, negative, inexact, denormal,

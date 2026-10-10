@@ -17,9 +17,8 @@ use burn::tensor::{backend::Backend, DType, FloatDType, Tensor, TensorData, Tens
 use burn_tt::{tensor_traffic, TtBackend};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
 
-#[path = "fp16_oracle/mod.rs"]
-mod oracle;
-use oracle::{f32_corpus, oracle_to_f16, oracle_to_f32, truncating_to_f16};
+mod fp16_support;
+use fp16_support::{f32_corpus, oracle_to_f16, oracle_to_f32, truncating_to_f16};
 
 fn data16(bits: Vec<u16>, shape: impl Into<burn::tensor::Shape>, dtype: DType) -> TensorData {
     let mut data = TensorData::new(bits, shape);

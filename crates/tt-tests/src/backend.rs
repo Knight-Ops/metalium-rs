@@ -116,6 +116,29 @@ mod simulator {
         })
         .is_ok()
     }
+
+    /// The session a gate gets from [`with_session`].
+    pub type Sess<'a> = tt_kernels::session::Session<tt_ttsim::LibTtsim<'a>>;
+
+    /// Run `f` against a fresh session on `tile` with GDDR streaming enabled
+    /// (`Session::enable_dram` with the shipped reader and writer), inside one
+    /// `fork_scope`. A failure of the scope panics with its message.
+    pub fn with_session(tile: tt_kernels::session::TileChoice, f: impl FnOnce(&mut Sess<'_>)) {
+        if let Err(e) = fork_scope(|| {
+            let mut sim = tt_ttsim::Simulator::open().unwrap();
+            let dev = Device::open(sim.transport()).unwrap();
+            let mut s =
+                tt_kernels::session::Session::open(dev, tt_firmware_images::ROLES, tile, |_, _| {
+                    Ok(None)
+                })
+                .unwrap();
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
+            f(&mut s);
+        }) {
+            panic!("{e}");
+        }
+    }
 }
 
 #[cfg(feature = "silicon")]
@@ -353,12 +376,6 @@ mod silicon {
         }
     }
 
-    /// Run `f` against the card, inside a fork.
-    ///
-    /// The fork is no longer about surviving ttsim's `_Exit` — silicon does not
-    /// terminate the process — but it earns its keep twice over here. A gate that
-    /// wedges a core cannot take the runner with it, and the child's file
-    /// descriptor closing is what fires the driver's cleanup write.
     /// Reset the gate thread's own Tensix state before a gate runs:
     /// [`crate::datapath::thread_state_reset`], run through the harness on the
     /// gate tile. The per-thread half of the scrub that [`reset_tile`] cannot
@@ -379,6 +396,12 @@ mod silicon {
         let _ = tt_kernels::session::reset_thread_state(dev, coord, &crate::firmware::ROLES);
     }
 
+    /// Run `f` against the card, inside a fork.
+    ///
+    /// The fork is no longer about surviving ttsim's `_Exit` — silicon does not
+    /// terminate the process — but it earns its keep twice over here. A gate that
+    /// wedges a core cannot take the runner with it, and the child's file
+    /// descriptor closing is what fires the driver's cleanup write.
     #[track_caller]
     pub fn in_device(f: impl FnOnce(&mut Dev<'_>)) {
         if let Err(e) = fork_scope(|| {
@@ -404,5 +427,27 @@ mod silicon {
             scrub(&mut dev);
         })
         .is_ok()
+    }
+
+    /// The session a gate gets from [`with_session`].
+    pub type Sess<'a> = tt_kernels::session::Session<Kmd>;
+
+    /// Run `f` against a session on this card's `tile` with GDDR streaming
+    /// enabled (`Session::enable_dram` with the shipped reader and writer),
+    /// inside one `fork_scope`. A failure of the scope panics with its message.
+    pub fn with_session(tile: tt_kernels::session::TileChoice, f: impl FnOnce(&mut Sess<'_>)) {
+        if let Err(e) = fork_scope(|| {
+            let mut s = tt_kernels::session::Session::open_card(
+                device_index(),
+                tt_firmware_images::ROLES,
+                tile,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
+            f(&mut s);
+        }) {
+            panic!("{e}");
+        }
     }
 }

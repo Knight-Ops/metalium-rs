@@ -17,13 +17,7 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, TtBackend};
 use tt_isa::numerics;
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
-
-fn lcg(s: &mut u64) -> u64 {
-    *s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *s >> 33
-}
+use tt_tests::data::{float_data, lcg};
 
 const SPECIALS: [u32; 12] = [
     0x0000_0000,
@@ -53,10 +47,6 @@ fn words(n: usize, seed: u64, specials: bool) -> Vec<u32> {
             }
         })
         .collect()
-}
-
-fn float_data(bits: &[u32]) -> Vec<f32> {
-    bits.iter().map(|&b| f32::from_bits(b)).collect()
 }
 
 fn read_bits<B: burn::tensor::backend::Backend, const D: usize>(t: Tensor<B, D>) -> Vec<u32> {

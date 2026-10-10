@@ -232,9 +232,6 @@ pub const SMOKE: &[&str] = &[
     "step111_matrix_debug::gatesrcrst_stale",
     "step135_sort::",
     "step136_burn_sort::",
-    "step137_sort_residency::",
-    "step138_sort_traces::",
-    "step139_sort_long_axes::",
     "step9_matmul::elw_broadcast_assignment_and_destination_fields",
     "step9_matmul::elw_oracles_reject_safe_instruction_mutants",
 ];

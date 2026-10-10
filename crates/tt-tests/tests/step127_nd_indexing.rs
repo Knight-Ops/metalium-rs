@@ -23,15 +23,9 @@ use burn_flex::{Flex, FlexDevice};
 use burn_tt::{tensor_traffic, TileChoice, TtBackend, TtDevice};
 use tt_isa::numerics;
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
+use tt_tests::data::{float_data, lcg, panic_message};
 
 // ---------------------------------------------------------------- data
-
-fn lcg(s: &mut u64) -> u64 {
-    *s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *s >> 33
-}
 
 const SPECIALS: [u32; 14] = [
     0x0000_0000,
@@ -204,10 +198,6 @@ fn has_duplicates(rows: &[usize]) -> bool {
 }
 
 // ---------------------------------------------------------------- tensors
-
-fn float_data(bits: &[u32]) -> Vec<f32> {
-    bits.iter().map(|&b| f32::from_bits(b)).collect()
-}
 
 fn read_bits<B: Backend, const D: usize>(t: Tensor<B, D>) -> Vec<u32> {
     t.into_data()
@@ -671,15 +661,6 @@ fn scatter_nd_assign_is_last_writer_in_index_order_and_raw_exact() {
         scatter_int_assign::<2, 2, 2>(&d, [35, 3], [6, 1], 46);
         scatter_int_assign::<1, 2, 1>(&d, [37], [9, 1], 47);
     });
-}
-
-fn panic_message(f: impl FnOnce()) -> String {
-    let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .expect_err("the operation must refuse");
-    e.downcast_ref::<String>()
-        .cloned()
-        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default()
 }
 
 #[test]
