@@ -243,23 +243,18 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 | MD matrix diagnostics | `[x]` MOVDBGA2D; GATESRCRST `[-]`; increment-1 `AddrMod` cases open (shared with `MOVA2D`) |
 | PU packer/unpacker modes | `[x]` ReLU, edge masking, BF16 `UnpackToDst`, tileize; unpacker transpose `[-]` (M3); not routed into Session/Burn ops |
 | FENCE (X7) | `[x]` card 0 and both-card Ethernet gates |
-| N NoC | atomics `[x]`; completion polling `[~]` (stickiness open); IRQ `[-]`; **multicast `[~]`: encoder and ttsim done, NoC-hang-class silicon probes NOT run** |
-| F MMIO | `PACR_SETREG`, `UNPACR_NOP_SETREG` `[-]`; **`LOADREG`/`STOREREG`/`STOREIND_MMIO` `[~]`: host/ttsim only, silicon probes NOT run** (a mis-encoded `STOREREG` could hit reset or mover registers) |
+| N NoC | atomics `[x]`; completion polling `[x]`; IRQ `[-]`; **multicast `[x]`** (cards 0 and 1, run one probe at a time, no reboot) |
+| F MMIO | `PACR_SETREG`, `UNPACR_NOP_SETREG` `[-]`; `LOADREG`/`STOREREG`/`STOREIND_MMIO` `[x]` on the allowlisted PIC words (card 0, one probe at a time, no reboot) |
 | TS tag search | `[-]` (armed trigger load hangs the baby core, block stays armed) |
 | G stream overlay | `[-]` (no pinned Blackhole register map) |
 | P9 planner, `.ttinsn` | `[-]` (checker shows 0 missing waits; fusion needs a run-time code generator) |
-| **X6 mover NIU fast path** | **not started** (depends on N; its register-persistence probe is NoC-hang class) |
+| **X6 mover NIU fast path** | agent working (2026-10-10); Phase 1 is whether NIU command-buffer registers persist between requests |
 
-### Still open
-1. NoC multicast silicon probes (1x2, larger rectangles, full grid; one per session, nothing queued
-   behind) and, if clean, X6. Order and expected results are in the N lane report and
-   `step115_noc_multicast::silicon_*`.
-2. The MMIO trio's silicon probes (`step107_mmio_regs::silicon_probe_*`), isolated, only after a
-   decision that a possible reset-register write is acceptable.
-3. The increment-1 `AddrMod` cases (shared configuration) and the RTZ source stickiness.
-4. The stale-statement audit from T10, the cutover/parity docs, and moving this plan and
-   `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1-3 are decided.
-5. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
+### Still open (updated 2026-10-10)
+1. X6 (mover fast path): agent in progress.
+2. The increment-1 `AddrMod` cases (shared with the `MOVA2D` control): a diagnostic sweep is being written.
+3. Mesh training traces and `copy_into` on a mesh; both-card runs of lanes validated on card 0 only.
+4. Moving this plan and `remaining-firmware-instructions.md` to `docs/completed-plans/` once 1 and 2 are decided.
 
 Operational notes for whoever continues: lane agents never run silicon (the coordinator runs it,
 one test per process, UNVERIFIED encodings isolated first, a known-good gate between risky probes);

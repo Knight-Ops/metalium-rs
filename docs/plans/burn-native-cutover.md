@@ -27,7 +27,7 @@ Missing FFT, sorting, portable quantized compute, and
 other required methods fail explicitly. Unsupported shapes of implemented
 operations also fail explicitly. Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
 columns across chips and move tile slots over Ethernet without host tensor
-staging. Other training primitives and batched matmuls execute on chip 0. The
+staging. Distributed batched products and F32/BF16 module gradients are gated (step83/step88); the remaining training primitives execute on chip 0. The
 two-chip and four-chip sharded MLP gates reproduce the native golden and reject
 intermediate downloads, host arithmetic and staged computation. Direct and
 relayed links have native residency and numerical gates.
@@ -80,7 +80,7 @@ are now gated; batched BF16 products and integer reductions are resident.
 Checked integer division/remainder and axis mean now pass `step82` in ttsim;
 card-0 silicon gates also pass (`1791232718`). Native attention, ragged F32
 batches and actual two-chip batched products pass the `step83` simulator and
-silicon gates, including BF16 resident training. Broader acceptance remains open.
+silicon gates, including BF16 resident training. The remaining items are listed in `hardware-coverage-closeout.md`.
 See `tensix-next-features.md` for the current handoff and validation evidence.
 BF16 is slower on the measured MNIST GEMMs; see `tensix-next-features.md`.
 

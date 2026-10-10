@@ -1,6 +1,6 @@
 # Remaining Tensix firmware instructions — implementation plan
 
-> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[~]` (allowlisted PIC targets, host/ttsim gates, silicon probes not run). The list below is historical.
+> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
 
 Review date: 2026-10-07. Source of completion status:
 [hardware-coverage.md](hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),

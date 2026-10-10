@@ -43,6 +43,12 @@ enum Mutant {
     NotSticky,
     /// Reading `NUM` leaves the `SOURCE` bit set (as if `RC_DISABLE`).
     NumDoesNotClear,
+    /// The `RTZ_CLR` write has no effect on the bit (constructed by the silicon gate only).
+    #[cfg_attr(not(feature = "silicon"), allow(dead_code))]
+    ClearIgnored,
+    /// Sampling the bit clears it (read-to-clear), so it does not survive to the next request.
+    #[cfg_attr(not(feature = "silicon"), allow(dead_code))]
+    ReadClears,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,13 +390,17 @@ mod silicon {
         clears
             .iter()
             .map(|&clear| {
-                if clear {
+                if clear && mutant != Mutant::ClearIgnored {
                     n.write_clr(1 << txn);
                 }
                 let before = n.source & (1 << txn) != 0;
                 n.issue(txn as usize, 1, mutant);
                 n.complete(txn as usize, mutant);
-                (before, n.source & (1 << txn) != 0)
+                let after = n.source & (1 << txn) != 0;
+                if mutant == Mutant::ReadClears {
+                    n.write_clr(1 << txn);
+                }
+                (before, after)
             })
             .collect()
     }
@@ -432,8 +442,7 @@ mod silicon {
 
     /// Sticky until cleared: a second request without the clear sees the bit
     /// already set before it issues; a third with the clear sees it clear. The
-    /// not-sticky mutant disagrees with the device on the second sample.
-    #[ignore = "open: on card 0 the RTZ source bit sequence equals the NOT-sticky mutant model, contradicting the page-derived sticky model (observed [(false,true),(true,true),(false,true)]); stickiness is not established"]
+    /// ignored-clear and read-to-clear mutants disagree with the device.
     #[test]
     fn silicon_niu_rtz_source_is_sticky_until_cleared() {
         harness::assert_on_silicon();
@@ -450,7 +459,12 @@ mod silicon {
             let clears = [true, false, true];
             let device = device_samples(&r, 2);
             assert_eq!(device, model_samples(Mutant::None, 2, &clears), "{r:?}");
-            assert_ne!(device, model_samples(Mutant::NotSticky, 2, &clears));
+            // The mutants that ARE observable in this sequence: a clear with no effect
+            // leaves the bit set before the third request, and a read-to-clear bit is
+            // gone before the second. (The in-flight-only `NotSticky` mutant is not
+            // observable by before/after samples, so it is not used as a control.)
+            assert_ne!(device, model_samples(Mutant::ClearIgnored, 2, &clears));
+            assert_ne!(device, model_samples(Mutant::ReadClears, 2, &clears));
         });
     }
 
