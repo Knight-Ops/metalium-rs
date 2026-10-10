@@ -13,13 +13,21 @@ build for both does not belong here.
 | `isa` | The Tensix instruction set. `isa::generated` is produced by `cargo xtask gen-isa`; each encoding carries a `Provenance` (Blackhole, shared, Wormhole-only `UNVERIFIED`, or measured). Wormhole forms are in `isa::generated::defs::wormhole`. |
 | `cfg` | Backend-configuration fields. `cfg::generated` is produced by `cargo xtask gen-cfg` from `cfg_defines.h`. |
 | `backend`, `sfpu`, `matrix`, `sync` | Hand-written layers over the encodings: checked config reads/mutations/writes and unit waits, SFPU hazards, `SrcA`/`SrcB` bank ownership, Tensix semaphores. |
+| `sfpu::load_macro` | Checked `SFPLOADMACRO` configuration (macro slots, delays, `SFPCONFIG` words); the schedule model is `tt_kernels::sfpu::macro_sched`. |
+| `matrix::debug` | `MOVDBGA2D` and `GATESRCRST` helpers, the address-modifier table and an independent page model (`model`). |
+| `sync::mutex` | Checked `ATGETM`/`ATRELM` (Tensix mutex indices 0, 2, 3, 4). |
 | `scalar` | Checked thread-local subtraction, low-16 multiplication, unsigned comparisons, logical shifts and bitwise operations. Register/immediate provenance and step100 simulator restrictions remain explicit. |
-| `noc` | NoC coordinate spaces (typed per NoC), NIU registers, `noc::grid::Tensix` (the surviving columns). |
+| `scalar::atomic` | Checked L1 atomics (`ATCAS`, `ATSWAP`, `ATINCGET`, `ATINCGETPTR`); all are `UNVERIFIED` Wormhole-page forms on Blackhole, measured on card 0. |
+| `scalar::mmio` | Allowlisted `LOADREG`, `STOREREG` and `STOREIND_MMIO` targets (never raw addresses). |
+| `noc` | NoC coordinate spaces (typed per NoC), NIU registers, `noc::grid::Tensix` (the surviving columns). `noc::atomic` (NoC atomic requests), `noc::multicast` (rectangle writes from the ARC-discovered grid) and `noc::probe` (the probe image's protocol). |
 | `tensix` | Tile memory map, baby RISC-V cores (`Core`), reset PCs, soft reset. |
 | `arc` | The ARC telemetry tags: how to ask a chip what it is (harvesting, translation). |
 | `dram` | GDDR6 channels (`Dram`, `DramRange`); only a chip's grid can produce a range. |
 | `eth` | Ethernet tile register map, firmware-owned L1, and the `eth::mover` protocol. |
-| `mailbox` | The L1 contract between host and firmware: status words, role mailboxes, program region. |
+| `mailbox` | The L1 contract between host and firmware: status words, role mailboxes, program region. `mailbox::guard` is the role-side deadline, blocked status and host release that make a blocking instruction safe to run. |
+| `packer`, `unpacker` | Checked staging of packer ReLU and edge masking, and of unpacker tileize and transpose modes. |
+| `hazard` | A hazard table over the backend wait rules and a checker that reports missing and redundant waits in a program. |
+| `tag_search` | The L1 tag-search accelerator's registers and helpers (host and ttsim only: armed trigger loads hang the core on silicon). |
 | `dm` | The RISCV B data mover protocol: descriptors, list entries (`op::READ`, `WRITE`, `LIST`, `COMPUTE`, `KERNEL`, `WAIT`, ...), element-wise `kind`s. |
 | `dm::record` | Op records (`GATHER`, `SCATTER`, `ELTWISE`, `SUM`): a whole op in a few list entries, `expand`ed on the tile and, first, on the host. |
 | `l1` | The fixed L1 region map (`REGIONS`: images, mover list, data arena, mailboxes, program slots, trace, program cache), checked at compile time. Kernels never address `l1::DATA` directly; `tt_kernels::l1` places buffers there. |

@@ -6,8 +6,8 @@ matmul, Burn propagation and identity backward pass on both cards
 both cards (`1791300035`); full SMOKE passes 364/364 (`1791300502`); final
 rounding/control/propagation gates pass 28/28 (`1791301208`). Diagnostic
 RISC-V PRNG restarts pass both cards (`1791302401`, 4/4 with advancement and
-predication). D2 is complete for the delivered BFP8/4/2 formats; S7 remains
-partial for application RNG quality and stream semantics.
+predication). D2 is complete for the delivered BFP8/4/2 formats; S7 (native seeded
+random) was completed in the Phase 10 close-out.
 
 ## Hardware prerequisites
 
@@ -22,7 +22,7 @@ partial for application RNG quality and stream semantics.
 - [x] Establish a reproducible diagnostic silicon restart path: direct RISC-V
   full-width configuration store, fence and 512 RISC-V NOP iterations
   (`step91_seeded_prng::riscv_seed_store_characterization`). WRCFG continues
-  the stream. Application stream semantics and RNG quality remain deferred.
+  the stream. The application-level device random built on it landed with S7 (step140-142).
 - [x] Full conversion sweeps at rounding/clamping thresholds, independent
   integer encoding model and conversion-to-matmul error propagation.
 
@@ -91,8 +91,7 @@ Serialization returns decoded F32 values; precision policies restore compression
 - [x] Both-card silicon validation, required workspace/firmware/generator and
   shipping checks, training regression and validated release benchmarks.
 
-BFP `a` variants, portable Burn QTensorOps, hardware Burn random distributions,
-SFPLOADMACRO, DOTPV, approximate transcendentals and packed mesh transport remain
+BFP `a` variants, portable Burn QTensorOps, DOTPV and packed mesh transport remain
 deferred. No compressed-gradient policy, INT8 path or dependency fork is added.
 
 Final validation: workspace tests with `tt-tests/e2e` pass, including the eight
@@ -120,9 +119,8 @@ and products, Burn storage control/propagation, autodiff, fusion boundaries,
 parameter copies/traces, model policies and diagnostic PRNG characterization.
 There is no active implementation or required acceptance check left pending
 for that scope. The deferred items above are future tranches. D2 is complete
-only for delivered formats; S7 remains partial for application RNG quality,
-distributions and stream semantics. Burn random already works using independent
-seeded per-device host construction (`burn-tt/src/random.rs`).
+only for delivered formats. S7 was completed in the Phase 10 close-out: Burn random
+draws on the device (`burn-tt/src/random.rs`, step140-142).
 
 Resume by reading this file, the backend/kernel READMEs and the BFP/PRNG sections
 of `silicon-operating-notes.md`, `ttsim-divergence.md` and

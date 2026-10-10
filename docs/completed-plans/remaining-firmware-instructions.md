@@ -1,6 +1,8 @@
 # Remaining Tensix firmware instructions — implementation plan
 
-> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](../plans/hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
+> **Rows below:** checkbox markers show each row's final disposition; the "Allocate protocol storage through `Requirements`" and "Gate config isolation across programs" rows were not individually dispositioned.
+>
+> **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
 
 Review date: 2026-10-07. Source of completion status:
 [hardware-coverage.md](../plans/hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
@@ -227,17 +229,17 @@ UNPACR_NOP_SETDVALID recovery attempt that took down the host.
 Dependencies: A/B. Begin with isolated protocol tests; existing scheduler
 semaphores and credits are not replaced as part of instruction coverage.
 
-- [ ] `ATGETM`/`ATRELM`: checked BH mutex indices **0, 2, 3, 4** (1 and values
+- [x] `ATGETM`/`ATRELM`: checked BH mutex indices **0, 2, 3, 4** (1 and values
   above 4 wait forever); explicit per-thread acquire/release scopes and state
   cleanup. Gate controlled contention and round-robin handoff, not timing guesses.
-- [ ] `ATCAS`: typed four-bit compare/set values on a checked L1 word. It
+- [x] `ATCAS`: typed four-bit compare/set values on a checked L1 word. It
   blocks/retries until equality; it is not a conventional nonblocking CAS that
   returns success. Ensure a progress path outside the blocked Scalar Unit.
-- [ ] `ATSWAP`: typed eight-halfword mask over an aligned 16-byte region,
+- [x] `ATSWAP`: typed eight-halfword mask over an aligned 16-byte region,
   single/four-GPR forms and preserved unmasked words. Assert no old-value return.
-- [ ] `ATINCGET`: explicit 1–32-bit field width, preserved upper bits, wrapping
+- [x] `ATINCGET`: explicit 1–32-bit field width, preserved upper bits, wrapping
   increments, old-value GPR return and C0 wait before consumption.
-- [ ] `ATINCGETPTR`: checked adjacent read/write counters, bounded counter
+- [x] `ATINCGETPTR`: checked adjacent read/write counters, bounded counter
   width, push/pop/no-increment and batch size; reject free-running counters and
   increments incompatible with the capacity. Gate empty/full transitions and
   wrap with an independent FIFO model and a producer that can make progress.
@@ -250,11 +252,11 @@ semaphores and credits are not replaced as part of instruction coverage.
 Dependencies: A/B, a documented harmless writable register target and ownership
 of TDMA-RISC state. No arbitrary MMIO-address API.
 
-- [ ] `LOADREG`, `STOREREG`, `STOREIND_MMIO`: allowlisted aligned register
+- [x] `LOADREG`, `STOREREG`, `STOREIND_MMIO`: allowlisted aligned register
   targets; reject the forbidden region below `0xFFB11000`, unknown/destructive
   targets and unintended address truncation. Model STOREIND's shifted half-GPR
   offset separately from its L1 variant. Drain/read back before external use.
-- [ ] `PACR_SETREG`: initialize `SetRegBase` and `SetRegHiScaler` explicitly
+- [-] `PACR_SETREG`: initialize `SetRegBase` and `SetRegHiScaler` explicitly
   through their documented path; check address/value construction and format
   dependence. Verify late pack conversion and buffer flush ordering, not merely
   an eventual MMIO write. If a harmless target/setup cannot be established,
@@ -267,15 +269,15 @@ of TDMA-RISC state. No arbitrary MMIO-address API.
 Dependencies: A/F and stream register definitions from the pinned Blackhole
 tree. Current software GDDR streaming is not proof of overlay support.
 
-- [ ] Declare exclusive overlay stream allocation, initialization, teardown,
+- [-] Declare exclusive overlay stream allocation, initialization, teardown,
   register access and thread-local stream selector/high target configuration.
-- [ ] `STREAMWAIT`: typed phase/message conditions, full target splitting,
+- [-] `STREAMWAIT`: typed phase/message conditions, full target splitting,
   selector 0–3 and B0–B8 consumer block mask; model zero mask's B6 default and
   latched wait behavior. Use a controlled producer for unmet-to-met transitions.
-- [ ] `STREAMWRCFG`: checked stream register and config destination, reject
+- [-] `STREAMWRCFG`: checked stream register and config destination, reject
   config reset, and append Configuration Unit completion wait. Explicitly
   cover the documented reordering bug with later Configuration Unit operations.
-- [ ] Probe ttsim support independently; add divergence-backed silicon arms if
+- [-] Probe ttsim support independently; add divergence-backed silicon arms if
   unavailable. Gate repeated sessions and changed-state replay. Automatic NoC
   dataflow adoption is a separate architecture/performance decision.
 
@@ -284,29 +286,29 @@ tree. Current software GDDR streaming is not proof of overlay support.
 Dependencies: mature SFPU interpreter/builder and explicit macro state lifecycle;
 A readback helps diagnosis. Does not require stream/atomic stages.
 
-- [ ] Extend `SFPCONFIG` beyond existing constants to checked macro misc,
+- [x] Extend `SFPCONFIG` beyond existing constants to checked macro misc,
   sequence and template setup. Declare persistent configuration in program keys
   and descriptors, initialize before use, and drain before reconfiguration.
-- [ ] Add a macro schedule model for load plus Simple/MAD/Round/Store, delays,
+- [x] Add a macro schedule model for load plus Simple/MAD/Round/Store, delays,
   substituted operands, LReg16 and predication. Reject scheduling collisions,
   invalid template classes and undefined encodings. Account for the coupled
   VDHi/address bit, SFPSWAP restrictions and Simple/Round destination conflicts.
-- [ ] Extend the step5 load-half evidence with each sub-unit independently,
+- [x] Extend the step5 load-half evidence with each sub-unit independently,
   then a small load/compute/store chain compared bit-for-bit against the
   ordinary SFPU sequence/interpreter. Add swapped template/delay mutants.
-- [ ] Silicon-only device execution (divergence 7); host model tests still run
+- [x] Silicon-only device execution (divergence 7); host model tests still run
   everywhere. Add changed-input trace and back-to-back different macro programs.
   Benchmark validated release medians before any SFPU default changes.
 
 ## Research and diagnostic closure
 
-- [ ] `MOVDBGA2D`: extend step9 probes to one/eight-row semantics and format
+- [x] `MOVDBGA2D`: extend step9 probes to one/eight-row semantics and format
   selection, with explicit valid ownership or a separately established format.
   Keep it a diagnostic surface; normal kernels already use MOVA2D's automatic wait.
-- [ ] `GATESRCRST`: checked cache-invalidation diagnostic and a controlled
+- [-] `GATESRCRST`: checked cache-invalidation diagnostic and a controlled
   changed-SrcB experiment. A no-effect comparison alone cannot prove invalidation;
   if no observable cache-state oracle exists, leave semantic completion open.
-- [ ] `UNPACR_NOP_SETREG`: establish TDMA-RISC base/accumulator semantics and
+- [-] `UNPACR_NOP_SETREG`: establish TDMA-RISC base/accumulator semantics and
   a harmless MMIO target before executing; otherwise document deferral.
 
 The six deliberate exclusions above have accepted planning dispositions and do
@@ -341,7 +343,7 @@ simulator divergence entries and firmware performance conditions/results.
 Move this plan to `docs/completed-plans/` only after every stage/research row has
 an accepted implemented or deliberately deferred disposition.
 
-**Recommended next tranche: Stage E.** Stages A–D are accepted (step100–104).
+**Superseded:** Stages E–H and the research rows were closed in the Phase 10 close-out (see the status above). Stages A–D were accepted earlier (step100–104).
 Stage D supplies bounded explicit healthy-bank handover after partial regular
 UNPACR; recovery is unchanged. E/F/G and H retain their stated dependencies.
 
@@ -370,6 +372,6 @@ Card-0 release SMOKE passes 258/258 (`1791413478`); MNIST 8/8 retains its golden
 Workspace tests, format/Clippy, silicon no-run/Clippy, generator and shipping
 checks pass. The old Wormhole mode 7 encoding is the isolated reboot trigger;
 the internal ARC reset mechanism remains unproven. The Stage D checklist alone
-is archived; this overall plan remains active at 92/16/six. Arbitrary disjoint
+is archived; this overall plan was active at 92/16/six at that point and is now closed. Arbitrary disjoint
 partial placement, hidden SrcA counter observation, other NOP modes and
 production/performance/recovery adoption are deferred.

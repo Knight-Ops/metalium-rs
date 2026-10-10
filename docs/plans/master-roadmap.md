@@ -996,11 +996,7 @@ and pooling are described below.
 **Current tranche (2026-10-06):** logical-F32 BFP storage, device conversions,
 packed products, Burn propagation/autodiff/fusion/traces and MNIST precision
 policies pass both cards. D2 is complete for the delivered BFP8/4/2 formats;
-`a` variants, packed mesh and portable quantization remain deferred. S7 remains
-partial: Burn random works through seeded per-device host construction;
-hardware advancement/predication and diagnostic RISC-V reseeding are gated,
-but hardware distributions, quality and application stream semantics remain
-deferred. See [the current contract and validation](mixed-bfp-storage.md).
+`a` variants, packed mesh and portable quantization remain deferred. S7 is done since the Phase 10 close-out (2026-10-10): Burn random draws on the device with native seeded kernels (step140-142; cards 0 and 1), and refuses random inside a trace rather than repeat a seed. See [the current contract and validation](mixed-bfp-storage.md).
 
 **Current milestone (2026-10-05):** 10.0–10.2 complete; 10.3–10.5 in progress.
 Reduction/scan, norm-composition, I32 ALU and deterministic cast/rounding

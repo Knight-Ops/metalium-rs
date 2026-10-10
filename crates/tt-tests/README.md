@@ -36,14 +36,21 @@ Prerequisites: `cargo xtask fetch-ttsim` and `fetch-mnist`; `fetch-spec` for
 | `step11_burn`, `step12_mnist` | burn-tt against burn-flex; MNIST training (golden in `tests/golden/mnist_reduced.txt`). |
 | `step13`, `step14` | Ethernet, sharded matmul across chips. |
 | `step15` to `step21` | Phase 9: GDDR, data mover, resident roles, GDDR matmul, GDDR element-wise, many tiles, one launch per op per tile. |
-| `probe_*`, `scan` | Exploratory measurements of ttsim or silicon. |
+| `step22` to `step47` | Program cache, profiling, padding; `Dst` tiles and the SFPU instruction set; Burn element-wise, division, exp/log, trig, broadcasts, reductions, softmax; batching, rank-N, `MOP`, loops, traces; integer/bool storage, compare/select and activations. |
+| `step48` to `step68` | Ethernet clock and in-flight limits, NoC1 ownership, NC mover and pipeline, host DMA, tile layout, streaming and batched blocks, gather, reductions, mesh, general reduce, K-block matmul. |
+| `step69` to `step89` | Reduction primitives, norms, integer ALU, rounding, FPU transpose and pooling, BF16 storage and matmul, extremum scans, integer reductions, attention, slice assignment, convolution, resident indices, SrcA transpose, mesh module reference, MNIST CNN. |
+| `step90` to `step104` | Matrix element-wise, seeded PRNG, BFP formats and storage, ADC copies and planes, scalar config, L1 movement, XMOV tensor copy, source banks, unpacker handover. |
+| `step105` to `step147` | Phase 10 close-out: mutexes and L1 atomics (105-106), restricted MMIO (107-108), `SFPLOADMACRO` (110), matrix diagnostics (111), packer and unpacker modes (112-114), NoC multicast, atomics, completion and the mover fast path (115-118), posted-write fence (119), tag search (120), wait planner (121), int/bool, indexing, scans and remainder (125-134), sort (135-136), random (140-142), FP16 (143-144), `MathMode` (145-146), mesh traces (147). Steps 109, 122-124 and 148-149 are unused; see `docs/completed-plans/hardware-coverage-closeout.md`. |
+| `probe_*`, `scan` | Exploratory measurements of ttsim or silicon (`probe_addr_mod_sweep` holds the `AddrMod` evidence and asserts nothing). |
 | `silicon_*` | Silicon-only gates, measurements and benchmarks (`silicon_perf`). |
 | `fma_oracle` | `tt_isa::numerics::fma_bh` against the spec's `fma.c`, compiled by `build.rs`. |
 
 `src/`: `harness` (the corpus runner and role helpers), `backend` (where a gate's
 `Device` comes from, and silicon isolation: grid from the ARC, tile resets),
 `burn_device` (a `TtDevice` attached to ttsim or the card), `mnist` (IDX loader),
-`topology` (ttsim's measured multi-chip link maps).
+`topology` (ttsim's measured multi-chip link maps), `data` (deterministic test data: LCG and xorshift streams, `panic_message`).
+
+Shared test-only modules live beside the gates as `tests/<name>_support/mod.rs` (`eltwise_support`, `fp16_support`, `matrix_debug_support`, `noc_support`, `prng_support`) and are pulled in with `mod <name>_support;`.
 
 ## Environment
 

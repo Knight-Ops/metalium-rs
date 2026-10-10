@@ -1553,10 +1553,10 @@ table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
 - [x] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9). Branch `phase10-0-sfpu-foundation`; full silicon suite 381/386 on both cards, the five being two since-fixed `step23` assertions and the pre-existing Ethernet flake above.
 - [x] **10.1** Softmax and cross-entropy on the device (was 9.12); `MOP`; op-list traces. Branch `phase10-1-softmax`; softmax and log-softmax on the device, cross-entropy moved to 10.5 with D4 (`float_gather`); `MOP` gated and measured (no gain on the replayed matmul); traces with their footguns refused; wedged tiles detected and recovered. At the close: ttsim 571, silicon 448/448 on both cards, smoke 42/42, MNIST golden 5/5, 91.96% on both cards (2.0 / 1.6 ms a step, 1 / 4 tiles).
 - [x] **10.2** Activation and math breadth. Branch `phase10-2-activations`; int and bool tensors resident (D3); compare, select and sign exact (S2); the reciprocal and division fixed at their range ends (S3); every transcendental Burn has on the SFPU within derived bounds (S4: `sqrt`, `log1p`, `pow`, the exponential family, the hyperbolics and their inverses, trigonometry with an exact reduction for every finite input); block repeats in the role runner (X8); every one of `tt-mnist`'s seven activations at ReLU's traffic. At the close: ttsim 635/635, silicon 494/494 on both cards, smoke 54/54, MNIST golden in the suite, 91.96% on both cards (2.0 / 1.7 ms a step, 1 / 4 tiles).
-- [~] **10.3** Native general reductions/scans, pooling and norms landed; payload-preserving Tensix tensor transpose remains partial.
-- [~] **10.4** BF16 storage/compute, I32 ALU/casts and checked division/remainder landed; see hardware coverage for remaining formats/layouts.
-- [~] **10.5** Resident indexing, convolution/attention and gradients landed; ND indexing remains partial.
-- [~] **10.6** M1 `ELW*` and BFP8/4/2 storage landed; diagnostic PRNG advancement/predication/reseeding is gated. Hardware Burn distributions, `SFPLOADMACRO` and `DOTPV` remain deferred. D2 is complete only for delivered formats; S7 remains partial. See [mixed BFP storage](mixed-bfp-storage.md).
+- [x] **10.3** Native general reductions/scans, pooling and norms landed; the payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack (M3 `[-]`).
+- [x] **10.4** BF16 and FP16 storage and casts, BF16 compute, I32 ALU/casts, checked division/remainder and integer scans/masks landed; see hardware coverage.
+- [x] **10.5** Resident indexing (including ND gather/scatter), convolution/attention, gradients and mesh trace replay landed.
+- [x] **10.6** M1 `ELW*`, BFP8/4/2 storage, native seeded random (S7), `SFPLOADMACRO` (S9) and `SHIFTXB` (M4) landed; `DOTPV` and `SHIFTXA` are excluded. D2 is complete only for delivered formats. See [mixed BFP storage](mixed-bfp-storage.md).
 
 ---
 
