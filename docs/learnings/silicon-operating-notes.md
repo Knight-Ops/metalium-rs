@@ -730,3 +730,53 @@ inputs 2.0078125 and 4.015625 retain their low mantissa bit in TF32 matmul and
 truncate it in BF16 pooling, with exact binary results. MNIST e2e passes 8/8
 against the unchanged golden. No firmware handler/mailbox ABI or production
 tensor route changed; no performance claim accompanies diagnostic adoption.
+
+## Close-out findings (2026-10-10, measured on card 0 unless noted)
+
+- **A parked Tensix thread survives the backend reset.** A gate that aborts while a thread waits on a
+  semaphore (or in a blocking atomic) leaves it parked; every later gate on that tile then times out
+  in the harness preamble (`core did not respond within 1000 ms`). The preamble now uses
+  `session::reset_thread_state`, which releases semaphores first. The apparent "SFPLOADMACRO hang"
+  during lane H was this wedge.
+- **Polling the Sync Unit semaphore window.** Back-to-back raw loads (`PollMode::Full`) hang after the
+  first poll. One consumed load per poll (`Light`, the default) runs at about 34.7 million polls/s
+  and an L1-word completion poll at about 32.8 million, steady over 3 s; `GuardSpec::for_seconds`
+  refuses more than 2^30 polls (about 35 s). Mutexes, atomics and the deadline/host-release path
+  all use the guarded runner (steps 105/106).
+- **Blocking atomics.** `ATCAS` and `ATINCGETPTR` keep the shared Scalar Unit busy for the whole
+  retry loop, so another Tensix thread cannot issue even a `SETDMAREG` until the atomic is freed
+  (`blocked_atomic_monopolizes_the_scalar_unit`). Only the host or another core's RISC-V store can
+  free them; a blocking atomic must never synchronize Tensix threads with each other.
+- **Mutexes** 0, 2, 3 and 4 all work on every thread with round-robin handoff; `ATINCGET` wraps its
+  field and preserves upper bits and is atomic across threads; `ATSWAP` group form is exact for all
+  256 masks and aligned bases, while the **single-register form places data in lanes that follow no
+  consistent rule** (excluded, sweep in `atswap_single_form_sweep_diagnostic`).
+- **`SFPLOADMACRO`** (probes s00-s13): Store, MAD, Simple and Round sub-units, `LReg[16]`, operand
+  substitution, the chain, pipelined macros, predication, forgetting and `SFPSWAP` in the Simple
+  sub-unit all agree with the page-derived schedule model. The macro configuration is persistent
+  state: write every register a program reads and restore with `MacroConfig::teardown`.
+- **L1 tag search accelerator.** An armed trigger load hangs the baby core (all ten scenarios stop at
+  step 0, load issued) and the block stays armed across resets, so the earlier passing minimal probe
+  fails afterwards. Not adopted; do not run the (ignored) step120 silicon tests.
+- **Packer and unpacker modes.** BF16 `UnpackToDst` widens correctly; packer ReLU (all seven modes)
+  and edge masking (row sets, partial columns, -inf fill, edge-then-ReLU order) match raw-bit models;
+  unpacker tileize is a payload-preserving strided gather; unpacker transpose swaps rows and columns
+  but goes through SrcA, and the plain SrcA path itself normalizes -0, subnormals and low mantissa
+  bits (`MEASURE src.plain`). The 16-bit Dst read path preserves normal BF16 exactly but maps -0 and
+  subnormals to +0 and every NaN to infinity.
+- **FP16 packer** (`T7-MEASURE`): the raw packer truncates and saturates (equal to ttsim); the
+  rounding packer is ties-even for normals and overflows to infinity from 65520 but drops NaN
+  payloads (`0x7e00`) and flushes subnormals.
+- **Matrix diagnostics.** `MOVDBGA2D` one/eight-row moves, all four SrcA format overrides (forced to
+  TF32 under Fp32), flush and reading a bank the unpacker still owns agree with the page model;
+  the increment-1 `AddrMod` advance cases disagree for the `MOVA2D` control too (increments of 8
+  agree), so they are an open shared configuration issue. `GATESRCRST` executes safely but has no
+  observable effect against a SrcB rewritten through `MOVD2B`.
+- **NoC.** All 21 NoC atomic forms (variable-width increment, CAS, mask and indexed swaps, eight
+  Zaamo ops, six accumulate formats) match the page models against a neighbouring tile's L1. The
+  `NIU_TRANS_COUNT_RTZ_SOURCE` read follows completion; its stickiness is not established.
+  Multicast probes were not run.
+- **PRNG.** Silicon lane `i` after a restart is `advance^(98-2i)(seed)` (8 seeds x 32 lanes, both
+  cards); the seed directive in the role firmware (RISC-V store, fence, 512 NOPs) reproduces the
+  model bit for bit under T0 unpack and T2 pack concurrency.
+- **Release baselines** for K-blocking and the norm compositions are in `firmware-performance.md`.

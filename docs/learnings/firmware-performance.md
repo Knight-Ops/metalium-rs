@@ -1127,3 +1127,15 @@ Norms (epsilon 1, gamma 1, beta 0), median ms, card 0 / card 1:
 The BF16 norms are 3-5x slower than F32 (each Burn op widens and narrows once); the compositions
 are unfused by design (norm fusion is deferred). Norm benchmarks record only downloads per run,
 because Burn exposes no `dataflow_stats`.
+
+## Approx transcendentals, per-tile saving (2026-10-10, card 0)
+
+`silicon_perf::approx_per_tile_saving` (lane T8, `MathMode::Approx` against `Precise`; the device
+programs equal the interpreter bit for bit): `exp` 8.08 -> 6.51 us per tile (1.24x), `log` 10.96 ->
+7.97 (1.37x), `recip` 7.82 -> 0.95 (8.24x), `sigmoid` 12.18 -> 7.40 (1.65x), `tanh` 13.09 -> 8.10
+(1.62x), `gelu` 28.46 -> 7.31 (3.89x). Interpreter instruction counts per tile: 1.51x, 2.52x, 2.12x,
+2.82x, 3.17x and 7.10x fewer. `sqrt` and `rsqrt` were measured and dropped (1.36x and 1.17x in
+instructions, with special-value handling costing as much as Precise's). SFPU math programs are
+push-bound at the runner's 2.8 cycles per word (39 of 73 kinds have a push/backend cycle ratio above
+1, median 1.17, max 2.87, taking the vector unit at one instruction per cycle as a floor); the
+matmul is backend-bound (rows AC/AD).
