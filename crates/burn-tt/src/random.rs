@@ -1,6 +1,6 @@
 //! Independent per-device random streams.
 //!
-//! A device with resident GDDR draws **on the device** (lane T6, S7): each call
+//! A device with resident GDDR draws **on the device** (S7): each call
 //! takes the next `base` of the device's seeded sequence and runs the seeded
 //! tile kernel (`tt_kernels::prng`), so a draw is a pure function of
 //! `(seed, call number, tile)` and costs no upload. Only a device with no

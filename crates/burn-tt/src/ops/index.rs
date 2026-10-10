@@ -1,6 +1,4 @@
-//! Lane T2 indexing compositions: native implementations. Routed from `ops.rs`'s `float`, `int`
-//! and `bool` modules by glob re-export, and listed in
-//! `xtask/src/gen_burn/overrides/`.
+//! Indexing compositions: `gather_nd`, `scatter_nd`, `cross` and integer matmul.
 //!
 //! Every method here is a composition of resident primitives; the host builds
 //! address metadata only and never sees a tensor value.
@@ -49,8 +47,7 @@
 //! Nothing goes through `f32`. The intermediate is bounded by
 //! [`INT_MATMUL_BUDGET`] elements; above it the op fails naming the shapes.
 
-#![allow(unused_imports)]
-
+use super::*;
 use burn_backend::tensor::IndexingUpdateOp;
 
 /// The most elements `int_matmul` materializes: the broadcast product
@@ -58,59 +55,43 @@ use burn_backend::tensor::IndexingUpdateOp;
 /// GDDR; the host holds their address lists).
 pub const INT_MATMUL_BUDGET: usize = 1 << 22;
 
-pub mod float {
-    use crate::ops::*;
-    use burn_backend::tensor::IndexingUpdateOp;
-
-    /// Multi-dimensional gather: see the module documentation.
-    pub fn float_gather_nd(data: TtTensor, indices: TtTensor) -> TtTensor {
-        super::gather_nd(data, indices, "float_gather_nd")
-    }
-
-    /// Multi-dimensional scatter: `Add` and `Assign` only.
-    pub fn float_scatter_nd(
-        data: TtTensor,
-        indices: TtTensor,
-        values: TtTensor,
-        reduction: IndexingUpdateOp,
-    ) -> TtTensor {
-        super::scatter_nd(data, indices, values, reduction, "float_scatter_nd")
-    }
-
-    /// The cross product of two tensors along `dim`, which has size 3 in both.
-    pub fn float_cross(lhs: TtTensor, rhs: TtTensor, dim: usize) -> TtTensor {
-        super::cross(lhs, rhs, dim)
-    }
+/// Multi-dimensional gather: see the module documentation.
+pub fn float_gather_nd(data: TtTensor, indices: TtTensor) -> TtTensor {
+    gather_nd(data, indices, "float_gather_nd")
 }
 
-pub mod int {
-    use crate::ops::*;
-    use burn_backend::tensor::IndexingUpdateOp;
-
-    pub fn int_gather_nd(data: TtTensor, indices: TtTensor) -> TtTensor {
-        super::gather_nd(data, indices, "int_gather_nd")
-    }
-
-    pub fn int_scatter_nd(
-        data: TtTensor,
-        indices: TtTensor,
-        values: TtTensor,
-        reduction: IndexingUpdateOp,
-    ) -> TtTensor {
-        super::scatter_nd(data, indices, values, reduction, "int_scatter_nd")
-    }
-
-    /// Integer matrix product, exact modulo 2^32.
-    pub fn int_matmul(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
-        super::int_matmul_composed(lhs, rhs)
-    }
+/// Multi-dimensional scatter: `Add` and `Assign` only.
+pub fn float_scatter_nd(
+    data: TtTensor,
+    indices: TtTensor,
+    values: TtTensor,
+    reduction: IndexingUpdateOp,
+) -> TtTensor {
+    scatter_nd(data, indices, values, reduction, "float_scatter_nd")
 }
 
-pub mod bool {
-    use crate::ops::*;
+/// The cross product of two tensors along `dim`, which has size 3 in both.
+pub fn float_cross(lhs: TtTensor, rhs: TtTensor, dim: usize) -> TtTensor {
+    cross(lhs, rhs, dim)
 }
 
-use crate::ops::*;
+pub fn int_gather_nd(data: TtTensor, indices: TtTensor) -> TtTensor {
+    gather_nd(data, indices, "int_gather_nd")
+}
+
+pub fn int_scatter_nd(
+    data: TtTensor,
+    indices: TtTensor,
+    values: TtTensor,
+    reduction: IndexingUpdateOp,
+) -> TtTensor {
+    scatter_nd(data, indices, values, reduction, "int_scatter_nd")
+}
+
+/// Integer matrix product, exact modulo 2^32.
+pub fn int_matmul(lhs: TtTensor, rhs: TtTensor) -> TtTensor {
+    int_matmul_composed(lhs, rhs)
+}
 
 /// `tensor` as `shape`: a free view when the stored matrix is the same,
 /// otherwise a device repack of its logical elements in order. (A reshape that

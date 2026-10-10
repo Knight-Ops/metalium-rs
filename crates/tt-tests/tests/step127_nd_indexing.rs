@@ -9,7 +9,7 @@
 //! gate says so. Gathers and `Assign` move raw datums, so signed zeros, subnormals
 //! and NaN payloads must survive.
 //!
-//! Duplicate-index contract (stated in `ops_index.rs`): `Add` folds in index order,
+//! Duplicate-index contract (stated in `ops/index.rs`): `Add` folds in index order,
 //! `Assign` is last-writer-wins in index order, `Mul`/`Min`/`Max` are refused naming
 //! the variant. Every coordinate is bounds-checked against its own axis on the device
 //! (code 11 DOMAIN), not only the flat row.

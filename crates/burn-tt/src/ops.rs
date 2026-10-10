@@ -109,6 +109,59 @@ pub(crate) fn bfp_result_storage(op: &str, inputs: &[&TtTensor]) -> crate::stora
     }
 }
 
+/// Resident F32 <-> F16 conversion on Tensix, and BF16 <-> F16 through F32.
+///
+/// FP16 is IEEE binary16 in BF16's two-byte physical slots (`tt_kernels::fp16`).
+/// In Burn it is a *storage and cast* dtype: raw views and movement work like
+/// BF16's (the buffers are raw two-byte slots, `crate::tensor::is_half`), and
+/// `float_cast` converts F32, BF16 and F16 on Tensix (BF16 to or from F16 goes
+/// through F32). Arithmetic on F16 operands is not claimed: it fails explicitly
+/// naming the operation and dtype, and `dtype_usage` reports `Storage` only.
+/// F64 stays unsupported and its cast names the operation and dtype.
+///
+/// `None` for any pair involving neither F16 nor a supported partner dtype, so
+/// the caller's explicit failure names the operation and the dtypes.
+fn cast_f16(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
+    let from = tensor.dtype();
+    if (from != DType::F16 && dtype != DType::F16)
+        || !matches!(from, DType::F32 | DType::BF16 | DType::F16)
+        || !matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
+        || !tensor.is_storable()
+        || !crate::server::supports_dram(tensor.device)
+    {
+        return None;
+    }
+    match (from, dtype) {
+        (DType::BF16, DType::F16) => {
+            let wide = cast_native(tensor.clone(), DType::F32);
+            cast_f16(&wide, DType::F16)
+        }
+        (DType::F16, DType::BF16) => {
+            let wide = cast_f16(tensor, DType::F32)?;
+            Some(cast_native(wide, DType::BF16))
+        }
+        _ => {
+            let source = tensor.to_dram();
+            let (id, dims) = crate::server::cast_f16(
+                tensor.device,
+                source.buffer.id,
+                [source.buffer.rows, source.buffer.cols],
+                dtype == DType::F16,
+            );
+            let mut result = device_view(tensor.device, id, dims, None, dtype)
+                .to_dram()
+                .clone();
+            result.transposed = source.transposed;
+            Some(TtTensor::on_device(
+                result,
+                tensor.shape(),
+                dtype,
+                tensor.device,
+            ))
+        }
+    }
+}
+
 /// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
 /// BF16 arithmetic widens to F32 on Tensix, computes using the existing native
 /// contract, then rounds its floating-point result once at the operation boundary.
@@ -116,8 +169,8 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
     if tensor.dtype() == dtype {
         return tensor;
     }
-    // FP16 casts are lane T7's (`ops_dtype.rs`); any other pair falls through.
-    if let Some(converted) = dtype_ops::cast_f16(&tensor, dtype) {
+    // FP16 casts are handled above; any other pair falls through.
+    if let Some(converted) = cast_f16(&tensor, dtype) {
         return converted;
     }
     if !matches!(
@@ -638,6 +691,66 @@ pub(crate) fn unfold_native(tensor: TtTensor, dim: usize, size: usize, step: usi
     device_result_shaped(tensor.device, id, dims, output.into(), tensor.dtype())
 }
 
+/// Upload a host-resident tensor first, as `float_swap_dims` does, so a dimension swap is a view
+/// of a device buffer rather than a host reshuffle.
+fn resident_for_view(tensor: &TtTensor) {
+    if tensor.is_storable()
+        && crate::server::is_attached(tensor.device)
+        && crate::server::supports_dram(tensor.device)
+    {
+        tensor.to_dram();
+    }
+}
+
+/// `mask ? value : tensor` for the raw-word kinds: the three operands broadcast to one shape
+/// (device copies, as `expand` does), then one ternary SFPU op.
+fn mask_where_native(
+    op: &str,
+    kind: u32,
+    tensor: TtTensor,
+    mask: TtTensor,
+    value: TtTensor,
+) -> TtTensor {
+    let fail_with = |why: &str| -> ! {
+        fail(
+            op,
+            format_args!(
+                "tensor=({}), mask=({}), value=({}): {why}",
+                context(&tensor),
+                context(&mask),
+                context(&value)
+            ),
+        )
+    };
+    let shape = broadcast_shape(&tensor.shape().to_vec(), &mask.shape().to_vec())
+        .and_then(|s| broadcast_shape(&s, &value.shape().to_vec()))
+        .unwrap_or_else(|| fail_with("shapes do not broadcast"));
+    let shape = burn_backend::Shape::from(shape);
+    let (tensor, mask, value) = (
+        expanded(&tensor, shape.clone(), op),
+        expanded(&mask, shape.clone(), op),
+        expanded(&value, shape, op),
+    );
+    let eltwise = tt_kernels::tensor::Eltwise {
+        kind,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    device_op(eltwise, &tensor, Some(&mask), Some(&value))
+        .unwrap_or_else(|| fail_with("operands are not resident-compatible"))
+}
+
+/// `mask ? scalar : tensor`, `scalar` the raw 32-bit pattern (`f32::from_bits`, never a float
+/// conversion).
+fn mask_fill_native(op: &str, kind: u32, bits: u32, tensor: TtTensor, mask: TtTensor) -> TtTensor {
+    device_eltwise(kind, f32::from_bits(bits), &tensor, Some(&mask)).unwrap_or_else(|| {
+        fail(
+            op,
+            format_args!("tensor=({}), mask=({})", context(&tensor), context(&mask)),
+        )
+    })
+}
+
 /// General raw resident gather. Static staging covers every legal source;
 /// B reads bounded I32 indices and rejects the domain before indexed copying.
 fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
@@ -917,7 +1030,7 @@ fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> 
     Some(device_result_shaped(*device, id, dims, shape, dtype))
 }
 
-/// lane:t6_random: a resident tensor drawn by the seeded tile kernel
+/// A resident tensor drawn by the seeded tile kernel
 /// (`tt_kernels::prng`). `None` only where the device has no resident buffers
 /// (unattached, or an engine without GDDR) or the shape is empty: the caller
 /// then builds host construction data. On an attached GDDR device a failed
@@ -1338,39 +1451,15 @@ fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
     t
 }
 
-#[path = "ops_intbool.rs"]
-mod intbool_ops;
-
-#[path = "ops_index.rs"]
-mod index_ops;
-
-#[path = "ops_scan.rs"]
-mod scan_ops;
-
-#[path = "ops_rem.rs"]
-mod rem_ops;
-
-#[path = "ops_sort.rs"]
-mod sort_ops;
-
-#[path = "ops_dtype.rs"]
-mod dtype_ops;
-
 pub mod float {
-    #[allow(unused_imports)]
-    pub use super::dtype_ops::float::*;
-    #[allow(unused_imports)]
-    pub use super::index_ops::float::*;
-    #[allow(unused_imports)]
-    pub use super::intbool_ops::float::*;
-    #[allow(unused_imports)]
-    pub use super::rem_ops::float::*;
-    #[allow(unused_imports)]
-    pub use super::scan_ops::float::*;
-    #[allow(unused_imports)]
-    pub use super::sort_ops::float::*;
+    pub use super::index::{float_cross, float_gather_nd, float_scatter_nd};
+    pub use super::scan::{float_cummax, float_cummin, float_cumprod, float_cumsum};
+    pub use super::sort::{
+        float_argsort, float_argtopk, float_sort, float_sort_with_indices, float_topk,
+    };
     use super::*;
     use burn_backend::Scalar;
+    use num_traits::ToPrimitive;
     use tt_kernels::kind;
 
     /// First extremum index, with the first NaN taking precedence. Index
@@ -1511,7 +1600,7 @@ pub mod float {
                 format_args!("shape={shape:?}, dtype={dtype:?}, distribution={distribution:?}"),
             );
         }
-        // lane:t6_random: drawn on the device (`crate::random`); BF16 is the
+        // Drawn on the device (`crate::random`); BF16 is the
         // device's F32 draw cast on the device.
         if let Some(out) = native_random(
             &shape,
@@ -2171,7 +2260,7 @@ pub mod float {
         acc.expect("a nonempty stored matrix has at least one column chunk")
     }
 
-    fn check_reduce_dim(tensor: &TtTensor, dim: usize, op: &str) {
+    pub(super) fn check_reduce_dim(tensor: &TtTensor, dim: usize, op: &str) {
         if dim >= tensor.shape().num_dims() || !tensor.is_stored_f32() {
             fail(op, format_args!("{}, axis={dim}", context(tensor)));
         }
@@ -2192,68 +2281,6 @@ pub mod float {
         fail(
             "float_sum_dim",
             format_args!("tensor=({})", context(&tensor)),
-        )
-    }
-
-    pub fn float_cumsum(tensor: TtTensor, dim: usize) -> TtTensor {
-        scan_dim(
-            tensor,
-            dim,
-            tt_kernels::sfpu::scan::ScanOp::Sum,
-            "float_cumsum",
-        )
-    }
-
-    pub fn float_cumprod(tensor: TtTensor, dim: usize) -> TtTensor {
-        scan_dim(
-            tensor,
-            dim,
-            tt_kernels::sfpu::scan::ScanOp::Prod,
-            "float_cumprod",
-        )
-    }
-
-    fn scan_dim(
-        tensor: TtTensor,
-        dim: usize,
-        op: tt_kernels::sfpu::scan::ScanOp,
-        name: &str,
-    ) -> TtTensor {
-        check_reduce_dim(&tensor, dim, name);
-        let packed = pack_axis(&tensor, dim).unwrap_or_else(|| fail(name, context(&tensor)));
-        let transposed = swapped_view(&packed, 0, 1).expect("packed matrix");
-        let source = plain_dram(&transposed);
-        let (id, dims) = crate::server::scan(tensor.device, source.buffer.id, op);
-        let scanned = device_result(tensor.device, id, dims);
-        let scanned = swapped_view(&scanned, 0, 1).expect("scanned matrix");
-        let plain = plain_dram(&scanned);
-        let shape = tensor.shape().to_vec();
-        let mut out_shape = shape.clone();
-        out_shape[dim] = 1;
-        let sources = (0..shape.iter().product())
-            .map(|mut flat| {
-                let mut coords = vec![0; shape.len()];
-                for k in (0..shape.len()).rev() {
-                    coords[k] = flat % shape[k];
-                    flat /= shape[k];
-                }
-                let column = coords[dim];
-                coords[dim] = 0;
-                let row = coords
-                    .iter()
-                    .zip(&out_shape)
-                    .fold(0, |n, (&i, &d)| n * d + i);
-                [row, column]
-            })
-            .collect();
-        let dims = crate::tensor::stored_dims(&shape).expect("stored scan shape");
-        let (id, dims) = crate::server::repack(tensor.device, plain.buffer.id, sources, dims);
-        device_result_shaped(
-            tensor.device,
-            id,
-            dims,
-            burn_backend::Shape::from(shape),
-            DType::F32,
         )
     }
 
@@ -2999,21 +3026,72 @@ pub mod float {
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
         async move { Ok(tensor.into_host().into_data()) }
     }
+
+    /// `((lhs % rhs) + rhs) % rhs` element-wise, Flex's formula, on the device
+    /// where the data is; operands that do not fit the device's element-wise
+    /// path fail, naming the operation and both operands.
+    pub fn float_remainder(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let (sl, sr) = (lhs.shape().to_vec(), rhs.shape().to_vec());
+        let (lhs, rhs) = if sl == sr {
+            (lhs, rhs)
+        } else {
+            let Some(common) = broadcast_shape(&sl, &sr) else {
+                fail(
+                    "float_remainder",
+                    format_args!(
+                        "lhs=({}), rhs=({}): the shapes do not broadcast",
+                        context(&lhs),
+                        context(&rhs)
+                    ),
+                )
+            };
+            let shape = burn_backend::Shape::from(common);
+            (
+                expanded(&lhs, shape.clone(), "float_remainder"),
+                expanded(&rhs, shape, "float_remainder"),
+            )
+        };
+        device_eltwise(kind_sfpu::REM, 0.0, &lhs, Some(&rhs)).unwrap_or_else(|| {
+            fail(
+                "float_remainder",
+                format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
+            )
+        })
+    }
+
+    /// `((lhs % s) + s) % s` with the scalar converted as Flex converts it
+    /// (`to_f64() as f32`, `burn-flex` `ops/binary.rs`), on the device where
+    /// the data is.
+    pub fn float_remainder_scalar(
+        lhs: FloatTensor<TtBackend>,
+        rhs: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        let s = rhs.to_f64().expect("a float scalar") as f32;
+        device_eltwise(kind_sfpu::REM_S, s, &lhs, None).unwrap_or_else(|| {
+            fail(
+                "float_remainder_scalar",
+                format_args!("lhs=({}), rhs={rhs:?}", context(&lhs)),
+            )
+        })
+    }
 }
 
-#[path = "pool.rs"]
-mod pooling;
-
-#[path = "conv.rs"]
-mod convolution;
+mod conv;
+mod index;
+mod pool;
+mod scan;
+mod sort;
 
 pub mod module {
-    pub use super::convolution::{
+    pub use super::conv::{
         conv2d, conv2d_bias_backward, conv2d_weight_backward, conv2d_x_backward, conv_transpose2d,
         conv_transpose2d_bias_backward, conv_transpose2d_weight_backward,
         conv_transpose2d_x_backward, unfold4d,
     };
-    pub use super::pooling::{
+    pub use super::pool::{
         adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
         max_pool2d, max_pool2d_with_indices, max_pool2d_with_indices_backward,
     };
@@ -3405,19 +3483,11 @@ pub mod activation {
 }
 
 pub mod int {
-    #[allow(unused_imports)]
-    pub use super::dtype_ops::int::*;
-    #[allow(unused_imports)]
-    pub use super::index_ops::int::*;
-    #[allow(unused_imports)]
-    pub use super::intbool_ops::int::*;
-    #[allow(unused_imports)]
-    pub use super::rem_ops::int::*;
-    #[allow(unused_imports)]
-    pub use super::scan_ops::int::*;
-    #[allow(unused_imports)]
-    pub use super::sort_ops::int::*;
+    pub use super::index::{int_gather_nd, int_matmul, int_scatter_nd};
+    pub use super::scan::{int_cummax, int_cummin, int_cumprod, int_cumsum};
+    pub use super::sort::{int_argsort, int_argtopk, int_sort, int_sort_with_indices, int_topk};
     use super::*;
+    use burn_backend::Scalar;
 
     pub fn int_gather(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
         gather_native(dim, tensor, indices)
@@ -3859,22 +3929,157 @@ pub mod int {
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
         async move { Ok(tensor.into_host().into_data()) }
     }
+
+    /// First index of the maximum along `dim`.
+    pub fn int_argmax(tensor: TtTensor, dim: usize) -> TtTensor {
+        int_argextreme(tensor, dim, false)
+    }
+
+    /// First index of the minimum along `dim`.
+    pub fn int_argmin(tensor: TtTensor, dim: usize) -> TtTensor {
+        int_argextreme(tensor, dim, true)
+    }
+
+    /// First index of the signed extreme of an I32 tensor along `dim`. The
+    /// extreme comes from the exact integer reduction, an integer comparison
+    /// marks the other elements, and the first unmarked index is the minimum of
+    /// the negated positions (exact in F32 for an axis up to 2^23, the bound
+    /// `float_argmax` keeps). The comparison is on the integers themselves, never
+    /// on a float image of them (an I32 above 2^24 has no exact one). Index
+    /// metadata is the only host-built input.
+    fn int_argextreme(tensor: TtTensor, dim: usize, minimum: bool) -> TtTensor {
+        let op = if minimum { "int_argmin" } else { "int_argmax" };
+        let shape = tensor.shape().to_vec();
+        if tensor.dtype() != DType::I32
+            || shape.is_empty()
+            || dim >= shape.len()
+            || shape[dim] == 0
+            || shape[dim] > 8_388_608
+            || !tensor.is_storable()
+            || !crate::server::supports_dram(tensor.device)
+        {
+            fail(op, format_args!("{}, dim={dim}", context(&tensor)));
+        }
+        if shape.len() > 2 {
+            let packed = pack_axis(&tensor, dim).unwrap_or_else(|| fail(op, context(&tensor)));
+            let selected = int_argextreme(packed, 1, minimum);
+            let mut output = shape;
+            output[dim] = 1;
+            return repack_shape(&selected, output);
+        }
+        let axis = if shape.len() == 1 { 1 } else { dim };
+        let dims = tensor.stored().expect("matrix");
+        let tensor = reshaped(tensor, burn_backend::Shape::new(dims));
+        let extreme = if minimum {
+            crate::ops::int::int_min_dim(tensor.clone(), axis)
+        } else {
+            crate::ops::int::int_max_dim(tensor.clone(), axis)
+        };
+        let indices = (0..dims[0] * dims[1])
+            .map(|i| {
+                let index = if axis == 1 { i % dims[1] } else { i / dims[1] };
+                (-(index as f32)).to_bits()
+            })
+            .collect();
+        let id = crate::server::metadata(tensor.device, indices, dims, Elem::F32);
+        let indices = device_result(tensor.device, id, dims);
+        let unequal = device_eltwise(kind_sfpu::INT_NE, 0.0, &tensor, Some(&extreme))
+            .unwrap_or_else(|| fail(op, context(&tensor)));
+        let candidate = device_eltwise(
+            kind_sfpu::MASK_FILL,
+            f32::NEG_INFINITY,
+            &indices,
+            Some(&unequal),
+        )
+        .unwrap_or_else(|| fail(op, context(&tensor)));
+        let best = crate::ops::float::float_max_dim(candidate, axis);
+        let positive = crate::ops::float::float_neg(best);
+        let index = device_eltwise(kind_sfpu::INDEX_TO_I32, 0.0, &positive, None)
+            .unwrap_or_else(|| fail(op, context(&tensor)));
+        let mut output = shape;
+        output[dim] = 1;
+        reshaped(index, burn_backend::Shape::from(output))
+    }
+
+    /// Reorder dimensions as strided views of the device buffer.
+    pub fn int_permute(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        permute_with(tensor, axes, "int_permute", |t, i, j| {
+            resident_for_view(&t);
+            int_swap_dims(t, i, j)
+        })
+    }
+
+    /// Reverse selected axes through bit-preserving device copies.
+    pub fn int_flip(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        flip_native(tensor, axes, "int_flip")
+    }
+
+    /// Sliding windows of an `I32` tensor, every word kept.
+    pub fn int_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
+        unfold_native(tensor, dim, size, step)
+    }
+
+    /// `mask ? value : tensor` as one raw-word predicated move: denormal and NaN bit patterns and
+    /// `i32::MIN` survive.
+    pub fn int_mask_where(tensor: TtTensor, mask: TtTensor, value: TtTensor) -> TtTensor {
+        mask_where_native(
+            "int_mask_where",
+            kind_sfpu::INT_MASK_WHERE,
+            tensor,
+            mask,
+            value,
+        )
+    }
+
+    /// `mask ? value : tensor` with `value` wrapped to I32 as Flex's `as i32` does and carried
+    /// as its raw bits: every I32 value, `16777217` and `i32::MIN` included, is filled exactly.
+    pub fn int_mask_fill(tensor: TtTensor, mask: TtTensor, value: Scalar) -> TtTensor {
+        let Some(v) = value.to_i64() else {
+            fail(
+                "int_mask_fill",
+                format_args!(
+                    "tensor=({}), mask=({}), value={value:?} is not an integer",
+                    context(&tensor),
+                    context(&mask)
+                ),
+            )
+        };
+        mask_fill_native(
+            "int_mask_fill",
+            kind_sfpu::INT_MASK_FILL,
+            v as i32 as u32,
+            tensor,
+            mask,
+        )
+    }
+
+    /// Wrapping absolute value in the integer ALU: `i32::MIN` stays `i32::MIN`, as Flex's
+    /// `wrapping_abs`.
+    pub fn int_abs(tensor: TtTensor) -> TtTensor {
+        device_eltwise(kind_sfpu::INT_ABS, 0.0, &tensor, None)
+            .unwrap_or_else(|| fail("int_abs", context(&tensor)))
+    }
+
+    /// I32 to I32 is the tensor itself (as Flex); every other width is not stored on the
+    /// device and fails naming both dtypes.
+    pub fn int_cast(tensor: TtTensor, dtype: IntDType) -> TtTensor {
+        if tensor.dtype() == DType::I32 && DType::from(dtype) == DType::I32 {
+            return tensor;
+        }
+        fail(
+            "int_cast",
+            format_args!(
+                "{}, target dtype={:?}: the device stores I32 only",
+                context(&tensor),
+                DType::from(dtype)
+            ),
+        )
+    }
 }
 
 pub mod bool {
-    #[allow(unused_imports)]
-    pub use super::dtype_ops::bool::*;
-    #[allow(unused_imports)]
-    pub use super::index_ops::bool::*;
-    #[allow(unused_imports)]
-    pub use super::intbool_ops::bool::*;
-    #[allow(unused_imports)]
-    pub use super::rem_ops::bool::*;
-    #[allow(unused_imports)]
-    pub use super::scan_ops::bool::*;
-    #[allow(unused_imports)]
-    pub use super::sort_ops::bool::*;
     use super::*;
+    use burn_backend::Scalar;
 
     pub fn bool_scatter_or(
         dim: usize,
@@ -4152,6 +4357,46 @@ pub mod bool {
                 format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
             )
         }
+    }
+
+    /// Reorder dimensions as strided views of the device buffer.
+    pub fn bool_permute(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        permute_with(tensor, axes, "bool_permute", |t, i, j| {
+            resident_for_view(&t);
+            bool_swap_dims(t, i, j)
+        })
+    }
+
+    /// Reverse selected axes through bit-preserving device copies.
+    pub fn bool_flip(tensor: TtTensor, axes: &[usize]) -> TtTensor {
+        flip_native(tensor, axes, "bool_flip")
+    }
+
+    /// Sliding windows of a `Bool` tensor, canonical `0`/`1` kept.
+    pub fn bool_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
+        unfold_native(tensor, dim, size, step)
+    }
+
+    /// `mask ? value : tensor` on canonical `0`/`1` words.
+    pub fn bool_mask_where(tensor: TtTensor, mask: TtTensor, value: TtTensor) -> TtTensor {
+        mask_where_native(
+            "bool_mask_where",
+            kind_sfpu::BOOL_MASK_WHERE,
+            tensor,
+            mask,
+            value,
+        )
+    }
+
+    /// `mask ? value : tensor`, `value` the canonical word `0` or `1`.
+    pub fn bool_mask_fill(tensor: TtTensor, mask: TtTensor, value: Scalar) -> TtTensor {
+        mask_fill_native(
+            "bool_mask_fill",
+            kind_sfpu::BOOL_MASK_FILL,
+            u32::from(value.elem::<bool>()),
+            tensor,
+            mask,
+        )
     }
 }
 

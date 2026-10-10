@@ -1,5 +1,5 @@
-//! Operations hardware coverage deliberately does not provide (`[-]` in
-//! `docs/plans/hardware-coverage-closeout.md`). Each must fail explicitly with
+//! Operations hardware coverage deliberately does not provide (the `[-]` dispositions in
+//! `docs/plans/burn-op-coverage.md`). Each must fail explicitly with
 //! its name and the input metadata, never fall back to a host computation.
 //! Needs no hardware: refusal inspects metadata only.
 use burn_backend::ops::{
