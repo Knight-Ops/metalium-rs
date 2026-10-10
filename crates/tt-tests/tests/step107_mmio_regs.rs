@@ -1,7 +1,7 @@
 //! Restricted Scalar Unit MMIO: `LOADREG`, `STOREREG`, `STOREIND` (MMIO).
 //!
 //! The only addressable words are `SW_INT_PC[28..=31]` of the tile PIC
-//! (`tt_isa::mmio_reg`). Host tests pin the allowlist, the address arithmetic
+//! (`tt_isa::scalar::mmio`). Host tests pin the allowlist, the address arithmetic
 //! and every refusal against literal addresses from `PIC.md` and a separate
 //! transcription of the pinned `STOREIND` model. ttsim executes none of these
 //! forms (divergence rows 78-79), so the simulator gate records the refusals with
@@ -9,7 +9,7 @@
 use tt_isa::{
     backend::{self, Before},
     isa::generated::encode,
-    mmio_reg::{self as mmio, MmioError, Scratch},
+    scalar::mmio::{self as mmio, MmioError, Scratch},
     scalar::{OffsetHalf, OffsetIncrement as Inc},
 };
 

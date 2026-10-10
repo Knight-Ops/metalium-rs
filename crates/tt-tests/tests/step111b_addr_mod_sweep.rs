@@ -46,10 +46,10 @@
 use tt_isa::{
     backend::{self, Before},
     isa::{generated::encode, Instruction},
-    matrix::{Banks, Loaded},
-    matrix_debug::{
+    matrix::debug::{
         AddrModEntry, AddrModTable, DebugFormat, DebugMode, DebugMove, Rows, SrcAFormat,
     },
+    matrix::{Banks, Loaded},
 };
 use tt_tests::datapath::{set_adc_x, Unpacker, STAGE};
 use tt_tests::harness::{self, Roles, Run};

@@ -3,7 +3,7 @@
 //! ttsim does not execute `SFPLOADMACRO` (divergence row 7), so this is the only
 //! oracle for what a configured macro does. It is written from
 //! `SFPLOADMACRO.md`'s functional model and `SFPCONFIG.md`, **not** from
-//! `tt_isa::sfpu_macro`'s checked helpers: it re-reads the raw `Sequence`,
+//! `tt_isa::sfpu::load_macro`'s checked helpers: it re-reads the raw `Sequence`,
 //! `Misc` and template words the way the page's pseudocode does, so a helper
 //! that encoded a byte wrongly disagrees with this model rather than agreeing
 //! with itself. What it shares with the helper is only the generated

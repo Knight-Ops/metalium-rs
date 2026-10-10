@@ -9,6 +9,8 @@
 //! (the highest is NC's at `0x1_2000`) with a wide margin for code growth.
 
 /// Byte offset of the mailbox within a tile's L1.
+pub mod guard;
+
 pub const MAILBOX_BASE: u64 = 0x0010_0000;
 
 /// Offsets of the words the firmware runtime itself writes, from whichever base

@@ -5,19 +5,20 @@
 //!
 //! The oracle is the pinned Blackhole pages (`ATGETM.md`, `ATRELM.md`,
 //! `SyncUnit.md`) and nothing in `tt-isa`: the arbitration rule below is
-//! written from the page text, not from `tt_isa::mutex`.
+//! written from the page text, not from `tt_isa::sync::mutex`.
 //!
 //! The threads report "I hold it" by posting a semaphore of their own, which the
 //! guarded runner publishes (`Guard::snapshot`). Not an L1 store: ttsim refuses
 //! `STOREIND` (divergence row 66's family), and this keeps one path for both
 //! targets.
 #[cfg(not(feature = "silicon"))]
-use tt_isa::l1_atomic::guard;
+use tt_isa::mailbox::guard;
 use tt_isa::{
     backend::{self, Before},
     isa::Instruction,
-    l1_atomic::{self as atomic, guard::PollMode},
-    mutex::{self, Mutex},
+    mailbox::guard::PollMode,
+    scalar::atomic::{self as atomic},
+    sync::mutex::{self, Mutex},
     sync::{self, Semaphore},
 };
 use tt_kernels::{
@@ -459,7 +460,7 @@ fn diagnose(dev: &mut harness::Dev<'_>, l: &Layout, launch: &Run3) -> String {
         let mb = Mailbox::of(role as u32);
         let raw = launch.read32(dev, mb.status()).unwrap_or(0xffff_ffff);
         let panic = launch.read32(dev, mb.panic_code()).unwrap_or(0xffff_ffff);
-        let g = tt_isa::l1_atomic::guard::Guard::of(mb);
+        let g = tt_isa::mailbox::guard::Guard::of(mb);
         let arm = launch.read32(dev, g.arm()).unwrap_or(0xffff_ffff);
         let polls = launch.read32(dev, g.polls()).unwrap_or(0xffff_ffff);
         let sems = launch.semaphores(dev, role);
@@ -684,7 +685,7 @@ fn calibrate(mode: PollMode) {
         let g = p.guard();
         // In its poll loop: the first poll finished.
         let polling = launch.wait(dev, budget(), "the first poll", |dev, l2| {
-            Ok(l2.read32(dev, g.stage())? >= tt_isa::l1_atomic::guard::stage::FIRST_POLL_DONE)
+            Ok(l2.read32(dev, g.stage())? >= tt_isa::mailbox::guard::stage::FIRST_POLL_DONE)
         });
         expect_wait(dev, &l, &launch, polling, "waiting for the poll loop");
         let start = Instant::now();

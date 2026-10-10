@@ -52,14 +52,14 @@ unsafe fn apply(step: ts::WriteStep) {
 /// # Safety
 ///
 /// As [`apply`].
-unsafe fn apply_blind(shadow: &mut [u32; 8], step: ts::WriteStep) {
-    let i = (step.word - 212) as usize;
+unsafe fn apply_blind(shadow: &mut [u32; ts::WORD_COUNT], step: ts::WriteStep) {
+    let i = (step.word - ts::FIRST_WORD) as usize;
     shadow[i] = (shadow[i] & !step.mask) | (step.value & step.mask);
     // SAFETY: a word of the generated `Config` table, per the caller.
     unsafe { core::ptr::write_volatile(ts::config_address(step.word) as *mut u32, shadow[i]) };
 }
 
-fn disarm(blind: bool, shadow: &mut [u32; 8]) {
+fn disarm(blind: bool, shadow: &mut [u32; ts::WORD_COUNT]) {
     for s in DISARM {
         // SAFETY: words 212, 218 and 219 of the generated table; the host
         // released the backend before starting this image.
@@ -83,7 +83,7 @@ fn stage(step: u32, phase: u32) {
 
 /// Leave the block disarmed, then stop: no exit path may leave the accelerator
 /// armed while this core goes on executing loads.
-fn bail(blind: bool, shadow: &mut [u32; 8], keep: bool, step: u32) -> ! {
+fn bail(blind: bool, shadow: &mut [u32; ts::WORD_COUNT], keep: bool, step: u32) -> ! {
     if !keep {
         disarm(blind, shadow);
     }
@@ -101,7 +101,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             l1_read32(probe::SCRIPT + 8) != 0,
         )
     };
-    let mut shadow = [0u32; 8];
+    let mut shadow = [0u32; ts::WORD_COUNT];
     stage(0, probe::phase::PROLOGUE);
     // Disarm first: `Config` outlives a process, and nothing here has run.
     if !keep {
@@ -122,7 +122,9 @@ pub extern "Rust" fn firmware_main() -> ! {
         for i in 0..u64::from(writes) {
             // SAFETY: bounded by `writes`, inside the step's 256 bytes.
             let word = unsafe { l1_read32(step + 8 + i * 12) };
-            if !(212..=219).contains(&word) {
+            if !(u32::from(ts::FIRST_WORD)..u32::from(ts::FIRST_WORD) + ts::WORD_COUNT as u32)
+                .contains(&word)
+            {
                 bail(blind, &mut shadow, keep, k);
             }
         }
@@ -155,13 +157,15 @@ pub extern "Rust" fn firmware_main() -> ! {
         // The stores must retire before the load that depends on them.
         publish();
         stage(k, probe::phase::CONFIG_WRITTEN);
-        for w in 0..8u64 {
+        for w in 0..ts::WORD_COUNT as u64 {
             if blind {
                 break;
             }
             // SAFETY: Config words 212..=219; result words in the data arena.
             unsafe {
-                let v = core::ptr::read_volatile(ts::config_address(212 + w as u16) as *const u32);
+                let v = core::ptr::read_volatile(
+                    ts::config_address(ts::FIRST_WORD + w as u16) as *const u32
+                );
                 l1_write32(result + 4 + w * 4, v);
             }
         }

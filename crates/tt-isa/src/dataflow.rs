@@ -19,7 +19,7 @@ pub const LENGTH_MASK: u32 = !(STREAMED | mailbox::loops::LOOPED);
 pub const VERSION: u32 = 1;
 pub const STEP_WORDS: u32 = 4;
 
-/// Lane T6: a role program may open with a two-word *seed directive*
+/// A role program may open with a two-word *seed directive*
 /// (`seed_directive`): the role firmware does not push them, it stores the
 /// second word to the PRNG seed register with a full-width RISC-V store, fences,
 /// and waits [`SEED_SETTLE_NOPS`] NOP iterations -- the one restart procedure

@@ -13,6 +13,8 @@
 //! is a guess about the encoding, and nothing in the generated layer is a guess
 //! about the hardware.
 
+pub mod load_macro;
+
 use crate::isa::generated::encode;
 use crate::isa::{self};
 use crate::tensix;

@@ -11,10 +11,10 @@
 //! forms with a producer on another thread and the deadline active.
 //!
 //! The models below are written from the page text and share nothing with
-//! `tt_isa::l1_atomic`.
+//! `tt_isa::scalar::atomic`.
 #[cfg(feature = "silicon")]
-use tt_isa::l1_atomic::Region16;
-use tt_isa::{backend, isa::Instruction, l1_atomic as atomic};
+use tt_isa::scalar::atomic::Region16;
+use tt_isa::{backend, isa::Instruction, scalar::atomic};
 #[cfg(feature = "silicon")]
 use tt_isa::{backend::Before, sync};
 use tt_tests::harness;
@@ -700,7 +700,7 @@ mod silicon_gates {
 
     /// DIAGNOSTIC, asserts nothing. **This is the recorded evidence for the
     /// `[-]` exclusion of `ATSWAP`'s single-register form**: the checked API
-    /// (`tt_isa::l1_atomic::masked_store`) offers only the four-GPR form, and
+    /// (`tt_isa::scalar::atomic::masked_store`) offers only the four-GPR form, and
     /// the single form is built here through the raw generated encoder
     /// (`SingleDataReg` = 1) alone.
     ///

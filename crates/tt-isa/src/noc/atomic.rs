@@ -148,7 +148,7 @@ pub enum AtomicOp {
 
 /// Why an [`AtomicRequest`] was refused.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AtomicError {
+pub enum RequestError {
     /// The target or return address is not a word in L1 (or, for an
     /// accumulate, not 16-byte aligned).
     Alignment,
@@ -167,18 +167,18 @@ pub struct AtomicRequest {
 
 impl AtomicRequest {
     /// The `NOC_AT_LEN_BE` and `NOC_AT_DATA` words for this operation, checked.
-    pub fn len_be_and_data(&self) -> Result<(u32, u32), AtomicError> {
+    pub fn len_be_and_data(&self) -> Result<(u32, u32), RequestError> {
         let a = self.to.addr;
         if a % 4 != 0 || self.ret_local % 4 != 0 || a >= MMIO_START || self.ret_local >= MMIO_START
         {
-            return Err(AtomicError::Alignment);
+            return Err(RequestError::Alignment);
         }
         let ofs = (a >> 2) & 3;
         let ins = |op: u32| op << 12;
         Ok(match self.op {
             AtomicOp::Increment { value, int_width } => {
                 if int_width > 31 {
-                    return Err(AtomicError::Operand);
+                    return Err(RequestError::Operand);
                 }
                 (
                     ins(opcode::INCREMENT) | (u32::from(int_width) << 2) | ofs,
@@ -187,7 +187,7 @@ impl AtomicRequest {
             }
             AtomicOp::CompareSwap { cmp, set } => {
                 if cmp > 15 || set > 15 {
-                    return Err(AtomicError::Operand);
+                    return Err(RequestError::Operand);
                 }
                 (
                     ins(opcode::CAS) | (u32::from(set) << 6) | (u32::from(cmp) << 2) | ofs,
@@ -211,7 +211,7 @@ impl AtomicRequest {
             ),
             AtomicOp::Accumulate { fmt, data } => {
                 if a % 16 != 0 {
-                    return Err(AtomicError::Alignment);
+                    return Err(RequestError::Alignment);
                 }
                 (ins(opcode::ACC) | u32::from(fmt.code()), data)
             }
@@ -221,7 +221,7 @@ impl AtomicRequest {
     /// The initiator registers to write before `CMD_CTRL`, in `Command::registers`'
     /// order, for an initiator at `me` under `txn`. Unicast, response-marked,
     /// static virtual channel 1 (as every unicast request in this workspace).
-    pub fn registers(&self, me: (u8, u8), txn: TxnId) -> Result<[(u64, u32); 10], AtomicError> {
+    pub fn registers(&self, me: (u8, u8), txn: TxnId) -> Result<[(u64, u32); 10], RequestError> {
         let (len_be, data) = self.len_be_and_data()?;
         let ret = Endpoint {
             x: me.0,
@@ -337,11 +337,11 @@ mod tests {
         let cas = |cmp, set| AtomicOp::CompareSwap { cmp, set };
         assert_eq!(
             mk(0x1_0000, 0x2_0000, cas(16, 0)).len_be_and_data(),
-            Err(AtomicError::Operand)
+            Err(RequestError::Operand)
         );
         assert_eq!(
             mk(0x1_0000, 0x2_0000, cas(0, 16)).len_be_and_data(),
-            Err(AtomicError::Operand)
+            Err(RequestError::Operand)
         );
         assert_eq!(
             mk(
@@ -353,7 +353,7 @@ mod tests {
                 }
             )
             .len_be_and_data(),
-            Err(AtomicError::Operand)
+            Err(RequestError::Operand)
         );
         // Not a word; MMIO target; MMIO return; accumulate off a 16-byte unit.
         for (a, r) in [
@@ -363,7 +363,7 @@ mod tests {
         ] {
             assert_eq!(
                 mk(a, r, cas(1, 2)).len_be_and_data(),
-                Err(AtomicError::Alignment)
+                Err(RequestError::Alignment)
             );
         }
         let acc = AtomicOp::Accumulate {
@@ -372,7 +372,7 @@ mod tests {
         };
         assert_eq!(
             mk(0x1_0004, 0x2_0000, acc).len_be_and_data(),
-            Err(AtomicError::Alignment)
+            Err(RequestError::Alignment)
         );
         assert!(mk(0x1_0010, 0x2_0000, acc).len_be_and_data().is_ok());
     }

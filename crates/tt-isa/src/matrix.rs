@@ -70,6 +70,8 @@
 //! true after a program that ended with an operand [`Loaded`]: the state lives in
 //! the coprocessor, not in the program, and outlives it.
 
+pub mod debug;
+
 use core::marker::PhantomData;
 
 use crate::isa::generated::{defs, encode};

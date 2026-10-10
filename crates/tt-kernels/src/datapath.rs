@@ -856,7 +856,7 @@ pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
     p
 }
 
-/// The optional packer stages of [`tt_isa::pack_modes`], staged together with
+/// The optional packer stages of [`tt_isa::packer`], staged together with
 /// the shared `Config` words they live in.
 ///
 /// [`pack_config`] leaves the stages as `Config`'s reset state (ReLU off,
@@ -865,8 +865,8 @@ pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
 /// Wormhole-only pages): the gate is `step112_packer_relu_edge`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PackStages {
-    pub relu: tt_isa::pack_modes::PackerRelu,
-    pub edge: tt_isa::pack_modes::EdgeMasking,
+    pub relu: tt_isa::packer::PackerRelu,
+    pub edge: tt_isa::packer::EdgeMasking,
     /// `ALU_ACC_CTRL_Zero_Flag_disabled_src`, which shares `Config` word 2 with
     /// ReLU, so staging ReLU must say what it should be.
     pub zero_flag_disabled_src: bool,
@@ -878,13 +878,13 @@ pub struct PackStages {
 impl PackStages {
     /// Both stages off: what a whole-word write must restore after a gate.
     pub const OFF: Self = Self {
-        relu: tt_isa::pack_modes::PackerRelu::OFF,
-        edge: tt_isa::pack_modes::EdgeMasking::OFF,
+        relu: tt_isa::packer::PackerRelu::OFF,
+        edge: tt_isa::packer::EdgeMasking::OFF,
         zero_flag_disabled_src: false,
         exhaustive: false,
     };
 
-    pub fn apply(&self, words: &mut ConfigWords) -> Result<(), tt_isa::pack_modes::PackModeError> {
+    pub fn apply(&self, words: &mut ConfigWords) -> Result<(), tt_isa::packer::PackModeError> {
         self.relu.apply(words, self.zero_flag_disabled_src)?;
         if self.exhaustive {
             self.edge.apply_all(words)
@@ -900,7 +900,7 @@ pub fn pack_tile_from_dst_staged(
     l1_dest: u64,
     row: u32,
     stages: &PackStages,
-) -> Result<Vec<Instruction>, tt_isa::pack_modes::PackModeError> {
+) -> Result<Vec<Instruction>, tt_isa::packer::PackModeError> {
     use tt_isa::backend::{self, Before};
     let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
     let mut words = ConfigWords::new();
@@ -1013,7 +1013,7 @@ pub fn pack_bf16_tile_from_dst16(l1_dest: u64, row: u32) -> Vec<Instruction> {
 
 // ---- unpacker input modes: tileize and transpose (M3, D5) --------------------
 //
-// `tt_isa::unpack_modes` has the checked field staging; these are the program
+// `tt_isa::unpacker` has the checked field staging; these are the program
 // builders `step113_unpacker_modes` gates. Both are UNVERIFIED on Blackhole
 // silicon. ttsim models both (tileize with Blackhole's 32-datum input rows;
 // transpose on unpacker 0 into `SrcA`) and refuses transpose with
@@ -1027,9 +1027,9 @@ pub fn unpack_tileize_config(
     descriptor: TileDescriptor,
     l1_base: u64,
     row_stride_bytes: u32,
-) -> Result<(), tt_isa::unpack_modes::UnpackModeError> {
+) -> Result<(), tt_isa::unpacker::UnpackModeError> {
     unpack_config(words, descriptor, l1_base);
-    tt_isa::unpack_modes::stage_tileize(words, row_stride_bytes, 32)
+    tt_isa::unpacker::stage_tileize(words, row_stride_bytes, 32)
 }
 
 /// Unpacker 0 into `SrcA` ([`unpack_src_config`]) with transpose staged:
@@ -1039,7 +1039,7 @@ pub fn unpack_src_transposed_config(
     descriptor: TileDescriptor,
     l1_base: u64,
     out: u32,
-) -> Result<(), tt_isa::unpack_modes::UnpackModeError> {
+) -> Result<(), tt_isa::unpacker::UnpackModeError> {
     unpack_src_config(words, Unpacker::SrcA, descriptor, l1_base, out);
-    tt_isa::unpack_modes::stage_transpose(words, false)
+    tt_isa::unpacker::stage_transpose(words, false)
 }

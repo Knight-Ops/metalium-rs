@@ -1,4 +1,4 @@
-//! Matrix diagnostics: `MOVDBGA2D` and `GATESRCRST` (`tt_isa::matrix_debug`).
+//! Matrix diagnostics: `MOVDBGA2D` and `GATESRCRST` (`tt_isa::matrix::debug`).
 //!
 //! Both are diagnostic surfaces, so there is no Burn routing, gradient or tensor
 //! padding to establish: the gates below move `SrcA` rows through the Matrix Unit
@@ -28,11 +28,11 @@
 use tt_isa::{
     backend::{self, Before},
     isa::{generated::encode, Instruction},
-    matrix::{Banks, Empty, Filling, Loaded},
-    matrix_debug::{
-        self, model, AddrModEntry, AddrModTable, CacheArm, CacheOutcome, CacheVerdict, DebugFormat,
-        DebugMode, DebugMove, Rows, SrcAFormat,
+    matrix::debug::{
+        self as matrix_debug, model, AddrModEntry, AddrModTable, CacheArm, CacheOutcome,
+        CacheVerdict, DebugFormat, DebugMode, DebugMove, Rows, SrcAFormat,
     },
+    matrix::{Banks, Empty, Filling, Loaded},
     numerics::mvmul_reference,
 };
 use tt_tests::datapath::{config_program, set_adc_x, Unpacker, STAGE};
