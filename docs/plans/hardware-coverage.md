@@ -1,5 +1,7 @@
 # Hardware coverage — Phase 10 tracker
 
+**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition, the open items (NoC multicast and MMIO silicon probes, X6) and the verification record. [Burn operation status](burn-op-coverage.md) is generated.
+
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
 for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
