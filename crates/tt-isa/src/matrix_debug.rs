@@ -227,6 +227,119 @@ impl DebugFormat {
     }
 }
 
+/// One address-modifier entry as a diagnostic uses it: plain `SrcA` and `Dst`
+/// increments, no carriage returns or clears, no fidelity step, no `SrcB` step.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct AddrModEntry {
+    /// `ADDR_MOD_AB_SECn_SrcAIncr`, six bits.
+    pub src_a_incr: u32,
+    /// `ADDR_MOD_DST_SECn_DestIncr`, ten bits.
+    pub dst_incr: u32,
+}
+
+/// All eight Blackhole address-modifier entries (`AddrMod` is three bits).
+///
+/// The entries live in `ThreadConfig`, persist between programs on silicon, and
+/// each is spread over three words (`ADDR_MOD_AB_SECn`, `ADDR_MOD_DST_SECn`,
+/// `ADDR_MOD_BIAS_SECn`). A test that sets only the one increment it cares about
+/// leaves the rest of those words, and the other entries, as whatever ran
+/// before. [`AddrModTable::setup`] writes **every** word of every entry, so what
+/// [`model::apply_addr_mod`] assumes is all there is: the table is the model's input.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AddrModTable {
+    entries: [AddrModEntry; 8],
+}
+
+impl AddrModTable {
+    /// Every entry moves nothing.
+    pub const ZERO: AddrModTable = AddrModTable {
+        entries: [AddrModEntry {
+            src_a_incr: 0,
+            dst_incr: 0,
+        }; 8],
+    };
+
+    /// Entry `index` (0..8) set to `entry`.
+    pub fn with(mut self, index: usize, entry: AddrModEntry) -> Result<Self, DebugError> {
+        if index >= 8 {
+            return Err(DebugError::Format("AddrMod entry index is 0..8"));
+        }
+        if entry.src_a_incr >= 64 || entry.dst_incr >= 1024 {
+            return Err(DebugError::Format(
+                "SrcAIncr is six bits and DestIncr ten bits",
+            ));
+        }
+        self.entries[index] = entry;
+        Ok(self)
+    }
+
+    /// Entries 4..8 copy entries 0..4, so an index shifted up by four (the
+    /// Wormhole page's `ExtraAddrModBit`) lands on the same increments.
+    pub const fn mirrored(mut self) -> Self {
+        let mut i = 0;
+        while i < 4 {
+            self.entries[i + 4] = self.entries[i];
+            i += 1;
+        }
+        self
+    }
+
+    pub const fn entry(&self, index: usize) -> AddrModEntry {
+        self.entries[index & 7]
+    }
+
+    /// 24 `SETC16`s: the `AB`, `DST` and `BIAS` word of each entry, every field
+    /// not named above zero (including the bias, which would otherwise step
+    /// the page's `ExtraAddrModBit`).
+    pub fn setup(&self) -> Result<[Instruction; 24], DebugError> {
+        use thread::*;
+        let a = [
+            ADDR_MOD_AB_SEC0_SrcAIncr,
+            ADDR_MOD_AB_SEC1_SrcAIncr,
+            ADDR_MOD_AB_SEC2_SrcAIncr,
+            ADDR_MOD_AB_SEC3_SrcAIncr,
+            ADDR_MOD_AB_SEC4_SrcAIncr,
+            ADDR_MOD_AB_SEC5_SrcAIncr,
+            ADDR_MOD_AB_SEC6_SrcAIncr,
+            ADDR_MOD_AB_SEC7_SrcAIncr,
+        ];
+        let d = [
+            ADDR_MOD_DST_SEC0_DestIncr,
+            ADDR_MOD_DST_SEC1_DestIncr,
+            ADDR_MOD_DST_SEC2_DestIncr,
+            ADDR_MOD_DST_SEC3_DestIncr,
+            ADDR_MOD_DST_SEC4_DestIncr,
+            ADDR_MOD_DST_SEC5_DestIncr,
+            ADDR_MOD_DST_SEC6_DestIncr,
+            ADDR_MOD_DST_SEC7_DestIncr,
+        ];
+        let b = [
+            ADDR_MOD_BIAS_SEC0_BiasIncr,
+            ADDR_MOD_BIAS_SEC1_BiasIncr,
+            ADDR_MOD_BIAS_SEC2_BiasIncr,
+            ADDR_MOD_BIAS_SEC3_BiasIncr,
+            ADDR_MOD_BIAS_SEC4_BiasIncr,
+            ADDR_MOD_BIAS_SEC5_BiasIncr,
+            ADDR_MOD_BIAS_SEC6_BiasIncr,
+            ADDR_MOD_BIAS_SEC7_BiasIncr,
+        ];
+        let mut out = [backend::nop(); 24];
+        for i in 0..8 {
+            let e = self.entries[i];
+            out[3 * i] = ThreadConfigEntry::zeroed(a[i].addr32())
+                .set(a[i], e.src_a_incr as u16)?
+                .encode()?;
+            out[3 * i + 1] = ThreadConfigEntry::zeroed(d[i].addr32())
+                .set(d[i], e.dst_incr as u16)?
+                .encode()?;
+            out[3 * i + 2] = ThreadConfigEntry::zeroed(b[i].addr32())
+                .set(b[i], 0)?
+                .encode()?;
+        }
+        Ok(out)
+    }
+}
+
 /// The rows one `MOVDBGA2D` moves.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Rows {
@@ -504,7 +617,7 @@ pub const fn cache_verdict(no_gate: CacheOutcome, gate: CacheOutcome) -> CacheVe
 /// An independent port of the `MOVA2D` functional model (`MOVDBGA2D` is identical
 /// but for the wait), for `MOVDBGA2D`'s diagnostic use.
 pub mod model {
-    use super::{DebugFormat, DebugMode, SrcAFormat};
+    use super::{AddrModTable, DebugFormat, DebugMode, Rows, SrcAFormat};
 
     /// The configuration and counters the model reads.
     #[derive(Copy, Clone, Debug)]
@@ -563,6 +676,36 @@ pub mod model {
     /// unpacker's TF32 truncation: the independent route from L1 data to `SrcA`.
     pub const fn tf32_src_datum(bits: u32) -> u32 {
         ((bits >> 31) << 18) | (((bits >> 13) & 0x3ff) << 8) | ((bits >> 23) & 0xff)
+    }
+
+    /// `ApplyAddrMod` for a table entry: `SrcA` and `Dst` advance by the entry's
+    /// increments, *after* the move that named it (`MOVA2D.md`, last statement;
+    /// `RWCs.md`). The counters are six and ten bits wide.
+    pub fn apply_addr_mod(state: &mut State, table: &AddrModTable, addr_mod: u32) {
+        let e = table.entry(addr_mod as usize);
+        state.src_rwc = (state.src_rwc + e.src_a_incr) & 0x3f;
+        state.dst_base = (state.dst_base + e.dst_incr) & 0x3ff;
+    }
+
+    /// A sequence of `(rows, AddrMod)` moves from `state`, each followed by its
+    /// entry's counter update.
+    pub fn run_moves(
+        src: &[[u32; 16]; 64],
+        mut state: State,
+        table: &AddrModTable,
+        moves: &[(Rows, u32)],
+        use_dst32b_lo: bool,
+        mut sink: impl FnMut(Write),
+    ) -> Result<(), &'static str> {
+        for &(rows, addr_mod) in moves {
+            let (s, d, eight) = match rows {
+                Rows::One { src_row, dst_row } => (src_row, dst_row, false),
+                Rows::Eight { src_row, dst_row } => (src_row, dst_row, true),
+            };
+            move_rows(src, state, s, d, eight, use_dst32b_lo, &mut sink)?;
+            apply_addr_mod(&mut state, table, addr_mod);
+        }
+        Ok(())
     }
 
     /// Apply one move to the 64-row `SrcA` bank, as the page says.
@@ -959,6 +1102,77 @@ mod tests {
         // Undefined combinations the model itself refuses.
         assert!(moved(&src, state(fp32()), 3, 9, false, true).is_err());
         assert!(moved(&src, state(bf16), 3, 9, false, true).is_err());
+    }
+
+    #[test]
+    fn addr_mod_table_writes_every_word_and_the_model_applies_it_after_the_move() {
+        let e = AddrModEntry {
+            src_a_incr: 1,
+            dst_incr: 2,
+        };
+        let t = AddrModTable::ZERO.with(1, e).unwrap();
+        let words = t.setup().unwrap();
+        assert_eq!(words.len(), 24);
+        assert!(words.iter().all(|i| i.def().mnemonic() == "SETC16"));
+        // Entry 1: AB word SrcAIncr 1, DST word DestIncr 2, BIAS word 0. The
+        // SETC16 immediate is the low 16 bits and the index sits above it.
+        let imm = |i: &Instruction| i.word() & 0xffff;
+        assert_eq!(imm(&words[3]), 1);
+        assert_eq!(imm(&words[4]), 2);
+        assert_eq!(imm(&words[5]), 0);
+        assert!(t.with(8, e).is_err());
+        assert!(t
+            .with(
+                0,
+                AddrModEntry {
+                    src_a_incr: 64,
+                    dst_incr: 0
+                }
+            )
+            .is_err());
+        assert_eq!(t.mirrored().entry(5), e);
+        assert_eq!(t.entry(5), AddrModEntry::default());
+
+        let mut bank = [[0u32; 16]; 64];
+        for (r, row) in bank.iter_mut().enumerate() {
+            row[0] = 0x100 | (r as u32 + 1);
+        }
+        let state = model::State {
+            format: fp32(),
+            src_rwc: 0,
+            dst_base: 0,
+            block_columns: [0; 8],
+        };
+        let mut rows = Vec::new();
+        let moves = [
+            (
+                Rows::One {
+                    src_row: 2,
+                    dst_row: 4,
+                },
+                1,
+            ),
+            (
+                Rows::One {
+                    src_row: 2,
+                    dst_row: 4,
+                },
+                0,
+            ),
+        ];
+        model::run_moves(&bank, state, &t, &moves, false, |w| {
+            if let Write::Dst32 {
+                row,
+                column: 0,
+                value,
+            } = w
+            {
+                rows.push((row, (value >> 16) & 0xff));
+            }
+        })
+        .unwrap();
+        // The first move is unshifted; the entry then advances SrcA by 1 and Dst by 2.
+        assert_eq!(rows, [(4, 3), (6, 4)]);
     }
 
     #[test]

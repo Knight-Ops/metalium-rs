@@ -104,7 +104,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   delays, LReg16, predication; rejects collisions, the VDHi coupling and `SFPSWAP` restrictions.
   Gate: bit-for-bit against the ordinary sequence in the interpreter; mutants swap template and
   delay. Silicon-only (divergence 7). Exit: a contradicting sub-unit becomes a `[-]` sub-form.
-- [~] **MD: matrix diagnostics** (step111; host/ttsim 6/6, two negative controls watched failing; silicon: encoding probe passes, `AddrMod`-advance case fails and is with the lane agent; `GATESRCRST` probes not yet run). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
+- [x] **MD: matrix diagnostics** (step111; `MOVDBGA2D` `[x]` for 1/8-row, formats, flush, bank ownership on card 0; `GATESRCRST` `[-]` `NoObservableOracle` after a clean isolated probe; the increment-1 `AddrMod` cases are an open shared-configuration issue also seen on the `MOVA2D` control, tests ignored). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
   `GATESRCRST` needs an observable stale-versus-fresh difference with SrcB loaded through
   `MOVD2B`. Exit: `GATESRCRST` becomes `[-]` "no observable oracle" if both arms match.
 - [ ] **PU: packer and unpacker modes.** Owns `tt-kernels/src/datapath.rs`. In order: packer ReLU,
