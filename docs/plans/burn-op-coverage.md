@@ -2,12 +2,10 @@
 # Burn operation coverage
 
 Status of every method of the pinned Burn operation traits in `burn-tt`.
-**Native** methods are listed in the override lists of `xtask/src/gen_burn.rs`
-and `xtask/src/gen_burn/overrides/` and may still refuse an unsupported dtype or
-shape. **Composed** methods are Burn's own default bodies over native primitives.
+**Native** methods are listed in the override list of `xtask/src/gen_burn.rs`
+and may still refuse an unsupported dtype or shape. **Composed** methods are Burn's own default bodies over native primitives.
 **Unsupported** methods fail explicitly with `burn-tt: unsupported operation`; each
-carries a disposition: a work lane from
-[hardware-coverage-closeout.md](hardware-coverage-closeout.md), or `[-]` with its reason.
+carries a `[-]` disposition with its reason.
 The per-method Device and Item notes remain in
 [hardware-coverage.md](hardware-coverage.md#burn-op-coverage).
 

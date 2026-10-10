@@ -116,8 +116,10 @@ Never hand-edit outputs. Change the generator/input, regenerate, then run its
 | `gen-cfg`          | `crates/tt-isa/src/cfg/generated.rs`  |
 | `gen-isa`          | `crates/tt-isa/src/isa/generated.rs`  |
 | `gen-burn-ops`     | `crates/burn-tt/src/generated/ops.rs` |
+| `burn-coverage`    | `docs/plans/burn-op-coverage.md`      |
 
-Burn routing is `OVERRIDDEN` in `xtask/src/gen_burn.rs`. Historical
+Burn routing is `OVERRIDDEN` in `xtask/src/gen_burn.rs`; an unsupported method needs a
+`[-]` disposition in `xtask/src/burn_coverage.rs`. Historical
 `gen-burn-delegate` instructions are obsolete. Measured Blackhole encodings belong
 in `xtask/src/gen_isa/Bits32_BH.lua` with evidence in `measured.rs` and a gate.
 Wormhole-only documentation does not establish Blackhole behavior or encoding.
