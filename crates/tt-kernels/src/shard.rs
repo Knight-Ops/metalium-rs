@@ -131,7 +131,9 @@ pub struct Fabric<T: Transport> {
     images: RoleImages<'static>,
     /// For each chip, the chips from 0 to it, inclusive.
     routes: Vec<Option<Vec<usize>>>,
-    execution: FabricExecution,
+    pub(crate) execution: FabricExecution,
+    /// Mesh trace capture and the traces made (`crate::mesh_trace`).
+    pub(crate) mesh: crate::mesh_trace::MeshState,
 }
 
 /// Completion evidence, recorded after Session compute and Ethernet mover ACKs.
@@ -184,6 +186,7 @@ impl<T: Transport> Fabric<T> {
             images,
             routes,
             execution,
+            mesh: Default::default(),
         })
     }
 
@@ -294,23 +297,12 @@ impl<T: Transport> Fabric<T> {
                     }
                 }
             }
-            for (source, destination) in ranges {
-                for hop in 0..route.len() - 1 {
-                    let (p, q) = (route[hop], route[hop + 1]);
-                    let src = if hop == 0 {
-                        Source::Dram(source)
-                    } else {
-                        Source::Tensix(self.chips[p].relay, RELAY_AT)
-                    };
-                    let dst = if hop + 2 == route.len() {
-                        Dest::Dram(destination)
-                    } else {
-                        Dest::Tensix(self.chips[q].relay, RELAY_AT)
-                    };
-                    self.hop(p, q, src, dst, source.len() as u32).map_err(|e| {
-                        TensorError::Shape(format!("resident Ethernet transfer: {e}"))
-                    })?;
-                }
+            if self.mesh.capturing() {
+                self.captured_transfer(from, to, &route, &ranges, t, &out)
+                    .map_err(TensorError::Shape)?;
+            } else {
+                self.run_hops(&route, &ranges)
+                    .map_err(|e| TensorError::Shape(format!("resident Ethernet transfer: {e}")))?;
             }
             Ok(())
         })();
@@ -320,6 +312,34 @@ impl<T: Transport> Fabric<T> {
         }
         out.set_pad(t.pad());
         Ok(out)
+    }
+
+    /// Carry each `(source, destination)` range along `route` (the chips from
+    /// the source's to the destination's), one Ethernet packet at a time,
+    /// relaying through each intermediate chip's L1. The host moves no tensor
+    /// data; both ends' sessions must have been synchronized.
+    pub(crate) fn run_hops(
+        &mut self,
+        route: &[usize],
+        ranges: &[(tt_isa::dram::DramRange, tt_isa::dram::DramRange)],
+    ) -> Result<(), ShardError> {
+        for &(source, destination) in ranges {
+            for hop in 0..route.len() - 1 {
+                let (p, q) = (route[hop], route[hop + 1]);
+                let src = if hop == 0 {
+                    Source::Dram(source)
+                } else {
+                    Source::Tensix(self.chips[p].relay, RELAY_AT)
+                };
+                let dst = if hop + 2 == route.len() {
+                    Dest::Dram(destination)
+                } else {
+                    Dest::Tensix(self.chips[q].relay, RELAY_AT)
+                };
+                self.hop(p, q, src, dst, source.len() as u32)?;
+            }
+        }
+        Ok(())
     }
 
     /// Split output columns across reachable chips, retaining inputs/results
@@ -408,6 +428,7 @@ impl<T: Transport> Fabric<T> {
                     .session()
                     .matmul_dram(&pa, false, &pb, false, route, fidelity, budget)?;
                 self.execution.completed_matmuls[peer] += 1;
+                self.mesh.note_matmul(peer);
                 temps.push((peer, c.clone()));
                 let c = transpose(self.chips[peer].session(), &c)?;
                 temps.push((peer, c.clone()));

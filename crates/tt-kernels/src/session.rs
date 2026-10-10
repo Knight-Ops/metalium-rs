@@ -389,9 +389,9 @@ pub struct Session<T: Transport> {
     /// at the next sync.
     pending_frees: Vec<tensor::Placement>,
     /// The trace being captured ([`Session::begin_trace`]).
-    capture: Option<trace::Capture>,
+    pub(crate) capture: Option<trace::Capture>,
     /// Finished traces, by number.
-    traces: std::collections::HashMap<u64, trace::Trace>,
+    pub(crate) traces: std::collections::HashMap<u64, trace::Trace>,
     next_trace: u64,
     /// Moves on whenever a tile's state is lost -- a reset, a mover restart --
     /// which every trace captured before is [`TraceError::Stale`] against.

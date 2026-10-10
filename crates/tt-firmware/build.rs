@@ -30,6 +30,7 @@ fn main() {
     link("nc_probe", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     link("dm_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     link("icache_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
+    link("tag_search_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     for (bin, script, t) in [
         ("icache_t0", "link.x", 0),

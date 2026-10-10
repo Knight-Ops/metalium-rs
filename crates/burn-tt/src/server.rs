@@ -3112,6 +3112,100 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     // lane:t8_mathmode (MeshEngine): add this lane's methods below this line only.
 
     // lane:t9_mesh (MeshEngine): add this lane's methods below this line only.
+    /// Capture a mesh trace (`tt_kernels::mesh_trace`): one session trace per
+    /// chip per stretch between Ethernet transfers, and the transfers
+    /// themselves, replayed in the capture's order.
+    fn begin_trace(&mut self) -> Result<(), EngineError> {
+        self.fabric.begin_mesh_trace().map_err(mesh_trace_error)
+    }
+    fn end_trace(&mut self) -> Result<u64, EngineError> {
+        self.fabric.end_mesh_trace().map_err(mesh_trace_error)
+    }
+    fn run_trace(
+        &mut self,
+        trace: u64,
+        input: BufferId,
+        values: &[f32],
+        output: BufferId,
+    ) -> Result<TraceRun, EngineError> {
+        use std::time::Instant;
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        // The write waits for what was queued first: that wait is not the
+        // write's.
+        self.fabric.chips[0].session().sync().map_err(e)?;
+        let t0 = Instant::now();
+        self.fabric.chips[0]
+            .session()
+            .write(self.buffers.get(input)?, values)
+            .map_err(e)?;
+        let t1 = Instant::now();
+        self.fabric
+            .replay_mesh_trace(trace)
+            .map_err(mesh_trace_error)?;
+        let t2 = Instant::now();
+        let output = self
+            .buffers
+            .download(self.fabric.chips[0].session(), output)?;
+        Ok(TraceRun {
+            output,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
+    }
+    fn release_trace(&mut self, trace: u64) {
+        let _ = self.fabric.release_mesh_trace(trace);
+    }
+    fn run_generic_trace(
+        &mut self,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<GenericTraceRun, EngineError> {
+        use std::time::Instant;
+        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        self.fabric.chips[0].session().sync().map_err(e)?;
+        let t0 = Instant::now();
+        for (input_id, payload) in inputs {
+            let t = self.buffers.get(*input_id)?;
+            let session = self.fabric.chips[0].session();
+            match payload {
+                InputPayload::F32(v) => session.write(t, v).map_err(e)?,
+                InputPayload::Bits(v) => session.write_bits(t, v).map_err(e)?,
+            }
+        }
+        let t1 = Instant::now();
+        self.fabric
+            .replay_mesh_trace(trace)
+            .map_err(mesh_trace_error)?;
+        let t2 = Instant::now();
+        let mut out_data = Vec::with_capacity(outputs.len());
+        for &(output_id, kind) in outputs {
+            match kind {
+                OutputKind::F32 => {
+                    let data = self
+                        .buffers
+                        .download(self.fabric.chips[0].session(), output_id)?;
+                    out_data.push(OutputPayload::F32(data));
+                }
+                OutputKind::Bits => {
+                    let t = self.buffers.get(output_id)?;
+                    let data = self.fabric.chips[0].session().download_bits(t).map_err(e)?;
+                    out_data.push(OutputPayload::Bits(data));
+                }
+            }
+        }
+        Ok(GenericTraceRun {
+            outputs: out_data,
+            write: t1 - t0,
+            replay: t2 - t1,
+            read: t2.elapsed(),
+        })
+    }
+}
+
+fn mesh_trace_error(e: tt_kernels::mesh_trace::MeshTraceError) -> EngineError {
+    EngineError(e.to_string())
 }
 
 /// A factory for [`attach`] that opens every card in `cards` (the first is chip

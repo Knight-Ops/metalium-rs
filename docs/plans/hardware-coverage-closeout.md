@@ -104,7 +104,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   delays, LReg16, predication; rejects collisions, the VDHi coupling and `SFPSWAP` restrictions.
   Gate: bit-for-bit against the ordinary sequence in the interpreter; mutants swap template and
   delay. Silicon-only (divergence 7). Exit: a contradicting sub-unit becomes a `[-]` sub-form.
-- [ ] **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
+- [~] **MD: matrix diagnostics** (step111; host/ttsim 6/6, two negative controls watched failing; silicon: encoding probe passes, `AddrMod`-advance case fails and is with the lane agent; `GATESRCRST` probes not yet run). **MD: matrix diagnostics** (`MOVDBGA2D`, `GATESRCRST`). Owns `tt-isa/src/matrix_debug.rs`.
   `GATESRCRST` needs an observable stale-versus-fresh difference with SrcB loaded through
   `MOVD2B`. Exit: `GATESRCRST` becomes `[-]` "no observable oracle" if both arms match.
 - [ ] **PU: packer and unpacker modes.** Owns `tt-kernels/src/datapath.rs`. In order: packer ReLU,
@@ -122,7 +122,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   stays `[~]` host-TLB only if the 1×2 probe is not clean.
 - [x] **FENCE: X7 posted-write fence** (step119; unit 11 + ttsim 5; probe on card 0 and both-card Ethernet gates pass; three negative controls watched failing; `silicon_eth_link` gates need both cards so they are not in SMOKE). Owns `tt-device/src/device.rs`. A `FencedWrite` API bundling
   posted writes with one read-back; migrate call sites that race another agent.
-- [ ] **TS: `L1CacheTagSearchAccel`.** Owns `tt-isa/src/tag_search.rs` and a probe bin. Done when
+- [~] **TS: `L1CacheTagSearchAccel`** (step120; host/ttsim 8/8, helper and model mutants watched failing; silicon: minimal probe passes, the multi-scenario probe did not finish, being split per scenario; ttsim refuses `Config[212..=219]`, row 92). **TS: `L1CacheTagSearchAccel`.** Owns `tt-isa/src/tag_search.rs` and a probe bin. Done when
   search, invalidate-all and the bit-vector query are gated; adoption not required.
 - [ ] **G: stream overlay** (`STREAMWAIT`, `STREAMWRCFG`; wave 2, after F's register research).
   Likely `[-]`: Blackhole has no NoC Overlay documentation pinned, and Wormhole offsets are not
@@ -177,7 +177,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 - [ ] **T8: `MathMode::{Precise, Approx}` (S10).** Session setting `TT_MATH=approx`, in the program
   memo keys, Precise default. Bounds derived beside each gate. Negative controls: Approx must break
   the Precise bound somewhere; alternating modes must give different bits.
-- [ ] **T9: mesh trace capture (R4).** `MeshEngine::begin_trace`; changed-input replay matches a
+- [x] **T9: mesh trace capture (R4)** (step147; ttsim 5/5 and card 0/1 silicon 3/3; per-chip session traces between host-run Ethernet transfers, `UnheldTransfer` refusal; two negative controls watched failing; mesh training traces and `copy_into` on a mesh still unsupported). **T9: mesh trace capture (R4).** `MeshEngine::begin_trace`; changed-input replay matches a
   fresh run with no uploads. Both cards.
 - [ ] **T10: benchmarks and dispositions.** Release K-block and norm benchmarks (P2/R3); M2 `[-]`
   GMPOOL diagnostic-only (packed ArgMax index bits missing on both cards, run `1791240702`); record

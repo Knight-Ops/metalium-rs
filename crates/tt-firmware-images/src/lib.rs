@@ -97,6 +97,14 @@ pub const ICACHE_NC: Image = (
     tt_isa::dm::nc::IMAGE_BASE,
 );
 
+/// The L1 Cache Tag Search Accelerator probe (`tt-firmware/src/bin/tag_search_b.rs`)
+/// for RISCV B, at L1 0: the block is usable by B only.
+pub const TAG_SEARCH_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_TAG_SEARCH_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+
 /// The instruction-cache probes for T0, T1 and T2, each at its core's
 /// default reset PC.
 pub const ICACHE_T: [Image; 3] = [
@@ -118,7 +126,7 @@ pub const ICACHE_T: [Image; 3] = [
 ];
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 17] = [
+const ENTRIES: [(&str, &str); 18] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
@@ -136,6 +144,7 @@ const ENTRIES: [(&str, &str); 17] = [
     ("icache_t0", env!("FIRMWARE_ICACHE_T0_ENTRY")),
     ("icache_t1", env!("FIRMWARE_ICACHE_T1_ENTRY")),
     ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
+    ("tag_search_b", env!("FIRMWARE_TAG_SEARCH_B_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -187,10 +196,11 @@ mod tests {
     /// T0's entry point.
     #[test]
     fn the_data_mover_is_linked_where_b_starts() {
-        let (core, image, at) = DM_B;
-        assert_eq!(entry("dm_b").map(u64::from), Some(at));
-        assert_eq!(at, core.default_reset_pc() as u64);
-        assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);
+        for (name, (core, image, at)) in [("dm_b", DM_B), ("tag_search_b", TAG_SEARCH_B)] {
+            assert_eq!(entry(name).map(u64::from), Some(at));
+            assert_eq!(at, core.default_reset_pc() as u64);
+            assert!(image.len() as u64 <= tt_isa::dm::IMAGE_MAX);
+        }
     }
 
     /// NC's images run from `dm::nc::IMAGE_BASE`, reached by the stub, and

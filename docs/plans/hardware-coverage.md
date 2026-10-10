@@ -383,7 +383,7 @@ Pulled in only when a kernel needs them; each says which.
 | NoC multicast (NIU broadcast; TLB `strided`, row 4) | BH `NoC/MemoryMap.md` | `[ ]` | weight broadcast to many tiles (9.6 follow-up) |
 | NoC atomics | BH `NoC/Atomics.md` | `[ ]` | R1 across tiles |
 | NoC counters / interrupts | BH `NoC/Counters.md`, `Interrupts.md` | counters `[x]`; interrupts `[ ]` | -- |
-| `L1CacheTagSearchAccel` | BH | `[ ]` | checklist Phase 9 |
+| `L1CacheTagSearchAccel` | BH | `[~]` helpers, model and B probe (`tt_isa::tag_search`, `tag_search_b`, step120); configured through `Config[212..=219]`, triggered by an L0-missing RISC-V B load; minimal probe passes on card 0, the multi-scenario semantic gate is open; ttsim refuses the block (row 92); no repo consumer | checklist Phase 9 |
 | Debug timestamper | BH (STUB-C) | `[x]` silicon; ttsim row 54 | -- |
 
 ### Out of scope, and why
@@ -488,11 +488,11 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `MOVD2B`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2A`: typed non-flipping helper, resident matrix chains and production instruction/traffic audits; step97 simulator and both-card semantic gates pass (`1791317039`). Step9 encoding provenance is retained.
 - [x] `MOVB2D`: typed `Banks::movb2d`, production `fpu.rs` transpose and step73 readback; measured four-row encoding in `probe_src`.
-- [ ] `MOVDBGA2D`: Debug move $SrcA \to Dst$.
+- [~] `MOVDBGA2D`: checked `tt_isa::matrix_debug` helpers (bank ownership, 1/8-row forms, format selection) and an independent page model; the encoding probe passes on card 0 and the first eight-row/one-row cases agree, the `AddrMod`-advancing two-move case disagrees with the model (open: configuration of the address-modifier entry or a model error, step111); ttsim refuses every form (extends row 50).
 - [x] `ZEROSRC`: checked A/B/both current-unpacker and current-matrix banks; ownership/staged claims, all 64 rows and opposite-bank sentinels pass step103, card 0 (`1791397029`). Matrix-bank forms run on ttsim; unpacker-bank forms refuse. Negative-infinity and both-physical-bank forms remain deferred.
 - [x] `CLEARDVALID`: checked separate/both Loaded → Empty releases, Reset=0 and KeepReadingSameSrc=0; step103 simulator/card-0 (`1791397029`) alternating-bank and downstream reuse gates. Reset stays excluded; retained-bank reading needs a separate state model.
 - [x] `CLREXPHIST`: typed diagnostic helper and independent histogram/max reset on both cards (step93); exponent selection is gated separately. Item D2.
-- [ ] `GATESRCRST`: Invalidate the one-slot SrcB operand cache.
+- [ ] `GATESRCRST`: checked helper and a pre-declared stale-versus-fresh experiment with its decision rule (`tt_isa::matrix_debug`, step111); not yet run on silicon (UNVERIFIED encoding, isolated probe first). Exit `[-]` "no observable oracle" if both arms read fresh.
 
 #### Vector Unit (SFPU) (40 instructions)
 - [x] `SFPADD`: Lanewise floating-point addition/subtraction.
@@ -1534,12 +1534,13 @@ Each names the measurement it must move. The Burn-side ones are in
       Dedicated forward/backward, layout and residency gates are in `step70`;
       both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
       Performance measurements remain open. Fusion is deferred.
+- [x] **R4d Mesh trace capture/replay** (2026-10-10, step147): `MeshEngine` captures one session trace per chip between the host-run Ethernet transfers and replays them in order (sync both chips, re-run the transfer, continue), refusing with `UnheldTransfer` any capture whose transfer endpoints no stored trace holds. Changed-input replays of a distributed product chain and an attention forward equal fresh runs bit for bit with no host uploads; card 0/1 gates pass. Mesh training traces and `copy_into` on a mesh remain unsupported.
 - [~] **R4 `ModuleOps::attention`.** Native QKᵀ, scale, positive softcap,
       bottom-right causal/broadcast masks, bias, NaN-safe softmax and V products.
       F32/BF16 forward, Q/K/V/bias gradients, resident training, large-K permuted
       views and one/two-tile replay pass step83. Actual two-card products and
       all gradients match single-card references (step88, `1791249486`), with
-      nonzero Q/K gradients on both partitions. Mesh trace capture remains unsupported.
+      nonzero Q/K gradients on both partitions. Mesh trace capture and replay: ttsim step147 and card 0/1 gates pass (R4d, below).
 
 
 ### D — Formats and data movement
