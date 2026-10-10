@@ -124,7 +124,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
   posted writes with one read-back; migrate call sites that race another agent.
 - [-] **TS: `L1CacheTagSearchAccel`** (step120; host/ttsim 8/8; silicon: every armed trigger load hangs the baby core and leaves the block armed across resets (all ten scenarios stop at step 0 LOAD_ISSUED, and the earlier passing minimal probe fails afterwards) — `[-]` with that evidence; silicon tests `#[ignore]`d). **TS: `L1CacheTagSearchAccel`.** Owns `tt-isa/src/tag_search.rs` and a probe bin. Done when
   search, invalidate-all and the bit-vector query are gated; adoption not required.
-- [ ] **G: stream overlay** (`STREAMWAIT`, `STREAMWRCFG`; wave 2, after F's register research).
+- [-] **G: stream overlay** (research complete 2026-10-10: no pinned Blackhole overlay register map, no controlled producer, host-reboot precedent; `STREAMWAIT` and `STREAMWRCFG` are `[-]` with the missing facts listed in `hardware-coverage.md`; steps 109 and rows 80-81 unused). **G: stream overlay** (`STREAMWAIT`, `STREAMWRCFG`; wave 2, after F's register research).
   Likely `[-]`: Blackhole has no NoC Overlay documentation pinned, and Wormhole offsets are not
   adopted.
 - [ ] **X6: mover NIU fast path** (wave 2, after N). First gate NIU register persistence on ttsim and

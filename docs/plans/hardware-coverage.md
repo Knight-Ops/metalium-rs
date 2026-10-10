@@ -563,8 +563,8 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `SEMGET`: Query hardware semaphore counter.
 - [x] `STALLWAIT`: Hardware pipeline barrier (blocks until unit execution drains).
 - [x] `NOP`: General backend pipeline bubble.
-- [ ] `STREAMWAIT`: Wait on hardware stream overlay.
-- [ ] `STREAMWRCFG`: Stream overlay configuration write.
+- [-] `STREAMWAIT`: no Blackhole NoC Overlay specification is pinned (`BabyRISCV/README.md` links a non-existent `NoC/Overlay` page; `STREAMWAIT.md` defines its conditions only through `NOC_STREAM_READ_REG` with no address or layout); no controlled producer exists without NoC or overlay traffic; a wrong overlay write already rebooted the host (operating notes, stream-pop mode 3). Raw encoder and ThreadConfig fields (`STREAMWAIT_*`, `STREAM_ID_SYNC_SEC*`) retained. Alternative: L1 semaphores/credits with `SEMWAIT`/`STALLWAIT` through the streaming scheduler.
+- [-] `STREAMWRCFG`: same missing register layout; no pinned harmless stream register with a known value to read back; documented reordering bug requires `STALLWAIT` afterwards. Reopen when a Blackhole overlay register map is pinned and an isolated silicon read of an idle stream is measured. Alternative: `LOADREG`+`WRCFG` (the page's own suggestion), checked `WRCFG`/`RDCFG`.
 
 #### Backend Configuration
 - [x] `WRCFG`: 32-bit and 128-bit backend configuration writes.
