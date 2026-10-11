@@ -1026,6 +1026,12 @@ fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> 
         _ => return None,
     };
     let dims = crate::tensor::stored_dims(&shape.to_vec())?;
+    // An empty tensor has nothing to put on the device (its buffer would have a zero
+    // dimension, which the device refuses): the caller builds it on the host, as
+    // `native_random` does.
+    if dims.contains(&0) {
+        return None;
+    }
     let (id, dims) = crate::server::zeros(*device, dims, elem, crate::tensor::is_half(dtype));
     Some(device_result_shaped(*device, id, dims, shape, dtype))
 }
@@ -1170,6 +1176,18 @@ fn device_view(
 
 /// The shape `a` and `b` broadcast to (NumPy's rule, which Burn's binary ops
 /// follow), or `None` if they do not.
+/// Two operands of different shapes expanded to their broadcast shape by device
+/// copies (`expanded`), for a binary kernel that takes equal shapes only. `None`
+/// if the shapes already agree or do not broadcast.
+fn broadcast_pair(op: &str, a: &TtTensor, b: &TtTensor) -> Option<(TtTensor, TtTensor)> {
+    if a.shape() == b.shape() {
+        return None;
+    }
+    let shape =
+        burn_backend::Shape::from(broadcast_shape(&a.shape().to_vec(), &b.shape().to_vec())?);
+    Some((expanded(a, shape.clone(), op), expanded(b, shape, op)))
+}
+
 fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let n = a.len().max(b.len());
     let at = |s: &[usize], i: usize| (i + s.len()).checked_sub(n).map_or(1, |j| s[j]);
@@ -2009,14 +2027,21 @@ pub mod float {
         ))
     }
 
-    /// A reshape of a device-resident F32 tensor (or a view) that changes the
+    /// A reshape of a device-resident tensor (or a view) that changes the
     /// matrix it is stored as: a view when strides still express it -- the
     /// heads split out of a projection -- else a native copy/repack into the
-    /// new matrix. Invalid shapes return `None`. A reshape that keeps a plain
-    /// tensor's matrix is
-    /// [`reshaped`]'s.
-    fn reshaped_strided(tensor: &TtTensor, shape: &burn_backend::Shape) -> Option<TtTensor> {
-        if !matches!(tensor.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+    /// new matrix. F32, BF16, F16, I32 and Bool: the copies move stored words
+    /// and never look at them, so the int and Boolean reshapes are the float's
+    /// (`int_reshape`, `bool_reshape`). Invalid shapes return `None`. A reshape
+    /// that keeps a plain tensor's matrix is [`reshaped`]'s.
+    pub(super) fn reshaped_strided(
+        tensor: &TtTensor,
+        shape: &burn_backend::Shape,
+    ) -> Option<TtTensor> {
+        if !matches!(
+            tensor.dtype(),
+            DType::F32 | DType::BF16 | DType::F16 | DType::I32 | DType::Bool(_)
+        ) {
             return None;
         }
         let (from, to) = (tensor.shape().to_vec(), shape.to_vec());
@@ -2820,14 +2845,16 @@ pub mod float {
                 return t;
             }
         }
-        fail(
+        // An operand that needs broadcasting -- a `[1, t, t]` score against a
+        // `[batch, t, t]` mask, a row of values -- is expanded by device copies
+        // to the common shape, as the integer and Boolean variants do; what the
+        // device cannot take fails there, naming the operation and operands.
+        mask_where_native(
             "float_mask_where",
-            format_args!(
-                "tensor=({}), mask=({}), value=({})",
-                context(&tensor),
-                context(&mask),
-                context(&value)
-            ),
+            kind_sfpu::MASK_WHERE,
+            tensor,
+            mask,
+            value,
         )
     }
 
@@ -2918,6 +2945,11 @@ pub mod float {
         if let Some(t) = device_pow(&lhs, PowY::Tensor(&rhs)) {
             return t;
         }
+        if let Some((l, r)) = broadcast_pair("float_powf", &lhs, &rhs) {
+            if let Some(t) = device_pow(&l, PowY::Tensor(&r)) {
+                return t;
+            }
+        }
         fail(
             "float_powf",
             format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
@@ -2931,6 +2963,11 @@ pub mod float {
     ) -> FloatTensor<TtBackend> {
         if let Some(t) = device_pow(&lhs, PowY::Int(&rhs)) {
             return t;
+        }
+        if let Some((l, r)) = broadcast_pair("float_powi", &lhs, &rhs) {
+            if let Some(t) = device_pow(&l, PowY::Int(&r)) {
+                return t;
+            }
         }
         fail(
             "float_powi",
@@ -3316,11 +3353,72 @@ pub mod activation {
         }
     }
 
-    /// Softmax (or log-softmax) of a resident matrix along `dim` -- of its
-    /// negation where `negate` (softmin) -- every step on the device: decided
-    /// once, on the whole input, so the small per-row statistics in the middle
-    /// stay there too.
+    /// Softmax (or log-softmax) of `t` along `dim` -- of its negation where
+    /// `negate` (softmin) -- every step on the device.
+    ///
+    /// A plain resident matrix goes straight to [`device_softmax_matrix`]. Any
+    /// other float tensor on the device -- another rank (an attention score
+    /// `[batch, heads, t, t]`), a transposed matrix, an axis that is not the
+    /// last -- has `dim` moved last and the rest flattened into rows, so the
+    /// same device composition runs on a `[rows, len]` matrix, and the result
+    /// is put back by the inverse reshape and swap. Each step is the
+    /// backend's own device op (a view where the strides allow it, else a
+    /// native copy), so nothing visits the host. `None` for what the matrix
+    /// path refuses: another dtype, an empty tensor, a device without GDDR.
     fn device_softmax(t: &TtTensor, dim: usize, log: bool, negate: bool) -> Option<TtTensor> {
+        if resident_matrix(t) && dim <= 1 {
+            return device_softmax_matrix(t, dim, log, negate);
+        }
+        let shape = t.shape().to_vec();
+        let rank = shape.len();
+        if dim >= rank
+            || shape.contains(&0)
+            || t.dtype() != DType::F32
+            || !t.is_storable()
+            || !crate::server::supports_dram(t.device)
+        {
+            return None;
+        }
+        let len = shape[dim];
+        let rows = shape.iter().product::<usize>() / len;
+        let last = rank - 1;
+        let moved = if dim == last {
+            t.clone()
+        } else {
+            float::float_swap_dims(t.clone(), dim, last)
+        };
+        let moved_shape = moved.shape().to_vec();
+        let matrix = float::float_reshape(moved, burn_backend::Shape::new([rows, len]));
+        // A transposed matrix (a `transpose()` of the input) is read through its
+        // strides: copy it to a plain one, which is what the composition takes.
+        let matrix = if matrix.is_transposed() {
+            TtTensor::on_device(
+                plain_dram(&matrix),
+                burn_backend::Shape::new([rows, len]),
+                DType::F32,
+                matrix.device,
+            )
+        } else {
+            matrix
+        };
+        let out = device_softmax_matrix(&matrix, 1, log, negate)?;
+        let out = float::float_reshape(out, burn_backend::Shape::from(moved_shape));
+        Some(if dim == last {
+            out
+        } else {
+            float::float_swap_dims(out, dim, last)
+        })
+    }
+
+    /// [`device_softmax`] of a plain resident rank-2 matrix along its own
+    /// `dim` (0 or 1): decided once, on the whole input, so the small per-row
+    /// statistics in the middle stay on the device too.
+    fn device_softmax_matrix(
+        t: &TtTensor,
+        dim: usize,
+        log: bool,
+        negate: bool,
+    ) -> Option<TtTensor> {
         use super::float::device_reduce_ungated as reduce;
         use tt_kernels::sfpu::ops::kind_sfpu;
         use tt_kernels::sfpu::reduce::ReduceOp;
@@ -3875,11 +3973,15 @@ pub mod int {
         expanded(&tensor, shape, "int_expand")
     }
 
-    /// A view where the stored matrix is kept, as `float_reshape`.
+    /// As `float_reshape`: a view where the stored matrix is kept or the strides
+    /// still express the shape, else a native copy into the new matrix.
     pub fn int_reshape(
         tensor: IntTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> IntTensor<TtBackend> {
+        if let Some(t) = float::reshaped_strided(&tensor, &shape) {
+            return t;
+        }
         reshaped(tensor, shape)
     }
 
@@ -4265,10 +4367,15 @@ pub mod bool {
         }
     }
 
+    /// As `float_reshape`: a view where the stored matrix is kept or the strides
+    /// still express the shape, else a native copy into the new matrix.
     pub fn bool_reshape(
         tensor: BoolTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> BoolTensor<TtBackend> {
+        if let Some(t) = float::reshaped_strided(&tensor, &shape) {
+            return t;
+        }
         reshaped(tensor, shape)
     }
 
@@ -4363,15 +4470,73 @@ pub mod bool {
         super::read_back(tensor)
     }
 
+    /// The coordinates of the `true` elements, `[count, rank]` in row-major order.
+    ///
+    /// The shape depends on the data, so exactly one thing is read back: the
+    /// count, a scalar (`host_ok`: the shape of the result is the only thing the
+    /// host needs). Everything else stays on the card: the flat positions of the
+    /// `true` elements are the first `count` of a *stable* argsort of the negated
+    /// mask (ties keep their order, so the positions come out ascending), and each
+    /// coordinate is `(position / stride) % extent`, native `I32` division and
+    /// remainder against two small constant rows.
+    ///
+    /// The mask's element count is bounded by the device sort's axis limit; a
+    /// larger one fails naming the operation and the limit.
     pub fn bool_argwhere(
         tensor: BoolTensor<TtBackend>,
         out_dtype: IntDType,
     ) -> impl Future<Output = IntTensor<TtBackend>> + 'static + Send {
         async move {
-            fail(
-                "bool_argwhere",
-                format_args!("{}, out_dtype={out_dtype:?}", context(&tensor)),
-            )
+            use burn_backend::{Scalar, Slice};
+            let refuse = |why: &str| -> ! {
+                fail(
+                    "bool_argwhere",
+                    format_args!("{why}: {}, out_dtype={out_dtype:?}", context(&tensor)),
+                )
+            };
+            let shape = tensor.shape().to_vec();
+            let rank = shape.len();
+            let n: usize = shape.iter().product();
+            let device = tensor.device;
+            if out_dtype != IntDType::I32 {
+                refuse("only an I32 result");
+            }
+            if n == 0 {
+                return int::int_from_data(TensorData::zeros::<i32, _>([0, rank]), &device);
+            }
+            let limit = tt_kernels::sfpu::sort::max_axis(true);
+            if n > limit {
+                refuse(&format!(
+                    "{n} elements exceed the device sort's limit of {limit}"
+                ));
+            }
+            if !tensor.is_storable() || !crate::server::supports_dram(device) {
+                refuse("the mask cannot be held on this device");
+            }
+            let flat = int::int_reshape(bool_into_int(tensor.clone(), IntDType::I32), [n].into());
+            let count = crate::report::host_ok(|| int::int_sum(flat.clone()).try_into_host())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .into_data()
+                .to_vec::<i32>()
+                .expect("an I32 count")[0] as usize;
+            if count == 0 {
+                return int::int_from_data(TensorData::zeros::<i32, _>([0, rank]), &device);
+            }
+            let negated = int::int_mul_scalar(flat, Scalar::Int(-1));
+            let order = int::int_argsort(negated, 0, false);
+            let positions = int::int_slice(order, &[Slice::new(0, Some(count as isize), 1)]);
+            // `positions[k]` is the flat index of the k-th `true`; the coordinates are
+            // its mixed-radix digits for `shape`.
+            let strides: Vec<i32> = (0..rank)
+                .map(|j| shape[j + 1..].iter().product::<usize>() as i32)
+                .collect();
+            let row = |v: Vec<i32>| int::int_from_data(TensorData::new(v, [1, rank]), &device);
+            let wide = int::int_expand(
+                int::int_reshape(positions, [count, 1].into()),
+                [count, rank].into(),
+            );
+            let digits = int::int_div(wide, row(strides));
+            int::int_remainder(digits, row(shape.iter().map(|&d| d as i32).collect()))
         }
     }
 

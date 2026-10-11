@@ -322,11 +322,13 @@ pub fn conv_transpose2d(
     assert_eq!(ws.len(), 4);
     assert_eq!(xs[1], ws[0]);
     let spatial = std::array::from_fn::<_, 2, _>(|d| {
+        // Burn defines any output padding: the trailing cells no input reaches are
+        // zero (plus the bias), and the backward pass drops `padding_out / stride`
+        // of them. PyTorch limits it below `max(stride, dilation)`; Burn's own tests
+        // (`conv_transpose1d_padding_out_stride1_backward_shape`) use more.
         assert!(
-            options.stride[d] > 0
-                && options.dilation[d] > 0
-                && options.padding_out[d] < options.stride[d].max(options.dilation[d]),
-            "output padding must be less than stride or dilation"
+            options.stride[d] > 0 && options.dilation[d] > 0,
+            "stride and dilation must be positive"
         );
         (xs[d + 2] - 1)
             .checked_mul(options.stride[d])

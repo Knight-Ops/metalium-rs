@@ -200,10 +200,14 @@ impl Backend for TtBackend {
     fn dtype_usage(_device: &Self::Device, dtype: DType) -> DTypeUsageSet {
         match dtype {
             DType::F32 | DType::BF16 => DTypeUsage::general() | DTypeUsage::Accelerated,
-            DType::Bool(_) => DTypeUsage::general(),
+            // Int arithmetic is native (wrapping ALU, comparisons, reductions:
+            // burn-op-notes S5/D3), so I32 can be a default dtype
+            // (`set_default_dtypes`, which Burn's own backend tests call). Not
+            // `Accelerated`: there is no int matmul.
+            DType::I32 | DType::Bool(_) => DTypeUsage::general(),
             // FP16 (IEEE binary16): stored and cast on Tensix; arithmetic is
             // not claimed, F64 stays unsupported.
-            DType::I32 | DType::F16 => DTypeUsage::Storage.into(),
+            DType::F16 => DTypeUsage::Storage.into(),
             _ => DTypeUsageSet::empty(),
         }
     }

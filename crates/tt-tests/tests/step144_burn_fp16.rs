@@ -13,7 +13,10 @@
 //! Negative controls: the BF16 reading of F16 slots differs from the F16 one, a
 //! truncating oracle differs from the device on the corpus's ties, and F16
 //! arithmetic must be refused (a silent F32 fallback would not panic).
-use burn::tensor::{backend::Backend, DType, FloatDType, Tensor, TensorData, TensorPrimitive};
+use burn::tensor::{
+    backend::{Backend, DTypeUsage},
+    DType, FloatDType, Tensor, TensorData, TensorPrimitive,
+};
 use burn_tt::{tensor_traffic, TtBackend};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
 
@@ -344,9 +347,15 @@ fn dtype_usage_reports_f16_as_storage_and_f64_as_unsupported() {
     with_device(Config::default(), |d| {
         let usage = TtBackend::dtype_usage(&d, DType::F16);
         assert!(!usage.is_empty(), "F16 is stored and cast");
-        // Storage only, exactly as I32: no arithmetic is claimed.
-        assert_eq!(usage, TtBackend::dtype_usage(&d, DType::I32));
+        // Storage only: no arithmetic is claimed.
+        assert_eq!(usage.iter().collect::<Vec<_>>(), [DTypeUsage::Storage]);
         assert!(!TtBackend::supports_dtype(&d, DType::F16));
+        // I32 has native arithmetic, so it can be a default dtype; Bool likewise.
+        assert_eq!(
+            TtBackend::dtype_usage(&d, DType::I32),
+            DTypeUsage::general()
+        );
+        assert!(TtBackend::supports_dtype(&d, DType::I32));
         assert!(TtBackend::dtype_usage(&d, DType::F64).is_empty());
         assert!(
             TtBackend::supports_dtype(&d, DType::BF16),

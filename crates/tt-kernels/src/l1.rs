@@ -112,6 +112,9 @@ fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The most pages a circular buffer can have: its page counters are 15 bits.
+pub const MAX_CB_PAGES: u32 = 0x7FFF;
+
 /// Why requirements could not be planned or fused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlanError {
@@ -123,6 +126,14 @@ pub enum PlanError {
     },
     /// More semaphores live at once than the tile's eight.
     TooManySemaphores { name: &'static str },
+    /// A circular buffer of more pages than its page counters hold
+    /// ([`MAX_CB_PAGES`]): the kernel is too large for one buffer, not
+    /// malformed, so a caller that can split the work does.
+    TooManyPages {
+        name: &'static str,
+        pages: u32,
+        max: u32,
+    },
     /// A spec that cannot be planned at all, or a fusion edge that does not
     /// join a producer's buffer to a consumer's.
     Invalid(String),
@@ -138,6 +149,10 @@ impl std::fmt::Display for PlanError {
             PlanError::TooManySemaphores { name } => {
                 write!(f, "{name}: more than eight semaphores live at once")
             }
+            PlanError::TooManyPages { name, pages, max } => write!(
+                f,
+                "{name}: a circular buffer of {pages} pages; its page counters hold at most {max}"
+            ),
             PlanError::Invalid(s) => f.write_str(s),
         }
     }
@@ -359,7 +374,14 @@ impl Requirements {
                 consumer,
             } = b.kind
             {
-                if pages == 0 || pages >= 0x8000 || page % b.align != 0 || producer == consumer {
+                if pages > MAX_CB_PAGES {
+                    return Err(PlanError::TooManyPages {
+                        name: b.name,
+                        pages,
+                        max: MAX_CB_PAGES,
+                    });
+                }
+                if pages == 0 || page % b.align != 0 || producer == consumer {
                     return bad(format!(
                         "{}: a circular buffer needs pages, aligned pages, and a producer \
                          and consumer that differ",
@@ -628,6 +650,46 @@ mod tests {
             r.plan(DATA),
             Err(PlanError::TooManySemaphores { .. })
         ));
+    }
+
+    /// More pages than a circular buffer's counters hold is a kernel too large for one buffer, which
+    /// a caller can split: a distinct error, not a malformed spec. The limit's edge: `MAX_CB_PAGES`
+    /// pages is a legal buffer (it merely has to fit), one more is not.
+    #[test]
+    fn too_many_circular_buffer_pages_is_its_own_error() {
+        let mut r = Requirements::new(1);
+        r.cb(
+            "wide",
+            64,
+            MAX_CB_PAGES + 1,
+            64,
+            Endpoint::Pack,
+            Endpoint::Unpack,
+            0..1,
+        );
+        match r.plan(DATA) {
+            Err(PlanError::TooManyPages { name, pages, max }) => {
+                assert_eq!((name, pages, max), ("wide", MAX_CB_PAGES + 1, MAX_CB_PAGES));
+            }
+            other => panic!("expected TooManyPages, got {:?}", other.err()),
+        }
+        let mut r = Requirements::new(1);
+        r.cb(
+            "wide",
+            64,
+            MAX_CB_PAGES,
+            64,
+            Endpoint::Pack,
+            Endpoint::Unpack,
+            0..1,
+        );
+        assert!(
+            matches!(
+                r.plan(DATA),
+                Err(PlanError::DoesNotFit { name: "wide", .. })
+            ),
+            "the largest legal count is validated, then asked to fit"
+        );
     }
 
     #[test]
