@@ -90,6 +90,24 @@ repo    = "https://github.com/tracel-ai/burn"
 version = "0.21.0"
 crates  = ["burn-backend", "burn-flex", "burn-tensor", "burn"]
 
+[burn-backend-tests]
+# Burn's own backend test suite, which `burn-tt-conformance` runs against `TtBackend`
+# (`docs/plans/burn-backend-parity.md` 5.2). `burn-backend-tests` is not published to
+# crates.io and 0.21 has no `testgen!` macro, so the suite is fetched from the Burn
+# repository at the tag matching the `=0.21.0` crates the workspace compiles against:
+# `cargo xtask fetch-burn-tests` extracts `crates/burn-backend-tests/tests/` into
+# `vendor/burn-backend-tests/` (not committed).
+#
+# Pinned by the SHA-256 of the extracted tree (every file: path, length, bytes, in
+# sorted path order), not of the tarball, which GitHub does not promise is
+# byte-stable -- the same reasoning as the ISA specification. A test that changed
+# underneath the expected-failures list would make "passes" mean something else.
+repo    = "https://github.com/tracel-ai/burn"
+tag     = "v0.21.0"
+path    = "crates/burn-backend-tests/tests"
+content_sha256 = "45c5b2f9c8903944bbfe0af1e31ef929377e2ec5e705000204a57acacfff9d16"
+files   = 404
+
 [mnist]
 # The Phase 7 training gate's data. Fetched by `cargo xtask fetch-mnist` from the
 # Google CVDF mirror, verified against the published .gz digests and against the

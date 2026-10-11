@@ -3,7 +3,7 @@
 **Start here.** This is the single list of open work. It holds only open items, each
 linking to its evidence and to the detailed plan. Closed work lives in
 [`completed-plans/`](../completed-plans/) and the archived phase docs below; permanent facts live in
-[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-10.
+[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-11.
 
 ## Where the project stands
 
@@ -32,8 +32,32 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
 - [x] **B2** lazy attach, engine registry (`set_default_engine`), `init`/`detach`/`TtConfig`, card lock
   (`Kmd::lock_card` in every `Session::open_card`), `TtDevice::enumerate`/`device_count` (2026-10-11).
   The default tile is `TileChoice::First`; see "Use the grid" for choosing a tile count per workload.
-- [ ] **B10/B11** vendored Burn conformance suite on ttsim with expected-failures, and a
-  subset in `cargo xtask silicon --smoke`. Never run to date.
+- [x] **B10/B11** (2026-10-11, [`burn-tt-conformance`](../../crates/burn-tt-conformance/README.md),
+  `cargo xtask conformance --release`): Burn 0.21's own backend tests (1,838 tensor and autodiff
+  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,675 pass; 163
+  are in `expected-failures.toml`, each group with a category and a reason.** 163 passing tests are in
+  `--smoke`, validated on card 0 (log `1791692395`). Still open: the run on `Fusion<TtBackend>`
+  (B13a) and the F16 suites (D1).
+- [ ] **Conformance findings** (each a group in `expected-failures.toml`; fixing one removes its
+  tests from the list). In the order the model ladder needs them:
+  1. `softmax`/`log_softmax` only for rank-2 F32 over dim <= 1: rank 1, 3, 4 and transposed inputs
+     are refused (10 tests). Attention over `[B, H, T, T]` needs them.
+  2. I32 and Bool `reshape` that changes the stored matrix is refused (18 tests); float does it
+     natively (`reshaped_strided` copies F32/BF16/F16 only).
+  3. `float_mask_where` and `float_powf` refuse a broadcast operand (8 tests), though `float_expand`
+     is native. Masked attention needs the first.
+  4. **Bugs:** `cat` with a zero-element input fails at execution with `invalid metadata dimensions`
+     (5 tests); a `[408, 261120] @ [261120, 408]` matmul fails in the planner with "the matmul's own
+     requirements are invalid" (1); `bool_argwhere` always refuses (10 tests incl. `nonzero`) while
+     `burn-op-coverage.md` lists it as native, so it needs a `[-]` disposition or an implementation.
+  5. Open gaps, deferred rather than designed away: `interpolate` (22 tests; upsampling in decoders,
+     UNets, ViT position-embedding resize), `conv3d` and `conv_transpose3d` (20), `deform_conv2d`
+     (17), and `scatter_nd` with Mul/Min/Max (26; Burn leaves duplicate indices undefined).
+  6. Ten `precision` failures, attributed to TF32 operand truncation (one reproduced by hand; the
+     LU, determinant and conv2d ones are not decomposed): derive a bound beside each. Eleven large
+     LU/determinant tests are too slow (> 1500 s each).
+  7. Upstream `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs
+     from the expected one, so the two F64-cast autodiff tests end as timeouts, not failures.
 - [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
   one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
 - [ ] **Model ladder**, each rung checked against burn-flex; every failure becomes an op or

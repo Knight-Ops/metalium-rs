@@ -5,13 +5,19 @@ use burn_tensor::{
 use burn_tt::{TtBackend, TtDevice};
 
 #[test]
-fn dtype_capabilities_do_not_advertise_missing_integer_or_reduced_float_compute() {
+fn dtype_capabilities_advertise_what_the_device_computes_and_no_more() {
     use burn_backend::DTypeUsage;
     let d = TtDevice::new(304);
     let float = TtBackend::dtype_usage(&d, DType::F32);
     assert!(float.contains(DTypeUsage::Arithmetic) && float.contains(DTypeUsage::Accelerated));
+    // Integer arithmetic is native (the wrapping ALU, comparisons, reductions: burn-op-notes S5), so
+    // I32 can be a default dtype; there is no integer matmul, so it is not `Accelerated`.
     let int = TtBackend::dtype_usage(&d, DType::I32);
-    assert!(int.contains(DTypeUsage::Storage) && !int.contains(DTypeUsage::Arithmetic));
+    assert!(
+        int.contains(DTypeUsage::Storage)
+            && int.contains(DTypeUsage::Arithmetic)
+            && !int.contains(DTypeUsage::Accelerated)
+    );
     // F16 is raw storage with exact device casts, not compute.
     let half = TtBackend::dtype_usage(&d, DType::F16);
     assert!(

@@ -8,6 +8,8 @@
 use std::process::ExitCode;
 
 mod burn_coverage;
+mod burn_tests;
+mod conformance;
 mod fetch;
 mod gen_burn;
 mod gen_cfg;
@@ -16,6 +18,7 @@ mod pin;
 mod ship;
 mod silicon;
 mod spec;
+mod testrun;
 mod util;
 
 fn main() -> ExitCode {
@@ -29,11 +32,13 @@ fn main() -> ExitCode {
         Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
         Some("fetch-kmd") => fetch::fetch_kmd(args.any(|a| a == "--force")),
         Some("fetch-mnist") => fetch::fetch_mnist(args.any(|a| a == "--force")),
+        Some("fetch-burn-tests") => fetch::fetch_burn_tests(args.any(|a| a == "--force")),
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
         Some("gen-burn-ops") => gen_burn::generate(args.any(|a| a == "--check")),
         Some("burn-coverage") => burn_coverage::run(args.any(|a| a == "--check")),
         Some("silicon") => silicon::run(args),
+        Some("conformance") => conformance::run(args),
         Some("bench") => silicon::bench(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
@@ -59,7 +64,12 @@ tasks:
   fetch-mnist [--force]   download MNIST into vendor/mnist/, decompressed and
                           verified against the pinned hashes; the Phase 7
                           training gate reads it
-  gen-cfg [--check]       regenerate tt-isa's backend-configuration field table
+  fetch-burn-tests [--force]
+                          download Burn's backend test suite (the pinned tag's
+                          crates/burn-backend-tests/tests) into
+                          vendor/burn-backend-tests/ and verify it against the
+                          pinned content digest; burn-tt-conformance runs it
+  gen-cfg [--check]      regenerate tt-isa's backend-configuration field table
                           from the pinned cfg_defines.h; --check fails if the
                           committed file is out of date rather than rewriting it
   gen-isa [--check]       regenerate tt-isa's instruction table from the pinned
@@ -81,6 +91,9 @@ tasks:
   check-no-sim-in-ship    assert tt-ttsim is absent from shippable dependency graphs
   silicon [options]       run the silicon suite one test per process, with an
                           fsync'd log; `cargo xtask silicon --help` for options
+  conformance [options]   Burn's own backend tests against burn-tt on the simulator,
+                          one test per process, compared with the expected-failures
+                          list; `cargo xtask conformance --help` for options
   bench [options]         the firmware benchmarks on silicon (release, ignored
                           tests included), collected into target/silicon/bench/;
                           `cargo xtask bench --help`";

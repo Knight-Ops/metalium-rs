@@ -1395,6 +1395,14 @@ fn plan_slots(
             bytes,
             limit: arena,
         },
+        // A K-block too long for one circular buffer's page counters is too large,
+        // not malformed: report it as not fitting, so the chunk search
+        // (`plan_uncached`) tries a shorter K-block as it does for L1.
+        PlanError::TooManyPages { name, pages, max } => RunError::DoesNotFit {
+            what: name,
+            bytes: pages as u64 * TILE_SLOT,
+            limit: max as u64 * TILE_SLOT,
+        },
         e => panic!("the matmul's own requirements are invalid: {e}"),
     })?;
     let (a_at, b_at, out_at) = (plan.addr(m.a), plan.addr(m.b), plan.addr(m.out));
@@ -1878,6 +1886,40 @@ mod tests {
             Err(RunError::DoesNotFit { .. })
         ));
         assert!(plan_layout([2, 2, 2], L1Format::Fp32).is_ok());
+    }
+
+    /// A K too long for one circular buffer's page counters (found by Burn's own
+    /// `transaction` test: `[408, 261120] @ [261120, 408]`) is planned in shorter K-blocks, as a K too
+    /// long for L1 is. It used to panic the planner, and with it the device's server thread.
+    #[test]
+    fn a_k_longer_than_a_circular_buffer_holds_is_planned_in_blocks() {
+        use crate::l1::MAX_CB_PAGES;
+        // One block of this many K tiles needs more pages than the counters hold.
+        let kt = MAX_CB_PAGES as usize + 1;
+        assert!(
+            !chunk_fits_in(
+                [1, kt, 1],
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                Staging::Slots
+            ),
+            "an over-long block is refused, not a panic"
+        );
+        let shape = plan_in(
+            [408, 261_120, 408],
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            Staging::Slots,
+        )
+        .expect("a long K is split into blocks that fit");
+        let [_, kc, _] = shape.tiles;
+        assert!(kc >= 1 && kc * 32 < 261_120, "{shape:?}");
+        assert!(chunk_fits_in(
+            shape.tiles,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            Staging::Slots
+        ));
     }
 
     #[test]

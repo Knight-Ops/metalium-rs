@@ -23,9 +23,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::testrun::{build, list, run_one, Built, Verdict};
 use crate::util::workspace_root;
 
 struct Opts {
@@ -105,6 +105,55 @@ pub const SMOKE: &[&str] = &[
     "step35_burn_rank_n::",
     "step47_burn_activations::",
     "step11_burn::",
+    // Burn's own backend tests (`crates/burn-tt-conformance`, B11): whole upstream
+    // modules, each a single-op claim checked against literals Burn's CPU backend
+    // meets. Only modules with no entry in `expected-failures.toml`, so every test
+    // matched here is meant to pass; on card 0, since they use `TtDevice::default()`.
+    // Upstream's own `#[ignore]`d tests are not run (the runner does not list them).
+    "tensor::float::ops::matmul::",
+    "tensor::float::ops::add::",
+    "tensor::float::ops::sub::",
+    "tensor::float::ops::mul::",
+    "tensor::float::ops::div::",
+    "tensor::float::ops::exp::",
+    "tensor::float::ops::neg::",
+    "tensor::float::activation::relu::",
+    "tensor::float::ops::aggregation::",
+    "tensor::float::ops::transpose::",
+    "tensor::float::ops::permute::",
+    "tensor::float::ops::reshape::",
+    "tensor::float::ops::expand::",
+    "tensor::float::ops::slice_assign::",
+    "tensor::int::ops::add::",
+    "tensor::int::ops::matmul::",
+    "tensor::int::ops::slice::",
+    "tensor::multi_threads::",
+    "autodiff::base::matmul::",
+    "autodiff::base::relu::",
+    "autodiff::base::add::",
+    "autodiff::base::slice::",
+    // The modules the first conformance round made pass (docs/plans/conformance-to-feature.md).
+    "tensor::float::activation::softmax::",
+    "tensor::float::ops::mask::",
+    "tensor::float::ops::powf::",
+    "tensor::float::ops::fmod::",
+    "tensor::float::ops::cat::",
+    "tensor::int::ops::cat::",
+    "tensor::bool::ops::cat::",
+    "tensor::bool::ops::argwhere_nonzero::",
+    "tensor::bool::ops::reshape::",
+    "tensor::int::ops::reshape::",
+    "tensor::int::ops::stack::",
+    "tensor::float::ops::one_hot::",
+    "autodiff::base::nonzero::",
+    "autodiff::base::reshape::",
+    // The gates written for them: exact oracles, exact traffic, each watched failing.
+    "step149_softmax_nd::",
+    "step150_int_bool_reshape::",
+    "step151_broadcast_mask_pow::",
+    "step152_empty_tensors::",
+    "step153_argwhere::",
+    "step154_conv_transpose_padding_out::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
     "silicon_card_lock::a_second",
@@ -401,13 +450,13 @@ type Results = Vec<(u16, String, Verdict, PathBuf)>;
 
 fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     let root = workspace_root();
-    let binaries = build(&root, o.release, &o.features)?;
+    let binaries = build(&root, o.release, &select(&o.features))?;
 
     let mut selection = Vec::new();
-    for (name, exe) in &binaries {
-        for test in list(exe, o.include_ignored)? {
-            let full = format!("{name}::{test}");
-            selection.push((full, exe.clone(), test));
+    for b in &binaries {
+        for test in list(&b.exe, o.include_ignored)? {
+            let full = format!("{}::{test}", b.name);
+            selection.push((full, b.clone(), test));
         }
     }
     if !o.filters.is_empty() {
@@ -459,7 +508,11 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 
     let mut results = Vec::new();
     'cards: for &dev in &o.devices {
-        for (full, exe, test) in &selection {
+        for (full, bin, test) in &selection {
+            if dev != 0 && card0_only(bin) {
+                println!("dev{dev} SKIP    {full}: runs on card 0 only");
+                continue;
+            }
             log.line(&format!(
                 "{} boot={boot} dev={dev} START {full}",
                 unix_secs()
@@ -468,7 +521,9 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
                 .join("out")
                 .join(format!("{stamp}-dev{dev}-{}.txt", full.replace("::", "__")));
             let started = Instant::now();
-            let verdict = run_one(&root, exe, test, dev, o.timeout, &out_path)?;
+            // `cargo test` runs a package's tests from its own directory.
+            let env = [("TT_SILICON_DEVICE", dev.to_string())];
+            let verdict = run_one(&bin.exe, test, &bin.dir, &env, o.timeout, &out_path)?;
             let secs = started.elapsed().as_secs_f64();
             log.line(&format!(
                 "{} boot={boot} dev={dev} END {full} {verdict} {secs:.2}s",
@@ -496,144 +551,29 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     Ok((stamp, results))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Pass,
-    Fail,
-    Timeout,
-}
-
-impl std::fmt::Display for Verdict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            Verdict::Pass => "PASS",
-            Verdict::Fail => "FAIL",
-            Verdict::Timeout => "TIMEOUT",
-        })
-    }
-}
-
-/// Build the silicon test binaries and return `(target name, executable)`.
-///
-/// Parses cargo's JSON messages by hand, which is enough here: the two fields
-/// wanted are simple strings, and `xtask` stays dependency-free.
-fn build(
-    root: &Path,
-    release: bool,
-    features: &[String],
-) -> Result<Vec<(String, PathBuf)>, String> {
+/// The cargo selection for the silicon test binaries: `tt-tests` with its `silicon`
+/// feature (and any experiment features the caller asked for), and the Burn
+/// conformance suite built for silicon too, whose smoke subset `SMOKE` lists.
+fn select(features: &[String]) -> Vec<String> {
     let features: Vec<String> = std::iter::once("silicon".to_string())
         .chain(features.iter().cloned())
+        .map(|f| format!("tt-tests/{f}"))
+        .chain(std::iter::once("burn-tt-conformance/silicon".to_string()))
         .collect();
-    let out = Command::new(env!("CARGO"))
-        .args(["test", "-p", "tt-tests", "--features"])
-        .arg(features.join(","))
-        .args(["--no-run", "--message-format=json"])
-        .args(release.then_some("--release"))
-        .current_dir(root)
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("could not run cargo: {e}"))?;
-    if !out.status.success() {
-        return Err("building the silicon suite failed".into());
-    }
-    let mut v = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if !line.contains("\"reason\":\"compiler-artifact\"") {
-            continue;
-        }
-        let Some(exe) = json_str(line, "\"executable\":\"") else {
-            continue;
-        };
-        let Some(target) = line
-            .find("\"target\":{")
-            .and_then(|i| json_str(&line[i..], "\"name\":\""))
-        else {
-            continue;
-        };
-        v.push((target, PathBuf::from(exe)));
-    }
-    v.sort();
-    Ok(v)
+    vec![
+        "-p".into(),
+        "tt-tests".into(),
+        "-p".into(),
+        "burn-tt-conformance".into(),
+        "--features".into(),
+        features.join(","),
+    ]
 }
 
-fn json_str(s: &str, key: &str) -> Option<String> {
-    let start = s.find(key)? + key.len();
-    let end = s[start..].find('"')?;
-    Some(s[start..start + end].to_string())
-}
-
-fn list(exe: &Path, include_ignored: bool) -> Result<Vec<String>, String> {
-    let mut all = run_list(exe, false)?;
-    if !include_ignored {
-        let ignored = run_list(exe, true)?;
-        all.retain(|t| !ignored.contains(t));
-    }
-    Ok(all)
-}
-
-fn run_list(exe: &Path, ignored_only: bool) -> Result<Vec<String>, String> {
-    let mut cmd = Command::new(exe);
-    cmd.args(["--list", "--format", "terse"]);
-    if ignored_only {
-        cmd.arg("--ignored");
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("{}: {e}", exe.display()))?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_suffix(": test"))
-        .map(str::to_string)
-        .collect())
-}
-
-fn run_one(
-    root: &Path,
-    exe: &Path,
-    test: &str,
-    dev: u16,
-    timeout: Duration,
-    out_path: &Path,
-) -> Result<Verdict, String> {
-    let out = File::create(out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    let err = out.try_clone().map_err(|e| e.to_string())?;
-    let mut child = Command::new(exe)
-        .args([
-            test,
-            "--exact",
-            "--test-threads=1",
-            "--include-ignored",
-            "--nocapture",
-        ])
-        .env("TT_SILICON_DEVICE", dev.to_string())
-        // `cargo test` runs a package's tests from its own directory.
-        .current_dir(root.join("crates/tt-tests"))
-        .stdout(out)
-        .stderr(err)
-        .spawn()
-        .map_err(|e| format!("{}: {e}", exe.display()))?;
-    let deadline = Instant::now() + timeout;
-    let verdict = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break if status.success() {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            };
-        }
-        if Instant::now() >= deadline {
-            // A process blocked in an MMIO read against a hung NoC may not die;
-            // the verdict is recorded either way, and the log already says START.
-            let _ = child.kill();
-            break Verdict::Timeout;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    if let Ok(f) = File::open(out_path) {
-        let _ = f.sync_all();
-    }
-    Ok(verdict)
+/// Binaries whose tests always run on card 0 (`TtDevice::default()`), whatever
+/// `--device` says: running them on another card would test card 0 again.
+fn card0_only(bin: &Built) -> bool {
+    bin.dir.ends_with("burn-tt-conformance")
 }
 
 /// Refuse to start against a card that is not there, and say out loud whether the

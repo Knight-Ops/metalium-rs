@@ -119,6 +119,23 @@ jobs:
       - name: Clippy (silicon build)
         run: cargo clippy --workspace --all-targets --features tt-tests/silicon
 
+      - name: Cache the pinned Burn test suite
+        uses: actions/cache@v4
+        with:
+          path: vendor/burn-backend-tests
+          key: burn-backend-tests-${{ hashFiles('PINS.toml') }}
+
+      # The conformance suite compiles Burn's own tests, which `--workspace` does
+      # not build: its test targets need the `run` feature.
+      - name: Fetch the Burn test suite
+        run: cargo xtask fetch-burn-tests
+
+      - name: Clippy (conformance suite)
+        run: cargo clippy -p burn-tt-conformance --all-targets --features run
+
+      - name: Clippy (conformance suite, silicon build)
+        run: cargo clippy -p burn-tt-conformance --all-targets --features silicon
+
   unit-tests:
     name: Host unit & doc tests
     runs-on: ubuntu-24.04
@@ -252,3 +269,24 @@ jobs:
       # The end-to-end tier: Burn training on ttsim against the golden loss curve
       - name: Test (end-to-end)
         run: cargo test -p tt-tests --features e2e --test step12_mnist
+
+      - name: Cache the pinned Burn test suite
+        uses: actions/cache@v4
+        with:
+          path: vendor/burn-backend-tests
+          key: burn-backend-tests-${{ hashFiles('PINS.toml') }}
+
+      - name: Fetch the Burn test suite
+        run: cargo xtask fetch-burn-tests
+
+      # Burn's own backend tests against burn-tt on ttsim, one test per process; the
+      # outcome must match crates/burn-tt-conformance/expected-failures.toml.
+      - name: Conformance (Burn's backend tests)
+        run: cargo xtask conformance --release
+
+      - name: Upload the conformance outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance
+          path: target/conformance

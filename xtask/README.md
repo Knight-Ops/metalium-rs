@@ -12,6 +12,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `fetch-spec [--force]` | Pinned tt-isa-documentation tree into `vendor/`, verified by content digest. |
 | `fetch-kmd [--force]` | Pinned tt-kmd `ioctl.h` into `vendor/` (the driver ABI `tt-kmd` binds). |
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |
+| `fetch-burn-tests [--force]` | Burn's own backend tests (`crates/burn-backend-tests/tests/` at the pinned tag) into `vendor/burn-backend-tests/`, verified by content digest. |
 | `gen-cfg [--check]` | `tt-isa/src/cfg/generated.rs` from the pinned `cfg_defines.h` (fetched if absent). |
 | `gen-isa [--check]` | `tt-isa/src/isa/generated.rs` from `Bits32.lua`, cross-checked against the spec's syntax blocks, plus the measured Blackhole layouts in `src/gen_isa/Bits32_BH.lua`. |
 | `gen-burn-ops [--check]` | `burn-tt/src/generated/ops.rs`: native dispatch for `OVERRIDDEN` in `src/gen_burn.rs`, explicit unsupported methods, and inherited composing Burn defaults. |
@@ -20,6 +21,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `check-isa-sources` | Parse `Bits32.lua` and report, generating nothing. |
 | `check-no-sim-in-ship` | `cargo tree` over every `SHIPPABLE` crate (`src/ship.rs`) must not reach `tt-ttsim` / `tt-ttsim-sys`; every workspace member must be `SHIPPABLE` or `DEV_ONLY`. |
 | `silicon [options]` | The silicon suite, one test per process. |
+| `conformance [options]` | Burn's own backend tests against `burn-tt` on ttsim, one test per process, compared with `crates/burn-tt-conformance/expected-failures.toml`. See that crate's README. |
 | `bench [options]` | The firmware benchmarks on silicon, collected into `target/silicon/bench/`. |
 
 `--check` fails if the committed file is stale instead of rewriting it. CI runs all

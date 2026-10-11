@@ -8,6 +8,9 @@ in [roadmap.md](roadmap.md); the generated Burn status table is
 [burn-op-coverage.md](burn-op-coverage.md), with per-method notes in
 [burn-op-notes.md](burn-op-notes.md).
 
+How to get from a failing Burn conformance test to an op that meets this contract, step by step, is
+[conformance-to-feature.md](conformance-to-feature.md).
+
 The two-gate rule, applied per op. An item is `[x]` only when every line below holds for
 it, and a line that does not apply says why in the item.
 
