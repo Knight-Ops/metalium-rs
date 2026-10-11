@@ -99,6 +99,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache the pinned MNIST files
+        uses: actions/cache@v4
+        with:
+          path: vendor/mnist
+          key: mnist-${{ hashFiles('PINS.toml') }}
+
+      # `tt-mnist`'s build script embeds the IDX files and panics without them,
+      # and every job that builds the workspace builds `tt-mnist`.
+      - name: Fetch MNIST
+        run: cargo xtask fetch-mnist
+
       - name: Clippy (host workspace)
         run: cargo clippy --workspace --all-targets
 
@@ -122,6 +133,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache the pinned MNIST files
+        uses: actions/cache@v4
+        with:
+          path: vendor/mnist
+          key: mnist-${{ hashFiles('PINS.toml') }}
+
+      # `tt-mnist`'s build script embeds the IDX files and panics without them,
+      # and every job that builds the workspace builds `tt-mnist`.
+      - name: Fetch MNIST
+        run: cargo xtask fetch-mnist
+
       # Pure host unit tests: covers encodings, tilize/detilize, SFPU bounds,
       # tensor padding/slicing, and driver ABI layouts without simulator overhead.
       - name: Host unit tests
@@ -143,6 +165,17 @@ jobs:
           rustup component add llvm-tools
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the pinned MNIST files
+        uses: actions/cache@v4
+        with:
+          path: vendor/mnist
+          key: mnist-${{ hashFiles('PINS.toml') }}
+
+      # `tt-mnist`'s build script embeds the IDX files and panics without them,
+      # and every job that builds the workspace builds `tt-mnist`.
+      - name: Fetch MNIST
+        run: cargo xtask fetch-mnist
 
       - name: Cache the pinned simulator
         uses: actions/cache@v4
@@ -205,6 +238,12 @@ jobs:
 
       - name: Fetch MNIST
         run: cargo xtask fetch-mnist
+
+      # `step120_tag_search` checks the L1 cache tag-search register layout
+      # against the pinned `vendor/cfg_defines.h`. `gen-cfg --check` fetches it
+      # (verified against PINS.toml) and confirms the generated table is current.
+      - name: Fetch cfg_defines.h
+        run: cargo xtask gen-cfg --check
 
       # Full simulator gate suite across all 80+ steps
       - name: Test (simulator all)
