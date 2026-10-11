@@ -3,7 +3,7 @@
 A review of this stack against tt-metal (TT-Metalium, LLK, TTNN), as of 2026-10-01 (after
 9.7c). It asks which **Tenstorrent-system concepts** tt-metal is built around that we lack,
 have only in part, or do differently, and how to close each gap here. It is a guide, not a
-tracker: work it creates is ticked in `implementation-checklist.md` (Phase 9) or
+tracker: work it creates is ticked in `phases-0-10-checklist.md` (Phase 9) or
 `hardware-coverage.md` (Phase 10, items F1..F6, S1..S9, M1..M4, R1..R4, D1..D6), which
 this file cites rather than repeats.
 
@@ -40,15 +40,45 @@ use the trackers for current completion status. Since that review:
   tensor storage remains open.
 - Mover tilize/untilize is implemented but slower in the recorded measurements;
   host tilize is the default. Tensix/unpacker tilize remains open.
-- G3 K blocking, G7 multicast, G9 BF16/block-float tensor formats, G12 L1
-  residency and G14 device-resident meshes remain open. Backend sync/init,
-  typed errors, conformance and fusion are tracked in the Burn roadmap.
+- *(2026-10-04 statement, superseded below.)* G3 K blocking, G7 multicast, G9
+  BF16/block-float tensor formats, G12 L1 residency and G14 device-resident
+  meshes remain open. Backend sync/init, typed errors, conformance and fusion
+  are tracked in the Burn roadmap.
+
+### Reconciliation update (2026-10-10)
+
+Checked against the code and `hardware-coverage.md`; open work is listed in
+[roadmap.md](../plans/roadmap.md).
+
+- **G3 K blocking: implemented.** Resident ordinary and tile-aligned batched
+  matmuls split K automatically with FP32 accumulator reload in product order.
+  Simulator and both-card silicon gates pass (`step67`/`step68`, run
+  `1791145571`) and release baselines were measured on both cards on 2026-10-10
+  (runs `1791593690`/`92`/`99`, [performance-log.md](performance-log.md)).
+  Packer L1 accumulation remains unimplemented. The "panic" rows below describe
+  the 2026-10-01 baseline: K beyond one L1 pass no longer refuses, because blocking
+  serves it (other device refusals still panic at the next wait, by design).
+- **G9 formats: mostly implemented.** BF16 and FP16 storage, and per-tensor BFP8/4/2
+  with native conversions and products, are delivered
+  ([mixed-bfp-storage.md](../plans/mixed-bfp-storage.md)). INT8, the `a`
+  variants and portable quantization remain deferred.
+- **G7 multicast:** the NoC multicast primitive is done and silicon-gated
+  (`step115_noc_multicast`), but no `tt-kernels` op uses it yet; matmul operands
+  are still re-read from GDDR per block.
+- **G14 mesh:** partial. A mesh is one Burn device over per-chip GDDR sessions with
+  Ethernet tile-slot transfers, not host-staged operands; matmul, convolution and
+  attention products partition across cards, everything else runs on chip 0, each
+  card uses one compute tile, chips are not yet run concurrently, mesh inference
+  traces replay (`step147`) and there are no collectives (all-reduce).
+- **G12 L1-sharded residency:** still open.
+- The 2026-10-01 table in section 1 is history: its "B core elementwise",
+  "host-staged" and "burn-tt panics" cells are annotated where they are stale.
 
 Next for model coverage: finish R1, then P2 K blocking, D4 general indexing,
 M3/R3 layout/norm paths, 10.4 formats/casts and 10.5 convolution/pooling/attention.
 X280 dispatch is optional and unscheduled. The historical K-limit measurements
-below predate loop lowering; the current GDDR code still refuses split K, but
-those old numeric limits are not a current bound.
+below predate loop lowering; those old numeric limits are not a current bound
+(the GDDR code no longer refuses split K: see the 2026-10-10 update above).
 
 ## 1. Historical comparison (2026-10-01)
 
@@ -61,7 +91,7 @@ before Phase 10's first new op, P1 alongside Phase 9/10, P2 when a model needs i
 | Logical vs padded shape, pad value | `Tensor` carries `logical_shape` and `padded_shape`. Tile padding is undefined unless an op fills it (`ttnn/operations/data_movement/fill_pad`, `kernel_helper_functions/pad_tile.hpp`) | `DramTensor` stores only `rows, cols` and assumes zero padding (`tensor.rs:6-8`). Nothing tracks or restores it | **have** (G1; `hardware-coverage.md` F0: `Pad` per tensor, `OpPadding` per op, edge-tile refills) | -- | -- |
 | Rank > 2 tensors in tile layout | `[..., H, W]`, each leading slice padded to `ceil32(H)`, tiles over the last two dims (`tech_reports/tensor_layouts`) | `DramTensor` is 2-D. `burn-tt` sends anything not `is_matrix_f32` (`burn-tt/src/tensor.rs:183`) to the host | **missing** (G2) | P, C | **P0** |
 | Row-major vs tile layout | `Layout::ROW_MAJOR` / `TILE`, with `tilize`/`untilize` ops on the device | Host tilize only (`tt-layout`, `matmul::tilize_f32` `matmul.rs:452`). GDDR holds tiles only | partial (D5, 9.10) | P | P1 |
-| K blocking (`in0_block_w`), spill or reload, packer L1 accumulation | Any K: partial sums go to an intermediate CB and are reloaded into Dst (`copy_tile`) or accumulated by the packer (`PACKER_L1_ACC`) (`ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm.cpp:38-107`) | All of K must fit in L1 at once. `matmul_dram` refuses a split (`tensor.rs:478-481`) and `burn-tt` panics (`server.rs:511`) | **missing** (G3) | C (panic) | **P0** |
+| K blocking (`in0_block_w`), spill or reload, packer L1 accumulation | Any K: partial sums go to an intermediate CB and are reloaded into Dst (`copy_tile`) or accumulated by the packer (`PACKER_L1_ACC`) (`ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm.cpp:38-107`) | All of K must fit in L1 at once. `matmul_dram` refuses a split (`tensor.rs:478-481`) and `burn-tt` panics (`server.rs:511`). *(2026-10-10: implemented, K-blocked accumulator reload, both cards, benchmarked.)* | **have** (G3; packer L1 accumulation not implemented) | -- | -- |
 | Dst capacity, subblocks, `SyncHalf` | 16 tiles of 16-bit Dst, 8 at FP32. Half of that per `tile_regs_acquire` in `SyncHalf`. `out_subblock_h*w` ≤ capacity (`tt-llk/tt_llk_blackhole/common/inc/ckernel.h:836-840`; `tensix_types.h:191-193`) | One output tile in Dst at a time, all of Dst cleared for each (`matmul.rs:333-338, 375`) | partial (G4) | P | P1 |
 | Circular buffers (page FIFO) | `cb_reserve_back/push_back/wait_front/pop_front` over 16-bit page counters, `NUM_CIRCULAR_BUFFERS` = 64 on BH (`tt_metal/api/tt-metalium/circular_buffer_constants.h`; `hw/inc/api/dataflow/dataflow_api.h:208, 474`) | Declared and planned (`tt-kernels/src/l1.rs:201`). No runtime: one-shot gather, compute, scatter | partial, designed (G5; 9.8) | P | P1 |
 | Double buffering | CB of 2× block pages; reader fills one half while compute drains the other | None | missing (G5; 9.8) | P | P1 |
@@ -73,7 +103,7 @@ before Phase 10's first new op, P1 alongside Phase 9/10, P2 when a model needs i
 | Command queues, fast dispatch | Host writes commands into a hugepage ring. Prefetcher and dispatcher cores pull them, write worker L1, send GO signals, and report completion into host memory (`tt_metal/impl/dispatch/kernels/cq_commands.hpp:19-62`) | Every op is synchronous: the host writes over uncached BAR MMIO and polls `DONE` by MMIO read, wave by wave (`session.rs:666-728`; `dm.rs:232-257`) | **missing** (G8) | P | P1 |
 | Non-blocking enqueue, events | `EnqueueProgram(blocking=false)`, `EnqueueRecordEvent` / `EventSynchronize`; the host runs ahead | Each Burn op blocks on `rx.recv()` (`server.rs:380-394`) | missing (G8) | P | P1 |
 | Traces | `BeginTraceCapture`/`ReplayTrace`: a step's commands kept in DRAM, replayed by `CQ_PREFETCH_CMD_EXEC_BUF` (`cq_commands.hpp:27`) | None. Op records (9.7b) are the raw material | missing (G8) | P | P1 |
-| Host pinned memory (sysmem) | Issue and completion queues in pinned host memory, reached by the device over PCIe (`PIN_PAGES`) | `tt-kmd` has no `PIN_PAGES`. All traffic is host MMIO (`RUST_IMPL_PLAN.md:234-237` names the ioctl) | missing (G8) | P | P1 |
+| Host pinned memory (sysmem) | Issue and completion queues in pinned host memory, reached by the device over PCIe (`PIN_PAGES`) | `tt-kmd` had no `PIN_PAGES`; all traffic was host MMIO (`RUST_IMPL_PLAN.md:234-237` named the ioctl; that plan is now `docs/completed-plans/phases-0-10-roadmap.md`). *(2026-10-10: the ioctl ABI is in `tt-kmd` and host DMA is implemented, see the G8 note above; device-side queues in host memory are not.)* | partial (G8) | P | P1 |
 | Program cache, program hash | `compute_program_hash` → cached `Program`; on a hit only `override_runtime_arguments` runs | Programs memoised by shape (`matmul.rs:906-925`), resident in L1 keyed by words (`program_cache.rs:70`), DRAM addresses carried in records | **have** (different form, §4) | -- | -- |
 | Compile-time vs runtime args | CT args baked into the kernel binary; RT args written per core per launch | Programs bake L1 addresses; records carry DRAM refs and scalars (`dm/record.rs`). No per-launch arguments for role programs | partial (F3's `SETDMAREG`) | P | P2 |
 | Interleaved DRAM buffers, page size | Page = one tile in its format, round-robin over banks at the **same offset** in every bank | Tile slot of 4160 B (`dm.rs:149`), round-robin over channels at **per-channel** bases (`tensor.rs:6-12, 213-228`) | **have** (different form, §4) | -- | -- |
@@ -81,15 +111,15 @@ before Phase 10's first new op, P1 alongside Phase 9/10, P2 when a model needs i
 | Data formats per tensor | `DataType` on every tensor (FP32, BF16, BFP8_B, BFP4_B, INT32, UINT8...). Unpack and pack convert | FP32-only tensors. Codes measured for 0, 1, 4, 5, 8 (`tile.rs:138-147`) | partial (G9; D1–D3) | P, C | P1 |
 | Compute kernel config | `MathFidelity`, `fp32_dest_acc_en`, `math_approx_mode`, `packer_l1_acc`, `dst_full_sync_en` per op | `Fidelity` and `SrcRoute` per engine, FP32 Dst always | partial (G10) | P, X | P1 |
 | `*_tile_init` / `*_tile` and LLK init/uninit state | Each op's init reprograms unpack/math/pack state; mixing ops needs `*_init_short` / reconfig (`bmm_large_block_zm.cpp:54-60`) | Every role program carries the full state it needs (`matmul.rs:357-368`), and a tile reset clears thread state (`session.rs:13-16`) | different now, **hazard with fusion** (G11) | C | P1 |
-| Eltwise via FPU vs SFPU | Binary: FPU `ELW*` (`add_tiles`). Unary and transcendental: SFPU | B core scalar FP32 (`dm_b.rs:86-151`) | missing (F1–F5, S1, M1) | P | P1 |
-| reduce / bcast / transpose_wh APIs | `reduce_tile` (with a scaler tile), `*_tiles_bcast`, `transpose_wh_tile` | `COL_SUM` on the B core; transpose in the B core | missing (R1, M2, M3) | P | P1 |
+| Eltwise via FPU vs SFPU | Binary: FPU `ELW*` (`add_tiles`). Unary and transcendental: SFPU | B core scalar FP32 (`dm_b.rs:86-151`). *(2026-10-10: B only reads GDDR; element-wise arithmetic runs on the Tensix SFPU, and matrix ELW add/subtract/multiply on the FPU, M1.)* | **have** (F1–F5, S1, M1) | -- | -- |
+| reduce / bcast / transpose_wh APIs | `reduce_tile` (with a scaler tile), `*_tiles_bcast`, `transpose_wh_tile` | `COL_SUM` on the B core; transpose in the B core. *(2026-10-10: reductions and scans are native Tensix kernels; transpose is the mover's `READ_TRANSPOSED`/repack, with no payload-preserving Tensix route, M3 `[-]`.)* | partial (R1, M2, M3) | P | P1 |
 | Tilize/untilize on the device | `tilize_block` / `untilize_block` compute APIs, or unpacker tilize mode | Host | missing (D5, 9.10) | P | P1 |
 | Tile shapes (tiny tiles) | `Tile({16,32})` etc., `DstTileShape` | `TileDescriptor` models any shape (`tile.rs:1-18`). Kernels fix 32×32 | partial (G15) | P | P2 |
 | Watcher, waypoints, DPRINT | NoC address sanitising, waypoints (`WAYPOINT("CWFW")`), kernel asserts, `DPRINT` ring buffers | Host-side `decode` refusals before the device and again on it, heartbeat, `PANICKED` and error codes, no message text (`tt-firmware/src/lib.rs:167-180`) | partial (G13) | X | P1 |
 | Device profiler (Tracy) | Per-RISC zone timestamps into L1, merged on the host | `runtime::Profile` (host phases), `Device::traffic`, and a device profile through each tile's timestamper: mover lists, entries and role runs per tile, Chrome trace export, `TT_PROFILE` (`tt-kernels/src/profile.rs`, `hardware-coverage.md` X3) | **have** (G13) | -- | -- |
 | `noc_async_*_barrier`, flush, posted writes | Per-NoC transaction counters, read/write/atomic barriers | Per-`TxnId` wait (`tt-firmware/src/lib.rs:438`), fence through `publish()` | **have** | -- | -- |
 | Allocator | Banked L1 and DRAM allocators, lock-step bank offsets, L1_SMALL, TRACE regions | Coalescing per-channel GDDR allocator (`tensor.rs:114-170`); L1 planned by liveness (`l1.rs`), stronger than tt-metal's (§4) | **have** | -- | -- |
-| Mesh device, fabric, CCL | `MeshDevice`, TT-Fabric routing, `all_gather`, `reduce_scatter`, `all_reduce` | `shard.rs` splits N over chips through Ethernet movers, host-staged (`shard.rs:1-16`) | partial (G14; 9.11) | P | P2 |
+| Mesh device, fabric, CCL | `MeshDevice`, TT-Fabric routing, `all_gather`, `reduce_scatter`, `all_reduce` | `shard.rs` splits N over chips through Ethernet movers, host-staged (`shard.rs:1-16`). *(2026-10-10: GDDR-resident per-chip sessions, tile slots move over Ethernet; one tile per card, chips not concurrent, no collectives.)* | partial (G14; 9.11) | P | P2 |
 | TTNN device-op structure | `validate`, `compute_output_specs`, `create_program`, `override_runtime_arguments`, `compute_program_hash` | Free functions returning `Work` (`tensor.rs:447, 592, 662`). Checks inline as `TensorError::Shape` | partial (G16) | X | P1 |
 
 ---
@@ -204,10 +234,11 @@ at all (R2 softmax is over `[B, S, V]`, R4 attention is rank 4).
 
 ### G3. K blocking without a K limit (P0, a panic mid-model)
 
-**Current implementation (2026-10-04):** resident ordinary and supported
+**Current implementation (updated 2026-10-10):** resident ordinary and supported
 batched matmuls use K-blocked accumulator reload when K does not fit L1.
-`step68_k_block_matmul` validates the same product order on the simulator;
-both-card silicon and release benchmarking remain pending. The notes below
+`step67`/`step68_k_block_matmul` validate the same product order on the simulator
+and both cards (`1791145571`), and release baselines were measured on both cards
+on 2026-10-10 (`1791593690`; see `performance-log.md`). The notes below
 are the original design and measured pre-implementation limits. Native Burn
 never uses their proposed host fallback, and packer L1 accumulation remains
 unimplemented.
@@ -307,7 +338,7 @@ Double buffering is a ring of 2× the block, nothing more.
 
 **(b)** `Requirements::cb(name, page, pages, align, from, to, live)` (`l1.rs:201`) declares
 rings with endpoints (`Endpoint::{Mover, Unpack, Math, Pack}`, `l1.rs:39`). The planner
-places them, `fuse` joins them. The runtime protocol is decided (`RUST_IMPL_PLAN.md`,
+places them, `fuse` joins them. The runtime protocol is decided (`RUST_IMPL_PLAN.md`, now `docs/completed-plans/phases-0-10-roadmap.md`,
 "L1 planning and circular buffers", item 6) and not built: today each "ring" is filled
 completely before the kernel starts (`dm_b.rs:213-217`: `KERNEL` waits for every move).
 
@@ -433,7 +464,7 @@ a list per tile".
 1. **Async enqueue in `burn-tt`.** `server::eltwise/matmul_dram/sum_rows` return the
    `BufferId` at once. The host-side allocator already decided the placement, so the
    server thread executes in order behind them, and only `download` (and `free`) waits.
-   Errors surface at the next sync point as a typed `EngineError` naming the op that
+   Errors surface at the next sync point as a typed `TtError` naming the op that
    failed. This is the `blocking=false` + `Finish` model, and it overlaps Burn's
    autodiff graph building with device time.
 2. **Completion into host memory.** `PIN_PAGES` a page. B's `DONE` becomes a NoC write
@@ -645,7 +676,7 @@ five ad hoc `eprintln!`s in `tt-kernels`/`burn-tt`/`tt-device`):
 | Pad contents after an op | G1 | **silent wrong result** (`ADD_ROW`, `COL_SUM`) | (1) the fill-pad job on edge tiles only, from `OpPadding`; `tt::pad` debug event per fill |
 | Rank > 2 on the device | G2 | silent host fallback; only downloads logged | (1) N-D `DramTensor`; meanwhile (2) `warn_once` per op and rank |
 | Row slice not on tile rows (`first % 32 != 0`) | `rows_view` (`tensor.rs:292-306`) | silent host fallback (`ops.rs:331`) | (1) a device re-tile copy (D4); meanwhile (2) |
-| Matmul K beyond one tile's L1 + program slot (K > 3264 at HiFi4, > 3488 at Lo; measured) | `tensor.rs:476-482`, `mailbox.rs:156` | `TensorError::Shape` → **panic** in burn-tt (`server.rs:511`) | (1) K blocking with Dst reload (G3); meanwhile (2) host-staged fallback + warn naming K and the limit |
+| Matmul K beyond one tile's L1 + program slot (K > 3264 at HiFi4, > 3488 at Lo; measured) | `tensor.rs:476-482`, `mailbox.rs:156` | `TensorError::Shape` → **panic** in burn-tt (`server.rs:511`) *(2026-10-01 baseline; K blocking since landed, G3)* | (1) K blocking with Dst reload (G3); meanwhile (2) host-staged fallback + warn naming K and the limit |
 | Batched matmul | `ops.rs:176-237` | (1) host-staged per batch, silent | (2) warn with the bytes per call until G2 |
 | Dst capacity (8 FP32 tiles; 4 per half in `SyncHalf`) | `ckernel.h:836-840`; BH `Dst.md` | by convention: 1 tile used | (3) `DstPlan::capacity()` and `DstSlot` newtype, refused at program construction |
 | Sync Unit semaphores: 8 per tile, 4-bit, saturate at 15 | `SyncUnit.md`; `sync.rs:43, 96-110` | (3) `Semaphore::new` refuses ≥ 8; the planner shares by liveness (`l1.rs:226`) | add: (3) refuse any use as a counter with a possible value > 15 (a CB of > 15 pages); CB counters are L1 words (G5) |
@@ -665,6 +696,20 @@ five ad hoc `eprintln!`s in `tt-kernels`/`burn-tt`/`tt-device`):
 | A mover or role that hangs | `dm.rs:244-254`, row 65 | `TimedOut` after a deadline; recovery resets the tile | add the waypoint dump (G13) to the error; never hang without a deadline |
 
 ---
+
+## Compile-time `.ttinsn` and instruction gathering (checked 2026-10-10 against tt-metal `6024ed40f33`)
+
+- `TTI_*` LLK macros emit `.ttinsn` with a compile-time constant (`TTI_INSN` in
+  `tt_llk_blackhole/common/inc/ckernel_ops.h`); `TT_*` with runtime operands store to `instrn_buffer`. So
+  tt-metal's unrolled SFPU and unpack/pack sequences are `.ttinsn` pushes by construction, from a JIT
+  compiler (`tt_metal/jit_build`, cached) that bakes data formats, loop counts and `DstSync` (default
+  `SyncHalf`) into each kernel binary. Replay (`lltt::record`/`replay`) and MOP templates
+  (`ckernel_template.h`) cut pushes further; `SFPLOADMACRO` is used in a few SFPU kernels only.
+- tt-metal **disables instruction gathering** on all RISCs around Tensix (`configure_gathering`, tt-metal#16439);
+  see `silicon-operating-notes.md`. This repo measured that gathering makes no difference to the `.ttinsn`
+  speedup, so the right default here is also off.
+- The same `cfg0` CSR carries the L1 data cache enable (bit 3) and relaxed memory ordering (bit 0), which
+  tt-metal configures at boot and this repo has never touched.
 
 ## 4. Deliberately different, and fine
 

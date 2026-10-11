@@ -1043,6 +1043,8 @@ fn call(
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
+    // Gathering off, as on every role (`tt_firmware::disable_gathering`).
+    tt_firmware::disable_gathering();
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
     // Local data RAM is not zeroed on the simulator (divergence row 25).
     *launched() = 0;

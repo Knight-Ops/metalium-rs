@@ -407,6 +407,13 @@ pub fn strictly<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Does a device error panic here rather than come back as an `Err`: strict,
+/// on this thread or process-wide? [`host_ok`] does not matter, since it
+/// permits host work, not failures.
+pub(crate) fn strict_here() -> bool {
+    STRICT_HERE.with(Cell::get) > 0 || strict()
+}
+
 /// Does a fallback here panic: strict, and not inside [`host_ok`]?
 fn refuses() -> bool {
     (STRICT_HERE.with(Cell::get) > 0 || strict()) && HOST_OK.with(Cell::get) == 0

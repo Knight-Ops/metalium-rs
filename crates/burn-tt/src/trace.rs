@@ -16,7 +16,8 @@
 //! The input and output are the capture's, kept alive by the trace; dropping
 //! the trace releases it on the device.
 
-use crate::server::{self, BufferId, EngineError};
+use crate::error::TtError;
+use crate::server::{self, BufferId};
 use crate::tensor::TtTensor;
 use crate::TtDevice;
 
@@ -44,8 +45,8 @@ impl Drop for Capturing {
     fn drop(&mut self) {
         if self.open {
             // Whatever it captured, it is no trace: ended, and released.
-            if let Ok(id) = server::run(self.device, |e, _| e.end_trace()) {
-                server::run(self.device, move |e, _| e.release_trace(id));
+            if let Some(Ok(id)) = server::run_if_attached(self.device, |e, _| e.end_trace()) {
+                server::run_if_attached(self.device, move |e, _| e.release_trace(id));
             }
         }
     }
@@ -65,14 +66,14 @@ impl Trace {
     pub fn capture(
         input: &TtTensor,
         f: impl FnOnce() -> TtTensor,
-    ) -> Result<(Trace, Vec<f32>), EngineError> {
+    ) -> Result<(Trace, Vec<f32>), TtError> {
         let device = input.device;
         if !input.is_stored_f32() || input.storage_format() != crate::storage::StorageFormat::F32 {
-            return Err(EngineError("a trace's input is an F32 tensor".into()));
+            return Err(TtError::Device("a trace's input is an F32 tensor".into()));
         }
         let d = input.to_dram();
         if d.transposed || d.buffer.parent.is_some() {
-            return Err(EngineError(
+            return Err(TtError::Device(
                 "a trace's input must own its buffer: not a transposed or row view".into(),
             ));
         }
@@ -84,7 +85,7 @@ impl Trace {
             Some(d) if !d.transposed && out.device == device && out.is_stored_f32() => {
                 Ok((d.buffer.id, [d.buffer.rows, d.buffer.cols]))
             }
-            _ => Err(EngineError(
+            _ => Err(TtError::Device(
                 "a trace's output must be F32, computed on its device, untransposed".into(),
             )),
         };
@@ -116,13 +117,13 @@ impl Trace {
     /// Write `values` (the input's, row-major as stored) into the input,
     /// replay, and read the output back, row-major as stored: one round trip
     /// to the device.
-    pub fn run(&self, values: Vec<f32>) -> Result<Vec<f32>, EngineError> {
+    pub fn run(&self, values: Vec<f32>) -> Result<Vec<f32>, TtError> {
         self.run_timed(values).map(|r| r.output)
     }
 
     /// [`Trace::run`], with the time the input's write, the replay and the
     /// output's read each took on the device's side.
-    pub fn run_timed(&self, values: Vec<f32>) -> Result<server::TraceRun, EngineError> {
+    pub fn run_timed(&self, values: Vec<f32>) -> Result<server::TraceRun, TtError> {
         let (id, input, output) = (self.id, self.input, self.output);
         server::run(self.device, move |e, ids| {
             ids.healthy()?;
@@ -134,7 +135,9 @@ impl Trace {
 impl Drop for Trace {
     fn drop(&mut self) {
         let id = self.id;
-        server::run(self.device, move |e, _| e.release_trace(id));
+        // A drop never opens a card, and never panics: a detached device has
+        // nothing left to release.
+        server::run_if_attached(self.device, move |e, _| e.release_trace(id));
     }
 }
 
@@ -158,9 +161,9 @@ impl TracedInference {
     pub fn capture(
         inputs: &[&TtTensor],
         f: impl FnOnce() -> Vec<TtTensor>,
-    ) -> Result<(Self, Vec<server::OutputPayload>), EngineError> {
+    ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
         let Some(first_in) = inputs.first() else {
-            return Err(EngineError(
+            return Err(TtError::Device(
                 "a trace needs at least one input tensor".into(),
             ));
         };
@@ -168,18 +171,18 @@ impl TracedInference {
         let mut in_ids = Vec::with_capacity(inputs.len());
         for &inp in inputs {
             if inp.device != device {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "all trace inputs must belong to the same device".into(),
                 ));
             }
             if !inp.is_storable() || inp.storage_format() != crate::storage::StorageFormat::F32 {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "a trace input must be a storable tensor".into(),
                 ));
             }
             let d = inp.to_dram();
             if d.transposed || d.buffer.parent.is_some() {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "a trace input must own its buffer: not a transposed or row view".into(),
                 ));
             }
@@ -192,15 +195,15 @@ impl TracedInference {
         let mut out_info = Vec::with_capacity(outs.len());
         for out in &outs {
             if out.device != device {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "all trace outputs must belong to the trace device".into(),
                 ));
             }
             let d = out.dram().ok_or_else(|| {
-                EngineError("a trace output must be computed on the device".into())
+                TtError::Device("a trace output must be computed on the device".into())
             })?;
             if d.transposed {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "a trace output cannot be a transposed view".into(),
                 ));
             }
@@ -256,7 +259,7 @@ impl TracedInference {
     pub fn run(
         &self,
         inputs: Vec<server::InputPayload>,
-    ) -> Result<Vec<server::OutputPayload>, EngineError> {
+    ) -> Result<Vec<server::OutputPayload>, TtError> {
         self.run_timed(inputs).map(|r| r.outputs)
     }
 
@@ -264,9 +267,9 @@ impl TracedInference {
     pub fn run_timed(
         &self,
         inputs: Vec<server::InputPayload>,
-    ) -> Result<server::GenericTraceRun, EngineError> {
+    ) -> Result<server::GenericTraceRun, TtError> {
         if inputs.len() != self.inputs.len() {
-            return Err(EngineError(format!(
+            return Err(TtError::Device(format!(
                 "expected {} inputs, got {}",
                 self.inputs.len(),
                 inputs.len()
@@ -286,7 +289,9 @@ impl TracedInference {
 impl Drop for TracedInference {
     fn drop(&mut self) {
         let id = self.id;
-        server::run(self.device, move |e, _| e.release_trace(id));
+        // A drop never opens a card, and never panics: a detached device has
+        // nothing left to release.
+        server::run_if_attached(self.device, move |e, _| e.release_trace(id));
     }
 }
 
@@ -324,9 +329,9 @@ impl TracedTrainingStep {
     pub fn capture(
         inputs: &[&TtTensor],
         f: impl FnOnce() -> (TtTensor, Vec<(TtTensor, TtTensor)>),
-    ) -> Result<(Self, f32), EngineError> {
+    ) -> Result<(Self, f32), TtError> {
         let Some(first_in) = inputs.first() else {
-            return Err(EngineError(
+            return Err(TtError::Device(
                 "a training trace needs at least one input tensor".into(),
             ));
         };
@@ -334,18 +339,18 @@ impl TracedTrainingStep {
         let mut in_ids = Vec::with_capacity(inputs.len());
         for &inp in inputs {
             if inp.device != device {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "all trace inputs must belong to the same device".into(),
                 ));
             }
             if !inp.is_storable() || inp.storage_format() != crate::storage::StorageFormat::F32 {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "a trace input must be a storable tensor".into(),
                 ));
             }
             let d = inp.to_dram();
             if d.transposed || d.buffer.parent.is_some() {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "a trace input must own its buffer: not a transposed or row view".into(),
                 ));
             }
@@ -358,15 +363,17 @@ impl TracedTrainingStep {
         let (loss, updates) = f();
 
         if loss.device != device {
-            return Err(EngineError(
+            return Err(TtError::Device(
                 "the loss tensor must belong to the trace device".into(),
             ));
         }
-        let loss_dram = loss
-            .dram()
-            .ok_or_else(|| EngineError("the loss tensor must be computed on the device".into()))?;
+        let loss_dram = loss.dram().ok_or_else(|| {
+            TtError::Device("the loss tensor must be computed on the device".into())
+        })?;
         if loss_dram.transposed {
-            return Err(EngineError("the loss tensor cannot be transposed".into()));
+            return Err(TtError::Device(
+                "the loss tensor cannot be transposed".into(),
+            ));
         }
         let loss_id = loss_dram.buffer.id;
 
@@ -374,14 +381,14 @@ impl TracedTrainingStep {
         let mut held_params = Vec::with_capacity(updates.len() * 2);
         for (new_param, orig_param) in updates {
             if new_param.device != device || orig_param.device != device {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "parameter update tensors must belong to the trace device".into(),
                 ));
             }
             let new_d = new_param.to_dram();
             let orig_d = orig_param.to_dram();
             if new_d.transposed || orig_d.transposed {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "parameter tensors cannot be transposed views for copy_into".into(),
                 ));
             }
@@ -418,9 +425,9 @@ impl TracedTrainingStep {
     }
 
     /// Replay the entire training step with new batch inputs.
-    pub fn step(&self, inputs: Vec<server::InputPayload>) -> Result<StepTiming, EngineError> {
+    pub fn step(&self, inputs: Vec<server::InputPayload>) -> Result<StepTiming, TtError> {
         if inputs.len() != self.inputs.len() {
-            return Err(EngineError(format!(
+            return Err(TtError::Device(format!(
                 "expected {} inputs, got {}",
                 self.inputs.len(),
                 inputs.len()
@@ -448,6 +455,8 @@ impl TracedTrainingStep {
 impl Drop for TracedTrainingStep {
     fn drop(&mut self) {
         let id = self.id;
-        server::run(self.device, move |e, _| e.release_trace(id));
+        // A drop never opens a card, and never panics: a detached device has
+        // nothing left to release.
+        server::run_if_attached(self.device, move |e, _| e.release_trace(id));
     }
 }

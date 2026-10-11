@@ -75,7 +75,7 @@ Final simulator suite passes 9/9. Card-0 step99 followed by CNN gates passes
 Fresh copies pass with TT_PIPELINE=0 (`1791324866`) and TT_BATCH=0
 (`1791324883`) on silicon and in the simulator. Benchmark `1791324901`
 validates all six records and measures ADC at 1.71–2.30× native repack cost.
-Conditions and dataflow counts are in firmware-performance.md.
+Conditions and dataflow counts are in performance-log.md.
 
 Eight step12 MNIST e2e gates pass (271.51 s) with the golden unchanged.
 Formatting, default/silicon Clippy, silicon no-run compilation, separate

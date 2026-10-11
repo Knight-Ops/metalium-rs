@@ -44,13 +44,13 @@ tt-metal is cited only to settle a point the guide raises, and is not part of th
 | X13 | Exploring TT-Metalium: "NoC 0: Reads, NoC 1: Writes" as a property of the tile | Both NoCs carry every request type. NoC 0 flows right and down, NoC 1 flows left and up, and each is a torus (`NoC/RoutingPaths.md`; `NoC/README.md:5-9`). The read/write split is a tt-metal kernel convention (§4). | It is a software default, not hardware. |
 | X14 | CS Fundamentals module 4: a "2D mesh" with "5-port routers" | Each NoC is a **2D torus**, with wraparound on both axes (`NoC/README.md:5`). The Playground page does say "2D torus". | The guide's pages disagree with each other. |
 | X15 | Module 4: "latency 1 cycle/hop", "~5 cycles for 1 hop", "bandwidth 32 bytes/cycle" | BH: router-to-router is **9 cycles** per hop and NIU↔router about 5. One 512-bit (64 B) flit per cycle per axis (`NoC/README.md:62-66`). | The guide's figures are illustrative. Use the Spec. |
-| X16 | Hardware Detection: "p150 - Dual chip" | The p150 is a single Blackhole chip (the repo's own target, `../plans/master-roadmap.md`). The guide also calls p300c "single chip" while saying QuietBox 2 holds "two dual-ASIC p300c boards". | Board taxonomy only. Hardware is unaffected. |
+| X16 | Hardware Detection: "p150 - Dual chip" | The p150 is a single Blackhole chip (the repo's own target, `../plans/phases-0-10-roadmap.md`). The guide also calls p300c "single chip" while saying QuietBox 2 holds "two dual-ASIC p300c boards". | Board taxonomy only. Hardware is unaffected. |
 
 ### 1b. Found while cross-checking (not from the guide, but worth fixing in the repo)
 
 | # | Repo says | Evidence | Action |
 |---|---|---|---|
-| R1 | "B's **2 KiB** instruction cache" (`firmware-performance.md:135`; `crates/tt-firmware/src/lib.rs:577`) | The 2 KiB / 2 / ½ / 2 / ½ KiB table is **Wormhole's** (`WormholeB0/.../InstructionCache.md:5-8`). BH `BabyRISCV/README.md:39` links an `InstructionCache.md` that exists neither in `vendor/` nor upstream (404 on `main`, 2026-10-02). **The BH icache sizes are undocumented.** | **Measured (2026-10-03, `probe_icache`): ~4 KiB on every baby core (B, NC, T0, T1, T2)**, a miss ~5.5 cycles per 32 bytes; the repo's "2 KiB" statements are corrected. |
+| R1 | "B's **2 KiB** instruction cache" (`performance-log.md:135`; `crates/tt-firmware/src/lib.rs:577`) | The 2 KiB / 2 / ½ / 2 / ½ KiB table is **Wormhole's** (`WormholeB0/.../InstructionCache.md:5-8`). BH `BabyRISCV/README.md:39` links an `InstructionCache.md` that exists neither in `vendor/` nor upstream (404 on `main`, 2026-10-02). **The BH icache sizes are undocumented.** | **Measured (2026-10-03, `probe_icache`): ~4 KiB on every baby core (B, NC, T0, T1, T2)**, a miss ~5.5 cycles per 32 bytes; the repo's "2 KiB" statements are corrected. |
 | R2 | `SoftReset.md:114` (BH) mentions "core-local instruction RAM" | That is a WH leftover link. The BH memory map has no IRAM. | None. Don't read it as evidence that BH has IRAM. |
 
 ---
@@ -141,7 +141,7 @@ Source: `EthernetTile/BabyRISCV/README.md:3-14`. Nothing contradicts the repo.
 | Question | Answer (BH) | Source |
 |---|---|---|
 | Does NC have IRAM? | **No.** It fetches only from L1, through its L0 icache. | `BabyRISCV/README.md:39`; tt-metal BH `dev_mem_map.h` ("No IRAM constraints") |
-| NC icache size | **Undocumented on BH.** WH was 512 B, a quarter of B's. If BH kept that ratio, NC's hot loop must be far smaller than B's ~3 KB (`firmware-performance.md:135`). | WH `InstructionCache.md:5-8`; R1 |
+| NC icache size | **Undocumented on BH.** WH was 512 B, a quarter of B's. If BH kept that ratio, NC's hot loop must be far smaller than B's ~3 KB (`performance-log.md:135`). | WH `InstructionCache.md:5-8`; R1 |
 | Can NC flush its own icache? | **No.** `TENSIX_CFG` is unmapped for NC, so B or the host must write `RISCV_IC_INVALIDATE` bit 4, or reset NC. | `BabyRISCV/README.md:135`; `BackendConfiguration.md:42` |
 | Can NC reach NoC 0 and NoC 1? | **Yes, both.** NC can also take NIU interrupts and has `mret`. | `BabyRISCV/README.md:117-118`; `PIC.md:5` |
 | Can NC push Tensix, use PCBufs, Tensix semaphores or mailboxes? | **No.** It must sync with the TRISCs through L1 words, such as CB counters (G5). | `BabyRISCV/README.md:120-135` |
@@ -190,7 +190,7 @@ preserved above.
 
 1. **Answered: BH instruction caches.** `probe_icache` measured about
    4 KiB on each baby core, including B and NC (2026-10-03). See
-   `firmware-performance.md`, "Instruction caches". This does not establish
+   `performance-log.md`, "Instruction caches". This does not establish
    an X280 cache size.
 2. **NoC atomics and inline writes into BH L1 may hang.** tt-metal's BH `dev_mem_map.h` says:
    "issuing inline writes **and atomics** requires all 4 memory ports to accept the transaction

@@ -41,27 +41,28 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 
 | Task                                    | Reference                                                                                                                                |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| What to work on next (open items)       | [roadmap.md](docs/plans/roadmap.md)                                                                                                      |
 | Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                               |
-| New kernel/op; completion criteria      | [hardware-coverage.md](docs/plans/hardware-coverage.md), [tensix-next-features.md](docs/plans/tensix-next-features.md)                   |
+| New kernel/op; completion criteria      | [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md), [burn-op-notes.md](docs/plans/burn-op-notes.md)                  |
 | Burn backend changes                    | [burn-native-cutover.md](docs/plans/burn-native-cutover.md), [burn-backend-parity.md](docs/plans/burn-backend-parity.md)                 |
 | Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
-| Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/plans/implementation-checklist.md) |
+| Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/completed-plans/phases-0-10-checklist.md) |
 | Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                                 |
-| Performance changes                     | [firmware-performance.md](docs/learnings/firmware-performance.md)                                                                        |
-| Architecture/specification rationale    | [master-roadmap.md](docs/plans/master-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
+| Performance changes                     | [performance-scoreboard.md](docs/learnings/performance-scoreboard.md) (current), [performance-log.md](docs/learnings/performance-log.md) (history) |
+| Architecture/specification rationale    | [phases-0-10-roadmap.md](docs/completed-plans/phases-0-10-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
 
 ### Codebase Subsystem $\leftrightarrow$ Documentation Matrix
 
-| Crate / Layer           | Relevant Learnings (`docs/learnings/`)                                                        | Relevant Plans & Checklists (`docs/plans/`)                                                          |
+| Crate / Layer           | Relevant Learnings (`docs/learnings/`)                                                        | Relevant Plans (`docs/plans/`)                                                          |
 | :---------------------- | :-------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
-| `tt-isa`                | `ttsim-divergence.md`, `riscv-guide-review.md`                                                | `master-roadmap.md`, `hardware-coverage.md`                                                          |
-| `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `master-roadmap.md`, `implementation-checklist.md`                                                   |
-| `tt-layout`             | `firmware-performance.md`                                                                     | `hardware-coverage.md`, `tensix-next-features.md`                                                    |
-| `tt-firmware`           | `firmware-performance.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `hardware-coverage.md`, `traced-execution.md`, `tensix-next-features.md`                             |
-| `tt-kernels`            | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `master-roadmap.md`, `traced-execution.md`, `hardware-coverage.md`, `tensix-next-features.md`        |
-| `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `tensix-next-features.md` |
-| `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `firmware-performance.md`                                              | `implementation-checklist.md`, `hardware-coverage.md`                                                |
-| `xtask`                 | `silicon-operating-notes.md`                                                                  | `master-roadmap.md`, `burn-backend-parity.md`                                                        |
+| `tt-isa`                | `ttsim-divergence.md`, `riscv-guide-review.md`                                                | `roadmap.md`, `new-op-definition-of-done.md`                                                              |
+| `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `roadmap.md`                                                                                         |
+| `tt-layout`             | `performance-scoreboard.md`                                                              | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
+| `tt-firmware`           | `performance-scoreboard.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`                                              |
+| `tt-kernels`            | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
+| `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `roadmap.md`, `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `burn-op-notes.md` |
+| `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `performance-scoreboard.md`                                       | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
+| `xtask`                 | `silicon-operating-notes.md`                                                                  | `roadmap.md`, `burn-backend-parity.md`                                                               |
 
 ## Build and check
 
@@ -98,9 +99,13 @@ cargo test -p tt-tests --features e2e --test step12_mnist
 **Never execute silicon tests with plain `cargo test`.** Use the isolated runner:
 
 ```bash
-cargo xtask silicon --release --device all --filter <gate>
-cargo xtask silicon --smoke --release --device all
+cargo xtask silicon --release --device 0 --filter <gate>
+cargo xtask silicon --smoke --release --device 0
 ```
+
+Validate on **one card** (card 0): the same single-card test on the other card
+adds no information. Use `--device all` only for work that needs both cards:
+mesh/multi-card ops, Ethernet, and larger models that span the two.
 
 `--list` inspects selections without touching cards. Logs are under
 `target/silicon/`. If hardware is unavailable, report the unrun gate; compilation
@@ -117,6 +122,7 @@ Never hand-edit outputs. Change the generator/input, regenerate, then run its
 | `gen-isa`          | `crates/tt-isa/src/isa/generated.rs`  |
 | `gen-burn-ops`     | `crates/burn-tt/src/generated/ops.rs` |
 | `burn-coverage`    | `docs/plans/burn-op-coverage.md`      |
+| `TT_BLESS=1 cargo test -p tt-tests --test probe_ttinsn_push ttinsn_programs_are_current` | `crates/tt-firmware/src/ttinsn_programs.in` |
 
 Burn routing is `OVERRIDDEN` in `xtask/src/gen_burn.rs`; an unsupported method needs a
 `[-]` disposition in `xtask/src/burn_coverage.rs`. Historical
@@ -128,8 +134,9 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
 
 - Ensure that documentation stays up to date: record empirical hardware discoveries in
   `docs/learnings/silicon-operating-notes.md`, simulator quirks in `docs/learnings/ttsim-divergence.md`,
-  and performance numbers in `docs/learnings/firmware-performance.md`. When working on features or
-  ops, update the active checklists in `docs/plans/`.
+  current performance rows in `docs/learnings/performance-scoreboard.md` and run history in
+  `docs/learnings/performance-log.md`. When working on features or ops, update
+  `docs/plans/roadmap.md` and the relevant feature plan.
 - `burn-tt` has no Flex dependency or host arithmetic fallback. Unsupported ops,
   shapes and dtypes fail explicitly. Preserve Burn defaults that compose native
   primitives. Model gates reject intermediate downloads and staged host compute;
@@ -150,9 +157,10 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   Cover signed zeros, subnormals, NaNs, infinities and extremes. Preserve stated
   accumulation order; `SFPMAD` is not IEEE fused multiply-add.
 - New ops need an independent oracle, a simulator gate with a meaningful
-  negative control, silicon validation on both cards, native Burn routing,
-  residency/padding checks and a smoke entry. Follow the coverage definition of
-  done. Re-bless `crates/tt-tests/tests/golden/mnist_reduced.txt` with
+  negative control, silicon validation on one card (both only for
+  mesh/multi-card ops), native Burn routing,
+  residency/padding checks and a smoke entry. Follow
+  `docs/plans/new-op-definition-of-done.md`. Re-bless `crates/tt-tests/tests/golden/mnist_reduced.txt` with
   `TT_BLESS=1` only for an explained, deliberate arithmetic change.
 
 ## Avoid hardware failures
@@ -166,7 +174,13 @@ cannot answer NoC accesses while its owning core is in reset.
 Preserve posted-write readback fences, NoC endpoint ownership, checked alignment
 and in-flight limits. Firmware L1 polls need fences. Preserve the build-time
 instruction gate; do not emit compressed instructions, `fence.i`, `pause` via
-`spin_loop()`, or `ebreak` for panic. Ethernet customer code runs on E1; leave E0
+`spin_loop()`, or `ebreak` for panic. The one exception is the opt-in `ttinsn_t1`
+experiment image (cargo feature `ttinsn-experiment`, off by default, never in a
+shippable build), whose `.ttinsn` words the gate validates word by word, and which can also write
+`.ttinsn` code to L1 at run time and invalidate its own instruction cache
+(`tt_firmware::ttinsn`, which checks every word it emits)
+(`docs/plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
+for every image. Ethernet customer code runs on E1; leave E0
 and firmware-owned L1 intact. Read the operating notes before low-level changes.
 
 ttsim is a non-reentrant process-wide singleton; violations call `_Exit`.
@@ -179,3 +193,15 @@ medians (`cargo xtask bench`). Concurrent NC timestamp exports can be invalid;
 use host timing and `dataflow_stats` for streaming evidence. Update affected
 coverage/checklist entries with code, log new divergences, and record benchmark
 conditions/run IDs in the performance scoreboard/change log.
+
+<!-- scryer:start -->
+# Code Intelligence (Scryer)
+
+This repository is indexed by **Scryer** (Rust, Python, TypeScript). When exploring or about to edit code, use it instead of grep and whole-file reads, and **load the `scryer` skill (`.agents/skills/scryer/SKILL.md`) for the full playbook**.
+
+- Don't know the name → `search_symbols`. Know it, or a crate path like `tokio::sync::Mutex` → `inspect_symbol`. Know a file and line → `get_enclosing_scope` / `resolve_definition`. Want a file's shape → `get_file_outline`. About to change something → `calculate_blast_radius` + `query_adrs`.
+- Grep is still right for string literals, log and error messages, comments, environment variables, non-code files (Markdown, JSON, YAML, TOML, Dockerfiles), or when the index doesn't resolve a symbol.
+- A list marked `complete` is exhaustive over the indexed files: don't re-grep it unless a `CAVEAT` applies. A cut list says `complete: false` and the next call. An empty result with a `notes` entry means the name or path didn't match, not that nothing uses it; `INDEXING` or `STALE` means partial, so retry shortly. The index follows your edits. Lines are 1-based, columns 0-based.
+- Not seen: code behind `cfg` is indexed whether or not it compiles; trait-object and closure calls resolve by name; build-script output; languages other than Rust, Python and TypeScript. "Who calls X?" is `find_references(X)` (default `view: callers`: each caller once, with its line), not grep plus a lookup per hit. Batch where you can: `get_enclosing_scope(at: ["src/a.rs:12", ..])` takes grep hits across files (or `lines: [..]` in one file), `inspect_symbol(symbols: [..])`.
+- Antigravity / Gemini CLI: call tools through the gateway, `call_mcp_tool(ServerName: "Scryer", ToolName: "inspect_symbol", Arguments: { "symbol": "MySymbol" })`. No MCP tools at all? Use the CLI: `scryer --help`, `scryer inspect-symbol MySymbol`, `scryer get-file-outline src/main.rs`.
+<!-- scryer:end -->

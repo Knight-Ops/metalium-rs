@@ -115,6 +115,51 @@ pub fn set_status(value: u32) {
     publish();
 }
 
+/// `cfg0` (CSR `0x7c0`, `TensixTile/BabyRISCV/CSRs.md`): the baby core's chicken bits.
+const CFG0_DIS_BP: u32 = 1 << 1;
+/// `cfg0.DisTriscCache`: when clear, adjacent `.ttinsn` instructions are
+/// macro-fused into one push of up to four Tensix instructions.
+const CFG0_DIS_TRISC_CACHE: u32 = 1 << 18;
+
+/// Turn instruction gathering off on this core, as tt-metal's firmware does on
+/// every RISC (`configure_gathering`, tt-metal#16439: a `REPLAY` record window
+/// can be corrupted while its instructions are gathered).
+///
+/// Blackhole boots with gathering on. It buys nothing here: this repo's
+/// firmware pushes Tensix instructions with stores, not `.ttinsn`, and
+/// measuring a `.ttinsn` push with gathering on or off gave identical cycles
+/// (`docs/plans/ttinsn-push-experiment.md`). Off removes the hazard for free.
+///
+/// The sequence is tt-metal's: set `DisBp`, set `DisTriscCache`, clear `DisBp`,
+/// with fences. `cfg0` is then read back, and a core where the bit did not
+/// stick publishes [`panic_code::GATHERING_STILL_ON`]
+/// instead of running with an unchecked assumption.
+///
+/// Tensix baby cores only (T0, T1, T2, B, NC): the CSR is documented for them,
+/// not for the Ethernet tile's.
+pub fn disable_gathering() {
+    let cfg0: u32;
+    // SAFETY: the custom CSR the vendored `CSRs.md` lists as `cfg0`; the same
+    // sequence tt-metal runs at the start of every RISC's firmware.
+    unsafe {
+        core::arch::asm!(
+            "csrrs zero, 0x7c0, {dis_bp}",
+            "fence",
+            "csrrs zero, 0x7c0, {dis_cache}",
+            "csrrc zero, 0x7c0, {dis_bp}",
+            "fence",
+            "csrr  {cfg0}, 0x7c0",
+            dis_bp = in(reg) CFG0_DIS_BP,
+            dis_cache = in(reg) CFG0_DIS_TRISC_CACHE,
+            cfg0 = out(reg) cfg0,
+            options(nostack),
+        );
+    }
+    if cfg0 & CFG0_DIS_TRISC_CACHE == 0 {
+        fail(panic_code::GATHERING_STILL_ON);
+    }
+}
+
 /// Make prior stores visible to observers outside this core.
 ///
 /// The L0 data cache is not coherent — nothing written by the NoC, the unpackers,
@@ -198,6 +243,9 @@ fn panic(info: &PanicInfo) -> ! {
 /// Pushing Tensix instructions from a baby RISC-V core.
 pub mod corpus;
 pub mod dataflow;
+/// Run-time `.ttinsn` translation: the experiment's, behind its feature.
+#[cfg(feature = "ttinsn-experiment")]
+pub mod ttinsn;
 
 pub mod tensix {
     use tt_isa::sfpu::Instruction;

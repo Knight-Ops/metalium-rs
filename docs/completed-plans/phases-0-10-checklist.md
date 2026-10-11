@@ -1,22 +1,28 @@
 # Implementation checklist
 
+> **Archived 2026-10-10:** Phases 0-10 are closed or tracked as open items in
+> [../plans/roadmap.md](../plans/roadmap.md). This file is the phase tick-list and evidence
+> record; do not add new work here. A remaining `[ ]` below is open work only where it says
+> "(open: tracked in ../plans/roadmap.md)".
+
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
 for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
 extremum scans, hardware precision modes, accuracy results and remaining work.
-Checked integer division/remainder is disabled after a failing simulator gate.
+Checked integer division/remainder now passes `step82` on ttsim and is done in
+[hardware-coverage.md](hardware-coverage.md) (10.4); the earlier "disabled" status is superseded.
 Ordinary validation uses one card; both cards are reserved for actual mesh tests
 or device-specific investigations per the user's instruction. Historical two-card
 requirements below are superseded for ordinary validation.
 
 
-The working tick-list for [`master-roadmap.md`](master-roadmap.md). The roadmap says *why*; this says *what
+The working tick-list for [`phases-0-10-roadmap.md`](phases-0-10-roadmap.md). The roadmap says *why*; this says *what
 is done, what is next, and what must not be forgotten*.
 
 Related: [`hardware-coverage.md`](hardware-coverage.md) (Phase 10 tracker),
 [`../learnings/silicon-operating-notes.md`](../learnings/silicon-operating-notes.md) (Silicon operating notes),
 [`../learnings/tt-metal-concepts-review.md`](../learnings/tt-metal-concepts-review.md) (gaps against tt-metal, G1–G16),
-[`burn-backend-parity.md`](burn-backend-parity.md) (Burn backend roadmap, B0–B16).
+[`burn-backend-parity.md`](../plans/burn-backend-parity.md) (Burn backend roadmap, B0–B16).
 
 **Status legend:** `[x]` done and gated by a test · `[~]` partially done, see note ·
 `[ ]` not started · `[-]` deliberately not applicable here, with the reason given.
@@ -68,10 +74,10 @@ remaining work are recorded in [tensix-next-features.md](tensix-next-features.md
 | 4 — Layout | `[x]` | **Silicon gate passed on both cards** |
 | 5 — Elementwise binary | `[~]` | **FP32 silicon gate passed on both cards** after three datapath fixes (see Silicon campaign); BF16 silicon-only gate not written. Real element-wise ops are Phase 10 (S1) |
 | 6 — Matmul | `[x]` | **Multi-tile matmul, TF32 and BF16, padded shapes, on ttsim and both cards**; three roles concurrent, `Dst` handed over by semaphores; HiFi2-4 at tile level; shapes larger than one run planned and chunked |
-| 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. `burn-tt` forwards everything else to `burn-flex`, generated from the pinned traits |
+| 7 — Burn backend, training | `[x]` | **MNIST MLP trains through `burn-autodiff` with every matmul on a Tensix tile, on ttsim and both cards**; the reduced run's loss curve is bit-identical on all three. The native cutover (see [burn-native-cutover.md](../plans/burn-native-cutover.md)) later removed the Flex delegate: `burn-tt` has no Flex dependency or host fallback, and unsupported ops, shapes and dtypes fail explicitly |
 | 8 — Multi-chip | `[x]` | **MNIST trains with every matmul sharded across the two cabled cards over Ethernet, reproducing the single-chip golden bit for bit**; on ttsim also round a four-chip ring. Link map from the chips; E1 data mover; throughput is Phase 9 |
-| 9 — Performance | `[~]` | GDDR residency, multi-tile execution, resident programs, host DMA, asynchronous dispatch, fresh/traced B-reader / T0–T2 / NC-writer ownership, and generalized multi-input inference / whole training step hardware traces (`TracedInference`, `TracedTrainingStep`) implemented. Current measurements: `firmware-performance.md` and `feature-traced-execution.md`. Remaining: host submission/per-request overhead, trace L1 segmentation, reliable concurrent profiling, Ethernet pipelining and a device-resident mesh |
-| 10 — Hardware coverage | `[~]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** 10.0–10.2 complete: SFPU arithmetic/activations, softmax, int/bool storage and logic. 10.3 started: rank-N views/reductions and full F32 sum/mean; arbitrary-axis reductions, other reduction kinds, Tensix transpose and norms remain |
+| 9 — Performance | `[~]` | GDDR residency, multi-tile execution, resident programs, host DMA, asynchronous dispatch, fresh/traced B-reader / T0–T2 / NC-writer ownership, and generalized multi-input inference / whole training step hardware traces (`TracedInference`, `TracedTrainingStep`) implemented. Current measurements: `performance-log.md` and `traced-execution.md`. Remaining: host submission/per-request overhead (9.14, partly superseded by X6), trace L1 segmentation, reliable concurrent profiling, Ethernet pipelining and a concurrent/data-parallel mesh (per-chip GDDR `Session`s and mesh trace replay are delivered, 9.11) |
+| 10 — Hardware coverage | `[x]` | **Tracked in [`hardware-coverage.md`](hardware-coverage.md).** 10.0–10.6 complete as of 2026-10-10 (see "Phase 10 — Hardware coverage" below and the close-out in [`../completed-plans/hardware-coverage-closeout.md`](hardware-coverage-closeout.md)); excluded instructions and out-of-scope blocks are `[-]` there with reasons |
 
 ### Current implementation order (2026-10-04)
 
@@ -156,8 +162,11 @@ passed on ttsim for weeks; each is now fixed in the code, not worked around.
 - [x] **Silicon regression clean.** The campaign's last two failures were the
       `MOVB2D` `Move4Rows` twin (row 38, fixed); after the Phase 6 close-out the
       unfiltered run was 129/129 on each card. Later phases record their own counts.
-- [ ] **Hazard knowledge as data, for a scheduler** -- see `RUST_IMPL_PLAN.md`,
-      "Hazards as data". Today every wait is a full `STALLWAIT` chosen by hand.
+- [x] **Hazard knowledge as data, for a scheduler** -- see `phases-0-10-roadmap.md`,
+      "Hazards as data". Delivered as the `tt_isa::hazard` table and checker
+      (`crates/tt-isa/src/hazard.rs`): it found 0 missing waits over 954 builder role
+      programs, so the planner has nothing to insert (`hardware-coverage.md`, "Hazards as
+      data, the wait planner" row, closed 2026-10-10).
 
 ---
 
@@ -170,7 +179,7 @@ Set up early; retrofitting is expensive.
       hash-verified: the specification by a digest over the *contents* of the files
       the generators read, since GitHub does not promise source tarballs are
       byte-stable.
-- [ ] **Re-sync the spec quarterly.** Recent upstream commits fill in exactly the
+- [ ] *(open: tracked in ../plans/roadmap.md)* **Re-sync the spec quarterly.** Recent upstream commits fill in exactly the
       Blackhole `UNPACR`/`PACR` gaps Phase 6 depends on. Check before doing
       silicon-discovery work the docs may have obviated.
 - [x] **One newtype per coordinate space** — `NocCoord<Noc0>`, `NocCoord<Noc1>`,
@@ -206,7 +215,7 @@ Set up early; retrofitting is expensive.
 - [x] **Pre-commit hooks** (`prek.toml`) running fmt, clippy for both workspaces,
       and the generated-table check — the same things CI runs, so a push does not
       fail on something a commit could have caught.
-- [ ] **CI: silicon suite nightly, and as a merge gate to main.**
+- [ ] *(open: tracked in ../plans/roadmap.md)* **CI: silicon suite nightly, and as a merge gate to main.**
 - [x] **Forking while another test thread is inside Burn could hang a child.**
       A forked child keeps every lock as it stood; one held by a thread
       computing a `burn-flex` reference in the parent is held forever. Seen
@@ -292,7 +301,7 @@ no answer.
       `tt_isa::matrix::Banks::unpack_to_dst` requires `SrcA` to be `Empty`, so it
       cannot run between the partial unpacks of one operand; a `compile_fail`
       doctest watches it, and goes red when the rule is removed.
-- [ ] `Dst` exclusivity across the three Tensix threads. *(Phase 5–6.)*
+- [ ] *(open: tracked in ../plans/roadmap.md)* `Dst` exclusivity across the three Tensix threads. *(Phase 5–6.)*
 - [x] **`SrcA`/`SrcB` bank ownership handshake.** `tt_isa::matrix::Banks<A, B>`
       tracks each operand as `Empty` / `Filling` / `Loaded` under a lockstep
       discipline: every bank the unpacker hands over is handed back by exactly one
@@ -461,7 +470,7 @@ The operational rules, ARC coordinate invariants, popcount harvesting logic, loc
       (B/NC 2048 words, T0/T1/T2 1024); `DISABLE_RESET` reads back; releasing T0 with its
       bit clear zeroes all 1024 words, and with it set keeps all 1024 -- the documented
       behaviour, observed for the first time (open question 6, zeroing half).
-- [ ] **I-cache invalidation path.** Avoided by construction today — code is
+- [ ] *(open: tracked in ../plans/roadmap.md)* **I-cache invalidation path.** Avoided by construction today — code is
       written before reset is released, and leaving reset invalidates the cache.
       Needed the moment anything reloads a *running* core: write the 5-bit mask to
       `RISCV_IC_INVALIDATE_InvalidateAll` (bit 0=B, 1=T0, 2=T1, 3=T2, 4=NC). That
@@ -479,18 +488,18 @@ The operational rules, ARC coordinate invariants, popcount harvesting logic, loc
       anything behavioural, including whether setting the bit abolishes the
       window as `SoftReset.md:116` says. The staging API and its silicon gates
       are the remaining work.
-  - [ ] `Device::load_and_start_staged` with `SuppressZeroing` / `WaitOutZeroing`,
+  - [ ] *(open: tracked in ../plans/roadmap.md)* `Device::load_and_start_staged` with `SuppressZeroing` / `WaitOutZeroing`,
         so a caller cannot get the ordering wrong, plus the `#[cfg(feature =
         "silicon")]` pair: staged data survives release with the bit set, and is
         deterministically wiped without it.
-  - [ ] **Open:** what occupies the upper 4 KiB of a T-core's 8 KiB slow-path
+  - [ ] *(open: tracked in ../plans/roadmap.md)* **Open:** what occupies the upper 4 KiB of a T-core's 8 KiB slow-path
         window? The memory map lists two identically-labelled rows per T-core and
         the RAM is only 4 KiB. Refused by `local_data_ram_noc_window` for now;
         resolvable only on silicon.
-- [ ] **Multi-core loader mutual exclusion.** `&mut self` is sufficient within one
+- [ ] *(open: tracked in ../plans/roadmap.md)* **Multi-core loader mutual exclusion.** `&mut self` is sufficient within one
       process; the soft-reset register has no atomic bit operations, so anything
       else touching the same tile needs coordination at a higher level.
-- [ ] **Measure I-cache capacities** (open question 1). Undocumented for Blackhole;
+- [ ] *(open: tracked in ../plans/roadmap.md)* **Measure I-cache capacities** (open question 1). Undocumented for Blackhole;
       affects hot-loop sizing and whether T1 is viable for large code.
 
 ---
@@ -561,7 +570,7 @@ The operational rules, ARC coordinate invariants, popcount harvesting logic, loc
       quoted: `step5_corpus.rs` pushes one, asserts the child dies, and runs a
       control program of the same shape that survives. A silicon-side test of what
       it actually does is still open.
-- [ ] **Probe whether ttsim models the documented hardware bugs** (open question 7)
+- [ ] *(open: tracked in ../plans/roadmap.md)* **Probe whether ttsim models the documented hardware bugs** (open question 7)
       or the intended behaviour. Either answer is workable but changes what the
       simulator gate proves.
 - [x] **Gate (silicon):** the corpus and SFPU gates pass on both cards; the one
@@ -618,7 +627,7 @@ specification does not make.
       signature change, and `TileImage` sizes and places the shared-exponent section
       for BFP8/4/2. Native device pack/unpack and independent f64/integer encoding
       oracles now pass step92/94 on both cards. `tt-layout` retains only ordinary
-      host scalar conversions; see [the delivered storage contract](mixed-bfp-storage.md).
+      host scalar conversions; see [the delivered storage contract](../plans/mixed-bfp-storage.md).
 - [x] **Gate (silicon):** passed on both cards (two tests).
       **The alignment scope is narrower than the plan first assumed.**
       `WormholeB0/NoC/Alignment.md:19,23` says data travelling *from the host via
@@ -817,7 +826,7 @@ Burn's own `nn::Linear`, `CrossEntropyLoss` and `Sgd` trains on MNIST through
 reduced run's loss curve is the same 32 `f32`s on ttsim and on silicon.
 
 - [x] **Verify the `Backend` supertrait list against the pinned Burn version**
-      (0.21.0, from source): see `RUST_IMPL_PLAN.md`, "The Burn surface, as
+      (0.21.0, from source): see `phases-0-10-roadmap.md`, "The Burn surface, as
       pinned". Associated types live on `BackendTypes`; `Backend` requires only
       `name`, `seed`, `dtype_usage`, `device_count`.
 - [x] **`burn-tt` delegates to `burn-flex`, generated rather than written.**
@@ -1036,7 +1045,7 @@ projects of this shape stall.
 
       `step12_mnist::the_mlp_trains_sharded_over_two_chips_matching_the_golden`
       passes on the two cards: **the loss curve is the golden, bit for bit.**
-- [x] **Throughput, measured** -- the table is in `RUST_IMPL_PLAN.md`, Phase 8
+- [x] **Throughput, measured** -- the table is in `phases-0-10-roadmap.md`, Phase 8
       "As built": 128 KiB Tensix -> Tensix across cards in 14 us (9.4 GB/s),
       about 500x the PCIe TLB path. Integrity: 200 transfers of
       mixed size, each with fresh data and a fenced sentinel, all correct
@@ -1050,8 +1059,8 @@ projects of this shape stall.
       commands fine). It exposed a real hazard: `Device::write` does not order
       against agents other than the host. `Mover::stage` now reads back, and
       the silicon gates fence what they stage.
-- [ ] Double-buffered `TX_STAGE`/`RX_LAND`, and both links at once.
-- [ ] **Data-parallel training** (a gradient all-reduce over the links) is not
+- [ ] *(open: tracked in ../plans/roadmap.md)* Double-buffered `TX_STAGE`/`RX_LAND`, and both links at once.
+- [ ] *(open: tracked in ../plans/roadmap.md)* **Data-parallel training** (a gradient all-reduce over the links) is not
       done. It reorders sums, so it needs a weaker claim than the golden, and
       `N`-sharding already makes Ethernet load-bearing.
 
@@ -1064,7 +1073,7 @@ GDDR6; the dataset and weights are loaded into it once at startup, and a
 steady-state training step should move almost nothing over PCIe. The headline
 metric is therefore **PCIe bytes per step** (`Device::traffic`), next to ms/step.
 
-**Baseline (2026-10-02):** [`firmware-performance.md`](../learnings/firmware-performance.md) has the
+**Baseline (2026-10-02):** [`performance-log.md`](../learnings/performance-log.md) has the
 firmware's device-timed numbers from `cargo xtask bench`: GDDR6 through the
 mover, the B -> T0/T1/T2 path hop by hop, and both Ethernet links, each held
 against the spec's peak. It also ranks where the overhead is.
@@ -1204,16 +1213,20 @@ host; the reduced golden bit for bit on ttsim and both cards after every slice):
       of both buffers' last words before the transfer starts fixes it: 3 failures in 40
       runs before, 6 in 60 with only the sender's read-back, 0 in 60 with both
       (`ttsim-divergence.md` row AA). The test now prints each mismatched range too.
-- [ ] **A `BufferId` can outlive its engine** (found by review): `DramBuffers`
+- [x] **A `BufferId` can outlive its engine** (found by review; fixed since asynchronous dispatch, B8/B3): `DramBuffers`
       numbers from 1 per attach (`burn-tt/src/server.rs`), so a tensor kept across
       a detach and re-attach reads another tensor's buffer, and dropping it frees
-      one. Reproduced: `burn-tt/tests/stale_buffer.rs`, both ignored until fixed.
+      one. Reproduced by `burn-tt/tests/stale_buffer.rs`; the tests are no longer `#[ignore]`d --
+      callers now name buffers by a process-wide number never reused, so a stale tensor is
+      refused and frees nothing (the file's header says so).
       `burn-backend-parity.md` sec. 4.1, roadmap B3.
-- [ ] **The two-card full run's accuracy is 0.9195, one card's 0.9196.** The
+- [ ] *(open: tracked in ../plans/roadmap.md)* **The two-card full run's accuracy is 0.9195, one card's 0.9196.** The
       reduced sharded run matches the golden bit for bit, so something past 32
       steps diverges on the mesh. Phase 8 code; not yet investigated.
-- [ ] **The mesh is not device-resident**: GDDR tensors, per-chip resident
-      roles, and chips concurrent rather than in turn.
+- [~] **The mesh is only partly device-resident**: delivered -- per-chip `Session`s with
+      GDDR `DramTensor`s (`crates/tt-kernels/src/shard.rs`) and mesh trace capture/replay
+      (R4d, `step147_mesh_trace`). Still open: chips running concurrently rather than in
+      turn, data-parallel training, and `copy_into` on a mesh.
 - [x] **The dataset is preloaded; a batch is a view.** `float_to_device` makes
       an F32 matrix resident (`Tensor::to_device` is the caller saying so), and
       `float_slice` of whole tile rows of a resident matrix is a view of the
@@ -1345,7 +1358,7 @@ tiles, done in turn. The slices from there:
     still writes 605 KB on 1-8 tiles, rewriting each role's single program
     slot whenever consecutive blocks differ in shape, and a program change
     also ends a list (`xt@g1`, ragged at its edges, writes 74 KB).
-- [x] **L1 planning, step 1** (design: `RUST_IMPL_PLAN.md`, "L1 planning and
+- [x] **L1 planning, step 1** (design: `phases-0-10-roadmap.md`, "L1 planning and
       circular buffers"). `tt_isa::l1` maps every fixed region of a tile's L1,
       ordered and disjoint at compile time, leaving the data arena.
       `tt_kernels::l1` plans `Requirements` -- scratch and circular buffers
@@ -1418,14 +1431,17 @@ tiles, done in turn. The slices from there:
     `SIGNAL` / `WAIT_PEER` handshake was removed 2026-10-03 for credits in a
     shared packet.
   - Card reads 127 -> 469 GB/s, NoC #1 writes 52 -> 378.
-  - Details in `firmware-performance.md`.
+  - Details in `performance-log.md`.
 - [~] **Performance backlog** (historical order from an independent review, 2026-10-02, checked
       against the measurements above):
-  - [ ] **9.13 Role `START` traced before the role's setup.**
+  - [ ] *(open: tracked in ../plans/roadmap.md)* **9.13 Role `START` traced before the role's setup.**
     - Today the descriptor and config work happens before `START`, so the push
-      timings in `firmware-performance.md` leave part of the launch out.
-  - [ ] **9.14 Per-request cost.**
-    - A mover entry costs ~350 cycles whatever its size (`firmware-performance.md`,
+      timings in `performance-log.md` leave part of the launch out.
+  - [ ] *(open: tracked in ../plans/roadmap.md)* **9.14 Per-request cost.** *(Partly superseded by X6, `step118_mover_fast_path`: the
+    NIU fast path keeps registers between requests but gains only 3-4%; the cost is the
+    request round trip, so the remaining lever is more requests in flight, not cheaper issue.
+    The GATHER/SCATTER-direct and multicast-list ideas below stay open.)*
+    - A mover entry costs ~350 cycles whatever its size (`performance-log.md`,
       "GDDR6 through the data mover"), and a GATHER record expands into one
       ~4 KiB read per tile, so gathers live in that regime.
     - First, show that the NIU's initiator registers keep their values between
@@ -1441,7 +1457,7 @@ tiles, done in turn. The slices from there:
       and traced. The legacy wave, B-only pipeline and two-host-queue NC
       schedulers below are historical and removed. `enable_dram(b,nc)` requires
       both images; pipelining off still uses NC. See
-      `feature-streaming-dataflow-ownership.md` for the current contract.
+      [streaming architecture](../learnings/streaming-dataflow-architecture.md) for the current contract.
     - [x] GDDR matmuls: `LAUNCH` / `KERNEL_WAIT`, blocks in two halves of the
       arena, on by default where `tensor::pipelining_pays` (`step54_pipeline`,
       `stress_pipeline`).
@@ -1481,7 +1497,7 @@ tiles, done in turn. The slices from there:
       tiles 28.8 -> 11.2 us an op, 32 tiles 51.4 -> 11.5); neutral on
       device-bound shapes; 5% slower on one tile, where captures lost
       pipelining at that measurement. Fresh and traced streaming now share
-      their schedule (`feature-traced-pipelining.md`). Device-resident Burn
+      their schedule (`traced-execution.md`). Device-resident Burn
       replay inputs remain a follow-up; `Trace::run` still writes its input.
     - [x] Host<->card copies: uncached under this VM (80 MB/s writes, 28
       reads; `ttsim-divergence.md` row M). Now around it: the card moves
@@ -1505,7 +1521,7 @@ tiles, done in turn. The slices from there:
     - Every launch streams its program words through RISC-V stores.
     - Measure the instruction-heavy kernels (SFPU `exp`: roles 87% busy) before
       rewriting the push loop.
-  - [ ] **Ethernet pipelining, a separate track.**
+  - [ ] *(open: tracked in ../plans/roadmap.md)* **Ethernet pipelining, a separate track.**
     - E1 gathers, sends, lands and forwards one transfer at a time, with one
       staging and one landing buffer, and the host blocks on each ack (800G at
       26%).
@@ -1517,29 +1533,35 @@ tiles, done in turn. The slices from there:
 - [~] **9.8 Overlap.** The runtime is implemented as fixed streaming
       ownership (9.15), with depth-one/two batch credits and resident roles,
       for fresh and traced work. Backend state still retires between batches;
-      a hazard-driven wait planner and retuning the old overlap thresholds
-      remain open. See `feature-streaming-dataflow-ownership.md`.
+      retuning the old overlap thresholds remains open (the hazard-driven wait
+      planner has nothing to insert: `tt_isa::hazard` found 0 missing waits, see the
+      cross-cutting item above). See [streaming architecture](../learnings/streaming-dataflow-architecture.md).
 - [-] **9.9 Element-wise on the SFPU** -- moved to Phase 10 and done (S1, 10.0).
 - [x] **9.10 Faster start-up.** Host DMA, parallel host tilize/detilize and
       run-record batching are implemented and gated (`step57_host_dma`).
       Mover tilize/untilize is also gated (`step58_tile_layout`) but is
       slower at the measured sizes; host tilize remains the default.
       Tensix tilize and DMA directly from caller memory are follow-ups.
-- [ ] **9.11 The mesh, device-resident.** Per-chip `Session`s with GDDR and
-      resident roles, chips running concurrently, the Ethernet movers moving
-      tiles between GDDR rather than host-staged operands; data-parallel
-      training over the two cards. First find why the full two-card run's
-      accuracy is 0.9195 against one card's 0.9196.
+- [~] **9.11 The mesh, device-resident.** Delivered: per-chip `Session`s with GDDR
+      `DramTensor`s (`crates/tt-kernels/src/shard.rs`) and mesh trace capture/replay
+      (`step147_mesh_trace`, R4d). Open: chips running concurrently, the Ethernet movers
+      moving tiles between GDDR rather than host-staged operands, data-parallel
+      training over the two cards, and `copy_into` on a mesh. First find why the full
+      two-card run's accuracy is 0.9195 against one card's 0.9196.
 - [-] **9.12 Loss on the device** -- moved to Phase 10 (R2, milestone 10.1).
 
 - [x] A `Device` write fence as API, rather than read-backs at call sites (`write_fenced` family, step119; `Mover::stage` and the Ethernet test sites migrated)
       (Phase 8: posted writes race other agents).
 - [-] `MOP`/`REPLAY` expansion -- moved to Phase 10 (`hardware-coverage.md` X1, X2).
-- [ ] NoC multicast for operands many tiles share (matmul `in0`/`in1`).
+- [~] NoC multicast for operands many tiles share (matmul `in0`/`in1`). The primitive is done
+      and silicon-gated (`crates/tt-isa/src/noc/multicast.rs`, `step115_noc_multicast`;
+      `hardware-coverage.md`, NoC multicast row `[x]`); open only: no `tt-kernels` op uses it yet.
 - [-] `.ttinsn` fusion (closed 2026-10-10, P9): `.ttinsn` is a firmware-image immediate and the runner pushes L1 data, so fusion needs a run-time code generator outside the build-time instruction gate. Up to four adjacent pushes per cycle, originally: Deferred from the
       baseline because fused words disassemble as garbage and the instruction-set
       gate would have to stop rejecting undecodable instructions.
-- [ ] `L1CacheTagSearchAccel` — Blackhole-only, RISCV B only.
+- [-] `L1CacheTagSearchAccel` — Blackhole-only, RISCV B only. Not adopted: on card 0 every armed trigger
+      load hangs the core and the block stays armed across resets (`hardware-coverage.md`, row `[-]`,
+      `tt_isa::tag_search`, step120).
 
 ---
 
@@ -1548,7 +1570,7 @@ tiles, done in turn. The slices from there:
 **Tracked in [`hardware-coverage.md`](hardware-coverage.md)**, not here: the inventory of
 every Tensix unit and what drives it, the work items (F foundation, S SFPU, M Matrix Unit,
 R reductions, D formats and data movement), milestones 10.0–10.6, and the Burn op coverage
-table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
+table. Ticks happen there. The rationale is `phases-0-10-roadmap.md`, "Phase 10".
 
 - [x] **10.0** Device profiler; SFPU foundation; today's element-wise ops on the SFPU (was 9.9). Branch `phase10-0-sfpu-foundation`; full silicon suite 381/386 on both cards, the five being two since-fixed `step23` assertions and the pre-existing Ethernet flake above.
 - [x] **10.1** Softmax and cross-entropy on the device (was 9.12); `MOP`; op-list traces. Branch `phase10-1-softmax`; softmax and log-softmax on the device, cross-entropy moved to 10.5 with D4 (`float_gather`); `MOP` gated and measured (no gain on the replayed matmul); traces with their footguns refused; wedged tiles detected and recovered. At the close: ttsim 571, silicon 448/448 on both cards, smoke 42/42, MNIST golden 5/5, 91.96% on both cards (2.0 / 1.6 ms a step, 1 / 4 tiles).
@@ -1556,7 +1578,7 @@ table. Ticks happen there. The rationale is `RUST_IMPL_PLAN.md`, "Phase 10".
 - [x] **10.3** Native general reductions/scans, pooling and norms landed; the payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack (M3 `[-]`).
 - [x] **10.4** BF16 and FP16 storage and casts, BF16 compute, I32 ALU/casts, checked division/remainder and integer scans/masks landed; see hardware coverage.
 - [x] **10.5** Resident indexing (including ND gather/scatter), convolution/attention, gradients and mesh trace replay landed.
-- [x] **10.6** M1 `ELW*`, BFP8/4/2 storage, native seeded random (S7), `SFPLOADMACRO` (S9) and `SHIFTXB` (M4) landed; `DOTPV` and `SHIFTXA` are excluded. D2 is complete only for delivered formats. See [mixed BFP storage](mixed-bfp-storage.md).
+- [x] **10.6** M1 `ELW*`, BFP8/4/2 storage, native seeded random (S7), `SFPLOADMACRO` (S9) and `SHIFTXB` (M4) landed; `DOTPV` and `SHIFTXA` are excluded. D2 is complete only for delivered formats. See [mixed BFP storage](../plans/mixed-bfp-storage.md).
 
 ---
 
@@ -1568,25 +1590,33 @@ against ttsim and silicon before it can be trusted. Each finding becomes a
 permanent test case — that suite is the project's real asset, because it is what
 lets you trust Wormhole-sourced behaviour at all.
 
-**Packers** — [ ] all 10 sub-pages · [ ] `PACR_SETREG` · [ ] `CLREXPHIST`
+*(The `[ ]` entries in this backlog are open: tracked in ../plans/roadmap.md, device-side backlog.)*
+
+**Packers** — [ ] all 10 sub-pages · [-] `PACR_SETREG` (no Blackhole page, ttsim refuses it, step108; `hardware-coverage.md` `[-]`) ·
+[x] `CLREXPHIST` (step93, both cards)
 
 **Unpackers** — [ ] `README` · [ ] `FormatConversion` · [ ] `FlushCache` ·
-[ ] `IncrementContextCounter` · [ ] most `UNPACR_NOP_*`
+[ ] `IncrementContextCounter` · [x] `UNPACR_NOP_*` (`UNPACR_NOP_SETDVALID` and `UNPACR_NOP_ZEROSRC` `[x]`,
+`UNPACR_NOP_SETREG` `[-]`; `hardware-coverage.md`, step103/108)
 
 **State** — [ ] `RWCs` (three Blackhole pages link to it) ·
-[ ] `SrcASrcB` **including fidelity phases** (not even linked from Blackhole) ·
-[ ] `ZEROACC` · [ ] `ZEROSRC` · [ ] `SETRWC`/`INCRWC`/`GATESRCRST` ·
-[ ] all 8 ADC-manipulation instructions
+[ ] `SrcASrcB` **including fidelity phases** (not even linked from Blackhole; the `MVMUL` fidelity
+phases `Lo`..`HiFi4` themselves are done on both cards, `hardware-coverage.md` matrix table) ·
+[x] `ZEROACC` · [x] `ZEROSRC` (step103, card 0) · [x] `SETRWC`/`INCRWC` · [-] `GATESRCRST` (no
+observable oracle, `hardware-coverage.md`) ·
+[x] all 8 ADC-manipulation instructions (`SETADC`, `SETADCXX/XY/ZW`, `INCADCXY/ZW`, `ADDRCRXY/ZW`; step98/99)
 
 **Numerics** — [ ] `FloatBitPatterns` (highest-value missing numerics doc)
 
-**Compute** — [ ] `SHIFTXA`/`SHIFTXB`/`TRNSPSRCB` · [ ] `GAPOOL`/`DOTPV`
+**Compute** — [-] `SHIFTXA` (pinned page calls it unsupported) · [x] `SHIFTXB` (step103, card 0) ·
+[x] `TRNSPSRCB` (step87, both cards) · [x] `GAPOOL` (step75, both cards) · [-] `DOTPV` (redundant with
+`MVMUL`; encoding probes retained)
 
 **Frontend** — [ ] `WaitGate` (a silent gap; seven BH pages reason about its
 semantics) · [x] `REPLAY` (`step26_sfpu_isa`: SFPU row loops replayed match their unrolled form on ttsim and both cards) · [x] `MOP`/`MOP_CFG` (`step36_mop`: both templates against the page's model, configuration from the role mailbox, ttsim and both cards; generator marks them `CONFIRMED`)
 
-**Units** — [ ] the entire Scalar Unit (ThCon) · [ ] Mover (`XMOV`) ·
-[ ] Miscellaneous Unit
+**Units** — [x] the Scalar Unit (ThCon) (`SETDMAREG`..`BITWOPDMAREG`, atomics, step100/101/106; `FLUSHDMA` `[-]`) ·
+[x] Mover (`XMOV`, step101/102) · [ ] Miscellaneous Unit
 
 **Closed by Phase 1's silicon gate** — [x] NoC coordinate translation is **on**
 (`NOC_TRANSLATION` = 1, both cards), so host-facing TLB coordinates are translated space,
@@ -1608,27 +1638,27 @@ Documented, not speculative. These bite in Phases 2–4.
       with a consuming ALU instruction.
 - [x] **#3 Auto TTSync does not cover push-then-load.** Sidestepped: the `Dst` read
       path uses Manual TTSync, which Auto TTSync does not cover either way.
-- [ ] **#1 Interrupt handlers cannot write CSRs.** Kills the usual
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#1 Interrupt handlers cannot write CSRs.** Kills the usual
       save/restore-`fcsr` ISR pattern. Interrupts exist only on B and NC.
-- [ ] **#4 `pmacfg0`/`pmacfg1` range selection is broken** — always selects the
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#4 `pmacfg0`/`pmacfg1` range selection is broken** — always selects the
       entire address space. Only usable as a global "every load/store behaves as if
       preceded by `fence`" debug switch.
-- [ ] **#5 `intp_restore_pc` is only a copy** — writing it does not change the
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#5 `intp_restore_pc` is only a copy** — writing it does not change the
       `mret` target. With #1, you cannot redirect an interrupt return.
-- [ ] **#6 Operand-forwarding starvation hang.** If two unretired instructions both
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#6 Operand-forwarding starvation hang.** If two unretired instructions both
       write the same register, forwarding happens from neither, and a specific
       sequence hangs forever. Replacing an `addi` with a `nop` flips a working
       example into a permanent hang.
-- [ ] **#7 L0 data cache is not coherent.** Nothing written by the NoC, unpackers,
+- [x] **#7 L0 data cache is not coherent.** *(Handled in code: firmware L1 polls fence, e.g. `crates/tt-firmware/src/dataflow.rs` `Poll`, and the 9.7a mover/role ACK polls above.)* Nothing written by the NoC, unpackers,
       packers, or another baby invalidates it. Polling loops over L1 **must**
       contain a `fence` or use an atomic. Hits also carry a ~0.8% random
       full-flush chance unless `cfg0.DisLowCachePeriodicFlush` is set.
-- [ ] **#8 Store-then-load with non-overlapping byte ranges** has no ordering
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#8 Store-then-load with non-overlapping byte ranges** has no ordering
       guarantee in either direction.
-- [ ] **#9 T0/T1/T2 storing to `INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` hangs the
-      RISCV.** A stray pointer is an unrecoverable lockup, not a fault. *(See the
+- [x] **#9 T0/T1/T2 storing to `INSTRN1_BUF_BASE`/`INSTRN2_BUF_BASE` hangs the
+      RISCV.** *(Handled by the type-level `PushesTo<Th>` guard, `tt_isa::tensix`.)* A stray pointer is an unrecoverable lockup, not a fault. *(See the
       hazard-encoding list above.)*
-- [ ] **#10 Configuration Unit cross-thread starvation.** Ordering is enforced
+- [ ] *(open: tracked in ../plans/roadmap.md)* **#10 Configuration Unit cross-thread starvation.** Ordering is enforced
       across all threads regardless of issuer; heavy `WRCFG` use by one thread
       starves RISC-V read/write requests from others.
 
@@ -1647,30 +1677,32 @@ Documented, not speculative. These bite in Phases 2–4.
       Blackhole's `SFPPOPC.md` says in a tip that Blackhole fixed the bug and in its
       summary that the complex modes still must not be used on a full stack; the
       builder follows the summary.
-- [ ] `SFPSTOCHRND` — stochastic rounding is biased toward increasing magnitude,
+- [x] `SFPSTOCHRND` *(checked modes gated in `step81_hardware_rounding`; `hardware-coverage.md` S6)* — stochastic rounding is biased toward increasing magnitude,
       and the new-in-Blackhole round-toward-zero mode sometimes rounds *away* from
       zero. **The functional models in the docs faithfully reproduce the buggy
       behaviour — match them, don't "fix" them.** *(Phase 10: S6.)*
-- [ ] `SFPCAST_IntAbs` — the bug makes it compute absolute value; use `SFPABS`. *(Phase 10: S5, S6.)*
-- [ ] `CLEARDVALID` — reset is unsafe and drops `SrcA`/`SrcB` banks
+- [x] `SFPCAST_IntAbs` — the bug makes it compute absolute value; use `SFPABS`. *(Phase 10: S5, S6.)* Designed out: only `_IntFloat` (`Mod1` 0) is exposed (`crates/tt-kernels/src/sfpu/mod.rs`, interpreter refuses other modes).
+- [x] `CLEARDVALID` — reset is unsafe and drops `SrcA`/`SrcB` banks
       ([tt-metal#22383](https://github.com/tenstorrent/tt-metal/issues/22383)).
-- [ ] `STREAMWRCFG` — later Configuration Unit instructions from the same thread
-      can reorder ahead of a pending one.
-- [ ] `SETC16` — scheduling restrictions on `CFG_STATE_ID_StateID` work around Auto
-      TTSync bugs.
+      The checked helper excludes `Reset` (`crates/tt-isa/src/matrix.rs`, module docs).
+- [-] `STREAMWRCFG` — later Configuration Unit instructions from the same thread
+      can reorder ahead of a pending one. Excluded: no Blackhole overlay register map is pinned
+      (`hardware-coverage.md` `[-]`).
+- [x] `SETC16` — scheduling restrictions on `CFG_STATE_ID_StateID` work around Auto
+      TTSync bugs. Direct 16-bit configuration writes are done (`hardware-coverage.md` `[x]`; used with the interpreter oracle, F5).
 
 ---
 
 ## Open questions
 
-- [ ] **1.** Blackhole I-cache capacities are undocumented. Measure in Phase 2.
-- [ ] **2.** Blackhole debug-interface parity is unverified — the four `RISC_DBG_*`
+- [ ] *(open: tracked in ../plans/roadmap.md)* **1.** Blackhole I-cache capacities are undocumented. Measure in Phase 2.
+- [-] **2.** Moved out of scope (`hardware-coverage.md`, "Out of scope": no GDB stub). Blackhole debug-interface parity is unverified — the four `RISC_DBG_*`
       registers are named at Wormhole's base but no Blackhole bit layouts exist.
       Prototype against silicon before committing to a GDB-stub architecture.
 - [x] **3.** Does `burn-fusion` compose with a hand-written backend? **Yes** --
-      see Phase 7 and `RUST_IMPL_PLAN.md`, "The Burn surface, as pinned".
+      see Phase 7 and `phases-0-10-roadmap.md`, "The Burn surface, as pinned".
 - [x] **4.** Is the NoC Overlay required for multi-chip? **No.** TT-link L1 writes carry the data (Phase 8).
-- [ ] **5.** PCIe DMA engines have no register-level documentation anywhere in the
+- [-] **5.** Moved out of scope (`hardware-coverage.md`, "Out of scope"); host DMA via pinned memory exists instead (`step57_host_dma`). PCIe DMA engines have no register-level documentation anywhere in the
       repo. Plan on TLB-window MMIO for bulk transfer; revisit only if bandwidth
       demands it, and expect driver-source reverse engineering.
 - [~] **6.** How faithfully does ttsim model reset sequencing, I-cache invalidation,
@@ -1678,7 +1710,7 @@ Documented, not speculative. These bite in Phases 2–4.
       silicon behaves as documented (`silicon_local_ram`). Reset sequencing is closed
       on silicon (Phase 2); ttsim models only the RISC-V reset bits (rows 16, 18).
       I-cache invalidation is still avoided by construction (Phase 2).
-- [ ] **7.** Does ttsim model the documented hardware bugs, or the intended
+- [ ] *(open: tracked in ../plans/roadmap.md)* **7.** Does ttsim model the documented hardware bugs, or the intended
       behaviour? Probe with targeted tests in Phase 3.
 - [x] **9.** *(Resolved for the formats this phase needs.)* **The 4-bit
       `InDataFormat`/`OutDataFormat` codes are undocumented** — absent from the

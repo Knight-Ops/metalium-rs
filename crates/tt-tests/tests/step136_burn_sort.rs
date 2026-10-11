@@ -1118,7 +1118,7 @@ mod long_axes {
                     .collect();
                 let (want_v, want_i) = reference(Elem::F32, &lane, false);
                 // The F32 -> BF16 narrowing flushes BF16 subnormals to signed zero
-                // (`docs/plans/hardware-coverage.md`, 2026-10-05): the sorted F32
+                // (`docs/completed-plans/hardware-coverage.md`, 2026-10-05): the sorted F32
                 // values, flushed, are what comes back.
                 let want_v: Vec<u32> = want_v
                     .into_iter()

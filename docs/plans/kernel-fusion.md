@@ -2,7 +2,7 @@
 
 This plan defines the concrete specification, architecture, and verification checklists for implementing kernel fusion in `burn-tt` using Burn's `burn-fusion` framework and native Tensix execution in `tt-kernels`.
 
-It tracks milestones **B12** and **B13a–B13c** from [`docs/plans/burn-backend-parity.md`](burn-backend-parity.md).
+It tracks milestones **B12** and **B13a–B13c** from [`burn-backend-parity.md`](burn-backend-parity.md).
 
 Current BFP contract (2026-10-06): `StorageBackend` also supports
 `Fusion<TtBackend>`. Explicit casts resolve pending work and register a new
@@ -56,14 +56,22 @@ flowchart TD
   - `type Handle = TtHandle;`
   - Implement the 8 primitive-to-handle conversions (`float_tensor_into_handle`, `handle_into_float_tensor`, `int_tensor_into_handle`, etc.).
   - Implement tensor cloning and handle management.
-- **Verification Gate**:
-  - `burn-router` with `(TtBackend, Flex)` passes delegation tests.
+- **Status (2026-10-10)**: `BackendIr` is implemented (`crates/burn-tt/src/tensor.rs`).
+  The router/remote gate below has never been run: neither `burn-router` nor `burn-remote`
+  is a dependency of any workspace crate.
+- **Verification Gate** (not yet run):
+  - `burn-router` with `(TtBackend, Flex)` passes delegation tests. Flex is a test-only
+    comparison backend (`tt-tests`), never a `burn-tt` dependency.
 
 ---
 
 ### Milestone B13a: `FusionBackend` Baseline (Zero Fusers)
 **Objective**: Integrate the `burn-fusion` runtime pipeline with eager fallback, proving client-server thread safety and zero regressions before enabling pattern matching.
 
+- **Status (2026-10-10)**: delivered as specified, then extended: `TtFusionRuntime::fusers`
+  now returns one MVP fuser (`ElementWiseFuser`, `ADD_RELU` and `RELU`; see B13b), so "zero
+  fusers" below is the original baseline, not today's behavior. The `Tt = Fusion<TtBackend>`
+  alias and default-on `fusion` feature exist (`crates/burn-tt/src/lib.rs`).
 - **Dependencies**: B12.
 - **Components Modified**: `crates/burn-tt/Cargo.toml`, `crates/burn-tt/src/lib.rs`, new `crates/burn-tt/src/fusion/mod.rs`.
 - **Cargo Feature**:
@@ -99,6 +107,11 @@ flowchart TD
 **Objective**: Eliminate combinatorial recipe explosion ($A+B=AB$, $A+B+C=ABC$) by building a generalized SFPU micro-op bytecode engine that fuses arbitrary pointwise DAGs into a single Tensix execution pass over L1 tiles.
 
 - **Dependencies**: B13a, [`tt_kernels::sfpu`](../learnings/kernel-fusion-architecture.md).
+- **Status (2026-10-10)**: only an MVP exists: `ElementWiseFuser` (`crates/burn-tt/src/fusion/eltwise.rs`)
+  recognises `add` followed by Burn's lowered ReLU (`lower_equal_elem(0.0)` + `mask_fill(0.0)`) as
+  one `ADD_RELU` SFPU dispatch, and a lone ReLU as one `RELU` dispatch. The micro-op bytecode
+  engine, register allocator and the fusible-operation list below are not built (Phase 2
+  checklist, unchecked items).
 - **The Combinatorial Trap vs. Micro-Op Bytecode**:
   - Rather than hardcoding distinct hardware opcodes (`ADD_RELU`, `ADD_GELU`, `MUL_ADD_SIGMOID`), `tt-kernels` defines a **generic parameterized SFPU kernel** driven by a compact micro-op sequence passed in the program descriptor.
   - Bytecode operations operate across the 8 local SFPU vector registers (`L0..L7`):
@@ -130,14 +143,14 @@ flowchart TD
 - **Verification Gate**:
   - Mathematical parity: bit-identical output compared to eager execution for arbitrary test DAGs.
   - Device traffic: `device_traffic().submissions` reduced by factor of $N$ (where $N$ is chain length).
-  - Silicon validation on both cards.
+  - Silicon validation on one card.
 
 ---
 
 ### Milestone B13c: Matmul Epilogue Fuser (Unified FPU + SFPU)
 **Objective**: Fuse Matrix Multiplication with Bias Addition and Activation functions into a single pass through Tensix `Dst` registers, sharing the exact same SFPU micro-op engine.
 
-- **Dependencies**: B13b, [`tt_kernels::matmul`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/matmul.rs).
+- **Dependencies**: B13b, [`tt_kernels::matmul`](../../crates/tt-kernels/src/matmul.rs).
 - **Fusible Pattern**:
   $$\text{Output} = \text{Activation}(\text{Matmul}(A, B) + \text{Bias})$$
   - Supported Activations: `ReLU`, `GELU`, `SiLU`, `None`.

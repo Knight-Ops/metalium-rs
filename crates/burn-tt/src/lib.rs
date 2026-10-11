@@ -7,26 +7,39 @@
 //! traits generate native dispatch and unsupported implementations
 //! (`cargo xtask gen-burn-ops`). [`report`] records execution and transfers.
 //!
-//! **Devices.** A [`TtDevice`] names a chip; the hardware behind it is owned by
-//! a server thread started with [`attach`], which runs a caller-supplied
-//! [`Engine`] factory *on* that thread. That is what lets the simulator -- a
-//! `!Send` process-wide singleton -- serve a backend whose tensors must be
-//! `Send + Sync`: it is created where it lives and never moves. [`kmd_engine`]
-//! is the silicon engine; the simulator engine lives in `tt-tests`, so nothing
-//! here depends on the simulator.
+//! **Devices.** A [`TtDevice`] names a chip, and needs no set-up: the first op
+//! that needs it opens `/dev/tenstorrent/{chip}` (see [`registry`](crate::TtConfig):
+//! [`init`] does it eagerly and returns the error, [`detach`] gives the card
+//! back). The hardware behind a device is owned by a server thread that runs an
+//! [`Engine`] factory *on* it. That is what lets the simulator -- a `!Send`
+//! process-wide singleton -- serve a backend whose tensors must be `Send +
+//! Sync`: it is created where it lives and never moves. [`set_default_engine`]
+//! chooses what a device nobody attached opens, and [`attach`] attaches a
+//! factory explicitly for the life of a guard; the simulator engine lives in
+//! `tt-tests`, so nothing here depends on the simulator. A card has one owner:
+//! a second session on it, in this process or another, is
+//! [`TtError::CardBusy`].
 //!
-//! **Errors.** Burn's ops return tensors, not results, so a device op on a
-//! device nobody attached **panics** at once, and a device run that fails
-//! panics at the next wait for a result (device ops are dispatched without
-//! waiting, `server::submit`), naming the op and the engine's error. The device
-//! path is never silently replaced by the host one.
+//! **Errors.** Failures are a [`TtError`]. Burn's ops return tensors, not
+//! results, so a device op that fails does not stop the caller: device ops are
+//! dispatched without waiting (`server::submit`), and the failure, naming the op
+//! and the engine's error, is returned where a result is next waited for --
+//! `try_into_data` and `Backend::sync` give `Err(ExecutionError)`, `into_data`
+//! panics (Burn's own `expect`). The first failure on an attachment is reported
+//! by every later wait; an engine that panics reports that panic the same way.
+//! Strict mode ([`set_strict`], [`strictly`]) panics at the failing wait instead.
+//! Ops that have no `Result` to defer to (a host-staged matmul or reduction) and
+//! an op on a device nobody attached panic at once. The device path is never
+//! silently replaced by the host one.
 
+mod error;
 #[cfg(feature = "fusion")]
 pub mod fusion;
 mod generated;
 mod host;
 mod ops;
 mod random;
+mod registry;
 mod report;
 mod server;
 pub mod storage;
@@ -37,14 +50,15 @@ mod traffic;
 mod unsupported;
 mod views;
 
+pub use error::TtError;
 pub use random::Draw;
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,
 };
 pub use server::{
-    attach, device_traffic, kmd_engine, kmd_mesh_engine, mesh_execution, AttachGuard, BufferId,
-    DramBuffers, Elem, Engine, EngineError, GenericTraceRun, InputPayload, KmdEngine, MeshEngine,
-    OutputKind, OutputPayload, PowArg, Serve, SortedBuffers, TraceRun,
+    attach, device_traffic, mesh_execution, AttachGuard, BufferId, DramBuffers, Elem, Engine,
+    GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload, PowArg, Serve,
+    SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;
@@ -60,7 +74,11 @@ pub use fusion::{
 #[cfg(not(feature = "fusion"))]
 pub type Tt = TtBackend;
 
-pub use topology::{attach_topology, parse_tiles, tiles_from_env, Topology};
+pub use registry::{
+    attach_with, detach, init, refuse_default_engine, reset_default_engine, set_default_engine,
+    EngineFactory, TtConfig,
+};
+pub use topology::{parse_tiles, tiles_from_env, Topology};
 pub use traffic::{
     device_time, record_transfers, take_transfers, tensor_traffic, Direction, TensorTraffic,
     Transfer,
@@ -69,7 +87,9 @@ pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 pub use tt_kernels::tensor::{Block, BlockMove};
 
-use burn_backend::{Backend, BackendTypes, DType, DTypeUsage, DTypeUsageSet, DeviceId, DeviceOps};
+use burn_backend::{
+    Backend, BackendTypes, DType, DTypeUsage, DTypeUsageSet, DeviceId, DeviceOps, ExecutionError,
+};
 
 /// The Burn backend. All state lives behind [`TtDevice`]s; the type itself is a
 /// marker, as Burn requires.
@@ -99,7 +119,7 @@ impl TtDevice {
     /// # Panics
     ///
     /// If the device is not attached.
-    pub fn set_math_mode(&self, mode: MathMode) -> Result<(), EngineError> {
+    pub fn set_math_mode(&self, mode: MathMode) -> Result<(), TtError> {
         server::run(*self, move |engine, _| engine.set_math_mode(mode))
     }
 
@@ -151,8 +171,30 @@ impl Backend for TtBackend {
         crate::random::seed(*device, seed)
     }
 
-    fn device_count(_type_id: u16) -> usize {
-        server::attached_count()
+    /// The `/dev/tenstorrent/{n}` nodes, and the devices attached some other
+    /// way ([`TtDevice::enumerate`]); nothing is opened to count them.
+    fn device_count(type_id: u16) -> usize {
+        // Every device is type 0 (`Device::to_id`).
+        if type_id == 0 {
+            TtDevice::enumerate().len()
+        } else {
+            0
+        }
+    }
+
+    /// A barrier: every op sent to the device so far has run, and the
+    /// first one that failed (or the server's panic) is the error -- the
+    /// "any error since the last sync" `try_into_data` documents. Strict mode
+    /// panics instead. A device nothing is attached to has nothing to wait
+    /// for.
+    fn sync(device: &Self::Device) -> Result<(), ExecutionError> {
+        match server::try_sync(*device) {
+            Ok(()) => Ok(()),
+            Err(e) if report::strict_here() => panic!("{e}"),
+            Err(e) => Err(ExecutionError::WithContext {
+                reason: e.to_string(),
+            }),
+        }
     }
 
     fn dtype_usage(_device: &Self::Device, dtype: DType) -> DTypeUsageSet {
@@ -167,8 +209,5 @@ impl Backend for TtBackend {
     }
 }
 
-pub use server::kmd_engine_with_elementwise;
 pub use tt_kernels::matrix_eltwise::{ElementwiseMode, SrcPrecision};
 pub use tt_kernels::sfpu::approx::MathMode;
-
-pub use topology::attach_topology_with_elementwise;

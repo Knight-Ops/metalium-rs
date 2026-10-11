@@ -29,7 +29,7 @@ use burn::tensor::activation;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{DType, ElementConversion, FloatDType, Int, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
-use burn_tt::{attach_topology, Fidelity, SrcRoute, Topology, TtBackend, TtDevice};
+use burn_tt::{detach, Topology, TtBackend, TtConfig, TtDevice};
 
 const PIXELS: usize = 28 * 28;
 const CLASSES: usize = 10;
@@ -976,21 +976,10 @@ fn main() {
     );
 
     let device = TtDevice::new(0);
-    let guard = match attach_topology(
-        device,
-        a.topology.clone(),
-        SrcRoute::Tf32FromFp32,
-        Fidelity::HiFi4,
-    ) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("could not open the card: {e}");
-            eprintln!(
-                "(is the tenstorrent kernel driver loaded, and /dev/tenstorrent/* readable?)"
-            );
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = burn_tt::init(device, TtConfig::default().topology(a.topology.clone())) {
+        eprintln!("could not open the card: {e}");
+        std::process::exit(1);
+    }
     if a.infer {
         println!(
             "inference only, batch {}, {} passes over the test set:",
@@ -1005,7 +994,7 @@ fn main() {
             infer::<TtBackend>(&test_split, &init, a.batch, a.passes, &device)
         };
         let moved = burn_tt::tensor_traffic() - before;
-        drop(guard);
+        let _ = detach(device);
         println!("\non the card:");
         print_infer(&r, a.batch);
         print_calls(&r.calls, r.first + r.rest, r.batches, "batch");
@@ -1065,7 +1054,7 @@ fn main() {
         )
     };
     let moved = burn_tt::tensor_traffic() - before;
-    drop(guard);
+    let _ = detach(device);
 
     let per = |d: Duration| d.as_secs_f64() * 1e3 / card.steps.max(1) as f64;
     println!();
@@ -1162,18 +1151,10 @@ fn transformer_benchmark(a: &Args) {
     );
     let weights = tf::init(59);
     let device = TtDevice::new(0);
-    let guard = match attach_topology(
-        device,
-        a.topology.clone(),
-        SrcRoute::Tf32FromFp32,
-        Fidelity::HiFi4,
-    ) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("could not open the card: {e}");
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = burn_tt::init(device, TtConfig::default().topology(a.topology.clone())) {
+        eprintln!("could not open the card: {e}");
+        std::process::exit(1);
+    }
     let before = burn_tt::tensor_traffic();
     let calls = burn_tt::device_time();
     let (card, report) = if a.train_trace {
@@ -1186,7 +1167,7 @@ fn transformer_benchmark(a: &Args) {
     };
     let card_wall: Duration = card.times.iter().sum();
     let moved = burn_tt::tensor_traffic() - before;
-    drop(guard);
+    let _ = detach(device);
     let host = tf::train::<Autodiff<Flex>>(&weights, steps, &FlexDevice);
 
     let ms = |d: Option<Duration>| d.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);

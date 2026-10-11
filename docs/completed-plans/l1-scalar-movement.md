@@ -176,7 +176,7 @@ for mover completion; that bit number is wrong for Blackhole.
      and dataflow_stats. Compare local transfer time separately from full GDDR
      end-to-end time against existing B-core/native repack paths; include small,
      large and ragged copies and actual staging/launch/drain costs.
-   - [x] Record conditions/run IDs in firmware-performance.md. Adopt automatic
+   - [x] Record conditions/run IDs in performance-log.md. Adopt automatic
      routing only for measured beneficial cases with the same bit/padding contract;
      a slower correct explicit implementation can remain supported without routing.
 5. **Close-out.**
@@ -207,7 +207,7 @@ stream overlay and SFPU macros remain separate dependency-driven tranches.
   failure cleanup gate `1791389916`, 1/1. Both 32-bit and BF16 rejected outputs
   return all GDDR allocation bytes; the session remains usable after cache refusal.
 - Release SMOKE: `1791389331`, 233/233, card 0. Benchmarks: `1791389713`, 3/3,
-  with conditions/medians/dataflow counts in firmware-performance.md. Copy is
+  with conditions/medians/dataflow counts in performance-log.md. Copy is
   slower end to end than native copy; all APIs remain explicitly selected.
 
 This closes the tranche under its one-card acceptance policy. Stage C and later

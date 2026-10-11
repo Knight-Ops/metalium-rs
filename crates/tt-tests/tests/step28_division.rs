@@ -1,7 +1,7 @@
 //! Phase 10 gate (S3): reciprocal and division on the SFPU.
 //!
 //! An approximation, so the Tolerance policy applies twice
-//! (`hardware-coverage.md`, Definition of done): the device is held **bit for
+//! (`new-op-definition-of-done.md`): the device is held **bit for
 //! bit** to its own program run by the interpreter
 //! (`tt_kernels::sfpu::ops::reference`), and that is held to `burn-flex`'s
 //! correctly rounded `1/x` and `a/b` within **one ulp** -- the bound derived on

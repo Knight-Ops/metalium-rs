@@ -32,11 +32,12 @@ directly, one test per process, single-threaded.
 
 | Option | Meaning |
 |---|---|
-| `--device N\|all` | Card to run on (default 0); `all` runs the selection on each card in turn. Passed as `TT_SILICON_DEVICE`. |
+| `--device N\|all` | Card to run on (default 0, the validation target); `all` runs the selection on each card in turn, which only multi-card work and models too large for one card need. Passed as `TT_SILICON_DEVICE`. |
 | `--filter S` | Only tests whose `binary::test` name contains `S`; repeatable, run in filter order. |
 | `--smoke` | Adds the current `SMOKE` filters in `src/silicon.rs`, including native model regressions and step91–96 PRNG/BFP conversion, packed-product, propagation and mixed-training gates. |
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
+| `--feature NAME` | Also build `tt-tests` with this feature (repeatable). Only for opt-in experiments such as `ttinsn-experiment`, never a suite. |
 | `--timeout-secs N` | Per-test wall-clock limit (default 120). |
 | `--release` | Optimised build. Quote timings only from this. |
 | `--list` | Print the selection without touching a card. |
@@ -61,9 +62,9 @@ by default the `BENCH` selection in `src/silicon.rs`:
 
 Every other `silicon` option applies; `--filter` replaces the default selection.
 The ignored BFP release benchmark is selected explicitly with
-`cargo xtask bench --device all --filter step94_bfp_storage::benchmark_resident_bfp_conversion_and_packed_product`.
+`cargo xtask bench --device 0 --filter step94_bfp_storage::benchmark_resident_bfp_conversion_and_packed_product`.
 It validates outputs, uses two warmups/nine samples and reports host medians
 plus dataflow statistics for pack/unpack and direct packed matmul.
 Every `BENCH {json}` line the tests print is collected into
 `target/silicon/bench/<stamp>.jsonl` (one record per line, with its test) and
-`<stamp>.md` (a table). [`docs/learnings/firmware-performance.md`](../docs/learnings/firmware-performance.md) is built from one such run.
+`<stamp>.md` (a table). [`docs/learnings/performance-log.md`](../docs/learnings/performance-log.md) is built from one such run.

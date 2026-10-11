@@ -35,6 +35,8 @@ struct Opts {
     keep_going: bool,
     list_only: bool,
     release: bool,
+    /// Extra `tt-tests` features for the build, beyond `silicon`.
+    features: Vec<String>,
     timeout: Duration,
 }
 
@@ -46,6 +48,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         keep_going: false,
         list_only: false,
         release: false,
+        features: Vec::new(),
         timeout: Duration::from_secs(120),
     };
     let mut smoke = false;
@@ -67,6 +70,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                 };
             }
             "--filter" => o.filters.push(value("--filter")?),
+            "--feature" => o.features.push(value("--feature")?),
             "--timeout-secs" => {
                 let v = value("--timeout-secs")?;
                 o.timeout = Duration::from_secs(
@@ -103,6 +107,8 @@ pub const SMOKE: &[&str] = &[
     "step11_burn::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
+    "silicon_card_lock::a_second",
+    "silicon_lazy_attach::",
     "step12_mnist::the_first_forward_pass",
     "step12_mnist::the_mlp_trains_on_a_reduced_dataset",
     "step12_mnist::the_mlp_trains_on_four_tiles",
@@ -249,6 +255,8 @@ usage: cargo xtask silicon [options]
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
   --timeout-secs N      per-test wall-clock limit (default 120)
+  --feature NAME        also build `tt-tests` with this feature (repeatable); only for
+                        opt-in experiments such as `ttinsn-experiment`, never a suite
   --release             build the suite optimised; every timing worth quoting
                         comes from this, since the dev build is not a baseline
   --list                print the selection and exit without touching a card";
@@ -393,7 +401,7 @@ type Results = Vec<(u16, String, Verdict, PathBuf)>;
 
 fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     let root = workspace_root();
-    let binaries = build(&root, o.release)?;
+    let binaries = build(&root, o.release, &o.features)?;
 
     let mut selection = Vec::new();
     for (name, exe) in &binaries {
@@ -509,17 +517,18 @@ impl std::fmt::Display for Verdict {
 ///
 /// Parses cargo's JSON messages by hand, which is enough here: the two fields
 /// wanted are simple strings, and `xtask` stays dependency-free.
-fn build(root: &Path, release: bool) -> Result<Vec<(String, PathBuf)>, String> {
+fn build(
+    root: &Path,
+    release: bool,
+    features: &[String],
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let features: Vec<String> = std::iter::once("silicon".to_string())
+        .chain(features.iter().cloned())
+        .collect();
     let out = Command::new(env!("CARGO"))
-        .args([
-            "test",
-            "-p",
-            "tt-tests",
-            "--features",
-            "silicon",
-            "--no-run",
-            "--message-format=json",
-        ])
+        .args(["test", "-p", "tt-tests", "--features"])
+        .arg(features.join(","))
+        .args(["--no-run", "--message-format=json"])
         .args(release.then_some("--release"))
         .current_dir(root)
         .stderr(Stdio::inherit())

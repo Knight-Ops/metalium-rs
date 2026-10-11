@@ -106,11 +106,11 @@ Blackhole provides 1.5 MB of L1 SRAM per Tensix core. It is statically partition
 Whole activation tensors in modern models (e.g., $1024 \times 1024$ FP32 = 4 MB) cannot fit in a single core's 1.2 MB data arena. Therefore, inter-kernel fusion on Tensix must operate via **tiled streaming** rather than full-tensor materialization.
 
 ### Circular Buffer Fusion via `Requirements::fuse`
-In `metalium-rs`, memory is never allocated as raw, unmanaged addresses. Kernels declare [`Requirements`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/l1.rs):
+In `metalium-rs`, memory is never allocated as raw, unmanaged addresses. Kernels declare [`Requirements`](../../crates/tt-kernels/src/l1.rs):
 - Buffers specify `bytes`, `align`, and a liveness interval `live: Range<u32>` across kernel execution stages.
 - Circular buffers are declared with a `page` size, `pages` count, a `producer` endpoint, and a `consumer` endpoint.
 
-[`Requirements::fuse`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/l1.rs#L240-L340) provides compile-time fusion:
+[`Requirements::fuse`](../../crates/tt-kernels/src/l1.rs#L240-L340) provides compile-time fusion:
 ```rust
 pub fn fuse(
     first: &Requirements,

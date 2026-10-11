@@ -104,6 +104,11 @@ pub enum SessionError {
     },
     /// `TT_MATH` named no math mode (`sfpu::approx::MathMode`).
     Math(String),
+    /// Another descriptor -- another process, or another session in this one
+    /// -- holds the card ([`tt_kmd::Kmd::lock_card`]).
+    CardBusy {
+        card: u16,
+    },
 }
 
 impl From<TransportError> for SessionError {
@@ -125,6 +130,10 @@ impl std::fmt::Display for SessionError {
             SessionError::TooFewTiles { asked, have } => write!(
                 f,
                 "{asked} Tensix tiles asked for, and this chip has {have}"
+            ),
+            SessionError::CardBusy { card } => write!(
+                f,
+                "card {card} is in use by another process, or another session in this one"
             ),
             SessionError::Reset(e) => write!(f, "resetting the tile: {e}"),
             SessionError::TooFewHealthy {
@@ -4826,8 +4835,9 @@ impl<T: Transport> Session<T> {
 }
 
 impl Session<tt_kmd::Kmd> {
-    /// Open `/dev/tenstorrent/{index}` for compute, with the driver's cleanup
-    /// write as step 3: the first tile's on this descriptor, every further
+    /// Open `/dev/tenstorrent/{index}` for compute, holding the card's driver
+    /// lock until the session drops ([`SessionError::CardBusy`] if another
+    /// session has it), with the driver's cleanup write as step 3: the first tile's on this descriptor, every further
     /// tile's on a descriptor of its own, since the driver keeps one per
     /// descriptor.
     pub fn open_card(
@@ -4836,6 +4846,12 @@ impl Session<tt_kmd::Kmd> {
         choice: TileChoice,
     ) -> Result<Self, SessionError> {
         let kmd = tt_kmd::Kmd::open(index)?;
+        // Before anything is written to the card: a second session resetting
+        // tiles under a running one would corrupt both. The lock lives as long
+        // as `kmd`'s descriptor, which the `Device` and so the session keep.
+        if !kmd.lock_card()? {
+            return Err(SessionError::CardBusy { card: index });
+        }
         let dev = Device::open(kmd)?;
         let mut first = true;
         Self::open(dev, images, choice, |kmd, tile| {

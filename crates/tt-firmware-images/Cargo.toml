@@ -11,5 +11,15 @@ license.workspace = true
 # depend on, not from the test harness (`cargo xtask check-no-sim-in-ship`).
 build = "build.rs"
 
+# Off by default. `ttinsn-experiment` also builds the `ttinsn_t1` image
+# (`docs/plans/ttinsn-push-experiment.md`) and relaxes the instruction-set gate for
+# that one image's `.ttinsn` words, and nothing else. Shippable builds never turn it on.
+[features]
+ttinsn-experiment = []
+
 [dependencies]
+tt-isa.workspace = true
+
+# The gate checks each admitted `.ttinsn` word against the instruction table.
+[build-dependencies]
 tt-isa.workspace = true

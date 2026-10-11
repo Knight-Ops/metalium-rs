@@ -1,5 +1,10 @@
 # Burn backend parity — what `burn-tt` needs to feel like `burn-cuda`
 
+> Open work lives in [roadmap.md](roadmap.md); this file is the B0-B16 design record and status
+> table (section 6). Sections 1, 2 and 4 are the 2026-10-01 design, written before the native
+> cutover: every statement about Flex, host fallback or "today" in them is **pre-cutover
+> history** unless a current-status note says otherwise.
+
 > Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
 > explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
 > below are superseded by [the current backend contract](../../crates/burn-tt/README.md)
@@ -12,7 +17,7 @@ arbitrary-axis gather/select and float scatter/select-add remove index readback.
 Slice assignment enables native cat/repeat. Mesh batched products partition across
 cards, including convolution/attention backwards. Both-card gates, changed-input
 traces, analytic/Flex oracles and remaining acceptance gaps are recorded in
-[tensix-next-features.md](tensix-next-features.md). Historical unchecked inventory
+[tensix-next-features.md](../completed-plans/tensix-next-features.md). Historical unchecked inventory
 rows below are not evidence that these paths are absent.
 
 Current storage extension (2026-10-06): BFP8/BFP4/BFP2 store logical F32 with
@@ -54,23 +59,36 @@ widen on device for Ethernet transport. Integer reductions are resident;
 checked division/remainder and integer mean now pass simulator and card-0 gates
 (`1791232718`). Native attention passes card-0 forward/gradient/F32 trace and
 BF16 training gates; distributed batched products pass actual two-card forward
-(distributed gradients remain unvalidated). See [the implementation record](tensix-next-features.md)
+(distributed gradients remain unvalidated). See [the implementation record](../completed-plans/tensix-next-features.md)
 and [the backend contract](../../crates/burn-tt/README.md) for limitations.
-B0 reporting and B3 stale-id protection are implemented; tracing, typed errors,
-lazy discovery, conformance, fusion and placement remain separate backend work.
+B0 reporting and B3 stale-id protection are implemented. Fusion has its first phase (B12
+`BackendIr`, `FusionBackend`, the `Tt = Fusion<TtBackend>` alias and one MVP element-wise
+fuser, see [kernel-fusion.md](kernel-fusion.md)); typed errors (B1, 2026-10-11) and the
+`Backend::sync` barrier are done, and so are lazy attach, the engine registry, device
+enumeration and the card lock (B2, 2026-10-11); `tracing` targets, the conformance suite and
+placement remain separate backend work.
 
-Next backend order: typed errors and a real sync barrier (B1/B8), lazy init
-and device discovery/card locks (B2), then the Burn conformance suite (B10/B11).
+Next backend order: the Burn conformance suite (B10/B11).
 General model coverage continues in `hardware-coverage.md`.
 
 ---
 
 ## 1. Historical comparison (2026-10-01)
 
+*Pre-cutover snapshot.* The "burn-tt today" column describes the Flex-delegating backend as
+of 2026-10-01 and is kept as history. Since then, native cutover removed every Flex fallback
+(unsupported ops, shapes and dtypes fail explicitly), rank-N storage and views, batched
+matmul, asynchronous dispatch, stale-buffer protection (B3), the report and strict mode (B0)
+and typed, sticky errors (B1) landed, `dtype_usage` is half corrected (B4) and fusion has
+its first phase. The table's explicit `attach` with a panic when unattached, its attached-only
+`device_count` and its missing driver lock were closed by B2 (2026-10-11); still open as the
+table says: no conformance run (B10/B11) and no `DistributedBackend` (B14). Section 6 holds the
+per-item status.
+
 | Capability | burn-cuda / burn-wgpu | burn-tt today | Gap | Pri |
 |---|---|---|---|:-:|
 | Device creation | `CudaDevice::default()` just works: first `R::client(device)` lazily runs `DeviceService::init` on a per-device runner thread (`reg:cubecl-cuda-0.10.0/src/runtime.rs:47-48,344-346`; `reg:cubecl-runtime-0.10.0/src/client.rs:69`). WGPU adds an opt-in `init_setup` (`reg:cubecl-wgpu-0.10.0/src/runtime.rs:232,250`) and `CUBECL_WGPU_DEFAULT_DEVICE` | explicit `attach(device, factory)` required (`server.rs:324-369`); unattached device ops panic (`server.rs:384-386`; pinned by `tests/delegation.rs:114-119`) | lazy auto-attach with an engine registry; `attach` kept as the `init_setup` analogue | **P0** |
-| Errors | `try_into_data`/`sync` return `ExecutionError`, documented as "any error since the last sync" (`reg:burn-tensor-0.21.0/src/tensor/api/base.rs:1904-1918`); init failures still `unwrap` | `EngineError(String)` (`server.rs:241-242`); every device failure panics in the op (`server.rs:405-512`) | typed `TtError` with hints; deferred (sticky) errors through `ExecutionError` | **P0** |
+| Errors | `try_into_data`/`sync` return `ExecutionError`, documented as "any error since the last sync" (`reg:burn-tensor-0.21.0/src/tensor/api/base.rs:1904-1918`); init failures still `unwrap` | *(was `EngineError(String)` and a panic in the op; since B1: `TtError`, deferred to `try_into_data`/`sync` as `ExecutionError`, strict mode panics)* | typed `TtError` with hints; deferred (sticky) errors through `ExecutionError` | done |
 | Fallback visibility | n/a (everything runs on device) | silent host fallback; `TT_TRACE_FALLBACK=1` prints a backtrace per *download* to stderr (`tensor.rs:223-230`); counters `tensor_traffic`, `device_time` (`traffic.rs:38,104`) | per-op report, `tracing` targets, strict mode | **P0** |
 | Conformance | `burn-backend-tests` via `burn-dispatch` (`cargo test-cuda`, `gh:crates/burn-backend-tests/.cargo/config.toml`); Flex: "all pass" (`reg:burn-flex-0.21.0/README.md:158`) | not run; hand-written batteries (`tests/delegation.rs`, `step11_burn`, `step19_eltwise`) | vendored suite against `TtBackend` on ttsim | **P0** |
 | `dtype_usage` | from the runtime's type table, `Accelerated` only where MMA exists (`reg:burn-cubecl-0.21.0/src/backend.rs:115-142`) | Flex's answer verbatim (`lib.rs:112-115`): claims F16/BF16/ints equal to F32 | `Accelerated` only for what has a device path | P1 |
@@ -102,10 +120,17 @@ General model coverage continues in `hardware-coverage.md`.
 carries the device and the four primitives. `CubeBackend` overrides all of them
 (`reg:burn-cubecl-0.21.0/src/backend.rs:56-147`).
 
-**burn-tt.** `lib.rs:87-116`: one primitive (`TtTensor`) for float/int/bool as Flex does,
-`TtQTensor` for quantized; `seed` seeds Flex's global generator (`lib.rs:103-106` -- correct,
-since every random op is Flex's until S7); `device_count` counts attached devices;
-`dtype_usage` is Flex's. `sync`, `memory_*`, `staging` are defaults.
+**burn-tt (2026-10-01, pre-cutover).** `lib.rs:87-116`: one primitive (`TtTensor`) for
+float/int/bool as Flex does, `TtQTensor` for quantized; `seed` seeds Flex's global generator
+(`lib.rs:103-106` -- correct, since every random op is Flex's until S7); `device_count` counts
+attached devices; `dtype_usage` is Flex's. `sync`, `memory_*`, `staging` are defaults.
+
+**burn-tt (2026-10-10, current).** `TtTensor` is the float/int/bool primitive and `TtQTensor` is
+metadata only. `seed` calls `random::seed`, which seeds the device's native generator (S7;
+no Flex). `device_count` still counts attached devices (`server::attached_count`). `dtype_usage`
+is native and half-honest: `F32`/`BF16` are `Accelerated`, `Bool` is general, `I32`/`F16` are
+`Storage`, everything else (including `F64` and `QFloat`) is empty (`lib.rs`, gate
+`step144_burn_fp16`). `sync`, `memory_*` and `staging` are still the defaults.
 
 **Design.**
 
@@ -192,7 +217,22 @@ registry that fails gives `TtError` text on the first *and* second op with one f
 a `[0x7FFF]` device with no node gives `NoSuchCard { card, present: [0, 1] }`. ttsim: the
 same through `tt-tests`. Silicon: `tt-mnist` with its attach code deleted still trains.
 
+**Implemented (B2, 2026-10-11).** As designed, with these differences: the registry lives in
+`burn-tt/src/registry.rs` and the attach table in `server.rs` (`ensure_attached`, one `OPENING` lock so
+a first use calls the factory once, failures remembered per device); the default tile is
+`TileChoice::First`, since a harvest-proof tile *count* needs the per-workload choice recorded in the
+roadmap; `detach(device)` was added; the positional `attach_topology*`/`kmd_engine*` functions were
+replaced by `attach_with(device, TtConfig)`; `supports_dram` is cached in the attachment record; an
+attachment made before a `fork` is treated as absent (a forked child has none of the parent's server
+threads); and the lock is `Kmd::lock_card` (driver lock 63) taken in `Session::open_card`, so every
+session, not only burn-tt's, owns its card. The gate is `burn_server.rs`, `step148_lazy_attach`,
+`silicon_card_lock` and `silicon_lazy_attach`.
+
 ### 2.3 Dtypes
+
+*The "burn-tt" paragraph below is the 2026-10-01 state; BF16 and FP16 storage and native casts
+since landed (see 2.1 for the current `dtype_usage`), and unsupported dtypes now fail
+explicitly instead of running on Flex.*
 
 **Burn 0.21.** `DType` and `FloatDType`/`IntDType` (`burn_std`); a tensor's dtype comes
 from `TensorCreationOptions` or the device default (`reg:burn-tensor-0.21.0/src/tensor/api/base.rs:1942-1954`).
@@ -242,9 +282,14 @@ refusal, but as a typed message naming both devices and the `to_device` fix (Bur
 
 ### 2.6 `QTensorOps`
 
-Flex's, on the host (checklist Phase 7: out of scope). `TtQTensor` wraps `FlexQTensor`
-(`tensor.rs:318-342`). Parity needs D2 (block float) and D3; until then `dtype_usage(QFloat)`
-= `Storage` only, which is what Flex returns, and the report counts every q-op as host.
+*Pre-cutover (2026-10-01):* Flex's, on the host (checklist Phase 7: out of scope); `TtQTensor`
+wrapped `FlexQTensor`; `dtype_usage(QFloat)` was `Storage`, as Flex returned.
+
+*Current (2026-10-10):* `TtQTensor` carries only shape, scheme and device. The generated
+`QTensorOps` impl fails explicitly for quantized construction and compute, and
+`dtype_usage(QFloat)` is empty. Per-tensor BFP8/4/2 storage of logical F32 exists, but it is
+not Burn's portable quantization and is not routed through `QTensorOps`
+([mixed-bfp-storage.md](mixed-bfp-storage.md)). Portable `QTensorOps` remains deferred.
 
 ---
 
@@ -361,6 +406,11 @@ matters because `burn-backend-tests` is written against `Dispatch` (§5).
 
 ## 4. Ergonomics and sharp edges
 
+*Section 4 is the 2026-10-01 design. Its "Today" column predates the native cutover: "host" /
+"silent fallback" entries are pre-cutover (those cases now run natively or fail explicitly);
+edges 9, 12, 20 and 21 are closed (batched matmul, views, B3); edges 1, 2, 18, 19, 22, 23, 24
+are still open as written.*
+
 ### 4.1 Inventory: every way a model hits an opaque failure, silent fallback or cliff
 
 Each with today's behaviour, and the handling tier: **(1)** automatic, **(2)** automatic +
@@ -368,10 +418,10 @@ once-per-key warning, **(3)** typed early error.
 
 | # | Edge | Today | Fix | Tier |
 |--:|---|---|---|:-:|
-| 1 | Device not attached | panic in the first device op (`server.rs:384-386`), only for matmul/`to_device`; eltwise on host tensors silently runs on host | lazy auto-attach (B2) | 1 |
-| 2 | No card / no driver / no permission | `tt-mnist` prints a hint itself (`tt-mnist/src/main.rs:331-346`); library users get `EngineError` text | `TtError::{NoDriver, NoSuchCard{present}, Permission{path}}` whose `Display` carries the hint; panics at first op name the error and `burn_tt::init` | 3 |
-| 3 | Hard-coded tile `(3,4)` fused off on another card | `NoSuchTile` at attach | default from the chip's grid | 1 |
-| 4 | `TT_TILES` default 1 | 1 tile unless the caller reads the env (`topology.rs:108-111`) | `TtConfig` reads env; default many tiles (Q2); `name()` reports it | 1 |
+| 1 | Device not attached | panic in the first device op (`server.rs:384-386`), only for matmul/`to_device`; eltwise on host tensors silently runs on host | lazy auto-attach (B2) -- **done (B2, 2026-10-11)** | 1  |
+| 2 | No card / no driver / no permission | `tt-mnist` prints a hint itself (`tt-mnist/src/main.rs:331-346`); library users get `EngineError` text | `TtError::{NoDriver, NoSuchCard{present}, Permission{path}}` whose `Display` carries the hint; panics at first op name the error and `burn_tt::init` -- **done (B1/B2, 2026-10-11)** | 3  |
+| 3 | Hard-coded tile `(3,4)` fused off on another card | `NoSuchTile` at attach | default from the chip's grid -- **done (B2: `TileChoice::First`, 2026-10-11)** | 1  |
+| 4 | `TT_TILES` default 1 | 1 tile unless the caller reads the env (`topology.rs:108-111`) | `TtConfig` reads env; default many tiles (Q2); `name()` reports it -- **done (B2, 2026-10-11)** | 1  |
 | 5 | Non-F32 dtypes (BF16 weights, `set_default_dtypes`, `cast`) | whole model on host, silent | warn once per (op, dtype) with the cast fix; strict = error; D1 removes it for BF16 | 2 |
 | 6 | Rank-1 tensors (biases, `[n]` params) | host; uploaded on every use as SGD updates them (checklist 9.5: the six tensors per step) | store rank-1 as `[1, n]` (B5) | 1 |
 | 7 | Rank > 2 (`[b, s, d]` activations) | every op host, incl. element-wise | store as `[prod(lead), last]`; same-shape eltwise on device (B5) | 1 |
@@ -385,12 +435,12 @@ once-per-key warning, **(3)** typed early error.
 | 15 | `sum_dim(1)`, mean, max, softmax, ... | host | report; R1/R2 | 2 |
 | 16 | Int/bool ops (labels, masks, argmax) | storage, views and the logic ops on the device since D3 (`hardware-coverage.md` 10.2b); arithmetic host until S5 | report under `Reason::NoDeviceKernel`; *not* warned when operands are host-resident (no cost) | 2 |
 | 17 | Mesh topology | all host-staged, no GDDR (`server.rs:630-643`; 233 vs 5.8 ms/step, checklist 9.4b) | warn at attach with the measured cost until 9.11 | 2 |
-| 18 | Device error mid-model (timeout, run error) | panic in the op (`server.rs:405-512`) | sticky error -> `ExecutionError` at `sync`/`try_into_data`; strict = immediate typed panic | 3 |
-| 19 | Engine panics on the server thread | thread dies; every later op panics "server thread has stopped" without the cause (`server.rs:391-393`) | `catch_unwind` around each job; device moves to `Failed(cause)` | 3 |
-| 20 | Tensor outlives its attachment, device re-attached | `BufferId`s restart at 1 (`server.rs:106-126`): **reads another tensor's data** | `Buffer` carries an attachment generation; mismatch = `TtError::StaleTensor` | 3 |
-| 21 | `supports_dram` cache keyed by device only (`server.rs:415-432`) | stale after re-attach with a different engine | cache in the attachment record | 1 |
+| 18 | Device error mid-model (timeout, run error) | panic in the op (`server.rs:405-512`) | sticky error -> `ExecutionError` at `sync`/`try_into_data`; strict = immediate typed panic -- **done (B1, 2026-10-11)** | 3  |
+| 19 | Engine panics on the server thread | thread dies; every later op panics "server thread has stopped" without the cause (`server.rs:391-393`) | `catch_unwind` around each job; device moves to `Failed(cause)` -- **done (B1, 2026-10-11)** | 3  |
+| 20 | Tensor outlives its attachment, device re-attached | `BufferId`s restart at 1 (`server.rs:106-126`): **reads another tensor's data** | `Buffer` carries an attachment generation; mismatch = `TtError::StaleTensor` -- **done (B3, 2026-10-11)** | 3  |
+| 21 | `supports_dram` cache keyed by device only (`server.rs:415-432`) | stale after re-attach with a different engine | cache in the attachment record -- **done (B2, 2026-10-11)** | 1  |
 | 22 | Operands on different chips | `assert!` (`ops.rs:152-156`) | typed panic message with the `to_device` fix (Burn ops cannot return `Result`) | 3 |
-| 23 | Another process on the same card | silent sharing | driver lock, `TtError::CardBusy` | 3 |
+| 23 | Another process on the same card | silent sharing | driver lock, `TtError::CardBusy` -- **done (B2, 2026-10-11)** | 3  |
 | 24 | GDDR exhausted | engine error -> panic with allocator text | `TtError::OutOfMemory { requested, live, largest_free }`; `memory_cleanup` then retry once | 3 |
 | 25 | `distributed` feature on | `Autodiff<TtBackend>` is not `AutodiffBackend` | implement `DistributedBackend` (B14) | 1 |
 | 26 | Determinism | bit-exact run to run (golden); Flex-seeded random | keep; document nothing -- assert it in conformance (seeded random test) | -- |
@@ -498,6 +548,11 @@ queue per device keeps program order. Gate: the MNIST golden bit for bit; ms/ste
 
 ### 4.5 Feature flags and env vars
 
+*Proposal (2026-10-01).* Current state: `burn-tt` has features `std` and `fusion` (both default;
+`fusion` provides `Tt = Fusion<TtBackend>`). There is no `tracing`, `distributed`, `train` or
+`strict` feature. Of the proposed environment variables, `TT_STRICT`, `TT_REPORT`,
+`TT_TRACE_FALLBACK`, `TT_TILES` and `TT_TOPOLOGY` exist; `TT_DEVICE` and `TtConfig` do not.
+
 | Flag | Default | Effect |
 |---|:-:|---|
 | `fusion` | on (after B13a) | `burn_tt::Tt = Fusion<TtBackend>`, as `burn_cuda::Cuda` |
@@ -577,24 +632,24 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | Id | Item | Depends | Done when |
 |---|---|---|---|
 | **B0** (report, strict, `host_ok`, `with_report`, `TT_REPORT`/`TT_STRICT` done 2026-10-03: `burn-tt/src/report.rs`, a guard the generator emits in every op; `tracing` targets, per-`Reason` attribution and the once-per-key warnings open) | Report + `tracing` + strict mode (§4.2); generator emits the hook | -- | every delegated op appears in `report()` with bytes; `TT_STRICT=1` turns `step12_mnist`'s known host ops into failures unless in `host_ok`; `TT_TRACE_FALLBACK` still works |
-| **B1** (partial: sticky errors and poisoning implemented; typed error remains open) | `TtError`, sticky errors, poisoned tensors, `catch_unwind` on the server thread (edges 2, 18, 19, 22, 24) | -- | `an_engine_error_panics_with_it` becomes `an_engine_error_is_try_into_data_s_error`; strict keeps the panic |
-| **B2** | Engine registry, lazy auto-attach, `init`/`TtConfig`, default tiles from the grid, card lock, `device_count`/`enumerate` (edges 1, 3, 4, 23) | B1 | §2.2 gate; `tt-mnist` without attach code |
+| **B1** (done 2026-10-11: `burn-tt/src/error.rs`; `EngineError` removed; `try_into_data`/`sync` return the sticky error, strict mode panics, `catch_unwind` per server job; `NoDriver`/`NoSuchCard`/`Permission` classify opening a card, `CardBusy` waits for B2's lock) | `TtError`, sticky errors, poisoned tensors, `catch_unwind` on the server thread (edges 2, 18, 19, 22, 24) | -- | `a_host_staged_engine_error_panics_in_the_op_with_it`, `an_engine_error_is_try_into_data_s_error`, `strict_mode_panics_where_try_into_data_would_return_the_error`, `a_panicking_engine_is_reported_by_every_later_wait` (`tt-tests/tests/burn_server.rs`) |
+| **B2** (done 2026-10-11: `burn-tt/src/registry.rs`, `server::ensure_attached`; the default tile is `TileChoice::First`, not a measured count -- the per-workload tile optimizer is a Track 2 item in the roadmap; the card lock is `Kmd::lock_card` taken by every `Session::open_card`, `SessionError::CardBusy` -> `TtError::CardBusy`; `kmd_engine`, `attach_topology*` and `kmd_mesh_engine` are gone, `attach_with(TtConfig)` replaces them; an attachment from before a `fork` is treated as absent) | Engine registry, lazy auto-attach, `init`/`detach`/`TtConfig`, default tile, card lock, `device_count`/`enumerate` (edges 1, 3, 4, 20, 21, 23) | B1 | `burn_server.rs` (registry, remembered failure, `init`, refusal, `enumerate`), `step148_lazy_attach` (ttsim, residency, fork negative control), `silicon_card_lock`, `silicon_lazy_attach` (smoke) |
 | **B3** (done via never-reused process-wide ids, 2026-10-03) | Stale buffers and capability cache scoped to the attachment; ids are translated by that server | -- | both stale-buffer gates pass; old tensors cannot read or free a new attachment's buffer |
-| **B4** | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
+| **B4** (half done: `dtype_usage` reports `F32`/`BF16` as `Accelerated` and `I32`/`F16` as `Storage` (`lib.rs`); the once-per-(op, dtype) warnings, the `burn-store` BF16 warning and strict-mode failure are missing) | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
 | **B5** (storage, views and element-wise done: `hardware-coverage.md` P1a; partial-row download open -- measured: a 1000-row batch of a resident set is a host slice and a 3 MB re-upload every batch, 46 ms a batch against 2.1 on the host, row X) | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
 | **B6** (done 2026-10-03 for tile-aligned operands: a rank-N lhs against an unbatched rhs -- every `Linear` -- folds into the 2-D product, as do `linear_{weight,bias}_backward`; a real batch on both sides runs as `Session::matmul_dram_batched` over blocks of the operands' buffers, reshapes and swaps being strided views (`burn-tt/src/views.rs`); untiled shapes are still host-staged) | Batched matmul on resident operands (edge 9) | B5 | `[8,64,64]@[8,64,64]` under strict: zero downloads; bit-identical to per-batch host-staged |
 | **B7** | `download_many`, real readback futures, batched `tr_execute` | B1 | one server job per transaction |
-| **B8** (partial: asynchronous calls done 2026-10-03; `Backend::sync` barrier open: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
+| **B8** (asynchronous calls done 2026-10-03; `Backend::sync` barrier done 2026-10-11 (`server::try_sync`, B1); batched readback is B7: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
 | **B9** | `name`, `memory_cleanup`, `memory_persistent_allocations`; OOM retry | B2 | unit tests §2.1 |
 | **B10** | Vendored conformance crate on ttsim, eager policy, expected-failures | B2, B0 | §5.2 gate |
-| **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on both cards |
-| **B12** | `BackendIr` (`TtHandle`); router + remote gates | -- | `burn-remote` server on a card host passes the delegation battery from a client |
-| **B13a** | `FusionBackend`, zero fusers, `burn_tt::Tt` alias, `fusion` feature | B12, B10 | conformance green on `Fusion<TtBackend>` |
-| **B13b** | Element-wise chain fuser | B13a, HC:F3/F4 (or chained `ELTWISE`) | one job per chain; golden unchanged |
+| **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on card 0 |
+| **B12** (partial: `impl BackendIr for TtBackend` with `TtHandle` exists, `tensor.rs`; the router/remote gate has never run -- neither `burn-router` nor `burn-remote` is a dependency or a test anywhere in the workspace) | `BackendIr` (`TtHandle`); router + remote gates | -- | `burn-remote` server on a card host passes the delegation battery from a client |
+| **B13a** (partial: `FusionBackend`, `TtFusionRuntime`, `burn_tt::Tt` and the default-on `fusion` feature exist; `step12_mnist` exercises `Tt`; "zero fusers" was superseded by the MVP fuser of B13b; conformance on `Fusion<TtBackend>` is open with B10) | `FusionBackend`, zero fusers, `burn_tt::Tt` alias, `fusion` feature | B12, B10 | conformance green on `Fusion<TtBackend>` |
+| **B13b** (MVP only: `ElementWiseFuser` matches `add` + Burn's lowered ReLU as one `ADD_RELU` dispatch and a lone ReLU as `RELU`; no general chain fuser, no micro-op engine; see [kernel-fusion.md](kernel-fusion.md)) | Element-wise chain fuser | B13a, HC:F3/F4 (or chained `ELTWISE`) | one job per chain; golden unchanged |
 | **B13c** | Matmul + bias + ReLU epilogue fuser | B13b, HC:S1 | Linear+ReLU is one device job |
 | **B14** | `DistributedBackend` (host all-reduce), `distributed` feature on by default | B2 | `burn-train` DDP over two cards trains MNIST (slowly); Ethernet all-reduce with checklist 9.11 |
 | **B15** | Integration gates: `Learner` run with checkpoint round trip; `burn-store` safetensors load (F32 + BF16); one `burn-onnx` model | B0, B2, B4 | each matches Flex; reports archived |
-| **B16** (proposed) | Cost-aware placement/lookahead for isolated ops and model-level decisions; the old size thresholds were removed 2026-10-03, so supported approximate ops now follow resident data at every size unless exact mode is selected | B0 report data | evaluate end-to-end models and PCIe traffic; full loss mean is now resident (R1b), while other shape fallbacks and host-created operands remain |
+| **B16** (proposed) | Cost-aware placement/lookahead for isolated ops and model-level decisions; the old size thresholds were removed 2026-10-03, so supported approximate ops now follow resident data at every size (exact mode is retired) | B0 report data | evaluate end-to-end models and PCIe traffic; full loss mean is now resident (R1b), while other shape fallbacks and host-created operands remain |
 
 Coverage work proper (S1-S9, M1-M4, R1-R4, D1-D6) proceeds in parallel; each landed item
 shrinks the report and the expected-failures list, and B0's report is how its "downloads
@@ -630,20 +685,7 @@ nothing" line in the Definition of done is checked.
 
 ### M1 matrix elementwise continuation (2026-10-06)
 
-- [x] Explicit `ElementwiseMode::Matrix { precision, fidelity }` before single-card
-      attachment; constructors still default to SFPU. The mode snapshot preserves
-      asynchronous dispatch and does not survive detachment/reattachment.
-- [x] Native floating add/subtract/multiply and scalar dispatch intercept packed
-      BF16 before widening, accumulate in F32 and narrow at the output boundary.
-- [x] Equal-shape and RHS row/column/scalar geometry, resident views, ragged
-      padding, trace holds and deferred frees; unsupported geometry/mesh mode
-      fails explicitly. Integer and other operation families retain routing.
-- [x] Step90 records matrix dispatches, audits actual role instructions and checks
-      native arithmetic/analytic gradients with no intermediate downloads.
-- [x] Final continuation acceptance is recorded in hardware-coverage.md: both-card
-      targeted gates 24/24, full smoke 322/322, release baseline `1791255969`,
-      workspace/Clippy/generator/shipping checks and unchanged MNIST golden.
-
-Benchmarks and matrix numerical/special-value contracts are in the learnings
-files. The opt-in permits reduced Src/alignment precision; no universal speedup
-or IEEE special-value behavior is promised.
+The checklist and its acceptance record are kept once, in
+[tensix-next-features.md](../completed-plans/tensix-next-features.md#m1-matrix-elementwise-continuation-2026-10-06);
+the kernel-level checklist is in [hardware-coverage.md](../completed-plans/hardware-coverage.md). Matrix-mode
+elementwise is an explicit opt-in (`ElementwiseMode::Matrix`); SFPU remains the default.

@@ -1,12 +1,12 @@
 # Hardware coverage close-out
 
 > **Status: complete (2026-10-10).** Moved here from `docs/plans/`. The open items are carried in
-> [hardware-coverage.md](../plans/hardware-coverage.md) ("Where things stand"); the permanent
+> [hardware-coverage.md](hardware-coverage.md) ("Where things stand"); the permanent
 > silicon-handling rules are in [silicon-operating-notes.md](../learnings/silicon-operating-notes.md).
 > Code paths named below are as of the lanes; the lane scaffolding was later folded away (see
 > "Scaffold lanes use").
 
-Record of the effort that finished [hardware-coverage.md](../plans/hardware-coverage.md) and
+Record of the effort that finished [hardware-coverage.md](hardware-coverage.md) and
 [remaining-firmware-instructions.md](remaining-firmware-instructions.md). Started 2026-10-09.
 Done means every coverage row is `[x]` or a documented `[-]` with evidence and a supported
 alternative. A `[-]` exit is a legitimate outcome when the hardware cannot be driven safely or has no
@@ -32,7 +32,7 @@ Legend as in the coverage tracker: `[x]` done and gated · `[~]` partial · `[ ]
 - **Coordinator-only files** (lanes propose text, never merge it): `xtask/src/silicon.rs` (SMOKE),
   `xtask/src/gen_isa/{Bits32_BH.lua,measured.rs}`, `crates/tt-isa/src/isa/{generated.rs,mod.rs}`
   (provenance counts at `mod.rs:511-524`), `crates/burn-tt/src/generated/ops.rs`,
-  `docs/learnings/*`, `docs/plans/hardware-coverage.md`, `remaining-firmware-instructions.md`.
+  `docs/learnings/*`, `docs/completed-plans/hardware-coverage.md`, `remaining-firmware-instructions.md`.
   A lane that needs a measured layout to compile may edit the Lua/`measured.rs` locally; the
   coordinator re-applies it after rebase and regenerates. Generated files are never merged as text.
 - **Definition of done** for any op is the AGENTS.md list: independent oracle (never an epsilon),
@@ -207,7 +207,7 @@ T6 `0x1c0–0x1cf`, T8 `0x1d0–0x1df`.
 - [x] **T9: mesh trace capture (R4)** (step147; ttsim 5/5 and card 0/1 silicon 3/3; per-chip session traces between host-run Ethernet transfers, `UnheldTransfer` refusal; two negative controls watched failing; mesh training traces and `copy_into` on a mesh still unsupported).
   `MeshEngine::begin_trace`; changed-input replay matches a
   fresh run with no uploads. Both cards.
-- [x] **T10: benchmarks and dispositions** (K-block and norm release benchmarks run on both cards, runs `1791593690`/`92`/`99`, validated, recorded in `firmware-performance.md`; M2/M3/D5 dispositions applied; the lane's stale-statement audit list for `burn-native-cutover.md` and `burn-backend-parity.md` is not yet applied).
+- [x] **T10: benchmarks and dispositions** (K-block and norm release benchmarks run on both cards, runs `1791593690`/`92`/`99`, validated, recorded in `performance-log.md`; M2/M3/D5 dispositions applied; the lane's stale-statement audit list for `burn-native-cutover.md` and `burn-backend-parity.md` is not yet applied).
   Release K-block and norm benchmarks (P2/R3); M2 `[-]`
   GMPOOL diagnostic-only (packed ArgMax index bits missing on both cards, run `1791240702`); record
   PU's M3/D5 dispositions.
@@ -280,7 +280,7 @@ smoke tier passes **486/486** (run `1791597495`; baseline before this effort 258
 | **X6 mover NIU fast path** | `[x]` card 0; persistence holds, byte-identical, 3-4% faster, opt-in |
 
 ### Still open
-Carried in [hardware-coverage.md](../plans/hardware-coverage.md) "Where things stand":
+Carried in [hardware-coverage.md](hardware-coverage.md) "Where things stand":
 
 1. Mesh training traces and `copy_into` on a mesh.
 2. Both-card runs of the lanes validated on card 0 only (including T3's cummin/cummax).

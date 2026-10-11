@@ -50,6 +50,15 @@ Prerequisites: `cargo xtask fetch-ttsim` and `fetch-mnist`; `fetch-spec` for
 `burn_device` (a `TtDevice` attached to ttsim or the card), `mnist` (IDX loader),
 `topology` (ttsim's measured multi-chip link maps), `data` (deterministic test data: LCG and xorshift streams, `panic_message`).
 
+**Attaching in gates.** A `TtDevice` attaches itself on first use (`burn_tt::init`), which on a host
+with cards means opening `/dev/tenstorrent/N`. Burn gates therefore go through
+`burn_device::with_device` / `with_mesh_device`, which attach the simulator (or, with `silicon`, the
+card) explicitly inside a `fork_scope` child, and a test that uses a device number with no engine of
+its own should pick one with no `/dev/tenstorrent` node (the host-engine tests use 100+). A gate that
+wants the lazy path registers the simulator with `burn_device::register_simulator` inside the child
+(`step148_lazy_attach`). The simulator is a once-per-process singleton, so it cannot be detached and
+attached again in one child.
+
 Shared test-only modules live beside the gates as `tests/<name>_support/mod.rs` (`eltwise_support`, `fp16_support`, `matrix_debug_support`, `noc_support`, `prng_support`) and are pulled in with `mod <name>_support;`.
 
 ## Environment

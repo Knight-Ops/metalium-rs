@@ -46,7 +46,7 @@ use crate::cfg::generated::thcon;
 ///
 /// The numeric `InDataFormat`/`OutDataFormat` encoding is deliberately absent: it
 /// appears in neither the specification tree nor `cfg_defines.h`. See the module
-/// note in `docs/plans/implementation-checklist.md` open question 9.
+/// note in `docs/completed-plans/phases-0-10-checklist.md` open question 9.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum L1Format {
     /// IEEE754 FP32.

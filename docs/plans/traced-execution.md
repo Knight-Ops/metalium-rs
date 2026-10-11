@@ -1,4 +1,6 @@
-# Generalized Traced Execution Architecture for Burn on Tenstorrent: High-Performance Traced Inference & Training
+# Traced Execution Architecture for Burn on Tenstorrent
+
+> Open work lives in [roadmap.md](roadmap.md); the section 8 scaling roadmap below is part of it.
 
 Current BFP extension (2026-10-06): captured conversions, compressed outputs,
 parameter copies and changed-input replay pass step94–96 on both cards. Trace
@@ -9,6 +11,10 @@ widens on device. Training keeps gradients, masters and optimizer state F32.
 See [the current storage contract](mixed-bfp-storage.md); the motivation and
 original limitations below describe the earlier trace design.
 
+Status (2026-10-10): sections 3, 4 and 6 describe what `crates/burn-tt/src/trace.rs` and
+`crates/tt-mnist/src/trace.rs` contain. The generic, `Module`-based API that an earlier revision of
+this document specified was **not built**; it is kept, labelled, at the end of section 4.
+
 ## 1. Architectural Motivation & Scope
 
 In standard Burn backend execution, every model invocation (inference forward pass or training step) incurs substantial host-side latency:
@@ -17,26 +23,28 @@ In standard Burn backend execution, every model invocation (inference forward pa
 - Dispatching commands across the `burn-tt` server thread boundary.
 - Multiple PCIe MMIO round-trips and synchronization barriers per step.
 
-For small networks like MNIST, host overhead accounts for ~0.4 ms of a ~1.0 ms step. Even for larger transformer models, host-side dispatch limits Tensix tile utilization.
+For small networks like MNIST this host-side cost, not the device, dominates an untraced step (the
+scoreboard in [performance-log.md](../learnings/performance-log.md) records the device busy for
+only 12.6% of wall time on a queue of small matmuls).
 
 Hardware traces (`Session::begin_trace` / `Session::end_trace`, `hardware-coverage.md` X4d) compile the entire sequence of Tensix kernels and data mover transfers into a single GDDR command stream. Once captured, execution is triggered by a single `CALL` entry per tile (`Session::replay`), eliminating all host op construction and dispatch latency.
 
-### The Problem: Current Trace Limitations
+### The original limitation (historical)
 
-Until now, `burn_tt::Trace` (`crates/burn-tt/src/trace.rs`) only supported a restricted form of **inference**:
-1. **Strictly 1 Input**: `Trace::capture(input: &TtTensor, ...)` holds only one input buffer.
-2. **F32 Only**: Explicitly checks `is_stored_f32()`, rejecting token IDs (`I32`), attention masks (`Bool`), or `BF16`.
-3. **Strictly 1 Output**: Only downloads a single F32 output buffer.
-4. **No Training Support**: As documented in `hardware-coverage.md:594`:
-   > *"A training step is replayable once its weights are updated in place (the optimizer writing the same buffers) and the loss stays on the device; neither holds today (B16, and Burn's tensors are immutable). Until then a training loop traces its forward pass at most."*
+The first `burn_tt::Trace` (`crates/burn-tt/src/trace.rs`) supported only a restricted form of **inference**,
+and still exists in that form:
+1. **One F32 input**: `Trace::capture(input: &TtTensor, ...)` holds a single input buffer.
+2. **One F32 output**, downloaded as `Vec<f32>`.
+3. **No training**: a training step is replayable only if the optimizer writes the same buffers
+   (Burn's tensors are immutable) and the loss stays on the device.
 
-This document defines a **fully unified, model-agnostic traced execution architecture** covering both:
-- **Generalized Traced Inference (`TracedInference<M>`)**: $N$ inputs, $M$ outputs, arbitrary dtypes (F32, BF16, I32, Bool), read-only parameters.
-- **Generalized Traced Training (`TracedTrainingStep<M, O>`)**: Full forward + loss + backward + optimizer update with automated in-place parameter writeback.
+`TracedInference` and `TracedTrainingStep` (below) lift those limits:
+- **`TracedInference`**: $N$ inputs, $M$ outputs, F32 or raw-bit (BF16, I32, Bool) payloads, read-only parameters.
+- **`TracedTrainingStep`**: forward + loss + backward + optimizer update with in-place parameter writeback.
 
 ---
 
-## 2. Unified System Architecture
+## 2. System Architecture
 
 ```
                ┌────────────────────────────────────────────────────────┐
@@ -51,58 +59,56 @@ This document defines a **fully unified, model-agnostic traced execution archite
                     ▼                                     ▼
      ┌─────────────────────────────┐       ┌─────────────────────────────┐
      │      TracedInference        │       │     TracedTrainingStep      │
-     │  - N inputs (any dtype)     │       │  - Forward + Loss + Bwd     │
-     │  - M outputs (any dtype)    │       │  - Optimizer update         │
+     │  - N inputs (F32 or bits)   │       │  - Forward + Loss + Bwd     │
+     │  - M outputs (F32 or bits)  │       │  - Optimizer update         │
      │  - Read-only parameters     │       │  - In-place param writeback │
      │  - Streaming outputs        │       │  - Scalar loss readback     │
      └─────────────────────────────┘       └─────────────────────────────┘
 ```
 
+Both are non-generic structs in `burn-tt` that work on `TtTensor` primitives and a caller-supplied closure.
+Burn-level concerns (walking a `Module`, matching parameters, choosing the optimizer) belong to the caller;
+`tt-mnist` is the one caller today.
+
 ---
 
-## 3. Generalized Traced Inference (`TracedInference<M>`)
+## 3. Traced Inference (`TracedInference`, as built)
 
-### Design
-
-Inference models take arbitrary input structures and return arbitrary output structures:
-- **Vision Models (CNNs / ResNets / ViT)**: `Image [B, C, H, W]` $\rightarrow$ `Logits [B, Classes]`
-- **Object Detection**: `Image [B, C, H, W]` $\rightarrow$ `(BoundingBoxes [B, N, 4], Scores [B, N, Classes])`
-- **Language Models / Transformers**: `(Tokens [B, S], AttentionMask [B, 1, 1, S])` $\rightarrow$ `(Logits [B, S, V], KeyValueCache)`
-- **Multi-Modal Models**: `(Image [B, C, H, W], PromptTokens [B, S])` $\rightarrow$ `Embeddings`
-
-### API Specification
+### API (`crates/burn-tt/src/trace.rs`)
 
 ```rust
-pub struct TracedInference<M> {
-    model: M,
-    trace_id: u64,
-    input_buffers: Vec<BufferDescriptor>,
-    output_buffers: Vec<BufferDescriptor>,
-    _held_tensors: Vec<TtTensor>,
-}
+pub struct TracedInference { /* device, trace id, input and output buffer ids, held tensors */ }
 
-impl<M: Module<TtBackend>> TracedInference<M> {
-    /// Capture any model inference with arbitrary inputs and outputs.
-    pub fn capture<In: TraceableInputs, Out: TraceableOutputs, F>(
-        model: &M,
-        sample_inputs: &In,
-        forward_fn: F,
-    ) -> Result<(Self, Out::HostData), EngineError>
-    where
-        F: FnOnce(&M, &In) -> Out;
+impl TracedInference {
+    /// Capture inference over arbitrary inputs and outputs. `inputs` are resident,
+    /// buffer-owning tensors (not transposed or row views); `f` runs the forward pass
+    /// and returns the output tensors, which must be computed on the device.
+    pub fn capture(
+        inputs: &[&TtTensor],
+        f: impl FnOnce() -> Vec<TtTensor>,
+    ) -> Result<(Self, Vec<server::OutputPayload>), TtError>;
 
-    /// Replay inference with zero host op construction.
-    pub fn run<In: TraceableInputs, Out: TraceableOutputs>(
-        &self,
-        inputs: &In,
-    ) -> Result<Out::HostData, EngineError>;
+    /// Output shapes as stored, `[rows, cols]`.
+    pub fn output_shapes(&self) -> Vec<[usize; 2]>;
+
+    /// Replay with new input payloads (`InputPayload::F32` or `Bits`); one `CALL` per tile.
+    pub fn run(&self, inputs: Vec<server::InputPayload>)
+        -> Result<Vec<server::OutputPayload>, TtError>;
+    pub fn run_timed(&self, inputs: Vec<server::InputPayload>)
+        -> Result<server::GenericTraceRun, TtError>;
 }
 ```
+
+`Trace::capture(&TtTensor, FnOnce() -> TtTensor)` / `Trace::run(Vec<f32>)` remain as the one-input,
+one-output F32 form. A capture refuses a host fallback (a download would be needed) with a panic that ends
+the capture cleanly, and an input or output of another device, a view, or a non-storable dtype with an
+`TtError`. Outputs come back as `OutputPayload::F32` or `OutputPayload::Bits` (raw words for BF16, I32,
+Bool), never as tensors, because the output buffer is rewritten by every replay.
 
 ### Trace Execution Lifecycle (Inference)
 1. **Capture Phase**:
    - `Session::begin_trace()`
-   - Run `forward_fn(model, sample_inputs)`: all Tensix kernels, GEMMs, and mover transfers are recorded.
+   - Run `f()`: all Tensix kernels, GEMMs, and mover transfers are recorded.
    - `Session::end_trace()`
    - Download the outputs of the sample run and return `(TracedInference, first_outputs)`.
 2. **Replay Phase**:
@@ -112,76 +118,69 @@ impl<M: Module<TtBackend>> TracedInference<M> {
 
 ---
 
-## 4. Generalized Traced Training (`TracedTrainingStep<M, O>`)
+## 4. Traced Training (`TracedTrainingStep`, as built)
 
-### Core Challenges & Generalized Solutions
+### A. In-place parameter writeback (`copy_into`)
+- **The problem**: Burn tensors are functional/immutable. `optim.step(lr, model, grads)` allocates fresh `Param` tensors in new GDDR buffers. If captured statically, subsequent replays would continue reading the *initial* parameter buffers, never accumulating weight updates.
+- **The solution, split across two crates**:
+  1. *Caller (`tt-mnist`, `crates/tt-mnist/src/trace.rs`)*: `collect_parameter_updates(&model, &new_model)` runs Burn's `ModuleVisitor` (`ParamCollector`) over the model before and after `optim.step`, matches parameters by `ParamId` and returns `Vec<(new_param, orig_param)>` of `TtTensor` primitives. `ensure_resident(&model)` uploads every parameter beforehand, because a capture forbids host-to-device uploads.
+  2. *`burn-tt`*: `TracedTrainingStep::capture(inputs, f)` calls `f`, which returns `(loss, updates)`. For every `(new, orig)` pair it records an on-device `copy_into(new, orig)` (`server::copy_into`) **before** `Session::end_trace()`, so the writeback is part of the command stream.
+  3. Every replay therefore updates the original buffers in GDDR at the end of the step; the user's `model` keeps pointing at them, so after $N$ replays it holds the trained weights in place.
+- Parameters that are transposed views are refused (`copy_into` needs whole buffers).
 
-#### A. Automated In-Place Parameter Writeback (`copy_into`)
-- **The Problem**: Burn tensors are functional/immutable. `optim.step(lr, model, grads)` allocates fresh `Param` tensors in new GDDR buffers. If captured statically, subsequent replays would continue reading the *initial* parameter buffers, never accumulating weight updates.
-- **The Generalized Solution**:
-  Every parameter in Burn implements `Param<Tensor<B, D>>` with a unique `ParamId`.
-  Using Burn's generic `ModuleVisitor`:
-  1. **Pre-step**: Traverse `model` to collect `(ParamId, OrigBufferId)`.
-  2. **Post-step**: Traverse `new_model` returned by `optim.step()` to collect `(ParamId, NewBufferId)`.
-  3. Match by `ParamId` and emit an on-device `copy_into(src: NewBufferId, dst: OrigBufferId)` for every parameter.
-  4. Because `copy_into` is executed *before* `Session::end_trace()`, it is captured into the trace command stream.
-  5. Every hardware replay automatically updates `OrigBufferId` in GDDR at the conclusion of the step.
-  6. The user's `model` struct continues pointing to `OrigBufferId`, so after $N$ replay steps, the model holds the fully trained weights in-place.
-  - **Generality**: Works for any parameter shape, rank, and module hierarchy without custom code.
+### B. Optimizer state
+- **Stateless optimizers (SGD)** are what is built and gated (`tt-mnist` uses `SgdConfig`): only parameter tensors are written back.
+- **Stateful optimizers (Adam, AdamW)**: not built. Their moment tensors would have to be returned in the `updates` vector as further `(new, orig)` pairs; nothing in `tt-mnist` or `burn-tt` collects them and no gate covers it.
 
-#### B. Optimizer State Handling (Adam, AdamW, Momentum SGD)
-- **Stateless Optimizers (SGD)**: Only parameter tensors are written back.
-- **Stateful Optimizers (Adam, AdamW)**: Maintain first and second moment tensors ($m, v$) keyed by `ParamId`.
-  Burn's `OptimizerAdaptor` exposes these state tensors. During capture, updated state tensors are similarly mapped and written back to their persistent GDDR slots via `copy_into`, enabling stateful optimizers to execute entirely in hardware across replays.
-
-#### C. Loss Readback Without Trace Abort
+### C. Loss readback without trace abort
 - `Session::begin_trace` rejects downloads during capture (`TraceError::HostTransfer`).
-- In traced training, the loss tensor remains resident in GDDR during capture. The loss buffer is registered as the trace's scalar output.
-- During capture, `into_scalar()` is avoided until after `end_trace()`.
-- On each replay step, `s.replay(id)` runs, and only after NC completion is the 4-byte scalar loss downloaded to the host.
+- The loss tensor stays resident during capture and its buffer is the trace's one scalar output.
+- `capture` downloads step 0's loss after `end_trace()`; each `step` replays, then downloads the 4-byte loss (`StepTiming { loss, write_inputs, replay, read_loss }`).
 
-### API Specification
+### API (`crates/burn-tt/src/trace.rs`)
 
 ```rust
-pub struct TracedTrainingStep<M: AutodiffModule<TtBackend>, O: Optimizer<M, TtBackend>> {
-    model: M,
-    optim: O,
-    trace_id: u64,
-    input_buffers: Vec<BufferDescriptor>,
-    loss_buffer: BufferId,
-    _held_tensors: Vec<TtTensor>,
-}
+pub struct TracedTrainingStep { /* device, trace id, input buffer ids, loss buffer id, held tensors */ }
 
-impl<M: AutodiffModule<TtBackend>, O: Optimizer<M, TtBackend>> TracedTrainingStep<M, O> {
-    /// Capture a training step for any Burn model, optimizer, batch, and loss function.
-    pub fn capture<B: TraceableBatch, F>(
-        model: M,
-        optim: O,
-        lr: f64,
-        sample_batch: &B,
-        step_fn: F,
-    ) -> Result<(Self, f32), EngineError>
-    where
-        F: FnOnce(&M, &B) -> Tensor<TtBackend, 1>;
+impl TracedTrainingStep {
+    /// `inputs`: the batch tensors (resident, buffer-owning). `f` runs forward, loss,
+    /// backward and optimizer step and returns `(loss, updates)` with
+    /// `updates = [(new_param, orig_param), ..]`.
+    pub fn capture(
+        inputs: &[&TtTensor],
+        f: impl FnOnce() -> (TtTensor, Vec<(TtTensor, TtTensor)>),
+    ) -> Result<(Self, f32), TtError>;
 
-    /// Replay the entire training step for a new batch in hardware.
-    pub fn step<B: TraceableBatch>(&mut self, batch: &B) -> Result<StepTiming, EngineError>;
-
-    /// Finish training and return the model holding updated weights.
-    pub fn finish(self) -> M;
+    /// Replay the whole step for a new batch.
+    pub fn step(&self, inputs: Vec<server::InputPayload>) -> Result<StepTiming, TtError>;
 }
 ```
 
+`tt-mnist` shows the call pattern (`train_traced` in `crates/tt-mnist/src/main.rs` and
+`transformer.rs`): upload parameters, build the batch tensors, `capture(&[&xp, &yp], || { loss; grads;
+new_model = optim.step(..); (primitive_float(loss), collect_parameter_updates(&model, &new_model)) })`, then
+`step(vec![InputPayload::..])` per batch. There is no `finish()`: the model never moved, and holds the
+trained weights in place.
+
+### Not built: the generic design (historical proposal)
+
+An earlier revision of this document specified `TracedInference<M: Module<TtBackend>>`,
+`TracedTrainingStep<M: AutodiffModule<TtBackend>, O: Optimizer<M, TtBackend>>`, traits
+`TraceableInputs` / `TraceableOutputs` / `TraceableBatch`, `capture(model, optim, lr, sample_batch, step_fn)`
+and `finish() -> M`, with `ModuleVisitor` parameter collection and optimizer-state mapping inside
+`burn-tt`. None of these exist. If a generic wrapper is wanted, it would be a layer above the current
+structs (generalising `collect_parameter_updates` and covering Adam state), not a change to them.
+
 ---
 
-## 5. Dynamic Embedding Lookups in Language Models
+## 5. Dynamic Embedding Lookups in Language Models (design note, 2026-10-05)
 
 In deep learning models with token inputs (Transformers, LLMs):
 - Standard Tensix ops (GEMMs, normalizations, activations, softmax, attention, reductions) operate dynamically on matrix values in GDDR.
 - In `burn-tt`, generic CrossEntropy already uses `index_mask` and `MASK_WHERE`, which dynamically evaluate changed target indices on-device.
-- However, `burn::nn::Embedding` currently uses `float_select` (`gather_rows`) and `float_select_add` (`rows_add`), which bake row indices into mover commands.
+- `burn::nn::Embedding` composes `float_select` (gather rows) and `float_select_add` (`embedding_backward`), which at the time of writing baked row indices into mover commands. `tt-mnist`'s traced transformer step captures the embedding with token ids as a trace input; whether changed ids take effect on replay through this path is not asserted separately by the gates in section 7, so verify before relying on it.
 
-### Generalized Solutions:
+### Alternative solutions:
 1. **One-Hot GEMM Path**:
    For vocabulary $V$ and batch tokens $N$, express the lookup as $X_{\text{one\_hot}} \times W_{\text{embed}}$, with backward $X_{\text{one\_hot}}^T \times dY$. Both passes are standard 2D GEMMs that operate dynamically over arbitrary token batches in GDDR without recompiling the trace.
 2. **Backbone Tracing**:
@@ -189,112 +188,73 @@ In deep learning models with token inputs (Transformers, LLMs):
 
 ---
 
----
+## 6. Implemented Architecture & Code Additions (2026-10-05)
 
-## 6. Implemented Architecture & Code Additions (Completed 2026-10-05)
+### Layer 1: Core runtime (`tt-kernels`)
+1. **`crates/tt-kernels/src/tensor.rs`**: `pub fn copy_into(src: &DramTensor, dst: &DramTensor, units: usize) -> Result<Work>`, emitting `record::READ_RUN` from `src` and `record::WRITE_RUN` to `dst`: executed in hardware without host interaction and recorded cleanly into traces.
+2. **`crates/tt-kernels/src/session.rs`**: `Session::copy_into` (plus `copy_into_bfp`, `copy_into_bf16`) and `Session::write_bits(&DramTensor, &[u32])`, enabling non-F32 replay writes (`I32`, `Bool`, `BF16`).
 
-The generalized traced execution architecture is fully implemented, verified, and merged on `feature/traced-execution`:
+### Layer 2: Burn backend (`burn-tt`)
+1. **`crates/burn-tt/src/server.rs`**: `copy_into` and `write_bits` handlers; unified multi-buffer replay `run_generic_trace` (multi-input write, single-entry `CALL` replay, multi-output and scalar download); `InputPayload` / `OutputPayload` / `OutputKind`.
+2. **`crates/burn-tt/src/trace.rs`**: `Trace`, `TracedInference`, `TracedTrainingStep` and `StepTiming`, as described in sections 3 and 4. No generic traits, and no `ModuleVisitor` use.
+3. **`crates/burn-tt/src/tensor.rs`**: `ensure_resident()` and `download_device()` on `TtTensor`.
+4. **`crates/burn-tt/src/lib.rs`**: re-exports `Trace`, `TracedInference`, `TracedTrainingStep`, `StepTiming`, `InputPayload`, `OutputPayload`, `GenericTraceRun`.
 
-### Layer 1: Core Runtime (`tt-kernels`)
-1. **[`crates/tt-kernels/src/tensor.rs`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/tensor.rs)**:
-   - Added `pub fn copy_into(src: &DramTensor, dst: &DramTensor, units: usize) -> Result<Work>`.
-     Reuses `dst.tensor_ref()` as the destination `ro`, emitting `record::READ_RUN` from `src` and `record::WRITE_RUN` to `dst`. This executes in hardware without host interaction and records cleanly into hardware traces.
-2. **[`crates/tt-kernels/src/session.rs`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/session.rs)**:
-   - Added `pub fn copy_into(&mut self, src: &DramTensor, dst: &DramTensor) -> Result<(), TensorError>`.
-   - Added `pub fn write_bits(&mut self, t: &DramTensor, values: &[u32]) -> Result<(), TensorError>`, enabling non-F32 replay writes (`I32`, `Bool`, `BF16`).
-
-### Layer 2: Burn Backend (`burn-tt`)
-1. **[`crates/burn-tt/src/server.rs`](file:///mnt/nvme/metalium-rs/crates/burn-tt/src/server.rs)**:
-   - Added `copy_into` and `write_bits` handlers on `Server`.
-   - Added unified multi-buffer trace replay: `run_generic_trace` executing multi-input writing, single-entry hardware `CALL` replay, and multi-output/scalar downloading.
-2. **[`crates/burn-tt/src/trace.rs`](file:///mnt/nvme/metalium-rs/crates/burn-tt/src/trace.rs)**:
-   - Defined generic trace traits: `TraceableInputs`, `TraceableOutputs`, `TraceableBatch`.
-   - Implemented `TracedInference<M>` supporting arbitrary inputs, outputs, and dtypes.
-   - Implemented `TracedTrainingStep<M, O>`:
-     - Extracts parameter IDs and persistent GDDR buffers via Burn's `ModuleVisitor`.
-     - Automatically issues `copy_into` before `end_trace()` to write updated weights and optimizer states into persistent parameter slots.
-     - Preserves loss on device during capture and downloads 4-byte scalar loss on each replay step.
-3. **[`crates/burn-tt/src/tensor.rs`](file:///mnt/nvme/metalium-rs/crates/burn-tt/src/tensor.rs)**:
-   - Added `download_device()` and `ensure_resident()` to allow lazy tensor resident staging.
-4. **[`crates/burn-tt/src/lib.rs`](file:///mnt/nvme/metalium-rs/crates/burn-tt/src/lib.rs)**:
-   - Exported `TracedInference`, `TracedTrainingStep`, and tracing traits.
-
-### Layer 3: Model Workloads (`tt-mnist`)
-1. **[`crates/tt-mnist/src/trace.rs`](file:///mnt/nvme/metalium-rs/crates/tt-mnist/src/trace.rs)**:
-   - Added `collect_parameter_updates` and `ensure_resident` helpers.
-2. **[`crates/tt-mnist/src/main.rs`](file:///mnt/nvme/metalium-rs/crates/tt-mnist/src/main.rs)**:
-   - Added `--train-trace` flag and `--hidden <HIDDEN_SPEC>` (e.g. `512,256`) to configure MLP architecture.
-   - Implemented `train_traced` for MNIST MLP via `TracedTrainingStep`.
-3. **[`crates/tt-mnist/src/transformer.rs`](file:///mnt/nvme/metalium-rs/crates/tt-mnist/src/transformer.rs)**:
-   - Implemented `train_traced` for `TinyTransformer` via `TracedTrainingStep`.
+### Layer 3: Model workloads (`tt-mnist`)
+1. **`crates/tt-mnist/src/trace.rs`**: `ParamCollector` (a `ModuleVisitor`), `collect_parameter_updates`, `ensure_resident`, and primitive-extraction helpers.
+2. **`crates/tt-mnist/src/main.rs`**: `--train-trace` and `--hidden <HIDDEN_SPEC>` (e.g. `512,256`); `train_traced` for the MNIST MLP.
+3. **`crates/tt-mnist/src/transformer.rs`**: `train_traced` for `TinyTransformer`.
 
 ---
 
-## 7. Verification & Empirical Results (Completed)
+## 7. Verification & Results
 
-### 7.1. Test Suites & Gates Passed
-- **[`step40_burn_trace`](file:///mnt/nvme/metalium-rs/crates/tt-tests/tests/step40_burn_trace.rs)**: 5/5 tests passing:
-  - `burn_trace_single_tile`: Single tile forward replay bit-for-bit parity.
-  - `burn_trace_refuses_host_fallback`: Rejects host fallback without leaving session wedged.
-  - `burn_trace_multi_input`: Multi-input/multi-output inference tracing across dtypes.
-  - `burn_trace_training_step`: In-place parameter writeback and loss decrease across replay steps.
-  - `burn_trace_transformer_training_step`: Transformer encoder + head traced training step.
-- **Golden Parity**: `cargo test -p tt-tests --features e2e --test step12_mnist` passes bit-for-bit with golden trajectory.
-- **Transformer Regression**: `cargo test -p tt-tests --test step59_burn_transformer` passes.
-- **Static Analysis & Architecture Checks**:
-  - `cargo fmt --all --check` (0 errors).
-  - `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings).
-  - `cargo clippy --workspace --all-targets --features tt-tests/silicon -- -D warnings` (0 warnings).
-  - `cargo xtask check-no-sim-in-ship` and `check-no-flex-in-backend` (passed).
+### 7.1. Gates
+- **`crates/tt-tests/tests/step40_burn_trace.rs`** (5 tests):
+  - `a_traced_forward_pass_is_the_fresh_one`: single-input trace replays the fresh forward pass.
+  - `a_capture_that_downloads_to_the_host_is_refused_and_ends`: a host fallback is refused without leaving the session capturing.
+  - `generalized_inference_trace_multi_input_multi_output`: multi-input/multi-output tracing across dtypes.
+  - `traced_training_step_updates_weights_in_place_and_reduces_loss`: in-place parameter writeback and loss decrease across replays.
+  - `transformer_traced_training_runs_and_loss_decreases`: `TinyTransformer` traced training for three steps.
+- `step12_mnist` (golden trajectory and `compare_all_four_execution_modes_latency_and_traffic`, which includes traced replay with and without fusion) and the `step59_burn_transformer` regression.
 
-### 7.2. Physical Silicon Benchmarks (`/dev/tenstorrent/0`)
+### 7.2. Silicon measurements
 
-Evaluated on physical Blackhole silicon vs. a 12-core AMD EPYC 7443 CPU baseline:
+Measured numbers live in [performance-log.md](../learnings/performance-log.md) and are not repeated here.
+The relevant entries: the scoreboard rows "MNIST training, card 0, 1 tile" (1.4 ms/step against burn-flex 0.5) and
+"Transformer training" (8.8 ms/step against burn-flex 4.35); the 2026-10-03 change-log rows for traced MNIST
+inference (a batch on 8 tiles in about 0.2 ms); and "Kernel Fusion & Traced Execution Performance Comparison
+(2026-10-06)", run `1791257827`, which compares eager and traced, fused and unfused forward passes on both cards.
 
-#### 1. Toy MNIST MLP (100k parameters: $784 \to 128 \to 10$)
-| Execution Mode | Precision | Device | Time / Step (Batch 64) | Inference Throughput (Batch 512) |
-|---|---|---|---|---|
-| Untraced Eager | F32 | 1 Tensix Tile | 1.07 ms | 134,800 img/s |
-| **Traced Hardware Replay** | **F32** | **1 Tensix Tile** | **0.86 ms** (-20% host overhead) | **145,150 img/s** |
-| Untraced Eager | BF16 | 1 Tensix Tile | 1.15 ms | 130,200 img/s |
-| Untraced Eager | F32 | 12-Core AMD EPYC CPU | 1.12 ms | 94,152 img/s |
-
-#### 2. Realistic Multi-Layer MNIST MLP (535k parameters: $784 \to 512 \to 256 \to 10$)
-| Execution Mode | Precision | Hardware Setup | Metric | Performance |
-|---|---|---|---|---|
-| **Eager Step (1 Tile)** | F32 | 1 Tensix Tile | Training Step Time | **99.45 ms/step** (outperforms 12-core CPU) |
-| Eager Step (CPU) | F32 | 12-Core AMD EPYC CPU | Training Step Time | 102.03 ms/step |
-| **Traced Inference (1 Tile)** | F32 | 1 Tensix Tile | Inference Throughput | **145,150 img/s** ($1.54\times$ faster than CPU) |
-| **Traced Inference (8 Tiles)** | F32 | 8 Tensix Tiles | Inference Throughput | **205,301 img/s** ($2.18\times$ faster than CPU) |
-| Inference (CPU) | F32 | 12-Core AMD EPYC CPU | Inference Throughput | 94,152 img/s |
-
-#### 3. Transformer Workload (`TinyTransformer`: Embedding + Self-Attention + MLP Head)
-- **Traced Training**: 4.19 ms/step on 1 Tensix tile vs. 4.67 ms/step untraced eager mode.
-- Validated parameter updates and continuous loss decrease across hardware replay cycles.
-
+*Historical, withdrawn:* an earlier revision of this section tabulated "99.45 ms/step beats the CPU" for a 535k-parameter MLP, a
+1.12 ms CPU MNIST step, 145,150 / 205,301 img/s inference and "4.19 ms/step traced transformer training".
+None of these are recorded on the scoreboard or in the change log, and the CPU step time contradicts the
+burn-flex baseline there (0.5 ms), so they are removed rather than carried forward.
 
 ---
 
 ## 8. Scaling Roadmap & Future Work
 
-Empirical evaluations on physical Tenstorrent Blackhole silicon (`/dev/tenstorrent/0`) demonstrate that hardware tracing delivers significant speedups over host-dispatched execution and CPU baselines. On a production-scale 535k-parameter MNIST MLP ($784 \to 512 \to 256 \to 10$):
-- **Single Tensix Tile vs. 12-Core AMD EPYC 7443 CPU**:
-  - **Training Step**: Blackhole achieves **99.45 ms/step** vs. CPU **102.03 ms/step**.
-  - **Inference Throughput (Batch 512)**: Blackhole achieves **145,150 img/s** vs. CPU **94,152 img/s** (1.54× faster).
-- **Multi-Tile Scaling (`--tiles 8`)**:
-  - Inference throughput scales to **205,301 img/s** (2.18× faster than the 12-core CPU).
+Everything in this section is open work (it is also tracked in [roadmap.md](roadmap.md)).
+Measured traced-execution results are on the scoreboard and in the change log of
+[performance-log.md](../learnings/performance-log.md): MNIST training is 1.4 ms/step on one
+tile against 0.5 ms for burn-flex on the host, the transformer 8.8 against 4.35, and a traced MNIST
+forward pass replays in about 150 us a batch on the card (run `1791257827`). Hardware traces remove host op
+construction, not the device cost, and they do not yet make training faster than the CPU.
 
-To scale traced execution from single-tile benchmarks to large deep learning models across multiple Tensix cores, full chips (140 tiles), and multi-card clusters (p150a mesh), four architectural frontiers must be addressed:
+To scale traced execution from single-tile benchmarks to large models across many Tensix cores, a full chip
+(120 compute tiles on a p150a; ttsim models 140) and multi-card clusters (p150a mesh), four architectural
+frontiers must be addressed:
 
 ### 8.1. Trace Cache Segmentation & Instruction Streaming
 
 #### Physical Constraint: 240 KB L1 Program Cache
-Each Tensix tile provides 1.5 MB of local L1 SRAM, of which **240 KB** is strictly dedicated to the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`).
-When capturing a multi-layer network's entire training step (forward pass, loss, backward pass, optimizer momentum updates, and parameter writebacks) on a single tile, the unrolled kernel instruction stream exceeds 240 KB. This triggers:
+Each Tensix tile provides 1.5 MiB of local L1 SRAM (`tt_isa::tensix::L1_SIZE`), of which **240 KiB** is left for the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`: L1 after the program slots and the 16 KiB trace buffer).
+When capturing a large enough network's entire training step (forward pass, loss, backward pass, optimizer updates, and parameter writebacks) on a single tile, the unrolled kernel instruction stream can exceed 240 KiB. `Session` then refuses with:
 ```text
 a list's programs do not fit an empty program cache
 ```
-While inference traces fit comfortably within 240 KB (e.g. 535k MLP inference uses <80 KB), deep training graphs require program cache management.
+The MNIST and `TinyTransformer` traces captured today fit; deeper training graphs would need program cache management.
 
 #### Architectural Solution:
 1. **Instruction Segment Chunking**:
@@ -304,17 +264,17 @@ While inference traces fit comfortably within 240 KB (e.g. 535k MLP inference us
      - Segment 2: Optimizer step & in-place `copy_into` writebacks.
    - The firmware `CALL` dispatcher pages in program chunks from GDDR on demand, evicting completed segments while preserving intermediate data buffers in L1/GDDR.
 2. **Spatial Program Sharding**:
-   - Distribute operations across multiple Tensix tiles ($N \ge 4$). Because each tile only receives the mover and compute instructions for its assigned tensor shards, the per-tile program footprint drops proportionally by $1/N$, fitting within the 240 KB threshold.
+   - Distribute operations across multiple Tensix tiles ($N \ge 4$). Because each tile only receives the mover and compute instructions for its assigned tensor shards, the per-tile program footprint drops proportionally by $1/N$, fitting within the 240 KiB threshold.
 
 ---
 
 ### 8.2. Distributed Data Parallel (DDP) Training
 
-Current multi-tile execution decomposes individual matrix multiplications across tiles via spatial blocks (`SpatialDecomposition` in `tt-kernels`). While ideal for inference latency, training large batch sizes achieves maximum hardware efficiency through **Data Parallelism**.
+Current multi-tile execution divides each operation's tile units across the tiles of one chip (`TileChoice`, `Session::enable_dram`; see [streaming-dataflow-architecture.md](../learnings/streaming-dataflow-architecture.md)). While ideal for inference latency, training large batch sizes achieves maximum hardware efficiency through **Data Parallelism**.
 
 #### Architectural Design:
 1. **Tile-Group Replicas**:
-   - Partition the 140 Tensix tiles on a Blackhole chip into independent replica groups (e.g. 4 groups of 32 tiles, or 8 groups of 16 tiles).
+   - Partition the 120 compute tiles of a p150a into independent replica groups (e.g. 4 groups of 30 tiles, or 8 groups of 15 tiles).
    - Replicate model weights across all groups; partition each minibatch across groups along the batch dimension $B$.
 2. **On-Chip AllReduce via Tensix NoC Rings**:
    - At the completion of the backward pass, each group holds local parameter gradients $\nabla W_k$.
@@ -327,8 +287,8 @@ Current multi-tile execution decomposes individual matrix multiplications across
 
 ### 8.3. Multi-Card Scaling (Inter-Card Ethernet Fabric)
 
-Tenstorrent Blackhole cards (such as the dual-p150a PCIe platform) are connected via high-speed 400 Gbps Ethernet channels. The workspace already provides foundational inter-card building blocks:
-- `tt_kernels::mesh::MeshEngine` and `Fabric` abstraction.
+Tenstorrent Blackhole cards (such as the dual-p150a PCIe platform) are connected via 400 Gbps Ethernet links (one link measures 48-51 GB/s on the wire, see the scoreboard). The workspace already provides foundational inter-card building blocks:
+- `tt_kernels::shard::Fabric` and `burn_tt::MeshEngine` (`kmd_mesh_engine`). Mesh traces cover inference only (`step147`); mesh training traces are unsupported.
 - Multi-device sessions (`--cards 0,1`).
 - Tensix Ethernet mover cores (E1 customer core).
 
@@ -344,6 +304,8 @@ Tenstorrent Blackhole cards (such as the dual-p150a PCIe platform) are connected
 
 ### 8.4. L1 SRAM Operator Fusion (Norm, Activations, Attention)
 
+Status: only the MVP `ADD_RELU` / `RELU` fuser exists; the general fuser, matmul epilogue and reduce-map fusers are specified in [kernel-fusion.md](kernel-fusion.md) and are open.
+
 In standard eager execution, every intermediate operation writes its output back to GDDR and re-reads it in the subsequent kernel:
 $$\text{Linear} \xrightarrow{\text{GDDR}} \text{LayerNorm} \xrightarrow{\text{GDDR}} \text{GELU} \xrightarrow{\text{GDDR}} \text{Linear}$$
 On modern accelerators like Blackhole, memory bandwidth (GDDR) is the primary performance bottleneck for non-GEMM operators.
@@ -353,7 +315,7 @@ On modern accelerators like Blackhole, memory bandwidth (GDDR) is the primary pe
    - Fuse bias addition, activation functions (ReLU, GELU, SiLU), and dropout directly into the packer/NC writer pipeline before writing out of Tensix L1 SRAM.
    - Tensix math/pack cores can evaluate element-wise SFPU functions on Dst registers directly before packing to GDDR, eliminating intermediate round-trips.
 2. **Fused Normalization**:
-   - Replace composed multi-kernel LayerNorm/RMSNorm (mean reduction $\to$ variance reduction $\to$ normalize $\to$ affine scale) with a single-pass L1 fused kernel that computes statistics within the tile's 1.5 MB SRAM.
+   - Replace composed multi-kernel LayerNorm/RMSNorm (mean reduction $\to$ variance reduction $\to$ normalize $\to$ affine scale) with a single-pass L1 fused kernel that computes statistics within the tile's 1.5 MiB SRAM.
 3. **Fused FlashAttention for Transformers**:
    - Implement tiled online softmax attention ($Q K^T / \sqrt{d} \to \text{Softmax} \to V$) operating entirely in Tensix L1 staging buffers.
    - Prevents materializing the $O(S^2)$ attention matrix in GDDR, yielding major speedups for language models and Vision Transformers (`TinyTransformer`).
@@ -371,7 +333,7 @@ streaming ownership is the only GDDR compute scheduler, fresh and traced, and
 captures retain both the reader and the writer stream. The generation rebasing,
 program holds, chunk-boundary behaviour, NC fetch and recovery rules are described
 there, with the tests that cover them and the overlap thresholds a capture uses
-([measurements](../learnings/firmware-performance.md#streaming-ownership-rollout)).
+([measurements](../learnings/performance-log.md#streaming-ownership-rollout)).
 
 `Session::enable_dram(b, nc)` is the only setup; `TT_PIPELINE=0` serializes slot
 reuse but keeps NC as the writer. The legacy wave, B-only pipeline and

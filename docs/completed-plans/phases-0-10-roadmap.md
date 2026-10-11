@@ -1,26 +1,33 @@
 # Master Roadmap: Rust-Native Software Stack for Tenstorrent Blackhole → Burn Backend
 
+> **Archived 2026-10-10:** Phases 0-10 are closed or tracked as open items in
+> [../plans/roadmap.md](../plans/roadmap.md). This file is the architecture and phase design
+> rationale; do not add new work here.
+
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
 for completed packed BF16/K/batched/mesh paths, pooling traces, integer reductions,
 extremum scans, hardware precision modes, accuracy results and remaining work.
-Checked integer division/remainder is disabled after a failing simulator gate.
+Checked integer division/remainder passes `step82` in ttsim and is done
+([hardware-coverage.md](hardware-coverage.md)); the earlier "disabled" status is superseded.
 Ordinary validation uses one card; both cards are reserved for actual mesh tests
 or device-specific investigations per the user's instruction. Historical two-card
 requirements below are superseded for ordinary validation.
 
 
-**Status:** Phases 0–8 closed on ttsim and silicon; Phase 9 (performance) and Phase 10
-(hardware coverage) in progress. Current state per item is in the checklist.
-**Target hardware:** Blackhole A0 (p100 / p150)
+**Status:** Phases 0–8 closed on ttsim and silicon; Phase 10 (hardware coverage) closed
+2026-10-10 ([close-out record](hardware-coverage-closeout.md)); Phase 9
+(performance) is open-ended and tracked in [roadmap.md](../plans/roadmap.md). Current state per item
+is in the checklist.
+**Target hardware:** Blackhole A0 (p100 / p150a / p300)
 **Spec source:** `tt-isa-documentation` @ `f848eb6` (2026-09-18)
-**Working checklist:** [`implementation-checklist.md`](implementation-checklist.md)
+**Working checklist:** [`phases-0-10-checklist.md`](phases-0-10-checklist.md)
 — per-phase tick-list, current state, and the verification backlog as actual checkboxes.
 **Hardware coverage tracker:** [`hardware-coverage.md`](hardware-coverage.md)
 — Phase 10: which Tensix units and Burn ops run on the device, and the order the rest arrives.
 **Implementation guides:** [`../learnings/tt-metal-concepts-review.md`](../learnings/tt-metal-concepts-review.md)
 — Tenstorrent-system concepts we lack or do differently (G1–G16), and the hardware sharp
-edges to handle in code; [`burn-backend-parity.md`](burn-backend-parity.md) — what
+edges to handle in code; [`burn-backend-parity.md`](../plans/burn-backend-parity.md) — what
 `burn-tt` needs to be a CUDA-grade Burn backend (roadmap B0–B16).
 
 ---
@@ -157,7 +164,7 @@ crates/
   burn-tt/             # the Burn backend
   tt-tests/            # ttsim and silicon gates (stepNN_*, probe_*, silicon_*)
   tt-mnist/            # shippable binary: MNIST training on the card
-xtask/                 # gen-cfg, gen-isa, gen-burn-delegate, silicon, fetch-*, check-no-sim-in-ship
+xtask/                 # gen-cfg, gen-isa, gen-burn-ops, silicon, fetch-*, check-no-sim-in-ship
 vendor/                # pinned specification checkout (PINS.toml)
 ```
 
@@ -514,7 +521,7 @@ The list, with what is closed, is the checklist's "Silicon-verification backlog"
 
 | Resource | URL | Use |
 |---|---|---|
-| ttsim | https://github.com/tenstorrent/ttsim | **Golden reference simulator and primary development target.** Full-system (L1, NoC, PCIe), bit-exact by design, Blackhole single- and multi-chip. See `docs/libttsim_api.md` for the C API |
+| ttsim | https://github.com/tenstorrent/ttsim | **Golden reference simulator and primary development target.** Full-system (L1, NoC, PCIe), bit-exact by design, Blackhole single- and multi-chip. The C API is ten `libttsim_*` entry points, declared in [`crates/tt-ttsim-sys/src/lib.rs`](../../crates/tt-ttsim-sys/src/lib.rs) and wrapped by [`crates/tt-ttsim`](../../crates/tt-ttsim/README.md) |
 | tt-kmd | https://github.com/tenstorrent/tt-kmd | Kernel driver; ioctl definitions |
 | tt-metal `cfg_defines.h` | https://github.com/tenstorrent/tt-metal/blob/81989dcdb8f9b340c932ae7a71a346f4f08703eb/tt_metal/hw/inc/blackhole/cfg_defines.h | `Field_ADDR32` / `_MASK` / `_SHAMT` for every config field — the input to `cargo xtask gen-cfg`. Cited directly by `BackendConfiguration.md` |
 | TT-LLK | https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/tt-llk | C++ implementation of the layer being reimplemented — reference for *what works*, not for design |
@@ -538,7 +545,8 @@ it means either the simulator, the docs, or your understanding is wrong.
 a singleton-enforcing safe API; plus the `Transport` trait in `tt-device` with a `LibTtsim`
 implementation.
 
-**References:** ttsim `docs/libttsim_api.md`, ttsim `README.md`.
+**References:** `crates/tt-ttsim-sys/src/lib.rs` (the ten-symbol C API; signatures come from ttsim's own
+`docs/libttsim_api.md`, which is not vendored here), `crates/tt-ttsim/README.md`, ttsim `README.md`.
 
 **Gate (simulator):** a Rust test calls `libttsim_init`, reads PCI config space, confirms the
 expected Blackhole device ID, and advances time with `libttsim_clock` without crashing.
@@ -564,7 +572,7 @@ window, read it back through a *different* window, bytes match. Repeat against a
 validate coordinate handling, and against `bh_x2` to validate chip indexing.
 
 **Gate (silicon):** the same test against a real p150, and across two cards if available.
-**Closed** — 7/7 on both p150a cards. See `implementation-checklist.md`, and the operating
+**Closed** — 7/7 on both p150a cards. See `phases-0-10-checklist.md`, and the operating
 notes below it, which every later silicon gate depends on.
 
 **Hazards:** multiple coordinate systems exist and are mutually incompatible. Establish the
@@ -768,8 +776,9 @@ Verified against `burn-backend 0.21.0`, `burn-ir 0.21.0` and `burn-fusion 0.21.0
   `BoolTensorOps` 28 of 39, `ModuleOps` 18 of 73, `QTensorOps` 13 of 80;
   `ActivationOps` and `TransactionOps` are all defaults. Burn does not compose the
   rest from a handful of primitives, so "implement matmul, add, relu, reshape and let
-  the defaults do the rest" cannot typecheck. **Consequence for Phase 7:** `burn-tt`
-  starts as a *delegating* backend -- its tensor primitive wraps a `burn-flex`
+  the defaults do the rest" cannot typecheck. **Consequence for Phase 7 (historical; the delegating backend described here was replaced
+  by the native cutover, see below and [burn-native-cutover.md](../plans/burn-native-cutover.md)):**
+  `burn-tt` started as a *delegating* backend -- its tensor primitive wraps a `burn-flex`
   tensor, every required op delegates to `burn-flex` on the host, and the ops worth
   running on Tensix (matmul first, via `tt_kernels::matmul::matmul`) are routed to
   the device. Correct from day one, and each op moved to the device is a change
@@ -787,7 +796,12 @@ Verified against `burn-backend 0.21.0`, `burn-ir 0.21.0` and `burn-fusion 0.21.0
   retargeting CubeCL. It is still Phase 9 work; Phase 7 needs only that the door
   is open, and it is.
 
-#### As built (2026-09-30)
+#### As built (2026-09-30, historical)
+
+> **Superseded.** The delegation to `burn-flex` and `gen-burn-delegate` below describe Phase 7
+> as it closed. The native cutover removed Flex from `burn-tt`: routing is the `OVERRIDDEN`
+> list in `xtask/src/gen_burn.rs`, and an unsupported op, shape or dtype fails explicitly
+> instead of forwarding to the host. See [burn-native-cutover.md](../plans/burn-native-cutover.md).
 
 * **Delegation is generated, and defaults are left alone.** `cargo xtask
   gen-burn-delegate` forwards every op method *Flex implements* to Flex and leaves
@@ -973,7 +987,7 @@ Burn submission and fresh/traced streaming ownership are implemented. B reads
 GDDR on NoC0, T0–T2 execute resident compute scripts and NC writes GDDR on NoC1;
 one host B packet dispatches the region. The legacy executors have been removed.
 The latest performance baseline remains the 2026-10-03 measurements in
-`firmware-performance.md`; new full reductions have not been benchmarked here.
+`performance-log.md`; new full reductions have not been benchmarked here.
 Remaining: host/per-request overhead, ownership tuning, concurrent profiling,
 Ethernet pipelining and a device-resident multi-card mesh (9.11).
 
@@ -996,9 +1010,10 @@ and pooling are described below.
 **Current tranche (2026-10-06):** logical-F32 BFP storage, device conversions,
 packed products, Burn propagation/autodiff/fusion/traces and MNIST precision
 policies pass both cards. D2 is complete for the delivered BFP8/4/2 formats;
-`a` variants, packed mesh and portable quantization remain deferred. S7 is done since the Phase 10 close-out (2026-10-10): Burn random draws on the device with native seeded kernels (step140-142; cards 0 and 1), and refuses random inside a trace rather than repeat a seed. See [the current contract and validation](mixed-bfp-storage.md).
+`a` variants, packed mesh and portable quantization remain deferred. S7 is done since the Phase 10 close-out (2026-10-10): Burn random draws on the device with native seeded kernels (step140-142; cards 0 and 1), and refuses random inside a trace rather than repeat a seed. See [the current contract and validation](../plans/mixed-bfp-storage.md).
 
-**Current milestone (2026-10-05):** 10.0–10.2 complete; 10.3–10.5 in progress.
+**Milestone status as of 2026-10-05 (historical; Phase 10 closed 2026-10-10):** 10.0–10.2
+complete; 10.3–10.5 were in progress.
 Reduction/scan, norm-composition, I32 ALU and deterministic cast/rounding
 extensions have simulator gates (`step69`–`step72`); a typed FPU SrcB transpose
 has TF32 coverage (`step73`). `step67`–`step73` pass both cards (run `1791145571`).
@@ -1018,7 +1033,7 @@ by L1/program capacity; the GDDR path chunks larger shapes and stays resident.
 Gates: `step63_burn_full_reduce`, `step59_burn_transformer`.
 Packed BF16 gathers/K continuations/batching, mesh execution, pooling traces,
 integer reductions, extremum scans and hardware precision modes now have gates.
-Next: checked integer division/remainder (currently disabled), general GMPOOL
+Then-next (all since closed, including checked integer division/remainder, `step82`): general GMPOOL
 semantics/window staging, M3 tensor transpose, general D4 indexing and
 convolution/attention. See the current implementation record for evidence and
 remaining negative controls.
@@ -1285,6 +1300,8 @@ Wormhole-sourced behaviour.
 ## Open questions
 
 Tracked, with what has been answered, in the checklist's "Open questions". Still open as of
-2026-10-01: Blackhole I-cache capacities (1), debug-interface parity (2), PCIe DMA (5), how
-faithfully ttsim models I-cache invalidation (6, in part), and whether ttsim models the
-documented hardware bugs (7).
+2026-10-01: Blackhole I-cache capacities (1), how faithfully ttsim models I-cache
+invalidation (6, in part), and whether ttsim models the documented hardware bugs (7).
+Debug-interface parity (2) and PCIe DMA (5) are out of scope: the Phase 10 close-out marks
+them `[-]` (GDB stub and PCIe DMA engines; see "Out of scope, and why" in
+[hardware-coverage.md](hardware-coverage.md)).

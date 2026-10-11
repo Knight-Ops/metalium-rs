@@ -44,6 +44,12 @@ fn main() {
             tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE,
         );
     }
+    // The `.ttinsn` experiment image, linked as the T1 role image is
+    // (`docs/plans/ttinsn-push-experiment.md`). Only when the feature is on: cargo
+    // refuses link arguments for a binary it is not building.
+    if std::env::var_os("CARGO_FEATURE_TTINSN_EXPERIMENT").is_some() {
+        link("ttinsn_t1", "link_t1.x", tt_isa::mailbox::MAILBOX_BASE);
+    }
     for f in [
         "link.x",
         "link_t1.x",

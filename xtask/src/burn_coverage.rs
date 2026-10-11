@@ -141,7 +141,7 @@ fn render(
          **Unsupported** methods fail explicitly with `burn-tt: unsupported operation`; each\n\
          carries a `[-]` disposition with its reason.\n\
          The per-method Device and Item notes remain in\n\
-         [hardware-coverage.md](hardware-coverage.md#burn-op-coverage).\n\n",
+         [burn-op-notes.md](burn-op-notes.md).\n\n",
     );
     for (tr, methods) in traits {
         let hand = gen_burn::hand_methods(overridden, tr);

@@ -336,7 +336,7 @@ fn the_element_pairing_matches_burn() {
     use burn_tensor::{Tensor, TensorData};
 
     // In Burn 0.21 the associated `Device` lives on `BackendTypes`, not on
-    // `Backend` — one of the restructurings `docs/plans/master-roadmap.md`'s Phase 7
+    // `Backend` — one of the restructurings `docs/completed-plans/phases-0-10-roadmap.md`'s Phase 7
     // supertrait list predates. Naming the concrete device type sidesteps it.
     type B = burn_flex::Flex;
     let device = burn_flex::FlexDevice;

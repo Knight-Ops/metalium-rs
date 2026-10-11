@@ -105,7 +105,7 @@ Burn propagation and actual MNIST MLP/CNN precision policies on both cards.
 Full SMOKE passed 364/364 (`1791300502`), final BFP controls 28/28
 (`1791301208`), and PRNG diagnostics 4/4 (`1791302401`). See
 [the contract and completed checklist](mixed-bfp-storage.md) and the
-[measured conversion costs and accuracy observations](../learnings/firmware-performance.md).
+[measured conversion costs and accuracy observations](../learnings/performance-log.md).
 BFP `a` variants, INT8/UINT8, packed mesh transport and portable Burn
 `QTensorOps` remain deferred. Burn random draws on the device (S7, step142): the seeded
 tile kernels' uniform, Bernoulli and normal distributions, with host construction only for a device
@@ -122,20 +122,7 @@ acceptance items; this does not close the entire backend inventory.
 
 ### M1 matrix elementwise continuation (2026-10-06)
 
-- [x] Explicit `ElementwiseMode::Matrix { precision, fidelity }` before single-card
-      attachment; constructors still default to SFPU. The mode snapshot preserves
-      asynchronous dispatch and does not survive detachment/reattachment.
-- [x] Native floating add/subtract/multiply and scalar dispatch intercept packed
-      BF16 before widening, accumulate in F32 and narrow at the output boundary.
-- [x] Equal-shape and RHS row/column/scalar geometry, resident views, ragged
-      padding, trace holds and deferred frees; unsupported geometry/mesh mode
-      fails explicitly. Integer and other operation families retain routing.
-- [x] Step90 records matrix dispatches, audits actual role instructions and checks
-      native arithmetic/analytic gradients with no intermediate downloads.
-- [x] Final continuation acceptance is recorded in hardware-coverage.md: both-card
-      targeted gates 24/24, full smoke 322/322, release baseline `1791255969`,
-      workspace/Clippy/generator/shipping checks and unchanged MNIST golden.
-
-Benchmarks and matrix numerical/special-value contracts are in the learnings
-files. The opt-in permits reduced Src/alignment precision; no universal speedup
-or IEEE special-value behavior is promised.
+The checklist and its acceptance record are kept once, in
+[tensix-next-features.md](../completed-plans/tensix-next-features.md#m1-matrix-elementwise-continuation-2026-10-06);
+the kernel-level checklist is in [hardware-coverage.md](../completed-plans/hardware-coverage.md). Matrix-mode
+elementwise is an explicit opt-in (`ElementwiseMode::Matrix`); SFPU remains the default.

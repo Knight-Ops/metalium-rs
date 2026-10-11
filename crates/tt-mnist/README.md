@@ -16,14 +16,16 @@ API 2). No Python, C++ or TT-Metalium.
 ## Run
 
 ```text
-tt-mnist [--model mnist|cnn] [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
+tt-mnist [--model mnist|cnn|transformer] [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host]
 ```
 
 | Flag | Meaning |
-| `--model cnn` | Conv2D 1→8 (5×5, stride 4), ReLU, average pool 2×2, Linear 72→10; 938 parameters. Training/inference and single-card traces share the MLP execution paths. |
 |---|---|
+| `--model M` | `mnist` (default), `cnn`, or `transformer`. |
+| `--model cnn` | Conv2D 1→8 (5×5, stride 4), ReLU, average pool 2×2, Linear 72→10; 938 parameters. Training/inference and single-card traces share the MLP execution paths. |
+| `--model transformer` | A small Burn transformer (embedding, pre-norm encoder layer, Linear head) trained `--steps S` steps (default 50) on one card and on `burn-flex`, printing the time per step of each and burn-tt's per-op report. Takes `--card`, `--tiles` and `--train-trace`; rejects `--bf16`. |
 | `--card N` | Train on `/dev/tenstorrent/N` (default 0). |
-| `--cards 0,1` | Several cabled cards, matmuls sharded over Ethernet. Not GDDR-resident, one tile per card, so much slower; cannot combine with `--tiles`. |
+| `--cards 0,1` | Several cabled cards as one Burn device (`burn_tt::MeshEngine`). Buffers stay in chip 0's GDDR; matmuls are split by output columns across the cards and tile slots move between their GDDR over Ethernet, with no host staging. Everything else runs on chip 0, one compute tile per card, and the chips are not yet run concurrently, so it is much slower than one card. Cannot combine with `--tiles`. Training uses fresh dispatch (no `--train-trace`); the two- and four-chip reduced-run gates (`step12_mnist`) match the single-card golden loss curve bit for bit. No data-parallel training. |
 | `--tiles T` | Compute on `T` Tensix tiles of the card, or `all` (default 1). |
 | `--epochs E` | Passes over the 60 000 training images (default 1). |
 | `--steps S` | Stop after `S` steps. |
@@ -40,7 +42,7 @@ BF16 subnormals flushed to signed zero on device conversion. The current packed
 gather route is slower than TF32 on MNIST's measured forward GEMMs (about
 662/81 us versus 94/18 us, one tile, release, both cards). This mode has native
 SGD and trace gates; full MNIST BF16 accuracy has not been measured. See
-[the implementation record](../../docs/plans/tensix-next-features.md).
+[the implementation record](../../docs/completed-plans/tensix-next-features.md).
 
 ## Build
 
@@ -122,4 +124,4 @@ no intermediate downloads and changed-input replay on both cards. The small
 four-image/four-step accuracy observations are diagnostics, not held-out
 accuracy or convergence measurements; existing F32 goldens are unchanged.
 See [the storage contract](../../docs/plans/mixed-bfp-storage.md) and
-[recorded accuracy and performance](../../docs/learnings/firmware-performance.md).
+[recorded accuracy and performance](../../docs/learnings/performance-log.md).

@@ -223,7 +223,7 @@ output blocks. Ragged lanes are independent and output padding is undefined;
 downstream repair operates on the result, leaving parent storage/claims intact.
 
 Release performance with validated outputs and dataflow evidence is recorded in
-firmware-performance.md. No mesh route or automatic SFPU replacement is enabled.
+performance-log.md. No mesh route or automatic SFPU replacement is enabled.
 
 ### Direct ELW RHS broadcasts (2026-10-06)
 
@@ -242,7 +242,7 @@ replay on one/two tiles and F32/packed BF16. The resident arithmetic gate checks
 zero staging transfer packets. Expanded poisoned-padding validation for all
 RHS geometries also passes both cards (`1791256629`, 2/2). Release comparison
 `1791256590` validates all 192 results; detailed medians are in
-firmware-performance.md. No new simulator divergence was observed.
+performance-log.md. No new simulator divergence was observed.
 
 ### BFP and PRNG characterization (2026-10-06)
 
@@ -315,7 +315,7 @@ Expanded BFP gates (`1791300035`) pass both cards: special/mixed exponent
 groups, executed wrong-exponent and reversed datum/nibble/bit stream controls,
 shared views, fusion boundaries, parameter casts, changed-input trace outputs
 and four-policy actual MNIST MLP/CNN training. The observed accuracy changes
-and conversion cost are recorded in `firmware-performance.md`.
+and conversion cost are recorded in `performance-log.md`.
 
 Final BFP control/sweep validation `1791301208` passes 28/28 on both cards.
 `step94` compares independent f64 scaling and integer-significand encoding
@@ -399,7 +399,7 @@ generated-output change was needed; `gen-isa --check` passes.
 
 Release chain benchmark `1791317719` passes on both cards with validated outputs,
 two warmups/seven host-timed samples and dataflow counts. See the resident chain
-record in firmware-performance.md for medians and conditions.
+record in performance-log.md for medians and conditions.
 
 ## XY-counter rectangle copies (2026-10-06) — measured, not quoted
 
@@ -466,7 +466,7 @@ and nonempty masks, and a selection whose global W and Z counts are both nine
 (`1791324245`). Fresh copies also pass with `TT_PIPELINE=0` (`1791324866`) and
 `TT_BATCH=0` (`1791324883`). Release native-repack comparison `1791324901`
 validates all six records; its conditions and medians are in
-firmware-performance.md. Ordinary tranche acceptance follows the current
+performance-log.md. Ordinary tranche acceptance follows the current
 card-0 policy; these results do not claim standalone step99 validation on card 1.
 
 
@@ -780,11 +780,94 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   writes reach every recipient of a 1x2 and a larger rectangle and no non-recipient (cards 0 and 1, one
   probe per process, no hang or reboot). Request initiator 1 of NoC #0 keeps its registers between
   requests, so `set_state`/`with_state` style issue works (X6, `step118_mover_fast_path`); it is only 3-4%
-  faster than rewriting initiator 0's registers (`firmware-performance.md`).
+  faster than rewriting initiator 0's registers (`performance-log.md`).
 - **PRNG.** Silicon lane `i` after a restart is `advance^(98-2i)(seed)` (8 seeds x 32 lanes, both
   cards); the seed directive in the role firmware (RISC-V store, fence, 512 NOPs) reproduces the
   model bit for bit under T0 unpack and T2 pack concurrency.
-- **Release baselines** for K-blocking and the norm compositions are in `firmware-performance.md`.
+- **Release baselines** for K-blocking and the norm compositions are in `performance-log.md`.
+
+## `.ttinsn` push fusion (2026-10-10, card 0)
+
+`docs/plans/ttinsn-push-experiment.md`; gates `probe_ttinsn_push`, run only with
+`cargo xtask silicon --feature ttinsn-experiment` (a feature no shippable build enables).
+
+- **Fused `.ttinsn` words run on silicon.** On RISC-V T1 pushing to Tensix thread 1 (`INSTRN_BUF_BASE`):
+  one fused NOP, four adjacent ones (the instruction cache's fusion case), a 130-word program and the full
+  ~11,600-word precise `gelu` retire with no hang, and leave `Dst` identical to the runner's push. The
+  push phase is 2.78x faster (`performance-log.md`). Only the T1-to-thread-1 pairing was exercised.
+- **The instruction-set gate could not see them, and could not see any `.word` at all.** The assembler marks
+  `.word` as data, so `llvm-objdump` prints it as `.word` rather than `<unknown>` or `c.*`, and the old
+  loop read its first column as a mnemonic. A stray compressed-space word in any image would have passed.
+  No image had any data in a code section, so the gate now refuses all of it, and the experiment image's
+  `.ttinsn` words are validated byte by byte from the section dump instead (`check_ttinsn_blocks`).
+- **`Dst` survives from one run to the next on silicon.** Comparing two runs of a program in one process
+  compares the second against the first's leftovers: a push that wrote nothing matched, and a control that
+  halved the loop count passed unchanged. Poison the rows before each run (`SENTINEL` stores in the
+  program's prelude) before trusting an equality, and keep a control that can fail.
+- The probe's first checksum cancelled to zero on the repeated four-row pattern; a comparison that cannot
+  tell results apart validates nothing.
+- **`SFPSTORE` writes one column parity.** At address `a` (a multiple of four) it writes the even columns
+  of rows `a..a + 4`, at `a + 2` the odd columns. A program that defines only one parity and reads both
+  reads whatever earlier runs left (a kernel's unpacker writes whole rows), so its results differ from
+  session to session and from ttsim. Define both.
+- **Run-time code works, with the documented invalidation.** RISC-V T1 wrote `a0 = 1; ret` into L1,
+  called it, rewrote it to `a0 = 2` and called it again *without* invalidating: it returned 1, so the
+  instruction cache holds code written at run time and serves it stale. After the documented sequence
+  (store, read the last word back and consume it, write the mask to `RISCV_IC_INVALIDATE_InvalidateAll`,
+  then 24 more instructions; mask bit 2 is T1, a core's own cache) it returned 2. `InstructionCache.md` is
+  the Wormhole page (the Blackhole tree links it); this is the Blackhole confirmation for T1. The whole
+  sequence costs about 330 cycles. Only T1 invalidating itself was exercised, not one core invalidating
+  another's.
+- **Translated code is as fast as built-in code once running**, and a fused push is about 1.19 cycles a
+  word against the runner's 3.31, but translating costs 13-22 cycles a word (`performance-log.md`).
+- **Instruction gathering is on at boot, and tt-metal turns it off.** Blackhole boots with the baby cores'
+  hardware gathering of adjacent `.ttinsn` pushes enabled. tt-metal's firmware disables it on every RISC
+  around Tensix at start (`configure_gathering()` in `tt_metal/hw/inc/internal/firmware_common.h`:
+  `cfg0` CSR `0x7c0`, set bit 1, set bit 18, clear bit 1, with fences) as a workaround for
+  tt-metal#16439, and the LLK brackets every `REPLAY` record window with disable/enable if it is on
+  ("gathering is done early in the pipeline": a record window can be corrupted when the instructions it
+  records are gathered; tt-metal checks this by inspecting the built ELFs, because it is "a codegen
+  lottery" that a kernel passes with gathering on). Measured here, gathering has **no effect on speed**
+  (a baked fused push is 13,868 cycles with it on or off), and it only ever fuses adjacent `.ttinsn`
+  words (`cfg0.DisTriscCache`, `CSRs.md`), which our runner's `lw`/`sw` pushes are not.
+  **Since 2026-10-11 every Tensix image turns it off** at start (T0, T1, T2, B and NC, through the
+  runner entry and the movers: `tt_firmware::disable_gathering`, tt-metal's sequence), reads `cfg0`
+  back, and publishes `panic_code::GATHERING_STILL_ON` if bit 18 did not stick, so a core that kept it
+  on cannot run unnoticed. The Ethernet image is left alone: the CSR is documented for the Tensix baby
+  cores. Verified by `probe_ttinsn_push::experiment::gathering_is_off_by_default_and_the_flag_keeps_it_on`
+  (T1's own `cfg0` read: bit 18 set by default, clear with the experiment's `GATHERING_ON` flag, so the
+  check can fail) on card 0 and card 1 (run `1791685705`) and on ttsim, and by the whole smoke suite on
+  both cards with the new firmware. The experiment's `gelu` programs hold no `REPLAY`, so they were never
+  exposed; the `short` program (32 `REPLAY`) passed bit-exact with it on. The same CSR carries other
+  chicken bits tt-metal sets (bit 3: Blackhole's L1 data cache; bit 0: relaxed load/store ordering); this
+  repo has never set any and they are untested here. **`cfg0` can outlive a core reset** (ttsim keeps a
+  previous run's bit 18 across one; `CSRs.md` says reset clears every field): the experiment's
+  gathering-on mode therefore clears the bit explicitly instead of skipping the write, and the shipped
+  images set it unconditionally, so neither depends on what ran before.
+- **Under `cargo test`, tests that fork a ttsim hung about one run in five when run concurrently**
+  (idle processes, always inside a forked child) and never single-threaded; not diagnosed. The
+  experiment's ttsim tests serialize on a mutex.
+
+## Card lock (2026-10-11, both cards)
+
+`Session::open_card` takes the driver lock `SESSION_LOCK` (index 63 of 64, clear of the Ethernet cores'
+0-15) on the descriptor it opened, right after `Kmd::open` and before anything is written to the card
+(`Kmd::lock_card`, `tt-kmd`). Measured by `silicon_card_lock` on card 0 and card 1:
+
+- A second `Session::open_card` of the same card is refused (`SessionError::CardBusy`, `TtError::CardBusy`)
+  while the first lives, **in the same process and from another process**, and succeeds as soon as the
+  owner is dropped or its process exits. Two descriptors in one process conflict: the driver ties the lock
+  to the open file description (`chardev.c`, `ioctl_lock_ctl`), not to the process.
+- The lock is released only by closing the descriptor, so a wedged process that is merely stuck (not dead)
+  keeps the card: the next open says `CardBusy` instead of resetting tiles under it. `xtask silicon` kills only
+  the test process on a timeout, not a `fork_scope` grandchild, so a timed-out gate can leave later gates in
+  a `--keep-going` run refused until the grandchild is gone.
+- Raw `Kmd::open` (the harness's `backend::open_card`, `on_card`, `in_device`) takes no lock: a gate that
+  uses it neither blocks nor is blocked by a session, which is what the multi-card Ethernet gates rely on.
+- **`LOCK_CTL`'s `output_size_bytes` is the size of the `out` half (4 bytes), not of the whole struct.** The
+  driver does `clear_user(&arg->out, in.output_size_bytes)` after the operation, so the whole struct's 16
+  bytes clear 12 bytes past the argument, on the caller's stack. The first version of `ioctl::lock_ctl` (never
+  called before this) did that and the process died with SIGSEGV (exit 139) at its first `open_card`.
 
 ## Handling silicon runs
 
