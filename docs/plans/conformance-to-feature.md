@@ -326,6 +326,30 @@ Lessons that generalize:
   few distinct values. Read the helper, fix it where it lives, and keep the unit test beside it.
 - A BF16 narrowing gate is silicon-only (PACR `0x105`, [`ttsim-divergence.md`](../learnings/ttsim-divergence.md)).
 
-Still open gaps (deferred, not designed away): `conv3d`, `conv_transpose3d`, `deform_conv2d`,
-`scatter_nd` with Mul/Min/Max. Closed by a technical limit: F64 casts. Not closed: the precision failures,
+Still open gaps (deferred, not designed away): `conv3d`, `conv_transpose3d`, `deform_conv2d`.
+Closed by a technical limit: F64 casts. Not closed: the precision failures,
 listed with their mechanisms, and the tests the simulator is too slow for, each with its silicon verdict.
+
+## Worked example: round three, `scatter_nd` with Mul, Min and Max
+
+The reason on file was "Burn leaves duplicate indices undefined for the others", which is a statement about
+Burn's contract, not a limit of the card. The `Assign` path already applied the index tuples one at a time in
+index order, so the same loop gives a defined order for the rest: Flex's. A 40-line change, no new primitive.
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| `scatter_nd` Mul/Min/Max: float and int forward (6), gradients under two autodiff binaries (20) | refused by name, filed as a design ("duplicates undefined") though only a deferral | `ops/index.rs` `scatter_rows`: per tuple, `Mul` selects `current * value`; `Min`/`Max` select `value` where `value < current` (`>`) holds, ANDed with the row mask. The gradients needed nothing: Burn composes them from `gather_nd`, comparisons and masks | `step156_scatter_nd_reduce` (3 tests) | pass |
+
+Lessons that generalize:
+
+- **Read a "not supported" reason for whose limit it is.** "Undefined in Burn" means any order is *allowed*, and
+  Flex's is a good one; it does not mean the device cannot.
+- **A control can be unable to fire on the data you have.** Min and Max do not depend on the order of untied
+  values, so "first writer only" and "reverse order", the controls that worked for `Add` and `Assign`, differ from
+  the right answer only by luck; the first run failed on exactly that. What can differ for them is a *tie*
+  (`-0.0` against `+0.0`), a NaN and a later duplicate that improves on the first, so `min_max_ties_nans_and_zeros_follow_the_comparison`
+  builds those by hand and asserts each control differs before it runs the device. Random data cannot tell a `<` from a
+  `<=`: with `<=` mutated in, the random-data tests still passed and only the ties test failed.
+- **Controls that need the data to move belong on the data that moves.** On the special-laden pass a row can hold
+  only infinities and NaNs, which nothing replaces; there Flex is the oracle, and the "something changed" controls
+  are asserted on the normals pass.

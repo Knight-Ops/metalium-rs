@@ -29,9 +29,13 @@
 //! * `scatter_nd(Assign)`: **the last writer in index order wins** (Flex's
 //!   sequential overwrite). Each index tuple, in order, replaces its row through
 //!   a mask select, so a later tuple replaces an earlier one by construction.
-//! * `scatter_nd(Mul | Min | Max)` fail naming the operation and the variant: no
-//!   gated resident arithmetic exists for them with Flex's duplicate order, and
-//!   Burn documents duplicates as undefined for them. `[-]`.
+//! * `scatter_nd(Mul | Min | Max)` run the same per-tuple loop as Assign, so
+//!   duplicates fold in index order as Flex's sequential update does (Burn leaves
+//!   the order undefined; ours is Flex's). `Mul` replaces the row by
+//!   `current * value`; `Min`/`Max` replace an element only when `value < current`
+//!   (`value > current`) is true, so a NaN on either side never replaces and
+//!   `-0.0` against `0.0` keeps the element already there, as Flex's
+//!   `if b < cur { cur = b }` does.
 //!
 //! # `float_cross`
 //!
@@ -60,7 +64,7 @@ pub fn float_gather_nd(data: TtTensor, indices: TtTensor) -> TtTensor {
     gather_nd(data, indices, "float_gather_nd")
 }
 
-/// Multi-dimensional scatter: `Add` and `Assign` only.
+/// Multi-dimensional scatter: every reduction; see the module documentation.
 pub fn float_scatter_nd(
     data: TtTensor,
     indices: TtTensor,
@@ -246,19 +250,6 @@ fn scatter_nd(
             ),
         );
     }
-    if !matches!(reduction, IndexingUpdateOp::Add | IndexingUpdateOp::Assign) {
-        fail(
-            name,
-            format_args!(
-                "reduction {reduction:?} is not supported (only Add and Assign; for unique \
-                 indices compose gather_nd, the arithmetic and an Assign scatter_nd): \
-                 data=({}), indices=({}), values=({})",
-                context(&data),
-                context(&indices),
-                context(&values)
-            ),
-        );
-    }
     let nd = nd_geometry(name, &data, &indices, &variant);
     if values.shape().to_vec() != nd.out_shape
         || values.device != data.device
@@ -281,15 +272,23 @@ fn scatter_nd(
     let rows = restack(&values, vec![nd.n, nd.rest]);
     let updated = match reduction {
         IndexingUpdateOp::Add => select_add_native(table, 0, flat, rows),
-        _ => scatter_assign_rows(table, flat, rows),
+        _ => scatter_rows(table, flat, rows, reduction),
     };
     restack(&updated, data.shape().to_vec())
 }
 
-/// `table` (`[P, R]`) with row `flat[j]` replaced by `rows[j]` for `j = 0..N`
-/// in order, so the last writer of a duplicated row wins. `flat` is already
-/// domain-checked. Raw datums move (a mask select, never arithmetic).
-fn scatter_assign_rows(table: TtTensor, flat: TtTensor, rows: TtTensor) -> TtTensor {
+/// `table` (`[P, R]`) updated by `rows[j]` into row `flat[j]` for `j = 0..N` in
+/// order, so duplicated rows fold in index order (for `Assign` the last writer
+/// wins). `flat` is already domain-checked. `Assign` moves raw datums (a mask
+/// select, never arithmetic); `Mul` selects `current * value`; `Min` and `Max`
+/// select `value` where it compares lower (greater) than `current`.
+fn scatter_rows(
+    table: TtTensor,
+    flat: TtTensor,
+    rows: TtTensor,
+    reduction: IndexingUpdateOp,
+) -> TtTensor {
+    const NATIVE: burn_backend::BoolDType = burn_backend::BoolDType::Native;
     let device = table.device;
     let dtype = table.dtype();
     let [p, rest] = [table.shape()[0], table.shape()[1]];
@@ -306,7 +305,7 @@ fn scatter_assign_rows(table: TtTensor, flat: TtTensor, rows: TtTensor) -> TtTen
     for j in 0..n {
         let target = mapped_native(&[&flat], vec![(0, j)], vec![1, 1]);
         let target = expanded(&target, vec![p, rest].into(), "scatter_nd target");
-        let mask = device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &positions, Some(&target))
+        let mut mask = device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &positions, Some(&target))
             .expect("integer scatter equality");
         let value = mapped_native(
             &[&rows],
@@ -314,19 +313,35 @@ fn scatter_assign_rows(table: TtTensor, flat: TtTensor, rows: TtTensor) -> TtTen
             vec![1, rest],
         );
         let value = expanded(&value, vec![p, rest].into(), "scatter_nd value");
-        current = match dtype {
-            DType::I32 => {
-                let mask = crate::ops::int::int_mul_scalar(
-                    crate::ops::bool::bool_into_int(mask, IntDType::I32),
-                    (-1i32).into(),
-                );
-                let old = crate::ops::int::bitwise_and(
-                    current,
-                    crate::ops::int::bitwise_not(mask.clone()),
-                );
-                crate::ops::int::bitwise_or(old, crate::ops::int::bitwise_and(value, mask))
+        let is_i32 = dtype == DType::I32;
+        // What the selected rows take: the value itself, or the product.
+        let incoming = match reduction {
+            IndexingUpdateOp::Mul if is_i32 => crate::ops::int::int_mul(current.clone(), value),
+            IndexingUpdateOp::Mul => crate::ops::float::float_mul(current.clone(), value),
+            IndexingUpdateOp::Min | IndexingUpdateOp::Max => {
+                let better = match (reduction, is_i32) {
+                    (IndexingUpdateOp::Min, true) => {
+                        crate::ops::int::int_lower(value.clone(), current.clone(), NATIVE)
+                    }
+                    (IndexingUpdateOp::Min, false) => {
+                        crate::ops::float::float_lower(value.clone(), current.clone(), NATIVE)
+                    }
+                    (_, true) => {
+                        crate::ops::int::int_greater(value.clone(), current.clone(), NATIVE)
+                    }
+                    (_, false) => {
+                        crate::ops::float::float_greater(value.clone(), current.clone(), NATIVE)
+                    }
+                };
+                mask = crate::ops::bool::bool_and(mask, better);
+                value
             }
-            _ => crate::ops::float::float_mask_where(current, mask, value),
+            _ => value,
+        };
+        current = if is_i32 {
+            crate::ops::int::int_mask_where(current, mask, incoming)
+        } else {
+            crate::ops::float::float_mask_where(current, mask, incoming)
         };
     }
     current

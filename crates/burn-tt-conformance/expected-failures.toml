@@ -75,38 +75,6 @@ tests = [
 ]
 
 [[group]]
-category = "unsupported-op"
-reason = "`scatter_nd` with a Mul, Min or Max reduction is refused by name: only Add (duplicates folded in index order) and Assign are native (docs/plans/burn-op-notes.md D4: Burn leaves duplicate indices undefined for the others)."
-tests = [
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_data_wins",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_k_equals_d",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_tie",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_values_win",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_min_grad",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_min_grad_tie",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_k_equals_d",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_data_tracked",
-    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_values_tracked",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_data_wins",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_k_equals_d",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_tie",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_values_win",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_min_grad",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_min_grad_tie",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_k_equals_d",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_data_tracked",
-    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_values_tracked",
-    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_max",
-    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_min",
-    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_mul",
-    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_max",
-    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_min",
-    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_mul",
-]
-
-[[group]]
 category = "precision"
 reason = "A matmul truncates an F32 operand to TF32 (SrcRoute::Tf32FromFp32, 10 explicit mantissa bits): in grad_1[0][1] = 58.4628 - 57 the operand 40.4628 becomes 40.4375 (the step is 2^-5 between 32 and 64), so the result is 1.4375 against 1.46281, a relative error of 1.7e-2 against the test's permissive 1e-2. Reproduced by hand; the tolerance stays as vendored."
 tests = [

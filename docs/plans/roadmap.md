@@ -34,9 +34,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   The default tile is `TileChoice::First`; see "Use the grid" for choosing a tile count per workload.
 - [x] **B10/B11** (2026-10-11, [`burn-tt-conformance`](../../crates/burn-tt-conformance/README.md),
   `cargo xtask conformance --release`): Burn 0.21's own backend tests (1,838 tensor and autodiff
-  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,675 pass; 163
-  are in `expected-failures.toml`, each group with a category and a reason.** 163 passing tests are in
-  `--smoke`, validated on card 0 (log `1791692395`). Still open: the run on `Fusion<TtBackend>`
+  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,771 pass; 67
+  are in `expected-failures.toml`, each group with a category and a reason** (it began at 163: rounds
+  one to three closed 96, see [conformance-to-feature.md](conformance-to-feature.md)). The passing
+  tests are in `--smoke`, validated on card 0. Still open: the run on `Fusion<TtBackend>`
   (B13a) and the F16 suites (D1).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
@@ -48,26 +49,28 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   thread on a table of many distinct values. Procedure: [conformance-to-feature.md](conformance-to-feature.md),
   "round two". Left: F16 is refused, and a resize staging more than 2^24 host addresses is refused by name
   (Track 2, "Separable `interpolate`").
-- [ ] **Conformance findings** (each a group in `expected-failures.toml`; fixing one removes its
-  tests from the list). In the order the model ladder needs them:
-  1. `softmax`/`log_softmax` only for rank-2 F32 over dim <= 1: rank 1, 3, 4 and transposed inputs
-     are refused (10 tests). Attention over `[B, H, T, T]` needs them.
-  2. I32 and Bool `reshape` that changes the stored matrix is refused (18 tests); float does it
-     natively (`reshaped_strided` copies F32/BF16/F16 only).
-  3. `float_mask_where` and `float_powf` refuse a broadcast operand (8 tests), though `float_expand`
-     is native. Masked attention needs the first.
-  4. **Bugs:** `cat` with a zero-element input fails at execution with `invalid metadata dimensions`
-     (5 tests); a `[408, 261120] @ [261120, 408]` matmul fails in the planner with "the matmul's own
-     requirements are invalid" (1); `bool_argwhere` always refuses (10 tests incl. `nonzero`) while
-     `burn-op-coverage.md` lists it as native, so it needs a `[-]` disposition or an implementation.
-  5. Open gaps, deferred rather than designed away: `conv3d` and `conv_transpose3d` (20),
-     `deform_conv2d` (17), and `scatter_nd` with Mul/Min/Max (26; Burn leaves duplicate indices
-     undefined). (`interpolate`, 22 tests, is closed: see below.)
-  6. Ten `precision` failures, attributed to TF32 operand truncation (one reproduced by hand; the
-     LU, determinant and conv2d ones are not decomposed): derive a bound beside each. Eleven large
-     LU/determinant tests are too slow (> 1500 s each).
-  7. Upstream `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs
-     from the expected one, so the two F64-cast autodiff tests end as timeouts, not failures.
+- [x] **`scatter_nd` with Mul, Min and Max** (2026-10-11, [`ops/index.rs`](../../crates/burn-tt/src/ops/index.rs)
+  `scatter_rows`, gate `step156_scatter_nd_reduce`, card 0, log `1791741849`, smoke tier 858 of 858, log `1791742419`). The refusal was a deferral:
+  the `Assign` loop already applies tuples in index order, so the same loop gives Flex's order for the
+  rest. All 26 of Burn's tests pass (20 are gradients, which needed nothing new); `Min`/`Max` equal Flex
+  bit for bit over every special, F32 `Mul` equals the specification's multiply in index order.
+- [ ] **Conformance findings** (rounds one to three are closed: softmax of any rank, I32/Bool
+  `reshape`, broadcast `mask_where`/`powf`, empty `cat`, the planner bug, `bool_argwhere`, `interpolate`,
+  `scatter_nd`; see [conformance-to-feature.md](conformance-to-feature.md)). 67 tests remain, each a group
+  in `expected-failures.toml`; fixing one removes its tests from the list. In the order the model ladder
+  needs them:
+  1. `conv3d` (9 tests) and `conv_transpose3d` (11): refused by name, a deferral. A video or volumetric
+     model needs them; composing from the 2-D kernels per depth tap is the first thing to try (untested).
+  2. `deform_conv2d` (17): refused by name, a deferral. Offsets are data-dependent, so unlike
+     `interpolate` the tap tables cannot be built from shapes alone (a device-side gather of data-dependent
+     indices plus the existing matmul is the likely shape; design it first).
+  3. Nineteen `precision` failures (gelu gradient 2, conv2d 1, LU and determinant 16), attributed to TF32
+     operand truncation (one reproduced by hand; the LU, determinant and conv2d ones are not decomposed):
+     derive a bound beside each, or decide whether a full-F32 matmul path (a multi-pass TF32 split) is
+     worth having. Never loosen a vendored tolerance.
+  4. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
+  5. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
+     `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs).
 - [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
   one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
 - [ ] **Model ladder**, each rung checked against burn-flex; every failure becomes an op or

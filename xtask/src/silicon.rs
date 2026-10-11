@@ -152,6 +152,9 @@ pub const SMOKE: &[&str] = &[
     "tensor::float::module::bicubic_interpolate::",
     "tensor::float::module::lanczos3_interpolate::",
     "autodiff::base::nearest_interpolate::",
+    "tensor::float::ops::gather_scatter_nd::",
+    "tensor::int::ops::gather_scatter_nd::",
+    "autodiff::base::gather_scatter_nd::",
     // The gates written for them: exact oracles, exact traffic, each watched failing.
     "step149_softmax_nd::",
     "step150_int_bool_reshape::",
@@ -160,6 +163,7 @@ pub const SMOKE: &[&str] = &[
     "step153_argwhere::",
     "step154_conv_transpose_padding_out::",
     "step155_interpolate::",
+    "step156_scatter_nd_reduce::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
     "silicon_card_lock::a_second",
