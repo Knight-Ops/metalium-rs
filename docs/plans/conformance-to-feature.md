@@ -69,7 +69,7 @@ a test uses.
 |---|---|---|
 | **Gap** | `unsupported operation X`, for a case Burn defines and a model can bring (a rank, a broadcast, an empty tensor) | Fix it (steps 4-9) |
 | **Sharp edge** | an opaque message, a panic on the server thread, a failure that surfaces only at read-back | Fix it, *and* make the failure explicit: a typed error or a refusal that names the operation and the input ([sharp-edges rule](../../AGENTS.md)) |
-| **By design** | refused for a technical reason or a recorded decision (F64: not a Tensix dtype; a PyTorch-only limit Burn does not impose is *not* one) | Keep it listed with the reason and the doc that records the decision. Do not "fix" a decision in passing; but a *deferral* ("not planned until a model needs it") is not a design: it is an open item, and a missing capability like `conv3d` or `interpolate` belongs under *Gap* |
+| **By design** | refused for a technical reason or a recorded decision (F64: not a Tensix dtype; a PyTorch-only limit Burn does not impose is *not* one) | Keep it listed with the reason and the doc that records the decision. Do not "fix" a decision in passing; but a *deferral* ("not planned until a model needs it") is not a design: it is an open item, and a missing capability like `conv3d` (or `interpolate`, before round two closed it) belongs under *Gap* |
 | **Precision** | `not approx eq` | Find the mechanism first (step 4). Never loosen the vendored tolerance; if the device cannot meet it, list it with the mechanism and whether a bound was derived |
 | **Slow** | timeout in release | Run it once with a long limit on silicon; if it passes there, it is a `timeout` entry ("ttsim does not finish"), not a bug |
 | **Test defect** | the failure is in the test or its macro, not in burn-tt | List it with the diagnosis. Never patch the vendored tree (its digest is pinned) |
@@ -291,6 +291,41 @@ the current change to its claim, as with the `powf(inf, subnormal)` NaN.
 | `conv_transpose` with `padding_out >= stride` (2) | PyTorch's limit asserted; Burn's reference has none | relax, after proving forward and all gradients against Flex | `step154_conv_transpose_padding_out` | pass |
 | `set_default_dtypes(.., I32)` (every test: found before the first one ran) | `dtype_usage(I32)` was storage-only; int arithmetic is native | `Storage \| Arithmetic` | `step144` (updated) | pass |
 
-Still open gaps (deferred, not designed away): `interpolate`, `conv3d`, `conv_transpose3d`, `deform_conv2d`,
+## Worked example: round two, `interpolate`
+
+The first planning question for a "missing op" is whether it needs a kernel. This one did not: each output
+is a weighted sum of a few inputs, with indices and weights fixed by the shapes, so it composes from three
+device primitives (a word-copy gather, an SFPU multiply, the in-order SFPU row sum) with the host building only
+the tables. Written up here because it exercised steps 4 to 6 in ways round one did not.
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| `interpolate`, nearest/bilinear/bicubic/Lanczos3, forward (18) and nearest backward under two autodiff binaries (4) | generated stubs that refused by name, filed under "not planned until a model needs it" (a deferral, so a gap) | `ops/interpolate.rs`: shape-only tap tables, one gather, SFPU multiplies, in-order row sum; the gradient is the transpose of the forward map. Lanczos3 backward too, though Flex has none | `step155_interpolate` (14 simulator tests, 15 on silicon with BF16) | pass |
+| a `metadata` table of many *distinct* values (found by the Lanczos3 weights; no Burn test) | `tensor::metadata` batched 200 words, but a word that differs from its predecessor costs two list entries, so a tile with more than ~126 distinct values overran the packet limit and **panicked the server thread** | batch by entries as well (`TRANSFER_SIDE_MAX`); batching is unchanged where it already fit | unit test beside it (`tensor.rs`), watched failing | via step155 |
+
+Lessons that generalize:
+
+- **Compare against the arithmetic, not only against a bound.** The card does Flex's f32 products and sums in
+  Flex's order for nearest and bilinear, so those are held to *equality*, forward and backward; the derived
+  bound is for bicubic and Lanczos3, where Flex accumulates in f64. Measuring first (how many elements differ,
+  and the worst difference over the bound) showed the equality was real and the bound was neither violated
+  nor slack (worst 0.70).
+- **An oracle that is not Flex needs its own validity conditions, asserted.** `image` clamps `f32` images to
+  [0, 1] and widens its filter when shrinking, so the gate restricts itself to upsampling and
+  `align_corners = false`, keeps the data inside (0, 1), asserts nothing was clamped, and asserts the one
+  assumption its error bound rests on (the filter divisor stays above `SIGMA_MIN`). A first draft assumed the
+  weight magnitudes sum to at most 1.5; the gate measured 2.23, so the bound was re-derived from facts instead.
+- **A control can be inapplicable.** A single input pixel makes every normalized filter agree, and nearest
+  ignores `align_corners`; the control for such a case is a different wrong answer (a reversed row), and the
+  gate counts how many controls actually fired so it cannot go quiet.
+- **A gate must be watched failing at every level.** Four mutations (nearest's rounding rule, Lanczos3's
+  renormalization, `align_corners`, the gradient's summation order) each failed the right tests; the order
+  mutation passed the unit tests until a multi-tap case pinned it, because the adjoint identity does not see
+  order.
+- **A shared helper's limit is found by a new kind of input.** `metadata` had only ever carried constants with
+  few distinct values. Read the helper, fix it where it lives, and keep the unit test beside it.
+- A BF16 narrowing gate is silicon-only (PACR `0x105`, [`ttsim-divergence.md`](../learnings/ttsim-divergence.md)).
+
+Still open gaps (deferred, not designed away): `conv3d`, `conv_transpose3d`, `deform_conv2d`,
 `scatter_nd` with Mul/Min/Max. Closed by a technical limit: F64 casts. Not closed: the precision failures,
 listed with their mechanisms, and the tests the simulator is too slow for, each with its silicon verdict.

@@ -48,6 +48,8 @@ burn-ir = { version = "=0.21.0", default-features = false }
 burn-fusion = { version = "=0.21.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
+# The independent Lanczos3 oracle of `tt-tests` (step155_interpolate): dev-only, no codecs.
+image = { version = "=0.25.10", default-features = false }
 libloading = "0.8"
 libc = "0.2"
 # The reference `erfc` the SFPU's `erf` fits its tail to, at program build time

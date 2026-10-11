@@ -143,7 +143,7 @@ fn regular(
     }
 }
 
-fn constant(device: TtDevice, values: Vec<f32>, dims: [usize; 2]) -> TtTensor {
+pub(super) fn constant(device: TtDevice, values: Vec<f32>, dims: [usize; 2]) -> TtTensor {
     let bits = values.into_iter().map(f32::to_bits).collect();
     let id = crate::server::metadata(device, bits, dims, Elem::F32);
     device_result(device, id, dims)

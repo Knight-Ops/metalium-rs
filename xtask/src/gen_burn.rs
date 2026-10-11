@@ -313,6 +313,8 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "linear_bias_backward",
             "embedding",
             "embedding_backward",
+            "interpolate",
+            "interpolate_backward",
         ],
     ),
     ("QTensorOps", &["q_device", "q_to_device", "q_into_data"]),
