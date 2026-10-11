@@ -10,8 +10,7 @@
 //! and NaN payloads must survive.
 //!
 //! Duplicate-index contract (stated in `ops/index.rs`): `Add` folds in index order,
-//! `Assign` is last-writer-wins in index order, `Mul`/`Min`/`Max` are refused naming
-//! the variant. Every coordinate is bounds-checked against its own axis on the device
+//! `Assign` is last-writer-wins in index order (`Mul`/`Min`/`Max` fold the same way: `step156`). Every coordinate is bounds-checked against its own axis on the device
 //! (code 11 DOMAIN), not only the flat row.
 //!
 //! Negative controls, each asserted below to differ from the device on the gate's
@@ -660,42 +659,6 @@ fn scatter_nd_assign_is_last_writer_in_index_order_and_raw_exact() {
         scatter_int_assign::<3, 3, 3>(&d, [3, 4, 5], [2, 3, 2], 45);
         scatter_int_assign::<2, 2, 2>(&d, [35, 3], [6, 1], 46);
         scatter_int_assign::<1, 2, 1>(&d, [37], [9, 1], 47);
-    });
-}
-
-#[test]
-fn unsupported_update_variants_fail_naming_the_op_and_the_variant() {
-    with_device(Config::default(), |d| {
-        let x = tt_float(&d, &float_words(12, 51), [3, 4]);
-        let v = tt_float(&d, &float_words(8, 52), [2, 4]);
-        let xi = tt_int(&d, &int_words(12, 53), [3, 4]);
-        let vi = tt_int(&d, &int_words(8, 54), [2, 4]);
-        let i = tt_indices(&d, &[2, 0], [2, 1]);
-        for variant in [
-            IndexingUpdateOp::Mul,
-            IndexingUpdateOp::Min,
-            IndexingUpdateOp::Max,
-        ] {
-            let m = panic_message(|| {
-                let _ = x.clone().scatter_nd::<2, 2>(i.clone(), v.clone(), variant);
-            });
-            assert!(
-                m.contains("float_scatter_nd") && m.contains(&format!("{variant:?}")),
-                "{m}"
-            );
-            let m = panic_message(|| {
-                let _ = xi
-                    .clone()
-                    .scatter_nd::<2, 2>(i.clone(), vi.clone(), variant);
-            });
-            assert!(
-                m.contains("int_scatter_nd") && m.contains(&format!("{variant:?}")),
-                "{m}"
-            );
-        }
-        // The supported variants still work after a refusal.
-        let y = x.clone().scatter_nd::<2, 2>(i, v, IndexingUpdateOp::Assign);
-        assert_eq!(y.dims(), [3, 4]);
     });
 }
 
