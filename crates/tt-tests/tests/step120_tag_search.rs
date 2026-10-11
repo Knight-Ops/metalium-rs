@@ -606,7 +606,7 @@ fn register_layout_matches_the_vendored_header() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../vendor/cfg_defines.h"
     ))
-    .expect("run `cargo xtask fetch-spec` or copy vendor/");
+    .expect("vendor/cfg_defines.h is missing: run `cargo xtask gen-cfg` (or `gen-cfg --check`), which fetches it");
     let define = |name: &str, what: &str| -> u32 {
         let key = format!("#define L1_CACHE_TAG_SEARCH_ACCEL_{name}_{what} ");
         let line = header
