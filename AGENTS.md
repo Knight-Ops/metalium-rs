@@ -18,7 +18,9 @@ C/C++ specification models and simulator FFI are development-only test oracles.
   `tt-firmware-images/build.rs` automatically builds, validates and embeds it.
 - `burn-tt`: native Burn storage, operation routing and device server threads.
 - `tt-tests`: cross-crate gates, simulator engines and external Flex comparisons.
-  `tt-mnist`: application/model workloads. `xtask`: fetchers, generators and runners.
+  `burn-tt-conformance`: Burn's own backend tests against `burn-tt`
+  (`cargo xtask conformance`; dev-only). `tt-mnist`: application/model workloads.
+  `xtask`: fetchers, generators and runners.
 
 Crates live under `crates/`. When adding a host workspace crate, classify it in
 `xtask/src/ship.rs` as `SHIPPABLE` or `DEV_ONLY`.
@@ -44,6 +46,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | What to work on next (open items)       | [roadmap.md](docs/plans/roadmap.md)                                                                                                      |
 | Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                               |
 | New kernel/op; completion criteria      | [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md), [burn-op-notes.md](docs/plans/burn-op-notes.md)                  |
+| Fixing a failing Burn conformance test  | [conformance-to-feature.md](docs/plans/conformance-to-feature.md), then the crate [README](crates/burn-tt-conformance/README.md)           |
 | Burn backend changes                    | [burn-native-cutover.md](docs/plans/burn-native-cutover.md), [burn-backend-parity.md](docs/plans/burn-backend-parity.md)                 |
 | Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
 | Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/completed-plans/phases-0-10-checklist.md) |
@@ -68,8 +71,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
-`fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), or `fetch-kmd`
-(driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
+`fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
+`cargo xtask conformance`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:
 
@@ -94,6 +97,13 @@ Arithmetic, routing or execution-order changes also need the training regression
 
 ```bash
 cargo test -p tt-tests --features e2e --test step12_mnist
+```
+
+Changes to `burn-tt` operations or routing also need Burn's own backend tests, whose result
+must match `crates/burn-tt-conformance/expected-failures.toml` (a fixed test leaves the list):
+
+```bash
+cargo xtask conformance --release
 ```
 
 **Never execute silicon tests with plain `cargo test`.** Use the isolated runner:

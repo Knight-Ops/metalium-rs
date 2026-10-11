@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::burn_tests;
 use crate::pin;
 use crate::spec;
 use crate::util::{download, sha256, workspace_root};
@@ -200,6 +201,78 @@ pub fn fetch_spec(force: bool) -> Result<(), String> {
     std::fs::rename(&staging, &dest).map_err(|e| format!("renaming into place: {e}"))?;
     let _ = std::fs::remove_file(&tarball);
     println!("wrote {} ({})", dest.display(), pin::SPEC_REV);
+    Ok(())
+}
+
+/// Download and verify the pinned Burn backend test suite.
+///
+/// The tests of `burn-backend-tests`, which is not on crates.io, extracted from
+/// the tag's source tarball into `vendor/burn-backend-tests/` and verified by
+/// content digest (see [`crate::burn_tests`]). Only `tests/` is kept: it is the
+/// only part `burn-tt-conformance` reads.
+pub fn fetch_burn_tests(force: bool) -> Result<(), String> {
+    let dest = burn_tests::vendored_root();
+    let tests = dest.join("tests");
+
+    if dest.exists() && !force {
+        let got = burn_tests::digest(&tests)?;
+        if got == pin::BURN_TESTS_CONTENT_SHA256 {
+            println!("{} is already present and matches the pin", dest.display());
+            return Ok(());
+        }
+        return Err(format!(
+            "{} hashes {got}, not the pinned {}.\n\
+             Re-run with --force to replace it, or update PINS.toml and xtask's pin \
+             module if the bump is intentional — note that doing so invalidates the \
+             conformance run and its expected-failures list until they are re-run.",
+            tests.display(),
+            pin::BURN_TESTS_CONTENT_SHA256
+        ));
+    }
+
+    let url = format!(
+        "https://github.com/tracel-ai/burn/archive/refs/tags/{}.tar.gz",
+        pin::BURN_TESTS_TAG
+    );
+    let vendor = workspace_root().join("vendor");
+    let tarball = vendor.join("burn-backend-tests.tar.gz");
+    download(&url, &tarball)?;
+
+    // Extract into a staging directory and swap it in, for the reason `fetch_spec`
+    // does. The archive's top level is `burn-<version>/`; keep only the crate's
+    // `tests/` directory, so `--strip-components 3` leaves `tests/` at the root.
+    let staging = vendor.join("burn-backend-tests.staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("creating {}: {e}", staging.display()))?;
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tarball)
+        .args(["-C"])
+        .arg(&staging)
+        .args(["--strip-components", "3", "--wildcards"])
+        .arg("*/crates/burn-backend-tests/tests")
+        .status()
+        .map_err(|e| format!("could not run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar failed extracting {}", tarball.display()));
+    }
+
+    let got = burn_tests::digest(&staging.join("tests"))?;
+    if got != pin::BURN_TESTS_CONTENT_SHA256 {
+        return Err(format!(
+            "content digest mismatch for the Burn test suite:\n  \
+             expected {}\n  got      {got}\n\
+             The pinned tag is immutable, so this means either the download was \
+             corrupted or PINS.toml and xtask's pin module disagree about the digest.",
+            pin::BURN_TESTS_CONTENT_SHA256
+        ));
+    }
+
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(&staging, &dest).map_err(|e| format!("renaming into place: {e}"))?;
+    let _ = std::fs::remove_file(&tarball);
+    println!("wrote {} ({})", dest.display(), pin::BURN_TESTS_TAG);
     Ok(())
 }
 

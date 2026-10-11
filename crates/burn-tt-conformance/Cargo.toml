@@ -1,0 +1,76 @@
+[package]
+name = "burn-tt-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Burn's own backend test suite, run against burn-tt (dev-only; see README.md)"
+
+# Named for the crate whose tests these are: the vendored suite imports
+# `burn_backend_tests::might_panic`, and an integration test links its package's
+# library under the library's name.
+[lib]
+name = "burn_backend_tests"
+path = "src/lib.rs"
+
+# Nothing here builds without `run`: the suite is run one test per process by
+# `cargo xtask conformance`, not by `cargo test --workspace`, so a plain
+# workspace build neither compiles it nor links the simulator into it.
+[features]
+default = ["std"]
+# The vendored tests are `#![cfg(feature = "std")]` in places.
+std = []
+# Build the test binaries (`required-features` on every `[[test]]`).
+run = [
+    "dep:burn-tt",
+    "dep:tt-tests",
+    "dep:burn-tensor",
+    "dep:burn-autodiff",
+    "dep:burn-tensor-testgen",
+    "dep:ctor",
+    "dep:num-traits",
+]
+# Against silicon (`TT_SILICON_DEVICE`, default card 0) instead of ttsim.
+silicon = ["run", "tt-tests/silicon"]
+# The same suite on `Fusion<TtBackend>` (`burn_tt::Tt`) instead of `TtBackend`.
+fusion = ["run"]
+
+# Features the vendored tests name in `#[cfg(..)]`, declared so `unexpected_cfgs`
+# stays quiet. None is ever enabled: they select code for other backends.
+cube = []
+cuda = []
+distributed = []
+flex = []
+metal = []
+ndarray = []
+quantization = []
+rocm = []
+vulkan = []
+
+[dependencies]
+burn-tt = { workspace = true, optional = true }
+# Dev-only by classification (`xtask/src/ship.rs`): the ttsim engine lives here.
+tt-tests = { path = "../tt-tests", optional = true }
+burn-tensor = { workspace = true, optional = true }
+# `export_tests` makes the backward pass assert that checkpointing left nothing
+# behind. Only with `run`, so no other build of burn-autodiff turns it on.
+burn-autodiff = { version = "=0.21.0", default-features = false, features = ["std", "export_tests"], optional = true }
+burn-tensor-testgen = { workspace = true, optional = true }
+ctor = { workspace = true, optional = true }
+num-traits = { version = "0.2", default-features = false, features = ["libm"], optional = true }
+
+[[test]]
+name = "tensor"
+path = "tests/tensor.rs"
+required-features = ["run"]
+
+[[test]]
+name = "autodiff"
+path = "tests/autodiff.rs"
+required-features = ["run"]
+
+[[test]]
+name = "autodiff_checkpointing"
+path = "tests/autodiff_checkpointing.rs"
+required-features = ["run"]

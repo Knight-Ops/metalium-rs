@@ -26,3 +26,11 @@
 # Fetched by `cargo xtask fetch-mnist`, pinned by SHA-256 in PINS.toml; the
 # Phase 7 training gate's data.
 /vendor/mnist/
+
+# Fetched by `cargo xtask fetch-burn-tests`, pinned by content digest in PINS.toml:
+# the tests of Burn's own `burn-backend-tests` crate (not on crates.io), which
+# `burn-tt-conformance` runs against `TtBackend`. Third-party, so fetched and
+# verified rather than vendored.
+/vendor/burn-backend-tests/
+/vendor/burn-backend-tests.staging/
+/vendor/burn-backend-tests.tar.gz

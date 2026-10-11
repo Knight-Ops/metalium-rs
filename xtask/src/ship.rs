@@ -50,7 +50,13 @@ const SHIPPABLE: &[&str] = &[
 ///
 /// `tt-ttsim` and `tt-ttsim-sys` *are* the binding; `tt-tests` holds the gates that
 /// drive it; `xtask` is build tooling.
-const DEV_ONLY: &[&str] = &["tt-ttsim", "tt-ttsim-sys", "tt-tests", "xtask"];
+const DEV_ONLY: &[&str] = &[
+    "tt-ttsim",
+    "tt-ttsim-sys",
+    "tt-tests",
+    "burn-tt-conformance",
+    "xtask",
+];
 
 /// Every workspace member is classified as shippable or dev-only.
 ///

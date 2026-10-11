@@ -13,7 +13,7 @@ flowchart TD
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs)"]
         PL0["roadmap.md (START HERE: open work only)"]
-        PL3["new-op-definition-of-done.md (standing contract for new ops)"]
+        PL3["new-op-definition-of-done.md (standing contract for new ops)<br>conformance-to-feature.md (standing process: failing Burn test to documented feature)"]
         PL4["burn-op-coverage.md (generated) + burn-op-notes.md"]
         PL5["burn-backend-parity.md (B0-B16 Roadmap)"]
         PL6["burn-native-cutover.md (Native Cutover Record)"]

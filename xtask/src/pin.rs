@@ -62,6 +62,15 @@ pub const TTKMD_IOCTL_SHA256: &str =
 // second source of truth for one fact, and the copy nothing asserts is the one
 // that silently goes stale.
 
+/// The Burn tag whose `crates/burn-backend-tests/tests/` is the conformance suite
+/// `burn-tt-conformance` runs. Fetched and verified by `cargo xtask fetch-burn-tests`.
+/// The same release as the `=0.21.0` crates the workspace compiles against.
+pub const BURN_TESTS_TAG: &str = "v0.21.0";
+/// SHA-256 over every file of the extracted `tests/` tree, not over the tarball,
+/// which GitHub does not promise is byte-stable. See `crate::burn_tests`.
+pub const BURN_TESTS_CONTENT_SHA256: &str =
+    "45c5b2f9c8903944bbfe0af1e31ef929377e2ec5e705000204a57acacfff9d16";
+
 /// MNIST, for the Phase 7 training gate. Fetched by `cargo xtask fetch-mnist`
 /// from the Google CVDF mirror (the original host is unreliable), verified
 /// against both the published `.gz` hash and the decompressed IDX file's.

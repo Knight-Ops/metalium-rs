@@ -12,6 +12,7 @@ members = [
     "crates/burn-tt",
     "crates/tt-mnist",
     "crates/tt-tests",
+    "crates/burn-tt-conformance",
     "xtask",
 ]
 # tt-firmware builds for riscv32im and is driven by xtask, not the host workspace.
@@ -53,6 +54,12 @@ libc = "0.2"
 # (`tt_kernels::sfpu::ops::erfc_fit`): pure Rust, already in the tree as
 # burn-flex's.
 libm = "0.2"
+# `burn-tt-conformance`, the dev-only crate that runs Burn's own backend tests
+# against `TtBackend`: exactly the versions upstream's `burn-backend-tests` uses
+# (the `ctor` that sets the test dtypes, the `might_panic` attribute, and
+# autodiff's test-only checkpointer check).
+burn-tensor-testgen = "=0.21.0"
+ctor = "=0.10.1"
 
 # `tt-mnist`'s build script deflates 55 MB of MNIST; unoptimised, that is
 # most of a minute.

@@ -586,42 +586,50 @@ attribute (`gh:crates/burn-tensor-testgen/src/lib.rs:44-45`).
 
 ### 5.2 How `burn-tt` runs it (B10)
 
-`burn-dispatch` cannot name `TtBackend` (closed enum), so vendor the suite:
+Implemented as `crates/burn-tt-conformance` and `cargo xtask conformance` (see the crate's README).
+`burn-dispatch` cannot name `TtBackend` (closed enum), so the suite is run from our own entry
+binaries:
 
-1. `cargo xtask vendor-burn-tests` copies `crates/burn-backend-tests/tests/**` at
-   `v0.21.0` into `crates/burn-tt-conformance/tests/upstream/`, pinned by tree digest in
-   `PINS.toml` like every other pin, `--check` in CI.
-2. Replace only `common/backend.rs` and `common/autodiff.rs`:
-   `TestBackend = burn_tt::TtBackend` (tensor binaries) and, for the autodiff binaries,
-   `TestBackend = Autodiff<TtBackend>` / `Autodiff<TtBackend, BalancedCheckpointing>` with
-   `AutodiffDevice::new() -> TtDevice`. The test bodies use only `TestTensor*`,
-   `AutodiffDevice::new()` and `Default::default()` -- which **requires B2**: tests create
-   tensors on `Default::default()` with no attach, and the `ctor` runs before `main`.
-3. An `expected-failures.toml` (test path -> reason, e.g. a Flex/Burn disagreement or a
-   documented numeric divergence such as denormal flush) so the suite is green and any
-   *new* failure is a regression. Empty is the goal.
-4. **Eager residency policy for the suite** (`Policy { residency: Eager }`): `from_data` of
-   F32 tensors uploads immediately, so every device-capable op actually runs on the device.
-   Without it the suite mostly re-tests Flex, because element-wise ops follow the data
-   (`ops.rs:66-78`) and test inputs start on the host.
-5. Engines: ttsim registered as default engine (tests share one simulator per process on
-   the server thread; parallel test threads serialise on its queue). Q1: per-test process
-   isolation (nextest) versus one simulator per binary.
-6. Run under `TT_STRICT=report` (collect, do not fail) and emit the report as an artefact:
-   the conformance run doubles as the coverage census for `hardware-coverage.md`.
+1. `cargo xtask fetch-burn-tests` downloads the `v0.21.0` tarball and keeps
+   `crates/burn-backend-tests/tests/` (404 files) in `vendor/burn-backend-tests/` (gitignored, like
+   the other pinned inputs), pinned in `PINS.toml` by the SHA-256 of the extracted tree, not of the
+   tarball (GitHub does not promise it is byte-stable). It is fetched rather than copied into the
+   crate: it is third-party, and the digest check is what makes "passes" mean the same thing twice.
+2. Three entry binaries replace upstream's `common/backend.rs` and `common/autodiff.rs`:
+   `tensor` (`TestBackend = TtBackend`), `autodiff` (`Autodiff<TtBackend>`) and
+   `autodiff_checkpointing` (`Autodiff<TtBackend, BalancedCheckpointing>`), with
+   `AutodiffDevice::new() -> TtDevice`. Autodiff is a *type* here and a property of a
+   `DispatchDevice` upstream, so the checkpointing run is a third binary, not a second module of
+   one. The vendored modules are `#[rustfmt::skip]`: `cargo fmt` follows `#[path]` modules and
+   would rewrite the pinned files.
+3. `crates/burn-tt-conformance/expected-failures.toml` groups the failing tests by reason, each group
+   with a category. The runner fails on an unlisted failure, on a listed test that passes, on an
+   entry whose test is gone, and on a `todo` entry. Empty is the goal.
+4. **No eager-upload policy was needed.** The design assumed test inputs start on the host, so ops
+   would run there. Measured: `float_from_data` stays on the host until the first op, which then
+   uploads its operands and computes on the device (`TT_REPORT=1`: `float_add` 1 call, 1 on the
+   device, 48 B up). The suite exercises the path a user's code takes.
+5. **One process per test**, not one simulator per binary: a process costs about 20 ms and 26 MB, and
+   an isolated simulator means one failure never poisons the next (Q1 answered). Upstream's own
+   `#[ignore]`d tests are not run.
+6. The runner sets `TT_REPORT=1`, so each test's output carries the residency table (the
+   coverage census); `--strict` adds `TT_STRICT=1`. (`TT_STRICT=report` does not exist: strict mode
+   is `1` or off.)
 
-**Gate (validation tier, ttsim):** `cargo test -p burn-tt-conformance` green with the
-expected-failures list; F32 tensor and autodiff binaries first, F16 when D1 lands; repeated
-on `Fusion<TtBackend>` after B13a.
+**Gate (validation tier, ttsim):** `cargo xtask conformance --release` matches the expected-failures
+list; F32 tensor and both autodiff binaries first, F16 when D1 lands; `--fusion` after B13a.
+Plain `cargo test --workspace` neither builds nor runs it (every test target needs the `run`
+feature).
 
-### 5.3 Silicon smoke tier
+### 5.3 Silicon smoke tier (B11)
 
-Add to `SMOKE` (`xtask/src/silicon.rs:97-105`) a curated conformance subset whose names
-cover every `OVERRIDDEN` method (generated, so it tracks the list): matmul family,
-element-wise family, `sum_dim`, `slice`, transposes, `relu{,_backward}`, autodiff
-`matmul`/`relu`/`add`, `multi_threads`. On silicon the comparison is burn-tt vs burn-flex
-(the suite's expected values are Flex-compatible). Full-suite runs on silicon are
-occasional, not smoke.
+`SMOKE` (`xtask/src/silicon.rs`) lists whole upstream modules that have no expected failures:
+matmul, element-wise, relu, aggregation (`sum_dim`..), transposes/permute/reshape/expand,
+`slice_assign`, int add/matmul/slice, `multi_threads`, and the autodiff `matmul`/`relu`/`add`/`slice`.
+The silicon runner builds `burn-tt-conformance` with its `silicon` feature beside `tt-tests`, and
+runs these on card 0 only (`TtDevice::default()`), skipping them on other cards. The suite's literals
+are the ones Burn's CPU backend meets, so a pass is a comparison with it. Full-suite runs on silicon
+are occasional, not smoke.
 
 ---
 
@@ -635,14 +643,14 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B1** (done 2026-10-11: `burn-tt/src/error.rs`; `EngineError` removed; `try_into_data`/`sync` return the sticky error, strict mode panics, `catch_unwind` per server job; `NoDriver`/`NoSuchCard`/`Permission` classify opening a card, `CardBusy` waits for B2's lock) | `TtError`, sticky errors, poisoned tensors, `catch_unwind` on the server thread (edges 2, 18, 19, 22, 24) | -- | `a_host_staged_engine_error_panics_in_the_op_with_it`, `an_engine_error_is_try_into_data_s_error`, `strict_mode_panics_where_try_into_data_would_return_the_error`, `a_panicking_engine_is_reported_by_every_later_wait` (`tt-tests/tests/burn_server.rs`) |
 | **B2** (done 2026-10-11: `burn-tt/src/registry.rs`, `server::ensure_attached`; the default tile is `TileChoice::First`, not a measured count -- the per-workload tile optimizer is a Track 2 item in the roadmap; the card lock is `Kmd::lock_card` taken by every `Session::open_card`, `SessionError::CardBusy` -> `TtError::CardBusy`; `kmd_engine`, `attach_topology*` and `kmd_mesh_engine` are gone, `attach_with(TtConfig)` replaces them; an attachment from before a `fork` is treated as absent) | Engine registry, lazy auto-attach, `init`/`detach`/`TtConfig`, default tile, card lock, `device_count`/`enumerate` (edges 1, 3, 4, 20, 21, 23) | B1 | `burn_server.rs` (registry, remembered failure, `init`, refusal, `enumerate`), `step148_lazy_attach` (ttsim, residency, fork negative control), `silicon_card_lock`, `silicon_lazy_attach` (smoke) |
 | **B3** (done via never-reused process-wide ids, 2026-10-03) | Stale buffers and capability cache scoped to the attachment; ids are translated by that server | -- | both stale-buffer gates pass; old tensors cannot read or free a new attachment's buffer |
-| **B4** (half done: `dtype_usage` reports `F32`/`BF16` as `Accelerated` and `I32`/`F16` as `Storage` (`lib.rs`); the once-per-(op, dtype) warnings, the `burn-store` BF16 warning and strict-mode failure are missing) | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
+| **B4** (half done: `dtype_usage` reports `F32`/`BF16` as `Accelerated`, `I32`/`Bool` as `Storage | Arithmetic` (so `set_default_dtypes(.., I32)` works, found by B10) and `F16` as `Storage` (`lib.rs`); the once-per-(op, dtype) warnings, the `burn-store` BF16 warning and strict-mode failure are missing) | Honest `dtype_usage`; dtype fallback warnings (edge 5); BF16 safetensors warning naming the cast | B0 | `burn-store` load of a BF16 file logs one warning; strict fails |
 | **B5** (storage, views and element-wise done: `hardware-coverage.md` P1a; partial-row download open -- measured: a 1000-row batch of a resident set is a host slice and a 3 MB re-upload every batch, 46 ms a batch against 2.1 on the host, row X) | Rank-N and rank-1 storage as `[prod(lead), last]`; `reshape`/`unsqueeze`/`flatten` keeping the last dim as views; partial-row download for unaligned slices (edges 6, 7, 8, 13) | B0 | MNIST steady step moves only `dL/dlogits` and the logits (biases and SGD stay resident, needs `float_sub` with `mul_scalar` on `[1,n]`); a `[b,s,d]` element-wise chain downloads nothing |
 | **B6** (done 2026-10-03 for tile-aligned operands: a rank-N lhs against an unbatched rhs -- every `Linear` -- folds into the 2-D product, as do `linear_{weight,bias}_backward`; a real batch on both sides runs as `Session::matmul_dram_batched` over blocks of the operands' buffers, reshapes and swaps being strided views (`burn-tt/src/views.rs`); untiled shapes are still host-staged) | Batched matmul on resident operands (edge 9) | B5 | `[8,64,64]@[8,64,64]` under strict: zero downloads; bit-identical to per-batch host-staged |
 | **B7** | `download_many`, real readback futures, batched `tr_execute` | B1 | one server job per transaction |
 | **B8** (asynchronous calls done 2026-10-03; `Backend::sync` barrier done 2026-10-11 (`server::try_sync`, B1); batched readback is B7: `server::submit` -- the caller names each result by a process-wide id and computes its shape, the server thread translates ids (`server::Ids`), only waits wait; a failed op poisons its result and the attachment's next wait. Per call 30-40 us -> 0.2 us; MNIST 1.8 -> 1.4 ms/step, the transformer 11.1 -> 8.6) | Async dispatch with client-assigned ids; `sync` as barrier. Measured (2026-10-01, `ttsim-divergence.md` row Z): each call's round trip to the server is 32-49 us, ~0.2 ms of a 0.61 ms batch-64 inference and ~0.7 ms of a 2.2 ms training step | B1, B3 | MNIST golden bit for bit; ms/step recorded; `tt-mnist --infer`'s per-call breakdown shows the calls returning without the round trip |
 | **B9** | `name`, `memory_cleanup`, `memory_persistent_allocations`; OOM retry | B2 | unit tests §2.1 |
-| **B10** | Vendored conformance crate on ttsim, eager policy, expected-failures | B2, B0 | §5.2 gate |
-| **B11** | Generated conformance subset in `SMOKE` | B10 | `cargo xtask silicon --smoke` runs it on card 0 |
+| **B10** (done 2026-10-11: `burn-tt-conformance`; no eager policy was needed, see 5.2) | Fetched, digest-pinned conformance suite on ttsim, expected-failures | B2, B0 | §5.2 gate: `cargo xtask conformance --release` |
+| **B11** (done 2026-10-11: 163 tests, card 0) | Conformance subset in `SMOKE` (curated modules, not generated) | B10 | `cargo xtask silicon --smoke` runs it on card 0 |
 | **B12** (partial: `impl BackendIr for TtBackend` with `TtHandle` exists, `tensor.rs`; the router/remote gate has never run -- neither `burn-router` nor `burn-remote` is a dependency or a test anywhere in the workspace) | `BackendIr` (`TtHandle`); router + remote gates | -- | `burn-remote` server on a card host passes the delegation battery from a client |
 | **B13a** (partial: `FusionBackend`, `TtFusionRuntime`, `burn_tt::Tt` and the default-on `fusion` feature exist; `step12_mnist` exercises `Tt`; "zero fusers" was superseded by the MVP fuser of B13b; conformance on `Fusion<TtBackend>` is open with B10) | `FusionBackend`, zero fusers, `burn_tt::Tt` alias, `fusion` feature | B12, B10 | conformance green on `Fusion<TtBackend>` |
 | **B13b** (MVP only: `ElementWiseFuser` matches `add` + Burn's lowered ReLU as one `ADD_RELU` dispatch and a lone ReLU as `RELU`; no general chain fuser, no micro-op engine; see [kernel-fusion.md](kernel-fusion.md)) | Element-wise chain fuser | B13a, HC:F3/F4 (or chained `ELTWISE`) | one job per chain; golden unchanged |

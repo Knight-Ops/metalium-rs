@@ -1,0 +1,193 @@
+# Tests of Burn's own backend suite (vendor/burn-backend-tests, pinned in PINS.toml)
+# that burn-tt is expected to fail, and why. `cargo xtask conformance` compares
+# every run with this file: an unlisted failure is a regression or a new finding,
+# and a listed test that passes is stale, so the list only shrinks. The goal is an
+# empty file.
+#
+# Never loosen a vendored tolerance to make a test pass; a `precision` entry
+# names the mechanism, and says whether a bound has been derived.
+#
+# Test names are `<binary>::<test path>`, as `cargo xtask conformance --list`
+# prints them.
+
+
+[[group]]
+category = "unsupported-dtype"
+reason = "F64 is not a Tensix dtype: `float_cast` to F64 is refused by name (`dtype_usage(F64)` is empty). The two autodiff tests are `#[might_panic(reason = \\\"Unsupported precision for fusion\\\")]`, and burn-tensor-testgen 0.21.0's macro self-deadlocks (its panic hook takes the PANIC_LOG lock the failing body still holds) when the panic message differs, so they end as timeouts."
+tests = [
+    "autodiff::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_checkpointing::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor::tensor::float::ops::slice::should_support_slice_fill_cast_f64",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "`conv3d` is refused by name; docs/plans/burn-op-notes.md lists it as not planned until a model needs it."
+tests = [
+    "autodiff::base::conv3d::test_conv3d_basic",
+    "autodiff::base::conv3d::test_conv3d_complex",
+    "autodiff::base::conv3d::test_conv3d_groups_stride_2_no_pad",
+    "autodiff_checkpointing::base::conv3d::test_conv3d_basic",
+    "autodiff_checkpointing::base::conv3d::test_conv3d_complex",
+    "autodiff_checkpointing::base::conv3d::test_conv3d_groups_stride_2_no_pad",
+    "tensor::tensor::float::module::conv3d::test_conv3d_complex",
+    "tensor::tensor::float::module::conv3d::test_conv3d_groups",
+    "tensor::tensor::float::module::conv3d::test_conv3d_simple",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "`conv_transpose3d` is refused by name, like `conv3d` (docs/plans/burn-op-notes.md: not planned until a model needs it)."
+tests = [
+    "autodiff::base::conv_transpose3d::test_conv_transpose3d_basic",
+    "autodiff::base::conv_transpose3d::test_conv_transpose3d_complex_groups",
+    "autodiff_checkpointing::base::conv_transpose3d::test_conv_transpose3d_basic",
+    "autodiff_checkpointing::base::conv_transpose3d::test_conv_transpose3d_complex_groups",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_dilation_2",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_groups_2",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_groups_different_channels",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_simple_1",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_simple_2",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_stride2_out_padding",
+    "tensor::tensor::float::module::conv_transpose3d::test_conv_transpose3d_stride_2",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "`deform_conv2d` is refused by name (docs/plans/burn-op-notes.md: not planned until a model needs it)."
+tests = [
+    "autodiff::base::deform_conv2d::test_deform_conv2d_basic",
+    "autodiff::base::deform_conv2d::test_deform_conv2d_batched",
+    "autodiff::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
+    "autodiff::base::deform_conv2d::test_deform_conv2d_different_padding",
+    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_basic",
+    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_batched",
+    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
+    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_padding",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_batched",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_dilation",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_kernel_size",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_padding_size",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_stride",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_width",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_offset_groups",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_simple",
+    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_weight_groups",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "`scatter_nd` with a Mul, Min or Max reduction is refused by name: only Add (duplicates folded in index order) and Assign are native (docs/plans/burn-op-notes.md D4: Burn leaves duplicate indices undefined for the others)."
+tests = [
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_data_wins",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_k_equals_d",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_tie",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_max_grad_values_win",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_min_grad",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_min_grad_tie",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_k_equals_d",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_data_tracked",
+    "autodiff::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_values_tracked",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_data_wins",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_k_equals_d",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_tie",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_max_grad_values_win",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_min_grad",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_min_grad_tie",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_k_equals_d",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_data_tracked",
+    "autodiff_checkpointing::base::gather_scatter_nd::test_scatter_nd_mul_grad_only_values_tracked",
+    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_max",
+    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_min",
+    "tensor::tensor::float::ops::gather_scatter_nd::test_scatter_nd_mul",
+    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_max",
+    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_min",
+    "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_mul",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "`interpolate` (nearest, bilinear, bicubic, Lanczos) is refused by name (docs/plans/burn-op-notes.md: not planned until a model needs it)."
+tests = [
+    "autodiff::base::nearest_interpolate::test_downsample_interpolation",
+    "autodiff::base::nearest_interpolate::test_upsample_interpolation",
+    "autodiff_checkpointing::base::nearest_interpolate::test_downsample_interpolation",
+    "autodiff_checkpointing::base::nearest_interpolate::test_upsample_interpolation",
+    "tensor::tensor::float::module::bicubic_interpolate::test_1d_bicubic",
+    "tensor::tensor::float::module::bicubic_interpolate::test_downsample_interpolation",
+    "tensor::tensor::float::module::bicubic_interpolate::test_upsample_half_pixel",
+    "tensor::tensor::float::module::bicubic_interpolate::test_upsample_interpolation",
+    "tensor::tensor::float::module::bilinear_interpolate::should_interpolate_cast",
+    "tensor::tensor::float::module::bilinear_interpolate::test_1d_bilinear",
+    "tensor::tensor::float::module::bilinear_interpolate::test_downsample_interpolation",
+    "tensor::tensor::float::module::bilinear_interpolate::test_interpolate_coord_float_precision_boundary",
+    "tensor::tensor::float::module::bilinear_interpolate::test_upsample_half_pixel",
+    "tensor::tensor::float::module::bilinear_interpolate::test_upsample_interpolation",
+    "tensor::tensor::float::module::lanczos3_interpolate::test_1d_lanczos3",
+    "tensor::tensor::float::module::lanczos3_interpolate::test_downsample_interpolation",
+    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_2x",
+    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_half_pixel",
+    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_interpolation",
+    "tensor::tensor::float::module::nearest_interpolate::test_1d_nearest",
+    "tensor::tensor::float::module::nearest_interpolate::test_downsample_interpolation",
+    "tensor::tensor::float::module::nearest_interpolate::test_upsample_interpolation",
+]
+
+[[group]]
+category = "precision"
+reason = "A matmul truncates an F32 operand to TF32 (SrcRoute::Tf32FromFp32, 10 explicit mantissa bits): in grad_1[0][1] = 58.4628 - 57 the operand 40.4628 becomes 40.4375 (the step is 2^-5 between 32 and 64), so the result is 1.4375 against 1.46281, a relative error of 1.7e-2 against the test's permissive 1e-2. Reproduced by hand; the tolerance stays as vendored."
+tests = [
+    "autodiff::base::gelu::should_diff_gelu",
+    "autodiff_checkpointing::base::gelu::should_diff_gelu",
+]
+
+[[group]]
+category = "precision"
+reason = "Burn's LU composes matmuls, whose operands the unpacker truncates to TF32 (SrcRoute::Tf32FromFp32); elimination amplifies the error (observed 1.8e-2 to 2.3e-2 relative against the test's 5e-3, and a determinant of -2.5e-4 where 0 is expected). Attributed to TF32 operand truncation, not decomposed: a bound for this composition is not derived."
+tests = [
+    "tensor::tensor::float::linalg::det::test_det_20x20_singular_linearly_dependent",
+    "tensor::tensor::float::linalg::lu::test_lu_2d_square",
+    "tensor::tensor::float::linalg::lu::test_lu_2d_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_3d_square",
+    "tensor::tensor::float::linalg::lu::test_lu_3d_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_4d_square",
+    "tensor::tensor::float::linalg::lu::test_lu_4d_tall",
+]
+
+[[group]]
+category = "precision"
+reason = "conv2d (TF32 operands, within step85's derived bound) followed by the test's batch-norm style subtraction of the mean: the error is 7.3e-3 relative (1.35e-4 absolute) against the test's 5e-3 and 1e-5. Attributed to TF32 operand truncation, not decomposed: a bound for this composition is not derived."
+tests = [
+    "tensor::tensor::float::module::conv2d::test_conv2d_binary_broadcasted",
+]
+
+[[group]]
+category = "precision"
+reason = "Burn's LU composes matmuls whose operands the unpacker truncates to TF32; elimination amplifies the error, so these miss the vendored tolerance. Confirmed on silicon, card 0: the 300 to 500 square and rectangular ones finish there in 9 to 355 s and then fail the same tolerance (the small ones in under a second). Also too slow for ttsim in the canonical limit, except `test_det_random_2x2x4x4` (1.5% against the tolerance). Attributed to TF32 operand truncation, not decomposed: a bound for this composition is not derived."
+tests = [
+    "tensor::tensor::float::linalg::det::test_det_random_2x2x4x4_pytorch_comparison",
+    "tensor::tensor::float::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_wide",
+]
+
+[[group]]
+category = "timeout"
+reason = "The simulator does not finish these in the limit (120 s in the canonical run; the CTC losses over 400 to 500 steps, the 300 x 300 determinants, and `[408, 261120] @ [261120, 408]`, each thousands of small device launches), but each passes on silicon, card 0: the CTC losses in 4 to 8 s (run 1791725576), the 300 x 300 determinants within the 900 s limit (run 1791725618), and the transaction matmul in 13 s (run 1791725132). Not a defect: ttsim speed."
+tests = [
+    "autodiff::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "autodiff_checkpointing::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_ones",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_zeros",
+    "tensor::tensor::float::linalg::det::test_det_300x300_identity_matrix",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_mixed_input_lengths",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_sequence",
+    "tensor::tensor::float::ops::transaction::should_support_transaction",
+]
