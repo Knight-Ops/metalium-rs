@@ -241,7 +241,7 @@ cargo xtask silicon --release --include-ignored --timeout-secs 600 --filter step
 ## Historical (pre-consolidation)
 
 The legacy executor's measurements against streaming are in
-[firmware-performance.md](firmware-performance.md#streaming-ownership-rollout)
+[performance-log.md](performance-log.md#streaming-ownership-rollout)
 (run 1791060004: traced 2048² adds 0.74/0.75/0.85 of legacy on 1/8/32 tiles;
 fresh 64² add 1.27, fresh 32-tile 256³ matmul 1.32).
 

@@ -695,7 +695,7 @@ pub(crate) fn unfold_native(tensor: TtTensor, dim: usize, size: usize, step: usi
 /// of a device buffer rather than a host reshuffle.
 fn resident_for_view(tensor: &TtTensor) {
     if tensor.is_storable()
-        && crate::server::is_attached(tensor.device)
+        && crate::server::attachable(tensor.device)
         && crate::server::supports_dram(tensor.device)
     {
         tensor.to_dram();
@@ -1016,7 +1016,7 @@ fn slice_assign_native(
 }
 
 fn native_zeros(shape: burn_backend::Shape, device: &TtDevice, dtype: DType) -> Option<TtTensor> {
-    if !crate::server::is_attached(*device) || !crate::server::supports_dram(*device) {
+    if !crate::server::attachable(*device) || !crate::server::supports_dram(*device) {
         return None;
     }
     let elem = match dtype {
@@ -1041,7 +1041,7 @@ fn native_random(
     device: &TtDevice,
     dtype: DType,
 ) -> Option<TtTensor> {
-    if !crate::server::is_attached(*device) || !crate::server::supports_dram(*device) {
+    if !crate::server::attachable(*device) || !crate::server::supports_dram(*device) {
         return None;
     }
     let dims = crate::tensor::stored_dims(&shape.to_vec())?;
@@ -1449,6 +1449,22 @@ fn to_device_resident(tensor: TtTensor, device: &TtDevice) -> TtTensor {
         let _ = t.to_dram();
     }
     t
+}
+
+/// A tensor's data, for `into_data`: a failed download is the future's
+/// `ExecutionError` -- what `try_into_data` returns -- unless strict mode asks
+/// for the panic at the failing call.
+fn read_back(tensor: TtTensor) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
+    let strict = crate::report::strict_here();
+    async move {
+        match tensor.try_into_host() {
+            Ok(host) => Ok(host.into_data()),
+            Err(e) if strict => panic!("{e}"),
+            Err(e) => Err(ExecutionError::WithContext {
+                reason: e.to_string(),
+            }),
+        }
+    }
 }
 
 pub mod float {
@@ -2047,7 +2063,7 @@ pub mod float {
             tensor
         };
         if tensor.is_storable()
-            && crate::server::is_attached(tensor.device)
+            && crate::server::attachable(tensor.device)
             && crate::server::supports_dram(tensor.device)
         {
             tensor.to_dram();
@@ -3024,7 +3040,7 @@ pub mod float {
     pub fn float_into_data(
         tensor: FloatTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
-        async move { Ok(tensor.into_host().into_data()) }
+        super::read_back(tensor)
     }
 
     /// `((lhs % rhs) + rhs) % rhs` element-wise, Flex's formula, on the device
@@ -3927,7 +3943,7 @@ pub mod int {
     pub fn int_into_data(
         tensor: IntTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
-        async move { Ok(tensor.into_host().into_data()) }
+        super::read_back(tensor)
     }
 
     /// First index of the maximum along `dim`.
@@ -4344,7 +4360,7 @@ pub mod bool {
     pub fn bool_into_data(
         tensor: BoolTensor<TtBackend>,
     ) -> impl Future<Output = Result<TensorData, ExecutionError>> + Send {
-        async move { Ok(tensor.into_host().into_data()) }
+        super::read_back(tensor)
     }
 
     pub fn bool_argwhere(

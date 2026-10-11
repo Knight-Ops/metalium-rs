@@ -17,14 +17,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use tt_kernels::tensor::{Block, BlockMove};
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::matrix_eltwise::{ElementwiseMode, MatrixEltwiseOp, SrcPrecision};
-use tt_kernels::session::{Session, SessionError, TileChoice};
+use tt_kernels::session::{Session, TileChoice};
 
+use crate::error::TtError;
 use crate::TtDevice;
 pub use tt_kernels::tensor::Elem;
 
@@ -50,16 +51,13 @@ pub trait Engine {
     }
     /// Run the transcendentals in `mode` from the next op on. An engine with
     /// no device-resident element-wise ops refuses, rather than ignoring it.
-    fn set_math_mode(
-        &mut self,
-        mode: tt_kernels::sfpu::approx::MathMode,
-    ) -> Result<(), EngineError> {
-        Err(EngineError(format!(
+    fn set_math_mode(&mut self, mode: tt_kernels::sfpu::approx::MathMode) -> Result<(), TtError> {
+        Err(TtError::unsupported(format!(
             "this engine has no math modes (asked for {mode:?})"
         )))
     }
     /// `A[m, k] @ B[k, n]`, row-major.
-    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError>;
+    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, TtError>;
 
     /// Can this engine keep tensors on the device (Phase 9)? If not, every
     /// tensor stays on the host; native `matmul` and `full_reduce` may stage
@@ -74,18 +72,13 @@ pub trait Engine {
         _values: &[f32],
         _dims: [usize; 2],
         _mean: bool,
-    ) -> Result<f32, EngineError> {
-        Err(EngineError(
-            "native full reduction is unsupported by this engine".into(),
+    ) -> Result<f32, TtError> {
+        Err(TtError::unsupported(
+            "native full reduction is unsupported by this engine",
         ))
     }
     /// Put a row-major `[rows, cols]` matrix on the device.
-    fn upload(
-        &mut self,
-        _values: &[f32],
-        _rows: usize,
-        _cols: usize,
-    ) -> Result<BufferId, EngineError> {
+    fn upload(&mut self, _values: &[f32], _rows: usize, _cols: usize) -> Result<BufferId, TtError> {
         Err(unsupported())
     }
     /// Materialize operation geometry from replayable mover immediates.
@@ -94,11 +87,11 @@ pub trait Engine {
         _bits: &[u32],
         _dims: [usize; 2],
         _elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         Err(unsupported())
     }
     /// Read one back, row-major.
-    fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, EngineError> {
+    fn download(&mut self, _id: BufferId) -> Result<Vec<f32>, TtError> {
         Err(unsupported())
     }
     fn upload_bf16(
@@ -106,10 +99,10 @@ pub trait Engine {
         _bits: &[u16],
         _rows: usize,
         _cols: usize,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         Err(unsupported())
     }
-    fn download_bf16(&mut self, _id: BufferId) -> Result<Vec<u16>, EngineError> {
+    fn download_bf16(&mut self, _id: BufferId) -> Result<Vec<u16>, TtError> {
         Err(unsupported())
     }
     fn pool_bf16(
@@ -118,14 +111,14 @@ pub trait Engine {
         _windows: &[Vec<[usize; 2]>],
         _divisors: &[usize],
         _dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn matmul_bf16(
         &mut self,
         _a: BufferId,
         _b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Convert between resident F32 and physical BF16 storage on Tensix.
@@ -133,7 +126,7 @@ pub trait Engine {
         &mut self,
         _id: BufferId,
         _bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Explicit physical BFP storage conversion. None widens to F32.
@@ -141,14 +134,14 @@ pub trait Engine {
         &mut self,
         _id: BufferId,
         _format: Option<tt_kernels::bfp::BfpFormat>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn matmul_bfp(
         &mut self,
         _a: BufferId,
         _b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Put a row-major `[rows, cols]` matrix of `elem` datums on the device, as
@@ -160,11 +153,11 @@ pub trait Engine {
         _rows: usize,
         _cols: usize,
         _elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         Err(unsupported())
     }
     /// Read any buffer back as its datums' bits, row-major.
-    fn download_bits(&mut self, _id: BufferId) -> Result<Vec<u32>, EngineError> {
+    fn download_bits(&mut self, _id: BufferId) -> Result<Vec<u32>, TtError> {
         Err(unsupported())
     }
     /// Forget one.
@@ -177,7 +170,7 @@ pub trait Engine {
         _a_transposed: bool,
         _b: BufferId,
         _b_transposed: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// `op(A_i) @ op(B_i)` for each pair of blocks of `a` and `b` in `items`,
@@ -189,7 +182,7 @@ pub trait Engine {
         _b: BufferId,
         _items: &[(Block, Block)],
         _mkn: [usize; 3],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// A new `dims` buffer assembled from blocks of `a`
@@ -200,7 +193,7 @@ pub trait Engine {
         _a: BufferId,
         _sources: &[[usize; 2]],
         _dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn copy_blocks(
@@ -208,7 +201,7 @@ pub trait Engine {
         _a: BufferId,
         _moves: &[BlockMove],
         _dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn zeros_dram(
@@ -216,14 +209,14 @@ pub trait Engine {
         _dims: [usize; 2],
         _elem: Elem,
         _bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn gather_indexed(
         &mut self,
         _input: BufferId,
         _indices: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     fn repack_many(
@@ -231,7 +224,7 @@ pub trait Engine {
         _inputs: &[BufferId],
         _sources: &[(usize, [usize; 2])],
         _dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Rows of `sources` gathered into a new buffer
@@ -241,7 +234,7 @@ pub trait Engine {
         _sources: &[BufferId],
         _rows: &[(usize, usize)],
         _cols: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// `t` with `value`'s rows added to the rows `indices` name, in order
@@ -251,11 +244,11 @@ pub trait Engine {
         _t: BufferId,
         _indices: &[usize],
         _value: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
-    fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// `a` reduced over `axis` by `op`, left on the device
@@ -265,7 +258,7 @@ pub trait Engine {
         _a: BufferId,
         _op: tt_kernels::sfpu::reduce::ReduceOp,
         _axis: tt_kernels::sfpu::reduce::Axis,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Inclusive scan down matrix rows, keeping all prefixes resident.
@@ -273,7 +266,7 @@ pub trait Engine {
         &mut self,
         _a: BufferId,
         _op: tt_kernels::sfpu::scan::ScanOp,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
@@ -283,7 +276,7 @@ pub trait Engine {
         _a: BufferId,
         _first: usize,
         _rows: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Element-wise `a (kind) b` or `a (kind) scalar` (`tt_kernels::kind`),
@@ -294,7 +287,7 @@ pub trait Engine {
         _scalar: f32,
         _a: BufferId,
         _b: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// [`Engine::eltwise`] with the whole op -- both its scalars -- and a
@@ -306,7 +299,7 @@ pub trait Engine {
         a: BufferId,
         b: Option<BufferId>,
         c: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if op.scalar2 != 0.0 || c.is_some() {
             return Err(unsupported());
         }
@@ -314,7 +307,7 @@ pub trait Engine {
     }
     /// `x^y` as `powf` (`tt_kernels::session::Session::pow`), result on the
     /// device.
-    fn pow(&mut self, _x: BufferId, _y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn pow(&mut self, _x: BufferId, _y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Everything the engine's device has moved across its transport so far
@@ -327,11 +320,11 @@ pub trait Engine {
         None
     }
     /// Start capturing a trace (`tt_kernels::trace`; [`crate::Trace`]).
-    fn begin_trace(&mut self) -> Result<(), EngineError> {
+    fn begin_trace(&mut self) -> Result<(), TtError> {
         Err(no_traces())
     }
     /// End it: the trace's number.
-    fn end_trace(&mut self) -> Result<u64, EngineError> {
+    fn end_trace(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
@@ -342,13 +335,13 @@ pub trait Engine {
         _input: BufferId,
         _values: &[f32],
         _output: BufferId,
-    ) -> Result<TraceRun, EngineError> {
+    ) -> Result<TraceRun, TtError> {
         Err(no_traces())
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
     /// Copy `src` into `dst` on the device without allocating a new buffer.
-    fn copy_into(&mut self, _src: BufferId, _dst: BufferId) -> Result<(), EngineError> {
+    fn copy_into(&mut self, _src: BufferId, _dst: BufferId) -> Result<(), TtError> {
         Err(unsupported())
     }
     /// Overwrite multiple inputs, replay `trace`, and read multiple outputs back.
@@ -357,7 +350,7 @@ pub trait Engine {
         _trace: u64,
         _inputs: &[(BufferId, InputPayload)],
         _outputs: &[(BufferId, OutputKind)],
-    ) -> Result<GenericTraceRun, EngineError> {
+    ) -> Result<GenericTraceRun, TtError> {
         Err(no_traces())
     }
 
@@ -368,7 +361,7 @@ pub trait Engine {
         &mut self,
         _a: BufferId,
         _spec: tt_kernels::sfpu::sort::Spec,
-    ) -> Result<SortedBuffers, EngineError> {
+    ) -> Result<SortedBuffers, TtError> {
         Err(unsupported())
     }
 
@@ -379,7 +372,7 @@ pub trait Engine {
         _dims: [usize; 2],
         _draw: crate::random::Draw,
         _base: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
 
@@ -389,7 +382,7 @@ pub trait Engine {
         &mut self,
         _id: BufferId,
         _to_f16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
 }
@@ -457,12 +450,12 @@ pub struct TraceRun {
     pub read: std::time::Duration,
 }
 
-fn no_traces() -> EngineError {
-    EngineError("this engine does not capture traces".into())
+fn no_traces() -> TtError {
+    TtError::unsupported("this engine does not capture traces")
 }
 
-fn unsupported() -> EngineError {
-    EngineError("this engine keeps no tensors on the device".into())
+fn unsupported() -> TtError {
+    TtError::unsupported("this engine keeps no tensors on the device")
 }
 
 /// A tensor kept on the device: by the engine's own numbering inside an
@@ -502,7 +495,7 @@ impl DramBuffers {
         b: Option<BufferId>,
         precision: SrcPrecision,
         fidelity: Fidelity,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         use tt_kernels::kind;
         let operation = match op.kind {
             kind::ADD | kind::ADD_SCALAR => MatrixEltwiseOp::Add,
@@ -510,7 +503,7 @@ impl DramBuffers {
             kind::MUL | kind::MUL_SCALAR => MatrixEltwiseOp::Mul,
             _ => return Err(unsupported()),
         };
-        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+        let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         let packed = self.bf16.contains_key(&a);
         let scalar = if b.is_none() {
             Some(
@@ -529,9 +522,7 @@ impl DramBuffers {
             Ok(None)
         };
         let result = (|| {
-            let packed_scalar = packed_scalar
-                .as_ref()
-                .map_err(|e| EngineError(e.0.clone()))?;
+            let packed_scalar = packed_scalar.as_ref().map_err(Clone::clone)?;
             if packed {
                 let ta = self.bf16.get(&a).unwrap();
                 let tb = if let Some(b) = b {
@@ -568,14 +559,14 @@ impl DramBuffers {
         windows: &[Vec<[usize; 2]>],
         divisors: &[usize],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let input = self
             .bf16
             .get(&a)
-            .ok_or_else(|| EngineError(format!("no BF16 buffer {a}")))?;
+            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {a}")))?;
         let out = s
             .bf16_pool_windows(input, windows, divisors, dims)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
     pub fn matmul_bf16<T: tt_device::Transport>(
@@ -585,18 +576,18 @@ impl DramBuffers {
         b: BufferId,
         fidelity: Fidelity,
         budget: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self
             .bf16
             .get(&a)
-            .ok_or_else(|| EngineError(format!("no BF16 buffer {a}")))?;
+            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {a}")))?;
         let tb = self
             .bf16
             .get(&b)
-            .ok_or_else(|| EngineError(format!("no BF16 buffer {b}")))?;
+            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {b}")))?;
         let out = s
             .matmul_bf16(ta, tb, fidelity, budget)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
     pub fn upload_bf16<T: tt_device::Transport>(
@@ -605,10 +596,8 @@ impl DramBuffers {
         bits: &[u16],
         rows: usize,
         cols: usize,
-    ) -> Result<BufferId, EngineError> {
-        let t = s
-            .upload_bf16(bits, rows, cols)
-            .map_err(|e| EngineError(e.to_string()))?;
+    ) -> Result<BufferId, TtError> {
+        let t = s.upload_bf16(bits, rows, cols).map_err(TtError::from)?;
         Ok(self.insert_bf16(t).0)
     }
 
@@ -616,12 +605,12 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         id: BufferId,
-    ) -> Result<Vec<u16>, EngineError> {
+    ) -> Result<Vec<u16>, TtError> {
         let t = self
             .bf16
             .get(&id)
-            .ok_or_else(|| EngineError(format!("no BF16 buffer {id}")))?;
-        s.download_bf16(t).map_err(|e| EngineError(e.to_string()))
+            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {id}")))?;
+        s.download_bf16(t).map_err(TtError::from)
     }
 
     pub fn cast_float<T: tt_device::Transport>(
@@ -629,18 +618,16 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
         bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if bf16 {
-            let t = s
-                .bf16_from_f32(self.get(id)?)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let t = s.bf16_from_f32(self.get(id)?).map_err(TtError::from)?;
             Ok(self.insert_bf16(t))
         } else {
             let t = self
                 .bf16
                 .get(&id)
-                .ok_or_else(|| EngineError(format!("no BF16 buffer {id}")))?;
-            let t = s.bf16_to_f32(t).map_err(|e| EngineError(e.to_string()))?;
+                .ok_or_else(|| TtError::Device(format!("no BF16 buffer {id}")))?;
+            let t = s.bf16_to_f32(t).map_err(TtError::from)?;
             Ok(self.insert(t))
         }
     }
@@ -650,8 +637,8 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
         format: Option<tt_kernels::bfp::BfpFormat>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
-        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
             let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
             let dims = [t.rows(), t.cols()];
@@ -662,7 +649,7 @@ impl DramBuffers {
             let t = self
                 .bfp
                 .get(&id)
-                .ok_or_else(|| EngineError(format!("no BFP buffer {id}")))?;
+                .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))?;
             let t = s.bfp_to_f32(t).map_err(error)?;
             Ok(self.insert(t))
         }
@@ -674,12 +661,12 @@ impl DramBuffers {
         a: BufferId,
         b: BufferId,
         fidelity: Fidelity,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let a = self.bfp.get(&a).ok_or_else(unsupported)?;
         let b = self.bfp.get(&b).ok_or_else(unsupported)?;
         let out = s
             .bfp_matmul(a, false, b, false, fidelity)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
     fn insert_bf16(&mut self, t: tt_kernels::bf16::Bf16Tensor) -> (BufferId, [usize; 2]) {
@@ -691,15 +678,15 @@ impl DramBuffers {
     pub fn begin_trace<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
-    ) -> Result<(), EngineError> {
-        s.begin_trace().map_err(|e| EngineError(e.to_string()))
+    ) -> Result<(), TtError> {
+        s.begin_trace().map_err(TtError::from)
     }
 
     pub fn end_trace<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
-    ) -> Result<u64, EngineError> {
-        let id = s.end_trace().map_err(|e| EngineError(e.to_string()))?;
+    ) -> Result<u64, TtError> {
+        let id = s.end_trace().map_err(TtError::from)?;
         self.next_trace += 1;
         self.traces.insert(self.next_trace, id);
         Ok(self.next_trace)
@@ -712,21 +699,20 @@ impl DramBuffers {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<TraceRun, EngineError> {
+    ) -> Result<TraceRun, TtError> {
         use std::time::Instant;
         let id = *self
             .traces
             .get(&trace)
-            .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
         // The write waits for what was queued first: that wait is not the
         // write's.
-        s.sync().map_err(e)?;
+        s.sync().map_err(TtError::from)?;
         let t0 = Instant::now();
-        s.write(self.get(input)?, values).map_err(e)?;
+        s.write(self.get(input)?, values).map_err(TtError::from)?;
         let t1 = Instant::now();
-        s.replay(id).map_err(e)?;
-        s.sync().map_err(e)?;
+        s.replay(id).map_err(TtError::from)?;
+        s.sync().map_err(TtError::from)?;
         let t2 = Instant::now();
         let output = self.download(s, output)?;
         Ok(TraceRun {
@@ -748,35 +734,30 @@ impl DramBuffers {
         s: &mut Session<T>,
         src: BufferId,
         dst: BufferId,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), TtError> {
         if let Some(src_t) = self.bfp.get(&src) {
             let dst_t = self
                 .bfp
                 .get(&dst)
-                .ok_or_else(|| EngineError("copy_into storage formats differ".into()))?;
-            return s
-                .copy_into_bfp(src_t, dst_t)
-                .map_err(|e| EngineError(e.to_string()));
+                .ok_or_else(|| TtError::Device("copy_into storage formats differ".into()))?;
+            return s.copy_into_bfp(src_t, dst_t).map_err(TtError::from);
         }
         if self.bfp.contains_key(&dst) {
-            return Err(EngineError("copy_into storage formats differ".into()));
+            return Err(TtError::Device("copy_into storage formats differ".into()));
         }
         if let Some(src_t) = self.bf16.get(&src) {
             let dst_t = self
                 .bf16
                 .get(&dst)
-                .ok_or_else(|| EngineError("copy_into storage formats differ".into()))?;
-            return s
-                .copy_into_bf16(src_t, dst_t)
-                .map_err(|e| EngineError(e.to_string()));
+                .ok_or_else(|| TtError::Device("copy_into storage formats differ".into()))?;
+            return s.copy_into_bf16(src_t, dst_t).map_err(TtError::from);
         }
         if self.bf16.contains_key(&dst) {
-            return Err(EngineError("copy_into storage formats differ".into()));
+            return Err(TtError::Device("copy_into storage formats differ".into()));
         }
         let src_t = self.get(src)?;
         let dst_t = self.get(dst)?;
-        s.copy_into(src_t, dst_t)
-            .map_err(|e| EngineError(e.to_string()))
+        s.copy_into(src_t, dst_t).map_err(TtError::from)
     }
 
     pub fn run_generic_trace<T: tt_device::Transport>(
@@ -785,19 +766,18 @@ impl DramBuffers {
         trace: u64,
         inputs: &[(BufferId, InputPayload)],
         outputs: &[(BufferId, OutputKind)],
-    ) -> Result<GenericTraceRun, EngineError> {
+    ) -> Result<GenericTraceRun, TtError> {
         use std::time::Instant;
         let id = *self
             .traces
             .get(&trace)
-            .ok_or_else(|| EngineError(format!("no trace {trace}")))?;
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
-        s.sync().map_err(e)?;
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        s.sync().map_err(TtError::from)?;
         let t0 = Instant::now();
         self.write_trace_inputs(s, inputs)?;
         let t1 = Instant::now();
-        s.replay(id).map_err(e)?;
-        s.sync().map_err(e)?;
+        s.replay(id).map_err(TtError::from)?;
+        s.sync().map_err(TtError::from)?;
         let t2 = Instant::now();
         let out_data = self.read_trace_outputs(s, outputs)?;
         Ok(GenericTraceRun {
@@ -813,13 +793,12 @@ impl DramBuffers {
         &self,
         s: &mut Session<T>,
         inputs: &[(BufferId, InputPayload)],
-    ) -> Result<(), EngineError> {
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+    ) -> Result<(), TtError> {
         for (input_id, payload) in inputs {
             let t = self.get(*input_id)?;
             match payload {
-                InputPayload::F32(v) => s.write(t, v).map_err(e)?,
-                InputPayload::Bits(v) => s.write_bits(t, v).map_err(e)?,
+                InputPayload::F32(v) => s.write(t, v).map_err(TtError::from)?,
+                InputPayload::Bits(v) => s.write_bits(t, v).map_err(TtError::from)?,
             }
         }
         Ok(())
@@ -830,14 +809,15 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         outputs: &[(BufferId, OutputKind)],
-    ) -> Result<Vec<OutputPayload>, EngineError> {
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+    ) -> Result<Vec<OutputPayload>, TtError> {
         let mut out_data = Vec::with_capacity(outputs.len());
         for &(output_id, kind) in outputs {
             match kind {
                 OutputKind::F32 => out_data.push(OutputPayload::F32(self.download(s, output_id)?)),
                 OutputKind::Bits => {
-                    let data = s.download_bits(self.get(output_id)?).map_err(e)?;
+                    let data = s
+                        .download_bits(self.get(output_id)?)
+                        .map_err(TtError::from)?;
                     out_data.push(OutputPayload::Bits(data));
                 }
             }
@@ -851,10 +831,8 @@ impl DramBuffers {
         values: &[f32],
         rows: usize,
         cols: usize,
-    ) -> Result<BufferId, EngineError> {
-        let t = s
-            .upload(values, rows, cols)
-            .map_err(|e| EngineError(e.to_string()))?;
+    ) -> Result<BufferId, TtError> {
+        let t = s.upload(values, rows, cols).map_err(TtError::from)?;
         self.next += 1;
         self.live.insert(self.next, t);
         Ok(self.next)
@@ -866,10 +844,8 @@ impl DramBuffers {
         bits: &[u32],
         dims: [usize; 2],
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
-        let t = s
-            .metadata(bits, dims, elem)
-            .map_err(|e| EngineError(e.to_string()))?;
+    ) -> Result<BufferId, TtError> {
+        let t = s.metadata(bits, dims, elem).map_err(TtError::from)?;
         Ok(self.insert(t).0)
     }
 
@@ -877,12 +853,12 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         id: BufferId,
-    ) -> Result<Vec<f32>, EngineError> {
+    ) -> Result<Vec<f32>, TtError> {
         if let Some(t) = self.bfp.get(&id) {
-            return s.download_bfp(t).map_err(|e| EngineError(e.to_string()));
+            return s.download_bfp(t).map_err(TtError::from);
         }
         let t = self.get(id)?;
-        s.download(t).map_err(|e| EngineError(e.to_string()))
+        s.download(t).map_err(TtError::from)
     }
 
     pub fn pow<T: tt_device::Transport>(
@@ -890,7 +866,7 @@ impl DramBuffers {
         s: &mut Session<T>,
         x: BufferId,
         y: PowArg,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         use tt_kernels::session::PowExponent;
         let tx = self.get(x)?.clone();
         let ty = match y {
@@ -903,7 +879,7 @@ impl DramBuffers {
             (PowArg::Scalar(v), _) => PowExponent::Scalar(v),
             _ => unreachable!(),
         };
-        let c = s.pow(&tx, exp).map_err(|e| EngineError(e.to_string()))?;
+        let c = s.pow(&tx, exp).map_err(TtError::from)?;
         let dims = [c.rows, c.cols];
         self.next += 1;
         self.live.insert(self.next, c);
@@ -917,10 +893,10 @@ impl DramBuffers {
         rows: usize,
         cols: usize,
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         let t = s
             .upload_bits(bits, rows, cols, elem)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         self.next += 1;
         self.live.insert(self.next, t);
         Ok(self.next)
@@ -930,9 +906,9 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         id: BufferId,
-    ) -> Result<Vec<u32>, EngineError> {
+    ) -> Result<Vec<u32>, TtError> {
         let t = self.get(id)?;
-        s.download_bits(t).map_err(|e| EngineError(e.to_string()))
+        s.download_bits(t).map_err(TtError::from)
     }
 
     pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
@@ -958,7 +934,7 @@ impl DramBuffers {
         route: SrcRoute,
         fidelity: Fidelity,
         budget: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
         let c = s
             .matmul_dram(
@@ -970,7 +946,7 @@ impl DramBuffers {
                 fidelity,
                 budget,
             )
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         let dims = [c.rows, c.cols];
         self.next += 1;
         self.live.insert(self.next, c);
@@ -988,11 +964,11 @@ impl DramBuffers {
         route: SrcRoute,
         fidelity: Fidelity,
         budget: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
         let c = s
             .matmul_dram_batched(&ta, &tb, items, mkn, route, fidelity, budget)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1002,15 +978,13 @@ impl DramBuffers {
         sources: &[BufferId],
         rows: &[(usize, usize)],
         cols: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ts = sources
             .iter()
             .map(|&id| self.get(id).cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<_> = ts.iter().collect();
-        let c = s
-            .gather_rows(&refs, rows, cols)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let c = s.gather_rows(&refs, rows, cols).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1020,11 +994,9 @@ impl DramBuffers {
         t: BufferId,
         indices: &[usize],
         value: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
-        let c = s
-            .rows_add(&tt, indices, &tv)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let c = s.rows_add(&tt, indices, &tv).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1034,17 +1006,13 @@ impl DramBuffers {
         a: BufferId,
         sources: &[[usize; 2]],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if let Some(t) = self.bf16.get(&a) {
-            let c = s
-                .repack_bf16(t, sources, dims)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let c = s.repack_bf16(t, sources, dims).map_err(TtError::from)?;
             return Ok(self.insert_bf16(c));
         }
         let ta = self.get(a)?.clone();
-        let c = s
-            .repack(&ta, sources, dims)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let c = s.repack(&ta, sources, dims).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1054,17 +1022,17 @@ impl DramBuffers {
         dims: [usize; 2],
         elem: Elem,
         bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if bf16 {
-            let out = s.zeros_bf16(dims).map_err(|e| EngineError(e.to_string()))?;
+            let out = s.zeros_bf16(dims).map_err(TtError::from)?;
             Ok(self.insert_bf16(out))
         } else {
             let count = dims[0]
                 .checked_mul(dims[1])
-                .ok_or_else(|| EngineError("zero shape overflow".into()))?;
+                .ok_or_else(|| TtError::Device("zero shape overflow".into()))?;
             let out = s
                 .metadata(&vec![0; count], dims, elem)
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(TtError::from)?;
             Ok(self.insert(out))
         }
     }
@@ -1074,17 +1042,15 @@ impl DramBuffers {
         s: &mut Session<T>,
         input: BufferId,
         indices: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let indices = self.get(indices)?.clone();
         if let Some(t) = self.bf16.get(&input) {
-            let out = s
-                .gather_indexed_bf16(t, &indices)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let out = s.gather_indexed_bf16(t, &indices).map_err(TtError::from)?;
             Ok(self.insert_bf16(out))
         } else {
             let out = s
                 .gather_indexed(self.get(input)?, &indices)
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(TtError::from)?;
             Ok(self.insert(out))
         }
     }
@@ -1095,28 +1061,26 @@ impl DramBuffers {
         inputs: &[BufferId],
         sources: &[(usize, [usize; 2])],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if inputs.first().is_some_and(|a| self.bf16.contains_key(a)) {
             let ts = inputs
                 .iter()
                 .map(|a| {
                     self.bf16
                         .get(a)
-                        .ok_or_else(|| EngineError("mixed repack storage".into()))
+                        .ok_or_else(|| TtError::Device("mixed repack storage".into()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let out = s
                 .repack_many_bf16(&ts, sources, dims)
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(TtError::from)?;
             return Ok(self.insert_bf16(out));
         }
         let ts = inputs
             .iter()
             .map(|&a| self.get(a))
             .collect::<Result<Vec<_>, _>>()?;
-        let out = s
-            .repack_many(&ts, sources, dims)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let out = s.repack_many(&ts, sources, dims).map_err(TtError::from)?;
         Ok(self.insert(out))
     }
 
@@ -1126,12 +1090,12 @@ impl DramBuffers {
         a: BufferId,
         moves: &[BlockMove],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if let Some(t) = self.bf16.get(&a) {
             let [rows, cols] = dims;
             let count = rows
                 .checked_mul(cols)
-                .ok_or_else(|| EngineError("BF16 copy shape overflow".into()))?;
+                .ok_or_else(|| TtError::Device("BF16 copy shape overflow".into()))?;
             let mut sources = vec![[usize::MAX; 2]; count];
             for m in moves {
                 for r in 0..m.extent[0] {
@@ -1139,7 +1103,7 @@ impl DramBuffers {
                         let [tr, tc] = [m.to[0].checked_add(r), m.to[1].checked_add(c)]
                             .map(|v| v.unwrap_or(usize::MAX));
                         if tr >= rows || tc >= cols || sources[tr * cols + tc] != [usize::MAX; 2] {
-                            return Err(EngineError(
+                            return Err(TtError::Device(
                                 "invalid or overlapping BF16 block copy".into(),
                             ));
                         }
@@ -1150,15 +1114,11 @@ impl DramBuffers {
                     }
                 }
             }
-            let c = s
-                .repack_bf16(t, &sources, dims)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let c = s.repack_bf16(t, &sources, dims).map_err(TtError::from)?;
             return Ok(self.insert_bf16(c));
         }
         let ta = self.get(a)?.clone();
-        let c = s
-            .copy_blocks(&ta, moves, dims)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let c = s.copy_blocks(&ta, moves, dims).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1169,7 +1129,7 @@ impl DramBuffers {
         scalar: f32,
         a: BufferId,
         b: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let op = tt_kernels::tensor::Eltwise {
             scalar2: 0.0,
             kind,
@@ -1185,7 +1145,7 @@ impl DramBuffers {
         a: BufferId,
         b: Option<BufferId>,
         c: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if c.is_none()
             && matches!(
                 op.kind,
@@ -1209,7 +1169,7 @@ impl DramBuffers {
         let tc = c.map(|c| self.get(c).cloned()).transpose()?;
         let c = s
             .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         let dims = [c.rows, c.cols];
         self.next += 1;
         self.live.insert(self.next, c);
@@ -1220,9 +1180,9 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         a: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s.sum_rows(&ta).map_err(|e| EngineError(e.to_string()))?;
+        let c = s.sum_rows(&ta).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1232,11 +1192,9 @@ impl DramBuffers {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s
-            .reduce(&ta, op, axis)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let c = s.reduce(&ta, op, axis).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1245,9 +1203,9 @@ impl DramBuffers {
         s: &mut Session<T>,
         a: BufferId,
         op: tt_kernels::sfpu::scan::ScanOp,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s.scan(&ta, op).map_err(|e| EngineError(e.to_string()))?;
+        let c = s.scan(&ta, op).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1257,11 +1215,9 @@ impl DramBuffers {
         s: &mut Session<T>,
         a: BufferId,
         spec: tt_kernels::sfpu::sort::Spec,
-    ) -> Result<SortedBuffers, EngineError> {
+    ) -> Result<SortedBuffers, TtError> {
         let planes = self.get(a)?.clone();
-        let sorted = s
-            .sort_planes(&planes, spec)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let sorted = s.sort_planes(&planes, spec).map_err(TtError::from)?;
         Ok(SortedBuffers {
             keys: self.insert(sorted.keys),
             indices: sorted.indices.map(|t| self.insert(t)),
@@ -1275,7 +1231,7 @@ impl DramBuffers {
         dims: [usize; 2],
         draw: crate::random::Draw,
         base: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         use crate::random::Draw;
         use tt_kernels::prng::{role, Output};
         let drawn = match draw {
@@ -1295,7 +1251,7 @@ impl DramBuffers {
             Draw::IntRange(lo, hi) => s.random_int_range(dims, base, lo, hi),
             Draw::IntWords => s.random_int_words(dims, base),
         }
-        .map_err(|e| EngineError(e.to_string()))?;
+        .map_err(TtError::from)?;
         Ok(self.insert(drawn))
     }
 
@@ -1306,8 +1262,8 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
         to_f16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
-        let error = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if to_f16 {
             let t = s.fp16_from_f32(self.get(id)?).map_err(error)?;
             Ok(self.insert_bf16(t.as_raw()))
@@ -1315,7 +1271,7 @@ impl DramBuffers {
             let raw = self
                 .bf16
                 .get(&id)
-                .ok_or_else(|| EngineError(format!("no FP16 buffer {id}")))?;
+                .ok_or_else(|| TtError::Device(format!("no FP16 buffer {id}")))?;
             let t = tt_kernels::fp16::Fp16Tensor::from_raw(raw.clone());
             let wide = s.fp16_to_f32(&t).map_err(error)?;
             Ok(self.insert(wide))
@@ -1328,26 +1284,19 @@ impl DramBuffers {
         a: BufferId,
         first: usize,
         rows: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if let Some(t) = self.bfp.get(&a) {
-            let v = t
-                .rows_view(first, rows)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let v = t.rows_view(first, rows).map_err(TtError::from)?;
             let dims = [v.rows(), v.cols()];
             self.next += 1;
             self.bfp.insert(self.next, v);
             return Ok((self.next, dims));
         }
         if let Some(t) = self.bf16.get(&a) {
-            let v = t
-                .rows_view(first, rows)
-                .map_err(|e| EngineError(e.to_string()))?;
+            let v = t.rows_view(first, rows).map_err(TtError::from)?;
             return Ok(self.insert_bf16(v));
         }
-        let v = self
-            .get(a)?
-            .rows_view(first, rows)
-            .map_err(|e| EngineError(e.to_string()))?;
+        let v = self.get(a)?.rows_view(first, rows).map_err(TtError::from)?;
         Ok(self.insert(v))
     }
 
@@ -1367,10 +1316,10 @@ impl DramBuffers {
         self.live.is_empty() && self.bf16.is_empty() && self.bfp.is_empty()
     }
 
-    fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, EngineError> {
+    fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, TtError> {
         self.live
             .get(&id)
-            .ok_or_else(|| EngineError(format!("no device buffer {id}")))
+            .ok_or_else(|| TtError::Device(format!("no device buffer {id}")))
     }
 }
 
@@ -1405,7 +1354,7 @@ pub(crate) fn sort_planes(
                             if let Some(i) = s.indices {
                                 engine.free(i.0);
                             }
-                            Err(EngineError(format!("sorted planes are not {dims:?}")))
+                            Err(TtError::Device(format!("sorted planes are not {dims:?}")))
                         }
                     });
                 match made {
@@ -1416,7 +1365,11 @@ pub(crate) fn sort_planes(
                         }
                     }
                     Err(e) => {
-                        let why = Arc::<str>::from(format!("sort {spec:?} on {device}: {e}"));
+                        let why = Arc::new(TtError::Op {
+                            what: format!("sort {spec:?}"),
+                            device,
+                            cause: Arc::new(e),
+                        });
                         ids.failed.get_or_insert_with(|| why.clone());
                         ids.map.insert(keys, Err(why.clone()));
                         if let Some(id) = indices {
@@ -1463,30 +1416,6 @@ pub(crate) fn cast_f16(
     )
 }
 
-/// Why an engine could not start or finish a job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineError(pub String);
-
-impl std::fmt::Display for EngineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for EngineError {}
-
-impl From<tt_kernels::runtime::RunError> for EngineError {
-    fn from(e: tt_kernels::runtime::RunError) -> Self {
-        EngineError(e.to_string())
-    }
-}
-
-impl From<SessionError> for EngineError {
-    fn from(e: SessionError) -> Self {
-        EngineError(e.to_string())
-    }
-}
-
 type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 
 /// Each buffer the callers have named, as the engine numbers it -- or why it
@@ -1495,18 +1424,18 @@ type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 /// server, running jobs in order, makes it before any job reads it.
 #[derive(Default)]
 pub(crate) struct Ids {
-    map: HashMap<BufferId, Result<BufferId, Arc<str>>>,
+    map: HashMap<BufferId, Result<BufferId, Arc<TtError>>>,
     /// The first asynchronous op that failed on this attachment: reported by
     /// every wait from then on (a download, a trace's replay), whatever it
     /// reads, so a failure whose result nobody reads is not lost.
-    failed: Option<Arc<str>>,
+    failed: Option<Arc<TtError>>,
 }
 
 impl Ids {
     /// `Err` with the attachment's first failure, if an op has failed.
-    pub(crate) fn healthy(&self) -> Result<(), EngineError> {
+    pub(crate) fn healthy(&self) -> Result<(), TtError> {
         match &self.failed {
-            Some(why) => Err(EngineError(format!("an earlier device op failed: {why}"))),
+            Some(why) => Err(TtError::EarlierFailure(why.clone())),
             None => Ok(()),
         }
     }
@@ -1514,14 +1443,11 @@ impl Ids {
     /// The engine's number for the caller's `id`; an error if the op that was
     /// to make it failed (its message), or if this attachment never made it
     /// -- a tensor that outlived an earlier attachment of its device.
-    pub(crate) fn get(&self, id: BufferId) -> Result<BufferId, EngineError> {
+    pub(crate) fn get(&self, id: BufferId) -> Result<BufferId, TtError> {
         match self.map.get(&id) {
             Some(Ok(e)) => Ok(*e),
-            Some(Err(why)) => Err(EngineError(why.to_string())),
-            None => Err(EngineError(format!(
-                "buffer {id} is not one of this attachment's: a tensor that outlived \
-                 the attachment it was made in"
-            ))),
+            Some(Err(why)) => Err(TtError::clone(why)),
+            None => Err(TtError::StaleTensor { id }),
         }
     }
 }
@@ -1561,17 +1487,48 @@ fn forget(id: BufferId) {
 /// Handed to an [`attach`] factory: call [`Serve::serve`] with the engine once
 /// it exists, and it runs the device's jobs until the device is detached.
 pub struct Serve {
-    ready: Sender<Result<ElementwiseMode, EngineError>>,
+    ready: Sender<Result<ElementwiseMode, TtError>>,
     jobs: Receiver<Job>,
+    device: TtDevice,
+    poison: Poison,
+}
+
+/// Why a server thread stopped running jobs: the panic of the job that
+/// killed it. Shared with the callers, who report it instead of "the thread
+/// has stopped".
+type Poison = Arc<OnceLock<TtError>>;
+
+/// Run `f`, turning a panic into [`TtError::ServerPanicked`] and recording it
+/// in `poison`: the engine's state after a panic is not to be trusted, so no
+/// later job runs on it.
+fn guarded<R>(poison: &Poison, device: TtDevice, f: impl FnOnce() -> R) -> Result<R, TtError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".into());
+        let e = TtError::ServerPanicked { device, message };
+        let _ = poison.set(e.clone());
+        poison.get().cloned().unwrap_or(e)
+    })
 }
 
 impl Serve {
     /// Serve jobs on `engine` until the [`AttachGuard`] is dropped.
+    ///
+    /// A job that panics ends the engine's service, not the thread's: the
+    /// queue is drained without running anything, so callers waiting on a
+    /// reply get the panic's message ([`TtError::ServerPanicked`]) rather
+    /// than a closed channel.
     pub fn serve(self, engine: &mut dyn Engine) {
         let _ = self.ready.send(Ok(engine.elementwise_mode()));
         let mut ids = Ids::default();
         while let Ok(job) = self.jobs.recv() {
-            job(engine, &mut ids);
+            if self.poison.get().is_some() {
+                continue;
+            }
+            let _ = guarded(&self.poison, self.device, || job(engine, &mut ids));
         }
     }
 }
@@ -1579,22 +1536,178 @@ impl Serve {
 struct Attached {
     jobs: Sender<Job>,
     elementwise: ElementwiseMode,
+    poison: Poison,
+    /// Set once the factory has served the first job's worth of state: until
+    /// then `elementwise` is a placeholder.
+    ready: bool,
+    /// Attached by the registry on first use (or [`init`](crate::init)) rather
+    /// than by [`attach`]; the configuration it was attached with.
+    config: Option<crate::TtConfig>,
+    /// The process's fork count when this was attached: an attachment from
+    /// before a `fork` has no server thread in the child.
+    epoch: u32,
+    /// Whether the engine keeps tensors on the device, asked once.
+    supports_dram: Arc<OnceLock<bool>>,
+}
+
+impl Attached {
+    fn auto(&self) -> bool {
+        self.config.is_some()
+    }
+
+    /// Is the server thread of this attachment running in *this* process?
+    fn live(&self) -> bool {
+        self.epoch == FORKS.load(Ordering::Relaxed)
+    }
+}
+
+/// How many times this process has been forked from (counted in the child).
+///
+/// A forked child has only the forking thread: the server threads of the
+/// parent's attachments are gone, though their queues are still there, so a
+/// job sent to one would wait forever. Attachments from an earlier epoch are
+/// treated as absent. (`fork_scope` runs every simulator gate in such a child.)
+static FORKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn count_fork() {
+    FORKS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn note_forks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `count_fork` is async-signal-safe (one atomic add) and
+        // `pthread_atfork` only registers it.
+        unsafe {
+            libc::pthread_atfork(None, None, Some(count_fork));
+        }
+    });
 }
 
 static ATTACHED: Mutex<Option<HashMap<TtDevice, Attached>>> = Mutex::new(None);
 
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn with_attached<R>(f: impl FnOnce(&mut HashMap<TtDevice, Attached>) -> R) -> R {
-    let mut guard = ATTACHED.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = locked(&ATTACHED);
     f(guard.get_or_insert_with(HashMap::new))
 }
 
-/// How many devices are attached.
-pub(crate) fn attached_count() -> usize {
-    with_attached(|a| a.len())
+/// The devices with a running attachment, in this process.
+pub(crate) fn attached_devices() -> Vec<TtDevice> {
+    with_attached(|a| {
+        a.iter()
+            .filter(|(_, d)| d.live())
+            .map(|(k, _)| *k)
+            .collect()
+    })
 }
 
 pub(crate) fn is_attached(device: TtDevice) -> bool {
-    with_attached(|a| a.contains_key(&device))
+    with_attached(|a| a.get(&device).is_some_and(Attached::live))
+}
+
+/// Serializes first-use attachment, so one factory call opens one card.
+static OPENING: Mutex<()> = Mutex::new(());
+
+/// Devices the registry attached, for the life of the process: the guards are
+/// never dropped, since statics are not, and the driver's cleanup write covers
+/// process exit (`tt-kmd/src/lib.rs`). [`detach`](crate::detach) removes one.
+static AUTO: Mutex<Option<HashMap<TtDevice, AttachGuard>>> = Mutex::new(None);
+
+/// Devices the registry could not attach, and why: the next op says the same
+/// thing at once instead of opening the card again.
+static FAILED: Mutex<Option<HashMap<TtDevice, TtError>>> = Mutex::new(None);
+
+fn failures<R>(f: impl FnOnce(&mut HashMap<TtDevice, TtError>) -> R) -> R {
+    f(locked(&FAILED).get_or_insert_with(HashMap::new))
+}
+
+/// Forget every remembered attach failure: the registry changed.
+pub(crate) fn forget_failures() {
+    failures(|f| f.clear());
+}
+
+/// Make sure `device` has an engine, attaching it through the registry
+/// ([`crate::set_default_engine`]; silicon unless set) the first time it is
+/// needed. An attach that failed fails again with the same error, without
+/// calling the factory, until [`crate::init`] or [`crate::detach`].
+pub(crate) fn ensure_attached(device: TtDevice) -> Result<(), TtError> {
+    match with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.ready)) {
+        Some(true) => return Ok(()),
+        // Another thread is attaching it: wait for that to finish.
+        Some(false) => {
+            drop(locked(&OPENING));
+            return Ok(());
+        }
+        None => {}
+    }
+    let _opening = locked(&OPENING);
+    if is_attached(device) {
+        return Ok(());
+    }
+    if let Some(e) = failures(|f| f.get(&device).cloned()) {
+        return Err(e);
+    }
+    let result = crate::TtConfig::from_env().and_then(|cfg| attach_auto(device, cfg));
+    if let Err(e) = &result {
+        failures(|f| f.insert(device, e.clone()));
+    }
+    result
+}
+
+/// Attach `device` through the registry with `cfg` and keep it. The caller
+/// holds [`OPENING`].
+pub(crate) fn attach_auto(device: TtDevice, cfg: crate::TtConfig) -> Result<(), TtError> {
+    let factory = crate::registry::default_factory(device, &cfg)?;
+    let guard = attach_inner(device, factory, Some(cfg))?;
+    let old = locked(&AUTO)
+        .get_or_insert_with(HashMap::new)
+        .insert(device, guard);
+    drop(old);
+    Ok(())
+}
+
+/// [`crate::init`]: attach `device` with `cfg` now, or confirm it already is.
+pub(crate) fn init(device: TtDevice, cfg: crate::TtConfig) -> Result<(), TtError> {
+    let _opening = locked(&OPENING);
+    let existing = with_attached(|a| {
+        a.get(&device)
+            .filter(|d| d.live())
+            .map(|d| (d.auto(), d.config.clone()))
+    });
+    match existing {
+        Some((true, Some(have))) if have == cfg => Ok(()),
+        Some((auto, _)) => Err(TtError::AlreadyAttached { device, auto }),
+        None => {
+            failures(|f| f.remove(&device));
+            let result = attach_auto(device, cfg);
+            if let Err(e) = &result {
+                failures(|f| f.insert(device, e.clone()));
+            }
+            result
+        }
+    }
+}
+
+/// [`crate::detach`]: detach a device the registry attached, dropping its
+/// hardware, and forget a failed attach so the next op tries again.
+pub(crate) fn detach(device: TtDevice) -> Result<(), TtError> {
+    let _opening = locked(&OPENING);
+    failures(|f| f.remove(&device));
+    let guard = locked(&AUTO).as_mut().and_then(|m| m.remove(&device));
+    match guard {
+        Some(guard) => {
+            drop(guard);
+            Ok(())
+        }
+        None if is_attached(device) => Err(TtError::Device(format!(
+            "{device} was attached with burn_tt::attach: drop its AttachGuard to detach it"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Keeps `device` attached; dropping it detaches the device and drops its
@@ -1603,10 +1716,17 @@ pub(crate) fn is_attached(device: TtDevice) -> bool {
 pub struct AttachGuard {
     device: TtDevice,
     thread: Option<JoinHandle<()>>,
+    epoch: u32,
 }
 
 impl Drop for AttachGuard {
     fn drop(&mut self) {
+        if self.epoch != FORKS.load(Ordering::Relaxed) {
+            // Made before a fork: the thread is the parent's, and there is
+            // nothing here to join or detach.
+            std::mem::forget(self.thread.take());
+            return;
+        }
         // Removing the sender closes the queue; the server's `recv` fails and
         // `serve` returns, and so does the factory, dropping the hardware.
         with_attached(|a| a.remove(&self.device));
@@ -1621,25 +1741,54 @@ impl Drop for AttachGuard {
 /// `factory` builds the engine -- opening the hardware -- and calls
 /// [`Serve::serve`] with it. It returns an error, rather than serving, if the
 /// hardware cannot be opened; `attach` returns that error. Attaching a device
-/// that is already attached is refused.
-pub fn attach<F>(device: TtDevice, factory: F) -> Result<AttachGuard, EngineError>
+/// that is already attached is refused ([`TtError::AlreadyAttached`]).
+///
+/// This is the scoped, explicit way: nothing needs to call it, since a device
+/// is attached through the registry the first time an op needs it
+/// ([`crate::init`], [`crate::set_default_engine`]).
+pub fn attach<F>(device: TtDevice, factory: F) -> Result<AttachGuard, TtError>
 where
-    F: FnOnce(Serve) -> Result<(), EngineError> + Send + 'static,
+    F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
 {
+    attach_inner(device, factory, None)
+}
+
+/// [`attach`]; `config` is `Some` for the registry's attachments.
+fn attach_inner<F>(
+    device: TtDevice,
+    factory: F,
+    config: Option<crate::TtConfig>,
+) -> Result<AttachGuard, TtError>
+where
+    F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
+{
+    note_forks();
+    let epoch = FORKS.load(Ordering::SeqCst);
     let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let already = with_attached(|a| match a.entry(device) {
-        std::collections::hash_map::Entry::Occupied(_) => true,
-        std::collections::hash_map::Entry::Vacant(v) => {
-            v.insert(Attached {
-                jobs: jobs_tx,
-                elementwise: ElementwiseMode::Sfpu,
-            });
-            false
+    let poison = Poison::default();
+    let served_poison = poison.clone();
+    let existing = with_attached(|a| match a.get(&device) {
+        Some(d) if d.live() => Some(d.auto()),
+        _ => {
+            // Absent, or from before a fork: replaced.
+            a.insert(
+                device,
+                Attached {
+                    jobs: jobs_tx,
+                    elementwise: ElementwiseMode::Sfpu,
+                    poison,
+                    ready: false,
+                    config,
+                    epoch,
+                    supports_dram: Arc::default(),
+                },
+            );
+            None
         }
     });
-    if already {
-        return Err(EngineError(format!("{device} is already attached")));
+    if let Some(auto) = existing {
+        return Err(TtError::AlreadyAttached { device, auto });
     }
     let failed = ready_tx.clone();
     let thread = std::thread::Builder::new()
@@ -1648,10 +1797,12 @@ where
             let serve = Serve {
                 ready: ready_tx,
                 jobs: jobs_rx,
+                device,
+                poison: served_poison,
             };
             match factory(serve) {
                 Ok(()) => {
-                    let _ = failed.send(Err(EngineError(
+                    let _ = failed.send(Err(TtError::Device(
                         "the engine factory returned without serving".into(),
                     )));
                 }
@@ -1660,18 +1811,25 @@ where
                 }
             }
         })
-        .map_err(|e| EngineError(format!("could not start the server thread: {e}")))?;
+        .map_err(|e| TtError::Device(format!("could not start the server thread: {e}")))?;
     let guard = AttachGuard {
         device,
         thread: Some(thread),
+        epoch,
     };
     match ready_rx.recv() {
         Ok(Ok(mode)) => {
-            with_attached(|a| a.get_mut(&device).expect("reserved attachment").elementwise = mode);
+            with_attached(|a| {
+                let d = a.get_mut(&device).expect("reserved attachment");
+                d.elementwise = mode;
+                d.ready = true;
+            });
             Ok(guard)
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(EngineError("the server thread died before serving".into())),
+        Err(_) => Err(TtError::Device(
+            "the server thread died before serving".into(),
+        )),
     }
 }
 
@@ -1679,33 +1837,91 @@ where
 ///
 /// # Panics
 ///
-/// If `device` is not attached, or its server thread has gone: Burn's ops
-/// cannot return an error, and quietly computing on the host instead would
-/// make the device path unobservable.
+/// If `device` has no engine and the registry cannot attach one, or its
+/// server thread has gone: Burn's ops cannot return an error, and quietly
+/// computing on the host instead would make the device path unobservable.
+/// [`try_run`] returns the error.
 pub(crate) fn run<R: Send + 'static>(
     device: TtDevice,
     job: impl FnOnce(&mut dyn Engine, &mut Ids) -> R + Send + 'static,
 ) -> R {
+    try_run(device, job).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The queue to `device`'s server and the cell its panic is recorded in,
+/// attaching the device through the registry if nothing serves it yet.
+fn handle(device: TtDevice) -> Result<(Sender<Job>, Poison), TtError> {
+    let get = || {
+        with_attached(|a| {
+            a.get(&device)
+                .filter(|d| d.live())
+                .map(|d| (d.jobs.clone(), d.poison.clone()))
+        })
+    };
+    if let Some(h) = get() {
+        return Ok(h);
+    }
+    ensure_attached(device)?;
+    get().ok_or(TtError::NotAttached { device })
+}
+
+/// Why `device`'s server cannot answer: its job panicked, or it is gone.
+fn stopped(device: TtDevice, poison: &Poison) -> TtError {
+    poison.get().cloned().unwrap_or_else(|| {
+        TtError::Device(format!("{device}'s server thread stopped during a job"))
+    })
+}
+
+/// [`run`], returning the error: the device is not attached, or its server
+/// panicked (this job's or an earlier one's).
+pub(crate) fn try_run<R: Send + 'static>(
+    device: TtDevice,
+    job: impl FnOnce(&mut dyn Engine, &mut Ids) -> R + Send + 'static,
+) -> Result<R, TtError> {
+    let (sender, poison) = handle(device)?;
     let (tx, rx) = mpsc::channel();
-    send(
-        device,
-        Box::new(move |engine, ids| {
-            let _ = tx.send(job(engine, ids));
-        }),
-    );
-    rx.recv()
-        .unwrap_or_else(|_| panic!("{device}'s server thread stopped during a job"))
+    let caught = poison.clone();
+    sender
+        .send(Box::new(move |engine, ids| {
+            // Caught here, not only by the server loop, so the caller is
+            // answered with the panic after it is recorded.
+            let _ = tx.send(guarded(&caught, device, || job(engine, ids)));
+        }))
+        .map_err(|_| stopped(device, &poison))?;
+    match rx.recv() {
+        Ok(reply) => reply,
+        Err(_) => Err(stopped(device, &poison)),
+    }
 }
 
 /// Queue `job` on `device`'s server, without waiting.
 fn send(device: TtDevice, job: Job) {
-    let sender = with_attached(|a| a.get(&device).map(|d| d.jobs.clone()));
-    let Some(sender) = sender else {
-        panic!("{device} is not attached: call burn_tt::attach before running device ops on it");
-    };
+    let (sender, poison) = handle(device).unwrap_or_else(|e| panic!("{e}"));
     sender
         .send(job)
-        .unwrap_or_else(|_| panic!("{device}'s server thread has stopped"));
+        .unwrap_or_else(|_| panic!("{}", stopped(device, &poison)));
+}
+
+/// [`run`] only if `device` already has an engine: `None` otherwise, and the
+/// registry is not asked. For cleanup that must never open a card.
+pub(crate) fn run_if_attached<R: Send + 'static>(
+    device: TtDevice,
+    job: impl FnOnce(&mut dyn Engine, &mut Ids) -> R + Send + 'static,
+) -> Option<R> {
+    if !is_attached(device) {
+        return None;
+    }
+    try_run(device, job).ok()
+}
+
+/// Wait for everything queued on `device`, and report the first failure, if
+/// there was one. Nothing to do, and no error, for a device that is not
+/// attached.
+pub(crate) fn try_sync(device: TtDevice) -> Result<(), TtError> {
+    if !is_attached(device) {
+        return Ok(());
+    }
+    try_run(device, |_, ids| ids.healthy())?
 }
 
 /// [`run`], timed by `kind` (`crate::traffic::device_time`).
@@ -1728,9 +1944,7 @@ fn submit(
     device: TtDevice,
     dims: [usize; 2],
     what: impl FnOnce() -> String + Send + 'static,
-    op: impl FnOnce(&mut dyn Engine, &Ids) -> Result<(BufferId, [usize; 2]), EngineError>
-        + Send
-        + 'static,
+    op: impl FnOnce(&mut dyn Engine, &Ids) -> Result<(BufferId, [usize; 2]), TtError> + Send + 'static,
 ) -> (BufferId, [usize; 2]) {
     let id = name(dims);
     crate::traffic::timed(kind, || {
@@ -1742,14 +1956,19 @@ fn submit(
                         Ok(e)
                     } else {
                         engine.free(e);
-                        Err(EngineError(format!(
+                        Err(TtError::Device(format!(
                             "made [{}, {}] where [{}, {}] was expected",
                             got[0], got[1], dims[0], dims[1]
                         )))
                     }
                 });
-                let made =
-                    made.map_err(|e| Arc::<str>::from(format!("{} on {device}: {e}", what())));
+                let made = made.map_err(|e| {
+                    Arc::new(TtError::Op {
+                        what: what(),
+                        device,
+                        cause: Arc::new(e),
+                    })
+                });
                 if let Err(why) = &made {
                     ids.failed.get_or_insert_with(|| why.clone());
                 }
@@ -1780,38 +1999,44 @@ pub(crate) fn full_reduce(device: TtDevice, values: Vec<f32>, dims: [usize; 2], 
 }
 
 pub(crate) fn elementwise_mode(device: TtDevice) -> ElementwiseMode {
-    with_attached(|a| {
-        a.get(&device)
-            .unwrap_or_else(|| panic!("{device} is not attached"))
-            .elementwise
-    })
+    ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
+    with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.elementwise))
+        .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
 }
 
-/// Does `device`'s engine keep tensors on the device? Asked once per device.
+/// Does `device`'s engine keep tensors on the device? Asked once per
+/// attachment, so a device attached again with another engine is asked again.
+///
+/// # Panics
+///
+/// If the device has no engine and the registry cannot attach one
+/// ([`ensure_attached`]): the op that asks needs a device.
 pub(crate) fn supports_dram(device: TtDevice) -> bool {
-    static KNOWN: Mutex<Option<HashMap<TtDevice, bool>>> = Mutex::new(None);
-    if let Some(&k) = KNOWN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .get(&device)
-    {
-        return k;
-    }
-    let k = run(device, |engine, _| engine.supports_dram());
-    KNOWN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(device, k);
-    k
+    ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
+    let known = with_attached(|a| {
+        a.get(&device)
+            .filter(|d| d.live())
+            .map(|d| d.supports_dram.clone())
+    })
+    .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }));
+    *known.get_or_init(|| run(device, |engine, _| engine.supports_dram()))
+}
+
+/// Can `device` be used for device ops: it has an engine, or the registry
+/// attaches one now? `false` for a device nothing can serve (no such card),
+/// whose tensors then stay on the host. The reason is remembered and the next
+/// op that needs the device ([`supports_dram`]) reports it.
+pub(crate) fn attachable(device: TtDevice) -> bool {
+    ensure_attached(device).is_ok()
 }
 
 /// Everything `device`'s engine has moved across its transport so far, if it
 /// can say ([`Engine::device_traffic`]). Queued behind every job already sent,
 /// frees included, so it counts all of them.
+///
+/// `None` for a device with no engine, which this does not attach.
 pub fn device_traffic(device: TtDevice) -> Option<tt_device::Traffic> {
-    run(device, |engine, _| engine.device_traffic())
+    run_if_attached(device, |engine, _| engine.device_traffic()).flatten()
 }
 
 /// Wait for queued work, then report completed per-chip products and mover ACKs.
@@ -1865,13 +2090,32 @@ pub(crate) fn upload_bf16(device: TtDevice, bits: Vec<u16>, rows: usize, cols: u
     .0
 }
 
-pub(crate) fn download_bf16(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u16> {
+/// What a failed download of buffer `id` says: the op, the device and why.
+fn download_failed(device: TtDevice, what: String, cause: TtError) -> TtError {
+    TtError::Op {
+        what,
+        device,
+        cause: Arc::new(cause),
+    }
+}
+
+/// Download a BF16 or FP16 buffer's datums as bits.
+pub(crate) fn try_download_bf16(
+    device: TtDevice,
+    id: BufferId,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u16>, TtError> {
     crate::traffic::downloaded_width(rows, cols, 2);
     crate::report::downloaded_width(rows, cols, 2);
-    timed_run("download_bf16", device, move |engine, ids| {
-        engine.download_bf16(ids.get(id)?)
+    crate::traffic::timed("download_bf16", || {
+        try_run(device, move |engine, ids| {
+            ids.healthy()?;
+            ids.get(id).and_then(|e| engine.download_bf16(e))
+        })
     })
-    .unwrap_or_else(|e| panic!("BF16 download [{rows}, {cols}]: {e}"))
+    .and_then(|r| r)
+    .map_err(|e| download_failed(device, format!("BF16 download {id} [{rows}, {cols}]"), e))
 }
 
 pub(crate) fn cast_float(
@@ -1975,37 +2219,68 @@ pub(crate) fn pool_bf16(
     )
 }
 
-/// Download any buffer's datums as bits, panicking on a device error.
-pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u32> {
-    let v = timed_run("download", device, move |engine, ids| {
-        ids.healthy()?;
-        ids.get(id).and_then(|e| engine.download_bits(e))
-    })
-    .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
-    debug_assert_eq!(v.len(), rows * cols);
-    crate::traffic::downloaded(rows, cols);
-    crate::report::downloaded(rows, cols);
-    v
+pub(crate) fn download_bf16(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u16> {
+    try_download_bf16(device, id, rows, cols).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// Download, panicking on a device error.
-/// `rows` and `cols` are the buffer's, for the traffic count.
-pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<f32> {
-    let v = timed_run("download", device, move |engine, ids| {
-        ids.healthy()?;
-        ids.get(id).and_then(|e| engine.download(e))
+/// Download any buffer's datums as bits.
+pub(crate) fn try_download_bits(
+    device: TtDevice,
+    id: BufferId,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u32>, TtError> {
+    let v = crate::traffic::timed("download", || {
+        try_run(device, move |engine, ids| {
+            ids.healthy()?;
+            ids.get(id).and_then(|e| engine.download_bits(e))
+        })
     })
-    .unwrap_or_else(|e| panic!("download {id} from {device}: {e}"));
+    .and_then(|r| r)
+    .map_err(|e| download_failed(device, format!("download {id}"), e))?;
     debug_assert_eq!(v.len(), rows * cols);
     crate::traffic::downloaded(rows, cols);
     crate::report::downloaded(rows, cols);
-    v
+    Ok(v)
+}
+
+/// [`try_download_bits`], panicking on a device error.
+pub(crate) fn download_bits(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<u32> {
+    try_download_bits(device, id, rows, cols).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Download. `rows` and `cols` are the buffer's, for the traffic count.
+pub(crate) fn try_download(
+    device: TtDevice,
+    id: BufferId,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, TtError> {
+    let v = crate::traffic::timed("download", || {
+        try_run(device, move |engine, ids| {
+            ids.healthy()?;
+            ids.get(id).and_then(|e| engine.download(e))
+        })
+    })
+    .and_then(|r| r)
+    .map_err(|e| download_failed(device, format!("download {id}"), e))?;
+    debug_assert_eq!(v.len(), rows * cols);
+    crate::traffic::downloaded(rows, cols);
+    crate::report::downloaded(rows, cols);
+    Ok(v)
+}
+
+/// [`try_download`], panicking on a device error.
+pub(crate) fn download(device: TtDevice, id: BufferId, rows: usize, cols: usize) -> Vec<f32> {
+    try_download(device, id, rows, cols).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Free, without waiting; nothing to do if the device has gone.
 pub(crate) fn free(device: TtDevice, id: BufferId) {
     forget(id);
-    if let Some(sender) = with_attached(|a| a.get(&device).map(|d| d.jobs.clone())) {
+    if let Some(sender) =
+        with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.jobs.clone()))
+    {
         let _ = sender.send(Box::new(move |engine, ids| {
             // A buffer this attachment never made (a stale tensor's) is not
             // anyone's here: nothing to free.
@@ -2285,12 +2560,12 @@ pub struct KmdEngine {
 
 impl KmdEngine {
     /// Consuming builder for a factory, before Serve attaches this engine.
-    pub fn with_elementwise_mode(mut self, mode: ElementwiseMode) -> Result<Self, EngineError> {
+    pub fn with_elementwise_mode(mut self, mode: ElementwiseMode) -> Result<Self, TtError> {
         if let Some(buffers) = self.buffers.take() {
             self.buffers = Some(buffers.with_elementwise_mode(mode));
         } else if mode != ElementwiseMode::Sfpu {
-            return Err(EngineError(
-                "matrix elementwise requires resident storage".into(),
+            return Err(TtError::unsupported(
+                "matrix elementwise requires resident storage",
             ));
         }
         Ok(self)
@@ -2306,10 +2581,7 @@ impl Engine for KmdEngine {
     fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
         self.session.math_mode()
     }
-    fn set_math_mode(
-        &mut self,
-        mode: tt_kernels::sfpu::approx::MathMode,
-    ) -> Result<(), EngineError> {
+    fn set_math_mode(&mut self, mode: tt_kernels::sfpu::approx::MathMode) -> Result<(), TtError> {
         self.session.set_math_mode(mode);
         Ok(())
     }
@@ -2319,7 +2591,7 @@ impl Engine for KmdEngine {
         windows: &[Vec<[usize; 2]>],
         divisors: &[usize],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.pool_bf16(
             &mut self.session,
             a,
@@ -2328,11 +2600,7 @@ impl Engine for KmdEngine {
             dims,
         )
     }
-    fn matmul_bf16(
-        &mut self,
-        a: BufferId,
-        b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bf16(
             &mut self.session,
             a,
@@ -2341,12 +2609,7 @@ impl Engine for KmdEngine {
             self.budget,
         )
     }
-    fn upload_bf16(
-        &mut self,
-        bits: &[u16],
-        rows: usize,
-        cols: usize,
-    ) -> Result<BufferId, EngineError> {
+    fn upload_bf16(&mut self, bits: &[u16], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.upload_bf16(
             &mut self.session,
             bits,
@@ -2354,17 +2617,13 @@ impl Engine for KmdEngine {
             cols,
         )
     }
-    fn download_bf16(&mut self, id: BufferId) -> Result<Vec<u16>, EngineError> {
+    fn download_bf16(&mut self, id: BufferId) -> Result<Vec<u16>, TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
             .download_bf16(&mut self.session, id)
     }
-    fn cast_float(
-        &mut self,
-        id: BufferId,
-        bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn cast_float(&mut self, id: BufferId, bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
@@ -2374,17 +2633,13 @@ impl Engine for KmdEngine {
         &mut self,
         id: BufferId,
         format: Option<tt_kernels::bfp::BfpFormat>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
             .cast_bfp(&mut self.session, id, format)
     }
-    fn matmul_bfp(
-        &mut self,
-        a: BufferId,
-        b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn matmul_bfp(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bfp(
             &mut self.session,
             a,
@@ -2392,7 +2647,7 @@ impl Engine for KmdEngine {
             self.fidelity,
         )
     }
-    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, EngineError> {
+    fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, TtError> {
         Ok(self
             .session
             .matmul(a, b, mkn, self.route, self.fidelity, self.budget)?)
@@ -2400,7 +2655,7 @@ impl Engine for KmdEngine {
     fn supports_dram(&self) -> bool {
         self.buffers.is_some()
     }
-    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, EngineError> {
+    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.upload(&mut self.session, v, rows, cols)
     }
@@ -2409,11 +2664,11 @@ impl Engine for KmdEngine {
         bits: &[u32],
         dims: [usize; 2],
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.metadata(&mut self.session, bits, dims, elem)
     }
-    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, TtError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.download(&mut self.session, id)
     }
@@ -2423,11 +2678,11 @@ impl Engine for KmdEngine {
         rows: usize,
         cols: usize,
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.upload_bits(&mut self.session, v, rows, cols, elem)
     }
-    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, EngineError> {
+    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, TtError> {
         let b = self.buffers.as_mut().ok_or_else(unsupported)?;
         b.download_bits(&mut self.session, id)
     }
@@ -2442,7 +2697,7 @@ impl Engine for KmdEngine {
         ta: bool,
         b: BufferId,
         tb: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.matmul(
             &mut self.session,
@@ -2461,7 +2716,7 @@ impl Engine for KmdEngine {
         scalar: f32,
         a: BufferId,
         b: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise(&mut self.session, kind, scalar, a, b)
     }
@@ -2471,15 +2726,15 @@ impl Engine for KmdEngine {
         a: BufferId,
         b: Option<BufferId>,
         c: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_op(&mut self.session, op, a, b, c)
     }
-    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.pow(&mut self.session, x, y)
     }
-    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.sum_rows(&mut self.session, a)
     }
@@ -2488,7 +2743,7 @@ impl Engine for KmdEngine {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.reduce(&mut self.session, a, op, axis)
     }
@@ -2496,7 +2751,7 @@ impl Engine for KmdEngine {
         &mut self,
         a: BufferId,
         op: tt_kernels::sfpu::scan::ScanOp,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
@@ -2507,7 +2762,7 @@ impl Engine for KmdEngine {
         a: BufferId,
         first: usize,
         rows: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.slice_rows(a, first, rows)
     }
@@ -2517,7 +2772,7 @@ impl Engine for KmdEngine {
         b: BufferId,
         items: &[(Block, Block)],
         mkn: [usize; 3],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.matmul_batched(
             &mut self.session,
@@ -2535,7 +2790,7 @@ impl Engine for KmdEngine {
         a: BufferId,
         moves: &[BlockMove],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.copy_blocks(&mut self.session, a, moves, dims)
     }
@@ -2544,7 +2799,7 @@ impl Engine for KmdEngine {
         a: BufferId,
         sources: &[[usize; 2]],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.repack(&mut self.session, a, sources, dims)
     }
@@ -2553,7 +2808,7 @@ impl Engine for KmdEngine {
         dims: [usize; 2],
         elem: Elem,
         bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
@@ -2563,7 +2818,7 @@ impl Engine for KmdEngine {
         &mut self,
         input: BufferId,
         indices: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
@@ -2574,7 +2829,7 @@ impl Engine for KmdEngine {
         inputs: &[BufferId],
         sources: &[(usize, [usize; 2])],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.repack_many(&mut self.session, inputs, sources, dims)
     }
@@ -2583,7 +2838,7 @@ impl Engine for KmdEngine {
         sources: &[BufferId],
         rows: &[(usize, usize)],
         cols: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.gather_rows(&mut self.session, sources, rows, cols)
     }
@@ -2592,18 +2847,18 @@ impl Engine for KmdEngine {
         t: BufferId,
         indices: &[usize],
         value: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rows_add(&mut self.session, t, indices, value)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
     }
-    fn begin_trace(&mut self) -> Result<(), EngineError> {
+    fn begin_trace(&mut self) -> Result<(), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.begin_trace(&mut self.session)
     }
-    fn end_trace(&mut self) -> Result<u64, EngineError> {
+    fn end_trace(&mut self) -> Result<u64, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.end_trace(&mut self.session)
     }
@@ -2613,7 +2868,7 @@ impl Engine for KmdEngine {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<TraceRun, EngineError> {
+    ) -> Result<TraceRun, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.run_trace(&mut self.session, trace, input, values, output)
     }
@@ -2622,7 +2877,7 @@ impl Engine for KmdEngine {
             b.release_trace(&mut self.session, trace);
         }
     }
-    fn copy_into(&mut self, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
+    fn copy_into(&mut self, src: BufferId, dst: BufferId) -> Result<(), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.copy_into(&mut self.session, src, dst)
     }
@@ -2631,7 +2886,7 @@ impl Engine for KmdEngine {
         trace: u64,
         inputs: &[(BufferId, InputPayload)],
         outputs: &[(BufferId, OutputKind)],
-    ) -> Result<GenericTraceRun, EngineError> {
+    ) -> Result<GenericTraceRun, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.run_generic_trace(&mut self.session, trace, inputs, outputs)
     }
@@ -2640,7 +2895,7 @@ impl Engine for KmdEngine {
         &mut self,
         a: BufferId,
         spec: tt_kernels::sfpu::sort::Spec,
-    ) -> Result<SortedBuffers, EngineError> {
+    ) -> Result<SortedBuffers, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.sort_planes(&mut self.session, a, spec)
     }
@@ -2650,18 +2905,14 @@ impl Engine for KmdEngine {
         dims: [usize; 2],
         draw: crate::random::Draw,
         base: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
             .random(&mut self.session, dims, draw, base)
     }
 
-    fn cast_f16(
-        &mut self,
-        id: BufferId,
-        to_f16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn cast_f16(&mut self, id: BufferId, to_f16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
@@ -2669,7 +2920,7 @@ impl Engine for KmdEngine {
     }
 }
 
-pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), EngineError> {
+pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), TtError> {
     run(device, move |engine, ids| {
         ids.healthy()?;
         engine.copy_into(ids.get(src)?, ids.get(dst)?)
@@ -2681,14 +2932,14 @@ pub fn run_generic_trace(
     trace: u64,
     inputs: Vec<(BufferId, InputPayload)>,
     outputs: Vec<(BufferId, OutputKind)>,
-) -> Result<GenericTraceRun, EngineError> {
+) -> Result<GenericTraceRun, TtError> {
     run(device, move |engine, ids| {
         ids.healthy()?;
-        let mapped_inputs: Result<Vec<(BufferId, InputPayload)>, EngineError> = inputs
+        let mapped_inputs: Result<Vec<(BufferId, InputPayload)>, TtError> = inputs
             .into_iter()
             .map(|(buf, p)| ids.get(buf).map(|b| (b, p)))
             .collect();
-        let mapped_outputs: Result<Vec<(BufferId, OutputKind)>, EngineError> = outputs
+        let mapped_outputs: Result<Vec<(BufferId, OutputKind)>, TtError> = outputs
             .into_iter()
             .map(|(buf, k)| ids.get(buf).map(|b| (b, k)))
             .collect();
@@ -2699,13 +2950,13 @@ pub fn run_generic_trace(
 /// Settings of the executors that were removed: refused with what replaces
 /// them rather than ignored, so a script that still sets one learns why it no
 /// longer does anything. `get` reads a variable, as `std::env::var` does.
-fn refuse_retired_settings(get: impl Fn(&str) -> Option<String>) -> Result<(), EngineError> {
+fn refuse_retired_settings(get: impl Fn(&str) -> Option<String>) -> Result<(), TtError> {
     if let Some(value) = get("TT_EXACT") {
-        return Err(EngineError(format!("TT_EXACT={value}: retired with the Flex cutover; native numerical bounds apply; unset it")));
+        return Err(TtError::Device(format!("TT_EXACT={value}: retired with the Flex cutover; native numerical bounds apply; unset it")));
     }
     for variable in ["TT_EXECUTION", "TT_SCATTER"] {
         if let Some(value) = get(variable) {
-            return Err(EngineError(format!(
+            return Err(TtError::Device(format!(
                 "{variable}={value}: retired; GDDR compute always uses B-reader/NC-writer ownership; unset it (TT_PIPELINE=0 disables overlap without changing ownership)"
             )));
         }
@@ -2713,37 +2964,28 @@ fn refuse_retired_settings(get: impl Fn(&str) -> Option<String>) -> Result<(), E
     Ok(())
 }
 
-/// A factory for [`attach`] that opens `/dev/tenstorrent/{device.chip}` as a
-/// [`Session`] computing on `tile` through `route` at `fidelity`.
-pub fn kmd_engine(
-    device: TtDevice,
-    tile: TileChoice,
-    route: SrcRoute,
-    fidelity: Fidelity,
-) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
-    kmd_engine_with_elementwise(device, tile, route, fidelity, ElementwiseMode::Sfpu)
-}
-
-/// Silicon factory with an explicit immutable arithmetic selection.
-pub fn kmd_engine_with_elementwise(
+/// A factory that opens `/dev/tenstorrent/{device.chip}` as a [`Session`] computing on
+/// `tile` through `route` at `fidelity`, with an immutable arithmetic selection.
+pub(crate) fn kmd_engine_with_elementwise(
     device: TtDevice,
     tile: TileChoice,
     route: SrcRoute,
     fidelity: Fidelity,
     elementwise: ElementwiseMode,
-) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
+) -> impl FnOnce(Serve) -> Result<(), TtError> + Send + 'static {
     move |serve| {
-        let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)?;
+        let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)
+            .map_err(|e| crate::error::open_error(device.chip, e))?;
         // Tensors live in GDDR (Phase 9). Bit-identical to the host-staged path
         // (`step18_dram_matmul`), so on by default.
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         // `TT_ELTWISE` once chose between the SFPU and the data mover's FP32
         // unit; the mover does no arithmetic now. Refused rather than ignored,
         // so a script that still sets it learns why it no longer does anything.
         if let Ok(v) = std::env::var("TT_ELTWISE") {
-            return Err(EngineError(format!(
+            return Err(TtError::Device(format!(
                 "TT_ELTWISE={v}: element-wise ops always run on the SFPU now; unset it"
             )));
         }
@@ -2754,7 +2996,7 @@ pub fn kmd_engine_with_elementwise(
         match std::env::var("TT_PIPELINE").as_deref() {
             Err(_) | Ok("1") => {}
             Ok("0") => session.set_pipeline(false),
-            Ok(v) => return Err(EngineError(format!("TT_PIPELINE={v}: expected 0 or 1"))),
+            Ok(v) => return Err(TtError::Device(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
         // `TT_HOST_DMA=0`: tensors cross PCIe by the host's own stores and
         // loads through a BAR, not the card's DMA through pinned host memory
@@ -2762,7 +3004,7 @@ pub fn kmd_engine_with_elementwise(
         match std::env::var("TT_HOST_DMA").as_deref() {
             Err(_) | Ok("1") => {}
             Ok("0") => session.set_host_dma(false),
-            Ok(v) => return Err(EngineError(format!("TT_HOST_DMA={v}: expected 0 or 1"))),
+            Ok(v) => return Err(TtError::Device(format!("TT_HOST_DMA={v}: expected 0 or 1"))),
         }
         // `TT_TILIZE=card`: tensors take the tile layout on the card's movers
         // rather than the host's cores (`Session::set_tilize`); `host`, the
@@ -2770,7 +3012,11 @@ pub fn kmd_engine_with_elementwise(
         match std::env::var("TT_TILIZE").as_deref() {
             Err(_) | Ok("host") => {}
             Ok("card") => session.set_tilize(tt_kernels::session::Tilize::Card),
-            Ok(v) => return Err(EngineError(format!("TT_TILIZE={v}: expected host or card"))),
+            Ok(v) => {
+                return Err(TtError::Device(format!(
+                    "TT_TILIZE={v}: expected host or card"
+                )))
+            }
         }
         refuse_retired_settings(|variable| std::env::var(variable).ok())?;
         // `TT_PROFILE=<path>`: a device-side profile of everything this
@@ -2782,7 +3028,7 @@ pub fn kmd_engine_with_elementwise(
         if profile_to.is_some() {
             session
                 .profile_start()
-                .map_err(|e| EngineError(format!("TT_PROFILE: {e}")))?;
+                .map_err(|e| TtError::Device(format!("TT_PROFILE: {e}")))?;
         }
         let mut engine = KmdEngine {
             session,
@@ -2826,10 +3072,10 @@ pub struct MeshEngine<T: tt_device::Transport> {
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
-    pub fn with_elementwise_mode(self, mode: ElementwiseMode) -> Result<Self, EngineError> {
+    pub fn with_elementwise_mode(self, mode: ElementwiseMode) -> Result<Self, TtError> {
         if mode != ElementwiseMode::Sfpu {
-            return Err(EngineError(
-                "matrix elementwise mode is unsupported on mesh engines".into(),
+            return Err(TtError::unsupported(
+                "matrix elementwise mode is unsupported on mesh engines",
             ));
         }
         Ok(self)
@@ -2840,10 +3086,10 @@ impl<T: tt_device::Transport> MeshEngine<T> {
         route: SrcRoute,
         fidelity: Fidelity,
         budget: u64,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Self, TtError> {
         fabric
             .enable_resident(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         let mode = fabric.chips[0].session().math_mode();
         Ok(Self {
             fabric,
@@ -2860,22 +3106,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
         self.mode
     }
-    fn set_math_mode(
-        &mut self,
-        mode: tt_kernels::sfpu::approx::MathMode,
-    ) -> Result<(), EngineError> {
+    fn set_math_mode(&mut self, mode: tt_kernels::sfpu::approx::MathMode) -> Result<(), TtError> {
         for chip in &mut self.fabric.chips {
             chip.session().set_math_mode(mode);
         }
         self.mode = mode;
         Ok(())
     }
-    fn matmul(
-        &mut self,
-        a: &[f32],
-        b: &[f32],
-        [m, k, n]: [usize; 3],
-    ) -> Result<Vec<f32>, EngineError> {
+    fn matmul(&mut self, a: &[f32], b: &[f32], [m, k, n]: [usize; 3]) -> Result<Vec<f32>, TtError> {
         let mut temporary = Vec::new();
         let result = (|| {
             let a = self.upload(a, m, k)?;
@@ -2896,7 +3134,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         values: &[f32],
         [r, c]: [usize; 2],
         mean: bool,
-    ) -> Result<f32, EngineError> {
+    ) -> Result<f32, TtError> {
         use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
         let mut temporary = Vec::new();
         let result = (|| {
@@ -2925,24 +3163,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     fn supports_dram(&self) -> bool {
         true
     }
-    fn upload_bf16(
-        &mut self,
-        bits: &[u16],
-        rows: usize,
-        cols: usize,
-    ) -> Result<BufferId, EngineError> {
+    fn upload_bf16(&mut self, bits: &[u16], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         self.buffers
             .upload_bf16(self.fabric.chips[0].session(), bits, rows, cols)
     }
-    fn download_bf16(&mut self, id: BufferId) -> Result<Vec<u16>, EngineError> {
+    fn download_bf16(&mut self, id: BufferId) -> Result<Vec<u16>, TtError> {
         self.buffers
             .download_bf16(self.fabric.chips[0].session(), id)
     }
-    fn cast_float(
-        &mut self,
-        id: BufferId,
-        bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn cast_float(&mut self, id: BufferId, bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .cast_float(self.fabric.chips[0].session(), id, bf16)
     }
@@ -2952,15 +3181,11 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         windows: &[Vec<[usize; 2]>],
         divisors: &[usize],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .pool_bf16(self.fabric.chips[0].session(), a, windows, divisors, dims)
     }
-    fn matmul_bf16(
-        &mut self,
-        a: BufferId,
-        b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         // The existing Ethernet fabric transports F32 physical tiles. Widen
         // on the root chip, compute BF16 Src products across the mesh, and
         // let the Burn boundary narrow the joined F32 output once.
@@ -2983,7 +3208,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
                     self.fidelity,
                     self.budget,
                 )
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(TtError::from)?;
             Ok(self.buffers.insert(out))
         })();
         for id in temporary {
@@ -2991,7 +3216,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         }
         result
     }
-    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, EngineError> {
+    fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         let b = &mut self.buffers;
         b.upload(self.fabric.chips[0].session(), v, rows, cols)
     }
@@ -3000,11 +3225,11 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         bits: &[u32],
         dims: [usize; 2],
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         self.buffers
             .metadata(self.fabric.chips[0].session(), bits, dims, elem)
     }
-    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, TtError> {
         let b = &mut self.buffers;
         b.download(self.fabric.chips[0].session(), id)
     }
@@ -3014,11 +3239,11 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         rows: usize,
         cols: usize,
         elem: Elem,
-    ) -> Result<BufferId, EngineError> {
+    ) -> Result<BufferId, TtError> {
         let b = &mut self.buffers;
         b.upload_bits(self.fabric.chips[0].session(), v, rows, cols, elem)
     }
-    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, EngineError> {
+    fn download_bits(&mut self, id: BufferId) -> Result<Vec<u32>, TtError> {
         let b = &mut self.buffers;
         b.download_bits(self.fabric.chips[0].session(), id)
     }
@@ -3031,13 +3256,13 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         ta: bool,
         b: BufferId,
         tb: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let a = self.buffers.get(a)?.clone();
         let b = self.buffers.get(b)?.clone();
         let out = self
             .fabric
             .matmul_resident(&a, ta, &b, tb, self.route, self.fidelity, self.budget)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(TtError::from)?;
         Ok(self.buffers.insert(out))
     }
     fn eltwise(
@@ -3046,7 +3271,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         scalar: f32,
         a: BufferId,
         b: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.eltwise(self.fabric.chips[0].session(), kind, scalar, a, b)
     }
@@ -3056,15 +3281,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         b: Option<BufferId>,
         c: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.eltwise_op(self.fabric.chips[0].session(), op, a, b, c)
     }
-    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.pow(self.fabric.chips[0].session(), x, y)
     }
-    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn sum_rows(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.sum_rows(self.fabric.chips[0].session(), a)
     }
@@ -3073,7 +3298,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.reduce(self.fabric.chips[0].session(), a, op, axis)
     }
@@ -3081,7 +3306,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         &mut self,
         a: BufferId,
         op: tt_kernels::sfpu::scan::ScanOp,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers.scan(self.fabric.chips[0].session(), a, op)
     }
     fn slice_rows(
@@ -3089,7 +3314,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         first: usize,
         rows: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.slice_rows(a, first, rows)
     }
@@ -3099,14 +3324,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         b: BufferId,
         items: &[(Block, Block)],
         mkn: [usize; 3],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let [m, k, n] = mkn;
         if items.is_empty() || mkn.contains(&0) {
-            return Err(EngineError(
+            return Err(TtError::Device(
                 "mesh batched matmul requires nonempty products".into(),
             ));
         }
-        let fits = |id, block: Block, rows, cols| -> Result<(), EngineError> {
+        let fits = |id, block: Block, rows, cols| -> Result<(), TtError> {
             let source = self.buffers.get(id)?;
             let [rows, cols] = if block.transposed {
                 [cols, rows]
@@ -3120,7 +3345,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
                     .checked_add(cols)
                     .is_none_or(|end| end > source.cols)
             {
-                return Err(EngineError(
+                return Err(TtError::Device(
                     "mesh batched matrix block is out of bounds".into(),
                 ));
             }
@@ -3178,7 +3403,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         moves: &[BlockMove],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.copy_blocks(self.fabric.chips[0].session(), a, moves, dims)
     }
@@ -3187,7 +3412,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         sources: &[[usize; 2]],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .repack(self.fabric.chips[0].session(), a, sources, dims)
     }
@@ -3196,7 +3421,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         dims: [usize; 2],
         elem: Elem,
         bf16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .zeros(self.fabric.chips[0].session(), dims, elem, bf16)
     }
@@ -3204,7 +3429,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         &mut self,
         input: BufferId,
         indices: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .gather_indexed(self.fabric.chips[0].session(), input, indices)
     }
@@ -3213,7 +3438,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         inputs: &[BufferId],
         sources: &[(usize, [usize; 2])],
         dims: [usize; 2],
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .repack_many(self.fabric.chips[0].session(), inputs, sources, dims)
     }
@@ -3223,7 +3448,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         sources: &[BufferId],
         rows: &[(usize, usize)],
         cols: usize,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.gather_rows(self.fabric.chips[0].session(), sources, rows, cols)
     }
@@ -3232,7 +3457,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         t: BufferId,
         indices: &[usize],
         value: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
     }
@@ -3247,7 +3472,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         &mut self,
         a: BufferId,
         spec: tt_kernels::sfpu::sort::Spec,
-    ) -> Result<SortedBuffers, EngineError> {
+    ) -> Result<SortedBuffers, TtError> {
         self.buffers
             .sort_planes(self.fabric.chips[0].session(), a, spec)
     }
@@ -3257,16 +3482,12 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         dims: [usize; 2],
         draw: crate::random::Draw,
         base: u64,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .random(self.fabric.chips[0].session(), dims, draw, base)
     }
 
-    fn cast_f16(
-        &mut self,
-        id: BufferId,
-        to_f16: bool,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    fn cast_f16(&mut self, id: BufferId, to_f16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .cast_f16(self.fabric.chips[0].session(), id, to_f16)
     }
@@ -3274,11 +3495,11 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     /// Capture a mesh trace (`tt_kernels::mesh_trace`): one session trace per
     /// chip per stretch between Ethernet transfers, and the transfers
     /// themselves, replayed in the capture's order.
-    fn begin_trace(&mut self) -> Result<(), EngineError> {
-        self.fabric.begin_mesh_trace().map_err(mesh_trace_error)
+    fn begin_trace(&mut self) -> Result<(), TtError> {
+        self.fabric.begin_mesh_trace().map_err(TtError::from)
     }
-    fn end_trace(&mut self) -> Result<u64, EngineError> {
-        self.fabric.end_mesh_trace().map_err(mesh_trace_error)
+    fn end_trace(&mut self) -> Result<u64, TtError> {
+        self.fabric.end_mesh_trace().map_err(TtError::from)
     }
     fn run_trace(
         &mut self,
@@ -3286,21 +3507,23 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         input: BufferId,
         values: &[f32],
         output: BufferId,
-    ) -> Result<TraceRun, EngineError> {
+    ) -> Result<TraceRun, TtError> {
         use std::time::Instant;
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
         // The write waits for what was queued first: that wait is not the
         // write's.
-        self.fabric.chips[0].session().sync().map_err(e)?;
+        self.fabric.chips[0]
+            .session()
+            .sync()
+            .map_err(TtError::from)?;
         let t0 = Instant::now();
         self.fabric.chips[0]
             .session()
             .write(self.buffers.get(input)?, values)
-            .map_err(e)?;
+            .map_err(TtError::from)?;
         let t1 = Instant::now();
         self.fabric
             .replay_mesh_trace(trace)
-            .map_err(mesh_trace_error)?;
+            .map_err(TtError::from)?;
         let t2 = Instant::now();
         let output = self
             .buffers
@@ -3320,17 +3543,19 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         trace: u64,
         inputs: &[(BufferId, InputPayload)],
         outputs: &[(BufferId, OutputKind)],
-    ) -> Result<GenericTraceRun, EngineError> {
+    ) -> Result<GenericTraceRun, TtError> {
         use std::time::Instant;
-        let e = |e: tt_kernels::tensor::TensorError| EngineError(e.to_string());
-        self.fabric.chips[0].session().sync().map_err(e)?;
+        self.fabric.chips[0]
+            .session()
+            .sync()
+            .map_err(TtError::from)?;
         let t0 = Instant::now();
         self.buffers
             .write_trace_inputs(self.fabric.chips[0].session(), inputs)?;
         let t1 = Instant::now();
         self.fabric
             .replay_mesh_trace(trace)
-            .map_err(mesh_trace_error)?;
+            .map_err(TtError::from)?;
         let t2 = Instant::now();
         let out_data = self
             .buffers
@@ -3344,55 +3569,51 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     }
 }
 
-fn mesh_trace_error(e: tt_kernels::mesh_trace::MeshTraceError) -> EngineError {
-    EngineError(e.to_string())
-}
-
 /// A factory for [`attach`] that opens every card in `cards` (the first is chip
 /// 0, the host's way in and out), computes on `compute` and relays through
 /// `relay` on each, finds the cabled links between them from the chips
 /// (`tt_kernels::link::discover`), and serves a [`MeshEngine`].
-pub fn kmd_mesh_engine(
+pub(crate) fn kmd_mesh_engine(
     cards: Vec<u16>,
     compute: (u8, u8),
     relay: (u8, u8),
     route: SrcRoute,
     fidelity: Fidelity,
-) -> impl FnOnce(Serve) -> Result<(), EngineError> + Send + 'static {
+) -> impl FnOnce(Serve) -> Result<(), TtError> + Send + 'static {
     use tt_device::tlb::WindowKind;
     use tt_kernels::shard::{Chip, Fabric};
     move |serve| {
         refuse_retired_settings(|variable| std::env::var(variable).ok())?;
-        let e = |e: tt_device::TransportError| EngineError(e.to_string());
         let mut chips = Vec::new();
         for &card in &cards {
             let s = Session::open_card(
                 card,
                 tt_firmware_images::ROLES,
                 TileChoice::Exactly(compute.0, compute.1),
-            )?;
+            )
+            .map_err(|e| crate::error::open_error(card, e))?;
             if !s.grid().contains(relay.0, relay.1) {
-                return Err(EngineError(format!(
+                return Err(TtError::Device(format!(
                     "relay tile {relay:?} is fused off on card {card}"
                 )));
             }
             let tile = s.tile();
             let relay = tt_isa::noc::NocCoord::new(relay.0, relay.1).expect("a Tensix coordinate");
-            chips.push(Chip::new(s.into_device(), tile, relay).map_err(e)?);
+            chips.push(Chip::new(s.into_device(), tile, relay).map_err(TtError::from)?);
         }
         let mut links = Vec::new();
         for p in 0..chips.len() {
             for q in p + 1..chips.len() {
                 let (l, r) = chips.split_at_mut(q);
                 let (a, b) = (l[p].device(), r[0].device());
-                let wa = a.alloc_window(WindowKind::TwoMib).map_err(e)?;
-                let wb = b.alloc_window(WindowKind::TwoMib).map_err(e)?;
+                let wa = a.alloc_window(WindowKind::TwoMib).map_err(TtError::from)?;
+                let wb = b.alloc_window(WindowKind::TwoMib).map_err(TtError::from)?;
                 let (ga, gb) = (
-                    a.ethernet_grid(&wa).map_err(e)?,
-                    b.ethernet_grid(&wb).map_err(e)?,
+                    a.ethernet_grid(&wa).map_err(TtError::from)?,
+                    b.ethernet_grid(&wb).map_err(TtError::from)?,
                 );
-                let found = tt_kernels::link::discover(a, &wa, &ga, b, &wb, &gb)
-                    .map_err(|x| EngineError(x.to_string()))?;
+                let found =
+                    tt_kernels::link::discover(a, &wa, &ga, b, &wb, &gb).map_err(TtError::from)?;
                 if let Some(link) = found.first() {
                     links.push((p, q, *link));
                 }
@@ -3404,7 +3625,7 @@ pub fn kmd_mesh_engine(
             tt_firmware_images::ROLES,
             tt_firmware_images::ETH_E1,
         )
-        .map_err(|x| EngineError(x.to_string()))?;
+        .map_err(TtError::from)?;
         let mut engine = MeshEngine::new(fabric, route, fidelity, 400_000)?;
         serve.serve(&mut engine);
         Ok(())
@@ -3432,7 +3653,7 @@ mod tests {
                 _a: &[f32],
                 _b: &[f32],
                 _dims: [usize; 3],
-            ) -> Result<Vec<f32>, EngineError> {
+            ) -> Result<Vec<f32>, TtError> {
                 Err(unsupported())
             }
         }
@@ -3461,6 +3682,34 @@ mod tests {
         }
     }
 
+    /// A BF16 download, like the others, reports the attachment's first failure
+    /// even though it reads a buffer that was never touched by it.
+    #[test]
+    fn a_bf16_download_reports_the_sticky_failure() {
+        use super::*;
+        struct Idle;
+        impl Engine for Idle {
+            fn matmul(&mut self, _: &[f32], _: &[f32], _: [usize; 3]) -> Result<Vec<f32>, TtError> {
+                Err(unsupported())
+            }
+        }
+        let device = TtDevice::new(u16::MAX - 1);
+        let guard = attach(device, |serve| {
+            serve.serve(&mut Idle);
+            Ok(())
+        })
+        .unwrap();
+        // An op on a buffer this attachment never made fails, asynchronously.
+        let (broken, _) = cast_float(device, 999_999_999, [1, 1], true);
+        let read = try_download_bf16(device, broken, 1, 1).unwrap_err();
+        assert!(read.to_string().contains("outlived"), "{read}");
+        // Another buffer's read is refused by the failure, not by itself.
+        let (other, _) = cast_float(device, 999_999_998, [1, 1], true);
+        let err = try_download_bf16(device, other, 1, 1).unwrap_err();
+        assert!(matches!(err.root(), TtError::StaleTensor { .. }), "{err:?}");
+        drop(guard);
+    }
+
     #[test]
     fn retired_executor_settings_are_refused_with_what_replaces_them() {
         for (variable, value) in [
@@ -3471,7 +3720,7 @@ mod tests {
         ] {
             let error = refuse_retired_settings(|name| (name == variable).then(|| value.into()))
                 .unwrap_err()
-                .0;
+                .to_string();
             assert!(
                 error.starts_with(&format!("{variable}={value}: retired")),
                 "{error}"
@@ -3481,7 +3730,7 @@ mod tests {
         assert!(refuse_retired_settings(|_| None).is_ok());
         let error = refuse_retired_settings(|name| (name == "TT_EXACT").then(|| "1".into()))
             .unwrap_err()
-            .0;
+            .to_string();
         assert!(error.contains("TT_EXACT=1: retired"), "{error}");
         assert!(
             error.contains("native numerical bounds") && error.contains("unset"),

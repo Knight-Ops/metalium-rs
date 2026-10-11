@@ -170,28 +170,30 @@ fn mesh_convolution_and_attention_gradients_match_single_card() {
         let config = tt_tests::burn_device::Config::default();
         for dtype in [FloatDType::F32, FloatDType::BF16] {
             let single = {
-                let _guard = burn_tt::attach_topology(
+                let _guard = burn_tt::attach_with(
                     device,
-                    burn_tt::Topology::Single {
-                        card: 0,
-                        tile: burn_tt::TileChoice::Count(1),
-                    },
-                    config.route,
-                    config.fidelity,
+                    burn_tt::TtConfig::default()
+                        .topology(burn_tt::Topology::Single {
+                            card: 0,
+                            tile: burn_tt::TileChoice::Count(1),
+                        })
+                        .route(config.route)
+                        .fidelity(config.fidelity),
                 )
                 .unwrap();
                 run(device, dtype)
             };
             let mesh = {
-                let _guard = burn_tt::attach(
+                let _guard = burn_tt::attach_with(
                     device,
-                    burn_tt::kmd_mesh_engine(
-                        vec![0, 1],
-                        tt_tests::backend::GATE_TILE,
-                        tt_tests::backend::RELAY_TILE,
-                        config.route,
-                        config.fidelity,
-                    ),
+                    burn_tt::TtConfig::default()
+                        .topology(burn_tt::Topology::Cards {
+                            cards: vec![0, 1],
+                            compute: tt_tests::backend::GATE_TILE,
+                            relay: tt_tests::backend::RELAY_TILE,
+                        })
+                        .route(config.route)
+                        .fidelity(config.fidelity),
                 )
                 .unwrap();
                 run(device, dtype)

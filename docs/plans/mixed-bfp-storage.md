@@ -101,7 +101,7 @@ compilation and shipping dependency checks pass. Ordinary-F32 and native
 policy API examples compile/run as `tt-mnist` doctests. Benchmarks use release
 outputs, two warmups and nine validated samples per format on both cards;
 conditions, medians and policy accuracy observations are in
-`docs/learnings/firmware-performance.md`.
+`docs/learnings/performance-log.md`.
 
 The accumulator negative control executes the final K tile alone (the numerical
 result of dropping the preceding accumulator). Exponent/order/padding controls
@@ -124,7 +124,7 @@ draws on the device (`burn-tt/src/random.rs`, step140-142).
 
 Resume by reading this file, the backend/kernel READMEs and the BFP/PRNG sections
 of `silicon-operating-notes.md`, `ttsim-divergence.md` and
-`firmware-performance.md`. The latter retain empirical results even if local
+`performance-log.md`. The latter retain empirical results even if local
 `target/silicon` logs are removed. Do not reinterpret historical unchecked
 entries as missing implementations. Important retained limits:
 

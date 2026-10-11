@@ -6,7 +6,9 @@ implemented.
 
 ## The problem it would solve
 
-Every number Phase 10 measured past the kernels themselves is the host being far away:
+Every number Phase 10 measured past the kernels themselves is the host being far away. The table
+is the 2026-10-01 measurement; the native cutover and Phase 10 have since moved the loss and argmax
+onto the card (see below), so the last row is history, while the PCIe and dispatch costs remain:
 
 | Cost | Measured | Where |
 |---|---|---|
@@ -14,7 +16,7 @@ Every number Phase 10 measured past the kernels themselves is the host being far
 | Building and enqueueing one op's lists on the host | ~10-25 us an op, ~0.4 ms of a training step | rows V, Z |
 | A small download (the logits, 2.5 KB) past its sync | ~140 us, uncached 4-byte MMIO reads at ~5 MB/s | rows M, Z |
 | A small upload (2.5 KB) | ~470 us a call | row Z |
-| A host op between device ops (the `[64, 10]` loss, argmax) | a download, Flex, an upload | rows V, X |
+| A host op between device ops (the `[64, 10]` loss, argmax), as of 2026-10-01 | a download, Flex, an upload (**no longer true**: both run natively on the card now) | rows V, X |
 
 Traces (X4d) take the first two out of a replayed stretch, but not what has to run between
 replays: picking the next batch, reading the predictions, running the loss or the optimizer
@@ -43,9 +45,12 @@ In short, a small host on the far side of PCIe.
    into the trace's input buffer (a GDDR-to-GDDR copy, or the movers'), replays, and
    reads the output where it lands. The host's part is to fill the queue and drain the
    results; the per-batch PCIe traffic is the inputs and outputs only.
-2. **Run the small ops that fall back to the host today**, next to the data: argmax,
-   a `[64, 10]` softmax and cross-entropy, a scalar loss reduction, and an optimizer's
-   per-step bookkeeping. With RVV, on cached GDDR, without a download.
+2. **Run the small work that is still host code**, next to the data. Argmax, softmax,
+   cross-entropy and the loss reduction are native Tensix ops now (`tt-mnist` trains and
+   evaluates with native argmax; no op falls back to Flex), so what is left is the
+   bookkeeping between replays: choosing the next batch, reading predictions for accuracy,
+   the stop decision, an optimizer's per-step scalars. With RVV, on cached GDDR, without a
+   download.
 3. **Be the dispatcher.** `tt-kernels` is `no_std`-friendly Rust in its ISA layer and plain
    Rust above it. Its session -- building lists, placing programs, enqueueing to the
    movers, the barriers -- could run on an x280 against the NoC instead of on the host
@@ -68,7 +73,7 @@ From the documentation, before any measurement:
 - **Clocks.** The harts must leave reset with the L2SYS clock low, which means programming
   PLLs through the ARC tile, then raising it (`tt-bh-linux`'s `clock.py` is the reference).
 - **Memory behaviour.** The L1 data cache allows one outstanding miss at a time
-  (`RUST_IMPL_PLAN.md`'s L2CPU notes), which makes NoC-backed loads slow; the work has to
+  (`../plans/phases-0-10-roadmap.md`, "L2CPU tiles"; `Caches.md`), which makes NoC-backed loads slow; the work has to
   live in the local GDDR tile, cached, and touch Tensix L1 only for doorbells and
   mailboxes. Coherence between the x280's caches and NoC writes into GDDR has to be
   designed, not assumed (`Caches.md`).
@@ -96,8 +101,10 @@ Each step gated on silicon (no ttsim), each one useful alone:
 - **L4 Replay traces from a queue.** X4d's replay driven from a GDDR batch queue: the
   inference loop with the host only filling the queue. Gate: MNIST inference bit for bit,
   per-batch host traffic the inputs and outputs only, images/s measured.
-- **L5 Small ops in RVV.** argmax and the small softmax/loss on the x280, bit-for-bit or
-  within a derived bound of Flex.
+- **L5 Small host work in RVV.** The between-replay bookkeeping above (batch selection,
+  prediction readback, scalar loss handling) on the x280. argmax and loss already run on
+  Tensix, so this step is only worth it if the measured host round trips still dominate
+  after L4; otherwise it is dropped.
 - **L6 Dispatch.** The session's list building on the x280; the host sends op requests.
 
 ## Decisions it needs
@@ -110,7 +117,7 @@ Each step gated on silicon (no ttsim), each one useful alone:
 
 - `vendor/tt-isa-documentation/BlackholeA0/L2CPUTile/` (README, MemoryMap, TLBWindows,
   Caches, RNMIs, MSICatcher).
-- `../plans/master-roadmap.md`, "L2CPU tiles (optional on-chip host)".
+- `../plans/phases-0-10-roadmap.md`, "L2CPU tiles (optional on-chip host)".
 - `../learnings/tt-metal-concepts-review.md` G8: tt-metal's fast dispatch and traces.
-- `../plans/hardware-coverage.md`, "Out of scope": the earlier reason for leaving these tiles
+- `../completed-plans/hardware-coverage.md`, "Out of scope": the earlier reason for leaving these tiles
   out, which this request revisits.

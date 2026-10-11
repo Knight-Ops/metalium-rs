@@ -6,7 +6,9 @@
 //! gate runs in a fork: the simulator is a once-per-process singleton, and on
 //! silicon the child's closing file descriptor fires the driver's cleanup write.
 
-use burn_tt::{attach, Fidelity, SrcRoute, TtDevice};
+#[cfg(not(feature = "silicon"))]
+use burn_tt::attach;
+use burn_tt::{Fidelity, SrcRoute, TtDevice};
 
 /// Core models may stage creation data and layouts, but all arithmetic stays resident.
 pub fn assert_native_model(report: &burn_tt::Report) {
@@ -109,17 +111,17 @@ fn attach_mesh(
     device: TtDevice,
     config: Config,
     chips: usize,
-) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
-    use burn_tt::{EngineError, MeshEngine};
+) -> Result<burn_tt::AttachGuard, burn_tt::TtError> {
+    use burn_tt::{MeshEngine, TtError};
     use tt_device::Device;
     use tt_kernels::shard::{Chip, Fabric};
     let (lib, table): (_, &[_]) = match chips {
         2 => (tt_ttsim::x2_lib_path(), &crate::topology::BH_X2),
         4 => (tt_ttsim::x4_lib_path(), &crate::topology::BH_X4),
-        n => return Err(EngineError(format!("no {n}-chip simulator build"))),
+        n => return Err(TtError::Device(format!("no {n}-chip simulator build"))),
     };
     attach(device, move |serve| {
-        let err = |e: &dyn std::fmt::Display| EngineError(e.to_string());
+        let err = |e: &dyn std::fmt::Display| TtError::Device(e.to_string());
         let mut sim = tt_ttsim::Simulator::open_path(lib).map_err(|e| err(&e))?;
         let (compute, relay) = (crate::harness::tensix_tile(), crate::harness::relay_tile());
         let mut list = Vec::new();
@@ -146,16 +148,17 @@ fn attach_mesh(
     device: TtDevice,
     config: Config,
     chips: usize,
-) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
-    attach(
+) -> Result<burn_tt::AttachGuard, burn_tt::TtError> {
+    burn_tt::attach_with(
         device,
-        burn_tt::kmd_mesh_engine(
-            (0..chips as u16).collect(),
-            crate::backend::GATE_TILE,
-            crate::backend::RELAY_TILE,
-            config.route,
-            config.fidelity,
-        ),
+        burn_tt::TtConfig::default()
+            .topology(burn_tt::Topology::Cards {
+                cards: (0..chips as u16).collect(),
+                compute: crate::backend::GATE_TILE,
+                relay: crate::backend::RELAY_TILE,
+            })
+            .route(config.route)
+            .fidelity(config.fidelity),
     )
 }
 
@@ -173,11 +176,30 @@ fn device() -> TtDevice {
 fn attach_engine(
     device: TtDevice,
     config: Config,
-) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
-    use burn_tt::{Engine, EngineError};
+) -> Result<burn_tt::AttachGuard, burn_tt::TtError> {
+    attach(device, sim_factory(config))
+}
+
+/// Make the simulator what `burn_tt` opens for a device nobody attached
+/// (`burn_tt::set_default_engine`), so a gate can use `TtDevice::default()`
+/// with no `attach`, as a user's code does. Call it inside the
+/// `tt_ttsim::fork_scope` child that runs the gate: the simulator is a
+/// once-per-process singleton, and a parent that attached it could not fork.
+#[cfg(not(feature = "silicon"))]
+pub fn register_simulator(config: Config) {
+    burn_tt::set_default_engine(move |_device, _burn_config| Ok(Box::new(sim_factory(config))));
+}
+
+/// The simulator engine: the same `Session` the silicon engine uses, served
+/// by [`burn_tt::attach`] or the registry.
+#[cfg(not(feature = "silicon"))]
+fn sim_factory(
+    config: Config,
+) -> impl FnOnce(burn_tt::Serve) -> Result<(), burn_tt::TtError> + Send + 'static {
+    use burn_tt::{Engine, TtError};
     use tt_device::Device;
 
-    // The same `Session` the silicon engine uses (`burn_tt::kmd_engine`), so
+    // The same `Session` the silicon engine uses (`burn_tt::attach_with`), so
     // the reduced run's golden exercises the resident path on both targets.
     struct Sim<'a> {
         session: tt_kernels::session::Session<tt_ttsim::LibTtsim<'a>>,
@@ -191,7 +213,7 @@ fn attach_engine(
         fn math_mode(&self) -> burn_tt::MathMode {
             self.session.math_mode()
         }
-        fn set_math_mode(&mut self, mode: burn_tt::MathMode) -> Result<(), EngineError> {
+        fn set_math_mode(&mut self, mode: burn_tt::MathMode) -> Result<(), TtError> {
             self.session.set_math_mode(mode);
             Ok(())
         }
@@ -201,7 +223,7 @@ fn attach_engine(
             windows: &[Vec<[usize; 2]>],
             divisors: &[usize],
             dims: [usize; 2],
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .pool_bf16(&mut self.session, a, windows, divisors, dims)
         }
@@ -209,7 +231,7 @@ fn attach_engine(
             &mut self,
             a: burn_tt::BufferId,
             b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.matmul_bf16(
                 &mut self.session,
                 a,
@@ -223,51 +245,46 @@ fn attach_engine(
             bits: &[u16],
             rows: usize,
             cols: usize,
-        ) -> Result<burn_tt::BufferId, EngineError> {
+        ) -> Result<burn_tt::BufferId, TtError> {
             self.buffers
                 .upload_bf16(&mut self.session, bits, rows, cols)
         }
-        fn download_bf16(&mut self, id: burn_tt::BufferId) -> Result<Vec<u16>, EngineError> {
+        fn download_bf16(&mut self, id: burn_tt::BufferId) -> Result<Vec<u16>, TtError> {
             self.buffers.download_bf16(&mut self.session, id)
         }
         fn cast_float(
             &mut self,
             id: burn_tt::BufferId,
             bf16: bool,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_float(&mut self.session, id, bf16)
         }
         fn cast_f16(
             &mut self,
             id: burn_tt::BufferId,
             to_f16: bool,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_f16(&mut self.session, id, to_f16)
         }
         fn cast_bfp(
             &mut self,
             id: burn_tt::BufferId,
             format: Option<tt_kernels::bfp::BfpFormat>,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_bfp(&mut self.session, id, format)
         }
         fn matmul_bfp(
             &mut self,
             a: burn_tt::BufferId,
             b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .matmul_bfp(&mut self.session, a, b, self.config.fidelity)
         }
         fn supports_dram(&self) -> bool {
             true
         }
-        fn upload(
-            &mut self,
-            v: &[f32],
-            r: usize,
-            c: usize,
-        ) -> Result<burn_tt::BufferId, EngineError> {
+        fn upload(&mut self, v: &[f32], r: usize, c: usize) -> Result<burn_tt::BufferId, TtError> {
             self.buffers.upload(&mut self.session, v, r, c)
         }
         fn metadata(
@@ -275,10 +292,10 @@ fn attach_engine(
             bits: &[u32],
             dims: [usize; 2],
             elem: burn_tt::Elem,
-        ) -> Result<burn_tt::BufferId, EngineError> {
+        ) -> Result<burn_tt::BufferId, TtError> {
             self.buffers.metadata(&mut self.session, bits, dims, elem)
         }
-        fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, EngineError> {
+        fn download(&mut self, id: burn_tt::BufferId) -> Result<Vec<f32>, TtError> {
             self.buffers.download(&mut self.session, id)
         }
         fn upload_bits(
@@ -287,10 +304,10 @@ fn attach_engine(
             r: usize,
             c: usize,
             elem: burn_tt::Elem,
-        ) -> Result<burn_tt::BufferId, EngineError> {
+        ) -> Result<burn_tt::BufferId, TtError> {
             self.buffers.upload_bits(&mut self.session, v, r, c, elem)
         }
-        fn download_bits(&mut self, id: burn_tt::BufferId) -> Result<Vec<u32>, EngineError> {
+        fn download_bits(&mut self, id: burn_tt::BufferId) -> Result<Vec<u32>, TtError> {
             self.buffers.download_bits(&mut self.session, id)
         }
         fn free(&mut self, id: burn_tt::BufferId) {
@@ -302,7 +319,7 @@ fn attach_engine(
             ta: bool,
             b: burn_tt::BufferId,
             tb: bool,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             let c = &self.config;
             self.buffers.matmul(
                 &mut self.session,
@@ -321,7 +338,7 @@ fn attach_engine(
             scalar: f32,
             a: burn_tt::BufferId,
             b: Option<burn_tt::BufferId>,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.eltwise(&mut self.session, kind, scalar, a, b)
         }
         fn eltwise_op(
@@ -330,20 +347,20 @@ fn attach_engine(
             a: burn_tt::BufferId,
             b: Option<burn_tt::BufferId>,
             c: Option<burn_tt::BufferId>,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.eltwise_op(&mut self.session, op, a, b, c)
         }
         fn pow(
             &mut self,
             x: burn_tt::BufferId,
             y: burn_tt::PowArg,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.pow(&mut self.session, x, y)
         }
         fn sum_rows(
             &mut self,
             a: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.sum_rows(&mut self.session, a)
         }
         fn reduce(
@@ -351,21 +368,21 @@ fn attach_engine(
             a: burn_tt::BufferId,
             op: tt_kernels::sfpu::reduce::ReduceOp,
             axis: tt_kernels::sfpu::reduce::Axis,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.reduce(&mut self.session, a, op, axis)
         }
         fn scan(
             &mut self,
             a: burn_tt::BufferId,
             op: tt_kernels::sfpu::scan::ScanOp,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.scan(&mut self.session, a, op)
         }
         fn sort_planes(
             &mut self,
             a: burn_tt::BufferId,
             spec: tt_kernels::sfpu::sort::Spec,
-        ) -> Result<burn_tt::SortedBuffers, EngineError> {
+        ) -> Result<burn_tt::SortedBuffers, TtError> {
             self.buffers.sort_planes(&mut self.session, a, spec)
         }
         fn slice_rows(
@@ -373,7 +390,7 @@ fn attach_engine(
             a: burn_tt::BufferId,
             first: usize,
             rows: usize,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.slice_rows(a, first, rows)
         }
         fn matmul_dram_batched(
@@ -382,7 +399,7 @@ fn attach_engine(
             b: burn_tt::BufferId,
             items: &[(burn_tt::Block, burn_tt::Block)],
             mkn: [usize; 3],
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             let c = &self.config;
             self.buffers.matmul_batched(
                 &mut self.session,
@@ -400,7 +417,7 @@ fn attach_engine(
             a: burn_tt::BufferId,
             sources: &[[usize; 2]],
             dims: [usize; 2],
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.repack(&mut self.session, a, sources, dims)
         }
         fn copy_blocks(
@@ -408,7 +425,7 @@ fn attach_engine(
             a: burn_tt::BufferId,
             moves: &[burn_tt::BlockMove],
             dims: [usize; 2],
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.copy_blocks(&mut self.session, a, moves, dims)
         }
         fn zeros_dram(
@@ -416,7 +433,7 @@ fn attach_engine(
             dims: [usize; 2],
             elem: tt_kernels::tensor::Elem,
             bf16: bool,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.zeros(&mut self.session, dims, elem, bf16)
         }
         fn random_dram(
@@ -424,14 +441,14 @@ fn attach_engine(
             dims: [usize; 2],
             draw: burn_tt::Draw,
             base: u64,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.random(&mut self.session, dims, draw, base)
         }
         fn gather_indexed(
             &mut self,
             input: burn_tt::BufferId,
             indices: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .gather_indexed(&mut self.session, input, indices)
         }
@@ -440,7 +457,7 @@ fn attach_engine(
             inputs: &[burn_tt::BufferId],
             sources: &[(usize, [usize; 2])],
             dims: [usize; 2],
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .repack_many(&mut self.session, inputs, sources, dims)
         }
@@ -449,7 +466,7 @@ fn attach_engine(
             sources: &[burn_tt::BufferId],
             rows: &[(usize, usize)],
             cols: usize,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .gather_rows(&mut self.session, sources, rows, cols)
         }
@@ -458,16 +475,16 @@ fn attach_engine(
             t: burn_tt::BufferId,
             indices: &[usize],
             value: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), EngineError> {
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.rows_add(&mut self.session, t, indices, value)
         }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }
-        fn begin_trace(&mut self) -> Result<(), EngineError> {
+        fn begin_trace(&mut self) -> Result<(), TtError> {
             self.buffers.begin_trace(&mut self.session)
         }
-        fn end_trace(&mut self) -> Result<u64, EngineError> {
+        fn end_trace(&mut self) -> Result<u64, TtError> {
             self.buffers.end_trace(&mut self.session)
         }
         fn run_trace(
@@ -476,7 +493,7 @@ fn attach_engine(
             input: burn_tt::BufferId,
             values: &[f32],
             output: burn_tt::BufferId,
-        ) -> Result<burn_tt::TraceRun, EngineError> {
+        ) -> Result<burn_tt::TraceRun, TtError> {
             self.buffers
                 .run_trace(&mut self.session, trace, input, values, output)
         }
@@ -487,7 +504,7 @@ fn attach_engine(
             &mut self,
             src: burn_tt::BufferId,
             dst: burn_tt::BufferId,
-        ) -> Result<(), EngineError> {
+        ) -> Result<(), TtError> {
             self.buffers.copy_into(&mut self.session, src, dst)
         }
         fn run_generic_trace(
@@ -495,16 +512,11 @@ fn attach_engine(
             trace: u64,
             inputs: &[(burn_tt::BufferId, burn_tt::InputPayload)],
             outputs: &[(burn_tt::BufferId, burn_tt::OutputKind)],
-        ) -> Result<burn_tt::GenericTraceRun, EngineError> {
+        ) -> Result<burn_tt::GenericTraceRun, TtError> {
             self.buffers
                 .run_generic_trace(&mut self.session, trace, inputs, outputs)
         }
-        fn matmul(
-            &mut self,
-            a: &[f32],
-            b: &[f32],
-            mkn: [usize; 3],
-        ) -> Result<Vec<f32>, EngineError> {
+        fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, TtError> {
             Ok(self.session.matmul(
                 a,
                 b,
@@ -516,10 +528,10 @@ fn attach_engine(
         }
     }
 
-    attach(device, move |serve| {
+    move |serve| {
         let mut sim = tt_ttsim::Simulator::open()
-            .map_err(|e| EngineError(format!("could not open the simulator: {e}")))?;
-        let dev = Device::open(sim.transport()).map_err(|e| EngineError(e.to_string()))?;
+            .map_err(|e| TtError::Device(format!("could not open the simulator: {e}")))?;
+        let dev = Device::open(sim.transport()).map_err(|e| TtError::Device(e.to_string()))?;
         let t = crate::harness::tensix_tile();
         let session = tt_kernels::session::Session::open(
             dev,
@@ -529,25 +541,25 @@ fn attach_engine(
                 .unwrap_or(tt_kernels::session::TileChoice::Exactly(t.x(), t.y())),
             |_, _| Ok(None),
         )
-        .map_err(|e| EngineError(e.to_string()))?;
+        .map_err(|e| TtError::Device(e.to_string()))?;
         let mut session = session;
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(|e| TtError::Device(e.to_string()))?;
         serve.serve(&mut Sim {
             session,
             config,
             buffers: burn_tt::DramBuffers::default().with_elementwise_mode(config.elementwise),
         });
         Ok(())
-    })
+    }
 }
 
 #[cfg(feature = "silicon")]
 fn attach_engine(
     device: TtDevice,
     config: Config,
-) -> Result<burn_tt::AttachGuard, burn_tt::EngineError> {
+) -> Result<burn_tt::AttachGuard, burn_tt::TtError> {
     // `TT_TOPOLOGY` ("0", "0,1") picks the cards, so one benchmark runs on one
     // card or several unchanged (`burn_tt::Topology`); unset, the card this
     // gate was pointed at, on the gate tile. The gate's own `tiles`, else
@@ -567,11 +579,12 @@ fn attach_engine(
         None => topology,
     };
     eprintln!("topology: {topology:?}");
-    burn_tt::attach_topology_with_elementwise(
+    burn_tt::attach_with(
         device,
-        topology,
-        config.route,
-        config.fidelity,
-        config.elementwise,
+        burn_tt::TtConfig::default()
+            .topology(topology)
+            .route(config.route)
+            .fidelity(config.fidelity)
+            .elementwise(config.elementwise),
     )
 }

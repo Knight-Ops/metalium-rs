@@ -5,7 +5,7 @@
 > **Status 2026-10-10:** Stages E-H and the research rows are closed by lane (see [hardware-coverage-closeout.md](hardware-coverage-closeout.md)): `ATGETM`/`ATRELM`, `ATCAS`, `ATSWAP` (group form), `ATINCGET`, `ATINCGETPTR`, `SFPLOADMACRO` and `MOVDBGA2D` are `[x]` on silicon; `PACR_SETREG`, `UNPACR_NOP_SETREG`, `STREAMWAIT`, `STREAMWRCFG` and `GATESRCRST` are `[-]` with evidence; `LOADREG`, `STOREREG` and `STOREIND_MMIO` are `[x]` on the allowlisted PIC words (silicon probes and gates pass on card 0). The list below is historical.
 
 Review date: 2026-10-07. Source of completion status:
-[hardware-coverage.md](../plans/hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
+[hardware-coverage.md](hardware-coverage.md#tensix-coprocessor-instruction-implementation-checklist),
 including the step97–104 acceptance and the current working-tree code.
 This is an implementation sequence; measured Stage D acceptance is recorded in
 its completed checklist and operating notes. Five pending rows are now

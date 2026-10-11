@@ -33,7 +33,7 @@ the batch into the rows and runs as the 2-D product; so do `linear_weight_backwa
 `linear_bias_backward`. Reshapes and dimension swaps of a resident F32 tensor are
 strided views of its buffer at any rank (`src/views.rs`): a batched matmul reads its
 operands' blocks where they lie (attention's heads, `K^T`), and an op that needs a plain
-matrix gets one by a native block copy or word repacking on the card. The table above is the first ops; `hardware-coverage.md`'s Burn
+matrix gets one by a native block copy or word repacking on the card. The table above is the first ops; `burn-op-notes.md`'s Burn
 op tables are the full list, and `TT_REPORT=1` says what a given model ran where. Any F32
 `float_matmul` the above does not cover (batched, or an engine without GDDR such as
 a minimal custom engine) still runs on the card, staged from the host (`Engine::matmul`).
@@ -43,12 +43,18 @@ derived bounds, not guaranteed to match Flex's bits. Empty/rank-zero tensors,
 non-F32 dtypes, engines without native reduction support and resident views
 that cannot be copied on the card fail explicitly. Required methods without
 a native implementation fail explicitly; Burn defaults compose our primitives.
-Mesh engines retain buffers in chip 0's GDDR. Rank-two matmuls split output
-columns across the fabric, moving tile slots over Ethernet, directly or through
-relay tiles. Other primitives and full reductions run on chip 0, retaining
-intermediates on the device. Batched matmuls also partition products across cards; convolution and attention
-reuse this path, including backward products. Elementwise work and reductions
-remain on chip 0. Mesh trace capture and changed-input replay of inference work (`step147`); mesh training traces and `copy_into` on a mesh are unsupported.
+`MeshEngine` presents the mesh as one Burn device and retains its buffers in
+chip 0's GDDR; each chip also has its own `Session` with GDDR tensors. Rank-two
+matmuls split output columns across the fabric, moving tile slots between the
+chips' GDDR over Ethernet, directly or through relay tiles, with no host
+staging. Batched matmuls also partition products across cards; convolution and
+attention reuse this path, including backward products. Every other primitive,
+including elementwise work and reductions, runs on chip 0, retaining
+intermediates on the device. Each card uses one compute tile, and the chips are
+not yet run concurrently (the per-chip steps are issued in sequence). Mesh trace
+capture and changed-input replay of inference work (`step147`); mesh training
+traces and `copy_into` on a mesh are unsupported, and there is no all-reduce or
+data-parallel training.
 The two-chip and four-chip MLP gates match the native single-chip golden and
 reject intermediate host transfers and staged computation.
 
@@ -76,30 +82,37 @@ ADC path is slower than native repack.
 |---|---|
 | `TtBackend`, `TtDevice { chip }` | The backend marker and a chip by index. |
 | `TtTensor` | A shared cell with a lazily filled host copy (owned tensor bytes) and device copy (GDDR buffer). |
-| `attach(device, factory)` | Starts the device's server thread and runs the `Engine` factory on it; returns an `AttachGuard`. Attaching a chip twice is refused. |
-| `Engine`, `kmd_engine`, `kmd_mesh_engine` | What a device can do; the silicon engines (one card on a `Session`, or a `Fabric` of cards). |
-| `Topology`, `attach_topology` | `Single { card, tile }` or `Cards { .. }`; the one call training code makes. |
+| *(nothing)* | A device is attached by the first op that needs it: `TtDevice::new(n)` opens `/dev/tenstorrent/n` on one card's first surviving tile (`TileChoice::First`), configured by `TT_TOPOLOGY`, `TT_TILES` and `TT_MATH`. A failed open is remembered: the next op fails at once with the same `TtError`. |
+| `init(device, TtConfig)`, `detach(device)` | The explicit, fallible form (a typed error instead of a panic in the first op), and the way back: `detach` closes the card; tensors made before it are `StaleTensor`. `init` is idempotent for an equal `TtConfig` and `AlreadyAttached` for another. |
+| `TtConfig` | Builder for what `init` and `attach_with` open: `topology`, `tiles`, `route`, `fidelity`, `elementwise`; `TtConfig::from_env()` applies the environment. |
+| `attach_with(device, TtConfig)`, `attach(device, factory)` | Scoped, explicit attachment for tests and benchmarks: the guard detaches on drop. `attach` runs any `Engine` factory on the server thread. Attaching a device twice is `TtError::AlreadyAttached`. |
+| `set_default_engine`, `refuse_default_engine`, `reset_default_engine` | What the registry opens for a device nobody attached (silicon unless set). `tt-tests` registers the simulator here. |
+| `TtDevice::enumerate()`, `Backend::device_count` | The `/dev/tenstorrent/n` nodes plus devices attached some other way; nothing is opened. |
+| `TtError` | Why a card could not be opened or a job finished: `NoDriver`, `NoSuchCard`, `Permission`, `NoSuchTile`, `Timeout`, `OutOfMemory`, `StaleTensor`, `ServerPanicked`, ... Its `Display` carries the fix. |
+| `Engine`, `KmdEngine`, `MeshEngine` | What a device can do; the silicon engines (one card on a `Session`, or a `Fabric` of cards). |
+| `Topology` | `Single { card, tile }` or `Cards { .. }`, the cards behind one `TtDevice`; a `TtConfig` field. |
 | `Topology::from_env` (`TT_TOPOLOGY`, `"0"` or `"0,1"`), `tiles_from_env` (`TT_TILES`, `n` or `all`) | Environment-driven choice, used by the `tt-tests` silicon harness. |
 | `tensor_traffic`, `device_traffic`, `record_transfers` | PCIe traffic accounting. |
 
 ## Explicit matrix elementwise mode
 
-SFPU remains the default. Configure one card before attaching its engine:
+SFPU remains the default. Configure one card before its engine opens:
 
 ```rust,no_run
-use burn_tt::{attach_topology_with_elementwise, ElementwiseMode, Fidelity,
-    SrcPrecision, SrcRoute, Topology, TtDevice};
+use burn_tt::{ElementwiseMode, Fidelity, SrcPrecision, TtConfig, TtDevice};
 let device = TtDevice::new(0);
-let guard = attach_topology_with_elementwise(
-    device, Topology::single(0), SrcRoute::Tf32FromFp32, Fidelity::HiFi4,
-    ElementwiseMode::Matrix { precision: SrcPrecision::Tf32, fidelity: Fidelity::HiFi4 },
+burn_tt::init(
+    device,
+    TtConfig::default().elementwise(ElementwiseMode::Matrix {
+        precision: SrcPrecision::Tf32,
+        fidelity: Fidelity::HiFi4,
+    }),
 )?;
-# Ok::<(), burn_tt::EngineError>(())
+# Ok::<(), burn_tt::TtError>(())
 ```
 
-`kmd_engine_with_elementwise` and the consuming
-`KmdEngine::with_elementwise_mode`/`DramBuffers::with_elementwise_mode` builders
-provide the same selection for custom factories. Custom engines expose it through
+The consuming `KmdEngine::with_elementwise_mode`/`DramBuffers::with_elementwise_mode`
+builders provide the same selection for custom factories. Custom engines expose it through
 `Engine::elementwise_mode`. Attachment snapshots it once; floating arithmetic
 keeps asynchronous dispatch. Mesh opt-in fails explicitly. Configuration cannot
 be changed through an attached engine's public dispatch interface.
@@ -194,7 +207,7 @@ support overlap backwards. BF16 averages use GAPOOL; F32 averages and general ma
 use SFPU to retain their numerical contracts. All-padding windows fail explicitly.
 Pooling geometry constants use replayable metadata, enabling trace capture. The GMPOOL
 block API is opt-in. `step74`–`step78` cover these paths; see
-[the implementation record](../../docs/plans/tensix-next-features.md) for runs and limits.
+[the implementation record](../../docs/completed-plans/tensix-next-features.md) for runs and limits.
 BF16 currently saves storage rather than time: the first packed gather path is
 slower than TF32 on the measured MNIST GEMMs.
 
@@ -262,16 +275,25 @@ unparsable value as `0`.
 
 ## Gotchas
 
-- **Device errors panic, at the next wait.** Device ops return before they run
-  (asynchronous dispatch), so a failed run panics where a result is next waited
-  for -- a download, a trace's replay -- naming the op that failed and the engine's
-  error; the first failure on an attachment is reported by every later wait. An op
-  on an unattached device panics at once. Nothing silently falls back.
+- **Device errors are typed (`TtError`) and arrive at the next wait.** Device ops
+  return before they run (asynchronous dispatch), so a failed run is reported where
+  a result is next waited for -- a download, a trace's replay, `Backend::sync`. There
+  it is `Err(ExecutionError)` from `try_into_data` and `sync` (the `TtError`'s text
+  names the op, the device and the engine's error), and a panic from `into_data`,
+  which is Burn's `try_into_data().expect(..)`. The first failure on an attachment is
+  reported by every later wait. Strict mode (`TT_STRICT=1`, `burn_tt::strictly`)
+  panics at the failing wait instead of returning the error. An engine that panics
+  ends its own service, not the process: every later wait reports
+  `TtError::ServerPanicked` with the message. Ops with no `Result` to return (a
+  host-staged matmul or full reduction) and an op on an unattached device panic at
+  once. Nothing silently falls back.
 - `TT_PROFILE` records each tile's mover lists, entries and records, and its role
   runs, by the tile's own cycle counter (Perfetto, `chrome://tracing`). Silicon
   only: ttsim does not model the timestamper's event stream.
-- `Topology::Cards` uses resident buffers and one compute tile per card;
-  `on_tiles` refuses more. Non-matmul primitives execute on chip 0.
+- `Topology::Cards` uses resident buffers (retained in chip 0's GDDR, per-chip
+  sessions for the matmul partitions) and one compute tile per card; `on_tiles`
+  refuses more. Non-matmul primitives execute on chip 0 and chips are not yet
+  run concurrently.
 - Native argmax and argmin support rank-N F32 input, I32 output, and reduced axes
   of at most 2^23 elements, with first-tie and first-NaN semantics.
 - Random draws run on the device (seeded tile kernels: uniform, Bernoulli, normal and
@@ -282,7 +304,8 @@ unparsable value as `0`.
 
 General reductions and K-blocked resident matmul have simulator gates in
 `step67_general_reduce` and `step68_k_block_matmul`; both-card silicon validation
-is pending. K continuations reload FP32 accumulators and retain the original
+passed on both cards (run `1791145571`), and release medians were measured on
+2026-10-10 (run `1791593690`, `docs/learnings/performance-log.md`). K continuations reload FP32 accumulators and retain the original
 product order. Supported batched layouts retain their tile-alignment rules.
 
 Native rank-four attention preserves pinned Burn's scale/softcap, Boolean and

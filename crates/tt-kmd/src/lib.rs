@@ -45,6 +45,10 @@ pub const PINNED_API_VERSION: u32 = 2;
 /// Where the device nodes live.
 pub const DEV_DIR: &str = "/dev/tenstorrent";
 
+/// The driver lock a compute session holds on its card: the last of the 64
+/// (`TENSTORRENT_RESOURCE_LOCK_COUNT`), clear of the Ethernet cores' 0-15.
+pub const SESSION_LOCK: u8 = 63;
+
 /// Where the loaded module publishes `auto_reset_timeout`.
 pub const AUTO_RESET_TIMEOUT_PARAM: &str = "/sys/module/tenstorrent/parameters/auto_reset_timeout";
 
@@ -357,6 +361,19 @@ impl Kmd {
 
     pub fn unlock(&self, index: u8) -> Result<bool, TransportError> {
         Ok(ioctl::lock_ctl(self.fd(), index, abi::lock::RELEASE)?)
+    }
+
+    /// Claim the card for this descriptor: `false` if another descriptor -- in
+    /// this process or another -- holds it.
+    ///
+    /// The driver ties a lock to the open file description and releases it only
+    /// when that closes (the process exiting included), so the claim lasts as
+    /// long as this `Kmd` does, and survives a chip reset. Index
+    /// [`SESSION_LOCK`] is the one a compute session takes
+    /// (`tt_kernels::session::Session::open_card`); indices 0-15 are by
+    /// convention the Ethernet cores' (`ioctl.h:217`).
+    pub fn lock_card(&self) -> Result<bool, TransportError> {
+        self.lock(SESSION_LOCK)
     }
 
     /// Read one of the driver's sysfs telemetry attributes, e.g. `tt_heartbeat`.

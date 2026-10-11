@@ -7,7 +7,7 @@ and may still refuse an unsupported dtype or shape. **Composed** methods are Bur
 **Unsupported** methods fail explicitly with `burn-tt: unsupported operation`; each
 carries a `[-]` disposition with its reason.
 The per-method Device and Item notes remain in
-[hardware-coverage.md](hardware-coverage.md#burn-op-coverage).
+[burn-op-notes.md](burn-op-notes.md).
 
 ## FloatTensorOps
 

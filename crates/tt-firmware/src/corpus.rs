@@ -19,6 +19,44 @@ use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
 
+/// The hooks the `.ttinsn` experiment image (`bin/ttinsn_t1.rs`) installs
+/// (`docs/plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
+/// this, and the image sets them before the runner starts.
+#[cfg(feature = "ttinsn-experiment")]
+pub mod experiment {
+    /// Push the staged program by other means, returning whether it did.
+    /// Arguments: the program's address, its length in words and its block
+    /// repeats, as the runner holds them.
+    pub type TryPush = unsafe fn(code: u64, code_len: u32, loops: &[(u32, u32, u32)]) -> bool;
+    /// Called once the coprocessor has retired the program, before the `Dst`
+    /// dump.
+    pub type AfterRetire = fn();
+
+    pub static mut TRY_PUSH: Option<TryPush> = None;
+    pub static mut AFTER_RETIRE: Option<AfterRetire> = None;
+    /// Leave instruction gathering on, as the core boots, instead of turning it
+    /// off as every shipped image does (`crate::disable_gathering`): what the
+    /// experiment's gathering measurements compare against.
+    pub static mut KEEP_GATHERING: bool = false;
+
+    pub(super) fn try_push(code: u64, code_len: u32, loops: &[(u32, u32, u32)]) -> bool {
+        // SAFETY: written once before the runner starts, by this core.
+        match unsafe { TRY_PUSH } {
+            // SAFETY: the hook's own contract; the arguments are the runner's
+            // checked program.
+            Some(f) => unsafe { f(code, code_len, loops) },
+            None => false,
+        }
+    }
+
+    pub(super) fn after_retire() {
+        // SAFETY: as above.
+        if let Some(f) = unsafe { AFTER_RETIRE } {
+            f()
+        }
+    }
+}
+
 pub fn run<Riscv, Thread>() -> !
 where
     Thread: TensixThread,
@@ -375,6 +413,16 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
+    // Gathering off before anything is pushed (`crate::disable_gathering`); the
+    // `.ttinsn` experiment may ask to measure with it left on.
+    // SAFETY: written once before the runner starts, by this core.
+    #[cfg(feature = "ttinsn-experiment")]
+    let keep_gathering = unsafe { experiment::KEEP_GATHERING };
+    #[cfg(not(feature = "ttinsn-experiment"))]
+    let keep_gathering = false;
+    if !keep_gathering {
+        crate::disable_gathering();
+    }
     // SAFETY: fixed aligned mailbox locations inside L1.
     unsafe { l1_write32(mb.status(), status::RUNNING) };
     publish();
@@ -583,13 +631,22 @@ where
     }
 
     trace(tracing, Thread::INDEX, mailbox::trace::START);
-    let mut push = Pusher::<Riscv, Thread> {
-        program: code,
-        push_window,
-        until_drain: push_window,
-        _p: core::marker::PhantomData,
-    };
-    push.span(push.start(code_len), code_len, &loops[..n]);
+    // The `.ttinsn` experiment's only change to this path: the image may push a
+    // program it was built with instead of reading it from L1
+    // (`experiment::try_push`). Without the feature this is the line it was.
+    #[cfg(feature = "ttinsn-experiment")]
+    let fused = experiment::try_push(code, code_len, &loops[..n]);
+    #[cfg(not(feature = "ttinsn-experiment"))]
+    let fused = false;
+    if !fused {
+        let mut push = Pusher::<Riscv, Thread> {
+            program: code,
+            push_window,
+            until_drain: push_window,
+            _p: core::marker::PhantomData,
+        };
+        push.span(push.start(code_len), code_len, &loops[..n]);
+    }
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
 
@@ -602,6 +659,8 @@ where
         wait_for_coprocessor();
     }
     trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
+    #[cfg(feature = "ttinsn-experiment")]
+    experiment::after_retire();
 
     let mut row = 0;
     while row < dump_rows {

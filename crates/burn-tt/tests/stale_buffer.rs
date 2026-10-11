@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use burn_tensor::{Tensor, TensorData};
-use burn_tt::{attach, AttachGuard, BufferId, Engine, EngineError, TtBackend, TtDevice};
+use burn_tt::{attach, AttachGuard, BufferId, Engine, TtBackend, TtDevice, TtError};
 use tt_kernels::kind;
 
 /// Keeps tensors on the host, numbered from 1 per engine as `DramBuffers`
@@ -36,24 +36,24 @@ impl HostDram {
         self.live.insert(self.next, (v, r, c));
         self.next
     }
-    fn get(&self, id: BufferId) -> Result<&(Vec<f32>, usize, usize), EngineError> {
+    fn get(&self, id: BufferId) -> Result<&(Vec<f32>, usize, usize), TtError> {
         self.live
             .get(&id)
-            .ok_or_else(|| EngineError(format!("no buffer {id}")))
+            .ok_or_else(|| TtError::Device(format!("no buffer {id}")))
     }
 }
 
 impl Engine for HostDram {
-    fn matmul(&mut self, _: &[f32], _: &[f32], _: [usize; 3]) -> Result<Vec<f32>, EngineError> {
-        Err(EngineError("not used".into()))
+    fn matmul(&mut self, _: &[f32], _: &[f32], _: [usize; 3]) -> Result<Vec<f32>, TtError> {
+        Err(TtError::Device("not used".into()))
     }
     fn supports_dram(&self) -> bool {
         true
     }
-    fn upload(&mut self, v: &[f32], r: usize, c: usize) -> Result<BufferId, EngineError> {
+    fn upload(&mut self, v: &[f32], r: usize, c: usize) -> Result<BufferId, TtError> {
         Ok(self.insert(v.to_vec(), r, c))
     }
-    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, EngineError> {
+    fn download(&mut self, id: BufferId) -> Result<Vec<f32>, TtError> {
         Ok(self.get(id)?.0.clone())
     }
     fn free(&mut self, id: BufferId) {
@@ -65,9 +65,9 @@ impl Engine for HostDram {
         scalar: f32,
         a: BufferId,
         b: Option<BufferId>,
-    ) -> Result<(BufferId, [usize; 2]), EngineError> {
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if k != kind::MUL_SCALAR || b.is_some() {
-            return Err(EngineError(format!("kind {k} not modelled")));
+            return Err(TtError::Device(format!("kind {k} not modelled")));
         }
         let (v, r, c) = self.get(a)?.clone();
         let out = v.iter().map(|x| x * scalar).collect();

@@ -39,7 +39,7 @@ pack mode `0x105`. Raw BF16 storage/copy, packed matmul and BF16 pooling window
 staging have simulator gates. Device conversion rounds ties-even, quiets NaNs
 while retaining sign/high payload and flushes BF16 subnormals to signed zero;
 raw storage/copies preserve every bit. See `step74`–`step78` and
-[the implementation record](../../docs/plans/tensix-next-features.md).
+[the implementation record](../../docs/completed-plans/tensix-next-features.md).
 
 A session with `TileChoice::Count(n)` or `All` runs one unit (resident roles + data
 mover) per surviving tile. A GDDR op is a set of independent jobs dealt round-robin
@@ -57,7 +57,7 @@ cargo test -p tt-kernels
 Unit tests here: the L1 planner, op-record expansion against the list builders it
 replaced, job dealing over units, list batching, matmul planning. Device gates
 are in `tt-tests`; the BFP extension is covered by step92–96. The active
-inventory and silicon evidence are in `docs/plans/hardware-coverage.md`.
+inventory and silicon evidence are in `docs/completed-plans/hardware-coverage.md`.
 
 ## Gotchas
 
@@ -70,8 +70,17 @@ inventory and silicon evidence are in `docs/plans/hardware-coverage.md`.
   A fused kernel that does not fit is a planning error, never an overlap.
 - Encoder `unwrap`s in the builders are bugs in this crate, not caller errors. The
   runner returns `runtime::RunError`.
-- `Topology::Cards` (via `shard`) stages operands from the host per matmul and
-  computes on one tile per card. Only `Session` keeps tensors in GDDR.
+- `Topology::Cards` (via `shard`) computes on one tile per card. After
+  `Fabric::enable_resident` each chip holds a `Session` and `DramTensor`s in its
+  own GDDR, and `matmul_resident` splits output columns across the chips,
+  moving whole tile slots over Ethernet (relayed through intermediate chips when
+  a chip is not adjacent to chip 0). Operands enter and results leave through
+  chip 0, and the per-chip steps are issued one after another, not
+  concurrently. The legacy `Fabric::matmul`, which stages operands from the
+  host per matmul, remains for a fabric without resident sessions and is
+  refused on a resident one. `mesh_trace` captures and replays inference work
+  (transfers replayed in capture order); there is no all-reduce or
+  data-parallel training.
 
 ## General reductions and K blocking
 
@@ -87,7 +96,7 @@ accumulators reloaded in product order. `set_matmul_k_block_limit` optionally
 forces a maximum K tile count; `None` restores automatic planning. Existing
 unsplit pipelining remains. `step67`/`step68` cover simulator and both-card
 execution (`1791145571`); BFP K reloads are covered separately by step94.
-Release BFP measurements are recorded in `docs/learnings/firmware-performance.md`.
+Release BFP measurements are recorded in `docs/learnings/performance-log.md`.
 
 ## Current extension status
 
@@ -96,7 +105,7 @@ wrapping sum/product and signed min/max without F32 conversion. Hardware BF16/
 TF32 precision modes are opt-in and preserve documented Blackhole rounding
 behavior; ordinary BF16 casts retain their separate contract. Checked integer
 division/remainder is enabled and validated by step82 on both cards. See
-[the current handoff](../../docs/plans/tensix-next-features.md).
+[the current handoff](../../docs/completed-plans/tensix-next-features.md).
 
 ## Resident BFP storage
 
@@ -117,7 +126,7 @@ Step92/94 cover independent encoding/arithmetic oracles, special values,
 ragged padding, physical sizes and changed-input replay on simulator and both
 cards. Pinned ttsim refuses direct BFP2 matmul; that arm is silicon-only. See
 [the delivered contract and validation](../../docs/plans/mixed-bfp-storage.md)
-and [conversion/matmul release medians](../../docs/learnings/firmware-performance.md).
+and [conversion/matmul release medians](../../docs/learnings/performance-log.md).
 
 `Session::copy_xmov` / `zeros_xmov` and `copy_bf16_xmov` / `zeros_bf16_xmov`
 are explicit single-card, bit-preserving Tensix L1 movement APIs. They support

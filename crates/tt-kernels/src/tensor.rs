@@ -367,7 +367,7 @@ pub enum PadNeed {
 /// An op's padding rules, as data: what it needs of each input's padding and
 /// what it leaves in its output's, from the op's algebra (`f(0) == 0` is a
 /// fact about `f`). Part of every device op's definition
-/// (`hardware-coverage.md`, Definition of done, line 7).
+/// (`new-op-definition-of-done.md`, item 7).
 pub trait OpPadding {
     fn requires(&self, input: usize) -> PadNeed;
     /// The output's padding, given the inputs' tensors (their pads and shapes).

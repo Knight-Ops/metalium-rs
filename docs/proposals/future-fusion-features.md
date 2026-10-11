@@ -2,6 +2,11 @@
 
 This document collects architectural proposals and Requests for Comments (RFCs) for future fusion and dataflow capabilities in `metalium-rs`, extending beyond the initial Burn B12/B13 milestones.
 
+Status (2026-10-10): none of these is built or scheduled. Of B12/B13 only `BackendIr`, the `Tt = Fusion<TtBackend>`
+alias and an MVP `ADD_RELU` fuser exist ([kernel-fusion.md](../plans/kernel-fusion.md)). L1 sizes used below:
+a Tensix tile has 1.5 MiB of L1, of which the kernel data arena (`tt_isa::l1::DATA`) is 896 KiB;
+the rest holds firmware images, mailboxes, program slots, the trace buffer and the 240 KiB program cache.
+
 ---
 
 ## Proposal 1: Tiled Online Softmax FlashAttention (Tensix L1 SRAM)
@@ -39,7 +44,7 @@ flowchart TD
 1. **L1 Tiling**:
    - Tile query sequence into blocks of size $B_r \times d$ (e.g., $64 \times 64$).
    - Tile key/value sequence into blocks of size $B_c \times d$ (e.g., $64 \times 64$).
-   - Total L1 buffer requirement: $4 \times (64 \times 64 \times 2\text{ bytes}) \approx 32\text{ KB}$, easily fitting in the 1.2 MB L1 data arena.
+   - Total L1 buffer requirement: $4 \times (64 \times 64 \times 2\text{ bytes}) \approx 32\text{ KB}$, easily fitting in the 896 KiB L1 data arena.
 2. **Online Softmax Loop in Tensix**:
    - For each $K_j, V_j$ block loaded from GDDR:
      1. TRISC1 computes $S_{ij} = Q_i K_j^T / \sqrt{d}$ into `Dst`.
@@ -57,7 +62,7 @@ flowchart TD
 
 ### Problem Statement
 In deep models, sequential operations frequently produce activations that are immediately consumed by the next operation (e.g., LayerNorm $\to$ Matmul $\to$ Residual Add).
-While a single Tensix core only has 1.2 MB of usable L1 SRAM, a full Blackhole grid contains **64 to 100 Tensix cores**, providing **75 to 120 MB of aggregate on-chip SRAM**.
+While a single Tensix core has 896 KiB of usable L1 data arena (1.5 MiB of L1 in all), a p150a exposes **120 compute tiles** (the number is per card: harvesting varies, so discover the grid from ARC; ttsim models 140), providing about **105 MiB of aggregate data arena** (180 MiB of raw L1).
 
 By distributing activations across the core grid, medium-sized intermediate tensors can remain completely on-chip across kernel dispatches.
 
@@ -75,7 +80,7 @@ By distributing activations across the core grid, medium-sized intermediate tens
    }
    ```
 2. **Mesh L1 Allocator in `burn-tt`**:
-   - Statically banks the 1.2 MB data arena across the designated worker cores.
+   - Statically banks the 896 KiB data arena across the designated worker cores.
    - Allocates sharded chunks with aligned bank offsets.
    - Tracks live handles referencing L1 allocations.
 3. **Automatic GDDR Spill Policy**:
@@ -124,5 +129,5 @@ flowchart LR
    - Core A checks available space in Core B's remote CB before transmitting.
    - Core A increments Core B's arrival semaphore upon completing the transfer.
 3. **Integration with `Requirements::fuse`**:
-   - Extend `Endpoint` in [`tt_kernels::l1`](file:///mnt/nvme/metalium-rs/crates/tt-kernels/src/l1.rs#L38) to include `RemoteEndpoint { core: TranslatedCoord, endpoint: Endpoint }`.
+   - Extend `Endpoint` in [`tt_kernels::l1`](../../crates/tt-kernels/src/l1.rs) to include `RemoteEndpoint { core: TranslatedCoord, endpoint: Endpoint }`.
    - The L1 planner generates paired synchronization structures on both tiles.

@@ -19,8 +19,9 @@ See [the native cutover and datatype backlog](docs/plans/burn-native-cutover.md)
 
 | Doc | What it holds |
 |---|---|
-| [`docs/plans/master-roadmap.md`](docs/plans/master-roadmap.md) | The master roadmap: why each layer is shaped as it is |
-| [`docs/plans/implementation-checklist.md`](docs/plans/implementation-checklist.md) | What is done, per phase tick-list |
+| [`docs/plans/roadmap.md`](docs/plans/roadmap.md) | **Start here:** what is left, as tracks (real models, performance, multi-chip) |
+| [`docs/completed-plans/phases-0-10-roadmap.md`](docs/completed-plans/phases-0-10-roadmap.md) | Archived master roadmap: why each layer is shaped as it is |
+| [`docs/completed-plans/phases-0-10-checklist.md`](docs/completed-plans/phases-0-10-checklist.md) | Archived Phase 0-10 tick-list and evidence |
 | [`docs/learnings/silicon-operating-notes.md`](docs/learnings/silicon-operating-notes.md) | Silicon operating notes: hardware survival guide |
 | [`docs/learnings/ttsim-divergence.md`](docs/learnings/ttsim-divergence.md) | Where ttsim and silicon disagree, by row number (code cites the rows) |
 | [`docs/README.md`](docs/README.md) | Full 3-tier documentation index and codebase subsystem matrix |
@@ -48,7 +49,7 @@ build that depends on it. `rust-toolchain.toml` requests the
 | End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole Burn training runs on ttsim, held to `crates/tt-tests/tests/golden/mnist_reduced.txt`. Run when the arithmetic changes; CI runs it on every push. |
 | Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs. |
 | Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`, which implies `e2e`). |
-| Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current baseline is [`docs/learnings/firmware-performance.md`](docs/learnings/firmware-performance.md). |
+| Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current numbers are in [`docs/learnings/performance-scoreboard.md`](docs/learnings/performance-scoreboard.md); history is in [`docs/learnings/performance-log.md`](docs/learnings/performance-log.md). |
 
 `cargo xtask silicon --help` lists the options (`--device N|all`, `--filter`,
 `--keep-going`, `--timeout-secs`, `--include-ignored`, `--list`). See
@@ -115,14 +116,23 @@ convolution/pooling/attention and matrix elementwise arithmetic have landed.
 BFP8/4/2 per-tensor storage, native conversions/products and mixed-storage
 training/traces are delivered; see the
 [storage contract and completed checklist](docs/plans/mixed-bfp-storage.md).
-General payload-preserving Tensix transpose, further indexing/format coverage
-and hardware Burn random distributions remain open. Burn random already works
-through seeded per-device host construction. See
-[`docs/plans/hardware-coverage.md`](docs/plans/hardware-coverage.md) for gated status.
+General payload-preserving Tensix transpose and further format coverage
+(INT8, `a` variants, quantization) remain open. Burn random draws on the device
+(seeded uniform, Bernoulli, normal and integer ranges, step140-142). See
+[`docs/plans/burn-op-coverage.md`](docs/plans/burn-op-coverage.md) for per-method status and
+[`docs/completed-plans/hardware-coverage.md`](docs/completed-plans/hardware-coverage.md) for the archived gate record.
 Backend typed errors, initialization/discovery and Burn conformance are in
 [`docs/plans/burn-backend-parity.md`](docs/plans/burn-backend-parity.md).
 
-Resident multi-card meshes now pass native training gates. More than one
-compute tile per card in `Topology::Cards`, Ethernet pipelining and fusion remain open. X280 dispatch
+Multi-card meshes (`Topology::Cards`, `burn_tt::MeshEngine`) are one Burn device
+whose buffers stay in chip 0's GDDR. Rank-two and batched matmuls (hence convolution
+and attention products) are split by output columns across the cards, which hold
+GDDR tensors in their own sessions and exchange tile slots over Ethernet with no host
+staging; every other op runs on chip 0. The two- and four-chip MLP training gates
+match the single-chip golden bit for bit, and mesh inference traces replay on
+changed inputs (`step147`). Open: more than one compute tile per card, chips
+running concurrently (the per-chip steps are issued one after another), mesh
+training traces and `copy_into` on a mesh, and data-parallel training with a
+gradient all-reduce. Ethernet pipelining and fusion remain open too. X280 dispatch
 is proposed and unscheduled. `ttsim-qemu` is deliberately deferred: the
 `tt-kmd` transport is already gated on real cards.

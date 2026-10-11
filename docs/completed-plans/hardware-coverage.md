@@ -1,6 +1,15 @@
-# Hardware coverage — Phase 10 tracker
+# Hardware coverage — Phase 10 tracker (archived)
 
-**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md) "Final state" for each lane's disposition and the verification record. The open items are listed under "Where things stand". NoC multicast, the MMIO trio and X6 ran on silicon on 2026-10-10. [Burn operation status](burn-op-coverage.md) is generated.
+> **Archived: Phase 10 closed 2026-10-10.** This is the Phase 10 tracker and evidence record,
+> kept for the item ids (X, P, F, S, M, R, D) that source comments and docs cite. Open work
+> is in [roadmap.md](../plans/roadmap.md). The standing definition of done for new ops is
+> [new-op-definition-of-done.md](../plans/new-op-definition-of-done.md); per-method Burn
+> Device/Item notes are in [burn-op-notes.md](../plans/burn-op-notes.md), beside the generated
+> status table [burn-op-coverage.md](../plans/burn-op-coverage.md). Close-out record:
+> [hardware-coverage-closeout.md](hardware-coverage-closeout.md). Everything below is a
+> historical snapshot unless it says otherwise.
+
+**Close-out (2026-10-10):** the remaining instruction groups, the `[~]` items and the performance items were worked through by lane; see [hardware-coverage-closeout.md](hardware-coverage-closeout.md) "Final state" for each lane's disposition and the verification record. The items still open at close-out are listed under "Where things stand" and are migrated to [roadmap.md](../plans/roadmap.md). NoC multicast, the MMIO trio and X6 ran on silicon on 2026-10-10.
 
 Current Tensix continuation status (2026-10-05): see
 [tensix-next-features.md](tensix-next-features.md#2026-10-05-wrap-up-and-next-starting-point)
@@ -18,21 +27,21 @@ requirements below are superseded for ordinary validation.
 > Native cutover: `burn-tt` no longer delegates to Flex. Unsupported methods fail
 > explicitly, and `TT_EXACT` is retired. Historical Flex fallback descriptions
 > below are superseded by [the current backend contract](../../crates/burn-tt/README.md)
-> and [the cutover backlog](burn-native-cutover.md).
+> and [the cutover backlog](../plans/burn-native-cutover.md).
 
-The working tick-list for Phase 10 of `RUST_IMPL_PLAN.md` ("Phase 10 — Hardware
+The working tick-list that tracked Phase 10 of `phases-0-10-roadmap.md` ("Phase 10 — Hardware
 coverage"). The plan says *why*; this file says *which parts of a Blackhole Tensix tile
-this stack can drive, which it cannot yet, and in what order the rest arrives*. It is the
-progress record: an item is ticked here or nowhere.
+this stack can drive, which it cannot yet, and in what order the rest arrives*. It was the
+progress record for Phase 10; it is now frozen.
 
-Execution order, branches and the per-item workflow: the "Execution" section at the end.
+Execution order, branches and the per-item workflow used during Phase 10: the "Execution" section at the end (historical).
 
 Companion guides: [`tt-metal-concepts-review.md`](../learnings/tt-metal-concepts-review.md) (the
 Tenstorrent concepts this stack lacks, G1–G16, and the hardware sharp edges to handle in
-code) and [`burn-backend-parity.md`](burn-backend-parity.md) (the `burn-tt` surface and
+code) and [`burn-backend-parity.md`](../plans/burn-backend-parity.md) (the `burn-tt` surface and
 ergonomics roadmap, B0–B16). Item ids here are cited from both.
 
-Same legend as `implementation-checklist.md`: `[x]` done and gated by a test · `[~]`
+Same legend as `phases-0-10-checklist.md`: `[x]` done and gated by a test · `[~]`
 partially done, see note · `[ ]` not started · `[-]` deliberately not done, with the
 reason given.
 
@@ -40,9 +49,9 @@ reason given.
 
 ## Where things stand
 
-**As of 2026-10-10 every row in this plan is `[x]` or a documented `[-]`, except X7's small-transfer latency (`[~]`).** The prose below is the 2026-10-05 snapshot, kept as history; current status is in each row and in [hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md).
+**As of 2026-10-10 every row in this plan is `[x]` or a documented `[-]`, except X7's small-transfer latency (`[~]`).** The prose below is the 2026-10-05 snapshot, kept as history; current status is in each row and in [hardware-coverage-closeout.md](hardware-coverage-closeout.md).
 
-**Still open:**
+**Still open at close-out (all carried in [roadmap.md](../plans/roadmap.md); item 5 is a naming note, not work):**
 1. Mesh training traces and `copy_into` on a mesh (mesh trace capture and replay of inference work, R4d).
 2. Both-card runs of the lanes validated on card 0 only, including the cummin/cummax gates (`step130`).
 3. X7: small-transfer latency (`[~]`).
@@ -98,7 +107,7 @@ scans and norm compositions are also gated. The payload-preserving transpose is 
 
 **Remaining after the 2026-10-10 close-out:** convolution, attention, ND indexing and the integer
 operations are native; the open items are listed in
-[hardware-coverage-closeout.md](../completed-plans/hardware-coverage-closeout.md) ("Still open" is
+[hardware-coverage-closeout.md](hardware-coverage-closeout.md) ("Still open" is
 carried above). Backend
 error/setup/conformance work is tracked separately as B1/B2/B10. X280 dispatch remains proposed and
 unscheduled.
@@ -191,7 +200,7 @@ all fidelities, TF32/BF16 Src routes, transposes and specials, `[64,8192] @
 [8192,64]`, supported batches and resident Burn large-K against a derived
 bound. Negative controls fail when axis mapping, edge masking or accumulator
 reload is omitted. Both cards passed in run `1791145571`.
-Release-silicon K-block medians with validation: `docs/learnings/firmware-performance.md`, "P2 K-blocking and R3 norm release baselines" (2026-10-10).
+Release-silicon K-block medians with validation: `docs/learnings/performance-log.md`, "P2 K-blocking and R3 norm release baselines" (2026-10-10).
 
 ### 10.2 close-out (historical measurements)
 
@@ -264,42 +273,7 @@ here, as S1 and R2.
 
 ## Definition of done
 
-The two-gate rule, applied per op. An item is `[x]` only when every line below holds for
-it, and a line that does not apply says why in the item.
-
-1. **A `tt-isa` helper**, typed so that the hazards are in the API (cross-cutting rule),
-   with unit tests of its encoding.
-2. **An oracle that is not an epsilon** (the Tolerance policy):
-   - *bit-exact* wherever the hardware's arithmetic is documented: `numerics::fma_bh` for
-     anything `SFPMAD`-shaped, and a port of the page's functional model for `SFPLUT`,
-     `SFPLUTFP32`, `SFPARECIP`, `SFPEXEXP`/`SFPSETEXP`/`SFPEXMAN`, `SFPSTOCHRND`,
-     `SFPCAST` -- each port checked against the page's pseudocode the way `fma_oracle`
-     checks `fma_bh` against `fma.c`;
-   - for an *approximation* (a polynomial, a Newton step, a range reduction), the device
-     result is still predicted bit for bit by running the same instruction sequence through
-     the ported models, **and** its distance from the true function is held to a bound
-     *derived* in a comment next to the gate (polynomial remainder, Newton's quadratic
-     convergence, the reduction's error), never a guessed number.
-3. **A ttsim gate** in `crates/tt-tests/tests/stepNN_*.rs`, inside `fork_scope`,
-   watched failing at least once (an empty kernel, a wrong constant, a swapped operand).
-4. **A silicon gate**, the same test through `cargo xtask silicon`. Ordinary
-   validation uses one card under the current policy; mesh or device-specific
-   investigations use both.
-5. **Burn routing**: the method overridden in `burn-tt/src/ops.rs` and listed in
-   `OVERRIDDEN` (then `cargo xtask gen-burn-ops` and its `--check` mode), agreeing with `burn-flex` bit for
-   bit or within the item's derived bound; a residency check that the op downloads
-   nothing (`tensor_traffic`, `TT_TRACE_FALLBACK=1` silent); and an entry in the silicon
-   smoke tier (`xtask/src/silicon.rs`, `SMOKE`), where burn-tt is compared with
-   burn-flex on the card.
-6. **Findings logged**: every ttsim refusal or ttsim/silicon disagreement met on the way
-   is a row in `ttsim-divergence.md`, and every measured fact a "Measured, not quoted"
-   entry.
-7. **Padding declared** (F0, from `tt-metal-concepts-review.md` G1): the op states the pad
-   it needs from each input and the pad it leaves (`OpPadding`), and a ragged-shape gate
-   chains it into an accumulation.
-
-An op that works only on silicon (ttsim refuses an instruction it needs) can be ticked
-with the simulator line `[-]` and the divergence row cited, as `DOTPV` is today.
+Moved to [new-op-definition-of-done.md](../plans/new-op-definition-of-done.md).
 
 ---
 
@@ -330,13 +304,13 @@ through `SFPCONFIG`, 16 for `SFPLOADMACRO` only), BH `Dst.md`.
 | Bitwise | `SFPAND`, `SFPOR`, `SFPXOR`, `SFPNOT` | x | x | `~` (masks) | x | x | S5 |
 | Integer arithmetic | `SFPIADD`, `SFPMUL24` (BH-only), `SFPSHFT`, `SFPSHFT2` | x | x (`SFPMUL24` with `VC` zero only; `SFPSHFT2` rotate) | `~` (`exp`, `log`, reductions) | x | x | S5 |
 | Lookup and reciprocal | `SFPLUT`, `SFPLUTFP32`, `SFPARECIP` (BH-only) | x | x (`SFPLUTFP32`'s indirect destination designed out) | `~` `SFPARECIP` | `~` (`SFPLUTFP32` only `Mod1` 2, 6: row 70) | x | S4 |
-| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | `~` `_IntFloat` round-to-nearest | | `~` | `~` | S6 |
+| Casts | `SFPCAST` (`_IntFloat`, `_IntInt`, `_IntAbs`) | x | x (`_IntFloat` round-to-nearest only: `_IntAbs` is a Tier 2 bug, use `SFPABS`; `_IntInt` unused, the device stores I32 only and `int_cast` to other widths is `[-]`) | x (I32→F32 conversions, S6 `[x]`) | x (the interpreter models `_IntFloat` only; 400k integers against the host's rounding) | x (`step26_sfpu_isa`) | S6 |
 | Rounding | `SFPSTOCHRND` (`_FloatFloat`, `_FloatInt`, `_IntInt`) | x | x (checked modes) | x (explicit precision reduction) | x (step81; supported forms) | x | S6 |
 | Lane movement | `SFPSWAP`, `SFPTRANSP` | x | x (`SFPSWAP` min/max) | `~` (reductions) | x | x | S2 |
 | Configuration | `SFPCONFIG` | x | `~` `LReg[11..15]` only (`Program::constant`) | | x | x | F2 |
-| Macro | `SFPLOADMACRO` | x | | | `-` row 7 | `~` load half | S9 |
+| Macro | `SFPLOADMACRO` | x | x (`tt_isa::sfpu::load_macro`; page-derived schedule model `macro_sched`) | -- (probes only; no default kernel adopts it) | `-` row 7 | x (probes s00-s13 on card 0, step110; S9 `[x]`) | S9 |
 | Misc | `SFPNOP` | x | x | x | x | x | -- |
-| PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | x (diagnostic seed) | x (reads) | x | x both (step91; reseed differs) | S7 partial |
+| PRNG | `SFPMOV`/`SFPCAST`/`SFPSTOCHRND` PRNG modes (`VectorUnit.md`, "PRNG") | x | x (diagnostic seed) | x (reads) | x | x both (step91; reseed differs; S7 `[x]`: native seeded random, step140-142) | S7 |
 
 ### Matrix Unit (FPU)
 
@@ -408,7 +382,7 @@ Pulled in only when a kernel needs them; each says which.
   Out of scope for Phase 10, but no longer for the reason first given ("nothing a Burn
   backend needs runs better there"): the measured host round trips say the opposite. A
   proposal to use the x280s as an on-card host -- driving traces, small ops, dispatch -- is
-  `feature-x280-on-card-dispatch.md`, awaiting a decision.
+  [`x280-on-card-dispatch.md`](../proposals/x280-on-card-dispatch.md), awaiting a decision.
 - `[-]` **PCIe DMA engines.** No register-level documentation (open question 5);
   residency makes bulk transfer a startup cost.
 - `[-]` **A GDB stub over the debug interface.** No Blackhole bit layouts (open question 2).
@@ -416,11 +390,11 @@ Pulled in only when a kernel needs them; each says which.
 ### Tensix coprocessor instruction implementation checklist
 
 Remaining-work review (2026-10-07):
-[remaining-firmware-instructions.md](../completed-plans/remaining-firmware-instructions.md)
+[remaining-firmware-instructions.md](remaining-firmware-instructions.md)
 accounts for every pending mnemonic group, distinguishes existing encoding/probe
 evidence from missing helpers and semantic gates, and sequences implementation
 with explicit research/defer dispositions for unsupported forms. The latest completed tranche
-is [Stage D explicit healthy-bank handover](../completed-plans/explicit-unpacker-handover.md)
+is [Stage D explicit healthy-bank handover](explicit-unpacker-handover.md)
 (step104), following step100–103.
 
 Mnemonic-level instruction inventory (counted 2026-10-10): 102 completed checklist rows (`[x]`),
@@ -450,21 +424,21 @@ traces, deferred frees and downstream reductions/matmul pass. No automatic Burn
 routing, mesh/BFP/in-place/rectangle API or firmware ABI change. See operating
 notes for measured STOREIND widths and the output-credit handoff, and the
 performance scoreboard for validated release comparisons.
-[Completed checklist](../completed-plans/scalar-config-foundation.md).
+[Completed checklist](scalar-config-foundation.md).
 
 Encoding, semantic evidence and production adoption are distinct. In particular,
 ADDDMAREG already drives matmul address stepping (step38), and the delivered LUT
 forms already have helpers/models/device gates (step26); broader LUT adoption
 remains S10. Step98 adds INCADCXY/ADDRCRXY helpers and an explicit ADC rectangle-copy
 kernel. Burn slices retain original native repack after the ADC performance
-comparison; automatic ADC adoption is deferred. See [the tranche checklist](../completed-plans/adc-row-window-copy.md).
+comparison; automatic ADC adoption is deferred. See [the tranche checklist](adc-row-window-copy.md).
 
 Step98 acceptance (2026-10-06): simulator 9/9; card-0 full release SMOKE
 203/203 (`1791321817`), including nine ADC gates and the CNN state-lifetime
 regression. Eight MNIST e2e regressions pass with the golden unchanged.
 Final isolated benchmark `1791322068` preserves every output bit but costs
 23–79% more than native repack for the measured rectangles; conditions and
-dataflow counts are in `docs/learnings/firmware-performance.md`. Ordinary
+dataflow counts are in `docs/learnings/performance-log.md`. Ordinary
 silicon acceptance uses the requested one-card policy.
 
 Burn performance restoration: the original native slice dispatch and engine
@@ -480,7 +454,7 @@ copies pass under both ownership settings; changed-input traces, deferred frees
 and downstream reduction/matmul pass. Workspace tests/lints, silicon compilation,
 generator/shipping checks and all eight MNIST regressions pass, golden unchanged.
 Burn routing is inapplicable to this Session-only API. See
-[the Z/W tranche checklist](../completed-plans/adc-plane-copy.md) and the performance record for
+[the Z/W tranche checklist](adc-plane-copy.md) and the performance record for
 validated native-repack medians. No speedup or additional instruction adoption
 is claimed. At step99 close-out, the pending group counts were 7 matrix/source, 1 SFPU,
 6 unpacker/packer, 2 frontend, 2 configuration and 19 DMA/register/atomic rows;
@@ -566,7 +540,7 @@ REG2FLOP_ADC was pending and RMWCIB0..3 deliberately omitted. Step100 and the
 - [x] `ADDRCRZW`: checked Z/W cursor restoration/advance helper in resident plane copies; step99 covers all masks/targets, wide addressing, zero restoration and negative controls.
 - [-] `SETDVALID`: Blackhole implied-format handover is explicitly unsupported in the pinned page. Use regular UNPACR's final FlipSrc; sequenced `UNPACR_NOP_SETDVALID` remains a separate gated task.
 - [-] `REG2FLOP_ADC`: pinned page declares unsupported functionality and weak model confidence. Use checked SETADC/SETADCXX/XY/ZW and descriptor reprogramming; no general GPR-to-ADC API is promised. Reopen only for a concrete runtime-value consumer and independent Blackhole evidence.
-- [x] `UNPACR_NOP_SETDVALID`: measured Blackhole non-clearing mode 0x1e9; Filling-only A/B handover with C1/C2 retirement and C5/C6 ownership waits. Alternating banks, TF32/BF16, multiple partials, sentinels and replay pass `1791413233`; nonzero SrcB row reset and direct consumers pass `1791413291`, tightened fractional inputs `1791413841`. Card-0 SMOKE 258/258 (`1791413478`). Legacy Wormhole mode 7 is the isolated reboot trigger; exact ARC mechanism remains unproven. See [completed Stage D](../completed-plans/explicit-unpacker-handover.md). Other modes and production/recovery adoption are deferred.
+- [x] `UNPACR_NOP_SETDVALID`: measured Blackhole non-clearing mode 0x1e9; Filling-only A/B handover with C1/C2 retirement and C5/C6 ownership waits. Alternating banks, TF32/BF16, multiple partials, sentinels and replay pass `1791413233`; nonzero SrcB row reset and direct consumers pass `1791413291`, tightened fractional inputs `1791413841`. Card-0 SMOKE 258/258 (`1791413478`). Legacy Wormhole mode 7 is the isolated reboot trigger; exact ARC mechanism remains unproven. See [completed Stage D](explicit-unpacker-handover.md). Other modes and production/recovery adoption are deferred.
 - [-] `UNPACR_NOP_SETREG`: Wormhole page says UnsupportedFunctionality with weak confidence and it uses TDMA-RISC `SetRegBase` state with no Blackhole page; ttsim refuses it (step108). Supported alternative: checked WRCFG/SETC16/RDCFG and step100/101 helpers.
 - [x] `UNPACR_NOP_ZEROSRC`: measured BH wait/bank/clear fields, checked current-unpacker zero (WaitLikeUnpacr=1, BothBanks=0); staged claims discarded and regular UNPACR handover retained. Step103 ttsim/card-0 gates, including held-opposite-bank wait and all-row sentinel checks (`1791397029`). Wider values/both banks remain outside the checked API.
 - [-] `PACR_SETREG`: no Blackhole page; `SetRegBase`/`SetRegHiScaler` are TDMA-RISC state set only through Wormhole-documented writes into a block shared with the mover command queue; ttsim refuses it (step108). Supported alternative: `PACR` with `Last`, `STALLWAIT` on packer-busy, and the checked configuration helpers.
@@ -828,16 +802,17 @@ reverse index.
       MLP traced and run on new inputs against the fresh Burn ops bit for bit; multi-input
       inference; whole training step tracing with in-place parameter writeback and loss
       readback; and a host fallback refused with the next capture working. ttsim and both
-      cards. MNIST inference traced: 205,301 img/s on 8 tiles; training step traced:
-      99.45 ms on 1 tile (outperforming 12-core CPU at 102.03 ms).
+      cards. Measured traced times are on the scoreboard in
+      [performance-log.md](../learnings/performance-log.md); earlier throughput
+      figures here were removed because they do not match it.
     - **Training: implemented (2026-10-05).** Whole-step training is fully replayable via
-      `burn_tt::TracedTrainingStep` (`feature-traced-execution.md`). Updated weights are
+      `burn_tt::TracedTrainingStep` ([`traced-execution.md`](../plans/traced-execution.md)). Updated weights are
       written back in place in GDDR using `Session::copy_into` captured into the trace stream,
       and scalar loss is read back after hardware replay completion without aborting the trace.
-      Stateless (SGD) and stateful (Adam/AdamW) optimizers are supported across arbitrary Burn
-      modules via `ModuleVisitor` parameter reflection. Evaluated on MNIST MLP and
-      `TinyTransformer`. Multi-tile/multi-card scaling roadmap documented in
-      `feature-traced-execution.md`.
+      Stateless (SGD) training is gated; Adam/AdamW state writeback is not built or gated. The
+      `ModuleVisitor` parameter collection lives in `tt-mnist`, not in `burn-tt`. Evaluated on
+      MNIST MLP and `TinyTransformer`. Multi-tile/multi-card scaling roadmap documented in
+      [`traced-execution.md`](../plans/traced-execution.md).
   Was: **X4 Op-list traces** (concepts review G8). `Session::begin_trace`/`end_trace`
       capture each unit's expanded lists into GDDR; `replay` is one descriptor per unit,
       B streaming the list from GDDR; a trace binds its tensors and refuses to replay
@@ -914,7 +889,7 @@ reverse index.
 From the training and inference profiles of 2026-10-01 (`ttsim-divergence.md` rows V-Z;
 `tt-mnist` and `tt-mnist --infer` print the host-side split, `TT_PROFILE` the device's).
 Each names the measurement it must move. The Burn-side ones are in
-`burn-backend-parity.md` (B5, B8, B16).
+`../plans/burn-backend-parity.md` (B5, B8, B16).
 
 - [x] **X6 A fast path for the mover's requests** (2026-10-10: built and silicon-validated, opt-in; the gain is 3-4%, far short of the 16 KiB-entry rate this item hoped for -- see the result below). A GDDR read costs ~0.46 us an entry
       however small (row W after row Y), and a matmul gather is one entry per tile: a
@@ -938,7 +913,7 @@ Each names the measurement it must move. The Burn-side ones are in
       host memory and the card's `HOST_READ`/`HOST_WRITE` DMA; parallel host
       tilize/detilize and run records deliver about 11 GB/s on large Session
       transfers. Gated by `step57_host_dma`; measurements in
-      `firmware-performance.md`. The Device-level posted-write fence is now API
+      `performance-log.md`. The Device-level posted-write fence is now API
       (`write_fenced`, `FencedWrite`; X7 below). The following is the historical motivation:
       **Small host transfers.** A `[64, 10]` upload (2.5 KB, two tiles) costs ~470 us
       a call and a download of the same ~140 us past its sync (rows Z, measurement M:
@@ -995,10 +970,10 @@ Each names the measurement it must move. The Burn-side ones are in
         broadcast and strided F32/BF16 batches are done too: each matrix is
         repacked on the card and run through the 2-D product
         (`materialized_batched_matmul`, `burn-tt/src/ops.rs`; step76, step83).
-- [x] **P2 K blocking** *(close-out: release baselines recorded in `firmware-performance.md`; planner default is at or near the best block length.)*  (concepts review G3): native FP32 Dst reload implemented
+- [x] **P2 K blocking** *(close-out: release baselines recorded in `performance-log.md`; planner default is at or near the best block length.)*  (concepts review G3): native FP32 Dst reload implemented
       for resident ordinary and supported batched matmuls (`step68`). Same
       accumulation order, no block-sum addition or packer L1 accumulation.
-      Simulator and both-card gates pass (`1791145571`); release baselines recorded 2026-10-10 in `firmware-performance.md`.
+      Simulator and both-card gates pass (`1791145571`); release baselines recorded 2026-10-10 in `performance-log.md`.
       Host-staged `matmul_chunked` retains its separate arithmetic contract.
 
 ### F — SFPU foundation (blocks every S item)
@@ -1546,7 +1521,7 @@ Each names the measurement it must move. The Burn-side ones are in
       placement thresholds (`APPROX_MIN_TILES`, `SOFTMAX_DEVICE_MIN_TILES`)
       were removed 2026-10-03: approximate operations follow resident data
       at every size. The old placement measurements remain in
-      `firmware-performance.md`'s change log.
+      `performance-log.md`'s change log.
       **Exact mode (retired):** `burn_tt::set_exact`, `TT_EXACT` and Flex
       placement no longer exist; every op is native within its derived bound, and
       full `sum`/`mean` always used native arithmetic. Gates: `step32_burn_softmax`
@@ -1559,7 +1534,7 @@ Each names the measurement it must move. The Burn-side ones are in
 - [x] **R3 Norms.** *(close-out: release baselines recorded; fusion stays deliberately unbuilt.)*  Burn LayerNorm and RMSNorm already compose native primitives.
       Dedicated forward/backward, layout and residency gates are in `step70`;
       both-card silicon passed (`1791145571`); BF16 derivatives pass `step76`.
-      Release baselines recorded 2026-10-10 in `firmware-performance.md`. Fusion is deferred.
+      Release baselines recorded 2026-10-10 in `performance-log.md`. Fusion is deferred.
 - [x] **R4d Mesh trace capture/replay** (2026-10-10, step147): `MeshEngine` captures one session trace per chip between the host-run Ethernet transfers and replays them in order (sync both chips, re-run the transfer, continue), refusing with `UnheldTransfer` any capture whose transfer endpoints no stored trace holds. Changed-input replays of a distributed product chain and an attention forward equal fresh runs bit for bit with no host uploads; card 0/1 gates pass. Mesh training traces and `copy_into` on a mesh remain unsupported.
 - [x] **R4 `ModuleOps::attention`.** *(close-out: mesh trace capture/replay is supported, see R4d.)*  Native QKᵀ, scale, positive softcap,
       bottom-right causal/broadcast masks, bias, NaN-safe softmax and V products.
@@ -1580,7 +1555,7 @@ Each names the measurement it must move. The Burn-side ones are in
       actual two-card mesh execution and full MNIST accuracy are now gated.
       Mesh transport still widens to F32. Measured MNIST GEMMs are slower, not accelerated
       relative to TF32.
-- [x] **D2 Per-tensor block float (BFP8/BFP4/BFP2), delivered formats only.** Step92/94 pin physical encodings with independent f64/integer oracles, exponent groups and sub-byte order; step93 independently measures histogram reset. Resident Session conversions/readback/free, direct packed products and native Burn storage propagation, F32 training state, fusion and traces pass both cards. Full SMOKE 364/364 (`1791300502`); final conversion/control/propagation gates 28/28 (`1791301208`); release benchmarks `1791300393`. BFP2 matmul and histogram-stat probing have silicon-only arms with documented simulator refusals. Transposed/mixed/batched products widen on device through the existing scheduler. This is a backend storage extension: BFP `a` variants, INT8/UINT8, packed mesh transport and portable `QTensorOps` remain deferred. See [mixed BFP storage](mixed-bfp-storage.md).
+- [x] **D2 Per-tensor block float (BFP8/BFP4/BFP2), delivered formats only.** Step92/94 pin physical encodings with independent f64/integer oracles, exponent groups and sub-byte order; step93 independently measures histogram reset. Resident Session conversions/readback/free, direct packed products and native Burn storage propagation, F32 training state, fusion and traces pass both cards. Full SMOKE 364/364 (`1791300502`); final conversion/control/propagation gates 28/28 (`1791301208`); release benchmarks `1791300393`. BFP2 matmul and histogram-stat probing have silicon-only arms with documented simulator refusals. Transposed/mixed/batched products widen on device through the existing scheduler. This is a backend storage extension: BFP `a` variants, INT8/UINT8, packed mesh transport and portable `QTensorOps` remain deferred. See [mixed BFP storage](../plans/mixed-bfp-storage.md).
 - [x] **D3 Integer and bool storage** (10.2b; was INT32, INT8, bool as a format).
       `tensor::Elem::{F32, I32, Bool}` on every `DramTensor`. The device moves
       every 32-bit pattern unchanged -- the FP32-coded unpack to `Dst` and pack back
@@ -1652,104 +1627,13 @@ Each names the measurement it must move. The Burn-side ones are in
 
 ## Burn op coverage
 
-The compute methods of the pinned Burn 0.21 op traits, with the item that brings each to
-the device. Bookkeeping methods (`*_device`, `*_to_device`, `*_into_data`, `*_from_data`,
-`*_reshape`, autodiff flags) are left out. **Device** is `x` when the method has a device
-path today, `~` when only some shapes do.
-
-### `FloatTensorOps`
-
-| Methods | Device | Item |
-|---|:-:|---|
-| `float_matmul` | `~` F32 resident: 2-D; rank-N against an unbatched rhs folded to 2-D; direct aligned batches or native ragged materialization (views/broadcast included); new ragged F32 path simulator-gated | P1b |
-| `float_add`, `float_sub`, `float_mul` (incl. row and column broadcasts; any rank, P1a), `float_mul_scalar` | x (SFPU) | S1, P1a |
-| `float_sum_dim` | all F32 axes/layouts on SFPU; both-card validated; BF16 via native adapters | R1 |
-| `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
-| `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs,  unsupported inputs fail | R1b |
-| `float_slice`, `float_flip` | x nonempty resident F32/BF16, arbitrary steps/axes via bit-preserving copies; both-card validated | D4 |
-| `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial | M3, D2 |
-| `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
-| `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
-| `float_remainder{,_scalar}` | x exact SFPU fmod (Flex's `((a%b)+b)%b` bit for bit; NaN payload canonical); 2362 words, long division on integers; card 0 (step133-134) | S6 (T4) |
-| `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
-| comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident) | S2 |
-| `float_cast` | x same dtype or native F32↔BF16; other reduced floats refused | D1, S6 |
-| `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
-| `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op) | S4 |
-| `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
-| `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
-| `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
-| `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
-| `float_random`, `int_random` | x native seeded resident draws (Default, Uniform, Bernoulli, Normal); host construction only for a device with no GDDR; F16/F64 fail explicitly; refused inside a trace; cards 0 and 1 (step142) | S7 |
-| `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
-| `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
-| `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |
-| `float_max`, `float_max_abs*` | `~` Burn defaults over reshape/abs/max_dim; existing layout and size limits | R1 |
-| `float_min*` | `~` Burn defaults over argmin/gather; existing gather axes and signed-zero limits | R1 |
-| `float_prod{,_dim}` | x direct SFPU products on all resident F32 axes; both-card validated | R1 |
-| `float_cumsum`, `float_cumprod` | x inclusive logical-order resident F32 scans on all axes; both-card validated | R1 |
-| `float_cummin`, `float_cummax` | x resident Flex-order scans (NaN propagates, earlier equal element kept); both-card gates pending, card 0 passes (step130) | R1 |
-| `float_sort*`, `float_argsort`, `float_topk`, `float_argtopk`, and the `int_` equivalents | x resident bitonic sort, F32/I32, any rank and axis up to 1024, stable (ties by original index), F32 in `total_cmp` order, trace-replayable; BF16 values widen, sort and narrow (flushing BF16 subnormals); longer axes, other dtypes and empty inputs refused by name; card 0 (step135 and step136, runs `1791561979`-`1791567677`) | R1 (T5) |
-| `float_gather`, `float_scatter_add` | `~` resident arbitrary-axis multi-index raw gather; deterministic duplicate F32/BF16 additions, step86 | D4 |
-| `float_select`, `float_select_add` | `~` arbitrary-axis resident indices and ordered additions, step86 | D4 |
-| `float_expand`, `int_expand`, `bool_expand` | x nonempty stored dtypes; native byte-preserving gathers/transposes | D4 |
-| `float_slice_assign`, `float_cat`, `float_repeat_dim`, `float_unfold` | `~` native raw copies/compositions, step84/85 | D4, M3 |
-| `float_gather_nd`, `float_scatter_nd`, `int_gather_nd`, `int_scatter_nd` | x resident F32/I32 (BF16 gather_nd); every coordinate checked against its own axis (DOMAIN 11); scatter Add folds duplicates in index order, Assign is last writer; Mul/Min/Max `[-]` (Burn leaves duplicates undefined); card 0 (step127, runs `1791567843`-`1791567861`) | D4 (T2) |
-| `float_cross` | x composition of slice/mul/sub/cat, device-rounding oracle; card 0 (step128) | D4 (T2) |
-| `float_grid_sample_2d` | `[-]` out of scope: not planned until a model needs it | -- |
-
-### `ActivationOps`
-
-| Methods | Device | Item |
-|---|:-:|---|
-| `relu`, `relu_backward` | x (SFPU) | S1 |
-| `leaky_relu`, `prelu`, `hard_sigmoid` | x (SFPU, exact; a one-element weight is expanded on the device by `device_op_ungated`, residency gate step129) | S2 |
-| `sigmoid{,_backward}`, `gelu{,_backward}` | x (SFPU, derived bounds; `sigmoid_backward` exact) | S4 |
-| `log_sigmoid{,_backward}` | x (SFPU, derived bounds) | S4 |
-| `softmax`, `log_softmax` | x (device composition, derived bound; every supported size) | R2 |
-| `softmin` | x (device composition, derived bound; every supported size) | R2 |
-
-### `ModuleOps`
-
-| Methods | Device | Item |
-|---|:-:|---|
-| `linear` and its three backwards | `~` over `float_matmul`; a rank-N input folds its batch into the rows (forward, `x` grad), `linear_{weight,bias}_backward` hand-written likewise | B6 |
-| `embedding{,_backward}` | x (Burn's default over `select`/`select_add`, on the mover) | D4 |
-| `conv1d`, `conv2d`, `conv_transpose2d`, their backwards, `unfold4d` | `~` native F32/BF16, grouped/ragged/dilated forward/backward, trace/training/mesh gates; acceptance open | D6 |
-| `avg_pool*`, `adaptive_avg_pool*`, `max_pool*` and backwards | x NCHW 2-D and Burn's 1-D compositions; all-padding windows refused; BF16 averages use GAPOOL | M2 |
-| `layer_norm` | x Burn composition over native primitives; F32 and BF16 numerical/gradient gates | R3 |
-| `attention` | `~` native F32/BF16 scale/softcap/masks/bias, zero masked rows, gradients/training, large-K views and replay; both-card forward/all-gradient references (`1791249486`) | R4 |
-| `conv3d`, `deform_conv2d`, `interpolate`, `ctc_loss`, `rfft`/`irfft` | | not planned until a model needs them |
-
-### `IntTensorOps`, `BoolTensorOps`, `QTensorOps`
-
-| Methods | Device | Item |
-|---|:-:|---|
-| storage on the device | x `I32`, `Bool` (any store); other int dtypes host | D3 |
-| `{int,bool}_{reshape, slice, swap_dims, transpose}` | `~` views, as `float_`'s | D3 |
-| `int_{add,sub,mul}{,_scalar}`, comparisons, `bitwise_*` | x I32 full-width wrapping ALU, signed comparisons, masked shifts; both-card validated | S5 |
-| `int_{div,remainder}{,_scalar}`, `int_mean_dim` | `~` checked native I32, simulator/card-0 validated (`1791232718`) | S5 |
-| `int_neg` | Burn composition over native wrapping ALU | S5 |
-| `int_abs` | x wrapping (`i32::MIN` stays `i32::MIN`, as Flex); card 0 (step126, run `1791560877`) | S5 (T1) |
-| `int_clamp*`, `int_sign`, `int_max_abs*` | x Burn defaults over native mask fill/abs, no downloads (step126) | S5 (T1) |
-| `int_into_float` | x to F32 (SFPU, exact) | S4 (10.2d) |
-| `bool_into_float`, `bool_into_int` | x native exact 0/1, F32/I32 output only | S6 |
-| `int_cast` | `~` I32→I32 native; other widths fail by name (`[-]`: the device stores I32 only) (step126) | S6 (T1) |
-| `int_sum*`, `int_max*`, `int_prod*`, `int_min*` | x I32 reductions (step80) | R1 |
-| `int_matmul` | x exact modulo 2^32 composition (expand, `int_mul`, `int_sum_dim`), size budget 2^22 elements, never an f32 matmul; card 0 (step128) | S5 (T2) |
-| `int_cumsum`, `int_cumprod`, `int_cummin`, `int_cummax`, `int_argmax`, `int_argmin` | x wrapping/signed resident scans and first-extreme indices (step131-132, card 0) | R1 |
-| `bool_and`, `bool_or`, `bool_xor`, `bool_not`, `bool_equal`, `bool_equal_elem` | x (SFPU, exact) | D3 |
-| `bool_any{,_dim}`, `bool_all{,_dim}` | x raw 0/1 OR/AND reductions on all axes; both-card validated | R1 |
-| `int_mask_where`, `int_mask_fill`, `bool_mask_where`, `bool_mask_fill` | x raw-bit selects and fills (16777217 and `i32::MIN` exact); card 0 (step126) | S5 (T1) |
-| `{int,bool}_{permute, flip, unfold}` | x dtype-generic views and copies; card 0 (step125, run `1791560886`) | D3 (T1) |
-| indexing (`*_gather`, `*_select`, `*_cat`, `*_slice*`, `*_scatter*`) | `~` resident arbitrary-axis gather/select, stepped slices/assignment/cat/repeat, I32 wrapping and Boolean OR updates; ND indexing remains open | D4 |
-| `QTensorOps` | explicit unsupported | Deferred; D2 is backend tensor storage, not portable quantization |
+Moved to [burn-op-notes.md](../plans/burn-op-notes.md) (per-method notes); the status table is generated in [burn-op-coverage.md](../plans/burn-op-coverage.md).
 
 ---
 
 ## Hazards and known bugs this phase meets
 
-From the Tier 2 register (`implementation-checklist.md`) and the divergence log, mapped to
+From the Tier 2 register (`phases-0-10-checklist.md`) and the divergence log, mapped to
 the item that must handle each. An item is not done while its hazard here is open.
 
 | Hazard | Source | Item |
@@ -1774,7 +1658,7 @@ the item that must handle each. An item is not done while its hazard here is ope
 | A drain that a descriptor change needs, taken after a list's programs were placed, unpinned them too, so the next placement could evict them under the queued list (an `SFPPUSHC` stack overflow on ttsim) | 10.2's block repeats (programs ~30x smaller changed what the cache evicted) | X8 -- closed: `enqueue_segment` drains before placing |
 | A tile wedged by a corrupt run stays wedged: after the backend pulse, every semaphore released (row 65) and the RISC-V semaphore posts (`mailbox::UNWEDGE`), thread 1 takes no instruction (its runner stalls after 29 pushes, one FIFO). Cause: a math instruction waiting for `Src` banks the pulse gave back to the unpackers (reproduced on purpose, row AH). Trying `UNPACR_NOP_SETDVALID` (UNVERIFIED encoding) on the wedged tile took the host down | silicon, 2026-10-01 | closed -- prevented (X4c), detected at open (X5a), recovered by feeding the banks with plain `UNPACR`s (X5b) |
 | A list's `READ_RUN` followed by its `WRITE_RUN` had no `WAIT` between: a record's moves are issued without waiting, so a write could read its staging slot before the read landed -- ordered only by timing (each group's writes start after all its reads are issued), which is why small groups were the risk and no gate saw it; ttsim's reads land at once | found reading the mover for D4 (2026-10-03) | closed: `tensor::copy` and `copy_blocks` put a `WAIT` between, as host DMA and `gather_rows` do |
-| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `../learnings/firmware-performance.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
+| The mover's completion wait reads an 8-bit counter (`NIU_MST_REQS_OUTSTANDING_ID`) that wraps at 256 in flight, so a long list or record could report done before its data landed | `NoC/Counters.md`; `../learnings/performance-log.md` | closed: `tt_isa::noc::niu::InFlight` caps each ID at `MAX_IN_FLIGHT` (128) in `noc::issue`; stalls counted (`DataMover::throttle`, `Session::throttle`, a `session:` warning); `step49_in_flight`, `silicon_bench_memory::gddr_in_flight`; ttsim cannot show it (row 72) |
 
 New ttsim refusals or disagreements found while doing any of this go in
 `ttsim-divergence.md`, numbered after the last row, and are cited from the item.
@@ -1797,9 +1681,9 @@ same commit as the code:
    closed, the milestone's state, the date in "Where things stand";
 2. `ttsim-divergence.md`: a numbered row per refusal or disagreement, a lettered row per
    measurement, cited from the item;
-3. `implementation-checklist.md`: the Tier 2 bug entries and silicon-verification backlog
+3. `phases-0-10-checklist.md`: the Tier 2 bug entries and silicon-verification backlog
    entries the item settles, and the milestone line `10.N` when it closes;
-4. at a milestone's close, `RUST_IMPL_PLAN.md`'s Phase 10 status and any
+4. at a milestone's close, `phases-0-10-roadmap.md`'s Phase 10 status and any
    `burn-backend-parity.md` row that cites the item.
 
 **Order inside 10.0.** X3 (so S1's gain is measured on the device), F0, F1, F2 with X1, F5,
@@ -1858,9 +1742,9 @@ all three generator checks and both shipping dependency checks pass
 (`target/silicon/tranche-checks-final.log`). The five MNIST e2e regressions pass
 in 264.20 s with the golden unchanged
 (`target/silicon/tranche-mnist-current.log`). Release operation baselines and
-conditions are recorded in `docs/learnings/firmware-performance.md`; no speedup
+conditions are recorded in `docs/learnings/performance-log.md`; no speedup
 guarantee is made. M3 remains partial for the measured Src payload-conversion
-limit; ND indexing and excluded convolution/attention variants are not closed.
+limit; ND indexing and excluded convolution/attention variants are not closed *(historical, 2026-10-05; ND indexing was later delivered, step127)*.
 
 
 Convolutional application coverage (2026-10-06): `tt-mnist --model cnn` shares
@@ -1897,7 +1781,7 @@ generator and both shipping dependency checks pass. Logs are
       silicon Dst base setup, BF16 analytic gradients, alignment and finite bounds.
 - [x] Release host-timed medians with validation, warmups and dataflow_stats:
       final baseline `1791255969`, both cards, 192 comparisons; conditions and
-      results are in firmware-performance.md.
+      results are in performance-log.md.
 - [x] Workspace tests, default/silicon Clippy, silicon compilation, formatting,
       all generator checks and both shipping dependency checks pass. Full release
       smoke `1791255409` passes 322/322 across both cards; final targeted setup
@@ -1955,11 +1839,11 @@ the three move completions. Full release silicon SMOKE passes on both cards
 (`1791317135`, 388/388), including expanded one-row offsets/wrapping and MNIST.
 The release benchmark passes on both cards (`1791317719`): measured cases
 improve 1.38–1.48×, with region/batch counts halved. Conditions and medians are
-recorded in firmware-performance.md; no application speedup is claimed. Encoding
+recorded in performance-log.md; no application speedup is claimed. Encoding
 provenance is unchanged.
 
 Stage C source-bank acceptance (2026-10-07): step103 card-0 release semantic gates
-9/9 (`1791397029`), simulator 6/6. See [source-bank tranche](../completed-plans/source-bank-clear-release-shift.md)
+9/9 (`1791397029`), simulator 6/6. See [source-bank tranche](source-bank-clear-release-shift.md)
 for the accepted checklist and restricted variants. Full card-0 release SMOKE
 passes 242/242 (`1791397621`); MNIST 8/8, golden unchanged; workspace tests,
 format/Clippy, silicon compilation/Clippy, generator and shipping checks pass. All four instruction groups have
@@ -1974,4 +1858,4 @@ Workspace tests, format/Clippy, silicon no-run/Clippy, generator and shipping
 dependency checks pass; MNIST e2e 8/8 retains its golden. Simulator refuses the
 measured NOP and B ownership wait; regular controls survive isolated probes.
 No production routing, recovery or performance change is claimed. See
-[completed Stage D](../completed-plans/explicit-unpacker-handover.md).
+[completed Stage D](explicit-unpacker-handover.md).

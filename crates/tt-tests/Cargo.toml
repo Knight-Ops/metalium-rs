@@ -44,6 +44,11 @@ silicon = ["e2e"]
 # shows as ignored, rather than quietly passing.
 e2e = []
 
+# The `.ttinsn` push-fusion experiment's silicon rungs and measurement
+# (`docs/plans/ttinsn-push-experiment.md`, `tests/probe_ttinsn_push.rs`): builds the
+# experiment image into `tt-firmware-images`. Off by default, and in no suite.
+ttinsn-experiment = ["tt-firmware-images/ttinsn-experiment"]
+
 # Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
 # is classified DEV_ONLY in `xtask/src/ship.rs`, so the simulator binding still
 # cannot reach a shippable artefact -- `check-no-sim-in-ship` walks the shippable

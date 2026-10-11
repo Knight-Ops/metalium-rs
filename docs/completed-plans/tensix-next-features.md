@@ -1,5 +1,15 @@
 # Tensix feature implementation record
 
+> **Dated sprint record (2026-10-05 era), not a current status page.** Read the sections
+> below as history: statements such as "remains", "unfinished" or "next" describe the day
+> they were written and several were later superseded (each is marked where it appears).
+>
+> **Archived 2026-10-10:** Phases 0-10 are closed or tracked as open items in
+> [../plans/roadmap.md](../plans/roadmap.md). This file is the dated 2026-10-05 sprint
+> record; do not add new work here. Current status is in
+> [hardware-coverage.md](hardware-coverage.md) and
+> [burn-backend-parity.md](../plans/burn-backend-parity.md).
+
 2026-10-05. Model coverage first; BF16 is the new storage format.
 Normalization keeps Burn's native compositions rather than adding fused kernels.
 
@@ -110,7 +120,7 @@ cargo xtask bench --device 0 --filter bf16_mnist_matmul
 
 The benchmark excludes uploads/readback from timing, synchronizes every run,
 validates every output, warms up once and reports nine-run host medians. Record
-conditions and run IDs in `firmware-performance.md`. Run `1791162075` measures
+conditions and run IDs in `performance-log.md`. Run `1791162075` measures
 one Tensix, release, resident operands, HiFi4, pipeline off, one warmup and nine
 validated host-timed samples on card 0: packed BF16 takes 141.092/53.499 us for
 64×784×128 and 64×128×10, versus TF32 97.741/18.083 us. The larger BF16 product
@@ -136,7 +146,7 @@ All five F32 training regressions pass with the original golden unchanged;
 transfer expectations now omit index metadata uploads that capture can replay.
 Log: `target/silicon/tensix-mnist-regression.log`.
 
-**Integer division/remainder is unfinished and disabled.** The full-width SFPU
+**Integer division/remainder is unfinished and disabled** *(historical: superseded by the 2026-10-05 continuation below and by `step82`, which enables and validates it on simulator and both cards)*. The full-width SFPU
 program agrees with an independent I64 oracle in the interpreter, including
 MIN/-1 wrapping and Python-sign remainder. The experimental NC `CHECK_FLAGS`
 path correctly detects a zero divisor but also rejects valid tensor divisors
@@ -148,7 +158,7 @@ packed C_ROW status flags, checking their publication/lifetime and ragged lane
 mapping, then rerun both simulator gates before enabling the route or testing
 silicon. Draft protocol/firmware and builder code remain for this investigation.
 
-Next: (1) resolve checked integer division/remainder and native integer mean;
+*Historical, as of that day:* Next: (1) resolve checked integer division/remainder and native integer mean (done, `step82`);
 (2) observe the new negative controls; (3) general GMPOOL semantics and window
 staging; (4) resolve transpose control and integrate tensor routing. Norm fusion
 remains deliberately deferred. The implementation plan is **not fully complete**.
@@ -215,7 +225,7 @@ All six step83 gates pass in that run and are in SMOKE.
 Mesh aligned batched products now materialize each block and call the existing
 Fabric output-column partitioner, rather than computing only on chip 0. Ragged
 products take that same distributed route through ordinary materialized matmul.
-Mesh trace capture remains unsupported. The two-chip simulator uses widths 64 for
+Mesh trace capture was unsupported when this was written (inference capture and replay were delivered later by R4d, `step147`; mesh training traces remain unsupported). The two-chip simulator uses widths 64 for
 both products, requiring two nonempty partitions. Per-chip arithmetic/Ethernet
 telemetry and mesh gradient comparison were initially outstanding; step88 and
 the later continuation sections record their validation. The forward gate
@@ -329,9 +339,9 @@ submitted on each card and acknowledged Ethernet packets/bytes, independently of
 PCIe traffic accounting. `step83` checks actual two-card attention forward and
 analytic Q/K/V/bias gradients, requiring at least six products per card for the
 backward workload; `step85` checks convolution gradients. These pass in
-`1791234542`. Mesh trace capture remains unsupported.
+`1791234542`. Mesh trace capture was unsupported at that point (since delivered for inference, `step147`; mesh training traces remain unsupported).
 
-Release card-0 operation baselines are recorded in firmware-performance.md, run
+Release card-0 operation baselines are recorded in performance-log.md, run
 `1791235277`; they establish conditions and medians, without speedup claims.
 Observed reversed-convolution-column and shifted-resident-index mutants fail
 their independent simulator gates. Later continuation sections record large-K/permuted attention and convolution
@@ -428,7 +438,7 @@ all three generator checks and both shipping dependency checks pass
 (`target/silicon/tranche-checks-final.log`). The five MNIST e2e regressions pass
 in 264.20 s with the golden unchanged
 (`target/silicon/tranche-mnist-current.log`). Release operation baselines and
-conditions are recorded in `docs/learnings/firmware-performance.md`; no speedup
+conditions are recorded in `docs/learnings/performance-log.md`; no speedup
 guarantee is made. M3 remains partial for the measured Src payload-conversion
 limit; ND indexing and excluded convolution/attention variants are not closed.
 
@@ -484,21 +494,23 @@ or IEEE special-value behavior is promised.
 
 ## Next tranche delivered: per-tensor BFP8/4/2 and PRNG diagnostics (2026-10-06)
 
-See [mixed BFP storage](mixed-bfp-storage.md) for the current contract. Session
+See [mixed BFP storage](../plans/mixed-bfp-storage.md) for the current contract. Session
 BFP pack/unpack, direct packed products and Burn storage policies retain logical
 F32 and F32 compute/accumulation. Master parameters, gradients and optimizer
 operations remain F32; casts use identity backward. Native policies for actual
 MNIST MLP/CNN, fusion, group-preserving views, parameter copies and changed-input
 traces pass both cards. Full SMOKE: 364/364 (`1791300502`); final rounding and
 negative controls: 28/28 (`1791301208`). Conversion cost and accuracy changes
-are recorded separately from the F32 golden in `firmware-performance.md`.
+are recorded separately from the F32 golden in `performance-log.md`.
 
 D2 is complete for BFP8/4/2, not the deferred `a`/INT8/portable quantization/mesh
-formats. S7 remains partial: WRCFG continues the observed silicon stream,
+formats. S7 was partial on 2026-10-06: WRCFG continues the observed silicon stream,
 but direct RISC-V seed stores with a fence and conservative settling interval
 restart it on both cards (`1791302214`, 4/4). Lanes have strong initialization
-correlations and seed 0xffffffff is absorbing. Application RNG quality and
-stream semantics remain deferred; Burn random construction is unchanged.
+correlations and seed 0xffffffff is absorbing. *Superseded:* S7 was completed in the
+Phase 10 close-out. Burn random now draws on the device (native `float_random`,
+`crates/burn-tt/src/random.rs`, step140-142; see [mixed-bfp-storage.md](../plans/mixed-bfp-storage.md)).
+Application RNG quality beyond that stays deferred.
 
 ### F1 resident matrix chains continuation (2026-10-06)
 
@@ -520,7 +532,7 @@ stream semantics remain deferred; Burn random construction is unchanged.
 - [x] Release benchmark on both cards: `1791317719`, validated outputs;
   1.38–1.48× in measured cases, with region/batch counts halved.
 - [x] Record medians, conditions, traffic counts and complete collector artifacts
-  in `docs/learnings/firmware-performance.md`; no speedup required.
+  in `docs/learnings/performance-log.md`; no speedup required.
 
 DOTPV, source shifts, reset instructions, PRNG and SFPLOADMACRO remain outside
 this continuation. Instruction completion requires semantics plus production

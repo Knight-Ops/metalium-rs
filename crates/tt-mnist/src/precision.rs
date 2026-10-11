@@ -13,11 +13,10 @@
 //! A single-card native model keeps F32 masters and casts its named boundaries:
 //! ```no_run
 //! use burn::{backend::Autodiff, tensor::Tensor};
-//! use burn_tt::{TtBackend, TtDevice, Topology, SrcRoute, Fidelity};
+//! use burn_tt::{TtBackend, TtDevice};
 //! use burn_tt::storage::{NativeStoragePolicy, StorageFormat as S, TensorStorageExt};
+//! // The card is opened by the first op that needs it (`burn_tt::init` does it eagerly).
 //! let device = TtDevice::new(0);
-//! let _server = burn_tt::attach_topology(device, Topology::single(0),
-//!     SrcRoute::Tf32FromFp32, Fidelity::HiFi4).unwrap();
 //! let model = tt_mnist::precision::Mlp::<Autodiff<TtBackend>>::new(&device);
 //! let policy = NativeStoragePolicy(|name| match name {
 //!     "mlp.hidden.weight" => S::Bfp2,

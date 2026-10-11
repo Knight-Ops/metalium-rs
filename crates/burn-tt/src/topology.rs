@@ -13,10 +13,8 @@
 //!   Ethernet, bit-identical to one card, with tensor slots retained in GDDR.
 //!   Other primitives and batched matmuls compute on chip 0.
 
-use crate::server::{
-    attach, kmd_engine_with_elementwise, kmd_mesh_engine, AttachGuard, EngineError,
-};
-use crate::{Fidelity, SrcRoute, TileChoice, TtDevice};
+use crate::error::TtError;
+use crate::TileChoice;
 
 /// The cards behind one [`TtDevice`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,17 +58,17 @@ impl Topology {
 
     /// From `TT_TOPOLOGY`: a comma-separated card list, `"0"` or `"0,1"`; one
     /// card is [`Topology::Single`]. `None` when unset.
-    pub fn from_env() -> Option<Result<Self, EngineError>> {
+    pub fn from_env() -> Option<Result<Self, TtError>> {
         let v = std::env::var("TT_TOPOLOGY").ok()?;
         Some(Self::parse(&v))
     }
 
     /// See [`Topology::from_env`].
-    pub fn parse(s: &str) -> Result<Self, EngineError> {
+    pub fn parse(s: &str) -> Result<Self, TtError> {
         let cards: Result<Vec<u16>, _> = s.split(',').map(|c| c.trim().parse()).collect();
         match cards {
             Ok(c) if !c.is_empty() => Ok(Self::cards(&c)),
-            _ => Err(EngineError(format!(
+            _ => Err(TtError::Device(format!(
                 "TT_TOPOLOGY={s:?}: expected card numbers, e.g. \"0\" or \"0,1\""
             ))),
         }
@@ -78,7 +76,7 @@ impl Topology {
 
     /// This topology computing on `tile` on each card it has; only
     /// [`Topology::Single`] can spread over several tiles yet.
-    pub fn on_tiles(self, tile: TileChoice) -> Result<Self, EngineError> {
+    pub fn on_tiles(self, tile: TileChoice) -> Result<Self, TtError> {
         match self {
             Topology::Single { card, .. } => Ok(Topology::Single { card, tile }),
             Topology::Cards { .. }
@@ -86,7 +84,7 @@ impl Topology {
             {
                 Ok(self)
             }
-            Topology::Cards { .. } => Err(EngineError(format!(
+            Topology::Cards { .. } => Err(TtError::Device(format!(
                 "{tile:?}: several cards compute on one tile each, for now"
             ))),
         }
@@ -107,86 +105,27 @@ impl Topology {
 
 /// From `TT_TILES`: how many Tensix tiles one card computes on, a count or
 /// `"all"` ([`parse_tiles`]). `None` when unset.
-pub fn tiles_from_env() -> Option<Result<TileChoice, EngineError>> {
+pub fn tiles_from_env() -> Option<Result<TileChoice, TtError>> {
     let v = std::env::var("TT_TILES").ok()?;
     Some(parse_tiles(&v))
 }
 
 /// See [`tiles_from_env`].
-pub fn parse_tiles(s: &str) -> Result<TileChoice, EngineError> {
+pub fn parse_tiles(s: &str) -> Result<TileChoice, TtError> {
     match s.trim() {
         "all" => Ok(TileChoice::All),
         n => match n.parse::<usize>() {
             Ok(n) if n > 0 => Ok(TileChoice::Count(n)),
-            _ => Err(EngineError(format!(
+            _ => Err(TtError::Device(format!(
                 "TT_TILES={s:?}: expected a tile count, e.g. \"8\", or \"all\""
             ))),
         },
     }
 }
 
-/// Attach `device` on `topology`'s silicon. The one call training code makes.
-pub fn attach_topology(
-    device: TtDevice,
-    topology: Topology,
-    route: SrcRoute,
-    fidelity: Fidelity,
-) -> Result<AttachGuard, EngineError> {
-    attach_topology_with_elementwise(
-        device,
-        topology,
-        route,
-        fidelity,
-        crate::ElementwiseMode::Sfpu,
-    )
-}
-
-pub fn attach_topology_with_elementwise(
-    device: TtDevice,
-    topology: Topology,
-    route: SrcRoute,
-    fidelity: Fidelity,
-    mode: crate::ElementwiseMode,
-) -> Result<AttachGuard, EngineError> {
-    if matches!(topology, Topology::Cards { .. }) && mode != crate::ElementwiseMode::Sfpu {
-        return Err(EngineError(
-            "matrix elementwise mode is unsupported on mesh engines".into(),
-        ));
-    }
-    match topology {
-        Topology::Single { card, tile } => attach(
-            device,
-            kmd_engine_with_elementwise(TtDevice::new(card), tile, route, fidelity, mode),
-        ),
-        Topology::Cards {
-            cards,
-            compute,
-            relay,
-        } => attach(
-            device,
-            kmd_mesh_engine(cards, compute, relay, route, fidelity),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn matrix_mesh_opt_in_is_refused_before_attachment() {
-        let result = attach_topology_with_elementwise(
-            TtDevice::new(0),
-            Topology::cards(&[0, 1]),
-            SrcRoute::Tf32FromFp32,
-            Fidelity::HiFi4,
-            crate::ElementwiseMode::Matrix {
-                precision: crate::SrcPrecision::Tf32,
-                fidelity: Fidelity::HiFi4,
-            },
-        );
-        assert!(matches!(result,Err(e) if e.0.contains("unsupported on mesh")));
-    }
 
     #[test]
     fn one_card_is_single_and_several_are_sharded() {

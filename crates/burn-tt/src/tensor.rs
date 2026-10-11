@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::error::TtError;
 use crate::host::HostBuffer;
 use burn_backend::quantization::QuantScheme;
 use burn_backend::{DType, QTensorPrimitive, Shape, TensorData, TensorMetadata};
@@ -248,79 +249,91 @@ impl TtTensor {
     }
 
     /// The host copy, downloaded the first time it is needed.
+    ///
+    /// # Panics
+    ///
+    /// If the download fails: host-side ops cannot return an error. A
+    /// readback that can ([`TtTensor::try_host`]) reports it instead.
     pub(crate) fn host(&self) -> &HostBuffer {
-        self.cell.host.get_or_init(|| {
-            if self.storage_format() != crate::storage::StorageFormat::F32 {
-                return self
-                    .clone()
-                    .with_storage(crate::storage::StorageFormat::F32)
-                    .host()
-                    .clone();
+        self.try_host().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`TtTensor::host`], returning the failure of the download.
+    pub(crate) fn try_host(&self) -> Result<&HostBuffer, TtError> {
+        if let Some(h) = self.cell.host.get() {
+            return Ok(h);
+        }
+        // `OnceLock::get_or_try_init` is unstable: load outside the lock. A
+        // concurrent loader's copy is the same data; the first one stays.
+        let loaded = self.load_host()?;
+        Ok(self.cell.host.get_or_init(|| loaded))
+    }
+
+    fn load_host(&self) -> Result<HostBuffer, TtError> {
+        if self.storage_format() != crate::storage::StorageFormat::F32 {
+            return Ok(self
+                .clone()
+                .with_storage(crate::storage::StorageFormat::F32)
+                .try_host()?
+                .clone());
+        }
+        if let (None, Some(v)) = (self.cell.dram.get(), &self.cell.strided) {
+            if !self.materialises_on_device(v) {
+                return self.gathered(v);
             }
-            if let (None, Some(v)) = (self.cell.dram.get(), &self.cell.strided) {
-                if !self.materialises_on_device(v) {
-                    return self.gathered(v);
+        }
+        let d = self
+            .dram()
+            .expect("a tensor with no host copy has a device copy");
+        if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
+            eprintln!(
+                "burn-tt: downloading {:?}{} for a host op\n{}",
+                self.cell.shape.to_vec(),
+                if d.transposed { " (transposed)" } else { "" },
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        let (r, c) = (d.buffer.rows, d.buffer.cols);
+        fn transposed<T: Copy + Default>(v: Vec<T>, t: bool, r: usize, c: usize) -> Vec<T> {
+            if !t {
+                return v;
+            }
+            let mut out = vec![T::default(); v.len()];
+            for i in 0..r {
+                for j in 0..c {
+                    out[j * r + i] = v[i * c + j];
                 }
             }
-            let d = self
-                .dram()
-                .expect("a tensor with no host copy has a device copy");
-            if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
-                eprintln!(
-                    "burn-tt: downloading {:?}{} for a host op\n{}",
-                    self.cell.shape.to_vec(),
-                    if d.transposed { " (transposed)" } else { "" },
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
-            let (r, c) = (d.buffer.rows, d.buffer.cols);
-            fn transposed<T: Copy + Default>(v: Vec<T>, t: bool, r: usize, c: usize) -> Vec<T> {
-                if !t {
-                    return v;
+            out
+        }
+        let shape = self.cell.shape.clone();
+        let data = if is_half(self.cell.dtype) {
+            let bits = server::try_download_bf16(self.device, d.buffer.id, r, c)?;
+            let bits = transposed(bits, d.transposed, r, c);
+            // Construct typed bytes; explicit readback performs no arithmetic.
+            let mut data = TensorData::new(bits, shape);
+            data.dtype = self.cell.dtype;
+            data
+        } else {
+            match device_elem(self.cell.dtype) {
+                Some(Elem::F32) => {
+                    let v = server::try_download(self.device, d.buffer.id, r, c)?;
+                    TensorData::new(transposed(v, d.transposed, r, c), shape)
                 }
-                let mut out = vec![T::default(); v.len()];
-                for i in 0..r {
-                    for j in 0..c {
-                        out[j * r + i] = v[i * c + j];
-                    }
-                }
-                out
-            }
-            let shape = self.cell.shape.clone();
-            let data = if is_half(self.cell.dtype) {
-                let bits = server::download_bf16(self.device, d.buffer.id, r, c);
-                let bits = transposed(bits, d.transposed, r, c);
-                // Construct typed bytes; explicit readback performs no arithmetic.
-                let mut data = TensorData::new(bits, shape);
-                data.dtype = self.cell.dtype;
-                data
-            } else {
-                match device_elem(self.cell.dtype) {
-                    Some(Elem::F32) => {
-                        let v = server::download(self.device, d.buffer.id, r, c);
-                        TensorData::new(transposed(v, d.transposed, r, c), shape)
-                    }
-                    Some(elem) => {
-                        let v = server::download_bits(self.device, d.buffer.id, r, c);
-                        let v = transposed(v, d.transposed, r, c);
-                        if elem == Elem::I32 {
-                            TensorData::new(
-                                v.into_iter().map(|b| b as i32).collect::<Vec<_>>(),
-                                shape,
-                            )
-                        } else {
-                            TensorData::new(
-                                v.into_iter().map(|b| b != 0).collect::<Vec<_>>(),
-                                shape,
-                            )
+                Some(elem) => {
+                    let v = server::try_download_bits(self.device, d.buffer.id, r, c)?;
+                    let v = transposed(v, d.transposed, r, c);
+                    if elem == Elem::I32 {
+                        TensorData::new(v.into_iter().map(|b| b as i32).collect::<Vec<_>>(), shape)
+                    } else {
+                        TensorData::new(v.into_iter().map(|b| b != 0).collect::<Vec<_>>(), shape)
                             .convert_dtype(self.cell.dtype)
-                        }
                     }
-                    None => unreachable!("only a stored dtype has a device copy"),
                 }
-            };
-            HostBuffer::from_data(data)
-        })
+                None => unreachable!("only a stored dtype has a device copy"),
+            }
+        };
+        Ok(HostBuffer::from_data(data))
     }
 
     /// `self` reshaped on the host to `shape`, which is stored as the same
@@ -347,21 +360,30 @@ impl TtTensor {
     }
 
     /// The host copy, owned: taken if this is the only reference to it.
+    ///
+    /// # Panics
+    ///
+    /// If the download fails; see [`TtTensor::try_into_host`].
     pub(crate) fn into_host(self) -> HostBuffer {
+        self.try_into_host().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`TtTensor::into_host`], returning the failure of the download.
+    pub(crate) fn try_into_host(self) -> Result<HostBuffer, TtError> {
         match Arc::try_unwrap(self.cell) {
-            Ok(cell) if cell.host.get().is_some() => cell.host.into_inner().expect("checked"),
-            Ok(cell) => TtTensor {
+            Ok(cell) if cell.host.get().is_some() => Ok(cell.host.into_inner().expect("checked")),
+            Ok(cell) => Ok(TtTensor {
                 cell: Arc::new(cell),
                 device: self.device,
             }
-            .host()
-            .clone(),
-            Err(cell) => TtTensor {
+            .try_host()?
+            .clone()),
+            Err(cell) => Ok(TtTensor {
                 cell,
                 device: self.device,
             }
-            .host()
-            .clone(),
+            .try_host()?
+            .clone()),
         }
     }
 
@@ -382,7 +404,7 @@ impl TtTensor {
 
     /// A strided view's elements, on the host: its source downloaded and
     /// read through the strides.
-    fn gathered(&self, v: &Strided) -> HostBuffer {
+    fn gathered(&self, v: &Strided) -> Result<HostBuffer, TtError> {
         let b = &v.src.buffer;
         if std::env::var_os("TT_TRACE_FALLBACK").is_some() {
             eprintln!(
@@ -393,7 +415,7 @@ impl TtTensor {
                 std::backtrace::Backtrace::force_capture()
             );
         }
-        let src = server::download(self.device, b.id, b.rows, b.cols);
+        let src = server::try_download(self.device, b.id, b.rows, b.cols)?;
         let shape = self.cell.shape.to_vec();
         let n: usize = shape.iter().product();
         let values: Vec<f32> = (0..n)
@@ -402,7 +424,7 @@ impl TtTensor {
                 src[r * b.cols + c]
             })
             .collect();
-        HostBuffer::from_data(TensorData::new(values, shape))
+        Ok(HostBuffer::from_data(TensorData::new(values, shape)))
     }
 
     /// The device copy, uploaded the first time it is needed, as the matrix

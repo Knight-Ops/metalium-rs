@@ -516,6 +516,10 @@ pub mod panic_code {
     pub const EXPLICIT: u32 = 1;
     /// A checked arithmetic operation or bounds check failed.
     pub const ARITHMETIC: u32 = 2;
+    /// Instruction gathering was still on after the firmware turned it off:
+    /// reading `cfg0` back showed `DisTriscCache` clear
+    /// (`tt_firmware::disable_gathering`).
+    pub const GATHERING_STILL_ON: u32 = 3;
 }
 
 #[cfg(test)]

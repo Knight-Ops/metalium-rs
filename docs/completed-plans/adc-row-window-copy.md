@@ -55,7 +55,7 @@ Burn routing are deferred to a later pass.
 - [x] Workspace tests/lints, generator/shipping checks and MNIST regression.
 - [x] Full release silicon SMOKE on card 0: 203/203, run `1791321817`.
 - [x] Validated release native-repack comparison: warmups, medians, host timing,
-  dataflow counts and collector artifacts in firmware-performance.md.
+  dataflow counts and collector artifacts in performance-log.md.
 
 Final isolated benchmark `1791322068` validates all six records, with ADC
 23–79% slower than native repack for the three measured rectangles. This

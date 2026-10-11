@@ -202,8 +202,12 @@ pub fn set_noc_cleanup(
 /// Returns whether the operation succeeded — `ACQUIRE` reports 0 when another
 /// process holds it rather than failing.
 pub fn lock_ctl(fd: BorrowedFd<'_>, index: u8, flags: u32) -> std::io::Result<bool> {
+    // `output_size_bytes` is the size of the `out` half alone: the driver clears
+    // that many bytes from `out` on (`clear_user(&arg->out, ..)`), so the whole
+    // struct's size would write past the argument, onto the caller's stack.
     let mut arg = abi::LockCtl {
-        in_output_size_bytes: std::mem::size_of::<abi::LockCtl>() as u32,
+        in_output_size_bytes: (std::mem::size_of::<abi::LockCtl>()
+            - std::mem::offset_of!(abi::LockCtl, out_value)) as u32,
         in_flags: flags,
         in_index: index,
         ..Default::default()

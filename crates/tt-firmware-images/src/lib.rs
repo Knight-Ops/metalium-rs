@@ -133,6 +133,17 @@ pub const ICACHE_T: [Image; 3] = [
     ),
 ];
 
+/// The `.ttinsn` push-fusion experiment's T1 image
+/// (`docs/plans/ttinsn-push-experiment.md`): [`ROLES`]'s math image with two hooks,
+/// built with fused `.ttinsn` words for a few programs. Only with the
+/// `ttinsn-experiment` feature, which no shippable build turns on.
+#[cfg(feature = "ttinsn-experiment")]
+pub const TTINSN_T1: Image = (
+    Core::T1,
+    include_bytes!(env!("FIRMWARE_TTINSN_T1")),
+    Core::T1.default_reset_pc() as u64,
+);
+
 /// The ELF entry points `build.rs` read, by image name.
 const ENTRIES: [(&str, &str); 19] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
@@ -158,6 +169,14 @@ const ENTRIES: [(&str, &str); 19] = [
 
 /// The entry point of the image called `name`, as linked.
 pub fn entry(name: &str) -> Option<u32> {
+    #[cfg(feature = "ttinsn-experiment")]
+    if name == "ttinsn_t1" {
+        return Some(
+            env!("FIRMWARE_TTINSN_T1_ENTRY")
+                .parse()
+                .expect("build.rs writes a decimal entry point"),
+        );
+    }
     ENTRIES
         .iter()
         .find(|(n, _)| *n == name)
@@ -182,6 +201,17 @@ mod tests {
                 "{name} is linked away from {core:?}'s default reset PC"
             );
         }
+    }
+
+    /// The experiment image is a T1 role image: loaded where `role_t1` is.
+    #[cfg(feature = "ttinsn-experiment")]
+    #[test]
+    fn the_experiment_image_is_linked_where_it_is_loaded() {
+        assert_eq!(
+            entry("ttinsn_t1").map(u64::from),
+            Some(TTINSN_T1.2),
+            "ttinsn_t1 is linked away from T1's default reset PC"
+        );
     }
 
     #[test]
