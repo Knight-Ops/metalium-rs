@@ -3731,16 +3731,28 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_size: [usize; 2],
         options: InterpolateOptions,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("interpolate", false);
-        crate::unsupported::fail(
-            "interpolate",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("output_size={:?}", output_size),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("interpolate", true);
+        let storage_inputs = [&x];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("interpolate", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::interpolate(x, output_size, options),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            return crate::ops::cast_native(
+                crate::ops::module::interpolate(x, output_size, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::interpolate(x, output_size, options)
     }
     fn interpolate_backward(
         x: FloatTensor<TtBackend>,
@@ -3748,17 +3760,31 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_size: [usize; 2],
         options: InterpolateOptions,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("interpolate_backward", false);
-        crate::unsupported::fail(
-            "interpolate_backward",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("grad={}", crate::unsupported::context(&grad)),
-                format!("output_size={:?}", output_size),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("interpolate_backward", true);
+        let storage_inputs = [&x, &grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("interpolate_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let grad = crate::ops::bfp_compute_input(grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::interpolate_backward(x, grad, output_size, options),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let grad = crate::ops::float_compute_input(grad);
+            return crate::ops::cast_native(
+                crate::ops::module::interpolate_backward(x, grad, output_size, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::interpolate_backward(x, grad, output_size, options)
     }
     fn attention(
         query: FloatTensor<TtBackend>,

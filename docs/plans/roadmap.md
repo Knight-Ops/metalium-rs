@@ -38,6 +38,16 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   are in `expected-failures.toml`, each group with a category and a reason.** 163 passing tests are in
   `--smoke`, validated on card 0 (log `1791692395`). Still open: the run on `Fusion<TtBackend>`
   (B13a) and the F16 suites (D1).
+- [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
+  backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
+  `step155_interpolate`, card 0, smoke tier 814 of 814, log `1791733008`). No new kernel: shape-only tap tables
+  on the host, a device gather, SFPU multiplies and the in-order row sum. All 22 of Burn's tests pass;
+  nearest and bilinear equal Flex bit for bit, bicubic and Lanczos3 are within a derived bound, Lanczos3
+  forward is also checked against the `image` crate, and Lanczos3 backward (which Flex lacks) against the
+  adjoint of the forward map. It also fixed a `tensor::metadata` batching overrun that panicked the server
+  thread on a table of many distinct values. Procedure: [conformance-to-feature.md](conformance-to-feature.md),
+  "round two". Left: F16 is refused, and a resize staging more than 2^24 host addresses is refused by name
+  (Track 2, "Separable `interpolate`").
 - [ ] **Conformance findings** (each a group in `expected-failures.toml`; fixing one removes its
   tests from the list). In the order the model ladder needs them:
   1. `softmax`/`log_softmax` only for rank-2 F32 over dim <= 1: rank 1, 3, 4 and transposed inputs
@@ -50,9 +60,9 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
      (5 tests); a `[408, 261120] @ [261120, 408]` matmul fails in the planner with "the matmul's own
      requirements are invalid" (1); `bool_argwhere` always refuses (10 tests incl. `nonzero`) while
      `burn-op-coverage.md` lists it as native, so it needs a `[-]` disposition or an implementation.
-  5. Open gaps, deferred rather than designed away: `interpolate` (22 tests; upsampling in decoders,
-     UNets, ViT position-embedding resize), `conv3d` and `conv_transpose3d` (20), `deform_conv2d`
-     (17), and `scatter_nd` with Mul/Min/Max (26; Burn leaves duplicate indices undefined).
+  5. Open gaps, deferred rather than designed away: `conv3d` and `conv_transpose3d` (20),
+     `deform_conv2d` (17), and `scatter_nd` with Mul/Min/Max (26; Burn leaves duplicate indices
+     undefined). (`interpolate`, 22 tests, is closed: see below.)
   6. Ten `precision` failures, attributed to TF32 operand truncation (one reproduced by hand; the
      LU, determinant and conv2d ones are not decomposed): derive a bound beside each. Eleven large
      LU/determinant tests are too slow (> 1500 s each).
@@ -94,6 +104,12 @@ Track 1 model. Evidence and bottlenecks:
   Dst subblocks (G4), multicast matmul operands (G7; the primitive is done and
   silicon-gated, nothing in `tt-kernels` uses it).
   [tt-metal-concepts-review.md](../learnings/tt-metal-concepts-review.md).
+- [ ] **Separable `interpolate`.** Today one pass of up to 36 taps stages `taps x N x C x outputs` host
+  addresses and refuses more than 2^24 (a ViT position-embedding resize, `[1, 768, 14, 14]` to
+  `[32, 32]` bicubic, is 12.6 million and fits; a Lanczos3 one does not). Two 1-D passes (rows, then
+  columns) cut taps per output from 16/36 to 4/6 and the staged addresses with them, at the cost of
+  Flex's single-sum term order for bicubic and Lanczos3 (both already bound-checked, not bit-exact).
+  Chunk the gather over planes. Measure on a real model before building it.
 - [ ] **B7** batched readback (`download_many`, batched `tr_execute`). (The `Backend::sync` barrier of B8 is
   done with B1.)
 - [ ] **X7** small-transfer latency; 9.14 per-request cost (note X6 found the fast

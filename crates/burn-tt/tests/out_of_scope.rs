@@ -63,15 +63,42 @@ fn volumetric_convolutions_are_refused_by_name() {
     assert_refused(&message, "conv_transpose3d", "[1, 1, 2, 2, 2]");
 }
 
+/// `interpolate` is native (`step155_interpolate`); what it still refuses, it refuses by name.
 #[test]
-fn interpolation_is_refused_by_name() {
+fn interpolation_beyond_its_limits_is_refused_by_name() {
     let d = TtDevice::new(311);
+    // Lanczos3's 36 taps over 700 x 700 outputs: more host addresses than one gather stages.
     let x = primitive([1, 1, 2, 2], &d);
+    let message = refusal(move || {
+        let _ = TtBackend::interpolate(
+            x,
+            [700, 700],
+            InterpolateOptions::new(InterpolateMode::Lanczos3),
+        );
+    });
+    assert_refused(&message, "interpolate", "[1, 1, 2, 2]");
+    assert!(message.contains("limit"), "{message}");
+
+    // The gradient has the same limit, and names itself.
+    let (x, grad) = (primitive([1, 1, 2, 2], &d), primitive([1, 1, 700, 700], &d));
+    let message = refusal(move || {
+        let _ = TtBackend::interpolate_backward(
+            x,
+            grad,
+            [700, 700],
+            InterpolateOptions::new(InterpolateMode::Lanczos3),
+        );
+    });
+    assert_refused(&message, "interpolate_backward", "[1, 1, 2, 2]");
+
+    // An empty input plane has nothing to interpolate (burn-flex asserts the same).
+    let x = primitive([1, 1, 0, 2], &d);
     let message = refusal(move || {
         let _ =
             TtBackend::interpolate(x, [4, 4], InterpolateOptions::new(InterpolateMode::Nearest));
     });
-    assert_refused(&message, "interpolate", "[1, 1, 2, 2]");
+    assert_refused(&message, "interpolate", "[1, 1, 0, 2]");
+    assert!(message.contains("spatial dimensions"), "{message}");
 }
 
 #[test]

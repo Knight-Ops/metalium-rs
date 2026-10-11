@@ -3134,6 +3134,7 @@ pub mod float {
 
 mod conv;
 mod index;
+mod interpolate;
 mod pool;
 mod scan;
 mod sort;
@@ -3144,6 +3145,7 @@ pub mod module {
         conv_transpose2d_bias_backward, conv_transpose2d_weight_backward,
         conv_transpose2d_x_backward, unfold4d,
     };
+    pub use super::interpolate::{interpolate, interpolate_backward};
     pub use super::pool::{
         adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
         max_pool2d, max_pool2d_with_indices, max_pool2d_with_indices_backward,

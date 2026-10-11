@@ -233,6 +233,9 @@ arithmetic gates are silicon-only; raw storage/copy, SrcA→MOVA2D widening and
 packed BF16 matmul have simulator gates. A direct BF16 `UnpackToDst` widening
 setup timed out on silicon during bring-up; the SrcA/MOVA2D path is used instead.
 That timeout does not refute row 31's separately measured BF16→BF16 behavior.
+`interpolate` on BF16 (`step155_interpolate::bf16_widens_computes_in_f32_and_rounds_once`) is a silicon-only
+gate for the same reason (its result is narrowed by that pack); on card 0 nearest and bilinear equal Flex's
+BF16 values exactly, so the device's narrowing agrees with Flex's round-to-nearest-even there (2026-10-11).
 
 GMPOOL/GAPOOL require bit 19 set in both ttsim and the measured Blackhole paths.
 AddrMod remains at bits 15–16, with bank flips at 22/23; GMPOOL's ArgMax remains

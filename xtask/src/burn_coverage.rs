@@ -25,11 +25,6 @@ const DISPOSITIONS: &[(&str, &str)] = &[
         "deform_conv2d_backward",
         "[-] out of scope: no model needs it",
     ),
-    ("interpolate", "[-] out of scope: no model needs it"),
-    (
-        "interpolate_backward",
-        "[-] out of scope: no model needs it",
-    ),
     ("rfft", "[-] out of scope: no model needs it"),
     ("irfft", "[-] out of scope: no model needs it"),
     (

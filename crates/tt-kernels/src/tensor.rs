@@ -2219,9 +2219,10 @@ pub(crate) fn metadata(
         positions.sort_unstable();
         let mut batches = Vec::new();
         let range = out.tile(tile / ct, tile % ct);
-        for (batch, chunk) in positions.chunks(200).enumerate() {
+        let mut next = 0;
+        while next < positions.len() {
             let mut read = Vec::new();
-            if batch == 0 {
+            if batches.is_empty() {
                 read.extend([
                     [op::FILL, 0, fill::param(1, 1), constant as u32, 0, 0, 0, 0],
                     [
@@ -2248,8 +2249,17 @@ pub(crate) fn metadata(
                 ]);
             }
             let mut prior = None;
-            for &(value, index) in chunk {
-                if prior != Some(value) {
+            let mut taken = 0;
+            // Up to 200 words a batch, fewer when each needs its own fill: a word costs two
+            // entries unless it repeats the one before, and a side must fit a packet
+            // ([`TRANSFER_SIDE_MAX`]); the word count alone cannot bound it.
+            while taken < 200 && next + taken < positions.len() {
+                let (value, index) = positions[next + taken];
+                let fresh = prior != Some(value);
+                if read.len() + 1 + usize::from(fresh) > TRANSFER_SIDE_MAX {
+                    break;
+                }
+                if fresh {
                     read.push([
                         op::FILL,
                         value,
@@ -2272,7 +2282,9 @@ pub(crate) fn metadata(
                     0,
                     0,
                 ]);
+                taken += 1;
             }
+            next += taken;
             batches.push(TransferBatch {
                 read,
                 write: vec![[
@@ -3840,13 +3852,51 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks, reference, runs, DramAlloc, DramTensor, Eltwise, Job, MatmulPadding, OpPadding,
-        Pad, PadNeed, Step, SumRows,
+        blocks, metadata, reference, runs, DramAlloc, DramTensor, Elem, Eltwise, Job,
+        MatmulPadding, OpPadding, Pad, PadNeed, Step, SumRows, TransferBatch, TRANSFER_SIDE_MAX,
     };
     use crate::kind;
     use tt_isa::dm::TILE_DATA;
     use tt_isa::dm::{fill, op, record};
     use tt_isa::dram::Dram;
+
+    /// The transfer batches of `metadata` for one `rows x cols` of `bits`, and how many words
+    /// (single-word copies) they move.
+    fn metadata_batches(bits: &[u32], dims: [usize; 2]) -> (Vec<TransferBatch>, usize) {
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let work = metadata(&mut alloc, bits, dims, Elem::F32).unwrap();
+        let batches: Vec<_> = work
+            .jobs
+            .into_iter()
+            .flatten()
+            .flat_map(|step| match step {
+                Step::Transfer { batches, .. } => batches,
+                _ => unreachable!("metadata is transfers"),
+            })
+            .collect();
+        let words = batches
+            .iter()
+            .flat_map(|b| &b.read)
+            .filter(|e| e[0] == op::COPY_WORDS && e[3] == 1)
+            .count();
+        (batches, words)
+    }
+
+    /// A tile of constants that all differ costs a fill and a copy each: batching by word count
+    /// alone overran a packet ("a transfer batch of resident metadata is too long"), which
+    /// panicked the server thread. A tile of one value still batches 200 words at a time.
+    #[test]
+    fn metadata_batches_fit_a_packet_however_many_words_differ() {
+        let different: Vec<u32> = (0..1024).map(|i| 0x3f80_0000 + i * 7919).collect();
+        let (batches, words) = metadata_batches(&different, [32, 32]);
+        assert_eq!(words, 1024);
+        assert!(batches.len() > 6, "all-different words need more batches");
+        for b in &batches {
+            assert!(b.read.len() <= TRANSFER_SIDE_MAX && b.write.len() <= TRANSFER_SIDE_MAX);
+        }
+        let (batches, words) = metadata_batches(&[0x3f80_0000; 1024], [32, 32]);
+        assert_eq!((words, batches.len()), (1024, 6));
+    }
 
     /// Every padding claim of an SFPU kind (`Eltwise::zero_at_zero`) holds
     /// for its program: zero `A` (either sign), and the other operands zero

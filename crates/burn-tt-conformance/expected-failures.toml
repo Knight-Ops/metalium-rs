@@ -10,7 +10,6 @@
 # Test names are `<binary>::<test path>`, as `cargo xtask conformance --list`
 # prints them.
 
-
 [[group]]
 category = "unsupported-dtype"
 reason = "F64 is not a Tensix dtype: `float_cast` to F64 is refused by name (`dtype_usage(F64)` is empty). The two autodiff tests are `#[might_panic(reason = \\\"Unsupported precision for fusion\\\")]`, and burn-tensor-testgen 0.21.0's macro self-deadlocks (its panic hook takes the PANIC_LOG lock the failing body still holds) when the panic message differs, so they end as timeouts."
@@ -105,34 +104,6 @@ tests = [
     "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_max",
     "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_min",
     "tensor::tensor::int::ops::gather_scatter_nd::test_int_scatter_nd_mul",
-]
-
-[[group]]
-category = "unsupported-op"
-reason = "`interpolate` (nearest, bilinear, bicubic, Lanczos) is refused by name (docs/plans/burn-op-notes.md: not planned until a model needs it)."
-tests = [
-    "autodiff::base::nearest_interpolate::test_downsample_interpolation",
-    "autodiff::base::nearest_interpolate::test_upsample_interpolation",
-    "autodiff_checkpointing::base::nearest_interpolate::test_downsample_interpolation",
-    "autodiff_checkpointing::base::nearest_interpolate::test_upsample_interpolation",
-    "tensor::tensor::float::module::bicubic_interpolate::test_1d_bicubic",
-    "tensor::tensor::float::module::bicubic_interpolate::test_downsample_interpolation",
-    "tensor::tensor::float::module::bicubic_interpolate::test_upsample_half_pixel",
-    "tensor::tensor::float::module::bicubic_interpolate::test_upsample_interpolation",
-    "tensor::tensor::float::module::bilinear_interpolate::should_interpolate_cast",
-    "tensor::tensor::float::module::bilinear_interpolate::test_1d_bilinear",
-    "tensor::tensor::float::module::bilinear_interpolate::test_downsample_interpolation",
-    "tensor::tensor::float::module::bilinear_interpolate::test_interpolate_coord_float_precision_boundary",
-    "tensor::tensor::float::module::bilinear_interpolate::test_upsample_half_pixel",
-    "tensor::tensor::float::module::bilinear_interpolate::test_upsample_interpolation",
-    "tensor::tensor::float::module::lanczos3_interpolate::test_1d_lanczos3",
-    "tensor::tensor::float::module::lanczos3_interpolate::test_downsample_interpolation",
-    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_2x",
-    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_half_pixel",
-    "tensor::tensor::float::module::lanczos3_interpolate::test_upsample_interpolation",
-    "tensor::tensor::float::module::nearest_interpolate::test_1d_nearest",
-    "tensor::tensor::float::module::nearest_interpolate::test_downsample_interpolation",
-    "tensor::tensor::float::module::nearest_interpolate::test_upsample_interpolation",
 ]
 
 [[group]]
