@@ -26,7 +26,7 @@ use tt_kernels::matrix_eltwise::{ElementwiseMode, MatrixEltwiseOp, SrcPrecision}
 use tt_kernels::session::{Session, TileChoice};
 
 use crate::error::TtError;
-use crate::TtDevice;
+use crate::{MatmulMode, TtDevice};
 pub use tt_kernels::tensor::Elem;
 
 /// What [`Engine::pow`] raises to: a buffer of the base's shape, a scalar, or
@@ -42,6 +42,16 @@ pub enum PowArg {
 pub trait Engine {
     fn elementwise_mode(&self) -> ElementwiseMode {
         ElementwiseMode::Sfpu
+    }
+    /// How matmuls accumulate on this engine, fixed for its attachment: the
+    /// fast FPU path unless the engine was built for exact F32.
+    fn matmul_mode(&self) -> MatmulMode {
+        MatmulMode::Fast
+    }
+    /// Can [`MatmulMode::Exact`] run here? The exact path composes element-wise ops and
+    /// reductions, which a mesh runs on chip 0 only, so a mesh says no.
+    fn supports_exact_matmul(&self) -> bool {
+        true
     }
     /// How this engine's transcendentals run (`MathMode`, S10):
     /// `Precise` unless [`Engine::set_math_mode`] (or `TT_MATH=approx` when
@@ -1487,7 +1497,7 @@ fn forget(id: BufferId) {
 /// Handed to an [`attach`] factory: call [`Serve::serve`] with the engine once
 /// it exists, and it runs the device's jobs until the device is detached.
 pub struct Serve {
-    ready: Sender<Result<ElementwiseMode, TtError>>,
+    ready: Sender<Result<(ElementwiseMode, MatmulMode, bool), TtError>>,
     jobs: Receiver<Job>,
     device: TtDevice,
     poison: Poison,
@@ -1522,7 +1532,11 @@ impl Serve {
     /// reply get the panic's message ([`TtError::ServerPanicked`]) rather
     /// than a closed channel.
     pub fn serve(self, engine: &mut dyn Engine) {
-        let _ = self.ready.send(Ok(engine.elementwise_mode()));
+        let _ = self.ready.send(Ok((
+            engine.elementwise_mode(),
+            engine.matmul_mode(),
+            engine.supports_exact_matmul(),
+        )));
         let mut ids = Ids::default();
         while let Ok(job) = self.jobs.recv() {
             if self.poison.get().is_some() {
@@ -1536,6 +1550,8 @@ impl Serve {
 struct Attached {
     jobs: Sender<Job>,
     elementwise: ElementwiseMode,
+    matmul: MatmulMode,
+    exact_matmul_ok: bool,
     poison: Poison,
     /// Set once the factory has served the first job's worth of state: until
     /// then `elementwise` is a placeholder.
@@ -1777,6 +1793,8 @@ where
                 Attached {
                     jobs: jobs_tx,
                     elementwise: ElementwiseMode::Sfpu,
+                    matmul: MatmulMode::Fast,
+                    exact_matmul_ok: true,
                     poison,
                     ready: false,
                     config,
@@ -1818,10 +1836,12 @@ where
         epoch,
     };
     match ready_rx.recv() {
-        Ok(Ok(mode)) => {
+        Ok(Ok((mode, matmul, exact_ok))) => {
             with_attached(|a| {
                 let d = a.get_mut(&device).expect("reserved attachment");
                 d.elementwise = mode;
+                d.matmul = matmul;
+                d.exact_matmul_ok = exact_ok;
                 d.ready = true;
             });
             Ok(guard)
@@ -2002,6 +2022,25 @@ pub(crate) fn elementwise_mode(device: TtDevice) -> ElementwiseMode {
     ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
     with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.elementwise))
         .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
+}
+
+/// How matmuls on `device` accumulate: the attachment's snapshot, with no
+/// server round trip.
+pub(crate) fn matmul_mode(device: TtDevice) -> MatmulMode {
+    ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
+    with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.matmul))
+        .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
+}
+
+/// Can `device`'s engine run [`MatmulMode::Exact`]? The attachment's snapshot.
+pub(crate) fn supports_exact_matmul(device: TtDevice) -> bool {
+    ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
+    with_attached(|a| {
+        a.get(&device)
+            .filter(|d| d.live())
+            .map(|d| d.exact_matmul_ok)
+    })
+    .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
 }
 
 /// Does `device`'s engine keep tensors on the device? Asked once per
@@ -2556,6 +2595,8 @@ pub struct KmdEngine {
     pub budget: u64,
     /// Tensors kept in GDDR, if the session has it enabled.
     pub buffers: Option<DramBuffers>,
+    /// How matmuls accumulate, fixed for the attachment.
+    pub matmul: MatmulMode,
 }
 
 impl KmdEngine {
@@ -2573,6 +2614,9 @@ impl KmdEngine {
 }
 
 impl Engine for KmdEngine {
+    fn matmul_mode(&self) -> MatmulMode {
+        self.matmul
+    }
     fn elementwise_mode(&self) -> ElementwiseMode {
         self.buffers
             .as_ref()
@@ -2972,6 +3016,7 @@ pub(crate) fn kmd_engine_with_elementwise(
     route: SrcRoute,
     fidelity: Fidelity,
     elementwise: ElementwiseMode,
+    matmul: MatmulMode,
 ) -> impl FnOnce(Serve) -> Result<(), TtError> + Send + 'static {
     move |serve| {
         let mut session = Session::open_card(device.chip, tt_firmware_images::ROLES, tile)
@@ -3036,6 +3081,7 @@ pub(crate) fn kmd_engine_with_elementwise(
             fidelity,
             budget: 400_000,
             buffers: Some(DramBuffers::default()),
+            matmul,
         }
         .with_elementwise_mode(elementwise)?;
         serve.serve(&mut engine);
@@ -3072,6 +3118,16 @@ pub struct MeshEngine<T: tt_device::Transport> {
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
+    /// Exact matmul would run unpartitioned on chip 0 here: refused by name.
+    pub fn with_matmul_mode(self, mode: MatmulMode) -> Result<Self, TtError> {
+        if mode != MatmulMode::Fast {
+            return Err(TtError::unsupported(
+                "exact matmul mode is unsupported on mesh engines",
+            ));
+        }
+        Ok(self)
+    }
+
     pub fn with_elementwise_mode(self, mode: ElementwiseMode) -> Result<Self, TtError> {
         if mode != ElementwiseMode::Sfpu {
             return Err(TtError::unsupported(
@@ -3103,6 +3159,9 @@ impl<T: tt_device::Transport> MeshEngine<T> {
 }
 
 impl<T: tt_device::Transport> Engine for MeshEngine<T> {
+    fn supports_exact_matmul(&self) -> bool {
+        false
+    }
     fn math_mode(&self) -> tt_kernels::sfpu::approx::MathMode {
         self.mode
     }

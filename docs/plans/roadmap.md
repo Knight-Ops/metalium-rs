@@ -34,11 +34,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   The default tile is `TileChoice::First`; see "Use the grid" for choosing a tile count per workload.
 - [x] **B10/B11** (2026-10-11, [`burn-tt-conformance`](../../crates/burn-tt-conformance/README.md),
   `cargo xtask conformance --release`): Burn 0.21's own backend tests (1,838 tensor and autodiff
-  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,771 pass; 67
+  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,789 pass; 49
   are in `expected-failures.toml`, each group with a category and a reason** (it began at 163: rounds
-  one to three closed 96, see [conformance-to-feature.md](conformance-to-feature.md)). The passing
-  tests are in `--smoke`, validated on card 0. Still open: the run on `Fusion<TtBackend>`
-  (B13a) and the F16 suites (D1).
+  one to four closed 114, see [conformance-to-feature.md](conformance-to-feature.md)). The passing
+  tests are in `--smoke`, validated on card 0. A second profile, `cargo xtask conformance --exact` (matmuls
+  accumulate in exact F32, `TT_EXACT_MATMUL=1`), has its own list, `expected-failures-exact.toml`: **1,801
+  pass, 37 listed** (17 `deform_conv2d`, 3 F64, 1 product the exact mode refuses by name, 16 that ttsim is too
+  slow for and silicon passes). Still open: the run on `Fusion<TtBackend>` (B13a) and the F16 suites (D1).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
   `step155_interpolate`, card 0, smoke tier 814 of 814, log `1791733008`). No new kernel: shape-only tap tables
@@ -54,20 +56,64 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   the `Assign` loop already applies tuples in index order, so the same loop gives Flex's order for the
   rest. All 26 of Burn's tests pass (20 are gradients, which needed nothing new); `Min`/`Max` equal Flex
   bit for bit over every special, F32 `Mul` equals the specification's multiply in index order.
-- [ ] **Conformance findings** (rounds one to three are closed: softmax of any rank, I32/Bool
+- [x] **`conv3d` and `conv_transpose3d`**, forward and all three gradients (2026-10-11,
+  [`ops/conv.rs`](../../crates/burn-tt/src/ops/conv.rs), gate `step157_conv3d`, card 0, log `1791751188`,
+  smoke tier 875 of 875, log `1791751984`). No new kernel: the 2-D patch tables became generic over the number of spatial
+  dimensions (`Geometry<D>`), and the 2-D results are unchanged (`step85`, `step154`, the MNIST golden). Output
+  and the x, weight and bias gradients equal Flex bit for bit on small integers, including `padding_out` past
+  `max(stride, dilation)`, groups, a batch of two and more positions than one 32-row chunk; a mirrored-kernel
+  control fails as it should. 18 of Burn's 20 tests pass. The other two (`test_conv3d_groups`, `_complex`)
+  are `precision`: **not TF32 truncation** (their operands are exact) but the Matrix Unit's group adder
+  (decomposed below, gate `step158_matmul_accumulation`), identical on silicon. Left: BF16 forward is
+  silicon-only (PACR `0x105`).
+- [x] **Exact matmul, opt-in** (2026-10-11, `MatmulMode::{Fast, Exact}`,
+  [`ops/exact_matmul.rs`](../../crates/burn-tt/src/ops/exact_matmul.rs), gate `step159_exact_matmul`, ttsim and card 0,
+  log `1791761930`; smoke tier 890 of 890, log `1791763156`). The fast Matrix Unit matmul stays the default, with the
+  tolerance now stated (the group adder's derived bound, `step158`). Exact means F32 SFPU products summed in
+  increasing `k` order from `+0.0`, no FPU and no TF32. Selected by `TtConfig::matmul(..)` or
+  `TT_EXACT_MATMUL=1` for an attachment, and by `with_matmul_mode(..)` / `exact_matmul(..)` for the ops a closure builds
+  on this thread (not reaching `Fusion<TtBackend>`, whose ops run on another thread; a trace freezes the mode it was
+  captured in). No new kernel: a gather into `[k, outputs]`, an SFPU multiply and `float_sum_dim` over
+  dimension 0 (the only in-order layout), chunked over outputs; every route is covered by one hook (conv, linear,
+  attention, gradients, batch broadcast, views, BF16 widened). Equal to an independent sequential-SFPU oracle bit
+  for bit on random operands, all special values, every route, a trace and autodiff `backward()`; two mutations
+  (reversed `k`, a wrong join) are caught. Refused by name: a mesh, a `k` beyond one chunk, more than 1024 chunks.
+  **Price (card 0, `1791761944`): 1,000x to 22,000x slower than the fast matmul, about 0.5 us a product**
+  (`[256,256]^2`: 8.2 s against 376 us; [performance-log.md](../learnings/performance-log.md#exact-matmul-cost-2026-10-11-card-0)).
+  **What it settled:** every one of the 21 `precision` entries passes in exact mode (on silicon for the large LU
+  tests), so they were the Matrix Unit matmul and not separate defects. Next: a faster formulation (below).
+- [ ] **Faster exact matmul.** The exact path is linear in products at about 0.5 us each; whether its two
+  `k x outputs` host address tables or the device gathers dominate is not profiled. The untried
+  formulations need far fewer addresses and give the same sum in the same order: a loop over `k` of
+  `acc = acc + a[:, p] * b[p, :]` (about `m + n` addresses a step), or one output row at a time. Profile first,
+  then build the cheaper one and re-measure (`cargo xtask bench --filter step159_exact_matmul::benchmark`); a
+  `k`-loop also removes the chunk limit that refuses the 4.3e10-product transaction test.
+- [ ] **Conformance findings** (rounds one to four are closed: softmax of any rank, I32/Bool
   `reshape`, broadcast `mask_where`/`powf`, empty `cat`, the planner bug, `bool_argwhere`, `interpolate`,
-  `scatter_nd`; see [conformance-to-feature.md](conformance-to-feature.md)). 67 tests remain, each a group
-  in `expected-failures.toml`; fixing one removes its tests from the list. In the order the model ladder
-  needs them:
-  1. `conv3d` (9 tests) and `conv_transpose3d` (11): refused by name, a deferral. A video or volumetric
-     model needs them; composing from the 2-D kernels per depth tap is the first thing to try (untested).
-  2. `deform_conv2d` (17): refused by name, a deferral. Offsets are data-dependent, so unlike
+  `scatter_nd`, `conv3d`/`conv_transpose3d`; see [conformance-to-feature.md](conformance-to-feature.md)).
+  49 tests remain, each a group in `expected-failures.toml`; fixing one removes its tests from the list.
+  In the order the model ladder needs them:
+  1. `deform_conv2d` (17): refused by name, a deferral. Offsets are data-dependent, so unlike
      `interpolate` the tap tables cannot be built from shapes alone (a device-side gather of data-dependent
-     indices plus the existing matmul is the likely shape; design it first).
-  3. Nineteen `precision` failures (gelu gradient 2, conv2d 1, LU and determinant 16), attributed to TF32
-     operand truncation (one reproduced by hand; the LU, determinant and conv2d ones are not decomposed):
-     derive a bound beside each, or decide whether a full-F32 matmul path (a multi-pass TF32 split) is
-     worth having. Never loosen a vendored tolerance.
+     indices plus the existing matmul is the likely shape; design it first, and see whether the generic
+     `Geometry<D>` weight and gradient tables can be reused).
+  2. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
+     determinant 16). **All pass in the exact profile**, so they are the Matrix Unit matmul (the fast mode's
+     documented rounding and TF32 truncation), not separate defects. Decomposed: the two `conv3d` ones are the
+     group adder (2026-10-11, [silicon-operating-notes.md](../learnings/silicon-operating-notes.md), "Matmul
+     accumulation: the Matrix Unit's group adder"; `step158_matmul_accumulation`, run `1791754387`: `MVMUL`
+     adds its 16 products in two groups of eight, aligned once to a quantum of 2^(largest operand-exponent sum
+     - 10) with half-up rounding; the model equals the device bit for bit); the gelu gradient is TF32
+     truncation (reproduced by hand); the LU, determinant and conv2d ones are the Matrix Unit matmul with
+     truncation and alignment **not separated** (apply the step158 model with TF32 truncation to the matmuls they
+     compose if it matters). Decision (2026-10-11): keep the fast matmul as the default and offer the exact one
+     opt-in (the entry above); the 21 stay listed in the default profile, `precision`, each reason saying the
+     exact profile passes it. Never loosen a vendored tolerance.
+  3. **Re-derive the `step68` and `step85` bounds.** They charge `2^-9 sum|ab|` for TF32 truncation and a few F32
+     additions, and nothing for the group alignment, which can be larger with exact operands (1024 beside seven
+     0.5s in one group: 1031 for 1027.5, `2^-8.2`; step158). They hold on their own similar-sized data, but are
+     not a guarantee. Add the alignment term from the measured rule (the gate's `dot` returns it) wherever a gate
+     derives a matmul bound.
   4. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
   5. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
      `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs).

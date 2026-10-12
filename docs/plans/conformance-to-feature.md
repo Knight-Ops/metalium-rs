@@ -205,6 +205,14 @@ value), and run the broad run with `cargo test --workspace --exclude tt-tests --
 by a second gate, `crates/burn-tt/tests/essentials.rs`, whose premise ("integer compute is missing") had
 gone stale when the integer ops landed: update the premise and the name, not just the number.
 
+**Numerical failures have a second profile.** `cargo xtask conformance --exact` runs the suite with matmuls
+accumulating in exact F32 (`TT_EXACT_MATMUL=1`, `burn_tt::MatmulMode::Exact`) against
+`expected-failures-exact.toml`. A `precision` entry that passes there is the Matrix Unit matmul, not a defect of
+the op under test; note it in the entry's reason, and do not change the default's arithmetic for it. An entry
+that still fails in the exact profile is a real finding. The exact profile is slower on ttsim, so some tests
+become `timeout` entries there: give each a silicon verdict in exact mode (`TT_EXACT_MATMUL=1 cargo xtask silicon
+--keep-going --timeout-secs 1500 --filter <module>`; the env reaches the spawned test processes).
+
 Run the checks the change touches ([AGENTS.md](../../AGENTS.md)): `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask check-no-sim-in-ship`,
 `cargo xtask check-no-flex-in-backend`, `cargo xtask gen-burn-ops --check`,
@@ -326,7 +334,7 @@ Lessons that generalize:
   few distinct values. Read the helper, fix it where it lives, and keep the unit test beside it.
 - A BF16 narrowing gate is silicon-only (PACR `0x105`, [`ttsim-divergence.md`](../learnings/ttsim-divergence.md)).
 
-Still open gaps (deferred, not designed away): `conv3d`, `conv_transpose3d`, `deform_conv2d`.
+Still open gaps (deferred, not designed away): `deform_conv2d`.
 Closed by a technical limit: F64 casts. Not closed: the precision failures,
 listed with their mechanisms, and the tests the simulator is too slow for, each with its silicon verdict.
 
@@ -353,3 +361,37 @@ Lessons that generalize:
 - **Controls that need the data to move belong on the data that moves.** On the special-laden pass a row can hold
   only infinities and NaNs, which nothing replaces; there Flex is the oracle, and the "something changed" controls
   are asserted on the normals pass.
+
+## Worked example: round four, `conv3d` and `conv_transpose3d`
+
+Another "missing op" that needed no kernel: `ops/conv.rs` already built its im2col and overlap-sum tables from
+shapes, so `Geometry` became generic over the number of spatial dimensions and the eight 3-D methods are
+one-line calls into the same generic functions. The 2-D path kept its exact source order, which the 2-D gates
+(`step85`, `step154`) and the MNIST golden confirm.
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| `conv3d` (7 of 9) and `conv_transpose3d` (11) | generated stubs that refused by name, filed under "not planned until a model needs it" (a deferral, so a gap) | `Geometry<const D: usize>`, generic `conv`, `conv_x_backward`, `conv_weight_backward`, `conv_transpose*`; the `padding_out` crop loops over `D` | `step157_conv3d` (3 simulator tests, plus a BF16 one on silicon) | pass |
+| `conv3d` forward, `test_conv3d_groups` and `_complex` (2) | **not the new op, and not TF32 truncation**: the Matrix Unit rounds each product of a group of eight to a quantum set by the group's largest (operands exact in TF32) | none; listed as `precision` with the mechanism | `step158_matmul_accumulation` (the model equals the device bit for bit) | same failure as ttsim; the gate passes on silicon |
+
+Lessons that generalize:
+
+- **Check an attribution before copying it.** These two failures look like the existing "TF32 truncation" ones
+  and the list's habit is to say so. The operands were `arange` integers below 2048, so they are exact, and the
+  claim would have been wrong. Computing the exact sum on the host, then running a plain matmul on the same
+  kind of integers, showed the cause is the shared matmul, found with no device change.
+- **Decompose a numerical mismatch by fitting a model to the device, one rule at a time.** Isolate one effect per
+  experiment (one big term and one small one; the same pair in every column; the second operand varied), fit the
+  rule, then score variants of it against the device on random data, counting mismatches: the right rule is the
+  one at zero, and its neighbours are off by hundreds. Three rules were found this way (the exponent is the sum
+  of the operands', a zero slice still sets it, `Dst` rounds ties upward), each only visible on data the earlier
+  tests did not have. Keep controls that turn each rule and show the gate fails.
+- **A filter that lists three tests may run one.** `xtask silicon --filter module::conv3d::` listed three tests
+  and ran only the first, which failed; the other two ran when named in full. Check the run count, not the list.
+- **A second implementation can decompose a whole group of failures at once.** Fitting the Matrix Unit's
+  accumulation explained two `conv3d` tests, but the cheap way to learn what the other 19 `precision` entries
+  were was to run the suite with an exact matmul (`--exact`): all 21 passed, so none was a separate defect.
+  Build the reference path first when failures share a suspect, and let the suite say which ones it explains.
+- **The exact profile exposed no regression, because the default path did not move.** The hook returns before
+  acting unless the mode is exact, so the default profile (1,789 pass, 49 listed), the MNIST golden and every
+  older gate were unchanged; confirm that, not just the new gate, when adding an opt-in mode.

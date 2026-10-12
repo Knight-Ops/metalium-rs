@@ -869,6 +869,50 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   bytes clear 12 bytes past the argument, on the caller's stack. The first version of `ioctl::lock_ctl` (never
   called before this) did that and the process died with SIGSEGV (exit 139) at its first `open_card`.
 
+## Matmul accumulation: the Matrix Unit's group adder (2026-10-11, card 0 and ttsim)
+
+Found by two of Burn's `conv3d` tests (`test_conv3d_groups`, `test_conv3d_complex`: `arange` operands, outputs of
+1.7e5 to 4.8e6) and decomposed to a model that equals the device bit for bit (gate `step158_matmul_accumulation`,
+ttsim and card 0, run `1791754387`). **It is not TF32 operand truncation**: the operands there are integers below
+2048, exact in TF32, and every sum is exact in F32. A tile matmul at HiFi4 still returns results off by whole
+units once the sum is large (`[32, 64] @ [64, 1]` of integers below 250 and 53: 32 of 32 rows inexact, worst 8 at
+2.3e5), because the unit does not add its products in F32.
+
+**The rule** (`MVMUL.md` calls its float model "a rough guide"; this is measured):
+
+- One `MVMUL` is a 16-term dot product, run once per fidelity phase (four at HiFi4: SrcB `hi`/`lo` times SrcA
+  `hi`/`lo`). Its terms are **two groups of eight** (k = 0..7 and 8..15).
+- In a group, a term's exponent is `exp(a) + exp(b)`, the sum of the *operands'* exponents, not the product's (with
+  `SrcA = 3` the quantum was 2^(16+1-10) = 128, not the 256 of a product of exponent 18). A low slice's exponent is
+  taken from its position (SrcB 7 below the operand's, SrcA 5 below) and **a zero slice still sets it**.
+- The group is aligned once to a quantum `2^(max term exponent - 10)` (ten fraction bits, the quantum step90 found
+  for `ELWADD`), every product is rounded **half-up on its magnitude** to a multiple of it, and the products are
+  summed exactly. Terms are not added in a tree: two 31s beside a 1024 vanish together wherever they sit.
+- The two group sums go to the F32 `Dst` as two adds, each to nearest with **ties toward +infinity** (a different
+  rule from the group's); the four phases of a face run in order, faces in order.
+- Across groups, `MVMUL`s, faces and tiles nothing else is lost: `P` at k = 0 and `Q` at k = 8 or 16 or 40 is `P + Q`.
+  In one group it is `P + round(Q)`.
+
+A term that is small beside its group's largest therefore loses its low bits, and rounding up is one-sided, so the
+error is mostly high (26 of 27 in `groups`). A group of terms of one size loses nothing, which is why small
+integers and `step85`/`step157` data equal exact arithmetic and `arange` data does not.
+
+**Bound** (derived from the rule, exact operands): `|result - exact| <= sum over phases, faces, groups of
+(nonzero terms) x quantum / 2, plus one ulp of Dst per add`. The worst measured error over thousands of rows was 0.44
+of it. It is not small: a group of one 1024 and seven 0.5s gives 1031 for 1027.5 (error 3.5, `2^-8.2`), with every
+operand exact in TF32 and every sum exact in F32; with the 0.5s in the other group it is exact. That is **larger than
+the `2^-9 sum|ab|` the `step68` and `step85` bounds charge for TF32 truncation**, and those bounds charge nothing for
+this alignment, so they hold on their own (fractional, similar-sized) data but are not a guarantee for an
+adversarial exponent spread. Re-derive them from this rule before relying on them elsewhere.
+
+**Consequences.** A multi-pass TF32 operand split cannot repair it: the operands are already exact. The loss is
+a property of the FPU's reduction, so a fix is a different reduction, not more operand bits: that is
+`burn_tt::MatmulMode::Exact` (2026-10-11, F32 SFPU products summed in `k` order, opt-in; `step159_exact_matmul`),
+which passes every Burn test the Matrix Unit's rounding failed, on silicon too (all 24 LU tests, the 300 to 500 square
+and rectangular ones taking 95 to 579 s, run `1791758996`; the determinants, attention and CTC too), at 1,000x to 22,000x the cost. For fractional float data the TF32 truncation (about 2^-11 per operand) is of the same order as
+a group's rounding, so the effect shows chiefly with exact data and large sums. Not covered: LoFi to HiFi3, BF16
+`Src`, `Dst` as BF16, subnormals, NaN and infinity. ttsim and silicon agree on all of it.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

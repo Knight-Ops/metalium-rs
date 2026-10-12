@@ -37,6 +37,7 @@ mod error;
 pub mod fusion;
 mod generated;
 mod host;
+mod matmul_mode;
 mod ops;
 mod random;
 mod registry;
@@ -51,6 +52,9 @@ mod unsupported;
 mod views;
 
 pub use error::TtError;
+pub use matmul_mode::{exact_matmul, with_matmul_mode, MatmulMode};
+#[doc(hidden)]
+pub use ops::set_exact_matmul_chunk_products;
 pub use random::Draw;
 pub use report::{
     host_ok, report, report_reset, set_strict, strict, strictly, with_report, OpStat, Report,

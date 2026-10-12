@@ -21,7 +21,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `check-isa-sources` | Parse `Bits32.lua` and report, generating nothing. |
 | `check-no-sim-in-ship` | `cargo tree` over every `SHIPPABLE` crate (`src/ship.rs`) must not reach `tt-ttsim` / `tt-ttsim-sys`; every workspace member must be `SHIPPABLE` or `DEV_ONLY`. |
 | `silicon [options]` | The silicon suite, one test per process. |
-| `conformance [options]` | Burn's own backend tests against `burn-tt` on ttsim, one test per process, compared with `crates/burn-tt-conformance/expected-failures.toml`. See that crate's README. |
+| `conformance [options]` | Burn's own backend tests against `burn-tt` on ttsim, one test per process, compared with `crates/burn-tt-conformance/expected-failures.toml`; `--exact` runs the second profile, with exact matmul accumulation (`expected-failures-exact.toml`). See that crate's README. |
 | `bench [options]` | The firmware benchmarks on silicon, collected into `target/silicon/bench/`. |
 
 `--check` fails if the committed file is stale instead of rewriting it. CI runs all

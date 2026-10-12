@@ -3267,17 +3267,137 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvOptions<3>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("conv3d", false);
-        crate::unsupported::fail(
-            "conv3d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("weight={}", crate::unsupported::context(&weight)),
-                format!("bias={}", crate::unsupported::context(&bias)),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("conv3d", true);
+        let mut storage_inputs = vec![&x, &weight];
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("conv3d", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv3d(x, weight, bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let weight = crate::ops::float_compute_input(weight);
+            return crate::ops::cast_native(
+                crate::ops::module::conv3d(x, weight, bias, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv3d(x, weight, bias, options)
+    }
+    fn conv3d_x_backward(
+        x: FloatTensor<TtBackend>,
+        weight: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+        options: ConvOptions<3>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv3d_x_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv3d_x_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv3d_x_backward(x, weight, output_grad, options),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let weight = crate::ops::float_compute_input(weight);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv3d_x_backward(x, weight, output_grad, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv3d_x_backward(x, weight, output_grad, options)
+    }
+    fn conv3d_weight_backward(
+        x: FloatTensor<TtBackend>,
+        weight: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+        options: ConvOptions<3>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv3d_weight_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv3d_weight_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv3d_weight_backward(x, weight, output_grad, options),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let weight = crate::ops::float_compute_input(weight);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv3d_weight_backward(x, weight, output_grad, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv3d_weight_backward(x, weight, output_grad, options)
+    }
+    fn conv3d_bias_backward(
+        x: FloatTensor<TtBackend>,
+        bias: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv3d_bias_backward", true);
+        let storage_inputs = [&x, &bias, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv3d_bias_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let bias = crate::ops::bfp_compute_input(bias);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv3d_bias_backward(x, bias, output_grad),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &bias, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let bias = crate::ops::float_compute_input(bias);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv3d_bias_backward(x, bias, output_grad),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv3d_bias_backward(x, bias, output_grad)
     }
     fn conv_transpose2d(
         x: FloatTensor<TtBackend>,
@@ -3392,17 +3512,149 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: ConvTransposeOptions<3>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("conv_transpose3d", false);
-        crate::unsupported::fail(
-            "conv_transpose3d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("weight={}", crate::unsupported::context(&weight)),
-                format!("bias={}", crate::unsupported::context(&bias)),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("conv_transpose3d", true);
+        let mut storage_inputs = vec![&x, &weight];
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose3d", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose3d(x, weight, bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let weight = crate::ops::float_compute_input(weight);
+            return crate::ops::cast_native(
+                crate::ops::module::conv_transpose3d(x, weight, bias, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv_transpose3d(x, weight, bias, options)
+    }
+    fn conv_transpose3d_x_backward(
+        weight: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+        options: ConvTransposeOptions<3>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose3d_x_backward", true);
+        let storage_inputs = [&weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose3d_x_backward", &storage_inputs);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose3d_x_backward(
+                    weight,
+                    output_grad,
+                    options,
+                ),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&weight, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let weight = crate::ops::float_compute_input(weight);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv_transpose3d_x_backward(weight, output_grad, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv_transpose3d_x_backward(weight, output_grad, options)
+    }
+    fn conv_transpose3d_weight_backward(
+        x: FloatTensor<TtBackend>,
+        weight: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+        options: ConvTransposeOptions<3>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose3d_weight_backward", true);
+        let storage_inputs = [&x, &weight, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose3d_weight_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose3d_weight_backward(
+                    x,
+                    weight,
+                    output_grad,
+                    options,
+                ),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let weight = crate::ops::float_compute_input(weight);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv_transpose3d_weight_backward(
+                    x,
+                    weight,
+                    output_grad,
+                    options,
+                ),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv_transpose3d_weight_backward(x, weight, output_grad, options)
+    }
+    fn conv_transpose3d_bias_backward(
+        x: FloatTensor<TtBackend>,
+        bias: FloatTensor<TtBackend>,
+        output_grad: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("conv_transpose3d_bias_backward", true);
+        let storage_inputs = [&x, &bias, &output_grad];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("conv_transpose3d_bias_backward", &storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let bias = crate::ops::bfp_compute_input(bias);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::conv_transpose3d_bias_backward(x, bias, output_grad),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&x, &bias, &output_grad]);
+        if compute_dtype == burn_backend::DType::BF16 {
+            let x = crate::ops::float_compute_input(x);
+            let bias = crate::ops::float_compute_input(bias);
+            let output_grad = crate::ops::float_compute_input(output_grad);
+            return crate::ops::cast_native(
+                crate::ops::module::conv_transpose3d_bias_backward(x, bias, output_grad),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::conv_transpose3d_bias_backward(x, bias, output_grad)
     }
     fn unfold4d(
         x: FloatTensor<TtBackend>,

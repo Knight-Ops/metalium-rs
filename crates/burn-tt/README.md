@@ -82,7 +82,7 @@ ADC path is slower than native repack.
 |---|---|
 | `TtBackend`, `TtDevice { chip }` | The backend marker and a chip by index. |
 | `TtTensor` | A shared cell with a lazily filled host copy (owned tensor bytes) and device copy (GDDR buffer). |
-| *(nothing)* | A device is attached by the first op that needs it: `TtDevice::new(n)` opens `/dev/tenstorrent/n` on one card's first surviving tile (`TileChoice::First`), configured by `TT_TOPOLOGY`, `TT_TILES` and `TT_MATH`. A failed open is remembered: the next op fails at once with the same `TtError`. |
+| *(nothing)* | A device is attached by the first op that needs it: `TtDevice::new(n)` opens `/dev/tenstorrent/n` on one card's first surviving tile (`TileChoice::First`), configured by `TT_TOPOLOGY`, `TT_TILES`, `TT_MATH` and `TT_EXACT_MATMUL`. A failed open is remembered: the next op fails at once with the same `TtError`. |
 | `init(device, TtConfig)`, `detach(device)` | The explicit, fallible form (a typed error instead of a panic in the first op), and the way back: `detach` closes the card; tensors made before it are `StaleTensor`. `init` is idempotent for an equal `TtConfig` and `AlreadyAttached` for another. |
 | `TtConfig` | Builder for what `init` and `attach_with` open: `topology`, `tiles`, `route`, `fidelity`, `elementwise`; `TtConfig::from_env()` applies the environment. |
 | `attach_with(device, TtConfig)`, `attach(device, factory)` | Scoped, explicit attachment for tests and benchmarks: the guard detaches on drop. `attach` runs any `Engine` factory on the server thread. Attaching a device twice is `TtError::AlreadyAttached`. |
@@ -140,6 +140,47 @@ broadcast improvements but do not justify changing the default.
 role-stream instruction audit establish execution; this field is not a hardware
 instruction counter. Ttsim covers packed inputs/F32 outputs; its existing PACR
 `0x105` refusal leaves BF16 result narrowing and BF16 Burn gradients silicon-only.
+
+## Matmul accumulation: fast (default) or exact
+
+A matmul runs on the Matrix Unit by default (`MatmulMode::Fast`): the fastest path, TF32 operands,
+and **not an F32 accumulation**. Each `MVMUL` adds its 16 products in two groups of eight, aligned once
+to a quantum of `2^(largest operand-exponent sum - 10)` with each product rounded half-up to it, so a
+term small beside its group's largest loses its low bits. That is a measured rule (`step158`, and
+`docs/learnings/silicon-operating-notes.md`, "Matmul accumulation: the Matrix Unit's group adder") with a
+derived bound: `|result - exact|` is at most half a quantum per rounded term plus an ulp of `Dst` per
+add, plus the TF32 truncation of the operands. For fractional float data of similar size this is of the
+order of the TF32 truncation; it shows chiefly where the operands are exact and the sums large.
+
+`MatmulMode::Exact` is **opt-in**: every product is an F32 SFPU multiply (to nearest, subnormals flushed)
+and the products are summed in increasing `k` order, sequentially, in F32, from `+0.0`. No FPU, no TF32.
+It is composed from resident SFPU ops (`ops/exact_matmul.rs`), chunked over output elements, with no new
+kernel, and is far slower (`docs/learnings/performance-scoreboard.md` has its measured price): for
+validation and for work that needs CPU-order accuracy, not for training.
+
+```rust,no_run
+use burn::tensor::Tensor;
+use burn_tt::{exact_matmul, MatmulMode, TtBackend, TtConfig, TtDevice};
+let device = TtDevice::new(0);
+
+// Exact for a device's whole attachment (or `TT_EXACT_MATMUL=1` with `TtConfig::from_env`):
+burn_tt::init(device, TtConfig::default().matmul(MatmulMode::Exact))?;
+
+// Or, on a fast device, exact for the ops a closure builds on this thread; scopes nest, and
+// `with_matmul_mode(MatmulMode::Fast, ..)` goes back. Wrap `backward()` for exact gradients:
+let x = Tensor::<TtBackend, 2>::ones([4, 8], &device);
+let w = Tensor::<TtBackend, 2>::ones([8, 2], &device);
+let y = exact_matmul(|| x.matmul(w));
+# Ok::<(), burn_tt::TtError>(())
+```
+
+Everything that is a matmul takes the mode: `linear`, `conv`, `attention`, gradients, batched and
+broadcast products, views; BF16 operands widen to F32 and narrow once. Limits, each refused by name
+rather than run fast: a mesh engine (attach and scope both), a `k` or an output count that does not fit
+the chunk (`set_exact_matmul_chunk_products`, 2^20 products by default; at most 1024 chunks), non-F32
+dtypes as before. Two things the scope cannot do: reach `Fusion<TtBackend>` (`burn_tt::Tt`), whose ops
+run later on another thread (there only the config applies), and change a trace after capture (a trace
+freezes the mode it was captured in).
 
 ## New Tensix primitives
 
@@ -238,7 +279,8 @@ unparsable value as `0`.
 | `TT_TILIZE` | `host`, `card` | Where tensors take the tile layout on their way to the card's GDDR and lose it on the way back (`Session::set_tilize`): the host's cores, or each tile's data mover. Burn sees row-major data either way, with the same bits. `host` is faster at every size measured: the host copies the rows into pinned memory either way, at about the cost of tilizing them, and a mover tilizes ~2.6 us a tile. |
 | `TT_MATH` | `precise`, `approx` | How transcendentals run (`Session::set_math_mode`, S10): `approx` selects the faster approximate programs, held to bounds derived beside each gate; any other value is refused at open. |
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
-| `TT_EXACT` | must be unset | Retired with the Flex cutover. Native numerical bounds apply; unset this variable. |
+| `TT_EXACT` | must be unset | Retired with the Flex cutover. Native numerical bounds apply; unset this variable. (Not the same as `TT_EXACT_MATMUL`.) |
+| `TT_EXACT_MATMUL` | unset, `0`, `1` | `1`: matmuls accumulate in exact F32 in `k` order on the SFPU (`MatmulMode::Exact`, `TtConfig::from_env`) instead of on the Matrix Unit; any other value is refused. The `tt-tests` harness's `Config::default()` reads it too. |
 | `TT_PROFILE` | unset, a path | Records a device-side profile of everything an attachment runs and writes it as Chrome trace JSON on detach (`{chip}` in the path becomes the card). Silicon only. |
 | `TT_REPORT` | unset, `1` | `1`: print the per-op report at exit (`burn_tt::report`): for every op, calls, results made on the device and on the host, bytes downloaded, uploaded and host-staged, and whether `burn-tt` implements it (`tt`) or the method is unsupported (`unsupported`). The worklist for a new model. |
 | `TT_STRICT` | unset, `1` | `1`: a download a host op causes, or a host-staged matmul, panics with the op's name (`burn_tt::set_strict`; one thread's block: `burn_tt::strictly`). Reading results back (`into_data`) is never one; `burn_tt::host_ok(..)` marks intended host work. |

@@ -2,9 +2,7 @@
 //! `docs/plans/burn-op-coverage.md`). Each must fail explicitly with
 //! its name and the input metadata, never fall back to a host computation.
 //! Needs no hardware: refusal inspects metadata only.
-use burn_backend::ops::{
-    ConvOptions, ConvTransposeOptions, InterpolateMode, InterpolateOptions, ModuleOps,
-};
+use burn_backend::ops::{DeformConvOptions, InterpolateMode, InterpolateOptions, ModuleOps};
 use burn_backend::tensor::FloatTensor;
 use burn_backend::TensorPrimitive;
 use burn_tensor::Tensor;
@@ -36,31 +34,39 @@ fn assert_refused(message: &str, op: &str, shape: &str) {
     assert!(message.contains("F32"), "{message}");
 }
 
+/// `conv3d` and `conv_transpose3d` are native (`step157_conv3d`); a deformable convolution is not, and
+/// its backward pass names itself.
 #[test]
-fn volumetric_convolutions_are_refused_by_name() {
+fn deformable_convolution_is_refused_by_name() {
     let d = TtDevice::new(310);
-    let (x, w) = (
-        primitive([1, 1, 2, 2, 2], &d),
-        primitive([1, 1, 1, 1, 1], &d),
-    );
+    let operands = || {
+        (
+            primitive([1, 1, 3, 3], &d),
+            primitive([1, 2, 2, 2], &d),
+            primitive([1, 1, 2, 2], &d),
+        )
+    };
+    let options = || DeformConvOptions::new([1; 2], [0; 2], [1; 2], 1, 1);
+    let (x, offset, weight) = operands();
     let message = refusal(move || {
-        let _ = TtBackend::conv3d(x, w, None, ConvOptions::new([1; 3], [0; 3], [1; 3], 1));
+        let _ = TtBackend::deform_conv2d(x, offset, weight, None, None, options());
     });
-    assert_refused(&message, "conv3d", "[1, 1, 2, 2, 2]");
+    assert_refused(&message, "deform_conv2d", "[1, 1, 3, 3]");
 
-    let (x, w) = (
-        primitive([1, 1, 2, 2, 2], &d),
-        primitive([1, 1, 1, 1, 1], &d),
-    );
+    let (x, offset, weight) = operands();
+    let output_grad = primitive([1, 1, 2, 2], &d);
     let message = refusal(move || {
-        let _ = TtBackend::conv_transpose3d(
+        let _ = TtBackend::deform_conv2d_backward(
             x,
-            w,
+            offset,
+            weight,
             None,
-            ConvTransposeOptions::new([1; 3], [0; 3], [0; 3], [1; 3], 1),
+            None,
+            output_grad,
+            options(),
         );
     });
-    assert_refused(&message, "conv_transpose3d", "[1, 1, 2, 2, 2]");
+    assert_refused(&message, "deform_conv2d_backward", "[1, 1, 3, 3]");
 }
 
 /// `interpolate` is native (`step155_interpolate`); what it still refuses, it refuses by name.

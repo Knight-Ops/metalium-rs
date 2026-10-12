@@ -39,6 +39,10 @@ usage: cargo xtask conformance [options]
   --filter S            run only tests whose `binary::test` name contains S;
                         repeatable. A filtered run does not check for stale entries
   --fusion              run on Fusion<TtBackend> (expected-failures-fusion.toml)
+  --exact               matmuls accumulate in exact F32, in k order, on the SFPU
+                        (TT_EXACT_MATMUL=1, `burn_tt::MatmulMode::Exact`) rather
+                        than on the Matrix Unit: expected-failures-exact.toml,
+                        and `-fusion-exact` with --fusion
   --jobs N              processes at a time (default: the CPU count)
   --timeout-secs N      per-test wall-clock limit (default 120)
   --strict              TT_STRICT=1: a download or a staged matmul panics the test
@@ -53,6 +57,7 @@ struct Opts {
     suites: Vec<String>,
     filters: Vec<String>,
     fusion: bool,
+    exact: bool,
     jobs: usize,
     timeout: Duration,
     strict: bool,
@@ -66,6 +71,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         suites: Vec::new(),
         filters: Vec::new(),
         fusion: false,
+        exact: false,
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         timeout: Duration::from_secs(120),
         strict: false,
@@ -94,6 +100,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                     Duration::from_secs(number("--timeout-secs", value("--timeout-secs")?)? as u64)
             }
             "--fusion" => o.fusion = true,
+            "--exact" => o.exact = true,
             "--strict" => o.strict = true,
             "--release" => o.release = true,
             "--update" => o.update = true,
@@ -125,14 +132,15 @@ struct Group {
     tests: BTreeSet<String>,
 }
 
-fn expected_path(fusion: bool) -> PathBuf {
+fn expected_path(fusion: bool, exact: bool) -> PathBuf {
+    let name = format!(
+        "expected-failures{}{}.toml",
+        if fusion { "-fusion" } else { "" },
+        if exact { "-exact" } else { "" }
+    );
     workspace_root()
         .join("crates/burn-tt-conformance")
-        .join(if fusion {
-            "expected-failures-fusion.toml"
-        } else {
-            "expected-failures.toml"
-        })
+        .join(name)
 }
 
 /// Read the expected-failures file.
@@ -372,7 +380,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let expected_file = expected_path(o.fusion);
+    let expected_file = expected_path(o.fusion, o.exact);
     let mut groups = read_expected(&expected_file)?;
     let reasons: BTreeMap<String, (String, String)> = groups
         .iter()
@@ -525,6 +533,9 @@ fn run_all(o: &Opts, selection: &[(String, Built, String)], out_dir: &Path) -> V
     let mut env: Vec<(&str, String)> = vec![("TT_REPORT", "1".into())];
     if o.strict {
         env.push(("TT_STRICT", "1".into()));
+    }
+    if o.exact {
+        env.push(("TT_EXACT_MATMUL", "1".into()));
     }
     std::thread::scope(|scope| {
         for _ in 0..o.jobs.min(selection.len()) {
