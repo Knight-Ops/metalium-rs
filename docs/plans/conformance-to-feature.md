@@ -434,3 +434,27 @@ Lessons that generalize:
   is why it is not the only test.
 - **The simulator is slow where silicon is not:** the main test takes 77 s on ttsim and 1.5 s on card 0, so the
   smoke tier is where a regression is cheap to find.
+
+## Worked example: round six, the suite on `Fusion<TtBackend>` (B13a)
+
+The first run of the suite on `burn_tt::Tt` (`cargo xtask conformance --fusion`; the harness existed, the lists did not).
+1,800 of 1,838 passed: the 32 failures listed for the default run recurred, and six were new, all in a layer no earlier
+round had exercised: the fuser and burn-fusion itself. After the fix 1,803 pass and 35 are listed.
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| `thresholded_relu` (2) and `mask_fill_swap_dims` (1) returned wrong values | burn-fusion hands a fuser every scalar as `ScalarIr::UInt(id)`, its value bound only at execution, and `ElementWiseFuser` took every id for zero: any `lower_equal_elem` + `mask_fill` pair ran as `relu` | the match records the scalar ids it assumed to be `+0.0` (`TtOptimization::{AddRelu, Relu}.zeros`); `execute` reads them from `Context::scalars` and, if one differs, runs the original operations (`OrderedExecution::operation_within_optimization`) | `step161_fusion_scalar_guard`: a real `relu` and `add` + `relu` stay fused (counters), other thresholds and fill values equal the host oracle after a `relu` of the same shape; fails against the old fuser | pass (log `1791772236`) |
+| `bool_equal_elem`, `bool_not_equal_elem`, bool `mask_fill` (3) | burn-fusion 0.21.0 `ScalarIr::to_relative` is `todo!()` for a Bool scalar; the fusion server thread dies | not ours: listed as `bug` with the upstream location in `expected-failures-fusion*.toml` | none | n/a |
+
+Lessons that generalize:
+
+- **A fuser sees a graph, not its values.** burn-fusion reuses a cached plan for the same graph with other scalars, so a
+  match on "the scalar is zero" cannot be decided when the fuser runs. Record what the match assumed and check it when the
+  plan executes, with the unfused operations as the fallback. The first version looked right because the only scalar in
+  the training graphs is zero.
+- **The conformance suite is also the test of the layers around the ops.** Nothing in the default run reaches the fuser,
+  and the MNIST gates only ever feed it a real ReLU. The wrong results were upstream's own `thresholded_relu` and
+  `mask_fill` tests.
+- **Run a case right after the plan it must not reuse.** The gate runs each other scalar after a real `relu` of the same
+  shape; a gate that began with the thresholded case would not meet a cached plan.
+- **The exact profile added nothing under fusion**: the same 20 entries as without it, plus the upstream bool ones.

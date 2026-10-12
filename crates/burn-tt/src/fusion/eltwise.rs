@@ -8,8 +8,8 @@
 
 use burn_fusion::{FuserProperties, FuserStatus, OperationFuser};
 use burn_ir::{
-    BaseOperationIr, BinaryOpIr, MaskFillOpIr, NumericOperationIr, OperationIr, ScalarOpIr,
-    TensorIr,
+    BaseOperationIr, BinaryOpIr, MaskFillOpIr, NumericOperationIr, OperationIr, ScalarIr,
+    ScalarOpIr, TensorIr,
 };
 
 use super::TtOptimization;
@@ -35,22 +35,26 @@ enum FuserState {
         rhs: TensorIr,
         add_out: TensorIr,
         mask: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     LowerEqual {
         input: TensorIr,
         mask: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     AddReluMatched {
         lhs: TensorIr,
         rhs: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     ReluMatched {
         input: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     Closed {
@@ -86,7 +90,7 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
                     rhs: scalar,
                     out,
                 }),
-            ) if is_zero_scalar(scalar) => match &self.state {
+            ) if zero_scalar_ids(scalar).is_some() => match &self.state {
                 FuserState::Add {
                     lhs,
                     rhs,
@@ -98,6 +102,7 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
                         rhs: rhs.clone(),
                         add_out: add_out.clone(),
                         mask: out.clone(),
+                        zeros: zero_scalar_ids(scalar).unwrap_or_default(),
                         num_ops: num_ops + 1,
                     };
                 }
@@ -105,6 +110,7 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
                     self.state = FuserState::LowerEqual {
                         input: input.clone(),
                         mask: out.clone(),
+                        zeros: zero_scalar_ids(scalar).unwrap_or_default(),
                         num_ops: 1,
                     };
                 }
@@ -119,29 +125,33 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
                 mask,
                 value,
                 out,
-            })) if is_zero_scalar(value) => match &self.state {
+            })) if zero_scalar_ids(value).is_some() => match &self.state {
                 FuserState::AddLowerEqual {
                     lhs,
                     rhs,
                     add_out,
                     mask: expected_mask,
+                    zeros,
                     num_ops,
                 } if tensor.id == add_out.id && mask.id == expected_mask.id => {
                     self.state = FuserState::AddReluMatched {
                         lhs: lhs.clone(),
                         rhs: rhs.clone(),
                         out: out.clone(),
+                        zeros: with_ids(zeros, value),
                         num_ops: num_ops + 1,
                     };
                 }
                 FuserState::LowerEqual {
                     input,
                     mask: expected_mask,
+                    zeros,
                     num_ops,
                 } if tensor.id == input.id && mask.id == expected_mask.id => {
                     self.state = FuserState::ReluMatched {
                         input: input.clone(),
                         out: out.clone(),
+                        zeros: with_ids(zeros, value),
                         num_ops: num_ops + 1,
                     };
                 }
@@ -183,20 +193,24 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
                 lhs,
                 rhs,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimization::AddRelu {
                 lhs,
                 rhs,
                 out,
+                zeros,
                 num_ops,
             },
             FuserState::ReluMatched {
                 input,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimization::Relu {
                 input,
                 out,
+                zeros,
                 num_ops,
             },
             _ => panic!("finish called on non-ready fuser"),
@@ -253,10 +267,22 @@ impl OperationFuser<TtOptimization> for ElementWiseFuser {
     }
 }
 
-fn is_zero_scalar(s: &burn_ir::ScalarIr) -> bool {
+/// The runtime scalar ids a match assumes to be `+0.0`, or `None` when the scalar cannot be.
+///
+/// burn-fusion hands a fuser every scalar as `ScalarIr::UInt(id)`: the value is bound only when
+/// the plan executes (a cached plan is reused for the same graph with other scalars). A match
+/// therefore cannot decide `relu` against `thresholded_relu(alpha)` or `mask_fill(.., -5.0)`;
+/// the optimization records the ids and checks them at execution (`TtOptimization::execute`).
+fn zero_scalar_ids(s: &ScalarIr) -> Option<Vec<u64>> {
     match s {
-        burn_ir::ScalarIr::Float(v) => *v == 0.0,
-        burn_ir::ScalarIr::UInt(_) => true,
-        _ => false,
+        ScalarIr::Float(v) if v.to_bits() == 0 => Some(Vec::new()),
+        ScalarIr::UInt(id) => Some(vec![*id]),
+        _ => None,
     }
+}
+
+fn with_ids(ids: &[u64], scalar: &ScalarIr) -> Vec<u64> {
+    let mut ids = ids.to_vec();
+    ids.extend(zero_scalar_ids(scalar).unwrap_or_default());
+    ids
 }

@@ -44,26 +44,33 @@ pub enum TtOptimizationState {
         lhs: TensorIr,
         rhs: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     Relu {
         input: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
 }
 
+/// A fused pattern. `zeros` are the runtime scalars (relative ids) the match took to be `+0.0`:
+/// the fuser sees every scalar as an id whose value is bound only at execution, so
+/// [`Optimization::execute`] checks them and runs the original operations when one differs.
 #[derive(Debug)]
 pub enum TtOptimization {
     AddRelu {
         lhs: TensorIr,
         rhs: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
     Relu {
         input: TensorIr,
         out: TensorIr,
+        zeros: Vec<u64>,
         num_ops: usize,
     },
 }
@@ -87,8 +94,25 @@ impl Optimization<TtFusionRuntime> for TtOptimization {
     fn execute(
         &mut self,
         context: &mut burn_fusion::stream::Context<TtHandle>,
-        _execution: &burn_fusion::stream::OrderedExecution<TtFusionRuntime>,
+        execution: &burn_fusion::stream::OrderedExecution<TtFusionRuntime>,
     ) {
+        let (TtOptimization::AddRelu { zeros, .. } | TtOptimization::Relu { zeros, .. }) = &*self;
+        let all_zero = zeros.iter().all(|&id| {
+            matches!(
+                context.scalars.get(&burn_fusion::stream::ScalarId { value: id }),
+                Some(burn_ir::ScalarIr::Float(v)) if v.to_bits() == 0
+            )
+        });
+        if !all_zero {
+            // `relu(x)` is `mask_fill(x, x <= 0, 0)`; `thresholded_relu(x, alpha)` and
+            // `mask_fill(x, x <= t, v)` have the same shape with other scalars.
+            for index in 0..self.len() {
+                execution
+                    .operation_within_optimization(index)
+                    .execute(&mut context.handles);
+            }
+            return;
+        }
         match self {
             TtOptimization::AddRelu { lhs, rhs, out, .. } => {
                 FUSED_ADD_RELU_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
@@ -157,20 +181,24 @@ impl Optimization<TtFusionRuntime> for TtOptimization {
                 lhs,
                 rhs,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimizationState::AddRelu {
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
                 out: out.clone(),
+                zeros: zeros.clone(),
                 num_ops: *num_ops,
             },
             TtOptimization::Relu {
                 input,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimizationState::Relu {
                 input: input.clone(),
                 out: out.clone(),
+                zeros: zeros.clone(),
                 num_ops: *num_ops,
             },
         }
@@ -182,20 +210,24 @@ impl Optimization<TtFusionRuntime> for TtOptimization {
                 lhs,
                 rhs,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimization::AddRelu {
                 lhs,
                 rhs,
                 out,
+                zeros,
                 num_ops,
             },
             TtOptimizationState::Relu {
                 input,
                 out,
+                zeros,
                 num_ops,
             } => TtOptimization::Relu {
                 input,
                 out,
+                zeros,
                 num_ops,
             },
         }

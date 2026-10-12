@@ -1,0 +1,59 @@
+# The `--exact` profile: Burn's own backend tests with every matmul accumulating in exact F32,
+# in k order, on the SFPU (`burn_tt::MatmulMode::Exact`, TT_EXACT_MATMUL=1), against
+# `expected-failures.toml`, the default profile's list (the fast Matrix Unit matmul).
+#
+# Everything the default profile lists as `precision` passes here: the gelu gradient, conv2d,
+# conv3d, LU and determinant entries were the Matrix Unit's group adder and TF32 truncation, not
+# separate defects (docs/learnings/silicon-operating-notes.md, "Matmul accumulation: the Matrix
+# Unit's group adder"). What is listed below is not about precision.
+#
+# `cargo xtask conformance --exact` compares every run with this file: an unlisted failure is a
+# regression or a new finding, and a listed test that passes is stale, so the list only shrinks.
+# Test names are `<binary>::<test path>`, as `cargo xtask conformance --exact --list` prints them.
+
+[[group]]
+category = "unsupported-dtype"
+reason = "F64 is not a Tensix dtype: `float_cast` to F64 is refused by name. The two autodiff tests end as timeouts, as in the default profile (burn-tensor-testgen 0.21.0's `#[might_panic]` deadlocks when the panic message differs)."
+tests = [
+    "autodiff::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_checkpointing::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor::tensor::float::ops::slice::should_support_slice_fill_cast_f64",
+]
+
+[[group]]
+category = "unsupported-op"
+reason = "The exact matmul refuses by name a product it cannot do in a reasonable time: `[408, 261120] @ [261120, 408]` is 4.3e10 products, 41616 chunks against the limit of 1024 (`exact matmul: ... needs 41616 chunks (limit 1024); split the operands`), on ttsim and on silicon (card 0, run 1791761062). It passes in the default profile, on the Matrix Unit (13 s on silicon)."
+tests = [
+    "tensor::tensor::float::ops::transaction::should_support_transaction",
+]
+
+[[group]]
+category = "timeout"
+reason = "The exact matmul is composed from SFPU ops and the simulator does not finish these in the limit (120 s in the canonical run: the attention test takes 259 s, the 300 to 500 square LU and determinant tests and the CTC losses far more, each thousands of small device launches), but each passes on silicon, card 0, in exact mode: attention in 3.7 s (run 1791761017), the CTC losses in 4 to 8 s (1791761021), the 300 x 300 determinants in 43 s (1791760863), and the LU tests in 14 to 579 s (1791758996), within the 900 s limit. Not a defect: ttsim speed. (Silicon runs of the default profile fail the LU and determinant tolerances that these meet.)"
+tests = [
+    "autodiff::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "autodiff_checkpointing::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_ones",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_zeros",
+    "tensor::tensor::float::linalg::det::test_det_300x300_identity_matrix",
+    "tensor::tensor::float::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_wide",
+    "tensor::tensor::float::module::attention::test_attention_no_mask",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_mixed_input_lengths",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_sequence",
+]
+
+[[group]]
+category = "bug"
+reason = "burn-fusion 0.21.0 panics on a Bool scalar: `ScalarIr::to_relative` (`stream/context.rs:1340`) is `todo!(\"Unsupported dtype ({self:?}) for scalar\")`, reached when the stream registers `bool_equal_elem`, `bool_not_equal_elem` or a `mask_fill` with a bool value; the fusion server thread dies and the client sees `CallError`. Not burn-tt's code, so only under `Fusion<TtBackend>` (the same tests pass on `TtBackend`), and a user of `burn_tt::Tt` meets it too. Needs an upstream change (hold the bool as a literal, as it holds none today). Roadmap, Track 1."
+tests = [
+    "tensor::tensor::bool::ops::comparison::test_bool_equal_elem",
+    "tensor::tensor::bool::ops::comparison::test_bool_not_equal_elem",
+    "tensor::tensor::bool::ops::mask::should_support_bool_mask_fill_ops",
+]

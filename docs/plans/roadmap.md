@@ -40,7 +40,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   tests are in `--smoke`, validated on card 0. A second profile, `cargo xtask conformance --exact` (matmuls
   accumulate in exact F32, `TT_EXACT_MATMUL=1`), has its own list, `expected-failures-exact.toml`: **1,818
   pass, 20 listed** (3 F64, 1 product the exact mode refuses by name, 16 that ttsim is too
-  slow for and silicon passes). Still open: the run on `Fusion<TtBackend>` (B13a) and the F16 suites (D1).
+  slow for and silicon passes). The run on `Fusion<TtBackend>` (B13a, `--fusion`, 2026-10-12) passes
+  1,803 with 35 listed (the 32 above and three bool-scalar tests that die in burn-fusion 0.21.0, below), and with `--exact` 1,815 with
+  23 listed; it found and
+  fixed a fuser bug (below). Still open: the F16 suites (D1).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
   `step155_interpolate`, card 0, smoke tier 814 of 814, log `1791733008`). No new kernel: shape-only tap tables
@@ -108,7 +111,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   `scatter_nd`, `conv3d`/`conv_transpose3d`, `deform_conv2d`; see [conformance-to-feature.md](conformance-to-feature.md)).
   32 tests remain, each a group in `expected-failures.toml`; **none is a missing op**: what is left is the Matrix
   Unit's rounding (21, passing in the exact profile), simulator speed (8) and F64 (3). The next conformance work is
-  therefore the two runs still open (B13a, `Fusion<TtBackend>`, and D1, the F16 suites), not more list entries.
+  therefore the run still open (D1, the F16 suites; B13a's run on `Fusion<TtBackend>` is done, round six), not more list entries.
   In the order the model ladder needs them:
   1. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
      determinant 16). **All pass in the exact profile**, so they are the Matrix Unit matmul (the fast mode's
@@ -130,6 +133,17 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   3. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
   4. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
      `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs).
+- [x] **Fuser scalar guard** (2026-10-12, [`fusion/eltwise.rs`](../../crates/burn-tt/src/fusion/eltwise.rs) and `fusion/mod.rs`,
+  gate `step161_fusion_scalar_guard`, ttsim and card 0, log `1791772236`). Found by the suite on `Fusion<TtBackend>`:
+  burn-fusion gives a fuser every scalar as an id, and the fuser took every id for zero, so `thresholded_relu(x, a)` and
+  `mask_fill(x, x <= t, v)` ran as `relu` (3 of Burn's tests). The optimization now records the ids and checks
+  `Context::scalars` when it executes, falling back to the original operations. Real `relu` and `add` + `relu` stay fused
+  (`step12_mnist` unchanged). See [conformance-to-feature.md](conformance-to-feature.md), "round six".
+- [ ] **Bool scalars under `Fusion<TtBackend>`.** burn-fusion 0.21.0's `ScalarIr::to_relative` is `todo!()` for a Bool
+  scalar, so `bool_equal_elem`, `bool_not_equal_elem` and a bool `mask_fill` kill the fusion server thread on `burn_tt::Tt`
+  (three tests, `bug` in `expected-failures-fusion*.toml`; the same ops pass on `TtBackend`). It is upstream's code: either an
+  upstream change (keep the bool as a literal) or, meanwhile, a refusal by name in `burn-tt` that points at it, since a
+  user of `Tt` meets a dead thread today.
 - [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
   one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
 - [ ] **Model ladder**, each rung checked against burn-flex; every failure becomes an op or

@@ -168,6 +168,7 @@ pub const SMOKE: &[&str] = &[
     "step158_matmul_accumulation::",
     "step159_exact_matmul::",
     "step160_deform_conv2d::",
+    "step161_fusion_scalar_guard::",
     // What that gate made pass in Burn's own suite.
     // `test_conv3d_complex` and `_groups` are `precision` entries; the rest of the module passes.
     "tensor::float::module::conv3d::test_conv3d_simple",

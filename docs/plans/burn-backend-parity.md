@@ -617,7 +617,7 @@ binaries:
    is `1` or off.)
 
 **Gate (validation tier, ttsim):** `cargo xtask conformance --release` matches the expected-failures
-list; F32 tensor and both autodiff binaries first, F16 when D1 lands; `--fusion` after B13a.
+list; F32 tensor and both autodiff binaries first, F16 when D1 lands; `--fusion` is done (B13a).
 Plain `cargo test --workspace` neither builds nor runs it (every test target needs the `run`
 feature).
 
@@ -652,7 +652,7 @@ Ordered; each item's done-criterion is its gate. `HC:` = `hardware-coverage.md` 
 | **B10** (done 2026-10-11: `burn-tt-conformance`; no eager policy was needed, see 5.2) | Fetched, digest-pinned conformance suite on ttsim, expected-failures | B2, B0 | §5.2 gate: `cargo xtask conformance --release` |
 | **B11** (done 2026-10-11: 163 tests, card 0) | Conformance subset in `SMOKE` (curated modules, not generated) | B10 | `cargo xtask silicon --smoke` runs it on card 0 |
 | **B12** (partial: `impl BackendIr for TtBackend` with `TtHandle` exists, `tensor.rs`; the router/remote gate has never run -- neither `burn-router` nor `burn-remote` is a dependency or a test anywhere in the workspace) | `BackendIr` (`TtHandle`); router + remote gates | -- | `burn-remote` server on a card host passes the delegation battery from a client |
-| **B13a** (partial: `FusionBackend`, `TtFusionRuntime`, `burn_tt::Tt` and the default-on `fusion` feature exist; `step12_mnist` exercises `Tt`; "zero fusers" was superseded by the MVP fuser of B13b; conformance on `Fusion<TtBackend>` is open with B10) | `FusionBackend`, zero fusers, `burn_tt::Tt` alias, `fusion` feature | B12, B10 | conformance green on `Fusion<TtBackend>` |
+| **B13a** (partial: `FusionBackend`, `TtFusionRuntime`, `burn_tt::Tt` and the default-on `fusion` feature exist; `step12_mnist` exercises `Tt`; "zero fusers" was superseded by the MVP fuser of B13b; conformance on `Fusion<TtBackend>` ran 2026-10-12: 1,803 pass, 35 listed, `expected-failures-fusion*.toml`; three bool-scalar tests die in burn-fusion 0.21.0, so "green" is open on that upstream `todo!()` alone) | `FusionBackend`, zero fusers, `burn_tt::Tt` alias, `fusion` feature | B12, B10 | conformance green on `Fusion<TtBackend>` |
 | **B13b** (MVP only: `ElementWiseFuser` matches `add` + Burn's lowered ReLU as one `ADD_RELU` dispatch and a lone ReLU as `RELU`; no general chain fuser, no micro-op engine; see [kernel-fusion.md](kernel-fusion.md)) | Element-wise chain fuser | B13a, HC:F3/F4 (or chained `ELTWISE`) | one job per chain; golden unchanged |
 | **B13c** | Matmul + bias + ReLU epilogue fuser | B13b, HC:S1 | Linear+ReLU is one device job |
 | **B14** | `DistributedBackend` (host all-reduce), `distributed` feature on by default | B2 | `burn-train` DDP over two cards trains MNIST (slowly); Ethernet all-reduce with checklist 9.11 |
