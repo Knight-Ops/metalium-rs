@@ -2,18 +2,18 @@
 use super::*;
 use burn_backend::ops::{ConvOptions, ConvTransposeOptions};
 
-const PATCH_ROWS: usize = 32;
+pub(super) const PATCH_ROWS: usize = 32;
 
 /// Shapes are `[batch, channels, spatial...]` with `D` spatial dimensions.
-struct Geometry<const D: usize> {
-    x: Vec<usize>,
-    w: Vec<usize>,
-    y: Vec<usize>,
-    options: ConvOptions<D>,
+pub(super) struct Geometry<const D: usize> {
+    pub(super) x: Vec<usize>,
+    pub(super) w: Vec<usize>,
+    pub(super) y: Vec<usize>,
+    pub(super) options: ConvOptions<D>,
 }
 
 impl<const D: usize> Geometry<D> {
-    fn new(x: &TtTensor, weight: &TtTensor, options: ConvOptions<D>) -> Self {
+    pub(super) fn new(x: &TtTensor, weight: &TtTensor, options: ConvOptions<D>) -> Self {
         let x = x.shape().to_vec();
         let w = weight.shape().to_vec();
         assert_eq!(x.len(), D + 2, "convolution input requires N, C, spatial");
@@ -53,19 +53,19 @@ impl<const D: usize> Geometry<D> {
     }
 
     /// Output cells per batch element.
-    fn spatial(&self) -> usize {
+    pub(super) fn spatial(&self) -> usize {
         self.y[2..].iter().product()
     }
-    fn kernel(&self) -> usize {
+    pub(super) fn kernel(&self) -> usize {
         self.w[2..].iter().product()
     }
-    fn positions(&self) -> usize {
+    pub(super) fn positions(&self) -> usize {
         self.y[0] * self.spatial()
     }
-    fn k(&self) -> usize {
+    pub(super) fn k(&self) -> usize {
         self.w[1] * self.kernel()
     }
-    fn channels(&self) -> usize {
+    pub(super) fn channels(&self) -> usize {
         self.w[0] / self.options.groups
     }
 
@@ -112,7 +112,7 @@ impl<const D: usize> Geometry<D> {
         mapped_native(&[x, zero], sources, vec![count, self.k()])
     }
 
-    fn weights(&self, weight: &TtTensor, group: usize) -> TtTensor {
+    pub(super) fn weights(&self, weight: &TtTensor, group: usize) -> TtTensor {
         // [patch K, output channels], so output-column mesh partitioning can
         // execute the same native product on both cards.
         let sources = (0..self.k())
@@ -123,7 +123,13 @@ impl<const D: usize> Geometry<D> {
         mapped_native(&[weight], sources, vec![self.k(), self.channels()])
     }
 
-    fn gradients(&self, grad: &TtTensor, group: usize, first: usize, count: usize) -> TtTensor {
+    pub(super) fn gradients(
+        &self,
+        grad: &TtTensor,
+        group: usize,
+        first: usize,
+        count: usize,
+    ) -> TtTensor {
         let spatial = self.spatial();
         let sources = (first..first + count)
             .flat_map(|p| {
@@ -140,7 +146,7 @@ impl<const D: usize> Geometry<D> {
     }
 }
 
-fn zero(device: TtDevice) -> TtTensor {
+pub(super) fn zero(device: TtDevice) -> TtTensor {
     native_zeros([1, 1].into(), &device, DType::F32).expect("native convolution zeros")
 }
 
@@ -155,22 +161,38 @@ fn conv<const D: usize>(
     let x = float_compute_input(x);
     let weight = float_compute_input(weight);
     let z = zero(x.device);
+    conv_products(&g, &weight, bias, dtype, |group, first, count| {
+        g.patches(&x, &z, group, first, count)
+    })
+}
+
+/// Patch rows times the weights, one native product per group and chunk of [`PATCH_ROWS`]
+/// positions, joined into `g.y` with the bias added. `patches(group, first, count)` is the
+/// `[count, g.k()]` matrix of rows `first..first + count` (position `batch * spatial + cell`,
+/// patch element `channel * kernel + tap`), so a convolution whose taps are not fixed by the
+/// shapes supplies its own. `weight` is already in compute dtype; the result is cast to `dtype`.
+pub(super) fn conv_products<const D: usize>(
+    g: &Geometry<D>,
+    weight: &TtTensor,
+    bias: Option<TtTensor>,
+    dtype: DType,
+    mut patches: impl FnMut(usize, usize, usize) -> TtTensor,
+) -> TtTensor {
     let chunks = g.positions().div_ceil(PATCH_ROWS);
     let spatial = g.spatial();
     let mut products = Vec::new();
     for group in 0..g.options.groups {
-        let weights = g.weights(&weight, group);
+        let weights = g.weights(weight, group);
         for first in (0..g.positions()).step_by(PATCH_ROWS) {
             let count = PATCH_ROWS.min(g.positions() - first);
             products.push(float::float_matmul(
-                g.patches(&x, &z, group, first, count),
+                patches(group, first, count),
                 weights.clone(),
             ));
         }
     }
     let sources = (0..g.y[0])
         .flat_map(|n| {
-            let g = &g;
             (0..g.y[1]).flat_map(move |c| {
                 (0..spatial).map(move |s| {
                     let p = n * spatial + s;
@@ -221,13 +243,26 @@ fn conv_weight_backward_geometry<const D: usize>(
     let x = float_compute_input(x);
     let grad = float_compute_input(output_grad);
     let z = zero(x.device);
+    weight_gradient(&g, &grad, dtype, |group, first, count| {
+        g.patches(&x, &z, group, first, count)
+    })
+}
+
+/// `patches^T * output_grad` per group, summed over chunks of [`PATCH_ROWS`] positions, joined
+/// into the weight's shape. `grad` is in compute dtype and `patches` is as in [`conv_products`].
+pub(super) fn weight_gradient<const D: usize>(
+    g: &Geometry<D>,
+    grad: &TtTensor,
+    dtype: DType,
+    mut patches: impl FnMut(usize, usize, usize) -> TtTensor,
+) -> TtTensor {
     let mut outputs = Vec::new();
     for group in 0..g.options.groups {
         let mut sum = None;
         for first in (0..g.positions()).step_by(PATCH_ROWS) {
             let count = PATCH_ROWS.min(g.positions() - first);
-            let patches = float::float_transpose(g.patches(&x, &z, group, first, count));
-            let partial = float::float_matmul(patches, g.gradients(&grad, group, first, count));
+            let patches = float::float_transpose(patches(group, first, count));
+            let partial = float::float_matmul(patches, g.gradients(grad, group, first, count));
             sum = Some(if let Some(prior) = sum {
                 float::float_add(prior, partial)
             } else {
@@ -307,7 +342,7 @@ fn conv_x_backward_geometry<const D: usize>(
     cast_native(mapped_native(&refs, sources, g.x.clone()), dtype)
 }
 
-fn conv_bias_backward(bias: TtTensor, output_grad: TtTensor) -> TtTensor {
+pub(super) fn conv_bias_backward(bias: TtTensor, output_grad: TtTensor) -> TtTensor {
     let dtype = output_grad.dtype();
     assert_eq!(bias.dtype(), dtype);
     let shape = output_grad.shape().to_vec();

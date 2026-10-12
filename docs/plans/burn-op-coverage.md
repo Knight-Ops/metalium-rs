@@ -59,18 +59,16 @@ The per-method Device and Item notes remain in
 
 ## ModuleOps
 
-31 native, 21 composed, 4 unsupported.
+33 native, 21 composed, 2 unsupported.
 
 | Unsupported method | Disposition |
 |---|---|
-| `deform_conv2d` | [-] out of scope: no model needs it |
-| `deform_conv2d_backward` | [-] out of scope: no model needs it |
 | `irfft` | [-] out of scope: no model needs it |
 | `rfft` | [-] out of scope: no model needs it |
 
-<details><summary>Native (31)</summary>
+<details><summary>Native (33)</summary>
 
-`adaptive_avg_pool2d`, `adaptive_avg_pool2d_backward`, `attention`, `avg_pool2d`, `avg_pool2d_backward`, `conv2d`, `conv2d_bias_backward`, `conv2d_weight_backward`, `conv2d_x_backward`, `conv3d`, `conv3d_bias_backward`, `conv3d_weight_backward`, `conv3d_x_backward`, `conv_transpose2d`, `conv_transpose2d_bias_backward`, `conv_transpose2d_weight_backward`, `conv_transpose2d_x_backward`, `conv_transpose3d`, `conv_transpose3d_bias_backward`, `conv_transpose3d_weight_backward`, `conv_transpose3d_x_backward`, `embedding`, `embedding_backward`, `interpolate`, `interpolate_backward`, `linear_bias_backward`, `linear_weight_backward`, `max_pool2d`, `max_pool2d_with_indices`, `max_pool2d_with_indices_backward`, `unfold4d`
+`adaptive_avg_pool2d`, `adaptive_avg_pool2d_backward`, `attention`, `avg_pool2d`, `avg_pool2d_backward`, `conv2d`, `conv2d_bias_backward`, `conv2d_weight_backward`, `conv2d_x_backward`, `conv3d`, `conv3d_bias_backward`, `conv3d_weight_backward`, `conv3d_x_backward`, `conv_transpose2d`, `conv_transpose2d_bias_backward`, `conv_transpose2d_weight_backward`, `conv_transpose2d_x_backward`, `conv_transpose3d`, `conv_transpose3d_bias_backward`, `conv_transpose3d_weight_backward`, `conv_transpose3d_x_backward`, `deform_conv2d`, `deform_conv2d_backward`, `embedding`, `embedding_backward`, `interpolate`, `interpolate_backward`, `linear_bias_backward`, `linear_weight_backward`, `max_pool2d`, `max_pool2d_with_indices`, `max_pool2d_with_indices_backward`, `unfold4d`
 
 </details>
 

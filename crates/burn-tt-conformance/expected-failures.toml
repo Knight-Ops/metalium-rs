@@ -20,29 +20,6 @@ tests = [
 ]
 
 [[group]]
-category = "unsupported-op"
-reason = "`deform_conv2d` is refused by name (docs/plans/burn-op-notes.md: not planned until a model needs it)."
-tests = [
-    "autodiff::base::deform_conv2d::test_deform_conv2d_basic",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_batched",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_different_padding",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_basic",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_batched",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_padding",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_batched",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_dilation",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_padding_size",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_stride",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_width",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_offset_groups",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_simple",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_weight_groups",
-]
-
-[[group]]
 category = "precision"
 reason = "A matmul truncates an F32 operand to TF32 (SrcRoute::Tf32FromFp32, 10 explicit mantissa bits): in grad_1[0][1] = 58.4628 - 57 the operand 40.4628 becomes 40.4375 (the step is 2^-5 between 32 and 64), so the result is 1.4375 against 1.46281, a relative error of 1.7e-2 against the test's permissive 1e-2. Reproduced by hand; the tolerance stays as vendored. Passes in the `--exact` profile on ttsim (`expected-failures-exact.toml`): the exact matmul has no TF32 truncation and no group alignment, so the mechanism is the Matrix Unit matmul."
 tests = [

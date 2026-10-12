@@ -3223,19 +3223,32 @@ impl ModuleOps<TtBackend> for TtBackend {
         bias: Option<FloatTensor<TtBackend>>,
         options: DeformConvOptions<2>,
     ) -> FloatTensor<TtBackend> {
-        let _op = crate::report::enter("deform_conv2d", false);
-        crate::unsupported::fail(
-            "deform_conv2d",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("offset={}", crate::unsupported::context(&offset)),
-                format!("weight={}", crate::unsupported::context(&weight)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("bias={}", crate::unsupported::context(&bias)),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
-        )
+        let _op = crate::report::enter("deform_conv2d", true);
+        let mut storage_inputs = vec![&x, &offset, &weight];
+        if let Some(t) = &mask {
+            storage_inputs.push(t);
+        }
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("deform_conv2d", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let offset = crate::ops::bfp_compute_input(offset);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let mask = mask.map(crate::ops::bfp_compute_input);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::deform_conv2d(x, offset, weight, mask, bias, options),
+                result_storage,
+            );
+        }
+        drop(storage_inputs);
+        crate::ops::module::deform_conv2d(x, offset, weight, mask, bias, options)
     }
     fn deform_conv2d_backward(
         x: FloatTensor<TtBackend>,
@@ -3246,19 +3259,47 @@ impl ModuleOps<TtBackend> for TtBackend {
         output_grad: FloatTensor<TtBackend>,
         options: DeformConvOptions<2>,
     ) -> DeformConv2dBackward<TtBackend> {
-        let _op = crate::report::enter("deform_conv2d_backward", false);
-        crate::unsupported::fail(
-            "deform_conv2d_backward",
-            [
-                format!("x={}", crate::unsupported::context(&x)),
-                format!("offset={}", crate::unsupported::context(&offset)),
-                format!("weight={}", crate::unsupported::context(&weight)),
-                format!("mask={}", crate::unsupported::context(&mask)),
-                format!("bias={}", crate::unsupported::context(&bias)),
-                format!("output_grad={}", crate::unsupported::context(&output_grad)),
-                format!("options={:?}", options),
-            ]
-            .join("; "),
+        let _op = crate::report::enter("deform_conv2d_backward", true);
+        let mut storage_inputs = vec![&x, &offset, &weight, &output_grad];
+        if let Some(t) = &mask {
+            storage_inputs.push(t);
+        }
+        if let Some(t) = &bias {
+            storage_inputs.push(t);
+        }
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("deform_conv2d_backward", &storage_inputs);
+            drop(storage_inputs);
+            let x = crate::ops::bfp_compute_input(x);
+            let offset = crate::ops::bfp_compute_input(offset);
+            let weight = crate::ops::bfp_compute_input(weight);
+            let output_grad = crate::ops::bfp_compute_input(output_grad);
+            let mask = mask.map(crate::ops::bfp_compute_input);
+            let bias = bias.map(crate::ops::bfp_compute_input);
+            let _ = result_storage;
+            return <Self as ModuleOps<Self>>::deform_conv2d_backward(
+                x,
+                offset,
+                weight,
+                mask,
+                bias,
+                output_grad,
+                options,
+            );
+        }
+        drop(storage_inputs);
+        crate::ops::module::deform_conv2d_backward(
+            x,
+            offset,
+            weight,
+            mask,
+            bias,
+            output_grad,
+            options,
         )
     }
     fn conv3d(

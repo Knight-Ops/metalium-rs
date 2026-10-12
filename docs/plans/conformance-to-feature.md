@@ -334,7 +334,7 @@ Lessons that generalize:
   few distinct values. Read the helper, fix it where it lives, and keep the unit test beside it.
 - A BF16 narrowing gate is silicon-only (PACR `0x105`, [`ttsim-divergence.md`](../learnings/ttsim-divergence.md)).
 
-Still open gaps (deferred, not designed away): `deform_conv2d`.
+Still open gaps (deferred, not designed away): `deform_conv2d` (closed in round five, below).
 Closed by a technical limit: F64 casts. Not closed: the precision failures,
 listed with their mechanisms, and the tests the simulator is too slow for, each with its silicon verdict.
 
@@ -395,3 +395,42 @@ Lessons that generalize:
 - **The exact profile exposed no regression, because the default path did not move.** The hook returns before
   acting unless the mode is exact, so the default profile (1,789 pass, 49 listed), the MNIST golden and every
   older gate were unchanged; confirm that, not just the new gate, when adding an opt-in mode.
+
+## Worked example: round five, `deform_conv2d`
+
+The last missing op in the suite (17 tests: nine forward, four autodiff cases under two binaries). Unlike
+`interpolate` the taps depend on the data, so the host cannot tabulate them; it builds what the shapes fix and the
+card does the rest (`ops/deform_conv.rs`, module documentation). Still no new kernel.
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| `deform_conv2d` forward (9) and backward under two autodiff binaries (8) | refused by name, filed under "not planned until a model needs it" (a deferral) | sample positions, bilinear fractions and corner validity on the device; four resident gathers of channel rows of `x` (an invalid corner reads an appended zero row); Flex's term order; the columns feed `conv`'s own product and weight gradient (`conv_products`, `weight_gradient`, extracted from `conv` and `conv_weight_backward_geometry`); the x gradient is a one-hot matrix times the column gradient | `step160_deform_conv2d` (4 simulator tests, a BF16 one on silicon) | pass |
+
+Lessons that generalize:
+
+- **Passing the vendored tests proved little here.** They passed on the first run (17 of 17, 12 s), but the autodiff
+  ones allow `relative(0.5)` on every gradient. The evidence is the gate: data chosen so that every product and sum is
+  exact (offsets in quarters, masks in quarters, small integers elsewhere, magnitudes below the group adder's quantum),
+  which makes "equal to Flex" a fair demand in a different summation order, forward and all five gradients.
+- **Check what a primitive costs before the plan leans on it.** The plan named `select` as the data-dependent gather;
+  reading it showed `select_native` is `gather_native`, which stages every row of the table for every element
+  returned. The design stands for these sizes, so it got an explicit limit (2^24 staged addresses, refused by name,
+  as `interpolate`'s) and a roadmap item, instead of an unmeasured claim. The same read ruled out `select_add` for the
+  x gradient: it launches several kernels per index, thousands of launches on the simulator; the one-hot matmul is a
+  fixed number.
+- **Clear the inputs of an invalid case, not only its result.** Flex returns zero for a sample on or past the border
+  without evaluating its neighbours; a sample at infinity has NaN fractions, and `0 * NaN` is NaN. The fractions of an
+  invalid sample are set to zero before any product, so nothing needs a final mask, and the one-hot weights stay finite.
+- **A NaN test must say whose arithmetic it tests.** With a NaN in `x` the output had Flex's poisoned cells exactly but
+  held infinities where Flex has NaN. That is the Matrix Unit (the unpacker turns a NaN into an infinity and `inf * 0` into
+  zero; silicon-operating-notes, the 17-pair corpus), not the op. The gate now runs the case in exact matmul mode,
+  where the products are the SFPU's and the result must equal Flex NaN for NaN, and asserts only what the fast mode
+  guarantees (every cell Flex leaves finite is equal).
+- **A control that fails for a bookkeeping reason is not a control.** "Mask dropped" first compared whole results, and
+  a run without a mask has no mask gradient, so it differed trivially. The controls now compare numbers.
+- **Mutate the implementation, not only the input.** Five source mutations (corners 1 and 2 swapped, the sample-validity
+  term dropped, the one-hot weights reversed, the offset gradient's axes swapped, the sampling axes swapped) each fail
+  the gate; the border test alone misses the last one because its constant offsets are symmetric in h and w, which
+  is why it is not the only test.
+- **The simulator is slow where silicon is not:** the main test takes 77 s on ttsim and 1.5 s on card 0, so the
+  smoke tier is where a regression is cheap to find.

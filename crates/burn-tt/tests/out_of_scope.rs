@@ -34,27 +34,30 @@ fn assert_refused(message: &str, op: &str, shape: &str) {
     assert!(message.contains("F32"), "{message}");
 }
 
-/// `conv3d` and `conv_transpose3d` are native (`step157_conv3d`); a deformable convolution is not, and
-/// its backward pass names itself.
+/// `conv3d`, `conv_transpose3d` and `deform_conv2d` are native (`step157_conv3d`, `step160_deform_conv2d`);
+/// a deformable convolution whose four gathers would stage more than 2^24 host addresses (every gather
+/// stages its whole table per element) is refused by name, forward and backward.
 #[test]
-fn deformable_convolution_is_refused_by_name() {
+fn deformable_convolution_beyond_its_limit_is_refused_by_name() {
     let d = TtDevice::new(310);
+    // A 64 x 64 plane, 3 x 3 taps, padding 1: 36,864 samples over 4,096 rows is 6e8 addresses.
     let operands = || {
         (
+            primitive([1, 1, 64, 64], &d),
+            primitive([1, 18, 64, 64], &d),
             primitive([1, 1, 3, 3], &d),
-            primitive([1, 2, 2, 2], &d),
-            primitive([1, 1, 2, 2], &d),
         )
     };
-    let options = || DeformConvOptions::new([1; 2], [0; 2], [1; 2], 1, 1);
+    let options = || DeformConvOptions::new([1; 2], [1; 2], [1; 2], 1, 1);
     let (x, offset, weight) = operands();
     let message = refusal(move || {
         let _ = TtBackend::deform_conv2d(x, offset, weight, None, None, options());
     });
-    assert_refused(&message, "deform_conv2d", "[1, 1, 3, 3]");
+    assert_refused(&message, "deform_conv2d", "[1, 1, 64, 64]");
+    assert!(message.contains("limit"), "{message}");
 
     let (x, offset, weight) = operands();
-    let output_grad = primitive([1, 1, 2, 2], &d);
+    let output_grad = primitive([1, 1, 64, 64], &d);
     let message = refusal(move || {
         let _ = TtBackend::deform_conv2d_backward(
             x,
@@ -66,7 +69,8 @@ fn deformable_convolution_is_refused_by_name() {
             options(),
         );
     });
-    assert_refused(&message, "deform_conv2d_backward", "[1, 1, 3, 3]");
+    assert_refused(&message, "deform_conv2d_backward", "[1, 1, 64, 64]");
+    assert!(message.contains("limit"), "{message}");
 }
 
 /// `interpolate` is native (`step155_interpolate`); what it still refuses, it refuses by name.

@@ -22,29 +22,6 @@ tests = [
 
 [[group]]
 category = "unsupported-op"
-reason = "`deform_conv2d` is refused by name, as in the default profile (docs/plans/burn-op-notes.md: not planned until a model needs it)."
-tests = [
-    "autodiff::base::deform_conv2d::test_deform_conv2d_basic",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_batched",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "autodiff::base::deform_conv2d::test_deform_conv2d_different_padding",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_basic",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_batched",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "autodiff_checkpointing::base::deform_conv2d::test_deform_conv2d_different_padding",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_batched",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_dilation",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_padding_size",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_stride",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_different_width",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_offset_groups",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_simple",
-    "tensor::tensor::float::module::deform_conv2d::test_deform_conv2d_weight_groups",
-]
-
-[[group]]
-category = "unsupported-op"
 reason = "The exact matmul refuses by name a product it cannot do in a reasonable time: `[408, 261120] @ [261120, 408]` is 4.3e10 products, 41616 chunks against the limit of 1024 (`exact matmul: ... needs 41616 chunks (limit 1024); split the operands`), on ttsim and on silicon (card 0, run 1791761062). It passes in the default profile, on the Matrix Unit (13 s on silicon)."
 tests = [
     "tensor::tensor::float::ops::transaction::should_support_transaction",
