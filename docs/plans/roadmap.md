@@ -157,7 +157,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   `reshape`, broadcast `mask_where`/`powf`, empty `cat`, the planner bug, `bool_argwhere`, `interpolate`,
   `scatter_nd`, `conv3d`/`conv_transpose3d`, `deform_conv2d`; see [conformance-to-feature.md](conformance-to-feature.md)).
   32 tests remain, each a group in `expected-failures.toml`; **none is a missing op**: what is left is the Matrix
-  Unit's rounding (21, passing in the exact profile), simulator speed (8) and F64 (3). The next conformance work is
+  Unit's rounding (21 F32, plus 3 in F16; they pass in the exact profile and under `--accurate`), simulator speed (8) and F64 (3). The next conformance work is
   therefore the runs that were open, both now done (B13a, `Fusion<TtBackend>`, round six; D1, the F16 suites, round seven), not more list entries.
   In the order the model ladder needs them:
   1. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
@@ -171,7 +171,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
      truncation and alignment **not separated** (apply the step158 model with TF32 truncation to the matmuls they
      compose if it matters). Decision (2026-10-11): keep the fast matmul as the default and offer the exact one
      opt-in (the entry above); the 21 stay listed in the default profile, `precision`, each reason saying the
-     exact profile passes it. Never loosen a vendored tolerance.
+     exact profile passes it. Never loosen a vendored tolerance. **Update (2026-10-12):** `--accurate` passes them too
+     (`MatmulMode::Accurate`, entry above), at 19x to 64x the fast matmul's cost instead of the exact mode's thousands; the default stays
+     fast and the 21 (and the 3 F16) stay listed until "Fused slicing for `MatmulMode::Accurate`" is measured. Their `reason`
+     strings in the expected-failures files still name only the exact profile.
   2. **Re-derive the `step68` and `step85` bounds.** They charge `2^-9 sum|ab|` for TF32 truncation and a few F32
      additions, and nothing for the group alignment, which can be larger with exact operands (1024 beside seven
      0.5s in one group: 1031 for 1027.5, `2^-8.2`; step158). They hold on their own similar-sized data, but are
