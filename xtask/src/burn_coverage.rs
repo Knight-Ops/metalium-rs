@@ -18,11 +18,6 @@ const DEST: &str = "docs/plans/burn-op-coverage.md";
 /// `(method, disposition)` for every method that fails explicitly. `[-]` means
 /// deliberately not supported, with the reason.
 const DISPOSITIONS: &[(&str, &str)] = &[
-    ("deform_conv2d", "[-] out of scope: no model needs it"),
-    (
-        "deform_conv2d_backward",
-        "[-] out of scope: no model needs it",
-    ),
     ("rfft", "[-] out of scope: no model needs it"),
     ("irfft", "[-] out of scope: no model needs it"),
     (

@@ -3,7 +3,7 @@
 **Start here.** This is the single list of open work. It holds only open items, each
 linking to its evidence and to the detailed plan. Closed work lives in
 [`completed-plans/`](../completed-plans/) and the archived phase docs below; permanent facts live in
-[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-11.
+[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-12.
 
 ## Where the project stands
 
@@ -34,12 +34,12 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   The default tile is `TileChoice::First`; see "Use the grid" for choosing a tile count per workload.
 - [x] **B10/B11** (2026-10-11, [`burn-tt-conformance`](../../crates/burn-tt-conformance/README.md),
   `cargo xtask conformance --release`): Burn 0.21's own backend tests (1,838 tensor and autodiff
-  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,789 pass; 49
+  tests; upstream's `#[ignore]`d ones excluded) run on ttsim one test per process. **1,806 pass; 32
   are in `expected-failures.toml`, each group with a category and a reason** (it began at 163: rounds
-  one to four closed 114, see [conformance-to-feature.md](conformance-to-feature.md)). The passing
+  one to five closed 131, see [conformance-to-feature.md](conformance-to-feature.md)). The passing
   tests are in `--smoke`, validated on card 0. A second profile, `cargo xtask conformance --exact` (matmuls
-  accumulate in exact F32, `TT_EXACT_MATMUL=1`), has its own list, `expected-failures-exact.toml`: **1,801
-  pass, 37 listed** (17 `deform_conv2d`, 3 F64, 1 product the exact mode refuses by name, 16 that ttsim is too
+  accumulate in exact F32, `TT_EXACT_MATMUL=1`), has its own list, `expected-failures-exact.toml`: **1,818
+  pass, 20 listed** (3 F64, 1 product the exact mode refuses by name, 16 that ttsim is too
   slow for and silicon passes). Still open: the run on `Fusion<TtBackend>` (B13a) and the F16 suites (D1).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
@@ -82,22 +82,35 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   (`[256,256]^2`: 8.2 s against 376 us; [performance-log.md](../learnings/performance-log.md#exact-matmul-cost-2026-10-11-card-0)).
   **What it settled:** every one of the 21 `precision` entries passes in exact mode (on silicon for the large LU
   tests), so they were the Matrix Unit matmul and not separate defects. Next: a faster formulation (below).
+- [x] **`deform_conv2d` and `deform_conv2d_backward`** (2026-10-12,
+  [`ops/deform_conv.rs`](../../crates/burn-tt/src/ops/deform_conv.rs), gate `step160_deform_conv2d`, ttsim and card 0,
+  silicon log `1791767178`; smoke tier 908 of 908, log `1791767187`). The refusal was a deferral. No new kernel: the host builds only what the
+  shapes fix; the card computes the sample positions, bilinear fractions and corner validity, four resident gathers read
+  the corners (an invalid corner reads an appended zero row), then Flex's term order and the mask; the product, bias and
+  weight gradient are `conv`'s own (`conv_products`, `weight_gradient`, now shared), and the x gradient is a one-hot
+  matrix times the column gradient. All 17 of Burn's tests pass in both profiles. Those tests are loose (`relative(0.5)`
+  on every gradient), so the gate is the evidence: forward and all five gradients **equal Flex bit for bit** on exact data
+  (7 cases covering groups, offset groups, stride, padding, dilation, a batch of two, more positions than a 32-row chunk,
+  with and without mask and bias; plus samples exactly on the `-1` and `H` borders), and a NaN or infinity in x
+  reaches only the samples that read it (exact matmul mode equals Flex NaN for NaN; the fast mode's Matrix Unit
+  turns NaN into infinity, a documented property). Five mutations of the implementation (corner swap, dropped
+  validity, wrong one-hot weight, swapped offset-gradient axes, swapped sampling axes) each fail the gate. **Limit:**
+  a gather stages its whole table per element, so the host holds `4 x samples x channels x (rows + 1)` addresses and
+  more than 2^24 is refused by name (Track 2, "Gather without staging").
 - [ ] **Faster exact matmul.** The exact path is linear in products at about 0.5 us each; whether its two
   `k x outputs` host address tables or the device gathers dominate is not profiled. The untried
   formulations need far fewer addresses and give the same sum in the same order: a loop over `k` of
   `acc = acc + a[:, p] * b[p, :]` (about `m + n` addresses a step), or one output row at a time. Profile first,
   then build the cheaper one and re-measure (`cargo xtask bench --filter step159_exact_matmul::benchmark`); a
   `k`-loop also removes the chunk limit that refuses the 4.3e10-product transaction test.
-- [ ] **Conformance findings** (rounds one to four are closed: softmax of any rank, I32/Bool
+- [ ] **Conformance findings** (rounds one to five are closed: softmax of any rank, I32/Bool
   `reshape`, broadcast `mask_where`/`powf`, empty `cat`, the planner bug, `bool_argwhere`, `interpolate`,
-  `scatter_nd`, `conv3d`/`conv_transpose3d`; see [conformance-to-feature.md](conformance-to-feature.md)).
-  49 tests remain, each a group in `expected-failures.toml`; fixing one removes its tests from the list.
+  `scatter_nd`, `conv3d`/`conv_transpose3d`, `deform_conv2d`; see [conformance-to-feature.md](conformance-to-feature.md)).
+  32 tests remain, each a group in `expected-failures.toml`; **none is a missing op**: what is left is the Matrix
+  Unit's rounding (21, passing in the exact profile), simulator speed (8) and F64 (3). The next conformance work is
+  therefore the two runs still open (B13a, `Fusion<TtBackend>`, and D1, the F16 suites), not more list entries.
   In the order the model ladder needs them:
-  1. `deform_conv2d` (17): refused by name, a deferral. Offsets are data-dependent, so unlike
-     `interpolate` the tap tables cannot be built from shapes alone (a device-side gather of data-dependent
-     indices plus the existing matmul is the likely shape; design it first, and see whether the generic
-     `Geometry<D>` weight and gradient tables can be reused).
-  2. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
+  1. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
      determinant 16). **All pass in the exact profile**, so they are the Matrix Unit matmul (the fast mode's
      documented rounding and TF32 truncation), not separate defects. Decomposed: the two `conv3d` ones are the
      group adder (2026-10-11, [silicon-operating-notes.md](../learnings/silicon-operating-notes.md), "Matmul
@@ -109,13 +122,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
      compose if it matters). Decision (2026-10-11): keep the fast matmul as the default and offer the exact one
      opt-in (the entry above); the 21 stay listed in the default profile, `precision`, each reason saying the
      exact profile passes it. Never loosen a vendored tolerance.
-  3. **Re-derive the `step68` and `step85` bounds.** They charge `2^-9 sum|ab|` for TF32 truncation and a few F32
+  2. **Re-derive the `step68` and `step85` bounds.** They charge `2^-9 sum|ab|` for TF32 truncation and a few F32
      additions, and nothing for the group alignment, which can be larger with exact operands (1024 beside seven
      0.5s in one group: 1031 for 1027.5, `2^-8.2`; step158). They hold on their own similar-sized data, but are
      not a guarantee. Add the alignment term from the measured rule (the gate's `dot` returns it) wherever a gate
      derives a matmul bound.
-  4. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
-  5. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
+  3. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
+  4. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
      `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs).
 - [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
   one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
@@ -159,6 +172,12 @@ Track 1 model. Evidence and bottlenecks:
   columns) cut taps per output from 16/36 to 4/6 and the staged addresses with them, at the cost of
   Flex's single-sum term order for bicubic and Lanczos3 (both already bound-checked, not bit-exact).
   Chunk the gather over planes. Measure on a real model before building it.
+- [ ] **Gather without staging.** `gather_native` stages every row of its table for every element it returns
+  (`select`, `gather`, `embedding` and `deform_conv2d` all go through it), so a lookup costs
+  `elements x table rows` host addresses. `deform_conv2d` refuses more than 2^24 of them by name, which is far
+  below a real detector head (a 64x64 plane with thousands of samples); an embedding of a real vocabulary has the
+  same shape of problem. A device-side indexed read that takes the table once, instead of one staged row per
+  element, is the fix; profile `embedding` and `deform_conv2d` first.
 - [ ] **B7** batched readback (`download_many`, batched `tr_execute`). (The `Backend::sync` barrier of B8 is
   done with B1.)
 - [ ] **X7** small-transfer latency; 9.14 per-request cost (note X6 found the fast
