@@ -14,7 +14,7 @@ fn shape(x: &TtTensor) -> [usize; 4] {
     assert!(
         shape.len() == 4
             && x.is_storable()
-            && matches!(x.dtype(), DType::F32 | DType::BF16)
+            && matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
             && !shape.contains(&0),
         "pooling requires a nonempty resident NCHW tensor: {}",
         context(x)
@@ -236,6 +236,11 @@ fn mean_forward(x: TtTensor, g: Geometry) -> TtTensor {
         g.divisors.iter().all(|&n| n > 0 && n <= 1 << 24),
         "pooling divisor exceeds exact F32 metadata range"
     );
+    if x.dtype() == DType::F16 {
+        // No packed F16 pooling kernel: widen, pool in F32, round once.
+        let wide = float_compute_input(x);
+        return cast_native(sfpu_forward(&wide, &g, false, false).0, DType::F16);
+    }
     if x.dtype() == DType::BF16 {
         let source = plain_dram(&x);
         let dims = [g.output[0] * g.output[1] * g.output[2], g.output[3]];

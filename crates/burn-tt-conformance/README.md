@@ -17,6 +17,7 @@ replaces them:
 | `tests/tensor.rs` | `TtBackend` |
 | `tests/autodiff.rs` | `Autodiff<TtBackend>` |
 | `tests/autodiff_checkpointing.rs` | `Autodiff<TtBackend, BalancedCheckpointing>` |
+| `tests/tensor_f16.rs`, `tests/autodiff_f16.rs` | the float tests and the autodiff suite with `f16` as the float element (upstream's `tensor_f16.rs` and `autodiff_f16.rs`) |
 
 With `--features fusion` the base backend is `Fusion<TtBackend>` (`burn_tt::Tt`) instead.
 

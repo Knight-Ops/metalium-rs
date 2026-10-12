@@ -119,7 +119,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_into_int(tensor, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_into_int(tensor, out_dtype);
         }
@@ -157,7 +157,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(crate::ops::float::float_add(lhs, rhs), compute_dtype);
@@ -188,7 +188,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_add_scalar(lhs, rhs),
@@ -212,7 +212,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_clamp_min(tensor, min),
@@ -236,7 +236,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_clamp_max(tensor, max),
@@ -264,7 +264,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_clamp(tensor, min, max),
@@ -297,7 +297,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(crate::ops::float::float_sub(lhs, rhs), compute_dtype);
@@ -328,7 +328,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_sub_scalar(lhs, rhs),
@@ -361,7 +361,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(crate::ops::float::float_mul(lhs, rhs), compute_dtype);
@@ -392,7 +392,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_mul_scalar(lhs, rhs),
@@ -420,7 +420,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(crate::ops::float::float_div(lhs, rhs), compute_dtype);
@@ -443,7 +443,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_div_scalar(lhs, rhs),
@@ -471,7 +471,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(
@@ -497,7 +497,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_remainder_scalar(lhs, rhs),
@@ -528,7 +528,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             if let Some(output) = crate::ops::bf16_matmul(&lhs, &rhs) {
                 return output;
             }
@@ -561,7 +561,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(
@@ -586,7 +586,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_neg(tensor), compute_dtype);
         }
@@ -607,7 +607,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_recip(tensor), compute_dtype);
         }
@@ -716,7 +716,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&_data, &_values]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let _data = crate::ops::float_compute_input(_data);
             let _values = crate::ops::float_compute_input(_values);
             return crate::ops::cast_native(
@@ -744,7 +744,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&_data]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let _data = crate::ops::float_compute_input(_data);
             return crate::ops::cast_native(
                 crate::ops::float::float_gather_nd(_data, _indices),
@@ -860,7 +860,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &value]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             let value = crate::ops::float_compute_input(value);
             return crate::ops::cast_native(
@@ -889,7 +889,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_mask_fill(tensor, mask, value),
@@ -916,7 +916,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_equal(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_equal(lhs, rhs, out_dtype);
@@ -941,7 +941,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_not_equal(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_not_equal(lhs, rhs, out_dtype);
@@ -966,7 +966,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_equal_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_equal_elem(lhs, rhs, out_dtype);
         }
@@ -990,7 +990,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_not_equal_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_not_equal_elem(lhs, rhs, out_dtype);
         }
@@ -1014,7 +1014,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_greater(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_greater(lhs, rhs, out_dtype);
@@ -1039,7 +1039,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_greater_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_greater_elem(lhs, rhs, out_dtype);
         }
@@ -1064,7 +1064,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_greater_equal(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_greater_equal(lhs, rhs, out_dtype);
@@ -1089,7 +1089,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_greater_equal_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_greater_equal_elem(lhs, rhs, out_dtype);
         }
@@ -1113,7 +1113,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_lower(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_lower(lhs, rhs, out_dtype);
@@ -1138,7 +1138,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_lower_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_lower_elem(lhs, rhs, out_dtype);
         }
@@ -1163,7 +1163,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_lower_equal(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::float::float_lower_equal(lhs, rhs, out_dtype);
@@ -1188,7 +1188,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_lower_equal_elem(lhs, rhs, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::float::float_lower_equal_elem(lhs, rhs, out_dtype);
         }
@@ -1209,7 +1209,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_sum(tensor), compute_dtype);
         }
@@ -1230,7 +1230,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_sum_dim(tensor, dim),
@@ -1254,7 +1254,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_prod(tensor), compute_dtype);
         }
@@ -1275,7 +1275,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_prod_dim(tensor, dim),
@@ -1299,7 +1299,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_mean(tensor), compute_dtype);
         }
@@ -1320,7 +1320,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_mean_dim(tensor, dim),
@@ -1344,7 +1344,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_cumsum(tensor, dim),
@@ -1368,7 +1368,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_cumprod(tensor, dim),
@@ -1392,7 +1392,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_cummin(tensor, dim),
@@ -1416,7 +1416,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_cummax(tensor, dim),
@@ -1456,7 +1456,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_exp(tensor), compute_dtype);
         }
@@ -1477,7 +1477,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_log(tensor), compute_dtype);
         }
@@ -1498,7 +1498,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_log1p(tensor), compute_dtype);
         }
@@ -1523,7 +1523,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(crate::ops::float::float_powf(lhs, rhs), compute_dtype);
@@ -1548,7 +1548,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(crate::ops::float::float_powi(lhs, rhs), compute_dtype);
         }
@@ -1570,7 +1570,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             return crate::ops::cast_native(
                 crate::ops::float::float_powi_scalar(lhs, rhs),
@@ -1595,7 +1595,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_powf_scalar(tensor, value),
@@ -1623,7 +1623,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_powf_scalar_impl(tensor, value),
@@ -1647,7 +1647,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_sqrt(tensor), compute_dtype);
         }
@@ -1668,7 +1668,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_abs(tensor), compute_dtype);
         }
@@ -1689,7 +1689,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_cos(tensor), compute_dtype);
         }
@@ -1710,7 +1710,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_sin(tensor), compute_dtype);
         }
@@ -1731,7 +1731,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_tan(tensor), compute_dtype);
         }
@@ -1752,7 +1752,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_cosh(tensor), compute_dtype);
         }
@@ -1773,7 +1773,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_sinh(tensor), compute_dtype);
         }
@@ -1794,7 +1794,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_tanh(tensor), compute_dtype);
         }
@@ -1815,7 +1815,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_acos(tensor), compute_dtype);
         }
@@ -1836,7 +1836,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_acosh(tensor), compute_dtype);
         }
@@ -1857,7 +1857,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_asin(tensor), compute_dtype);
         }
@@ -1878,7 +1878,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_asinh(tensor), compute_dtype);
         }
@@ -1899,7 +1899,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_atan(tensor), compute_dtype);
         }
@@ -1920,7 +1920,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_atanh(tensor), compute_dtype);
         }
@@ -1945,7 +1945,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&lhs, &rhs]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let lhs = crate::ops::float_compute_input(lhs);
             let rhs = crate::ops::float_compute_input(rhs);
             return crate::ops::cast_native(
@@ -1970,7 +1970,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_round(tensor), compute_dtype);
         }
@@ -1991,7 +1991,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_floor(tensor), compute_dtype);
         }
@@ -2012,7 +2012,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_ceil(tensor), compute_dtype);
         }
@@ -2033,7 +2033,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_trunc(tensor), compute_dtype);
         }
@@ -2054,7 +2054,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_erf(tensor), compute_dtype);
         }
@@ -2077,7 +2077,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_argmax(tensor, dim, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_argmax(tensor, dim, out_dtype);
         }
@@ -2101,7 +2101,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_argtopk(tensor, dim, k, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_argtopk(tensor, dim, k, out_dtype);
         }
@@ -2122,7 +2122,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_topk(tensor, dim, k),
@@ -2148,7 +2148,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_argmin(tensor, dim, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_argmin(tensor, dim, out_dtype);
         }
@@ -2169,7 +2169,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_max_dim(tensor, dim),
@@ -2193,7 +2193,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::float::float_sign(tensor), compute_dtype);
         }
@@ -2234,7 +2234,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::float::float_sort(tensor, dim, descending),
@@ -2267,7 +2267,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             let (values, indices) =
                 crate::ops::float::float_sort_with_indices(tensor, dim, descending, indices_dtype);
@@ -2295,7 +2295,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_argsort(tensor, dim, descending, out_dtype);
         }
@@ -2335,7 +2335,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_is_nan(tensor, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_is_nan(tensor, out_dtype);
         }
@@ -2354,7 +2354,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return <Self as FloatTensorOps<Self>>::float_is_inf(tensor, out_dtype);
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::float::float_is_inf(tensor, out_dtype);
         }
@@ -3021,7 +3021,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&weights]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let weights = crate::ops::float_compute_input(weights);
             return crate::ops::cast_native(
                 crate::ops::module::embedding(weights, indices),
@@ -3051,7 +3051,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&weights, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let weights = crate::ops::float_compute_input(weights);
             let output_grad = crate::ops::float_compute_input(output_grad);
             return crate::ops::cast_native(
@@ -3081,7 +3081,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let output_grad = crate::ops::float_compute_input(output_grad);
             return crate::ops::cast_native(
@@ -3107,7 +3107,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let output_grad = crate::ops::float_compute_input(output_grad);
             return crate::ops::cast_native(
                 crate::ops::module::linear_bias_backward(output_grad),
@@ -3329,9 +3329,10 @@ impl ModuleOps<TtBackend> for TtBackend {
         }
         drop(storage_inputs);
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let weight = crate::ops::float_compute_input(weight);
+            let bias = bias.map(crate::ops::float_compute_input);
             return crate::ops::cast_native(
                 crate::ops::module::conv3d(x, weight, bias, options),
                 compute_dtype,
@@ -3362,7 +3363,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let weight = crate::ops::float_compute_input(weight);
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -3396,7 +3397,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let weight = crate::ops::float_compute_input(weight);
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -3429,7 +3430,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &bias, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let bias = crate::ops::float_compute_input(bias);
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -3575,9 +3576,10 @@ impl ModuleOps<TtBackend> for TtBackend {
         }
         drop(storage_inputs);
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let weight = crate::ops::float_compute_input(weight);
+            let bias = bias.map(crate::ops::float_compute_input);
             return crate::ops::cast_native(
                 crate::ops::module::conv_transpose3d(x, weight, bias, options),
                 compute_dtype,
@@ -3610,7 +3612,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&weight, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let weight = crate::ops::float_compute_input(weight);
             let output_grad = crate::ops::float_compute_input(output_grad);
             return crate::ops::cast_native(
@@ -3648,7 +3650,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &weight, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let weight = crate::ops::float_compute_input(weight);
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -3686,7 +3688,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &bias, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let bias = crate::ops::float_compute_input(bias);
             let output_grad = crate::ops::float_compute_input(output_grad);
@@ -3787,7 +3789,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -3853,7 +3855,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -3892,7 +3894,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             return crate::ops::cast_native(
                 crate::ops::module::max_pool2d(
@@ -3937,7 +3939,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             return output;
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let mut output = crate::ops::module::max_pool2d_with_indices(
                 x,
@@ -3992,7 +3994,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &output_grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let output_grad = crate::ops::float_compute_input(output_grad);
             let mut output = crate::ops::module::max_pool2d_with_indices_backward(
@@ -4038,7 +4040,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             return crate::ops::cast_native(
                 crate::ops::module::interpolate(x, output_size, options),
@@ -4069,7 +4071,7 @@ impl ModuleOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -4165,7 +4167,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::leaky_relu(tensor, negative_slope),
@@ -4189,7 +4191,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::activation::relu(tensor), compute_dtype);
         }
@@ -4214,7 +4216,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let output = crate::ops::float_compute_input(output);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -4239,7 +4241,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::activation::gelu(tensor), compute_dtype);
         }
@@ -4264,7 +4266,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &alpha]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             let alpha = crate::ops::float_compute_input(alpha);
             return crate::ops::cast_native(
@@ -4293,7 +4295,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -4318,7 +4320,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(crate::ops::activation::sigmoid(tensor), compute_dtype);
         }
@@ -4344,7 +4346,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&output, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let output = crate::ops::float_compute_input(output);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(
@@ -4373,7 +4375,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::hard_sigmoid(tensor, alpha, beta),
@@ -4397,7 +4399,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::log_sigmoid(tensor),
@@ -4421,7 +4423,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::softmax(tensor, dim),
@@ -4445,7 +4447,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::log_softmax(tensor, dim),
@@ -4469,7 +4471,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&tensor]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let tensor = crate::ops::float_compute_input(tensor);
             return crate::ops::cast_native(
                 crate::ops::activation::softmin(tensor, dim),
@@ -4498,7 +4500,7 @@ impl ActivationOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&x, &grad]);
-        if compute_dtype == burn_backend::DType::BF16 {
+        if crate::tensor::is_half(compute_dtype) {
             let x = crate::ops::float_compute_input(x);
             let grad = crate::ops::float_compute_input(grad);
             return crate::ops::cast_native(

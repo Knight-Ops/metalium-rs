@@ -3,16 +3,15 @@
 //! `DType::F16` is IEEE binary16 in BF16's two-byte physical slots: a storage and
 //! cast dtype. Raw views and uploads keep every bit pattern and move two bytes per
 //! element; `float_cast` converts F32, BF16 and F16 on Tensix (`step143` holds the
-//! conversions bit for bit); arithmetic on F16 is not claimed and fails naming the
-//! operation and dtype; F64 stays unsupported. Everything here runs on ttsim except
+//! conversions bit for bit); arithmetic on F16 widens to F32 and rounds once
+//! (`step162_f16_arithmetic`); F64 stays unsupported. Everything here runs on ttsim except
 //! the BF16 narrowing arm (ttsim refuses mode `0x105`, divergence row 29), which is
 //! silicon-only.
 //!
 //! Residency: every device result is checked `computed_on_device()` and the gates
 //! assert `tensor_traffic().downloads` did not move before the explicit readback.
 //! Negative controls: the BF16 reading of F16 slots differs from the F16 one, a
-//! truncating oracle differs from the device on the corpus's ties, and F16
-//! arithmetic must be refused (a silent F32 fallback would not panic).
+//! truncating oracle differs from the device on the corpus's ties.
 use burn::tensor::{
     backend::{Backend, DTypeUsage},
     DType, FloatDType, Tensor, TensorData, TensorPrimitive,
@@ -330,26 +329,17 @@ fn unsupported_cases_fail_explicitly_naming_the_operation_and_dtype() {
             text.contains("float_cast") && text.contains("F16") && text.contains("F64"),
             "{text}"
         );
-        // Control for residency: arithmetic on F16 does not silently fall back
-        // to the host or to another dtype.
-        let text = message(&mut || {
-            let _ = f16s.clone() + f16s.clone();
-        });
-        assert!(
-            text.contains("unsupported operation") && text.contains("F16"),
-            "{text}"
-        );
     });
 }
 
 #[test]
-fn dtype_usage_reports_f16_as_storage_and_f64_as_unsupported() {
+fn dtype_usage_reports_f16_as_general_and_f64_as_unsupported() {
     with_device(Config::default(), |d| {
         let usage = TtBackend::dtype_usage(&d, DType::F16);
-        assert!(!usage.is_empty(), "F16 is stored and cast");
-        // Storage only: no arithmetic is claimed.
-        assert_eq!(usage.iter().collect::<Vec<_>>(), [DTypeUsage::Storage]);
-        assert!(!TtBackend::supports_dtype(&d, DType::F16));
+        // Arithmetic widens to F32 and rounds once (`step162_f16_arithmetic`), so it is
+        // `general`; not `Accelerated`: there is no packed F16 matmul.
+        assert_eq!(usage, DTypeUsage::general());
+        assert!(TtBackend::supports_dtype(&d, DType::F16));
         // I32 has native arithmetic, so it can be a default dtype; Bool likewise.
         assert_eq!(
             TtBackend::dtype_usage(&d, DType::I32),

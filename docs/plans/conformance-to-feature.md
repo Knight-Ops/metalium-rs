@@ -458,3 +458,39 @@ Lessons that generalize:
 - **Run a case right after the plan it must not reuse.** The gate runs each other scalar after a real `relu` of the same
   shape; a gate that began with the thresholded case would not meet a cached plan.
 - **The exact profile added nothing under fusion**: the same 20 entries as without it, plus the upstream bool ones.
+
+## Worked example: round seven, the F16 suites (D1)
+
+Burn ships the float tests and the whole autodiff suite again with `f16` as the float element (`tensor_f16.rs`,
+`autodiff_f16.rs`, 1,187 tests; upstream runs them on its GPU backends). They are entry binaries here too
+(`tests/tensor_f16.rs`, `tests/autodiff_f16.rs`) and run in every profile. They could not start: `dtype_usage(F16)` was
+`Storage`, so `set_default_dtypes(F16)` in the setup failed before the first test, and the runner could not even list them.
+F16 now widens to F32 on the card, computes, and rounds once, as BF16 does (the generator emits `is_half`).
+First run: 145 of 1,187 failed. After the fixes: 22 listed (1,165 pass), 20 in the exact profile (1,167 pass), the same under
+`Fusion<TtBackend>` (no fusion-specific finding).
+
+| Finding (tests) | Cause | Fix | Gate | Card 0 |
+|---|---|---|---|---|
+| every F16 test | `dtype_usage(F16)` was `Storage` | `general`, not `Accelerated` (no packed F16 matmul); arithmetic by widening (`float_compute_input`, the generated wrappers use `is_half`) | `step162_f16_arithmetic` | pass |
+| `expand`, `meshgrid`, `slice_fill` (about 18) | `expanded` read a half-precision buffer with the row gather, which looks in F32 buffers only: **also broken for BF16**, no BF16 suite had covered `expand` | widen, expand, narrow back (exact) | same, `expand` cases; fails with the branch removed | pass |
+| conv with a bias (6) | the generated wrapper widened the required operands and not an optional one (the bias): **also broken for BF16** | widen optional operands too (generator) | same, `conv2d`, `conv3d_groups`; fails with it removed | pass |
+| `float_empty`, `float_random` (about 60), pooling, `interpolate`, `gather_nd` | refused F16 by name | F16 accepted: zeros are the same bits; the F32 draw is cast; pooling widens inside `mean_forward` | same | pass |
+| 3 `precision`: `should_diff_gelu`, `cov_1`, `det_random_2x2x4x4` | the Matrix Unit matmul, by elimination: all pass in the exact profile | listed | none | fail the same on card 0 |
+| 2 `precision`: CTC gradients | per-operation binary16 rounding in Burn's default `ctc_loss`; not the matmul (fail in the exact profile too) | listed; the tolerance stays | `ctc_gradient_in_f16_is_flexs_to_rounding_noise` | fail the same on card 0 |
+| 15 `timeout` | ttsim speed | listed | none | all pass (run `1791811392`) |
+| 2 F64 | not a Tensix dtype | listed with the F32 ones | none | n/a |
+
+Lessons that generalize:
+
+- **A dtype suite finds the bugs of the dtype next to it.** Two of the three defects (`expand`, the optional bias) were
+  BF16's, latent for as long as BF16 existed, because nothing ran BF16 through `expand` or a biased `conv3d`. Fixing them for
+  F16 fixed both.
+- **Attribute a precision failure with a second implementation, not with the story that fits.** The CTC gradients missed
+  by up to 0.235, far more than one binary16 step, so "rounding" was a hypothesis. Running the same composition on burn-flex
+  in F16 gave the same shortfall and agreed with burn-tt to one step; that, not the explanation, went into the gate.
+- **A test about rounding must say which results need rounding.** The first version of the gate demanded that rounding change
+  something in every case, which a selection (`relu`, `max`, `expand`) cannot satisfy; those now assert the opposite, that
+  the result is exactly an operand value.
+- **Re-run what the change touched, not everything.** F32 code was not edited (every change is gated on `is_half`), so the
+  F32 suites were not re-run; the new binaries were run in each profile, and the BF16 gates that the shared fixes reach
+  (`step76`, `78`, `83`-`85`, `127`, `155`, `157`, `160`) were re-run.

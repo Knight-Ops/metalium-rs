@@ -221,7 +221,10 @@ fn nd_flat_rows(data: &TtTensor, indices: &TtTensor, nd: &Nd) -> TtTensor {
 }
 
 fn gather_nd(data: TtTensor, indices: TtTensor, name: &str) -> TtTensor {
-    if !matches!(data.dtype(), DType::F32 | DType::BF16 | DType::I32) {
+    if !matches!(
+        data.dtype(),
+        DType::F32 | DType::BF16 | DType::F16 | DType::I32
+    ) {
         fail(name, format_args!("data=({})", context(&data)));
     }
     let nd = nd_geometry(name, &data, &indices, "");

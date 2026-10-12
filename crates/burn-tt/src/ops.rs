@@ -116,11 +116,11 @@ pub(crate) fn bfp_result_storage(op: &str, inputs: &[&TtTensor]) -> crate::stora
 /// Resident F32 <-> F16 conversion on Tensix, and BF16 <-> F16 through F32.
 ///
 /// FP16 is IEEE binary16 in BF16's two-byte physical slots (`tt_kernels::fp16`).
-/// In Burn it is a *storage and cast* dtype: raw views and movement work like
-/// BF16's (the buffers are raw two-byte slots, `crate::tensor::is_half`), and
-/// `float_cast` converts F32, BF16 and F16 on Tensix (BF16 to or from F16 goes
-/// through F32). Arithmetic on F16 operands is not claimed: it fails explicitly
-/// naming the operation and dtype, and `dtype_usage` reports `Storage` only.
+/// Raw views and movement work like BF16's (the buffers are raw two-byte slots,
+/// `crate::tensor::is_half`), and `float_cast` converts F32, BF16 and F16 on
+/// Tensix (BF16 to or from F16 goes through F32). Arithmetic widens to F32 and
+/// rounds once at the operation boundary, as BF16's does (`float_compute_input`,
+/// `cast_native`); `dtype_usage` reports it `general`, not `Accelerated`.
 /// F64 stays unsupported and its cast names the operation and dtype.
 ///
 /// `None` for any pair involving neither F16 nor a supported partner dtype, so
@@ -167,7 +167,7 @@ fn cast_f16(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
 }
 
 /// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
-/// BF16 arithmetic widens to F32 on Tensix, computes using the existing native
+/// BF16 and F16 arithmetic widens to F32 on Tensix, computes using the existing native
 /// contract, then rounds its floating-point result once at the operation boundary.
 pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
     if tensor.dtype() == dtype {
@@ -203,7 +203,7 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
 }
 
 pub(crate) fn float_compute_input(tensor: TtTensor) -> TtTensor {
-    if tensor.dtype() == DType::BF16 {
+    if crate::tensor::is_half(tensor.dtype()) {
         cast_native(tensor, DType::F32)
     } else {
         tensor
@@ -221,6 +221,10 @@ pub(crate) fn matrix_float_op(
         crate::server::elementwise_mode(a.device),
         crate::ElementwiseMode::Matrix { .. }
     ) {
+        return None;
+    }
+    // F16 has no matrix elementwise path: it widens like any other half-precision operand.
+    if a.dtype() == DType::F16 || b.is_some_and(|b| b.dtype() == DType::F16) {
         return None;
     }
     let valid = |t: &TtTensor| {
@@ -1101,6 +1105,13 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
             format_args!("{}, engine has no resident buffers", context(tensor)),
         );
     }
+    if crate::tensor::is_half(tensor.dtype()) {
+        // The row gather reads F32 buffers; a half-precision one is widened (exactly),
+        // expanded and narrowed back (exactly: every value is one it came from).
+        let dtype = tensor.dtype();
+        let wide = cast_native(tensor.clone(), DType::F32);
+        return cast_native(expanded(&wide, shape, op), dtype);
+    }
     let rank = to.len();
     let rows: usize = to[..rank - 1].iter().product();
     let cols = to[rank - 1];
@@ -1616,9 +1627,10 @@ pub mod float {
         if let Some(out) = native_zeros(shape.clone(), device, dtype.into()) {
             return out;
         }
-        if DType::from(dtype) == DType::BF16 {
+        if crate::tensor::is_half(DType::from(dtype)) {
+            // All-zero bits are zero in BF16 and in binary16.
             let mut data = TensorData::zeros::<u16, _>(shape);
-            data.dtype = DType::BF16;
+            data.dtype = dtype.into();
             return float_from_data(data, device);
         }
         if DType::from(dtype) != DType::F32 {
@@ -1636,13 +1648,13 @@ pub mod float {
         device: &TtDevice,
         dtype: burn_backend::FloatDType,
     ) -> TtTensor {
-        if !matches!(DType::from(dtype), DType::F32 | DType::BF16) {
+        if !matches!(DType::from(dtype), DType::F32 | DType::BF16 | DType::F16) {
             fail(
                 "float_random",
                 format_args!("shape={shape:?}, dtype={dtype:?}, distribution={distribution:?}"),
             );
         }
-        // Drawn on the device (`crate::random`); BF16 is the
+        // Drawn on the device (`crate::random`); BF16 and F16 are the
         // device's F32 draw cast on the device.
         if let Some(out) = native_random(
             &shape,
@@ -1650,16 +1662,16 @@ pub mod float {
             device,
             DType::F32,
         ) {
-            return if DType::from(dtype) == DType::BF16 {
-                cast_native(out, DType::BF16)
+            return if crate::tensor::is_half(DType::from(dtype)) {
+                cast_native(out, dtype.into())
             } else {
                 out
             };
         }
         // No resident buffers on this device: host construction data, as `from_data`.
         let host = float_from_data(crate::random::float(*device, shape, distribution), device);
-        if DType::from(dtype) == DType::BF16 {
-            cast_native(host, DType::BF16)
+        if crate::tensor::is_half(DType::from(dtype)) {
+            cast_native(host, dtype.into())
         } else {
             host
         }

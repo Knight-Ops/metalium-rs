@@ -74,3 +74,14 @@ required-features = ["run"]
 name = "autodiff_checkpointing"
 path = "tests/autodiff_checkpointing.rs"
 required-features = ["run"]
+
+# The same suites with `f16` as the float element (upstream's `tensor_f16.rs`, `autodiff_f16.rs`).
+[[test]]
+name = "tensor_f16"
+path = "tests/tensor_f16.rs"
+required-features = ["run"]
+
+[[test]]
+name = "autodiff_f16"
+path = "tests/autodiff_f16.rs"
+required-features = ["run"]

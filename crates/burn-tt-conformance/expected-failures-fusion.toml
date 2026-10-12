@@ -17,6 +17,8 @@ tests = [
     "autodiff::base::cast::cast_keeps_gradient_flow_might_panic",
     "autodiff_checkpointing::base::cast::cast_keeps_gradient_flow_might_panic",
     "tensor::tensor::float::ops::slice::should_support_slice_fill_cast_f64",
+    "autodiff_f16::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor_f16::f16::ops::slice::should_support_slice_fill_cast_f64",
 ]
 
 [[group]]
@@ -91,4 +93,42 @@ tests = [
     "tensor::tensor::bool::ops::comparison::test_bool_equal_elem",
     "tensor::tensor::bool::ops::comparison::test_bool_not_equal_elem",
     "tensor::tensor::bool::ops::mask::should_support_bool_mask_fill_ops",
+]
+
+[[group]]
+category = "precision"
+reason = "F16 (`tensor_f16`, `autodiff_f16`): the same Matrix Unit matmul as the F32 entries above. A matmul truncates its F32 operand to TF32 and adds in groups, and the F16 tests keep their vendored tolerances (`gelu` gradient 1.4375 against 1.4629, one binary16 step at 32 to 64; `cov` 1.13e-3 relative against 1e-3; the 2x2x4x4 determinant 1.1e-2 against 5e-3). Attributed by elimination, not by hand reproduction: all three pass in the `--exact` profile on ttsim (`expected-failures-exact.toml`), where the matmul has no TF32 truncation and no group alignment, and they fail the same way on card 0 (run 1791811392). Operands and results are binary16; the arithmetic between them is F32 on the card (`step162_f16_arithmetic`)."
+tests = [
+    "autodiff_f16::base::gelu::should_diff_gelu",
+    "tensor_f16::f16::linalg::det::test_det_random_2x2x4x4_pytorch_comparison",
+    "tensor_f16::f16::stats::cov::test_cov_1",
+]
+
+[[group]]
+category = "precision"
+reason = "F16 CTC loss gradients against a PyTorch F32 reference at `rel_abs(1e-3, 1e-3)`: burn-tt is off by up to 0.235 (`mixed_input_lengths`) and 0.025 (`repeated_labels`). Not burn-tt's arithmetic: Burn's default `ctc_loss` composes elementwise operations over a recursion of up to a dozen steps and each rounds to binary16, so the vendored tolerance, set for backends with a fused F32 CTC kernel, cannot hold. Burn-flex running the same composition in F16 misses the F32 gradient by the same amounts and agrees with burn-tt to 2.4e-4 (one binary16 step), which `step162_f16_arithmetic::ctc_gradient_in_f16_is_flexs_to_rounding_noise` asserts (the shortfall at least 100 times the disagreement). Also fails in the `--exact` profile (so it is not the matmul) and on card 0 (run 1791811392). The F32 versions of both pass. The tolerance stays as vendored."
+tests = [
+    "autodiff_f16::base::ctc::test_ctc_loss_grad_mixed_input_lengths",
+    "autodiff_f16::base::ctc::test_ctc_loss_grad_repeated_labels",
+]
+
+[[group]]
+category = "timeout"
+reason = "F16 (`tensor_f16`, `autodiff_f16`): the simulator does not finish these in the limit (120 s in the canonical run), as their F32 counterparts above, but each passes on silicon, card 0 (run 1791811392, 900 s limit): the 300 x 300 determinants in 37 to 38 s, the LU block dispatches in 9 to 355 s (they pass in F16, where the F32 ones miss the tolerance), the long CTC losses in 22 to 34 s, the transaction matmul in 18 s and the scaled swap-dims CTC gradient in 49 s. Not a defect: ttsim speed."
+tests = [
+    "autodiff_f16::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "tensor_f16::f16::linalg::det::test_det_300x300_all_ones",
+    "tensor_f16::f16::linalg::det::test_det_300x300_all_zeros",
+    "tensor_f16::f16::linalg::det::test_det_300x300_identity_matrix",
+    "tensor_f16::f16::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_medium_tall",
+    "tensor_f16::f16::linalg::lu::test_lu_medium_wide",
+    "tensor_f16::f16::module::ctc::test_ctc_loss_long_mixed_input_lengths",
+    "tensor_f16::f16::module::ctc::test_ctc_loss_long_sequence",
+    "tensor_f16::f16::ops::transaction::should_support_transaction",
 ]

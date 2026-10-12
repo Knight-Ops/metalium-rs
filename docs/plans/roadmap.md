@@ -43,7 +43,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   slow for and silicon passes). The run on `Fusion<TtBackend>` (B13a, `--fusion`, 2026-10-12) passes
   1,803 with 35 listed (the 32 above and three bool-scalar tests that die in burn-fusion 0.21.0, below), and with `--exact` 1,815 with
   23 listed; it found and
-  fixed a fuser bug (below). Still open: the F16 suites (D1).
+  fixed a fuser bug (below). The F16 suites (D1, `tensor_f16` and `autodiff_f16`, 1,187 tests, 2026-10-12) run in every profile: 1,165 pass with 22 listed (1,167 and 20 with `--exact`, and the same under fusion); see round seven in [conformance-to-feature.md](conformance-to-feature.md).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
   `step155_interpolate`, card 0, smoke tier 814 of 814, log `1791733008`). No new kernel: shape-only tap tables
@@ -111,7 +111,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   `scatter_nd`, `conv3d`/`conv_transpose3d`, `deform_conv2d`; see [conformance-to-feature.md](conformance-to-feature.md)).
   32 tests remain, each a group in `expected-failures.toml`; **none is a missing op**: what is left is the Matrix
   Unit's rounding (21, passing in the exact profile), simulator speed (8) and F64 (3). The next conformance work is
-  therefore the run still open (D1, the F16 suites; B13a's run on `Fusion<TtBackend>` is done, round six), not more list entries.
+  therefore the runs that were open, both now done (B13a, `Fusion<TtBackend>`, round six; D1, the F16 suites, round seven), not more list entries.
   In the order the model ladder needs them:
   1. Twenty-one `precision` failures in the default profile (gelu gradient 2, conv2d 1, conv3d 2, LU and
      determinant 16). **All pass in the exact profile**, so they are the Matrix Unit matmul (the fast mode's
@@ -144,6 +144,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   (three tests, `bug` in `expected-failures-fusion*.toml`; the same ops pass on `TtBackend`). It is upstream's code: either an
   upstream change (keep the bool as a literal) or, meanwhile, a refusal by name in `burn-tt` that points at it, since a
   user of `Tt` meets a dead thread today.
+- [x] **D1: F16 arithmetic** (2026-10-12, generator `is_half`, `float_compute_input`, `expanded`, `step162_f16_arithmetic`, ttsim;
+  `step162` and `step144` on card 0, log `1791814459`; the conformance failures on card 0, run `1791811392`). F16 widens to F32 on the card, computes and rounds once, as BF16
+  does; `dtype_usage(F16)` is `general`. Found two latent BF16 defects on the way (`expand` of a half-precision tensor, an
+  optional bias left unwidened) and fixed both. Listed: five `precision` (three are the Matrix Unit and pass in the exact
+  profile; two are CTC gradients, per-operation binary16 rounding in Burn's default composition, matched by burn-flex's F16),
+  15 `timeout` (all pass on silicon) and two F64. Left: the exact-profile timeouts were not run on silicon (the exact matmul is
+  about 1,000x slower), and the F16 conformance modules that pass are not in `--smoke` (only the gate is).
 - [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
   one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
 - [ ] **Model ladder**, each rung checked against burn-flex; every failure becomes an op or

@@ -367,13 +367,13 @@ fn nchw(x: &TtTensor, op: &str) -> [usize; 4] {
     let shape = x.shape().to_vec();
     let nonempty = !shape.contains(&0);
     if shape.len() != 4
-        || !matches!(x.dtype(), DType::F32 | DType::BF16)
+        || !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
         || (nonempty && !x.is_storable())
     {
         fail(
             op,
             format_args!(
-                "requires a resident F32 or BF16 NCHW tensor: {}",
+                "requires a resident F32, BF16 or F16 NCHW tensor: {}",
                 context(x)
             ),
         );
@@ -395,6 +395,7 @@ fn sampled([n, c, h, w]: [usize; 4], x: &TtTensor, op: &str) -> [usize; 4] {
 fn empty(x: &TtTensor, shape: [usize; 4]) -> TtTensor {
     let dtype = match x.dtype() {
         DType::BF16 => burn_backend::FloatDType::BF16,
+        DType::F16 => burn_backend::FloatDType::F16,
         _ => burn_backend::FloatDType::F32,
     };
     float::float_empty(shape.into(), &x.device, dtype)

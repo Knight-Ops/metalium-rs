@@ -209,9 +209,11 @@ impl Backend for TtBackend {
             // (`set_default_dtypes`, which Burn's own backend tests call). Not
             // `Accelerated`: there is no int matmul.
             DType::I32 | DType::Bool(_) => DTypeUsage::general(),
-            // FP16 (IEEE binary16): stored and cast on Tensix; arithmetic is
-            // not claimed, F64 stays unsupported.
-            DType::F16 => DTypeUsage::Storage.into(),
+            // FP16 (IEEE binary16) is stored in BF16's two-byte slots and its
+            // arithmetic widens to F32 on Tensix, rounding once at the
+            // operation boundary, as BF16's does. Not `Accelerated`: there is
+            // no packed F16 matmul. F64 stays unsupported.
+            DType::F16 => DTypeUsage::general(),
             _ => DTypeUsageSet::empty(),
         }
     }

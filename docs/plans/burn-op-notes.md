@@ -28,14 +28,14 @@ path today, `~` when only some shapes do.
 | `float_remainder{,_scalar}` | x exact SFPU fmod (Flex's `((a%b)+b)%b` bit for bit; NaN payload canonical); 2362 words, long division on integers; card 0 (step133-134) | S6 (T4) |
 | `float_neg`, `float_abs`, `float_sign`, `float_clamp{,_min,_max}` | x (SFPU, exact) | S2 |
 | comparisons (`float_equal`.. `float_lower_equal_elem`), `float_mask_where`, `float_mask_fill`, `float_is_nan`, `float_is_inf` | x (SFPU, exact; `Bool` results resident). `float_mask_where` broadcasts any operand (a `[1, t, t]` score against a `[batch, t, t]` mask) by device copies, then selects; bit-exact against Flex, card 0 (step151, found by `burn-tt-conformance`) | S2 |
-| `float_cast` | x same dtype or native F32↔BF16; other reduced floats refused | D1, S6 |
+| `float_cast` | x same dtype or native F32, BF16 and F16 in any pair (BF16↔F16 through F32); F64 and other reduced floats refused | D1, S6 |
 | `float_exp`, `float_log` | x (SFPU, derived bounds) | S4 |
 | `float_log1p`, `float_sqrt`, `float_powf*`, `float_powi*` | x (SFPU, derived bounds; `pow` one op). `powf`/`powi` of a tensor broadcast both operands by device copies, within `pow_bound` of Flex, card 0 (step151). Open: `powf(inf, subnormal)` is NaN on the device and `inf` in Flex (probably the SFPU flushing the exponent) | S4 |
 | `float_erf`, `float_tanh`, `float_sinh`, `float_cosh`, `float_asinh`, `float_acosh`, `float_atanh` | x (SFPU, derived bounds) | S4 |
 | `float_sin`, `float_cos`, `float_tan` | x (SFPU, derived bounds, every finite input) | S4 (10.2f) |
 | `float_atan`, `float_asin`, `float_acos`, `float_atan2` | x (SFPU, derived bounds; `atan2` same-shape operands only, a broadcast refused) | S4 (10.2f) |
 | `float_round`, `float_floor`, `float_ceil`, `float_trunc`, `float_into_int` | x F32 raw-bit rounding and saturating I32 conversion; both-card validated | S6 |
-| `float_random`, `int_random` | x native seeded resident draws (Default, Uniform, Bernoulli, Normal); host construction only for a device with no GDDR; F16/F64 fail explicitly; refused inside a trace; cards 0 and 1 (step142) | S7 |
+| `float_random`, `int_random` | x native seeded resident draws (Default, Uniform, Bernoulli, Normal); host construction only for a device with no GDDR; F16 is the F32 draw cast on the device; F64 fails explicitly; refused inside a trace; cards 0 and 1 (step142) | S7 |
 | `float_max_dim` | all F32 axes/layouts on SFPU; both-card validated | R1 |
 | `float_argmax`, `float_argmin` | x resident rank-N F32, I32 output, first tie/NaN, axis up to 2^23; both-card validated | R1 |
 | `float_any*`, `float_all*` | `~` Burn defaults over native comparisons, Boolean-to-F32 and supported sum axes/full sums | R1 |

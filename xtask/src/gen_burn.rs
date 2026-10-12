@@ -815,8 +815,8 @@ pub fn render(
                 m.name
             ));
             if is_hand {
-                // BF16 arithmetic has an explicit native F32 compute / BF16
-                // result policy. Metadata, raw transfers and views retain their
+                // BF16 and F16 arithmetic have an explicit native F32 compute /
+                // half-precision result policy. Metadata, raw transfers and views retain their
                 // own dtype-aware implementation and never round view bytes.
                 let floats: Vec<_> = m
                     .args
@@ -938,7 +938,7 @@ pub fn render(
                 }
                 if !is_future && !floats.is_empty() && !storage.contains(&m.name.as_str()) {
                     impls.push_str(&format!(
-                        "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif compute_dtype == burn_backend::DType::BF16 {{\n",
+                        "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif crate::tensor::is_half(compute_dtype) {{\n",
                         floats.iter().map(|name| format!("&{name}")).collect::<Vec<_>>().join(", ")
                     ));
                     if m.name == "float_matmul" {
@@ -947,6 +947,12 @@ pub fn render(
                     for name in &floats {
                         impls.push_str(&format!(
                             "let {name} = crate::ops::float_compute_input({name});\n"
+                        ));
+                    }
+                    // An optional operand (a bias) computes in F32 with the rest.
+                    for name in &optional {
+                        impls.push_str(&format!(
+                            "let {name} = {name}.map(crate::ops::float_compute_input);\n"
                         ));
                     }
                     let call = format!(
