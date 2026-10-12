@@ -33,8 +33,8 @@ pub(crate) fn bfp_compute_input(tensor: TtTensor) -> TtTensor {
 }
 
 pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
-    // Exact mode widens to F32 and takes the exact path.
-    if crate::matmul_mode::effective(a.device) == crate::MatmulMode::Exact {
+    // Exact and Accurate widen to F32 and take their own path.
+    if crate::matmul_mode::effective(a.device) != crate::MatmulMode::Fast {
         return None;
     }
     if a.storage_format() != b.storage_format()
@@ -266,8 +266,8 @@ pub(crate) fn matrix_float_op(
 }
 
 pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
-    // Exact mode widens to F32, takes the exact path and narrows once.
-    if crate::matmul_mode::effective(lhs.device) == crate::MatmulMode::Exact {
+    // Exact and Accurate widen to F32, take their own path and narrow once.
+    if crate::matmul_mode::effective(lhs.device) != crate::MatmulMode::Fast {
         return None;
     }
     if lhs.dtype() != DType::BF16
@@ -1852,6 +1852,10 @@ pub mod float {
         if let Some(t) = super::exact_matmul::exact_matmul(&lhs, &rhs) {
             return t;
         }
+        // `MatmulMode::Accurate`: integer slices with shared exponents on the Matrix Unit.
+        if let Some(t) = super::accurate_matmul::accurate_matmul(&lhs, &rhs) {
+            return t;
+        }
         // Phase 9: two matrices on an engine that keeps tensors on the device
         // stay there -- operands uploaded once, the result never downloaded
         // unless a host op asks for it (`tensor.rs`).
@@ -2665,6 +2669,16 @@ pub mod float {
         "`|x|`, the sign bit cleared (NaNs too), on the device where the data is, unsupported inputs fail."
     );
     unary_sfpu!(
+        float_pow2_floor,
+        kind_sfpu::POW2_FLOOR,
+        "`2^floor(log2 |x|)`, the exponent field alone, exact; `+0` for a zero or a denormal. The scale `MatmulMode::Accurate` slices by."
+    );
+    unary_sfpu!(
+        float_pow2_floor_inv,
+        kind_sfpu::POW2_FLOOR_INV,
+        "`2^-floor(log2 |x|)`, exact, so `|x|` times it is in `[1, 2)`; `2^127` for a zero or a denormal, `2^-126` from `|x| >= 2^127`."
+    );
+    unary_sfpu!(
         float_sign,
         kind_sfpu::SIGN,
         "Flex's `sign` (a NaN itself, `+0` for a zero) on the device where the data is."
@@ -3156,10 +3170,12 @@ pub mod float {
     }
 }
 
+mod accurate_matmul;
 mod conv;
 mod ctc;
 mod deform_conv;
 mod exact_matmul;
+pub use accurate_matmul::set_slicing as set_accurate_matmul_slicing;
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;

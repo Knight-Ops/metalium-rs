@@ -183,6 +183,29 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// [`Engine::matmul_dram`] at `fidelity` in place of the engine's own (`MatmulMode::Accurate`
+    /// multiplies integer slices at `Fidelity::Lo`). An engine that cannot refuses.
+    fn matmul_dram_at(
+        &mut self,
+        _a: BufferId,
+        _a_transposed: bool,
+        _b: BufferId,
+        _b_transposed: bool,
+        _fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// [`Engine::matmul_dram_batched`] at `fidelity`; see [`Engine::matmul_dram_at`].
+    fn matmul_dram_batched_at(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+        _items: &[(Block, Block)],
+        _mkn: [usize; 3],
+        _fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// `op(A_i) @ op(B_i)` for each pair of blocks of `a` and `b` in `items`,
     /// every product `mkn`, stacked into one `[items.len() m, n]` result left
     /// on the device (`Session::matmul_dram_batched`).
@@ -2436,13 +2459,16 @@ pub(crate) fn matmul_dram(
     let ([ar, ac], [br, bc]) = (dims_of(a), dims_of(b));
     let m = if a_transposed { ac } else { ar };
     let n = if b_transposed { br } else { bc };
-    submit(
-        "matmul_dram",
-        device,
-        [m, n],
-        move || "matmul".into(),
-        move |engine, ids| engine.matmul_dram(ids.get(a)?, a_transposed, ids.get(b)?, b_transposed),
-    )
+    submit("matmul_dram", device, [m, n], move || "matmul".into(), {
+        // Frozen at submit time, as the matmul mode is: the closure runs on the server thread.
+        let fidelity = crate::matmul_mode::fidelity_override();
+        move |engine, ids| match fidelity {
+            None => engine.matmul_dram(ids.get(a)?, a_transposed, ids.get(b)?, b_transposed),
+            Some(f) => {
+                engine.matmul_dram_at(ids.get(a)?, a_transposed, ids.get(b)?, b_transposed, f)
+            }
+        }
+    })
 }
 
 /// A batched matmul over blocks on the device, without waiting.
@@ -2459,7 +2485,13 @@ pub(crate) fn matmul_dram_batched(
         device,
         [items.len() * m, n],
         || "batched matmul".into(),
-        move |engine, ids| engine.matmul_dram_batched(ids.get(a)?, ids.get(b)?, &items, mkn),
+        {
+            let fidelity = crate::matmul_mode::fidelity_override();
+            move |engine, ids| match fidelity {
+                None => engine.matmul_dram_batched(ids.get(a)?, ids.get(b)?, &items, mkn),
+                Some(f) => engine.matmul_dram_batched_at(ids.get(a)?, ids.get(b)?, &items, mkn, f),
+            }
+        },
     )
 }
 
@@ -2751,6 +2783,46 @@ impl Engine for KmdEngine {
             tb,
             self.route,
             self.fidelity,
+            self.budget,
+        )
+    }
+    fn matmul_dram_at(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+        fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul(
+            &mut self.session,
+            a,
+            ta,
+            b,
+            tb,
+            self.route,
+            fidelity,
+            self.budget,
+        )
+    }
+    fn matmul_dram_batched_at(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        items: &[(Block, Block)],
+        mkn: [usize; 3],
+        fidelity: Fidelity,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul_batched(
+            &mut self.session,
+            a,
+            b,
+            items,
+            mkn,
+            self.route,
+            fidelity,
             self.budget,
         )
     }

@@ -43,7 +43,9 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   slow for and silicon passes). The run on `Fusion<TtBackend>` (B13a, `--fusion`, 2026-10-12) passes
   1,803 with 35 listed (the 32 above and three bool-scalar tests that die in burn-fusion 0.21.0, below), and with `--exact` 1,815 with
   23 listed; it found and
-  fixed a fuser bug (below). The F16 suites (D1, `tensor_f16` and `autodiff_f16`, 1,187 tests, 2026-10-12) run in every profile: 1,165 pass with 22 listed (1,167 and 20 with `--exact`, and the same under fusion); see round seven in [conformance-to-feature.md](conformance-to-feature.md).
+  fixed a fuser bug (below). **`--accurate`** (2026-10-12, `MatmulMode::Accurate`, `expected-failures-accurate.toml`): **2,989 of 3,025 pass, 36
+  listed** (5 F64 and 31 ttsim timeouts, every one passing on card 0 in that mode: F32 run `1791819292`, F16 run `1791820653`), so no
+  `precision` entry is left; `--fusion --accurate` 2,986 with 39 listed. The F16 suites (D1, `tensor_f16` and `autodiff_f16`, 1,187 tests, 2026-10-12) run in every profile: 1,165 pass with 22 listed (1,167 and 20 with `--exact`, and the same under fusion); see round seven in [conformance-to-feature.md](conformance-to-feature.md).
 - [x] **`interpolate` / `interpolate_backward`**, nearest, bilinear, bicubic and Lanczos3, forward and
   backward (2026-10-11, [`ops/interpolate.rs`](../../crates/burn-tt/src/ops/interpolate.rs), gate
   `step155_interpolate`, card 0, smoke tier 814 of 814, log `1791733008`). No new kernel: shape-only tap tables
@@ -100,12 +102,52 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   validity, wrong one-hot weight, swapped offset-gradient axes, swapped sampling axes) each fail the gate. **Limit:**
   a gather stages its whole table per element, so the host holds `4 x samples x channels x (rows + 1)` addresses and
   more than 2^24 is refused by name (Track 2, "Gather without staging").
+- [x] **Accurate matmul, opt-in** (2026-10-12, ttsim and card 0: `step158` `lofi_*` run `1791818525`, `step163` and `step162` run `1791818535`,
+  benchmark run `1791818553`). `MatmulMode::Accurate`
+  ([`ops/accurate_matmul.rs`](../../crates/burn-tt/src/ops/accurate_matmul.rs), gate `step163_accurate_matmul`, `step158` `lofi_*`):
+  the answer to "can a matmul stay on the Matrix Unit and lose its error". Per-row and per-column power-of-two scales and integer
+  slices of 7 and 5 bits make every product and every sum of eight exact at `Fidelity::Lo` (the unit's quantum is then 1), twelve
+  slice pairs are added small to large, and NaN and infinity follow IEEE by three 0/+-1 matmuls. New SFPU kinds `POW2_FLOOR` and
+  `POW2_FLOOR_INV` (an exponent-field mask, bit for bit against the host on every special); a per-call fidelity override
+  (`Engine::matmul_dram_at`); `TT_ACCURATE_MATMUL=1`, `TtConfig::matmul(Accurate)`, `accurate_matmul(..)`, `--accurate`. ttsim: error
+  about 1e-7 of the largest entry against the fast matmul's 1e-3 (0.21 of the derived bound; the fast one leaves the bound 22,072
+  times on the same data), integer data exact, 41 of 41 selected precision tests pass under `--accurate` (F32 and F16). Domain:
+  `|x| <= 2^64`, subnormals zero; a row's small entries are kept to the row's scale. **Cost on card 0: 19x to 64x the fast matmul** (seven shapes, 18.7x at 1024 cubed; 50x to 750x faster than exact). One
+  `[64,96]@[96,48]` submits **127 device jobs** (101 element-wise, 18 matmuls, 4 reductions, 4 gathers and copies) against 1, and 64% to
+  86% of the time is the element-wise slicing and classification, not the LoFi matmuls (profile in
+  [performance-log.md](../learnings/performance-log.md#accurate-matmul-cost-2026-10-12-card-0)). Open: fused slicing kinds and a
+  cheaper NaN/infinity classification, and whether it should become the default (decide from the cost above and the model numbers).
+  Closed: the 300 to 500 LU tests, the determinants and the transaction pass on card 0 under `--accurate` (the LU and determinant
+  ones fail their tolerance in the fast mode there), the full `--accurate` lists, and the BF16 gate (`1791818535`).
+- [ ] **Fused slicing for `MatmulMode::Accurate`** (opt-in stays until this is measured; decided 2026-10-12). The mode is correct and
+  gated but costs **19x to 64x the fast matmul** on card 0 (run `1791818553`, seven shapes, 18.7x at 1024 cubed), because one
+  `[64,96]@[96,48]` submits **127 device jobs** (101 element-wise, 18 matmuls, 4 reductions, 4 gathers and copies) and 64% to 86% of
+  the time is that element-wise work, not the LoFi matmuls (profile: [performance-log.md](../learnings/performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
+  The arithmetic does not change, so `step163_accurate_matmul` must keep passing unchanged; what shrinks is the job count. In order of
+  expected saving:
+  1. **A slice kind**: `x` and the row or column power of two in, slice `s` out, already weighted. Today a slice is `trunc`, subtract,
+     multiply by the radix, then a weight multiply (about 3 to 4 jobs a slice, 9 slices); one SFPU program can compute the earlier
+     slices in registers and store only slice `s`. This also folds in the scaling `x * u * 2^k` (2 more jobs an operand).
+  2. **A cheaper NaN and infinity classification**: about 45 of the 127 jobs (15 an operand: `is_nan`, `is_inf`, `== 0`, three
+     bool-to-float, `bool_not`, `mask_fill`, `sign`, `mul`, two `sub`, a `sum_dim`, a second `mask_fill`, `clamp`, then six 0/+-1
+     matmuls and about a dozen combining ops). One kind per operand producing the encodings (`inf_sign`, `finite_sign`, the zero and
+     nonzero indicators, the finite part) would cut it to a few jobs; the six small matmuls could share one launch.
+  3. **One matmul for the pairs**: twelve Lo matmuls and eleven adds (each add rounds in F32 and is a job) could be one Lo matmul over
+     the slices concatenated along `k` (each block padded to a multiple of 32 so no group of eight straddles two scales), the unit's
+     own `Dst` accumulation doing the adds; needs a cheap concatenation (a row gather costs host address tables, which is what made the
+     exact mode slow, so measure it).
+  Each new kind needs what `POW2_FLOOR` has: a program in `tt-kernels/src/sfpu/ops.rs`, `operands`/`sig`/`accuracy` entries, and a
+  bit-for-bit test against the host on every special (zeros, denormals, `f32::MAX`, infinities, NaNs). Measure with
+  `cargo xtask bench --device 0 --filter step163_accurate_matmul::benchmark`, record the new rows beside the 2026-10-12 ones in the
+  performance log and scoreboard, and set the target from the first fused measurement (the exact mode took 0.5 us a product; this one
+  is already 50x to 750x faster than that). Only then revisit making `Accurate` the default: today the default profile still lists the
+  21 F32 and 3 F16 matmul `precision` tests, which pass only under `--accurate`.
 - [x] **F16 CTC gradients** (2026-10-12, ttsim, fusion and card 0 (`step162`, run `1791818535`)): `has_ctc_loss_backward`, native `ctc_loss` and
   `ctc_loss_backward` ([`ops/ctc.rs`](../../crates/burn-tt/src/ops/ctc.rs)), widened to F32 and rounded once; the two
   `autodiff_f16` CTC gradient entries are gone from every list. The alpha recursion is Burn's (private there) and beta is alpha of
   the time- and label-reversed problem; gate `step162` `ctc_gradient_in_f16_meets_the_f32_reference`. F32 CTC takes the same path
   (its gradient equals Burn's composition to 1e-5).
-- [ ] **Faster exact matmul.** The exact path is linear in products at about 0.5 us each; whether its two
+- [ ] **Faster exact matmul.** (`MatmulMode::Accurate`, above, answers the cost question for most users; this is for the exact CPU order.) The exact path is linear in products at about 0.5 us each; whether its two
   `k x outputs` host address tables or the device gathers dominate is not profiled. The untried
   formulations need far fewer addresses and give the same sum in the same order: a loop over `k` of
   `acc = acc + a[:, p] * b[p, :]` (about `m + n` addresses a step), or one output row at a time. Profile first,

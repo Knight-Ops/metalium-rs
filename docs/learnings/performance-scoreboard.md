@@ -60,6 +60,7 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | MNIST training, card 0, 1 tile (`tt-mnist --host`) | 1.4 ms/step | burn-flex 0.5 | ≤ burn-flex |
 | Transformer training, card 0, 1 tile (`tt-mnist --model transformer`) | 8.8 ms/step | burn-flex 4.35 | ≤ burn-flex |
 | SFPU precise `gelu`, three-role kernel, device cycles per tile (`probe_ttinsn_push`, card 0) | 38,053 cycles (T1 push 3.31 cycles/word: push-bound) | `.ttinsn` fused push, experiment only: 13,734 cycles, 2.77x (run-time translated: 2.67x) | decide the follow-on (roadmap Track 2) |
+| Accurate matmul (opt-in `MatmulMode::Accurate`), F32 `[256, 256] @ [256, 256]`, card 0, host | 10.96 ms (`1791818553`) | the fast Matrix Unit matmul: 277 us (39.6x); 19.1x to 64.4x over seven shapes, 18.7x at 1024 cubed; the exact mode is 750x slower than this at 256 cubed | the element-wise slicing and NaN/infinity classification are 64% to 86% of it (127 device jobs a matmul): fuse the slicing into one SFPU kind a slice, cheapen the classification, one matmul for the pairs; see roadmap, "Fused slicing for `MatmulMode::Accurate`" |
 | Exact matmul (opt-in `MatmulMode::Exact`), F32 `[256, 256] @ [256, 256]`, card 0, host | 8.19 s (about 0.5 us per product, 16 chunks; `1791761944`) | the fast Matrix Unit matmul: 376 us (22,000x); 64x32x64 1,000x, 1024x27x32 3,300x | cut the host-side table cost: a k-loop of broadcast multiply-adds (m + n addresses a step) instead of two `k x outputs` gathers; see roadmap Track 1 |
 | Requests that waited under the in-flight cap (120 tiles × 300 × 16 KiB, one channel) | 8762 per run | — | watch: revisit `MAX_IN_FLIGHT` if it binds below the NoC's own limit |
 
@@ -75,6 +76,7 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Device busy, MNIST and transformer ms/step | [Streaming ownership rollout](performance-log.md#streaming-ownership-rollout), [Change log](performance-log.md#change-log) |
 | Streaming traced/fresh sweeps | [Overlap thresholds for NC ownership](performance-log.md#overlap-thresholds-for-nc-ownership-run-1791079782-2026-10-04) |
 | Operation baselines (BF16, packed, mesh) | [Native](performance-log.md#native-operation-baselines-2026-10-05), [BF16 and mesh](performance-log.md#bf16-and-mesh-operation-baselines-2026-10-05), [Packed BF16](performance-log.md#packed-bf16-update-2026-10-05) |
+| Accurate matmul against the fast one | [Accurate matmul cost](performance-log.md#accurate-matmul-cost-2026-10-12-card-0) |
 | Exact matmul against the fast one | [Exact matmul cost](performance-log.md#exact-matmul-cost-2026-10-11-card-0) |
 | SFPU `gelu` kernel, `.ttinsn` push fusion | [`.ttinsn` push fusion](performance-log.md#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) |
 | P2 K-blocking, R3 norm, Approx, X6 | [P2/R3](performance-log.md#p2-k-blocking-and-r3-norm-release-baselines-2026-10-10), [Approx transcendentals](performance-log.md#approx-transcendentals-per-tile-saving-2026-10-10-card-0), [X6](performance-log.md#x6-mover-niu-fast-path-2026-10-10-card-0) |

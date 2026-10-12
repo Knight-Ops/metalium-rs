@@ -186,6 +186,14 @@ pub mod kind_sfpu {
     pub const CEIL: u32 = 0x192;
     pub const TRUNC: u32 = 0x193;
     pub const F32_TO_I32: u32 = 0x194;
+    /// `2^floor(log2 |a|)`: the exponent field alone (`a & 0x7f800000`), exact. Zero and
+    /// denormals give `+0`; infinities and NaNs give `+inf`.
+    pub const POW2_FLOOR: u32 = 0x195;
+    /// `2^-floor(log2 |a|)`: the exponent field `254 - e` (`0x7f000000 - (a & 0x7f800000)`), exact,
+    /// so `a * POW2_FLOOR_INV(a)` is in `[1, 2)`. Zero and denormals (`e = 0`) give `2^127`;
+    /// `e >= 254` (`|a| >= 2^127`, whose inverse is not a normal number, and infinities and
+    /// NaNs) saturate to `2^-126`.
+    pub const POW2_FLOOR_INV: u32 = 0x196;
     // I32 operations; scalar immediates carry raw I32 bits.
     pub const INT_ADD: u32 = 0x170;
     pub const INT_SUB: u32 = 0x171;
@@ -308,6 +316,7 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::BOOL_TO_I32 => sig(&[Bool], Elem::I32),
         kind_sfpu::INDEX_TO_I32 | kind_sfpu::F32_TO_I32 => sig(&[F32], Elem::I32),
         kind_sfpu::ROUND..=kind_sfpu::TRUNC => sig(&[F32], F32),
+        kind_sfpu::POW2_FLOOR | kind_sfpu::POW2_FLOOR_INV => sig(&[F32], F32),
         _ => sig(&[F32, F32], F32),
     }
 }
@@ -2333,7 +2342,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
             Operands::Binary
         });
     }
-    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32) {
+    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::POW2_FLOOR_INV) {
         return Some(Operands::Unary);
     }
     Some(match kind {
@@ -2927,7 +2936,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
         });
         return Some((Operands::Unary, p.finish_code()));
     }
-    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32) {
+    if matches!(kind, kind_sfpu::ROUND..=kind_sfpu::POW2_FLOOR_INV) {
         use super::round::{self, RoundOp};
         let mut p = Program::new();
         p.for_each_row_group(64, |p, o| {
@@ -2937,6 +2946,21 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 kind_sfpu::FLOOR => round::body(p, RoundOp::Floor),
                 kind_sfpu::CEIL => round::body(p, RoundOp::Ceil),
                 kind_sfpu::TRUNC => round::body(p, RoundOp::Trunc),
+                kind_sfpu::POW2_FLOOR => {
+                    p.loadi_bits(LReg::L3, 0x7f80_0000);
+                    p.and(LReg::L0, LReg::L3, LReg::L2);
+                }
+                kind_sfpu::POW2_FLOOR_INV => {
+                    p.loadi_bits(LReg::L3, 0x7f80_0000);
+                    p.and(LReg::L0, LReg::L3, LReg::L1);
+                    p.loadi_bits(LReg::L4, 0x7f00_0000);
+                    p.mov(LReg::L1, LReg::L2);
+                    p.isub_from(LReg::L4, LReg::L2); // 254 - e, in the exponent field
+                                                     // `e >= 254` would make the field 0 or negative: 2^-126 instead.
+                    p.if_(Cond::LessEq(LReg::L4, LReg::L1), |p| {
+                        p.loadi_bits(LReg::L2, 0x0080_0000)
+                    });
+                }
                 _ => round::to_i32(p),
             }
             p.store(LReg::L2, Format::Int32, OUT_ROW + o);
@@ -3611,7 +3635,7 @@ mod fit {
         .into_iter()
         .chain(kind_sfpu::INT_ADD..=kind_sfpu::INT_NOT)
         .chain(kind_sfpu::INT_ADD_S..=kind_sfpu::INT_LE_S)
-        .chain(kind_sfpu::ROUND..=kind_sfpu::F32_TO_I32)
+        .chain(kind_sfpu::ROUND..=kind_sfpu::POW2_FLOOR_INV)
         .chain([
             kind_sfpu::INT_MASK_FILL,
             kind_sfpu::BOOL_MASK_FILL,
@@ -4938,7 +4962,7 @@ mod arity {
             .chain([kind_sfpu::INDEX_TO_I32])
             .chain(0x170..=0x17e)
             .chain(0x180..=0x18d)
-            .chain(0x190..=0x194)
+            .chain(0x190..=0x196)
             .chain(0x161..=0x165)
         {
             // Scalars any kind takes: `CLAMP`'s bounds uncrossed.
@@ -5027,6 +5051,47 @@ mod s2 {
                 want.to_bits()
             );
         }
+    }
+
+    /// The power-of-two scale kinds the accurate matmul slices with, against the one-line host
+    /// definitions, bit for bit on every special: zeros and denormals (`e = 0`), `f32::MAX`
+    /// (`e = 254`), infinities and NaNs (`e = 255`), and ordinary values of both signs.
+    #[test]
+    fn the_power_of_two_scale_kinds_are_the_exponent_field() {
+        check(
+            POW2_FLOOR,
+            [0.0; 2],
+            |x, _| f32::from_bits(x.to_bits() & 0x7f80_0000),
+            false,
+        );
+        check(
+            POW2_FLOOR_INV,
+            [0.0; 2],
+            |x, _| {
+                let e = (x.to_bits() >> 23) & 0xff;
+                f32::from_bits(if e >= 254 {
+                    0x0080_0000
+                } else {
+                    (254 - e) << 23
+                })
+            },
+            false,
+        );
+        // The meaning, on normal values: `x * inverse` lands in [1, 2), and `floor * inverse` is 1.
+        let (a, _) = pairs();
+        let inv = reference_op(POW2_FLOOR_INV, [0.0; 2], Broadcast::None, &[&a], 32, 32);
+        let floor = reference_op(POW2_FLOOR, [0.0; 2], Broadcast::None, &[&a], 32, 32);
+        let mut normal = 0;
+        for i in 0..1024 {
+            let e = (a[i].to_bits() >> 23) & 0xff;
+            if (1..254).contains(&e) {
+                let m = f64::from(a[i].abs()) * f64::from(inv[i]);
+                assert!((1.0..2.0).contains(&m), "{:#x}: {m}", a[i].to_bits());
+                assert_eq!(f64::from(floor[i]) * f64::from(inv[i]), 1.0);
+                normal += 1;
+            }
+        }
+        assert!(normal > 256, "the specials hold too few normal values");
     }
 
     #[test]

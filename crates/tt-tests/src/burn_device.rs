@@ -60,6 +60,10 @@ pub struct Config {
     /// The default follows `TT_EXACT_MATMUL=1`, which is how `cargo xtask conformance --exact`
     /// selects its profile.
     pub exact_matmul: bool,
+    /// Matmuls run as integer slices with shared exponents on the FPU at `Fidelity::Lo`
+    /// (`burn_tt::MatmulMode::Accurate`). The default follows `TT_ACCURATE_MATMUL=1`
+    /// (`cargo xtask conformance --accurate`). Setting both this and `exact_matmul` is refused.
+    pub accurate_matmul: bool,
 }
 
 impl Default for Config {
@@ -72,14 +76,21 @@ impl Default for Config {
             budget: 4_000_000,
             tiles: None,
             exact_matmul: std::env::var("TT_EXACT_MATMUL").as_deref() == Ok("1"),
+            accurate_matmul: std::env::var("TT_ACCURATE_MATMUL").as_deref() == Ok("1"),
         }
     }
 }
 
 impl Config {
     fn matmul_mode(&self) -> burn_tt::MatmulMode {
+        assert!(
+            !(self.exact_matmul && self.accurate_matmul),
+            "exact_matmul and accurate_matmul are both set: choose one matmul mode"
+        );
         if self.exact_matmul {
             burn_tt::MatmulMode::Exact
+        } else if self.accurate_matmul {
+            burn_tt::MatmulMode::Accurate
         } else {
             burn_tt::MatmulMode::Fast
         }
@@ -112,8 +123,8 @@ pub fn with_mesh_device(config: Config, chips: usize, f: impl FnOnce(TtDevice)) 
         "matrix mode is unsupported on mesh engines"
     );
     assert!(
-        !config.exact_matmul,
-        "exact matmul mode is unsupported on mesh engines"
+        !config.exact_matmul && !config.accurate_matmul,
+        "exact and accurate matmul modes are unsupported on mesh engines"
     );
     if let Err(e) = tt_ttsim::fork_scope(|| {
         let device = TtDevice::new(0);
@@ -351,6 +362,38 @@ fn sim_factory(
                 tb,
                 c.route,
                 c.fidelity,
+                c.budget,
+            )
+        }
+        fn matmul_dram_at(
+            &mut self,
+            a: burn_tt::BufferId,
+            ta: bool,
+            b: burn_tt::BufferId,
+            tb: bool,
+            fidelity: burn_tt::Fidelity,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers
+                .matmul(&mut self.session, a, ta, b, tb, c.route, fidelity, c.budget)
+        }
+        fn matmul_dram_batched_at(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            items: &[(burn_tt::Block, burn_tt::Block)],
+            mkn: [usize; 3],
+            fidelity: burn_tt::Fidelity,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.matmul_batched(
+                &mut self.session,
+                a,
+                b,
+                items,
+                mkn,
+                c.route,
+                fidelity,
                 c.budget,
             )
         }

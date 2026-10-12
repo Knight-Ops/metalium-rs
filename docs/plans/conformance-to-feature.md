@@ -476,7 +476,7 @@ First run: 145 of 1,187 failed. After the fixes: 22 listed (1,165 pass), 20 in t
 | conv with a bias (6) | the generated wrapper widened the required operands and not an optional one (the bias): **also broken for BF16** | widen optional operands too (generator) | same, `conv2d`, `conv3d_groups`; fails with it removed | pass |
 | `float_empty`, `float_random` (about 60), pooling, `interpolate`, `gather_nd` | refused F16 by name | F16 accepted: zeros are the same bits; the F32 draw is cast; pooling widens inside `mean_forward` | same | pass |
 | 3 `precision`: `should_diff_gelu`, `cov_1`, `det_random_2x2x4x4` | the Matrix Unit matmul, by elimination: all pass in the exact profile | listed | none | fail the same on card 0 |
-| 2 `precision`: CTC gradients | per-operation binary16 rounding in Burn's default `ctc_loss`; not the matmul (fail in the exact profile too) | listed; the tolerance stays | `ctc_gradient_in_f16_is_flexs_to_rounding_noise` | fail the same on card 0 |
+| 2 `precision`: CTC gradients | per-operation binary16 rounding in Burn's default `ctc_loss`, differentiated by autodiff; not the matmul (fail in the exact profile too) | **fixed afterwards (round eight below):** native `ctc_loss` / `ctc_loss_backward` in F32, rounded once | `ctc_gradient_in_f16_meets_the_f32_reference` | pass (`1791818535`) |
 | 15 `timeout` | ttsim speed | listed | none | all pass (run `1791811392`) |
 | 2 F64 | not a Tensix dtype | listed with the F32 ones | none | n/a |
 
@@ -494,3 +494,33 @@ Lessons that generalize:
 - **Re-run what the change touched, not everything.** F32 code was not edited (every change is gated on `is_half`), so the
   F32 suites were not re-run; the new binaries were run in each profile, and the BF16 gates that the shared fixes reach
   (`step76`, `78`, `83`-`85`, `127`, `155`, `157`, `160`) were re-run.
+
+## Worked example: round eight, a Matrix Unit matmul without its rounding, and F16 CTC
+
+Round seven left five F16 `precision` entries: three that pass in the exact profile (the Matrix Unit matmul), two CTC
+gradients that do not (the matmul is not the cause). The exact profile was never a fix, only a diagnosis: 1,000x to 22,000x
+slower, so the question was whether a matmul could stay on the Matrix Unit and lose its error. Cost on card 0: 19x to 64x the fast matmul (run `1791818553`), 50x to 750x faster than exact.
+
+| Finding | Cause | Fix | Gate |
+|---|---|---|---|
+| 21 F32 + 3 F16 `precision` (gelu gradient, conv2d, conv3d, LU, determinant, `cov`) | the Matrix Unit's group adder rounds each product of a group of eight to a quantum set by the group's *largest* term ([silicon-operating-notes.md](../learnings/silicon-operating-notes.md), "Matmul accumulation"); the note's "a multi-pass split cannot repair it" holds for splitting *operands* (they were already exact), not for **making every term a multiple of the quantum** | `MatmulMode::Accurate` ([`ops/accurate_matmul.rs`](../../crates/burn-tt/src/ops/accurate_matmul.rs)): per-row/column power-of-two scales and integer slices of 7 and 5 bits, at `Fidelity::Lo`, so the quantum is 1 and every product and sum of eight is exact; twelve slice pairs added small to large; NaN and infinity by three 0/+-1 matmuls | `step163_accurate_matmul`, `step158` `lofi_*` |
+| 2 F16 CTC gradients | per-operation binary16 rounding in the composition autodiff differentiates | `has_ctc_loss_backward`: native `ctc_loss` and `ctc_loss_backward` ([`ops/ctc.rs`](../../crates/burn-tt/src/ops/ctc.rs)), widened to F32 and rounded once | `step162` `ctc_gradient_in_f16_meets_the_f32_reference` |
+
+Measured on ttsim, with the gates also passing on card 0: with `--accurate`, the 41 selected precision tests (gelu 3, conv2d, conv3d 2,
+the small LU and determinant tests, `cov_1`, the 2x2x4x4 determinant) all pass; the gate's worst error is 0.21 of its derived bound
+while the fast matmul leaves the bound 22,072 times on the same data. The F16 CTC gradients pass in the default profile and under
+fusion.
+
+Lessons that generalize:
+
+- **Find the quantum, then arrange the data to be a multiple of it.** The unit's loss was a rule (step158), not noise, so the fix was
+  arithmetic on the operands (Ozaki's splitting, fitted to the measured rule) and not a different reduction.
+- **Hardware limits the slice, not the type.** LoFi's slices are 7 bits of `SrcB` and 5 of `SrcA`; those, and not TF32's 11, set
+  how much a pass can carry, so the gate that matters is the one that fails at 8 and 6 bits (`lofi_loses_a_bit_past_the_slice`).
+- **Do not nest autodiff inside a backward step.** The first CTC attempt differentiated Burn's composition under an inner graph:
+  the outer `backward()` holds autodiff's global graph lock while it runs the backend method, and the inner graph takes the same
+  lock, so 20 gradient tests timed out. It also lacked the unreachable-target masking that Burn's gradient composition has (a
+  direct test had been skipped for as long as `has_ctc_loss_backward` was false). The fix ports the alpha recursion and gets beta as
+  alpha of the time- and label-reversed problem, then calls Burn's public `ctc_grad_from_alpha_beta_default`.
+- **A skipped test starts running when its guard flips.** `test_ctc_loss_backward_unreachable_is_finite` found a real defect the
+  moment `has_ctc_loss_backward` became true.

@@ -43,6 +43,10 @@ usage: cargo xtask conformance [options]
                         (TT_EXACT_MATMUL=1, `burn_tt::MatmulMode::Exact`) rather
                         than on the Matrix Unit: expected-failures-exact.toml,
                         and `-fusion-exact` with --fusion
+  --accurate            matmuls run as integer slices with shared exponents on the
+                        Matrix Unit at LoFi (TT_ACCURATE_MATMUL=1,
+                        `burn_tt::MatmulMode::Accurate`): expected-failures-accurate.toml,
+                        and `-fusion-accurate` with --fusion. Not with --exact
   --jobs N              processes at a time (default: the CPU count)
   --timeout-secs N      per-test wall-clock limit (default 120)
   --strict              TT_STRICT=1: a download or a staged matmul panics the test
@@ -58,6 +62,7 @@ struct Opts {
     filters: Vec<String>,
     fusion: bool,
     exact: bool,
+    accurate: bool,
     jobs: usize,
     timeout: Duration,
     strict: bool,
@@ -72,6 +77,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         filters: Vec::new(),
         fusion: false,
         exact: false,
+        accurate: false,
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         timeout: Duration::from_secs(120),
         strict: false,
@@ -101,6 +107,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             }
             "--fusion" => o.fusion = true,
             "--exact" => o.exact = true,
+            "--accurate" => o.accurate = true,
             "--strict" => o.strict = true,
             "--release" => o.release = true,
             "--update" => o.update = true,
@@ -108,6 +115,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
+    }
+    if o.exact && o.accurate {
+        return Err(format!(
+            "`--exact` and `--accurate` are two matmul modes: choose one\n\n{USAGE}"
+        ));
     }
     Ok(o)
 }
@@ -132,11 +144,12 @@ struct Group {
     tests: BTreeSet<String>,
 }
 
-fn expected_path(fusion: bool, exact: bool) -> PathBuf {
+fn expected_path(fusion: bool, exact: bool, accurate: bool) -> PathBuf {
     let name = format!(
-        "expected-failures{}{}.toml",
+        "expected-failures{}{}{}.toml",
         if fusion { "-fusion" } else { "" },
-        if exact { "-exact" } else { "" }
+        if exact { "-exact" } else { "" },
+        if accurate { "-accurate" } else { "" }
     );
     workspace_root()
         .join("crates/burn-tt-conformance")
@@ -380,7 +393,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let expected_file = expected_path(o.fusion, o.exact);
+    let expected_file = expected_path(o.fusion, o.exact, o.accurate);
     let mut groups = read_expected(&expected_file)?;
     let reasons: BTreeMap<String, (String, String)> = groups
         .iter()
@@ -536,6 +549,9 @@ fn run_all(o: &Opts, selection: &[(String, Built, String)], out_dir: &Path) -> V
     }
     if o.exact {
         env.push(("TT_EXACT_MATMUL", "1".into()));
+    }
+    if o.accurate {
+        env.push(("TT_ACCURATE_MATMUL", "1".into()));
     }
     std::thread::scope(|scope| {
         for _ in 0..o.jobs.min(selection.len()) {

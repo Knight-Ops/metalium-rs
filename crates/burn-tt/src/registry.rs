@@ -50,16 +50,21 @@ impl Default for TtConfig {
 }
 
 impl TtConfig {
-    /// The defaults, with `TT_TOPOLOGY`, `TT_TILES` and `TT_EXACT_MATMUL` applied if set.
+    /// The defaults, with `TT_TOPOLOGY`, `TT_TILES`, `TT_EXACT_MATMUL` and `TT_ACCURATE_MATMUL` applied if set.
     pub fn from_env() -> Result<Self, TtError> {
         let mut config = Self::default();
-        match std::env::var("TT_EXACT_MATMUL").as_deref() {
-            Err(_) | Ok("0") => {}
-            Ok("1") => config.matmul = MatmulMode::Exact,
-            Ok(v) => {
-                return Err(TtError::Device(format!(
-                    "TT_EXACT_MATMUL={v}: expected 0 or 1"
-                )))
+        for (name, mode) in [
+            ("TT_EXACT_MATMUL", MatmulMode::Exact),
+            ("TT_ACCURATE_MATMUL", MatmulMode::Accurate),
+        ] {
+            match std::env::var(name).as_deref() {
+                Err(_) | Ok("0") => {}
+                Ok("1") if config.matmul != MatmulMode::Fast => return Err(TtError::Device(
+                    "TT_EXACT_MATMUL and TT_ACCURATE_MATMUL are both set: choose one matmul mode"
+                        .into(),
+                )),
+                Ok("1") => config.matmul = mode,
+                Ok(v) => return Err(TtError::Device(format!("{name}={v}: expected 0 or 1"))),
             }
         }
         if let Some(topology) = Topology::from_env() {
@@ -151,9 +156,10 @@ pub(crate) fn kmd_factory(device: TtDevice, config: &TtConfig) -> Result<EngineF
                 ));
             }
             if config.matmul != MatmulMode::Fast {
-                return Err(TtError::unsupported(
-                    "exact matmul mode is unsupported on mesh engines",
-                ));
+                return Err(TtError::unsupported(match config.matmul {
+                    MatmulMode::Accurate => "accurate matmul mode is unsupported on mesh engines",
+                    _ => "exact matmul mode is unsupported on mesh engines",
+                }));
             }
             Ok(Box::new(server::kmd_mesh_engine(
                 cards,

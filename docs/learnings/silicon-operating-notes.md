@@ -905,13 +905,36 @@ the `2^-9 sum|ab|` the `step68` and `step85` bounds charge for TF32 truncation**
 this alignment, so they hold on their own (fractional, similar-sized) data but are not a guarantee for an
 adversarial exponent spread. Re-derive them from this rule before relying on them elsewhere.
 
-**Consequences.** A multi-pass TF32 operand split cannot repair it: the operands are already exact. The loss is
+**Consequences.** A multi-pass TF32 operand split of the *bits* cannot repair it: the operands are already exact (but see "Making every term a multiple of the quantum" below, which does). The loss is
 a property of the FPU's reduction, so a fix is a different reduction, not more operand bits: that is
 `burn_tt::MatmulMode::Exact` (2026-10-11, F32 SFPU products summed in `k` order, opt-in; `step159_exact_matmul`),
 which passes every Burn test the Matrix Unit's rounding failed, on silicon too (all 24 LU tests, the 300 to 500 square
 and rectangular ones taking 95 to 579 s, run `1791758996`; the determinants, attention and CTC too), at 1,000x to 22,000x the cost. For fractional float data the TF32 truncation (about 2^-11 per operand) is of the same order as
 a group's rounding, so the effect shows chiefly with exact data and large sums. Not covered: LoFi to HiFi3, BF16
 `Src`, `Dst` as BF16, subnormals, NaN and infinity. ttsim and silicon agree on all of it.
+
+### Making every term a multiple of the quantum (2026-10-12, ttsim and card 0)
+
+The loss happens only where a term is not a multiple of its group's quantum `2^(max operand-exponent sum - 10)`. If the
+operands are **integers** whose significands fit the slice a phase takes, the largest exponent sum is at most 6 + 4 = 10 at
+`Fidelity::Lo` (one phase: `SrcB`'s 7 significant bits times `SrcA`'s 5, masks `0xfffe_0000` and `0xfff8_0000`), so the
+quantum is `2^0 = 1` and every product and every sum of eight is exact. Gate: `step158_matmul_accumulation`,
+`lofi_is_exact_on_seven_by_five_bit_integers` (|lhs| <= 127, |rhs| <= 31, mixed magnitudes inside one group, ragged `k`, `k` up to
+4096 over many K-blocks, sums under 2^24: equal to exact arithmetic on every row) and `lofi_loses_a_bit_past_the_slice` (an 8-bit
+lhs or a 6-bit rhs gives wrong rows: the masks cut the extra bit). Planting one 8-bit operand in the first makes it fail. Both pass on ttsim and on card 0 (run `1791818525`): the LoFi rule is the
+same on silicon.
+
+That is the Ozaki scheme: scale each row of the left operand and column of the right one by its own power of two, cut each into
+integer slices of 7 and 5 bits (`trunc`, then the remainder times the radix), run a `Fidelity::Lo` matmul per slice pair and add
+the partial products from the smallest to the largest. `MatmulMode::Accurate` (`ops/accurate_matmul.rs`, gate
+`step163_accurate_matmul`) does this with twelve pairs (total weight `7 (s - 1) + 5 (t - 1)` up to 23, past an F32's 24 bits);
+measured against an f64 reference on ttsim its error is about 1e-7 of the largest entry (the fast matmul's is about 1e-3), worst
+0.21 of the derived bound (the same gate passes on card 0, run `1791818535`), and it equals exact arithmetic on integer data whose sums stay below 2^24, `arange` data of Burn's
+conv3d tests included. **Limits that follow from the construction:** the bound scales with each row's and column's largest
+magnitude, not the entry's, so a row of very different magnitudes keeps its small entries only to that scale; operands are clamped
+to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x to 64x the fast matmul** (18.7x at 1024 cubed), 50x to 750x
+faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
+matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
 ## Handling silicon runs
 

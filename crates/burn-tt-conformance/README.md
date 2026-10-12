@@ -44,7 +44,13 @@ singleton, and one failure must not poison the next test. It then compares the o
 [`expected-failures-exact.toml`](expected-failures-exact.toml) (`--fusion` has its own lists, `expected-failures-fusion.toml` and
 `expected-failures-fusion-exact.toml`). The
 default profile keeps the fast Matrix Unit matmul; a test that only the exact one passes stays listed in
-`expected-failures.toml` as a `precision` entry whose reason says so. `--update` rewrites the list: it drops entries that now pass and adds new failures under `todo`, to be
+`expected-failures.toml` as a `precision` entry whose reason says so.
+
+`--accurate` is a third: matmuls run as integer slices with shared exponents on the Matrix Unit at LoFi
+(`burn_tt::MatmulMode::Accurate`, `TT_ACCURATE_MATMUL=1`), within a derived bound of the exact value at a
+small multiple of the fast matmul's cost, and the outcome is compared with
+[`expected-failures-accurate.toml`](expected-failures-accurate.toml) (and `-fusion-accurate` with `--fusion`). It is not
+combined with `--exact`. `--update` rewrites the list: it drops entries that now pass and adds new failures under `todo`, to be
 given a category and a reason by hand. `--strict` sets `TT_STRICT=1`, so a download or a staged matmul
 fails the test. Output of every test, with burn-tt's `TT_REPORT=1` residency table, is kept in
 `target/conformance/<stamp>/out/`.

@@ -1,0 +1,56 @@
+# The `--accurate` profile: Burn's own backend tests with every matmul run as integer slices with
+# shared exponents on the Matrix Unit at LoFi (`burn_tt::MatmulMode::Accurate`,
+# TT_ACCURATE_MATMUL=1), against `expected-failures.toml`, the default profile's list (the fast
+# Matrix Unit matmul) and `expected-failures-exact.toml` (the exact one).
+#
+# `cargo xtask conformance --accurate` compares every run with this file: an unlisted failure is a
+# regression or a new finding, and a listed test that passes is stale, so the list only shrinks.
+# Test names are `<binary>::<test path>`, as `cargo xtask conformance --accurate --list` prints them.
+
+[[group]]
+category = "unsupported-dtype"
+reason = "F64 is not a Tensix dtype: `float_cast` to F64 is refused by name. The two autodiff tests end as timeouts, as in the default profile (burn-tensor-testgen 0.21.0's `#[might_panic]` deadlocks when the panic message differs)."
+tests = [
+    "autodiff::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_checkpointing::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor::tensor::float::ops::slice::should_support_slice_fill_cast_f64",
+    "autodiff_f16::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor_f16::f16::ops::slice::should_support_slice_fill_cast_f64",
+]
+
+[[group]]
+category = "timeout"
+reason = "The simulator does not finish these in the limit (120 s in the canonical run): the long CTC losses, the 300 x 300 determinants, the 300 to 500 LU tests, `lu_medium_tall`/`_wide` and `[408, 261120] @ [261120, 408]`, each thousands of small device launches, and every accurate matmul is about a hundred of them (`MatmulMode::Accurate` submits 127 device jobs for a small product). Every one passes on silicon, card 0, in the accurate mode: the F32 ones in run `1791819292` (the 300 x 300 determinants in 40 s, the LU tests in 0.8 s to 389 s, the transaction in 31 s, the CTC tests in 4 to 8 s) and the F16 ones in run `1791820653` (the same times to within a second), within the 1800 s limit. The same tests fail the LU and determinant tolerances in the default profile on silicon, and the transaction is refused by name in the exact one. Not a defect: ttsim speed."
+tests = [
+    "autodiff::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "autodiff_checkpointing::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "autodiff_f16::base::ctc::test_ctc_loss_scaled_swap_dims_then_narrow_autodiff",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_ones",
+    "tensor::tensor::float::linalg::det::test_det_300x300_all_zeros",
+    "tensor::tensor::float::linalg::det::test_det_300x300_identity_matrix",
+    "tensor::tensor::float::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_wide",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_mixed_input_lengths",
+    "tensor::tensor::float::module::ctc::test_ctc_loss_long_sequence",
+    "tensor::tensor::float::ops::transaction::should_support_transaction",
+    "tensor_f16::f16::linalg::det::test_det_300x300_all_ones",
+    "tensor_f16::f16::linalg::det::test_det_300x300_all_zeros",
+    "tensor_f16::f16::linalg::det::test_det_300x300_identity_matrix",
+    "tensor_f16::f16::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor_f16::f16::linalg::lu::test_lu_medium_tall",
+    "tensor_f16::f16::linalg::lu::test_lu_medium_wide",
+    "tensor_f16::f16::module::ctc::test_ctc_loss_long_mixed_input_lengths",
+    "tensor_f16::f16::module::ctc::test_ctc_loss_long_sequence",
+    "tensor_f16::f16::ops::transaction::should_support_transaction",
+]

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Accurate matmul cost](#accurate-matmul-cost-2026-10-12-card-0) | 2026-10-12 | opt-in F32-accuracy matmul on the Matrix Unit: 19x to 64x slower than the fast one; the element-wise work around the matmuls dominates |
 | [Exact matmul cost](#exact-matmul-cost-2026-10-11-card-0) | 2026-10-11 | opt-in F32 matmul 1,000x to 22,000x slower than the fast one; linear in products |
 | [`.ttinsn` push fusion, precise `gelu`](#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) | 2026-10-10 | experiment: 2.77x on a push-bound kernel; not adopted |
 | [X6 mover NIU fast path](#x6-mover-niu-fast-path-2026-10-10-card-0) | 2026-10-10 | |
@@ -39,6 +40,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
 | 2026-10-11 | 1791761944 | Exact matmul (`MatmulMode::Exact`) against the fast Matrix Unit matmul, four shapes, card 0, validated; see "Exact matmul cost" below. | New scoreboard row. |
 | 2026-10-10 | 1791597495 | Release card-0 smoke tier after the Phase 10 close-out: 486/486 pass (baseline before the close-out: 258/258, run `1791558187`). | None; correctness record. |
 | 2026-10-10 | 1791600377 | X6 mover NIU fast path: request initiator 1 keeps its registers, fast/slow 0.96-0.97 on every shape (about 17 ns of 0.48 us per request); opt-in, see "X6 mover NIU fast path" below. | None; not the default. |
@@ -273,6 +275,47 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Accurate matmul cost (2026-10-12, card 0)
+
+`MatmulMode::Accurate` ([`ops/accurate_matmul.rs`](../../crates/burn-tt/src/ops/accurate_matmul.rs)) runs integer slices with
+shared exponents at `Fidelity::Lo` on the Matrix Unit and adds twelve slice pairs, with NaN and infinity handled by three more
+0/+-1 matmul pairs. It is built from the existing resident ops, so it submits many jobs: one `[64,96]@[96,48]` is **127 device jobs**
+(101 element-wise, 18 matmuls, 4 reductions, 4 gathers and copies) against 1 for the fast matmul (counted on ttsim with a temporary
+counter in `server::submit`, since removed).
+
+**Conditions.** Run `1791818553` (`cargo xtask bench --device 0 --filter step163_accurate_matmul::benchmark`), card 0, release,
+`Config::default()` (one tile, HiFi4 for the fast mode, `Tf32FromFp32`). Host `Instant` around `matmul` and the read of its result,
+two warm-ups and `REPS` samples, median (p10 to p90). Every sample validated: the first sixteen rows of the accurate result inside the
+derived bound of `step163_accurate_matmul` (a bound the fast matmul leaves), the fast one inside a loose sanity bound.
+
+| `m x k x n` | fast (us) | accurate (us) | accurate / fast |
+|---|--:|--:|--:|
+| 64 x 32 x 64 | 72.8 (70.6 to 76.8) | 1,393 (1,334 to 1,426) | 19.1 |
+| 1024 x 27 x 32 | 146.6 (132.3 to 158.0) | 9,444 (9,377 to 9,471) | 64.4 |
+| 128 x 256 x 128 | 126.9 (109.1 to 138.8) | 4,996 (4,994 to 5,000) | 39.4 |
+| 256 x 256 x 256 | 277.2 (272.7 to 288.3) | 10,964 (10,956 to 10,981) | 39.6 |
+| 32 x 784 x 128 | 101.1 (100.5 to 110.5) | 6,081 (6,077 to 6,092) | 60.2 |
+| 512 x 512 x 512 | 1,546 (1,545 to 1,562) | 49,586 (49,526 to 49,641) | 32.1 |
+| 1024 x 1024 x 1024 | 14,922 (14,787 to 15,007) | 279,692 (279,286 to 279,948) | 18.7 |
+
+For scale, the exact mode (same card, run `1791761944`) took 70 ms at 64x32x64 and 8.2 s at 256 cubed: accurate is about 50x and 750x
+faster than exact at those two shapes, and 19x to 64x slower than fast.
+
+**Where the time goes** (a scratch profile on the same card, medians of the same host timing, not kept): limiting the slice pairs to
+the leading one (`set_accurate_matmul_slicing(0, 0)`: 11 matmuls and 11 adds fewer, everything else unchanged) gives
+
+| `m x k x n` | 12 pairs (us) | 1 pair (us) | 11 pairs cost | the rest |
+|---|--:|--:|--:|--:|
+| 64 x 32 x 64 | 1,448 | 1,133 | 315 us (29 us a pair) | 78% |
+| 256 x 256 x 256 | 11,027 | 9,523 | 1,504 us (137 us a pair) | 86% |
+| 1024 x 1024 x 1024 | 279,266 | 178,449 | 100,817 us (9.2 ms a pair) | 64% |
+
+**Reading.** The Matrix Unit part (the LoFi matmuls) is not what costs: the rest, which is scaling, slicing and the NaN/infinity
+classification, all element-wise on one tile's SFPU, is 64% to 86% of the time, and at 1024 cubed 178 ms of it is spent on
+operands of a million elements, about 100 element-wise jobs each. Two things would cut it without touching the arithmetic: fused SFPU
+kinds that make a weighted slice in one job (one input and one scale in, one slice out, instead of `trunc`, subtract, scale), and a
+cheaper classification of NaN and infinity (about 45 of the 127 jobs). Neither is built.
 
 ## Exact matmul cost (2026-10-11, card 0)
 

@@ -12,6 +12,13 @@
 //! neither the FPU nor TF32. It is composed from resident SFPU ops (`ops/exact_matmul.rs`), so it is
 //! far slower; it is for validation and for work that needs CPU-order accuracy, not for training.
 //!
+//! [`MatmulMode::Accurate`] stays on the Matrix Unit and removes its rounding by arithmetic instead of
+//! by a different reduction: each operand is cut into integer slices that share one exponent per row
+//! (left operand) or column (right operand), so every product and every sum of eight is an integer the
+//! unit's group adder keeps whole (`ops/accurate_matmul.rs`). It runs at `Fidelity::Lo`, one phase of
+//! four, over about a dozen slice pairs, and costs a small multiple of the fast matmul where the exact
+//! one costs thousands.
+//!
 //! The mode is chosen in two ways. [`TtConfig::matmul`](crate::TtConfig::matmul) (or
 //! `TT_EXACT_MATMUL=1`) fixes it for a device's attachment. [`with_matmul_mode`] overrides it for the
 //! ops a closure builds **on the calling thread**. The override cannot reach `Fusion<TtBackend>`
@@ -30,10 +37,33 @@ pub enum MatmulMode {
     Fast,
     /// F32 products summed in order on the SFPU: slow, exact to F32 rounding.
     Exact,
+    /// Integer slices with shared exponents on the Matrix Unit at `Fidelity::Lo`: within a derived
+    /// bound of the exact value, at a small multiple of [`MatmulMode::Fast`]'s cost.
+    Accurate,
 }
 
 thread_local! {
     static SCOPED: Cell<Option<MatmulMode>> = const { Cell::new(None) };
+    static FIDELITY: Cell<Option<crate::Fidelity>> = const { Cell::new(None) };
+}
+
+/// Run `f` with the Matrix Unit matmuls submitted on this thread at `fidelity`, in place of the
+/// engine's own, then restore what was in force (also if `f` panics). `MatmulMode::Accurate`'s
+/// integer slices are exact at `Fidelity::Lo`, which runs one phase of four.
+pub(crate) fn with_fidelity<R>(fidelity: crate::Fidelity, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<crate::Fidelity>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIDELITY.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FIDELITY.with(|c| c.replace(Some(fidelity))));
+    f()
+}
+
+/// The fidelity [`with_fidelity`] forces on this thread, if any.
+pub(crate) fn fidelity_override() -> Option<crate::Fidelity> {
+    FIDELITY.with(Cell::get)
 }
 
 /// Run `f` with matmuls built on this thread in `mode`, whatever the device's own, then restore what
@@ -53,6 +83,11 @@ pub fn with_matmul_mode<R>(mode: MatmulMode, f: impl FnOnce() -> R) -> R {
 /// [`with_matmul_mode`] in [`MatmulMode::Exact`].
 pub fn exact_matmul<R>(f: impl FnOnce() -> R) -> R {
     with_matmul_mode(MatmulMode::Exact, f)
+}
+
+/// [`with_matmul_mode`] in [`MatmulMode::Accurate`].
+pub fn accurate_matmul<R>(f: impl FnOnce() -> R) -> R {
+    with_matmul_mode(MatmulMode::Accurate, f)
 }
 
 /// The mode a matmul on `device` runs in now: this thread's override, else the device's.

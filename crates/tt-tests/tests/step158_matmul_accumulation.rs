@@ -33,7 +33,8 @@
 //! The model equals the device on every output of every case here (a pair grid, random operands of
 //! every slice combination, sums past 2^24, Burn's conv3d cases), where exact arithmetic does not; a
 //! bound derived from it holds; and each of its rules is watched failing when changed.
-//! Not covered: LoFi to HiFi3, BF16 `Src`, `Dst` as BF16, subnormals, NaN and infinity.
+//! LoFi is covered only for what `MatmulMode::Accurate` needs: integers of 7 (`SrcB`) and 5 (`SrcA`) significant bits
+//! are exact (`lofi_*` below). Not covered: HiFi2 and HiFi3, BF16 `Src`, `Dst` as BF16, subnormals, NaN and infinity.
 
 use burn::tensor::module::conv3d;
 use burn::tensor::ops::ConvOptions;
@@ -510,4 +511,102 @@ fn the_alignment_error_can_exceed_the_bound_the_older_gates_charge() {
         apart.swap(0, 8);
         assert_eq!(matmul(&d, &apart, &[1.0; 16], 16)[0], 1027.5);
     });
+}
+
+/// Integers of mixed magnitude: each has a random bit length up to `bits`, so one group of eight holds
+/// terms whose exponents differ by up to `bits - 1`, and zeros occur. Signed.
+fn mixed(rng: &mut Rng, n: usize, bits: u32) -> Vec<f32> {
+    (0..n)
+        .map(|_| {
+            let width = 1 + rng.below(u64::from(bits));
+            let v = rng.below(1 << width) as f32;
+            if rng.below(2) == 0 {
+                -v
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// The shared-exponent slicing the accurate matmul is built on: at `Fidelity::Lo` (one phase, the SrcB
+/// slice of 7 significant bits times the SrcA slice of 5) a matmul of integers `|a| <= 127`, `|b| <= 31`
+/// is **exact**. Every term is then an integer, the largest operand-exponent sum is 6 + 4 = 10, so the
+/// group quantum `2^(10 - 10)` is 1 and the alignment rounds nothing; every sum stays below 2^24, so
+/// `Dst` loses nothing either. That is `Rules`'s quantum rule, run in the one place it had not been:
+/// LoFi, with the exponent spread inside a group at its widest.
+#[test]
+fn lofi_is_exact_on_seven_by_five_bit_integers() {
+    with_device(
+        Config {
+            fidelity: burn_tt::Fidelity::Lo,
+            ..Config::default()
+        },
+        |d| {
+            // (k, rows): ragged faces, one tile, and far more than one K-block (4096 x 127 x 31 < 2^24).
+            for (n, &(k, rows_n)) in [
+                (16usize, 128usize),
+                (27, 128),
+                (33, 128),
+                (64, 128),
+                (1024, 32),
+                (4096, 32),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let mut rng =
+                    Rng(0x2545_f491_4f6c_dd1d ^ (n as u64 + 1).wrapping_mul(0x1000_0000_01b3));
+                let mut a = mixed(&mut rng, rows_n * k, 7);
+                let mut b = mixed(&mut rng, k, 5);
+                // The worst group: the largest product beside the smallest, in the first rows.
+                for r in 0..4.min(rows_n) {
+                    a[r * k] = 127.0;
+                    b[0] = 31.0;
+                    a[r * k + 1] = 1.0;
+                    b[1] = 1.0;
+                }
+                // Full-size operands of one sign in the last rows: the largest sum the tests above allow.
+                for r in rows_n - 2..rows_n {
+                    a[r * k..(r + 1) * k].fill(127.0);
+                }
+                if rows_n > 2 {
+                    b[2..].fill(31.0);
+                }
+                let got = matmul(&d, &a, &b, k);
+                for r in 0..rows_n {
+                    let e = exact(&a[r * k..(r + 1) * k], &b);
+                    assert_eq!(f64::from(got[r]), e, "k {k}, row {r}");
+                }
+            }
+        },
+    );
+}
+
+/// The controls for the test above, each past the slice: an eighth bit in A and a sixth in B are cut by
+/// LoFi's masks (7 and 5 bits), so the same check must fail where the operand has the bit.
+#[test]
+fn lofi_loses_a_bit_past_the_slice() {
+    with_device(
+        Config {
+            fidelity: burn_tt::Fidelity::Lo,
+            ..Config::default()
+        },
+        |d| {
+            let k = 64;
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ 0x2545_f491_4f6c_dd1d);
+            for (bits_a, bits_b) in [(8u32, 5u32), (7, 6)] {
+                let a = mixed(&mut rng, 256 * k, bits_a);
+                let b = mixed(&mut rng, k, bits_b);
+                let got = matmul(&d, &a, &b, k);
+                let wrong = (0..256)
+                    .filter(|&r| f64::from(got[r]) != exact(&a[r * k..(r + 1) * k], &b))
+                    .count();
+                assert!(
+                    wrong > 128,
+                    "A {bits_a} bits, B {bits_b} bits: only {wrong} of 256 rows differ"
+                );
+            }
+        },
+    );
 }
