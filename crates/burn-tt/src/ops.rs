@@ -33,6 +33,10 @@ pub(crate) fn bfp_compute_input(tensor: TtTensor) -> TtTensor {
 }
 
 pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    // Exact mode widens to F32 and takes the exact path.
+    if crate::matmul_mode::effective(a.device) == crate::MatmulMode::Exact {
+        return None;
+    }
     if a.storage_format() != b.storage_format()
         || a.storage_format() == crate::storage::StorageFormat::F32
         || a.shape().num_dims() != 2
@@ -258,6 +262,10 @@ pub(crate) fn matrix_float_op(
 }
 
 pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    // Exact mode widens to F32, takes the exact path and narrows once.
+    if crate::matmul_mode::effective(lhs.device) == crate::MatmulMode::Exact {
+        return None;
+    }
     if lhs.dtype() != DType::BF16
         || rhs.dtype() != DType::BF16
         || !lhs.is_storable()
@@ -1828,6 +1836,10 @@ pub mod float {
                 format_args!("lhs=({}), rhs=({})", context(&lhs), context(&rhs)),
             );
         }
+        // `MatmulMode::Exact`: F32 products summed in order on the SFPU, not the Matrix Unit.
+        if let Some(t) = super::exact_matmul::exact_matmul(&lhs, &rhs) {
+            return t;
+        }
         // Phase 9: two matrices on an engine that keeps tensors on the device
         // stay there -- operands uploaded once, the result never downloaded
         // unless a host op asks for it (`tensor.rs`).
@@ -3133,6 +3145,8 @@ pub mod float {
 }
 
 mod conv;
+mod exact_matmul;
+pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
 mod pool;
@@ -3141,9 +3155,11 @@ mod sort;
 
 pub mod module {
     pub use super::conv::{
-        conv2d, conv2d_bias_backward, conv2d_weight_backward, conv2d_x_backward, conv_transpose2d,
+        conv2d, conv2d_bias_backward, conv2d_weight_backward, conv2d_x_backward, conv3d,
+        conv3d_bias_backward, conv3d_weight_backward, conv3d_x_backward, conv_transpose2d,
         conv_transpose2d_bias_backward, conv_transpose2d_weight_backward,
-        conv_transpose2d_x_backward, unfold4d,
+        conv_transpose2d_x_backward, conv_transpose3d, conv_transpose3d_bias_backward,
+        conv_transpose3d_weight_backward, conv_transpose3d_x_backward, unfold4d,
     };
     pub use super::interpolate::{interpolate, interpolate_backward};
     pub use super::pool::{

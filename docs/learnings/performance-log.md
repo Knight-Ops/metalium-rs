@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Exact matmul cost](#exact-matmul-cost-2026-10-11-card-0) | 2026-10-11 | opt-in F32 matmul 1,000x to 22,000x slower than the fast one; linear in products |
 | [`.ttinsn` push fusion, precise `gelu`](#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) | 2026-10-10 | experiment: 2.77x on a push-bound kernel; not adopted |
 | [X6 mover NIU fast path](#x6-mover-niu-fast-path-2026-10-10-card-0) | 2026-10-10 | |
 | [Approx transcendentals, per-tile saving](#approx-transcendentals-per-tile-saving-2026-10-10-card-0) | 2026-10-10 | |
@@ -38,6 +39,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-11 | 1791761944 | Exact matmul (`MatmulMode::Exact`) against the fast Matrix Unit matmul, four shapes, card 0, validated; see "Exact matmul cost" below. | New scoreboard row. |
 | 2026-10-10 | 1791597495 | Release card-0 smoke tier after the Phase 10 close-out: 486/486 pass (baseline before the close-out: 258/258, run `1791558187`). | None; correctness record. |
 | 2026-10-10 | 1791600377 | X6 mover NIU fast path: request initiator 1 keeps its registers, fast/slow 0.96-0.97 on every shape (about 17 ns of 0.48 us per request); opt-in, see "X6 mover NIU fast path" below. | None; not the default. |
 | 2026-10-10 | (`silicon_perf::approx_per_tile_saving`) | `MathMode::Approx` saves 1.24x-8.24x per tile on six transcendentals; see "Approx transcendentals" below. | None; Precise stays the default. |
@@ -271,6 +273,35 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Exact matmul cost (2026-10-11, card 0)
+
+`MatmulMode::Exact` ([`ops/exact_matmul.rs`](../../crates/burn-tt/src/ops/exact_matmul.rs)) computes F32
+products on the SFPU and sums them in `k` order, in place of the Matrix Unit's group adder
+([silicon-operating-notes.md](silicon-operating-notes.md), "Matmul accumulation: the Matrix Unit's group
+adder"). It is built from existing resident ops, so what it costs is what a gather, a multiply and a
+reduction cost.
+
+**Conditions.** Run `1791761944` (`cargo xtask bench --device 0 --filter
+step159_exact_matmul::benchmark`), card 0, release, `Config::default()` otherwise (one tile, HiFi4,
+`Tf32FromFp32`). Host `Instant` around `matmul` and the read of its result, two warm-ups and nine samples,
+median (p10 to p90). Every sample is validated: the exact result bit for bit against the host oracle, the
+fast one within a loose sanity bound.
+
+| `m x k x n` | products | chunks | fast (us) | exact (us) | exact / fast |
+|---|--:|--:|--:|--:|--:|
+| 64 x 32 x 64 | 131 k | 1 | 68.2 (66.3 to 74.9) | 70,430 (70,180 to 70,569) | 1,033 |
+| 1024 x 27 x 32 | 885 k | 1 | 149.1 (145.7 to 155.9) | 495,350 (472,299 to 497,103) | 3,322 |
+| 128 x 256 x 128 | 4.2 M | 4 | 164.0 (159.9 to 169.8) | 2,109,880 (2,106,610 to 2,113,014) | 12,863 |
+| 256 x 256 x 256 | 16.8 M | 16 | 376.2 (341.0 to 387.2) | 8,192,931 (8,184,219 to 8,199,700) | 21,775 |
+
+**Reading.** The exact path costs about 0.5 us per product (0.54, 0.56, 0.50, 0.49) at every size, so it is
+linear in products while the fast one is nearly flat: 22,000x at 256 cubed. Whether the host's two address
+tables per chunk (a 16-byte entry per product each) or the device's gathers dominate is **not profiled**. The
+untried alternatives that need far fewer addresses: a loop over `k` of `acc = acc + a[:, p] * b[p, :]` (about
+`m + n` addresses a step, a few device ops a step, the same sum and the same order, so the same bits), or one
+output row at a time. Until one of them is built and measured, the exact mode is for validation and for work
+that needs CPU-order accuracy, not for training.
 
 ## `.ttinsn` push fusion, precise `gelu` (2026-10-10, card 0)
 

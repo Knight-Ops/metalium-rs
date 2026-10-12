@@ -56,6 +56,10 @@ pub struct Config {
     /// The Tensix tiles the device computes on; `None` is the gate tile
     /// (`harness::tensix_tile`), or on silicon what `TT_TILES` says.
     pub tiles: Option<burn_tt::TileChoice>,
+    /// Matmuls accumulate in exact F32 (`burn_tt::MatmulMode::Exact`) instead of on the FPU.
+    /// The default follows `TT_EXACT_MATMUL=1`, which is how `cargo xtask conformance --exact`
+    /// selects its profile.
+    pub exact_matmul: bool,
 }
 
 impl Default for Config {
@@ -67,6 +71,17 @@ impl Default for Config {
             fidelity: Fidelity::HiFi4,
             budget: 4_000_000,
             tiles: None,
+            exact_matmul: std::env::var("TT_EXACT_MATMUL").as_deref() == Ok("1"),
+        }
+    }
+}
+
+impl Config {
+    fn matmul_mode(&self) -> burn_tt::MatmulMode {
+        if self.exact_matmul {
+            burn_tt::MatmulMode::Exact
+        } else {
+            burn_tt::MatmulMode::Fast
         }
     }
 }
@@ -95,6 +110,10 @@ pub fn with_mesh_device(config: Config, chips: usize, f: impl FnOnce(TtDevice)) 
         config.elementwise,
         burn_tt::ElementwiseMode::Sfpu,
         "matrix mode is unsupported on mesh engines"
+    );
+    assert!(
+        !config.exact_matmul,
+        "exact matmul mode is unsupported on mesh engines"
     );
     if let Err(e) = tt_ttsim::fork_scope(|| {
         let device = TtDevice::new(0);
@@ -209,6 +228,9 @@ fn sim_factory(
     impl Engine for Sim<'_> {
         fn elementwise_mode(&self) -> burn_tt::ElementwiseMode {
             self.config.elementwise
+        }
+        fn matmul_mode(&self) -> burn_tt::MatmulMode {
+            self.config.matmul_mode()
         }
         fn math_mode(&self) -> burn_tt::MathMode {
             self.session.math_mode()
@@ -585,6 +607,7 @@ fn attach_engine(
             .topology(topology)
             .route(config.route)
             .fidelity(config.fidelity)
-            .elementwise(config.elementwise),
+            .elementwise(config.elementwise)
+            .matmul(config.matmul_mode()),
     )
 }

@@ -38,7 +38,11 @@ singleton, and one failure must not poison the next test. It then compares the o
 - a listed test that no longer exists;
 - an entry still in the `todo` category.
 
-`--update` rewrites the list: it drops entries that now pass and adds new failures under `todo`, to be
+`--exact` is a second profile: matmuls accumulate in exact F32 (`burn_tt::MatmulMode::Exact`, set with
+`TT_EXACT_MATMUL=1` for every test process) and the outcome is compared with
+[`expected-failures-exact.toml`](expected-failures-exact.toml) (`-fusion-exact` with `--fusion`). The
+default profile keeps the fast Matrix Unit matmul; a test that only the exact one passes stays listed in
+`expected-failures.toml` as a `precision` entry whose reason says so. `--update` rewrites the list: it drops entries that now pass and adds new failures under `todo`, to be
 given a category and a reason by hand. `--strict` sets `TT_STRICT=1`, so a download or a staged matmul
 fails the test. Output of every test, with burn-tt's `TT_REPORT=1` residency table, is kept in
 `target/conformance/<stamp>/out/`.

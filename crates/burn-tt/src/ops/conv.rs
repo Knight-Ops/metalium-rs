@@ -4,20 +4,21 @@ use burn_backend::ops::{ConvOptions, ConvTransposeOptions};
 
 const PATCH_ROWS: usize = 32;
 
-struct Geometry {
-    x: [usize; 4],
-    w: [usize; 4],
-    y: [usize; 4],
-    options: ConvOptions<2>,
+/// Shapes are `[batch, channels, spatial...]` with `D` spatial dimensions.
+struct Geometry<const D: usize> {
+    x: Vec<usize>,
+    w: Vec<usize>,
+    y: Vec<usize>,
+    options: ConvOptions<D>,
 }
 
-impl Geometry {
-    fn new(x: &TtTensor, weight: &TtTensor, options: ConvOptions<2>) -> Self {
-        let xs = x.shape().to_vec();
-        let ws = weight.shape().to_vec();
-        assert_eq!(xs.len(), 4, "convolution input requires NCHW");
-        assert_eq!(ws.len(), 4, "convolution weights require OIHW");
-        assert!(!xs.contains(&0) && !ws.contains(&0));
+impl<const D: usize> Geometry<D> {
+    fn new(x: &TtTensor, weight: &TtTensor, options: ConvOptions<D>) -> Self {
+        let x = x.shape().to_vec();
+        let w = weight.shape().to_vec();
+        assert_eq!(x.len(), D + 2, "convolution input requires N, C, spatial");
+        assert_eq!(w.len(), D + 2, "convolution weights require O, I, spatial");
+        assert!(!x.contains(&0) && !w.contains(&0));
         assert!(
             options.groups > 0
                 && options
@@ -26,12 +27,11 @@ impl Geometry {
                     .chain(&options.dilation)
                     .all(|&n| n > 0)
         );
-        let x: [usize; 4] = xs.try_into().unwrap();
-        let w: [usize; 4] = ws.try_into().unwrap();
         assert_eq!(x[1] % options.groups, 0);
         assert_eq!(w[0] % options.groups, 0);
         assert_eq!(w[1].checked_mul(options.groups), Some(x[1]));
-        let spatial = std::array::from_fn::<_, 2, _>(|d| {
+        let mut y = vec![x[0], w[0]];
+        for d in 0..D {
             let effective = (w[d + 2] - 1)
                 .checked_mul(options.dilation[d])
                 .unwrap()
@@ -41,10 +41,9 @@ impl Geometry {
                 .checked_add(options.padding[d].checked_mul(2).unwrap())
                 .unwrap();
             assert!(padded >= effective, "empty convolution output");
-            (padded - effective) / options.stride[d] + 1
-        });
-        let y = [x[0], w[0], spatial[0], spatial[1]];
-        for shape in [x, w, y] {
+            y.push((padded - effective) / options.stride[d] + 1);
+        }
+        for shape in [&x, &w, &y] {
             shape
                 .iter()
                 .try_fold(1usize, |n, &d| n.checked_mul(d))
@@ -53,11 +52,18 @@ impl Geometry {
         Self { x, w, y, options }
     }
 
+    /// Output cells per batch element.
+    fn spatial(&self) -> usize {
+        self.y[2..].iter().product()
+    }
+    fn kernel(&self) -> usize {
+        self.w[2..].iter().product()
+    }
     fn positions(&self) -> usize {
-        self.y[0] * self.y[2] * self.y[3]
+        self.y[0] * self.spatial()
     }
     fn k(&self) -> usize {
-        self.w[1] * self.w[2] * self.w[3]
+        self.w[1] * self.kernel()
     }
     fn channels(&self) -> usize {
         self.w[0] / self.options.groups
@@ -65,22 +71,29 @@ impl Geometry {
 
     /// Logical input coordinate of one patch datum, or explicit zero padding.
     fn input(&self, group: usize, position: usize, k: usize) -> Option<usize> {
-        let [_, channels, h, w] = self.x;
-        let [_, _, oh, ow] = self.y;
-        let batch = position / (oh * ow);
-        let r = position / ow % oh;
-        let c = position % ow;
-        let channel = group * self.w[1] + k / (self.w[2] * self.w[3]);
-        let kr = k / self.w[3] % self.w[2];
-        let kc = k % self.w[3];
-        let ir = (r as i128) * self.options.stride[0] as i128
-            + kr as i128 * self.options.dilation[0] as i128
-            - self.options.padding[0] as i128;
-        let ic = (c as i128) * self.options.stride[1] as i128
-            + kc as i128 * self.options.dilation[1] as i128
-            - self.options.padding[1] as i128;
-        (ir >= 0 && ir < h as i128 && ic >= 0 && ic < w as i128)
-            .then(|| ((batch * channels + channel) * h + ir as usize) * w + ic as usize)
+        let batch = position / self.spatial();
+        let channel = group * self.w[1] + k / self.kernel();
+        let mut out = position % self.spatial();
+        let mut tap = k % self.kernel();
+        let mut at = [0i128; D];
+        // Row-major, last dimension fastest.
+        for d in (0..D).rev() {
+            let (o, kd) = (self.y[d + 2], self.w[d + 2]);
+            let (r, kr) = (out % o, tap % kd);
+            (out, tap) = (out / o, tap / kd);
+            let i = r as i128 * self.options.stride[d] as i128
+                + kr as i128 * self.options.dilation[d] as i128
+                - self.options.padding[d] as i128;
+            if i < 0 || i >= self.x[d + 2] as i128 {
+                return None;
+            }
+            at[d] = i;
+        }
+        let mut flat = batch * self.x[1] + channel;
+        for (&i, &size) in at.iter().zip(&self.x[2..]) {
+            flat = flat * size + i as usize;
+        }
+        Some(flat)
     }
 
     fn patches(
@@ -111,7 +124,7 @@ impl Geometry {
     }
 
     fn gradients(&self, grad: &TtTensor, group: usize, first: usize, count: usize) -> TtTensor {
-        let spatial = self.y[2] * self.y[3];
+        let spatial = self.spatial();
         let sources = (first..first + count)
             .flat_map(|p| {
                 (0..self.channels()).map(move |c| {
@@ -131,18 +144,19 @@ fn zero(device: TtDevice) -> TtTensor {
     native_zeros([1, 1].into(), &device, DType::F32).expect("native convolution zeros")
 }
 
-pub fn conv2d(
+fn conv<const D: usize>(
     x: TtTensor,
     weight: TtTensor,
     bias: Option<TtTensor>,
-    options: ConvOptions<2>,
+    options: ConvOptions<D>,
 ) -> TtTensor {
     let dtype = float_compute_dtype(&[&x, &weight]);
-    let g = Geometry::new(&x, &weight, options);
+    let g = Geometry::<D>::new(&x, &weight, options);
     let x = float_compute_input(x);
     let weight = float_compute_input(weight);
     let z = zero(x.device);
     let chunks = g.positions().div_ceil(PATCH_ROWS);
+    let spatial = g.spatial();
     let mut products = Vec::new();
     for group in 0..g.options.groups {
         let weights = g.weights(&weight, group);
@@ -158,8 +172,8 @@ pub fn conv2d(
         .flat_map(|n| {
             let g = &g;
             (0..g.y[1]).flat_map(move |c| {
-                (0..g.y[2] * g.y[3]).map(move |s| {
-                    let p = n * g.y[2] * g.y[3] + s;
+                (0..spatial).map(move |s| {
+                    let p = n * spatial + s;
                     (
                         c / g.channels() * chunks + p / PATCH_ROWS,
                         p % PATCH_ROWS * g.channels() + c % g.channels(),
@@ -169,32 +183,39 @@ pub fn conv2d(
         })
         .collect();
     let refs: Vec<_> = products.iter().collect();
-    let mut output = mapped_native(&refs, sources, g.y.to_vec());
+    let mut output = mapped_native(&refs, sources, g.y.clone());
     if let Some(bias) = bias {
         assert_eq!(bias.dtype(), dtype);
         assert_eq!(bias.shape().to_vec(), vec![g.y[1]]);
-        let bias = float::float_reshape(float_compute_input(bias), [1, g.y[1], 1, 1].into());
+        let bias = float::float_reshape(float_compute_input(bias), channel_shape(g.y[1], D));
         output = float::float_add(output, bias);
     }
     cast_native(output, dtype)
 }
 
-pub fn conv2d_weight_backward(
-    x: TtTensor,
-    weight: TtTensor,
-    output_grad: TtTensor,
-    options: ConvOptions<2>,
-) -> TtTensor {
-    let g = Geometry::new(&x, &weight, options);
-    assert_eq!(output_grad.shape().to_vec(), g.y);
-    conv2d_weight_backward_geometry(x, weight, output_grad, g)
+/// `[1, channels, 1, ...]` with `spatial` trailing ones, the shape a bias broadcasts from.
+fn channel_shape(channels: usize, spatial: usize) -> burn_backend::Shape {
+    let mut shape = vec![1, channels];
+    shape.extend(std::iter::repeat_n(1, spatial));
+    shape.into()
 }
 
-fn conv2d_weight_backward_geometry(
+fn conv_weight_backward<const D: usize>(
     x: TtTensor,
     weight: TtTensor,
     output_grad: TtTensor,
-    g: Geometry,
+    options: ConvOptions<D>,
+) -> TtTensor {
+    let g = Geometry::<D>::new(&x, &weight, options);
+    assert_eq!(output_grad.shape().to_vec(), g.y);
+    conv_weight_backward_geometry(x, weight, output_grad, g)
+}
+
+fn conv_weight_backward_geometry<const D: usize>(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    g: Geometry<D>,
 ) -> TtTensor {
     let dtype = float_compute_dtype(&[&x, &weight, &output_grad]);
     let x = float_compute_input(x);
@@ -220,25 +241,25 @@ fn conv2d_weight_backward_geometry(
         .flat_map(|c| (0..g.k()).map(move |k| (c / channels, k * channels + c % channels)))
         .collect();
     let refs: Vec<_> = outputs.iter().collect();
-    cast_native(mapped_native(&refs, sources, g.w.to_vec()), dtype)
+    cast_native(mapped_native(&refs, sources, g.w.clone()), dtype)
 }
 
-pub fn conv2d_x_backward(
+fn conv_x_backward<const D: usize>(
     x: TtTensor,
     weight: TtTensor,
     output_grad: TtTensor,
-    options: ConvOptions<2>,
+    options: ConvOptions<D>,
 ) -> TtTensor {
-    let g = Geometry::new(&x, &weight, options);
+    let g = Geometry::<D>::new(&x, &weight, options);
     assert_eq!(output_grad.shape().to_vec(), g.y);
-    conv2d_x_backward_geometry(x, weight, output_grad, g)
+    conv_x_backward_geometry(x, weight, output_grad, g)
 }
 
-fn conv2d_x_backward_geometry(
+fn conv_x_backward_geometry<const D: usize>(
     x: TtTensor,
     weight: TtTensor,
     output_grad: TtTensor,
-    g: Geometry,
+    g: Geometry<D>,
 ) -> TtTensor {
     let dtype = float_compute_dtype(&[&x, &weight, &output_grad]);
     let weight = float_compute_input(weight);
@@ -283,14 +304,14 @@ fn conv2d_x_backward_geometry(
         .map(|i| (i / PATCH_ROWS, i % PATCH_ROWS))
         .collect();
     let refs: Vec<_> = outputs.iter().collect();
-    cast_native(mapped_native(&refs, sources, g.x.to_vec()), dtype)
+    cast_native(mapped_native(&refs, sources, g.x.clone()), dtype)
 }
 
-pub fn conv2d_bias_backward(_x: TtTensor, bias: TtTensor, output_grad: TtTensor) -> TtTensor {
+fn conv_bias_backward(bias: TtTensor, output_grad: TtTensor) -> TtTensor {
     let dtype = output_grad.dtype();
     assert_eq!(bias.dtype(), dtype);
     let shape = output_grad.shape().to_vec();
-    assert_eq!(shape.len(), 4);
+    assert!(shape.len() >= 3, "bias gradient requires N, C, spatial");
     assert_eq!(bias.shape().to_vec(), vec![shape[1]]);
     let grad = float_compute_input(output_grad);
     let grad = pack_axis(&grad, 1).expect("native bias gradient");
@@ -300,7 +321,7 @@ pub fn conv2d_bias_backward(_x: TtTensor, bias: TtTensor, output_grad: TtTensor)
     )
 }
 
-fn regular(options: &ConvTransposeOptions<2>) -> ConvOptions<2> {
+fn regular<const D: usize>(options: &ConvTransposeOptions<D>) -> ConvOptions<D> {
     ConvOptions::new(
         options.stride,
         options.padding,
@@ -309,19 +330,21 @@ fn regular(options: &ConvTransposeOptions<2>) -> ConvOptions<2> {
     )
 }
 
-pub fn conv_transpose2d(
+fn conv_transpose<const D: usize>(
     x: TtTensor,
     weight: TtTensor,
     bias: Option<TtTensor>,
-    options: ConvTransposeOptions<2>,
+    options: ConvTransposeOptions<D>,
 ) -> TtTensor {
     let dtype = float_compute_dtype(&[&x, &weight]);
     let xs = x.shape().to_vec();
     let ws = weight.shape().to_vec();
-    assert_eq!(xs.len(), 4);
-    assert_eq!(ws.len(), 4);
+    assert_eq!(xs.len(), D + 2);
+    assert_eq!(ws.len(), D + 2);
     assert_eq!(xs[1], ws[0]);
-    let spatial = std::array::from_fn::<_, 2, _>(|d| {
+    let channels = ws[1].checked_mul(options.groups).unwrap();
+    let mut shape = vec![xs[0], channels];
+    for d in 0..D {
         // Burn defines any output padding: the trailing cells no input reaches are
         // zero (plus the bias), and the backward pass drops `padding_out / stride`
         // of them. PyTorch limits it below `max(stride, dilation)`; Burn's own tests
@@ -330,25 +353,25 @@ pub fn conv_transpose2d(
             options.stride[d] > 0 && options.dilation[d] > 0,
             "stride and dilation must be positive"
         );
-        (xs[d + 2] - 1)
-            .checked_mul(options.stride[d])
-            .unwrap()
-            .checked_add((ws[d + 2] - 1).checked_mul(options.dilation[d]).unwrap())
-            .unwrap()
-            .checked_add(options.padding_out[d])
-            .unwrap()
-            .checked_add(1)
-            .unwrap()
-            .checked_sub(options.padding[d].checked_mul(2).unwrap())
-            .filter(|&n| n > 0)
-            .expect("empty transposed convolution")
-    });
-    let channels = ws[1].checked_mul(options.groups).unwrap();
-    let shape = [xs[0], channels, spatial[0], spatial[1]];
+        shape.push(
+            (xs[d + 2] - 1)
+                .checked_mul(options.stride[d])
+                .unwrap()
+                .checked_add((ws[d + 2] - 1).checked_mul(options.dilation[d]).unwrap())
+                .unwrap()
+                .checked_add(options.padding_out[d])
+                .unwrap()
+                .checked_add(1)
+                .unwrap()
+                .checked_sub(options.padding[d].checked_mul(2).unwrap())
+                .filter(|&n| n > 0)
+                .expect("empty transposed convolution"),
+        );
+    }
     let template = native_zeros(shape.into(), &x.device, DType::F32).unwrap();
-    let mut g = Geometry::new(&template, &weight, regular(&options));
-    g.y = xs.try_into().unwrap();
-    let mut output = conv2d_x_backward_geometry(
+    let mut g = Geometry::<D>::new(&template, &weight, regular(&options));
+    g.y = xs;
+    let mut output = conv_x_backward_geometry(
         template,
         float_compute_input(weight),
         float_compute_input(x),
@@ -359,21 +382,21 @@ pub fn conv_transpose2d(
         assert_eq!(bias.shape().to_vec(), vec![channels]);
         output = float::float_add(
             output,
-            float::float_reshape(float_compute_input(bias), [1, channels, 1, 1].into()),
+            float::float_reshape(float_compute_input(bias), channel_shape(channels, D)),
         );
     }
     cast_native(output, dtype)
 }
 
-pub fn conv_transpose2d_x_backward(
+fn conv_transpose_x_backward<const D: usize>(
     weight: TtTensor,
     output_grad: TtTensor,
-    options: ConvTransposeOptions<2>,
+    options: ConvTransposeOptions<D>,
 ) -> TtTensor {
-    let output = conv2d(output_grad, weight, None, regular(&options));
+    let output = conv(output_grad, weight, None, regular(&options));
     let full = output.shape().to_vec();
     let mut shape = full.clone();
-    for d in 0..2 {
+    for d in 0..D {
         shape[d + 2] -= options.padding_out[d] / options.stride[d];
     }
     if shape == full {
@@ -381,13 +404,77 @@ pub fn conv_transpose2d_x_backward(
     }
     let sources = (0..shape.iter().product::<usize>())
         .map(|i| {
-            let c = i % shape[3];
-            let r = i / shape[3] % shape[2];
-            let nc = i / (shape[2] * shape[3]);
-            (0, (nc * full[2] + r) * full[3] + c)
+            let mut rest = i;
+            let mut flat = 0;
+            let mut stride = 1;
+            for d in (0..shape.len()).rev() {
+                flat += rest % shape[d] * stride;
+                rest /= shape[d];
+                stride *= full[d];
+            }
+            (0, flat)
         })
         .collect();
     mapped_native(&[&output], sources, shape)
+}
+
+fn conv_transpose_weight_backward<const D: usize>(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvTransposeOptions<D>,
+) -> TtTensor {
+    let mut g = Geometry::<D>::new(&output_grad, &weight, regular(&options));
+    g.y = x.shape().to_vec();
+    conv_weight_backward_geometry(output_grad, weight, x, g)
+}
+
+pub fn conv2d(
+    x: TtTensor,
+    weight: TtTensor,
+    bias: Option<TtTensor>,
+    options: ConvOptions<2>,
+) -> TtTensor {
+    conv(x, weight, bias, options)
+}
+
+pub fn conv2d_weight_backward(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvOptions<2>,
+) -> TtTensor {
+    conv_weight_backward(x, weight, output_grad, options)
+}
+
+pub fn conv2d_x_backward(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvOptions<2>,
+) -> TtTensor {
+    conv_x_backward(x, weight, output_grad, options)
+}
+
+pub fn conv2d_bias_backward(_x: TtTensor, bias: TtTensor, output_grad: TtTensor) -> TtTensor {
+    conv_bias_backward(bias, output_grad)
+}
+
+pub fn conv_transpose2d(
+    x: TtTensor,
+    weight: TtTensor,
+    bias: Option<TtTensor>,
+    options: ConvTransposeOptions<2>,
+) -> TtTensor {
+    conv_transpose(x, weight, bias, options)
+}
+
+pub fn conv_transpose2d_x_backward(
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvTransposeOptions<2>,
+) -> TtTensor {
+    conv_transpose_x_backward(weight, output_grad, options)
 }
 
 pub fn conv_transpose2d_weight_backward(
@@ -396,12 +483,75 @@ pub fn conv_transpose2d_weight_backward(
     output_grad: TtTensor,
     options: ConvTransposeOptions<2>,
 ) -> TtTensor {
-    let mut g = Geometry::new(&output_grad, &weight, regular(&options));
-    g.y = x.shape().to_vec().try_into().unwrap();
-    conv2d_weight_backward_geometry(output_grad, weight, x, g)
+    conv_transpose_weight_backward(x, weight, output_grad, options)
 }
 
 pub fn conv_transpose2d_bias_backward(
+    x: TtTensor,
+    bias: TtTensor,
+    output_grad: TtTensor,
+) -> TtTensor {
+    conv2d_bias_backward(x, bias, output_grad)
+}
+
+pub fn conv3d(
+    x: TtTensor,
+    weight: TtTensor,
+    bias: Option<TtTensor>,
+    options: ConvOptions<3>,
+) -> TtTensor {
+    conv(x, weight, bias, options)
+}
+
+pub fn conv3d_weight_backward(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvOptions<3>,
+) -> TtTensor {
+    conv_weight_backward(x, weight, output_grad, options)
+}
+
+pub fn conv3d_x_backward(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvOptions<3>,
+) -> TtTensor {
+    conv_x_backward(x, weight, output_grad, options)
+}
+
+pub fn conv3d_bias_backward(_x: TtTensor, bias: TtTensor, output_grad: TtTensor) -> TtTensor {
+    conv_bias_backward(bias, output_grad)
+}
+
+pub fn conv_transpose3d(
+    x: TtTensor,
+    weight: TtTensor,
+    bias: Option<TtTensor>,
+    options: ConvTransposeOptions<3>,
+) -> TtTensor {
+    conv_transpose(x, weight, bias, options)
+}
+
+pub fn conv_transpose3d_x_backward(
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvTransposeOptions<3>,
+) -> TtTensor {
+    conv_transpose_x_backward(weight, output_grad, options)
+}
+
+pub fn conv_transpose3d_weight_backward(
+    x: TtTensor,
+    weight: TtTensor,
+    output_grad: TtTensor,
+    options: ConvTransposeOptions<3>,
+) -> TtTensor {
+    conv_transpose_weight_backward(x, weight, output_grad, options)
+}
+
+pub fn conv_transpose3d_bias_backward(
     x: TtTensor,
     bias: TtTensor,
     output_grad: TtTensor,
@@ -424,13 +574,13 @@ pub fn unfold4d(
         dtype,
     )
     .unwrap();
-    let g = Geometry::new(
+    let g = Geometry::<2>::new(
         &x,
         &weights,
         ConvOptions::new(options.stride, options.padding, options.dilation, 1),
     );
     let zero = native_zeros([1].into(), &device, dtype).unwrap();
-    let positions = g.y[2] * g.y[3];
+    let positions = g.spatial();
     let mut sources = Vec::new();
     for n in 0..g.x[0] {
         for k in 0..g.k() {

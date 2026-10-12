@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use crate::error::TtError;
 use crate::server::{self, AttachGuard, Serve};
 use crate::topology::{tiles_from_env, Topology};
-use crate::{ElementwiseMode, Fidelity, SrcRoute, TileChoice, TtDevice};
+use crate::{ElementwiseMode, Fidelity, MatmulMode, SrcRoute, TileChoice, TtDevice};
 
 /// How a device is opened.
 ///
 /// The default is one card -- the device's own, `/dev/tenstorrent/{chip}` --
 /// computing on its first surviving tile, through `Tf32FromFp32` at `HiFi4`,
-/// with SFPU element-wise arithmetic. That tile is the one choice that exists
+/// with SFPU element-wise arithmetic and the fast (FPU) matmul ([`MatmulMode`]). That tile is the one choice that exists
 /// on every card, however it is harvested; a tile *count* is the caller's
 /// ([`TtConfig::tiles`], `TT_TILES`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub struct TtConfig {
     route: SrcRoute,
     fidelity: Fidelity,
     elementwise: ElementwiseMode,
+    matmul: MatmulMode,
 }
 
 impl Default for TtConfig {
@@ -43,14 +44,24 @@ impl Default for TtConfig {
             route: SrcRoute::Tf32FromFp32,
             fidelity: Fidelity::HiFi4,
             elementwise: ElementwiseMode::Sfpu,
+            matmul: MatmulMode::Fast,
         }
     }
 }
 
 impl TtConfig {
-    /// The defaults, with `TT_TOPOLOGY` and `TT_TILES` applied if set.
+    /// The defaults, with `TT_TOPOLOGY`, `TT_TILES` and `TT_EXACT_MATMUL` applied if set.
     pub fn from_env() -> Result<Self, TtError> {
         let mut config = Self::default();
+        match std::env::var("TT_EXACT_MATMUL").as_deref() {
+            Err(_) | Ok("0") => {}
+            Ok("1") => config.matmul = MatmulMode::Exact,
+            Ok(v) => {
+                return Err(TtError::Device(format!(
+                    "TT_EXACT_MATMUL={v}: expected 0 or 1"
+                )))
+            }
+        }
         if let Some(topology) = Topology::from_env() {
             config.topology = Some(topology?);
         }
@@ -88,6 +99,14 @@ impl TtConfig {
         self
     }
 
+    /// How matmuls accumulate on this attachment: the fast FPU path (the default) or exact F32
+    /// ([`MatmulMode`]). Fixed for the attachment; [`with_matmul_mode`](crate::with_matmul_mode)
+    /// overrides it for the ops a closure builds.
+    pub fn matmul(mut self, mode: MatmulMode) -> Self {
+        self.matmul = mode;
+        self
+    }
+
     /// The cards and tiles this configuration opens for `device`.
     pub fn resolve(&self, device: TtDevice) -> Result<Topology, TtError> {
         let base = self.topology.clone().unwrap_or(Topology::Single {
@@ -119,6 +138,7 @@ pub(crate) fn kmd_factory(device: TtDevice, config: &TtConfig) -> Result<EngineF
             config.route,
             config.fidelity,
             config.elementwise,
+            config.matmul,
         ))),
         Topology::Cards {
             cards,
@@ -128,6 +148,11 @@ pub(crate) fn kmd_factory(device: TtDevice, config: &TtConfig) -> Result<EngineF
             if config.elementwise != ElementwiseMode::Sfpu {
                 return Err(TtError::unsupported(
                     "matrix elementwise mode is unsupported on mesh engines",
+                ));
+            }
+            if config.matmul != MatmulMode::Fast {
+                return Err(TtError::unsupported(
+                    "exact matmul mode is unsupported on mesh engines",
                 ));
             }
             Ok(Box::new(server::kmd_mesh_engine(
@@ -267,6 +292,34 @@ mod tests {
             .expect("refused");
         assert!(refused.to_string().contains("unsupported on mesh"));
         assert!(kmd_factory(TtDevice::new(0), &config).is_err());
+    }
+
+    #[test]
+    fn exact_matmul_on_a_mesh_is_refused_before_anything_opens() {
+        let config = TtConfig::default()
+            .topology(Topology::cards(&[0, 1]))
+            .matmul(MatmulMode::Exact);
+        let refused = attach_with(TtDevice::new(0), config.clone())
+            .err()
+            .expect("refused");
+        assert!(refused.to_string().contains("exact matmul"));
+        assert!(refused.to_string().contains("unsupported on mesh"));
+        assert!(kmd_factory(TtDevice::new(0), &config).is_err());
+        // Fast matmul on the same mesh is not refused for that reason.
+        let fast = TtConfig::default().topology(Topology::cards(&[0, 1]));
+        assert_eq!(fast, fast.clone().matmul(MatmulMode::Fast));
+    }
+
+    #[test]
+    fn the_matmul_mode_is_part_of_the_configuration() {
+        assert_eq!(
+            TtConfig::default(),
+            TtConfig::default().matmul(MatmulMode::Fast)
+        );
+        assert_ne!(
+            TtConfig::default(),
+            TtConfig::default().matmul(MatmulMode::Exact)
+        );
     }
 
     #[test]
