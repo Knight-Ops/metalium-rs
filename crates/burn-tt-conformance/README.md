@@ -8,6 +8,39 @@ crates.io, so `cargo xtask fetch-burn-tests` downloads it into `vendor/burn-back
 it against the content digest pinned in `PINS.toml`. Upstream's tests check themselves against literals
 that Burn's CPU backend meets, so a pass needs no second backend to compare with.
 
+## Results (2026-10-12)
+
+Every lane matches its expected-failures list: no unexpected failure and no unexpected pass. "Listed" tests each have a category and a
+reason in the list; **none is a missing operation**. The suites are `tensor`, `autodiff`, `autodiff_checkpointing`, `tensor_f16` and
+`autodiff_f16` (3,025 tests), plus `tensor_bf16` and `autodiff_bf16` (1,187 tests, silicon only).
+
+| Lane | Tests | Pass | Listed |
+|---|---:|---:|---|
+| silicon, card 0, `--strict`: F32 and F16 (run `1791833700`) | 3,025 | 3,001 | 24: 19 `precision` (Matrix Unit matmul), 5 F64 |
+| silicon, card 0, `--strict`: BF16 (run `1791830816`) | 1,187 | 1,098 | 89: 87 `precision` (63 are BF16's own resolution, 22 the Matrix Unit matmul, 2 CTC), 2 F64 |
+| ttsim, default (fast matmul) | 3,025 | 2,973 | 52: 24 `precision`, 23 `timeout`, 5 F64 |
+| ttsim, `--accurate` | 3,025 | 2,989 | 36: 31 `timeout`, 5 F64 |
+| ttsim, `--exact` | 3,025 | 2,987 | 38: 31 `timeout`, 5 F64, 2 `unsupported-op` |
+| ttsim, `--fusion` (`Fusion<TtBackend>`) | 3,025 | 2,970 | 55: 24 `precision`, 23 `timeout`, 5 F64, 3 `bug` |
+
+What the listed tests are, and why they are not gaps in the backend:
+
+- **Matrix Unit matmul precision (24 in the default profile).** The fast matmul truncates operands to TF32 and adds in groups of
+  eight, so a few compositions (LU, determinants, the gelu gradient, conv2d and conv3d) miss tolerances that are never loosened. Every one
+  passes under `--accurate` (integer slices with shared exponents, 19x to 64x the fast matmul's cost) and under `--exact`.
+- **F64 (5 in F32 and F16, 2 more in BF16).** Not a Tensix dtype; `float_cast` to F64 is refused by name. Two end as timeouts because
+  upstream's `#[might_panic]` macro deadlocks when the panic message differs.
+- **`timeout` (23 default, 31 in the accurate and exact lists).** The simulator is too slow; each passes on silicon, which is why the
+  silicon lists have none.
+- **BF16 resolution (63).** The tolerance is as fine as one BF16 step (about 4e-3); they also miss under `--accurate`, and burn-flex run in
+  BF16 on the host fails them too (`--reference-flex`).
+- **3 `bug` under `--fusion`.** burn-fusion 0.21.0 has a `todo!()` for Bool scalars (`ScalarIr::to_relative`); the same tests pass on
+  `TtBackend`.
+
+The ttsim rows are the tests minus the list, from the last run of each lane (the lists are updated with the runs). The silicon runs
+have a log under `target/silicon/<run id>.log`. `--fusion`, `--exact` and `--accurate` have no silicon lists yet
+([roadmap](../../docs/plans/roadmap.md), "Conformance follow-ups").
+
 Only the backend is ours. Upstream's `common/backend.rs` and `common/autodiff.rs` name
 `burn_dispatch::Dispatch`, a closed enum that cannot hold `TtBackend`, so each entry binary in `tests/`
 replaces them:
@@ -18,6 +51,7 @@ replaces them:
 | `tests/autodiff.rs` | `Autodiff<TtBackend>` |
 | `tests/autodiff_checkpointing.rs` | `Autodiff<TtBackend, BalancedCheckpointing>` |
 | `tests/tensor_f16.rs`, `tests/autodiff_f16.rs` | the float tests and the autodiff suite with `f16` as the float element (upstream's `tensor_f16.rs` and `autodiff_f16.rs`) |
+| `tests/tensor_bf16.rs`, `tests/autodiff_bf16.rs` | the same with `bf16` (upstream has no such entries). **Silicon only**: ttsim refuses the BF16 narrowing, so the ttsim lane skips them |
 
 With `--features fusion` the base backend is `Fusion<TtBackend>` (`burn_tt::Tt`) instead.
 
@@ -83,8 +117,26 @@ The goal is an empty file. Tests upstream marks `#[ignore]` are not run.
 ## On silicon
 
 `cargo xtask silicon --smoke` includes a subset of the passing modules (`SMOKE` in `xtask/src/silicon.rs`)
-and runs it on card 0 only, since the tests use `TtDevice::default()`. The full suite on silicon is not
-part of smoke: build with `burn-tt-conformance/silicon` and run the test binaries one test per process.
+and runs it on card 0 only, since the tests use `TtDevice::default()`.
+
+The full suite on silicon is `cargo xtask conformance --silicon [--release]`: it builds with
+`burn-tt-conformance/silicon`, runs every test in its own process on card 0, one at a time (the card lock
+refuses a second process; the timeout defaults to 600 s, the 300 to 500 LU tests take up to 355 s), and
+compares the outcome with `expected-failures-silicon.toml` (`-fusion`, `-exact`, `-accurate` as for ttsim). One
+file holds every suite, the BF16 ones included. The run ID is the stamp of its fsync'd log,
+`target/silicon/<stamp>.log` (START and END lines, as `cargo xtask silicon` writes). It needs no ttsim,
+and `--list` touches no card. Check that no other session is using the card first: a second process is
+refused with `CardBusy`, and the runner has no lock between agents.
+
+## Telling a test from a defect: `--reference-flex`
+
+`cargo xtask conformance --reference-flex [--suite ..]` runs the same tests on burn-flex, on the host (build
+feature `reference-flex`; this crate is dev-only, `burn-tt` itself has no Flex dependency). It compares with
+no list and exits 0, printing the failures and writing `target/conformance/<stamp>/summary.txt`. A test that
+burn-flex also fails misses its tolerance for the type's own reasons (BF16 has 8 significant bits, and
+upstream's half-precision tolerances were set for F16): list it as `precision` with that evidence, and keep
+the vendored tolerance. A test that only burn-tt fails is a finding for
+[`conformance-to-feature.md`](../../docs/plans/conformance-to-feature.md).
 
 ## Layout
 

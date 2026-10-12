@@ -25,8 +25,8 @@ pub struct AutodiffDevice;
 
 impl AutodiffDevice {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> burn_tt::TtDevice {
-        burn_tt::TtDevice::default()
+    pub fn new() -> super::setup::Device {
+        Default::default()
     }
 }
 

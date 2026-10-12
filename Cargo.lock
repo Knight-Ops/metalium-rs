@@ -660,6 +660,7 @@ name = "burn-tt-conformance"
 version = "0.1.0"
 dependencies = [
  "burn-autodiff",
+ "burn-flex",
  "burn-tensor",
  "burn-tensor-testgen",
  "burn-tt",

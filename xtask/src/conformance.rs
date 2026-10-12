@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::burn_tests;
 use crate::pin;
+use crate::silicon::{boot_id, preflight, unix_secs, Log};
 use crate::testrun::{build, list, run_one, Built, Verdict};
 use crate::util::workspace_root;
 
@@ -35,7 +36,10 @@ usage: cargo xtask conformance [options]
   fetch-burn-tests` and `cargo xtask fetch-ttsim`.
 
   --suite NAME          run only this test binary (`tensor`, `autodiff`,
-                        `autodiff_checkpointing`); repeatable
+                        `autodiff_checkpointing`, `tensor_f16`, `autodiff_f16`,
+                        `tensor_bf16`, `autodiff_bf16`); repeatable. The two
+                        bf16 binaries run only with --silicon or --reference-flex
+                        (ttsim refuses the BF16 narrowing)
   --filter S            run only tests whose `binary::test` name contains S;
                         repeatable. A filtered run does not check for stale entries
   --fusion              run on Fusion<TtBackend> (expected-failures-fusion.toml)
@@ -47,8 +51,18 @@ usage: cargo xtask conformance [options]
                         Matrix Unit at LoFi (TT_ACCURATE_MATMUL=1,
                         `burn_tt::MatmulMode::Accurate`): expected-failures-accurate.toml,
                         and `-fusion-accurate` with --fusion. Not with --exact
-  --jobs N              processes at a time (default: the CPU count)
-  --timeout-secs N      per-test wall-clock limit (default 120)
+  --silicon             run on card 0 instead of ttsim: one test at a time (the card
+                        lock refuses a second process), with the fsync'd log
+                        target/silicon/<stamp>.log, against
+                        expected-failures-silicon{-fusion}{-exact}{-accurate}.toml.
+                        Does not need ttsim. Includes the bf16 suites
+  --reference-flex      run the suite on burn-flex, on the host, instead of burn-tt:
+                        the second implementation that tells a test a dtype cannot
+                        pass from a burn-tt defect. Compares with no list; prints
+                        the failures and exits 0
+  --jobs N              processes at a time (default: the CPU count; 1 with --silicon)
+  --timeout-secs N      per-test wall-clock limit (default 120; 600 with --silicon,
+                        where the 300 to 500 LU tests take up to 355 s)
   --strict              TT_STRICT=1: a download or a staged matmul panics the test
   --release             build optimised; the simulator runs the same program
                         faster
@@ -69,7 +83,14 @@ struct Opts {
     release: bool,
     update: bool,
     list_only: bool,
+    silicon: bool,
+    reference_flex: bool,
 }
+
+/// Test binaries that need the BF16 narrowing (PACR mode `0x105`), which ttsim refuses
+/// (`docs/learnings/ttsim-divergence.md`, "BF16 late narrowing"). burn-tt runs them on
+/// silicon only; burn-flex runs them anywhere.
+const SILICON_ONLY_SUITES: &[&str] = &["tensor_bf16", "autodiff_bf16"];
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
     let mut o = Opts {
@@ -84,7 +105,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         release: false,
         update: false,
         list_only: false,
+        silicon: false,
+        reference_flex: false,
     };
+    let (mut jobs_given, mut timeout_given) = (false, false);
     let mut args = args;
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -100,11 +124,17 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         match a.as_str() {
             "--suite" => o.suites.push(value("--suite")?),
             "--filter" => o.filters.push(value("--filter")?),
-            "--jobs" => o.jobs = number("--jobs", value("--jobs")?)?,
+            "--jobs" => {
+                o.jobs = number("--jobs", value("--jobs")?)?;
+                jobs_given = true;
+            }
             "--timeout-secs" => {
                 o.timeout =
-                    Duration::from_secs(number("--timeout-secs", value("--timeout-secs")?)? as u64)
+                    Duration::from_secs(number("--timeout-secs", value("--timeout-secs")?)? as u64);
+                timeout_given = true;
             }
+            "--silicon" => o.silicon = true,
+            "--reference-flex" => o.reference_flex = true,
             "--fusion" => o.fusion = true,
             "--exact" => o.exact = true,
             "--accurate" => o.accurate = true,
@@ -120,6 +150,27 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         return Err(format!(
             "`--exact` and `--accurate` are two matmul modes: choose one\n\n{USAGE}"
         ));
+    }
+    if o.silicon && o.reference_flex {
+        return Err(format!(
+            "`--silicon` runs burn-tt on the card and `--reference-flex` runs burn-flex on the host: choose one\n\n{USAGE}"
+        ));
+    }
+    if o.reference_flex && (o.fusion || o.exact || o.accurate || o.update) {
+        return Err(format!(
+            "`--reference-flex` takes no burn-tt profile and keeps no list: not with `--fusion`, `--exact`, `--accurate` or `--update`\n\n{USAGE}"
+        ));
+    }
+    if o.silicon {
+        if jobs_given && o.jobs != 1 {
+            return Err(format!(
+                "`--silicon` runs one test at a time: the card lock refuses a second process\n\n{USAGE}"
+            ));
+        }
+        o.jobs = 1;
+        if !timeout_given {
+            o.timeout = Duration::from_secs(600);
+        }
     }
     Ok(o)
 }
@@ -144,9 +195,10 @@ struct Group {
     tests: BTreeSet<String>,
 }
 
-fn expected_path(fusion: bool, exact: bool, accurate: bool) -> PathBuf {
+fn expected_path(silicon: bool, fusion: bool, exact: bool, accurate: bool) -> PathBuf {
     let name = format!(
-        "expected-failures{}{}{}.toml",
+        "expected-failures{}{}{}{}.toml",
+        if silicon { "-silicon" } else { "" },
         if fusion { "-fusion" } else { "" },
         if exact { "-exact" } else { "" },
         if accurate { "-accurate" } else { "" }
@@ -344,11 +396,30 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             pin::BURN_TESTS_CONTENT_SHA256
         ));
     }
-    if !root.join("vendor/libttsim_bh.so").exists() {
+    if !o.silicon && !o.reference_flex && !root.join("vendor/libttsim_bh.so").exists() {
         return Err("vendor/libttsim_bh.so is missing: run `cargo xtask fetch-ttsim`.".into());
     }
+    if !o.silicon && !o.reference_flex {
+        if let Some(s) = o
+            .suites
+            .iter()
+            .find(|s| SILICON_ONLY_SUITES.contains(&s.as_str()))
+        {
+            return Err(format!(
+                "`{s}` needs the BF16 narrowing (PACR mode 0x105), which ttsim refuses \
+                 (docs/learnings/ttsim-divergence.md, \"BF16 late narrowing\"): \
+                 run it with `--silicon`, or on burn-flex with `--reference-flex`"
+            ));
+        }
+    }
 
-    let mut features = vec!["burn-tt-conformance/run"];
+    let mut features = vec![if o.silicon {
+        "burn-tt-conformance/silicon"
+    } else if o.reference_flex {
+        "burn-tt-conformance/reference-flex"
+    } else {
+        "burn-tt-conformance/run"
+    }];
     if o.fusion {
         features.push("burn-tt-conformance/fusion");
     }
@@ -361,6 +432,13 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let binaries: Vec<Built> = build(&root, o.release, &select)?
         .into_iter()
         .filter(|b| o.suites.is_empty() || o.suites.contains(&b.name))
+        // The default selection is the ttsim lane: the BF16 binaries wait for silicon.
+        .filter(|b| {
+            o.silicon
+                || o.reference_flex
+                || !o.suites.is_empty()
+                || !SILICON_ONLY_SUITES.contains(&b.name.as_str())
+        })
         .collect();
     if let Some(unknown) = o
         .suites
@@ -393,7 +471,11 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let expected_file = expected_path(o.fusion, o.exact, o.accurate);
+    // Preflight only now: `--list` above never touches a card.
+    if o.silicon {
+        preflight(&[0])?;
+    }
+    let expected_file = expected_path(o.silicon, o.fusion, o.exact, o.accurate);
     let mut groups = read_expected(&expected_file)?;
     let reasons: BTreeMap<String, (String, String)> = groups
         .iter()
@@ -404,9 +486,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         })
         .collect();
 
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = unix_secs();
     let dir = root.join("target/conformance").join(stamp.to_string());
     fs::create_dir_all(dir.join("out")).map_err(|e| format!("{}: {e}", dir.display()))?;
     println!(
@@ -416,9 +496,47 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         dir.display()
     );
 
+    // The silicon lane keeps the runner's log, fsync'd per line: a line not on disk when
+    // the host dies was never written. Its stamp is the run ID the docs cite.
+    let log = if o.silicon {
+        let silicon_dir = root.join("target/silicon");
+        fs::create_dir_all(&silicon_dir).map_err(|e| format!("{}: {e}", silicon_dir.display()))?;
+        let path = silicon_dir.join(format!("{stamp}.log"));
+        let mut log = Log::open(&path)?;
+        println!("silicon run {stamp}, logging to {}", path.display());
+        let profile = if o.release { "release" } else { "dev" };
+        log.line(&format!(
+            "{stamp} boot={} PROFILE {profile} conformance",
+            boot_id()
+        ))?;
+        Some(Mutex::new(log))
+    } else {
+        None
+    };
+
     let started = Instant::now();
-    let ran = run_all(&o, &selection, &dir.join("out"));
+    let ran = run_all(&o, &selection, &dir.join("out"), log.as_ref());
     let elapsed = started.elapsed();
+
+    if o.reference_flex {
+        let failed: Vec<&Ran> = ran.iter().filter(|r| r.verdict != Verdict::Pass).collect();
+        let mut summary = format!(
+            "burn-flex reference: {} run, {} passed, {} failed\n",
+            ran.len(),
+            ran.len() - failed.len(),
+            failed.len()
+        );
+        for r in &failed {
+            summary.push_str(&format!("FAIL {} {}\n", r.verdict, r.full));
+        }
+        print!("{summary}");
+        let _ = fs::write(dir.join("summary.txt"), &summary);
+        println!("summary: {}", dir.join("summary.txt").display());
+        return Ok(());
+    }
+    if o.silicon {
+        println!("silicon run {stamp}");
+    }
 
     let mut outcomes = Vec::new();
     for r in &ran {
@@ -539,7 +657,12 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 /// Run the selection `o.jobs` at a time, each test in its own process.
-fn run_all(o: &Opts, selection: &[(String, Built, String)], out_dir: &Path) -> Vec<Ran> {
+fn run_all(
+    o: &Opts,
+    selection: &[(String, Built, String)],
+    out_dir: &Path,
+    log: Option<&Mutex<Log>>,
+) -> Vec<Ran> {
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let results: Mutex<Vec<Option<Ran>>> = Mutex::new((0..selection.len()).map(|_| None).collect());
@@ -564,9 +687,22 @@ fn run_all(o: &Opts, selection: &[(String, Built, String)], out_dir: &Path) -> V
                 let stem: String = full.replace("::", "__").chars().take(150).collect();
                 let out = out_dir.join(format!("{i:04}-{stem}.txt"));
                 let started = Instant::now();
+                if let Some(log) = log {
+                    let _ = log
+                        .lock()
+                        .unwrap()
+                        .line(&format!("{} START {full}", unix_secs()));
+                }
                 let verdict = run_one(&bin.exe, test, &bin.dir, &env, o.timeout, &out)
                     // A harness failure is not a pass.
                     .unwrap_or(Verdict::Fail);
+                if let Some(log) = log {
+                    let _ = log.lock().unwrap().line(&format!(
+                        "{} END {full} {verdict} {:.2}s",
+                        unix_secs(),
+                        started.elapsed().as_secs_f64()
+                    ));
+                }
                 let ran = Ran {
                     full: full.clone(),
                     verdict,

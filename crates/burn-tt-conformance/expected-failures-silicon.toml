@@ -1,0 +1,154 @@
+# Tests of Burn's own backend suite (vendor/burn-backend-tests, pinned in PINS.toml)
+# that burn-tt is expected to fail, and why. `cargo xtask conformance` compares
+# every run with this file: an unlisted failure is a regression or a new finding,
+# and a listed test that passes is stale, so the list only shrinks. The goal is an
+# empty file.
+#
+# Never loosen a vendored tolerance to make a test pass; a `precision` entry
+# names the mechanism, and says whether a bound has been derived.
+#
+# Test names are `<binary>::<test path>`, as `cargo xtask conformance --list`
+# prints them.
+
+[[group]]
+category = "unsupported-dtype"
+reason = "F64 is not a Tensix dtype: `float_cast` to F64 is refused by name (`dtype_usage(F64)` is empty). `should_support_slice_fill_cast_f64` panics with that refusal. The autodiff one is `#[might_panic(reason = \\\"Unsupported precision for fusion\\\")]`, and upstream `burn-tensor-testgen` 0.21.0's macro deadlocks when the panic message differs, so it ends as a timeout (600 s here). Silicon runs 1791827110 (BF16) and 1791833700 (F32 and F16), card 0."
+tests = [
+    "autodiff::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_bf16::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_checkpointing::base::cast::cast_keeps_gradient_flow_might_panic",
+    "autodiff_f16::base::cast::cast_keeps_gradient_flow_might_panic",
+    "tensor::tensor::float::ops::slice::should_support_slice_fill_cast_f64",
+    "tensor_bf16::bf16::ops::slice::should_support_slice_fill_cast_f64",
+    "tensor_f16::f16::ops::slice::should_support_slice_fill_cast_f64",
+]
+
+[[group]]
+category = "precision"
+reason = "BF16 (`tensor_bf16`, `autodiff_bf16`): the Matrix Unit matmul, as the F32 and F16 `precision` entries in expected-failures.toml. These miss the vendored tolerance on silicon in the default (fast) matmul mode (run 1791827110, card 0) and pass in the same binary under `--accurate` (`MatmulMode::Accurate`, card 0, runs 1791829833 and 1791830481). The misses are one BF16 step (2^-8, about 4e-3 relative) against tolerances of 1e-3 to 5e-3, or larger where a deform_conv2d / LU composition amplifies it. Not decomposed beyond that; the vendored tolerances stay."
+tests = [
+    "tensor_bf16::bf16::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor_bf16::bf16::linalg::lu::test_lu_medium_tall",
+    "tensor_bf16::bf16::module::attention::test_attention_custom_scale",
+    "tensor_bf16::bf16::module::conv1d::test_conv1d_complex",
+    "tensor_bf16::bf16::module::conv1d::test_conv1d_dilation",
+    "tensor_bf16::bf16::module::conv1d::test_conv1d_groups",
+    "tensor_bf16::bf16::module::conv1d::test_conv1d_simple",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_complex",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_groups_channels_out",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_groups_padding_larger_than_output_width_regression",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_simple_implicit",
+    "tensor_bf16::bf16::module::conv_transpose3d::test_conv_transpose3d_simple_2",
+    "tensor_bf16::bf16::module::conv_transpose3d::test_conv_transpose3d_stride2_out_padding",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_batched",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_dilation",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_kernel_size",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_padding_size",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_stride",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_width",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_offset_groups",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_simple",
+    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_weight_groups",
+]
+
+[[group]]
+category = "precision"
+reason = "BF16 resolution, not a burn-tt defect: the test's tolerance (1e-3 to 5e-3 relative) is finer than or equal to one BF16 step (2^-8, about 4e-3), and these tests miss it on silicon in the default mode (run 1791827110, card 0) and under `--accurate` (runs 1791829833 and 1791830481), and burn-flex, run in BF16 on the host (`cargo xtask conformance --reference-flex`, run 1791827087), fails every one of them too. Attributed by the second implementation, not decomposed per test; the vendored tolerances stay."
+tests = [
+    "autodiff_bf16::base::ctc::test_ctc_loss_grad_mixed_input_lengths",
+    "autodiff_bf16::base::ctc::test_ctc_loss_grad_repeated_labels",
+    "autodiff_bf16::base::gelu::should_diff_gelu",
+    "autodiff_bf16::base::log1p::should_diff_log1p",
+    "autodiff_bf16::base::log::should_diff_log",
+    "autodiff_bf16::base::mask::should_diff_mask_where",
+    "autodiff_bf16::base::pow::should_diff_powf_scalar",
+    "autodiff_bf16::base::softmax::test_log_softmax_grad",
+    "autodiff_bf16::base::softmax::test_quiet_softmax_grad",
+    "autodiff_bf16::base::softmax::test_softmax_grad",
+    "autodiff_bf16::base::sqrt::should_diff_sqrt",
+    "autodiff_bf16::base::transpose::should_diff_swap_dims",
+    "autodiff_bf16::base::trig::should_diff_asin",
+    "autodiff_bf16::base::trig::should_diff_atan",
+    "autodiff_bf16::base::trig::should_diff_atan2",
+    "autodiff_bf16::base::trig::should_diff_atanh",
+    "autodiff_bf16::base::trig::should_diff_sinh",
+    "autodiff_bf16::base::trig::should_diff_tan",
+    "tensor_bf16::bf16::activation::glu::test_glu_d3",
+    "tensor_bf16::bf16::activation::prelu::test_prelu_2_dimension",
+    "tensor_bf16::bf16::activation::prelu::test_prelu_2_dimension_scalar_weight",
+    "tensor_bf16::bf16::activation::selu::test_selu",
+    "tensor_bf16::bf16::activation::softmax::test_softmax_non_last_axis_d3",
+    "tensor_bf16::bf16::activation::softmax::test_softmax_non_last_axis_d4_dim0",
+    "tensor_bf16::bf16::activation::softplus::test_softplus_d2",
+    "tensor_bf16::bf16::linalg::cosine_similarity::test_cosine_similarity_basic",
+    "tensor_bf16::bf16::linalg::cosine_similarity::test_cosine_similarity_opposite",
+    "tensor_bf16::bf16::linalg::cosine_similarity::test_cosine_similarity_parallel",
+    "tensor_bf16::bf16::linalg::det::test_det_random_2x2x4x4_pytorch_comparison",
+    "tensor_bf16::bf16::module::attention::test_attention_bias_broadcast_batch_and_heads",
+    "tensor_bf16::bf16::module::attention::test_attention_bias_broadcast_heads_only",
+    "tensor_bf16::bf16::module::attention::test_attention_bool_mask_broadcast_batch_and_heads",
+    "tensor_bf16::bf16::module::attention::test_attention_is_causal",
+    "tensor_bf16::bf16::module::attention::test_attention_softcap",
+    "tensor_bf16::bf16::module::bicubic_interpolate::test_1d_bicubic",
+    "tensor_bf16::bf16::module::bilinear_interpolate::test_1d_bilinear",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_binary_broadcasted",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_groups_remainder_padding_regression",
+    "tensor_bf16::bf16::module::conv2d::test_conv2d_implicit_padded_in_channels",
+    "tensor_bf16::bf16::module::conv3d::test_conv3d_complex",
+    "tensor_bf16::bf16::ops::blackman_window::should_support_blackman_window_size_8_periodic",
+    "tensor_bf16::bf16::ops::blackman_window::should_support_blackman_window_size_8_symmetric",
+    "tensor_bf16::bf16::ops::ceil::should_support_ceil_ops",
+    "tensor_bf16::bf16::ops::floor::should_support_floor_ops",
+    "tensor_bf16::bf16::ops::fmod::should_handle_mixed_signs",
+    "tensor_bf16::bf16::ops::fmod::should_handle_negative_dividend",
+    "tensor_bf16::bf16::ops::fmod::should_handle_positive_dividend_positive_divisor",
+    "tensor_bf16::bf16::ops::fmod::should_support_fmod_broadcasting_2d",
+    "tensor_bf16::bf16::ops::fmod::should_support_fmod_ops",
+    "tensor_bf16::bf16::ops::fmod::should_support_fmod_scalar",
+    "tensor_bf16::bf16::ops::fmod::should_support_fmod_scalar_broadcasting",
+    "tensor_bf16::bf16::ops::hamming_window::should_support_hamming_window_symmetric",
+    "tensor_bf16::bf16::ops::hann_window::should_support_hann_window_symmetric",
+    "tensor_bf16::bf16::ops::matmul::test_float_matmul_vecmat_transposed_fused",
+    "tensor_bf16::bf16::ops::powf::should_support_neg_power",
+    "tensor_bf16::bf16::ops::remainder::should_be_negative",
+    "tensor_bf16::bf16::ops::remainder::should_support_remainder_float",
+    "tensor_bf16::bf16::ops::trig::should_support_atanh_ops",
+    "tensor_bf16::bf16::ops::trig::should_support_cos_flipped_axis1",
+    "tensor_bf16::bf16::stats::cov::test_cov_1",
+    "tensor_bf16::bf16::stats::cov::test_cov_2",
+    "tensor_bf16::bf16::stats::var::test_var_mean",
+    "tensor_bf16::bf16::stats::var::test_var_mean_bias",
+]
+
+[[group]]
+category = "precision"
+reason = "BF16 rounding of the reference's inputs. `test_ctc_loss_matches_pytorch`: the test builds `log_softmax` of BF16 logits, so the log-probabilities are BF16 values; the CTC loss of sample 1 for exactly those values is 3.49106 in f64, which is 3.484375 as BF16, what burn-tt returns (the test's 3.5 comes from PyTorch's F32 inputs). `test_ctc_loss_grad`: for those log-probabilities the gradient element is -0.46064 in f64, which is -0.4609375 as BF16, what burn-tt returns; the test's -0.45898 is reproduced only when the CTC gradient is rounded to BF16 before the `log_softmax` backward (-0.45938). Reproduced by hand in f64 for both. burn-flex passes both, so its BF16 chain differs from burn-tt's; why burn-tt's gradient keeps the unrounded value at that point is not determined. They fail under `--accurate` too (run 1791829833), so it is not the Matrix Unit."
+tests = [
+    "autodiff_bf16::base::ctc::test_ctc_loss_grad",
+    "tensor_bf16::bf16::module::ctc::test_ctc_loss_matches_pytorch",
+]
+
+[[group]]
+category = "precision"
+reason = "F32 and F16 (`tensor`, `autodiff`, `autodiff_checkpointing`, `tensor_f16`, `autodiff_f16`): the same Matrix Unit matmul as the `precision` entries of expected-failures.toml, whose reasons give the mechanism per group (TF32 operand truncation in Burn's LU, determinant, gelu gradient and conv2d compositions; the group adder in conv3d; binary16 steps in the F16 ones). They miss the vendored tolerance on silicon in the default mode (run 1791833700, card 0, `--strict`), as they do on ttsim, and each is listed there with the evidence that it passes under `--accurate` or `--exact`; this list does not repeat it, and does not claim an `--accurate` silicon run beyond the ones those entries cite (the 300 to 500 LU tests, F32 run 1791819292 and F16 run 1791820653). Five small LU and determinant tests listed there do NOT miss on silicon (`test_lu_2d_square`, `_2d_tall`, `_3d_square`, `_4d_square`, `test_det_20x20_singular_linearly_dependent`; three runs, all pass): they draw `Tensor::random` inputs, and the device PRNG is reproducible per target but not across them (ttsim-divergence.md row 99), so their outcome is a property of the data each target draws, not a numerical difference between ttsim and silicon."
+tests = [
+    "autodiff::base::gelu::should_diff_gelu",
+    "autodiff_checkpointing::base::gelu::should_diff_gelu",
+    "autodiff_f16::base::gelu::should_diff_gelu",
+    "tensor::tensor::float::linalg::det::test_det_random_2x2x4x4_pytorch_comparison",
+    "tensor::tensor::float::linalg::lu::test_lu_300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3d_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_3x300x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_3x500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_4d_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_500x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_500x500_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_5x300x300_block_dispatch",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_tall",
+    "tensor::tensor::float::linalg::lu::test_lu_medium_wide",
+    "tensor::tensor::float::module::conv2d::test_conv2d_binary_broadcasted",
+    "tensor::tensor::float::module::conv3d::test_conv3d_complex",
+    "tensor::tensor::float::module::conv3d::test_conv3d_groups",
+    "tensor_f16::f16::linalg::det::test_det_random_2x2x4x4_pytorch_comparison",
+    "tensor_f16::f16::stats::cov::test_cov_1",
+]

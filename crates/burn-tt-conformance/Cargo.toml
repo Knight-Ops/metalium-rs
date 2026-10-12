@@ -33,6 +33,9 @@ run = [
 ]
 # Against silicon (`TT_SILICON_DEVICE`, default card 0) instead of ttsim.
 silicon = ["run", "tt-tests/silicon"]
+# The suite on burn-flex, on the host (`cargo xtask conformance --reference-flex`): the second
+# implementation that attributes a failure to the test's tolerance rather than to burn-tt.
+reference-flex = ["run", "dep:burn-flex"]
 # The same suite on `Fusion<TtBackend>` (`burn_tt::Tt`) instead of `TtBackend`.
 fusion = ["run"]
 
@@ -53,6 +56,7 @@ burn-tt = { workspace = true, optional = true }
 # Dev-only by classification (`xtask/src/ship.rs`): the ttsim engine lives here.
 tt-tests = { path = "../tt-tests", optional = true }
 burn-tensor = { workspace = true, optional = true }
+burn-flex = { workspace = true, optional = true }
 # `export_tests` makes the backward pass assert that checkpointing left nothing
 # behind. Only with `run`, so no other build of burn-autodiff turns it on.
 burn-autodiff = { version = "=0.21.0", default-features = false, features = ["std", "export_tests"], optional = true }
@@ -84,4 +88,15 @@ required-features = ["run"]
 [[test]]
 name = "autodiff_f16"
 path = "tests/autodiff_f16.rs"
+required-features = ["run"]
+
+# The same with `bf16` (upstream has no such entries). Silicon only: ttsim refuses the BF16 narrowing.
+[[test]]
+name = "tensor_bf16"
+path = "tests/tensor_bf16.rs"
+required-features = ["run"]
+
+[[test]]
+name = "autodiff_bf16"
+path = "tests/autodiff_bf16.rs"
 required-features = ["run"]

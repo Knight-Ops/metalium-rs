@@ -178,6 +178,22 @@ pub const SMOKE: &[&str] = &[
     "autodiff::base::conv_transpose3d::",
     "tensor::float::module::deform_conv2d::",
     "autodiff::base::deform_conv2d::",
+    // The same suites with a BF16 float element (D2), silicon only: ttsim refuses the BF16
+    // narrowing. Modules with no entry in `expected-failures-silicon.toml`.
+    "tensor_bf16::bf16::ops::add::",
+    "tensor_bf16::bf16::ops::mul::",
+    "tensor_bf16::bf16::ops::exp::",
+    "tensor_bf16::bf16::ops::cat::",
+    "tensor_bf16::bf16::ops::gather_scatter::",
+    "tensor_bf16::bf16::ops::sort_argsort::",
+    "tensor_bf16::bf16::ops::grid_sample::",
+    "tensor_bf16::bf16::module::avgpool2d::",
+    "tensor_bf16::bf16::module::maxpool2d::",
+    "tensor_bf16::bf16::module::conv_transpose2d::",
+    "autodiff_bf16::base::add::",
+    "autodiff_bf16::base::mul::",
+    "autodiff_bf16::base::matmul::",
+    "step164_grid_sample_bf16::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
     "silicon_card_lock::a_second",
@@ -602,7 +618,7 @@ fn card0_only(bin: &Built) -> bool {
 
 /// Refuse to start against a card that is not there, and say out loud whether the
 /// ARC watchdog is armed.
-fn preflight(devices: &[u16]) -> Result<(), String> {
+pub(crate) fn preflight(devices: &[u16]) -> Result<(), String> {
     for d in devices {
         let p = format!("/dev/tenstorrent/{d}");
         if !Path::new(&p).exists() {
@@ -623,10 +639,10 @@ fn preflight(devices: &[u16]) -> Result<(), String> {
     Ok(())
 }
 
-struct Log(File);
+pub(crate) struct Log(File);
 
 impl Log {
-    fn open(path: &Path) -> Result<Self, String> {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -637,19 +653,19 @@ impl Log {
 
     /// Append and `fsync`: a line that is not on disk when the host dies is a line
     /// that was never written.
-    fn line(&mut self, s: &str) -> Result<(), String> {
+    pub(crate) fn line(&mut self, s: &str) -> Result<(), String> {
         writeln!(self.0, "{s}").map_err(|e| e.to_string())?;
         self.0.sync_all().map_err(|e| e.to_string())
     }
 }
 
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
 }
 
-fn unix_secs() -> u64 {
+pub(crate) fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
