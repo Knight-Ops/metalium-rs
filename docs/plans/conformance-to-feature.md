@@ -230,6 +230,12 @@ silicon-only, with a [`ttsim-divergence.md`](../learnings/ttsim-divergence.md) r
 the simulator may finish in seconds on the card (the 261,120-long matmul: 13 s on card 0, no end in sight
 on ttsim): run it there once, and record the run and the verdict in the entry.
 
+A whole suite on the card is `cargo xtask conformance --silicon [--release] [--suite NAME]`: one test at a time on card 0,
+compared with `expected-failures-silicon.toml` (the lane's own list, so a test that only ttsim is too slow for needs no entry),
+with the run ID of `target/silicon/<stamp>.log`. The BF16 suites (`tensor_bf16`, `autodiff_bf16`) run only there. To tell a
+test whose tolerance the type cannot meet from a burn-tt defect, run the same suite on burn-flex first:
+`cargo xtask conformance --reference-flex --suite tensor_bf16`.
+
 Then add the gate and the conformance modules that now pass to `SMOKE` (`xtask/src/silicon.rs`); a filter
 that matches nothing fails the run, so a renamed test cannot go quiet.
 
@@ -524,3 +530,33 @@ Lessons that generalize:
   alpha of the time- and label-reversed problem, then calls Burn's public `ctc_grad_from_alpha_beta_default`.
 - **A skipped test starts running when its guard flips.** `test_ctc_loss_backward_unreachable_is_finite` found a real defect the
   moment `has_ctc_loss_backward` became true.
+
+## Worked example: round nine, the BF16 suites and the first silicon lane (D2)
+
+BF16 had no suite of its own: upstream has none, and ttsim cannot run one (it refuses PACR mode `0x105`). So the round began with
+a lane: `cargo xtask conformance --silicon` (card 0, one test at a time, compared with `expected-failures-silicon.toml`), and the two
+entries `tensor_bf16` and `autodiff_bf16` (948 + 239 tests). First run on card 0 (`1791827110`, 2,690 s): 1,097 pass, 90 fail.
+
+| Finding | How it was attributed | Fix | Gate |
+|---|---|---|---|
+| 1 `grid_sample_2d` (reflection) | f64 oracle on the BF16 grid: 1.3003 is 1.296875, burn-tt returned 1.3047; burn-flex passes | override `float_grid_sample_2d`: widen, compose, round once | `step164_grid_sample_bf16`, card 0 (`1791830746`) |
+| 22 `precision`, Matrix Unit matmul | pass under `--accurate`, same binary (`1791829833`, `1791830481`) | none (listed) | n/a |
+| 63 `precision`, BF16 resolution | fail under `--accurate` and on burn-flex in BF16 (`--reference-flex`, `1791827087`) | none (listed) | n/a |
+| 2 CTC (loss vs PyTorch, gradient) | f64 by hand: burn-tt's value is the correctly rounded one for BF16 log-probabilities; burn-flex passes | none; open question in the roadmap | n/a |
+| 2 F64 | refused by name; one is the `#[might_panic]` deadlock | none | n/a |
+
+The list was then checked by running both suites again with `--strict` (run `1791830816`): 1,098 pass, 89 listed, 0 unexpected, and
+nothing downloaded or staged on the host.
+
+Lessons that generalize:
+
+- **A dtype with few mantissa bits turns every unoverridden Burn default into a precision defect.** `grid_sample_2d` passed in F16
+  (11 bits) and failed in BF16 (8) for the same reason: the default composition rounds every intermediate to the tensor's dtype. The
+  fix is the same as for CTC: override, so the generated wrapper widens and rounds once.
+- **Three attributions, in order of cost:** the same binary under `--accurate` (the Matrix Unit), the same test on burn-flex in the same
+  dtype (the type's resolution), and an f64 oracle on the operands as the device holds them (the correctly rounded answer). A failure
+  that survives all three is a finding; do not list it.
+- **An oracle that restates the reference's inputs in F32 is wrong for a half-type suite.** The tests build their inputs in the dtype
+  (`log_softmax` of BF16 logits), so the exact answer is for the rounded inputs, not for the literals the expected values came from.
+- **`--strict` costs nothing on a clean backend and is the evidence for "no host fallback".** Run the final pass with it.
+- **A run that holds the card is the long pole:** about 45 minutes a BF16 profile, 20 of them two timeouts that no change can shorten.

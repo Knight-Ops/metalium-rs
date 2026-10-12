@@ -124,6 +124,13 @@ General payload-preserving Tensix transpose and further format coverage
 Backend typed errors, initialization/discovery and Burn conformance are in
 [`docs/plans/burn-backend-parity.md`](docs/plans/burn-backend-parity.md).
 
+**Burn's own backend tests** run against burn-tt in
+[`crates/burn-tt-conformance`](crates/burn-tt-conformance/README.md) (`cargo xtask conformance`, on ttsim; `--silicon` on card 0).
+On silicon, with host downloads and staged matmuls made fatal (`--strict`), 3,001 of 3,025 F32 and F16 tests pass, and 1,098 of
+1,187 with a BF16 float element. The rest are listed with reasons (the Matrix Unit's matmul rounding, F64 which Tensix lacks,
+BF16's own resolution) and none is a missing operation; see
+[its results table](crates/burn-tt-conformance/README.md#results-2026-10-12).
+
 Multi-card meshes (`Topology::Cards`, `burn_tt::MeshEngine`) are one Burn device
 whose buffers stay in chip 0's GDDR. Rank-two and batched matmuls (hence convolution
 and attention products) are split by output columns across the cards, which hold

@@ -173,8 +173,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
      opt-in (the entry above); the 21 stay listed in the default profile, `precision`, each reason saying the
      exact profile passes it. Never loosen a vendored tolerance. **Update (2026-10-12):** `--accurate` passes them too
      (`MatmulMode::Accurate`, entry above), at 19x to 64x the fast matmul's cost instead of the exact mode's thousands; the default stays
-     fast and the 21 (and the 3 F16) stay listed until "Fused slicing for `MatmulMode::Accurate`" is measured. Their `reason`
-     strings in the expected-failures files still name only the exact profile.
+     fast and the 21 (and the 3 F16) stay listed until "Fused slicing for `MatmulMode::Accurate`" is measured.
   2. **Re-derive the `step68` and `step85` bounds.** They charge `2^-9 sum|ab|` for TF32 truncation and a few F32
      additions, and nothing for the group alignment, which can be larger with exact operands (1024 beside seven
      0.5s in one group: 1031 for 1027.5, `2^-8.2`; step158). They hold on their own similar-sized data, but are
@@ -183,6 +182,67 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   3. Eight `timeout` tests the simulator is too slow for; each passes on silicon, so nothing to fix.
   4. Three F64 tests (not a Tensix dtype; two end as timeouts because upstream
      `burn-tensor-testgen` 0.21.0's `#[might_panic]` deadlocks when the panic message differs).
+- [x] **D2: Burn's suites with a BF16 float element, and a silicon conformance lane** (2026-10-12; BF16 on card 0 in `--strict`: run
+  `1791830816`, **1,187 tests, 1,098 pass, 89 listed, 0 unexpected**, 2,691 s). BF16 is the half type this hardware prefers, and
+  upstream ships no BF16 suite (`tensor_f16.rs` has `TODO: bf16`), so `tests/tensor_bf16.rs` and `tests/autodiff_bf16.rs` are the F16
+  entries with `bf16` (948 + 239 tests). ttsim refuses PACR mode `0x105`, the narrowing every BF16 result goes through
+  ([ttsim-divergence.md](../learnings/ttsim-divergence.md), "BF16 late narrowing"), so they are **silicon only**: the ttsim lane skips them
+  and names that if asked for one. What it added:
+  - **`cargo xtask conformance --silicon`**: card 0, one test at a time, 600 s default timeout, the fsync'd `target/silicon/<stamp>.log`
+    (the stamp is the run ID), compared with `expected-failures-silicon{-fusion}{-exact}{-accurate}.toml`; needs no ttsim. It is also the
+    first full silicon pass lane for the F32 and F16 suites (not yet run, below).
+  - **`cargo xtask conformance --reference-flex`**: the suite on burn-flex on the host, no list, exit 0, to tell a test whose tolerance the
+    type cannot meet from a burn-tt defect. Dev only (`reference-flex` feature of the conformance crate, which refuses to compile with `silicon`
+    or `fusion`); never part of a pass count.
+  - **One defect: `grid_sample_2d`.** Burn's default bilinear composition ran in BF16, rounding the coordinates, weights and sum;
+    `should_pad_reflection_grid_sample_2d` returned 1.3047 where the BF16 grid gives 1.3003 (1.296875 as BF16). It is now overridden
+    (`ops.rs` `float_grid_sample_2d`), so the generated wrapper widens to F32, composes and rounds once. Gate `step164_grid_sample_bf16`
+    (card 0, run `1791830746`): equal to an f64 oracle rounded once over zeros, border and reflection padding, and the default
+    composition, run on the same operands, differs (negative control). All 15 `grid_sample` conformance tests pass on card 0 (run `1791830775`).
+  - **The other 89 listed, in `expected-failures-silicon.toml`:** 2 F64; 22 that pass under `--accurate` (the Matrix Unit matmul, runs
+    `1791829833`, `1791830481`); 63 that fail under `--accurate` too and that burn-flex fails in BF16 (run `1791827087`), so the type's
+    own resolution (BF16 steps at 2^-8 against tolerances of 1e-3 to 5e-3); 2 CTC tests (`test_ctc_loss_matches_pytorch`,
+    `test_ctc_loss_grad`) that burn-flex passes, where burn-tt's value is the correctly rounded one for the BF16 log-probabilities (reproduced
+    in f64 by hand). **Open:** why burn-tt's CTC gradient keeps the unrounded value before the `log_softmax` backward where burn-flex's BF16
+    chain rounds it (the test's value needs that rounding); settle it with a trace of the chain, not by an entry.
+  - **Smoke:** 13 BF16 modules and `step164` are in `SMOKE`.
+  - **First full silicon pass of F32 and F16** (default profile, `--strict`, card 0, run `1791833700`): **3,025 tests, 3,001 pass, 24 listed,
+    0 unexpected, 6,460 s**, nothing downloaded or staged on the host. All 24 are already listed for ttsim (5 F64, 19 `precision`);
+    the 23 ttsim `timeout` entries pass on silicon, as their reasons say. Five small LU and determinant tests listed as `precision` on
+    ttsim pass on silicon (three runs): they draw `Tensor::random` inputs, which differ per target
+    ([ttsim-divergence.md](../learnings/ttsim-divergence.md) row 99), so their outcome follows the data, not a numerical difference.
+    `expected-failures-silicon.toml` holds the 24 and the 89 BF16 entries.
+  Left: the `--fusion` silicon passes (`conformance --silicon --fusion`, about 45 to 110 minutes each, card 0), the `--exact` and `--accurate`
+  silicon lists (empty files today, so those profiles are unverified on silicon beyond the cited targeted runs), and whether CI runs
+  conformance with `--strict` (it does not; both silicon passes above did).
+- [ ] **Conformance follow-ups (low priority; nothing here blocks a model or a gate).** Where conformance stands after D2: every listed
+  test has a cause and none is a missing op (F32 and F16 on silicon: 3,001 of 3,025 pass; BF16: 1,098 of 1,187; both `--strict`). What is left:
+  1. **Silicon lists for the other profiles.** `conformance --silicon --fusion`, `--exact` and `--accurate` have empty lists
+     (`expected-failures-silicon-{fusion,exact,accurate}.toml` do not exist), about an hour a profile on card 0 (single-card rule). Run each
+     with `--update`, triage as in [conformance-to-feature.md](conformance-to-feature.md) round nine, and cite the run IDs. `--exact` is
+     slow on silicon (the exact matmul costs thousands of times the fast one), so start with `--fusion` and `--accurate`.
+  2. **The CTC gradient in BF16.** burn-tt's `test_ctc_loss_grad` value (-0.4609375) is the correctly rounded one for the BF16
+     log-probabilities, but burn-flex's BF16 chain gives the test's -0.45898, which needs the CTC gradient rounded to BF16 before the
+     `log_softmax` backward. Why burn-tt's gradient keeps the unrounded value there is not determined (the entry in
+     `expected-failures-silicon.toml` says so). Trace the autodiff chain (`ctc_loss_backward`, then `log_softmax` backward) with intermediate
+     dtypes before deciding whether it is a defect or only a difference.
+  3. **Hardening from the 2026-10-12 audit** (no cheating was found: `burn-tt` has no host arithmetic on tensor values, and the
+     conformance path links no CPU backend). Decisions still open:
+     - CI runs `cargo xtask conformance --release` without `--strict` (`.github/workflows/ci.yml`); both silicon passes used it and
+       nothing was downloaded or staged. Add it to CI, or a strict lane.
+     - `check-no-flex-in-backend` forbids only the crate name `burn-flex`; extend it to `burn-ndarray`, `ndarray`, `burn-cpu`, `burn-candle`
+       and `nalgebra`, and decide whether the conformance crate's `reference-flex` feature stays (it is dev-only and refuses to compile
+       with `silicon` or `fusion`).
+     - `float_random` and `int_random` fall back to a host `StdRng` when the engine is unattached or has no DRAM (`ops.rs`, `random.rs`);
+       the conformance engines never take that path. Refuse by name instead, or drop `rand` and `rand_distr`.
+     - Strict mode and the residency report exempt `*_into_data` (Burn's LU pivots and `one_hot` round-trip through the host, moving
+       indices only), `bool_argwhere`'s 4-byte count read (`host_ok`), and host-resident byte repacks; the vendored-tests digest is
+       checked only by `cargo xtask conformance`, not by `cargo xtask silicon --smoke`; the summary does not count the upstream tests
+       that are never run (`#[ignore]`d ones and cfg-gated ones such as the Flex-only NaN tests).
+  4. **The 24 matmul-precision tests** stay listed in the default profile until "Fused slicing for `MatmulMode::Accurate`" is measured
+     (above); they pass under `--accurate`.
+  5. **Not ours:** 3 Bool-scalar tests under `Fusion<TtBackend>` (burn-fusion 0.21.0 `todo!()`, "Bool scalars under `Fusion<TtBackend>`"
+     below), the F64 tests (not a Tensix dtype) and the ttsim `timeout` entries (each passes on silicon).
 - [x] **Fuser scalar guard** (2026-10-12, [`fusion/eltwise.rs`](../../crates/burn-tt/src/fusion/eltwise.rs) and `fusion/mod.rs`,
   gate `step161_fusion_scalar_guard`, ttsim and card 0, log `1791772236`). Found by the suite on `Fusion<TtBackend>`:
   burn-fusion gives a fuser every scalar as an id, and the fuser took every id for zero, so `thresholded_relu(x, a)` and
