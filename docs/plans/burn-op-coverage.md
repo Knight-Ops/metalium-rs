@@ -59,22 +59,22 @@ The per-method Device and Item notes remain in
 
 ## ModuleOps
 
-33 native, 21 composed, 2 unsupported.
+36 native, 18 composed, 2 unsupported.
 
 | Unsupported method | Disposition |
 |---|---|
 | `irfft` | [-] out of scope: no model needs it |
 | `rfft` | [-] out of scope: no model needs it |
 
-<details><summary>Native (33)</summary>
+<details><summary>Native (36)</summary>
 
-`adaptive_avg_pool2d`, `adaptive_avg_pool2d_backward`, `attention`, `avg_pool2d`, `avg_pool2d_backward`, `conv2d`, `conv2d_bias_backward`, `conv2d_weight_backward`, `conv2d_x_backward`, `conv3d`, `conv3d_bias_backward`, `conv3d_weight_backward`, `conv3d_x_backward`, `conv_transpose2d`, `conv_transpose2d_bias_backward`, `conv_transpose2d_weight_backward`, `conv_transpose2d_x_backward`, `conv_transpose3d`, `conv_transpose3d_bias_backward`, `conv_transpose3d_weight_backward`, `conv_transpose3d_x_backward`, `deform_conv2d`, `deform_conv2d_backward`, `embedding`, `embedding_backward`, `interpolate`, `interpolate_backward`, `linear_bias_backward`, `linear_weight_backward`, `max_pool2d`, `max_pool2d_with_indices`, `max_pool2d_with_indices_backward`, `unfold4d`
+`adaptive_avg_pool2d`, `adaptive_avg_pool2d_backward`, `attention`, `avg_pool2d`, `avg_pool2d_backward`, `conv2d`, `conv2d_bias_backward`, `conv2d_weight_backward`, `conv2d_x_backward`, `conv3d`, `conv3d_bias_backward`, `conv3d_weight_backward`, `conv3d_x_backward`, `conv_transpose2d`, `conv_transpose2d_bias_backward`, `conv_transpose2d_weight_backward`, `conv_transpose2d_x_backward`, `conv_transpose3d`, `conv_transpose3d_bias_backward`, `conv_transpose3d_weight_backward`, `conv_transpose3d_x_backward`, `ctc_loss`, `ctc_loss_backward`, `deform_conv2d`, `deform_conv2d_backward`, `embedding`, `embedding_backward`, `has_ctc_loss_backward`, `interpolate`, `interpolate_backward`, `linear_bias_backward`, `linear_weight_backward`, `max_pool2d`, `max_pool2d_with_indices`, `max_pool2d_with_indices_backward`, `unfold4d`
 
 </details>
 
-<details><summary>Composed (21)</summary>
+<details><summary>Composed (18)</summary>
 
-`adaptive_avg_pool1d`, `adaptive_avg_pool1d_backward`, `avg_pool1d`, `avg_pool1d_backward`, `conv1d`, `conv1d_bias_backward`, `conv1d_weight_backward`, `conv1d_x_backward`, `conv_transpose1d`, `conv_transpose1d_bias_backward`, `conv_transpose1d_weight_backward`, `conv_transpose1d_x_backward`, `ctc_loss`, `ctc_loss_backward`, `has_ctc_loss_backward`, `layer_norm`, `linear`, `linear_x_backward`, `max_pool1d`, `max_pool1d_with_indices`, `max_pool1d_with_indices_backward`
+`adaptive_avg_pool1d`, `adaptive_avg_pool1d_backward`, `avg_pool1d`, `avg_pool1d_backward`, `conv1d`, `conv1d_bias_backward`, `conv1d_weight_backward`, `conv1d_x_backward`, `conv_transpose1d`, `conv_transpose1d_bias_backward`, `conv_transpose1d_weight_backward`, `conv_transpose1d_x_backward`, `layer_norm`, `linear`, `linear_x_backward`, `max_pool1d`, `max_pool1d_with_indices`, `max_pool1d_with_indices_backward`
 
 </details>
 

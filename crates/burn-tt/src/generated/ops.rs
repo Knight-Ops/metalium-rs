@@ -4112,6 +4112,107 @@ impl ModuleOps<TtBackend> for TtBackend {
         drop(storage_inputs);
         crate::ops::module::attention(query, key, value, mask, attn_bias, options)
     }
+    fn ctc_loss(
+        log_probs: FloatTensor<TtBackend>,
+        targets: IntTensor<TtBackend>,
+        input_lengths: IntTensor<TtBackend>,
+        target_lengths: IntTensor<TtBackend>,
+        blank: usize,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("ctc_loss", true);
+        let storage_inputs = [&log_probs];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage = crate::ops::bfp_result_storage("ctc_loss", &storage_inputs);
+            let log_probs = crate::ops::bfp_compute_input(log_probs);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::ctc_loss(
+                    log_probs,
+                    targets,
+                    input_lengths,
+                    target_lengths,
+                    blank,
+                ),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&log_probs]);
+        if crate::tensor::is_half(compute_dtype) {
+            let log_probs = crate::ops::float_compute_input(log_probs);
+            return crate::ops::cast_native(
+                crate::ops::module::ctc_loss(
+                    log_probs,
+                    targets,
+                    input_lengths,
+                    target_lengths,
+                    blank,
+                ),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::ctc_loss(log_probs, targets, input_lengths, target_lengths, blank)
+    }
+    fn has_ctc_loss_backward() -> bool {
+        let _op = crate::report::enter("has_ctc_loss_backward", true);
+        crate::ops::module::has_ctc_loss_backward()
+    }
+    fn ctc_loss_backward(
+        _log_probs: FloatTensor<TtBackend>,
+        _targets: IntTensor<TtBackend>,
+        _input_lengths: IntTensor<TtBackend>,
+        _target_lengths: IntTensor<TtBackend>,
+        _grad_loss: FloatTensor<TtBackend>,
+        _blank: usize,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("ctc_loss_backward", true);
+        let storage_inputs = [&_log_probs, &_grad_loss];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("ctc_loss_backward", &storage_inputs);
+            let _log_probs = crate::ops::bfp_compute_input(_log_probs);
+            let _grad_loss = crate::ops::bfp_compute_input(_grad_loss);
+            return crate::ops::bfp_compute_result(
+                <Self as ModuleOps<Self>>::ctc_loss_backward(
+                    _log_probs,
+                    _targets,
+                    _input_lengths,
+                    _target_lengths,
+                    _grad_loss,
+                    _blank,
+                ),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&_log_probs, &_grad_loss]);
+        if crate::tensor::is_half(compute_dtype) {
+            let _log_probs = crate::ops::float_compute_input(_log_probs);
+            let _grad_loss = crate::ops::float_compute_input(_grad_loss);
+            return crate::ops::cast_native(
+                crate::ops::module::ctc_loss_backward(
+                    _log_probs,
+                    _targets,
+                    _input_lengths,
+                    _target_lengths,
+                    _grad_loss,
+                    _blank,
+                ),
+                compute_dtype,
+            );
+        }
+        crate::ops::module::ctc_loss_backward(
+            _log_probs,
+            _targets,
+            _input_lengths,
+            _target_lengths,
+            _grad_loss,
+            _blank,
+        )
+    }
     fn rfft(
         signal: FloatTensor<TtBackend>,
         dim: usize,

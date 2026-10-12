@@ -22,8 +22,8 @@
 //! nonzero, so the comparison cannot pass by an F32 result that needed no rounding. Residency: each
 //! result is on the device and nothing was downloaded before the explicit readback.
 //!
-//! Also the CTC loss gradient against burn-flex, in F16 on both (the conformance entries
-//! `ctc_loss_grad_mixed_input_lengths` and `_repeated_labels` are `precision`): see its test.
+//! Also the CTC loss gradient in F16 against burn-flex's and the F32 gradient (Burn's own
+//! `ctc_loss_grad_mixed_input_lengths` and `_repeated_labels`): see its test.
 
 use burn::backend::Autodiff;
 use burn::tensor::activation::{log_softmax, relu, softmax};
@@ -405,14 +405,17 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Burn's own `autodiff_f16` CTC gradient tests (`mixed_input_lengths`, `repeated_labels`) compare the
-/// F16 gradient with a PyTorch F32 reference at `rel_abs(1e-3, 1e-3)`, and burn-tt misses them in
-/// both matmul profiles. The cause is not burn-tt: Burn's default `ctc_loss` composes elementwise
-/// operations, each of which rounds to binary16, and burn-flex, running the same composition in F16 on
-/// the CPU, misses the same reference by the same amount while agreeing with burn-tt to rounding noise.
-/// The test states that: both F16 gradients are further from the F32 gradient than the vendored
-/// tolerance, and burn-tt's differs from Flex's by under 1% of that shortfall.
+/// F16 gradient with a PyTorch F32 reference at `rel_abs(1e-3, 1e-3)`. Burn's default `ctc_loss`
+/// composes elementwise operations, each of which rounds to binary16, and burn-flex, running that
+/// composition in F16 on the CPU, misses the reference by up to 0.235. burn-tt does not run it that
+/// way: it reports `has_ctc_loss_backward`, so autodiff calls its own forward and backward
+/// (`ops/ctc.rs`), which the generated wrappers run on the F32-widened `log_probs` and round once. The
+/// test states the difference: the F16 gradient meets the vendored tolerance against the F32 gradient
+/// and is ten times closer to it than Flex's F16 composition, which misses by more than 1e-2 (the
+/// control, and what the test fails with when `has_ctc_loss_backward` is turned off); and burn-tt's F32
+/// gradient is Flex's to 1e-5, so the native backward is the default composition's function.
 #[test]
-fn ctc_gradient_in_f16_is_flexs_to_rounding_noise() {
+fn ctc_gradient_in_f16_meets_the_f32_reference() {
     let cases = [
         Ctc {
             t: 12,
@@ -457,17 +460,21 @@ fn ctc_gradient_in_f16_is_flexs_to_rounding_noise() {
                 max_diff(&tt32, f32_ref)
             );
             let tt16 = ctc_grad::<Autodiff<TtBackend>>(&d, true, k);
+            // The control: composed in F16, the gradient misses the tolerance by a wide margin.
             let shortfall = max_diff(flex16, f32_ref);
             assert!(
-                shortfall > 1e-3,
+                shortfall > 1e-2,
                 "Flex F16 meets the tolerance: {shortfall}"
             );
-            assert!(max_diff(&tt16, f32_ref) > 1e-3);
-            let apart = max_diff(&tt16, flex16);
-            assert!(
-                apart * 100.0 <= shortfall,
-                "burn-tt F16 and Flex F16 differ by {apart}, the shortfall is {shortfall}"
-            );
+            // Burn's tolerance, `rel_abs(1e-3, 1e-3)`: `|a - b| < max(abs, rel * max(|a|, |b|))`.
+            for (i, (a, b)) in tt16.iter().zip(f32_ref).enumerate() {
+                let tolerance = 1e-3f32.max(1e-3 * a.abs().max(b.abs()));
+                assert!(
+                    (a - b).abs() < tolerance,
+                    "element {i}: F16 {a} against F32 {b}"
+                );
+            }
+            assert!(max_diff(&tt16, f32_ref) * 10.0 < shortfall);
         }
     });
 }

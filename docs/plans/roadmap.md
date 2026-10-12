@@ -100,6 +100,11 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   validity, wrong one-hot weight, swapped offset-gradient axes, swapped sampling axes) each fail the gate. **Limit:**
   a gather stages its whole table per element, so the host holds `4 x samples x channels x (rows + 1)` addresses and
   more than 2^24 is refused by name (Track 2, "Gather without staging").
+- [x] **F16 CTC gradients** (2026-10-12, ttsim, fusion and card 0 (`step162`, run `1791818535`)): `has_ctc_loss_backward`, native `ctc_loss` and
+  `ctc_loss_backward` ([`ops/ctc.rs`](../../crates/burn-tt/src/ops/ctc.rs)), widened to F32 and rounded once; the two
+  `autodiff_f16` CTC gradient entries are gone from every list. The alpha recursion is Burn's (private there) and beta is alpha of
+  the time- and label-reversed problem; gate `step162` `ctc_gradient_in_f16_meets_the_f32_reference`. F32 CTC takes the same path
+  (its gradient equals Burn's composition to 1e-5).
 - [ ] **Faster exact matmul.** The exact path is linear in products at about 0.5 us each; whether its two
   `k x outputs` host address tables or the device gathers dominate is not profiled. The untried
   formulations need far fewer addresses and give the same sum in the same order: a loop over `k` of

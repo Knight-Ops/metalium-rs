@@ -3157,6 +3157,7 @@ pub mod float {
 }
 
 mod conv;
+mod ctc;
 mod deform_conv;
 mod exact_matmul;
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
@@ -3174,6 +3175,7 @@ pub mod module {
         conv_transpose2d_x_backward, conv_transpose3d, conv_transpose3d_bias_backward,
         conv_transpose3d_weight_backward, conv_transpose3d_x_backward, unfold4d,
     };
+    pub use super::ctc::{ctc_loss, ctc_loss_backward, has_ctc_loss_backward};
     pub use super::deform_conv::{deform_conv2d, deform_conv2d_backward};
     pub use super::interpolate::{interpolate, interpolate_backward};
     pub use super::pool::{

@@ -96,14 +96,6 @@ tests = [
 ]
 
 [[group]]
-category = "precision"
-reason = "F16 CTC loss gradients against a PyTorch F32 reference at `rel_abs(1e-3, 1e-3)`: burn-tt is off by up to 0.235 (`mixed_input_lengths`) and 0.025 (`repeated_labels`). Not burn-tt's arithmetic: Burn's default `ctc_loss` composes elementwise operations over a recursion of up to a dozen steps and each rounds to binary16, so the vendored tolerance, set for backends with a fused F32 CTC kernel, cannot hold. Burn-flex running the same composition in F16 misses the F32 gradient by the same amounts and agrees with burn-tt to 2.4e-4 (one binary16 step), which `step162_f16_arithmetic::ctc_gradient_in_f16_is_flexs_to_rounding_noise` asserts (the shortfall at least 100 times the disagreement). Also fails in the `--exact` profile (so it is not the matmul) and on card 0 (run 1791811392). The F32 versions of both pass. The tolerance stays as vendored."
-tests = [
-    "autodiff_f16::base::ctc::test_ctc_loss_grad_mixed_input_lengths",
-    "autodiff_f16::base::ctc::test_ctc_loss_grad_repeated_labels",
-]
-
-[[group]]
 category = "timeout"
 reason = "F16 (`tensor_f16`, `autodiff_f16`): the simulator does not finish these in the limit (120 s in the canonical run), as their F32 counterparts above, but each passes on silicon, card 0 (run 1791811392, 900 s limit): the 300 x 300 determinants in 37 to 38 s, the LU block dispatches in 9 to 355 s (they pass in F16, where the F32 ones miss the tolerance), the long CTC losses in 22 to 34 s, the transaction matmul in 18 s and the scaled swap-dims CTC gradient in 49 s. Not a defect: ttsim speed."
 tests = [
