@@ -2601,6 +2601,20 @@ pub mod float {
         unfold_native(tensor, dim, size, step)
     }
 
+    /// Burn's default bilinear `grid_sample_2d`, composed of this backend's primitives.
+    ///
+    /// Overridden only so that a half-precision operand takes the generated wrapper's path: widen to F32,
+    /// compose, round once. The default composition in the half type rounds the sampling coordinates and
+    /// every weight to it, and BF16's 8 significant bits put the result more than one step from the
+    /// correctly rounded one (`should_pad_reflection_grid_sample_2d`: 1.3047 where the BF16 grid gives 1.3003).
+    pub fn float_grid_sample_2d(
+        tensor: FloatTensor<TtBackend>,
+        grid: FloatTensor<TtBackend>,
+        options: burn_backend::ops::GridSampleOptions,
+    ) -> FloatTensor<TtBackend> {
+        burn_backend::ops::grid_sample::float_grid_sample_2d_ref::<TtBackend>(tensor, grid, options)
+    }
+
     pub fn float_slice(
         tensor: FloatTensor<TtBackend>,
         slices: &[burn_backend::Slice],

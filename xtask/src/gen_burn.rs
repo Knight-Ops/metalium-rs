@@ -80,6 +80,7 @@ pub const OVERRIDDEN: &[(&str, &[&str])] = &[
             "float_slice",
             "float_slice_assign",
             "float_unfold",
+            "float_grid_sample_2d",
             "float_flip",
             "float_swap_dims",
             "float_transpose",

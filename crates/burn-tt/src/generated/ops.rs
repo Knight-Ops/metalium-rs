@@ -19,6 +19,8 @@ use burn_backend::ops::DeformConv2dBackward;
 #[allow(unused_imports)]
 use burn_backend::ops::DeformConvOptions;
 #[allow(unused_imports)]
+use burn_backend::ops::GridSampleOptions;
+#[allow(unused_imports)]
 use burn_backend::ops::InterpolateOptions;
 #[allow(unused_imports)]
 use burn_backend::ops::MaxPool2dBackward;
@@ -2300,6 +2302,37 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             return crate::ops::float::float_argsort(tensor, dim, descending, out_dtype);
         }
         crate::ops::float::float_argsort(tensor, dim, descending, out_dtype)
+    }
+    fn float_grid_sample_2d(
+        tensor: FloatTensor<TtBackend>,
+        grid: FloatTensor<TtBackend>,
+        options: GridSampleOptions,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_grid_sample_2d", true);
+        let storage_inputs = [&tensor, &grid];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_grid_sample_2d", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            let grid = crate::ops::bfp_compute_input(grid);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_grid_sample_2d(tensor, grid, options),
+                result_storage,
+            );
+        }
+        let compute_dtype = crate::ops::float_compute_dtype(&[&tensor, &grid]);
+        if crate::tensor::is_half(compute_dtype) {
+            let tensor = crate::ops::float_compute_input(tensor);
+            let grid = crate::ops::float_compute_input(grid);
+            return crate::ops::cast_native(
+                crate::ops::float::float_grid_sample_2d(tensor, grid, options),
+                compute_dtype,
+            );
+        }
+        crate::ops::float::float_grid_sample_2d(tensor, grid, options)
     }
     fn float_unfold(
         tensor: FloatTensor<TtBackend>,
