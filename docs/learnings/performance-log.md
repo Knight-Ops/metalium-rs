@@ -412,10 +412,31 @@ sequence word (device cycles per encoded entry, 4 KiB; 64 B in brackets):
   phase-0 fast numbers in brackets (the dips are noise: three runs of 32 tiles read 426 / 438 / 448, of 64 tiles 461 / 476 /
   473): 1 tile 29.1 (28.8), 8 tiles 229 (227), 32 tiles 426-448 (447), 120 tiles 486 (491); 2 KiB: 1 tile 14.6 (14.4), 8 tiles
   115 (114), 32 tiles 288 (290), 120 tiles 440 (442). **Unchanged.** The entry now costs 91 cycles, a 61 GB/s ceiling at 4 KiB,
-  and one tile reads 29, which is not the entry. It fits a tile bound by the round trip at the cap of 8 requests in flight
-  (8 x 4 KiB per ~1.1 us, by Little's law; an inference, phase 3 tests it by raising the cap). If so, the lever at 1-8 tiles is
-  the in-flight depth, and from 32 tiles up the channels; the entry cost only mattered where it exceeded those, which the first
-  fast mode already fixed.
+  and one tile reads 29, which is not the entry. It looked like a tile bound by the round trip at the cap of 8 requests in flight
+  (8 x 4 KiB per ~1.1 us); the cap sweep in the next section refutes that. The entry cost only mattered where it exceeded
+  what bounds a tile, which the first fast mode already fixed.
+
+**The in-flight depth does not bound a tile (plan phase 3, 2026-10-13: not built).** `gddr_aggregate` reads, fast build,
+tight loop, `AGG_CAP` 16 / 32 / 64 and 128 (0), GB/s, card 1 at 4 KiB entries (runs `1791928262`, `1791928503`, `1791928744`, `1791929010`):
+
+| Tiles | cap 16 | cap 32 | cap 64 | cap 128 |
+|--:|--:|--:|--:|--:|
+| 1 | 29.0 | 29.1 | 29.1 | 29.0 |
+| 2 | 57.5 | 57.5 | 57.6 | |
+| 4 | 114.9 | 114.8 | 115.0 | 110.8 |
+| 8 | 228.8 | 229.1 | 229.4 | |
+| 16 | 344.5 | 344.5 | 344.8 | |
+| 32 | 438 | 446 | 444 | |
+| 120 | 487 | 491 | 490 | |
+
+and card 0 at 2 KiB (runs `1791928268`, `1791928509`, `1791928749`): 1 tile 14.6 at every cap, 4 tiles 57.6, 120 tiles 436-444 (a
+cap-16 run read 376 at 120 tiles and 65 at 8, an outlier that did not repeat at the other caps). The default cap, 8, gave the
+same (29.1, 227-229, 486 at 1, 8, 120 tiles). **The hypothesis of the tight-loop section above is refuted:** one tile reads 29
+GB/s (14.6 at 2 KiB) at a cap of 8 and at a cap of 128, with an entry that costs 91 cycles (a 61 GB/s ceiling), so neither the
+cap nor the entry bounds it. Plan phase 3 (a per-list cap in the queue slot) gated on >= 5% at 1-4 tiles; there is none, so
+the cap stays 8 and the machinery is not built. What does bound a tile at 29 GB/s is open: candidates are the tile's NoC read path
+(one NIU's return bandwidth into L1), the list's own wait at its end, and the benchmark's per-list overheads; the bare-loop probe's
+"~58 GB/s" was an entry-cost figure, not a measured throughput.
 
 **Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
 reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:

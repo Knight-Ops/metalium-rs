@@ -202,8 +202,8 @@ and refuses `READ_ENCODED` as an unknown op. A **fast** image runs host-encoded 
 validated in full on the host (`encoded::validate`), integrity-checked on the card (`encoded::verify`,
 a checksum), and with `encoded-guard` also semantically guarded on the card (`encoded::guard`). The
 image reports its mode in `dm::CAPS`, which the host reads; never queue an encoded entry that did not
-pass `validate` (`enqueue_checked` trusts its caller), and never send a hand-made one to silicon whose
-refusal you have not checked on ttsim.
+pass `validate` (`enqueue_checked` validates them; only the doc-hidden `enqueue_raw` sends one unchecked), and never
+send a hand-made one to silicon whose refusal you have not checked on ttsim.
 Keep one `Device` per chip because power policy is chip-wide. Local data RAM
 cannot answer NoC accesses while its owning core is in reset.
 

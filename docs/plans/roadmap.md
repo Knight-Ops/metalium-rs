@@ -430,8 +430,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   on B's reads and NC's writes; NC's writes are 0-4% top-level `WRITE` in the matmul, Burn and scatter flows), P1 safety (the
   checksum bound to a per-start key, tile, chip and op; `validate` also runs the guard; `enqueue_checked` validates;
   `step173_mover_differential`; the encoded entry is 180.5 cycles with the seed load), P2 tight read loop (X6 default,
-  `ReadBatch`, `run_encoded_reads`: 91 cycles an entry, 109 with the guard; card-wide GB/s unchanged: a tile is bound by its
-  in-flight depth, not the entry). Open: P3 per-list in-flight cap (now the lever at 1-8 tiles), P4 sealed static read records, P5 NC writes
+  `ReadBatch`, `run_encoded_reads`: 91 cycles an entry, 109 with the guard; card-wide GB/s unchanged: a tile is not bound by the entry). P3 per-list in-flight cap: not built, the sweep refuted it (one tile reads 29 GB/s at every cap from 8 to 128; what bounds a tile is open). Open: P4 sealed static read records, P5 NC writes
   (`fast-writes`; sealed `WRITE_RUN`/`SCATTER` first), P7 L1 containment check.
   **9.13** role `START` traced before the role's descriptor and config work, so the push
   timings leave part of the launch out; measure instruction-heavy kernels (SFPU `exp`, roles
