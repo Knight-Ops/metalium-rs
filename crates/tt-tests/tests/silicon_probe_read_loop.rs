@@ -24,9 +24,7 @@
 use std::time::{Duration, Instant};
 
 use tt_device::tlb::WindowKind;
-#[cfg(feature = "fast-reads")]
-use tt_isa::dm;
-use tt_isa::dm::op;
+use tt_isa::dm::{self, op};
 use tt_kernels::dm::DataMover;
 use tt_tests::bench::{median, on_card, pattern, report, Stats, REPS};
 use tt_tests::harness::Dev;
@@ -470,6 +468,164 @@ fn encoded_entries_against_plain_entries() {
                 // The list the card ran is the form under test.
                 let first = d.read32(&w, t, mover.list).unwrap();
                 assert_eq!(first, if encode { op::READ_ENCODED } else { op::READ });
+                m.stop(d, &w).unwrap();
+            }
+        }
+    });
+}
+
+/// `records_against_entries`: what a gathered tile costs the B mover as a plain `READ` entry, as an encoded
+/// one (a `fast-reads` build) and as a tile of a `READ_RUN` record (32 tiles an entry group), all resident
+/// lists rerun from the sequence word with no upload, device cycles by the host clock less an empty list's
+/// time, per tile, for N = 64, 256 and 448 tiles of a tensor spread over the eight channels. This is the
+/// gate for sealing static records (`docs/plans`: the saving per record tile decides it). Every repetition
+/// poisons the 64-slot destination window and compares what landed, tile by tile.
+#[test]
+#[ignore = "benchmark"]
+fn records_against_entries() {
+    use tt_isa::dm::record::{self, TensorRef};
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let chans: Vec<_> = dram.channels().collect();
+        assert_eq!(chans.len(), 8, "the tensor spans all eight channels");
+        const SLOT: u32 = dm::TILE_SLOT as u32;
+        const MAX_TILES: u32 = 448;
+        let base = 64u32 << 20;
+        let per_channel = (MAX_TILES / 8 + 1) * SLOT;
+        let data: Vec<Vec<u8>> = (0..8)
+            .map(|c| pattern(per_channel as usize, 21 + c))
+            .collect();
+        for (c, ch) in chans.iter().enumerate() {
+            d.dram_write(
+                &w4,
+                ch.range(base as u64, per_channel as u64).unwrap(),
+                &data[c],
+            )
+            .unwrap();
+        }
+        let tile = |n: u32| {
+            &data[(n % 8) as usize][((n / 8) * SLOT) as usize..((n / 8 + 1) * SLOT) as usize]
+        };
+        let window = 64 * SLOT as usize;
+        let channels: [u8; 8] = core::array::from_fn(|c| chans[c].index());
+        let x = TensorRef {
+            n: 8,
+            channels,
+            base: [base; 8],
+            first: 0,
+            ct: 32,
+        };
+        let plain = |n: u32| -> Vec<[u32; 8]> {
+            (0..n)
+                .map(|k| {
+                    [
+                        op::READ,
+                        chans[(k % 8) as usize].index() as u32,
+                        0,
+                        base + (k / 8) * SLOT,
+                        L1 + (k % 64) * SLOT,
+                        SLOT,
+                        0,
+                        0,
+                    ]
+                })
+                .collect()
+        };
+        let records = |n: u32| -> Vec<[u32; 8]> {
+            (0..n / 32)
+                .flat_map(|k| {
+                    let [meta, bases] = x.encode();
+                    [
+                        [
+                            record::READ_RUN,
+                            32 * k,
+                            32,
+                            L1 + (k % 2) * 32 * SLOT,
+                            0,
+                            32,
+                            0,
+                            0,
+                        ],
+                        meta,
+                        bases,
+                    ]
+                })
+                .collect()
+        };
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let empty_list = [[op::WAIT, 0, 0, 0, 0, 0, 0, 0]];
+        let mut variants: Vec<(&str, bool, bool)> = vec![("plain READ", false, false)];
+        // (name, encode, records)
+        {
+            let probe = DataMover::start(d, &w, t, &dram, image).unwrap();
+            if probe.fast_reads() {
+                variants.push(("encoded READ", true, false));
+            }
+            probe.stop(d, &w).unwrap();
+        }
+        variants.push(("READ_RUN record", false, true));
+        for n in [64u32, 256, 448] {
+            // What the window holds after the run: slot s the last tile numbered s mod 64.
+            let mut expected = vec![0xA5u8; window];
+            for k in 0..n {
+                let at = ((k % 64) * SLOT) as usize;
+                expected[at..at + SLOT as usize].copy_from_slice(tile(k));
+            }
+            for &(name, encode, as_records) in &variants {
+                let list = if as_records { records(n) } else { plain(n) };
+                let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+                m.set_encode_reads(encode).unwrap_or_default();
+                let mover = m.mover();
+                m.submit_list(d, &w, &empty_list).unwrap();
+                m.wait(d, &w).unwrap();
+                let rerun = |d: &mut Dev<'_>| {
+                    let seq = d
+                        .read32(&w, t, mover.at(dm::SEQ))
+                        .unwrap()
+                        .wrapping_add(1)
+                        .max(1);
+                    let t0 = Instant::now();
+                    d.write32(&w, t, mover.at(dm::SEQ), seq).unwrap();
+                    while d.read32(&w, t, mover.at(dm::DONE)).unwrap() != seq {
+                        assert!(
+                            t0.elapsed() < Duration::from_secs(5),
+                            "the mover did not finish"
+                        );
+                    }
+                    t0.elapsed()
+                };
+                rerun(d);
+                let empty = median((0..REPS).map(|_| rerun(d)).collect());
+                m.submit_list(d, &w, &list).unwrap();
+                m.wait(d, &w).unwrap();
+                rerun(d);
+                let samples: Vec<f64> = (0..REPS)
+                    .map(|_| {
+                        d.l1_write(&w, t, L1 as u64, &vec![0xA5u8; window]).unwrap();
+                        let dt = rerun(d).saturating_sub(empty);
+                        let mut back = vec![0u8; window];
+                        d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+                        assert!(back == expected, "{name} N={n}: the tiles did not land");
+                        dt.as_secs_f64() * 1e6 * CYCLES_PER_US / n as f64
+                    })
+                    .collect();
+                // The list the card ran is the form under test.
+                let first = d.read32(&w, t, mover.list).unwrap();
+                let want = match (as_records, encode) {
+                    (true, _) => record::READ_RUN,
+                    (false, true) => op::READ_ENCODED,
+                    (false, false) => op::READ,
+                };
+                assert_eq!(first, want, "{name}: the form the card ran");
+                report(
+                    &format!("{name}, N={n}: per tile"),
+                    "cycles",
+                    "host",
+                    Stats::of(samples),
+                );
                 m.stop(d, &w).unwrap();
             }
         }
