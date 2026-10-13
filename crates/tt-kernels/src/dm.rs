@@ -291,6 +291,11 @@ impl<N: NocId> DataMover<N> {
                 |c| c & dm::caps::VALID != 0,
             )?
             .map_err(|_| DmError::NotStarted)?;
+        // A fast image issues its reads on request initiator 1 (`set_read_fast`), with the
+        // words that do not change written once per list, not per read.
+        if caps & dm::caps::FAST_READS != 0 {
+            d.write32(w, tile, mover.at(dm::READ_FAST), 1)?;
+        }
         Ok(DataMover {
             tile,
             mover,
