@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Records and NC writes](#per-tile-cost-of-the-movers-records-and-ncs-writes-2026-10-13-cards-0-and-1) | 2026-10-13 | A record's tile costs a plain entry's ~340 cycles on B (read) and ~320-345 on NC (write); only plain entries gain from encoding |
 | [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
 | [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
 | [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
@@ -475,6 +476,32 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Per-tile cost of the movers' records and NC's writes (2026-10-13, cards 0 and 1)
+
+`silicon_probe_read_loop::records_against_entries` (card 0) and `silicon_probe_nc_writes::nc_writes_against_records`
+(card 1; `cargo xtask bench --device 1 --filter silicon_probe_nc_writes`, run `1791925106`, release, branch
+`fast-mode-hardening`). Resident lists rerun from the sequence word, device cycles by the host clock less an empty list's
+time, per tile, N = 64 / 256 / 448 tiles of a tensor over the eight channels. Every repetition poisons the destination,
+reruns, and compares every tile's datums (writes: the 4096 datum bytes, header untouched), so a form that is cheap
+because it moved nothing fails.
+
+| Per tile, device cycles | N = 64 | N = 256 | N = 448 |
+|---|--:|--:|--:|
+| B, plain 4160 B `READ` (card 0) | 351-363 | | |
+| B, host-encoded `READ_ENCODED` (card 0) | 175-177 | | |
+| B, `READ_RUN` record, 32 tiles each (card 0) | 340-351 | | |
+| NC, plain `WRITE` (card 1) | 328 | 345 | 343 |
+| NC, `WRITE_RUN` record, 32 tiles each (card 1) | 327 | 326 | 320 |
+
+- A record's tile costs what a plain entry does: the record is expanded into the same `DramMove` per tile, so encoding a
+  plain entry (175) saves nothing there, and only a validated static record path (plan phase 4/5) can. NC's writes
+  cost the same ~330-345 cycles as B's reads; a record saves 0-7% on the write side.
+- The probe's first run failed on its own error, not the mover's: a tile's slot holds 4096 datum bytes and 48 bytes of
+  padding (`TILE_DATA + 4096 <= TILE_SLOT`), which a `WRITE_RUN` correctly does not write; the probe had compared and written the
+  padding. Both forms now move exactly the datums.
+- `gddr_aggregate_nocs` is still unusable for NC, and is not fixed here: its lists begin with a `BARRIER`, which only B runs,
+  so NC answers `DIRECTION`. The probe above does what it was for without one.
 
 ## Firmware image budget and core-assignment (2026-10-13, card 0)
 
