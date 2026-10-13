@@ -503,6 +503,23 @@ because it moved nothing fails.
 - `gddr_aggregate_nocs` is still unusable for NC, and is not fixed here: its lists begin with a `BARRIER`, which only B runs,
   so NC answers `DIRECTION`. The probe above does what it was for without one.
 
+**Where NC's requests come from** (ttsim, temporary instrumentation in `DataMover::check_as`, reverted; the NC list of every
+upload, top-level `WRITE` entries against writes a record expands to):
+
+| Gate | Lists | Top-level `WRITE` | Records | Record-expanded writes |
+|---|--:|--:|--:|--:|
+| `step68_k_block_matmul` | 114 | 0 | 287 | 1,765 |
+| `step56_scatter_on_nc` | 64 | 0 | 1,076 | 22,848 |
+| `step11_burn` | 91 | 14 | 100 | 367 |
+| `step171_select_rows` | 141 | 321 | 87 | 210 |
+| `step62_gather_rows` | 97 | 596 | 52 | 212 |
+| `step52_nc_mover` (plain writes by design) | 2 | 312 | 0 | 0 |
+
+Matmul, Burn and scatter flows write through records (0-4% top-level); only the row-select and gather gates, whose output rows
+are ragged, write plain entries in bulk. An NC fast path therefore has little to win from encoding plain entries (~340 -> ~170
+cycles at best) and most from a validated static record path; sealed `WRITE_RUN`/`SCATTER` first, `WRITE_ENCODED` only if a
+model flow needs the row writers. This is a tally of gates, not of production flows on silicon.
+
 ## Firmware image budget and core-assignment (2026-10-13, card 0)
 
 Why: `dm_b` had 172 bytes left of its 24,576 (silicon-operating-notes, "RISCV B's image has little room
