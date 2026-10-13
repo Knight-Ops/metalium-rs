@@ -96,9 +96,10 @@ that mixes clocks and the upload. The like-for-like gap is 3.4-4x.
 Its toolchain did not run here at first (the installed ttnn's SFPI mismatch, and an Ethernet image left by our gates,
 [silicon-operating-notes](../learnings/silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)).
 For DRAM reads there are now live numbers, on card 1 ([performance-log](../learnings/performance-log.md#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1)):
-- **The compiled kernel is faster per entry.** A 4 KiB page costs tt-metal's compiled reader ~125 cycles, our fast mode 175, our safe
+- **The compiled kernel is faster per entry.** A 4 KiB page costs tt-metal's compiled reader ~125 cycles, our fast mode 91 (175 before the tight loop of phase 2 of fast-mode hardening), our safe
   mode 359. At one core, 44 / 29 / 15 GB/s. The interpreter's cost is real, and `fast-reads` closes about four fifths of the gap to
-  the compiled kernel in cycles (359 -> 175 against 125; 3.0x -> 1.5x in rate at 4 KiB).
+  the compiled kernel in cycles (359 -> 175 against 125; 3.0x -> 1.5x in rate at 4 KiB), and with the tight loop passes it
+  (91 cycles: the entry no longer bounds a tile, its in-flight depth does).
 - **At scale the interpreter is not what limits us.** With 64 or more cores ours reaches 94-97% of the card (4 and 16 KiB), where the
   plain interleaved tt-metal pattern reaches 71-81%: entry cost stops mattering once enough cores are issuing, and the data path
   (ports, placement) decides. tt-metal's own report says the same about placement; I did not run its tuned layout, so the

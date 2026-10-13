@@ -444,6 +444,43 @@ fn read_encoded(me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
     Ok(())
 }
 
+/// A run of host-encoded reads from the ring at `base`, at most `max` entries, stopping at the first
+/// entry that is not one: `(entries issued, error code or 0)`. [`read_encoded`] for each, as a loop of
+/// its own: the seed, the guard's tile word and the issue's state stay in registers for the run, one
+/// `CMD_CTRL` read-back fences the run ([`noc::ReadBatch`]), and no entry is copied through an array.
+/// Entries before a bad one are issued, as they would be one at a time; the run is always ended, so
+/// they are counted. For the fast read path only, untraced.
+#[link_section = ".text.hot"]
+#[inline(never)]
+fn run_encoded_reads(me: (u8, u8), base: u64, max: u32) -> (u32, u32) {
+    let seed = unsafe { ENCODE_SEED };
+    let me_hi = encoded::endpoint_hi(me.0, me.1);
+    let mut batch = noc::ReadBatch::begin(TXN);
+    let mut k = 0u32;
+    let mut code = 0;
+    while k < max {
+        let e = entry_at(base + k as u64 * dm::ENTRY_BYTES);
+        if e[0] != op::READ_ENCODED {
+            break;
+        }
+        if !encoded::verify_with(&e, seed) {
+            code = dm::error::ENCODED;
+            break;
+        }
+        if ENCODED_GUARD {
+            let bit = |hi: u32| rd(M.at(encoded::ENDPOINTS) + (hi as u64 / 32) * 4) >> (hi % 32) & 1 != 0;
+            if !encoded::guard(&e, me_hi, bit) {
+                code = dm::error::ENCODED;
+                break;
+            }
+        }
+        batch.issue(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7]);
+        k += 1;
+    }
+    batch.end();
+    (k, code)
+}
+
 /// Run one list entry: plain entries are issued without waiting; a transposed
 /// read waits for its own tile before rearranging it; a kernel or a wait entry
 /// first waits for everything before it.
@@ -950,8 +987,19 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             let entry_traced = traced && head[0] != op::PAIR_CALL;
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
             if n == 1 {
-                // The host-encoded read goes straight to its issue, past `exec`'s
+                // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
+                // fast read path; past it, each goes straight to its issue, past `exec`'s
                 // prologue and decode (`exec` also takes it, for the other callers).
+                if FAST_READS && !traced && head[0] == op::READ_ENCODED && noc::read_fast() {
+                    let (done, code) =
+                        run_encoded_reads(me, base + i * dm::ENTRY_BYTES, (count as u64 - i) as u32);
+                    if code != 0 {
+                        wr(M.mailbox + offset::RESULT, head[0]);
+                        return Err(code);
+                    }
+                    i += done as u64;
+                    continue;
+                }
                 let r = if FAST_READS && head[0] == op::READ_ENCODED {
                     read_encoded(me, head)
                 } else {

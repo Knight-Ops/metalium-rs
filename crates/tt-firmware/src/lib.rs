@@ -505,7 +505,9 @@ pub mod cfg {
 /// NIU: NoC #0's or NoC #1's, named per request.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{self, initiator, Command, InFlight, Niu, RequestError, TxnId};
+    use tt_isa::noc::niu::{
+        self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId,
+    };
 
     const _: () = assert!(niu::NOC1_BASE <= u32::MAX as u64 && niu::NOC0_BASE < niu::NOC1_BASE);
 
@@ -803,6 +805,110 @@ pub mod noc {
             let _ = read_volatile(reg(niu, INITIATOR_1 + CMD_CTRL));
         }
         in_flight(niu, txn).after_issue();
+    }
+
+    /// A run of GDDR reads through the fast path, [`issue_read`] without its per-request costs: the in-flight
+    /// room and the initiator's last key live in registers for the run, and `CMD_CTRL` is read back once, when
+    /// the run ends or must read a counter (`tt_isa::noc::niu::Batch`), not after each request. The next
+    /// request's wait for the initiator to be free reads the same register behind the same store, so it
+    /// already orders one request's writes before the next; only the counter reads need the fence.
+    /// Every exit from a run calls [`ReadBatch::end`], or the requests it issued are not counted and the
+    /// last one is not fenced.
+    pub struct ReadBatch {
+        batch: Batch,
+        key: u32,
+        txn: TxnId,
+    }
+
+    /// [`Batch::refill`]'s counter polling, with the stall accounting of [`make_room`]. Out of line: the
+    /// issue path holds only the test that decides to come here.
+    #[cold]
+    #[inline(never)]
+    fn refill_batch(batch: &mut Batch, txn: TxnId) {
+        let st = stalls_mut();
+        let t0 = st.clock.map_or(0, |c| c());
+        let full = batch.refill(in_flight(Niu::Noc0, txn), fence_initiator_1, || {
+            outstanding(Niu::Noc0, txn)
+        });
+        if full != 0 {
+            st.count = st.count.wrapping_add(1);
+            if let Some(c) = st.clock {
+                st.cycles = st.cycles.wrapping_add(c().wrapping_sub(t0));
+            }
+        }
+    }
+
+    /// Read `CMD_CTRL` of initiator 1 back: the posted stores before it have reached the NIU.
+    #[inline(always)]
+    fn fence_initiator_1() {
+        // SAFETY: a read of initiator 1's command register, as `issue_read` makes.
+        unsafe {
+            let _ = read_volatile(reg(Niu::Noc0, INITIATOR_1 + initiator::CMD_CTRL));
+        }
+    }
+
+    impl ReadBatch {
+        /// Start a run of reads under `txn`'s cap on NoC #0. The read path must be on ([`read_fast`]).
+        #[inline(always)]
+        pub fn begin(txn: TxnId) -> Self {
+            ReadBatch {
+                batch: Batch::begin(in_flight(Niu::Noc0, txn)),
+                key: read_path().key,
+                txn,
+            }
+        }
+
+        /// One request: [`issue_read`]'s, with `tag` and `ctrl` known to the caller.
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn issue(
+            &mut self,
+            targ: u32,
+            targ_hi: u32,
+            ret: u32,
+            ret_hi: u32,
+            tag: u32,
+            ctrl: u32,
+            len: u32,
+        ) {
+            use initiator::*;
+            let niu = Niu::Noc0;
+            if self.batch.full() {
+                refill_batch(&mut self.batch, self.txn);
+            }
+            let key = targ_hi | len << 12;
+            // SAFETY: initiator 1's registers, as `issue_read`.
+            unsafe {
+                while read_volatile(reg(niu, INITIATOR_1 + CMD_CTRL)) & 1 != 0 {}
+                if self.key != key {
+                    if self.key == UNKNOWN {
+                        write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_MID), 0);
+                        write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_MID), 0);
+                        write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_HI), ret_hi);
+                        write_volatile(reg(niu, INITIATOR_1 + PACKET_TAG), tag);
+                        write_volatile(reg(niu, INITIATOR_1 + AT_DATA), 0);
+                    }
+                    write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_HI), targ_hi);
+                    write_volatile(reg(niu, INITIATOR_1 + AT_LEN_BE), len);
+                    self.key = key;
+                }
+                write_volatile(reg(niu, INITIATOR_1 + TARG_ADDR_LO), targ);
+                write_volatile(reg(niu, INITIATOR_1 + RET_ADDR_LO), ret);
+                write_volatile(reg(niu, INITIATOR_1 + CTRL), ctrl);
+                write_volatile(reg(niu, INITIATOR_1 + CMD_CTRL), 1);
+            }
+            self.batch.issued();
+        }
+
+        /// End the run: charge what it issued, keep the initiator's key for the next, and fence the
+        /// last request before anything reads a counter.
+        #[inline(always)]
+        pub fn end(self) {
+            read_path().key = self.key;
+            if self.batch.end(in_flight(Niu::Noc0, self.txn)) {
+                fence_initiator_1();
+            }
+        }
     }
 
     /// One request of a `tt_isa::noc::niu::HostMove` through NoC #0, under

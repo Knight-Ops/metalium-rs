@@ -384,6 +384,39 @@ capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
   safe build's plain entry unchanged (362 / 359 / 360 against 362 / 362 / 361 before at N = 64 / 256 / 448). `dm_b`: safe 24,400
   bytes, fast 24,924, fast + guard 25,092; `dm_nc` 14,252.
 
+**The tight read loop (plan phase 2, 2026-10-13, card 0).** Three steps, each measured on card 0 with a resident list rerun from the
+sequence word (device cycles per encoded entry, 4 KiB; 64 B in brackets):
+
+| Step | Fast | Fast + guard | Safe (plain) | Run |
+|---|--:|--:|--:|---|
+| after phase 1 (keyed checksum) | 180.5 (180.5) | | 361 | `1791926086` |
+| 1. request initiator 1 (X6) by default in a fast image | 159.7 (155.2) | | 361 (fast image's plain entry 334) | `1791926392` |
+| 2-3. `noc::ReadBatch` and `run_encoded_reads`, a loop of its own | **90.8 (81.0)** | **108.7 (108.6)** | 363 / 358 / 360 (N = 64 / 256 / 448; unchanged) | `1791926751`, `1791926891`, `1791926977` |
+| 4. software pipelining | not done: the bare issue loop is ~88 at 4 KiB, 69 at 64 B (read-loop probe) | | | |
+
+- *Step 1* costs nothing but a host write (`READ_FAST = 1` in `start_on` when the image reports `FAST_READS`): each request
+  writes the address words, `CTRL` and the command, and the rest of initiator 1 once per list (`step118` holds it
+  byte-identical to the slow path on silicon, with its negative controls). It takes the fast image's plain entries from 361 to 334 too.
+- *Steps 2-3.* `run_encoded_reads` runs a list's consecutive `READ_ENCODED` entries in one loop, untraced, on the fast path:
+  the checksum seed, the guard's tile word, the in-flight room and the initiator's key stay in registers for the run;
+  the entry is read word by word, not copied into an array; and `CMD_CTRL` is read back **once per run**
+  (`noc::ReadBatch`, over `tt_isa::noc::niu::Batch`) instead of after every request -- the next request's own wait for the
+  initiator to be free reads the same register behind the same store, so only the counter reads need the fence (before a
+  refill, and when the run ends). Error semantics are the one-at-a-time path's: entries before a bad one are issued, then
+  `RESULT = READ_ENCODED` and the code, with no final wait; `step172` holds it for a bad first, middle and last entry of a run
+  of eight, watched failing with the issue moved before the check. The accounting is unit-tested on the host against the
+  NIU model (the counter never passes the cap, it is read only when the batch is out of room and always after a fence, one
+  fence per refill and per non-empty batch). 90.8 is within 3 cycles of the bare issue loop, so there is nothing left for
+  software pipelining to win; the guard costs 18 cycles in the loop (it was 40).
+- *What it did to the card.* Card-wide `gddr_aggregate` reads, fast build, card 1 at 4 KiB / card 0 at 2 KiB, GB/s with the
+  phase-0 fast numbers in brackets (the dips are noise: three runs of 32 tiles read 426 / 438 / 448, of 64 tiles 461 / 476 /
+  473): 1 tile 29.1 (28.8), 8 tiles 229 (227), 32 tiles 426-448 (447), 120 tiles 486 (491); 2 KiB: 1 tile 14.6 (14.4), 8 tiles
+  115 (114), 32 tiles 288 (290), 120 tiles 440 (442). **Unchanged.** The entry now costs 91 cycles, a 61 GB/s ceiling at 4 KiB,
+  and one tile reads 29, which is not the entry. It fits a tile bound by the round trip at the cap of 8 requests in flight
+  (8 x 4 KiB per ~1.1 us, by Little's law; an inference, phase 3 tests it by raising the cap). If so, the lever at 1-8 tiles is
+  the in-flight depth, and from 32 tiles up the channels; the entry cost only mattered where it exceeded those, which the first
+  fast mode already fixed.
+
 **Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
 reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:
 

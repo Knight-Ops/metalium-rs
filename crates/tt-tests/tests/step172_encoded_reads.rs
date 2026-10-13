@@ -542,6 +542,67 @@ mod fast {
         });
     }
 
+    /// A run of encoded reads that meets a damaged entry issues the ones before it and none after, and
+    /// the mover answers `error::ENCODED` and survives (the card's tight loop and the one-at-a-time
+    /// path give the same answer): the first, a middle and the last entry of a run of eight.
+    #[test]
+    fn a_run_of_encoded_reads_stops_at_a_bad_entry_after_issuing_the_ones_before() {
+        const RUN: usize = 8;
+        in_device(|d| {
+            let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+            let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+            let dram = d.dram_grid(&w).unwrap();
+            let ch = dram.channel(0).unwrap();
+            let data = pattern(RUN * 4096, 7);
+            d.dram_write(&w4, ch.range(GOOD_AT, (RUN * 4096) as u64).unwrap(), &data)
+                .unwrap();
+            for bad_at in [0, 3, RUN - 1] {
+                let mut m = start(d, &w, Mover::B);
+                let t = m.tile();
+                let mut list: Vec<[u32; 8]> = (0..RUN)
+                    .map(|k| {
+                        let read = plain(
+                            0,
+                            0,
+                            (GOOD_AT + 4096 * k as u64) as u32,
+                            L1_AT + 4096 * k as u32,
+                            4096,
+                        );
+                        encoded::encode(m.encode_context(), read).unwrap().unwrap()
+                    })
+                    .collect();
+                list[bad_at][encoded::CHECK_WORD] ^= 1;
+                d.l1_write(&w, t, L1_AT as u64, &[POISON; RUN * 4096])
+                    .unwrap();
+                let n = m.enqueue_raw(d, &w, &list).unwrap();
+                let r = m.wait_for(d, &w, n);
+                assert!(
+                    matches!(r, Err(DmError::Queued { code, .. }) if code == dm::error::ENCODED),
+                    "bad entry {bad_at}: the card answered {r:?}"
+                );
+                // The reads issued before the error have no wait behind them: give them time to land.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut back = vec![0u8; RUN * 4096];
+                d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
+                for k in 0..RUN {
+                    let slot = &back[k * 4096..(k + 1) * 4096];
+                    if k < bad_at {
+                        assert!(
+                            slot == &data[k * 4096..(k + 1) * 4096],
+                            "entry {k} before {bad_at}"
+                        );
+                    } else {
+                        assert!(
+                            slot.iter().all(|&b| b == POISON),
+                            "entry {k} ran, at or after {bad_at}"
+                        );
+                    }
+                }
+                m.stop(d, &w).unwrap();
+            }
+        });
+    }
+
     /// An entry that is consistent and wrong carries a good checksum, so the card's
     /// checksum cannot refuse it: only an `encoded-guard` build does, and that is held on
     /// ttsim alone (on silicon these are the NoC hang).
