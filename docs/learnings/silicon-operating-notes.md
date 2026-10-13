@@ -1025,6 +1025,11 @@ hang after "Opening subset of mmio devices" (the first attempt, killed by its 50
 
 - **Fix:** `tt-smi -r <PCI address>` for the card, with nothing else on it (`tt-smi -ls` lists the addresses; card 1 is `0000:02:00.0`
   here). After it, tt-metal opens the card. Nothing else in the repo needed re-establishing: the gates start from a known state.
+- **The other direction, 2026-10-13:** after tt-metal runs on card 1 and many benchmark processes, the two-card Ethernet gate
+  `step76_burn_bf16::bf16_mesh_product_uses_resident_ethernet_execution_across_two_cards` failed on both card-0 smoke runs and with
+  `--device all` (`resident Ethernet transfer: transfer 1 was not acknowledged (last acknowledged: 0)`); `tt-smi -r 0000:01:00.0
+  0000:02:00.0` and it passed on both cards, with the same build. A mesh gate that fails like that after tt-metal has touched the
+  cards is link state: reset both boards before suspecting the code.
 - **Fence the cards:** `TT_VISIBLE_DEVICES=<PCIe device number>` restricts UMD to that card, so tt-metal's cluster start (which
   touches every card it can see) cannot disturb a job on the other one.
 - **First import is slow:** `import ttnn` took about three minutes cold (the libraries come off disk); a C++ program linked against

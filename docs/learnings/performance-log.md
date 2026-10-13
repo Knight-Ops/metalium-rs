@@ -384,6 +384,13 @@ capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
   safe build's plain entry unchanged (362 / 359 / 360 against 362 / 362 / 361 before at N = 64 / 256 / 448). `dm_b`: safe 24,400
   bytes, fast 24,924, fast + guard 25,092; `dm_nc` 14,252.
 
+**End-to-end, after phases 0-3 and 7 (card 0, release, runs `1791930590` safe, `1791931447` `--feature fast-reads`).** The smoke
+selection, one card, one boot each: safe 606 of 607 pass, fast 611 of 612 (the five extra are step173 and the new step172 gates); the one
+failure in both is the two-card Ethernet gate `step76 bf16_mesh_product`, which needs both cards and the Ethernet link in a known
+state: it failed on `--device all` too, and passed on both cards after `tt-smi -r` of both boards
+([silicon-operating-notes](silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)), so it is link state
+and not the movers. Neither build refused a list.
+
 **Containment (plan phase 7, 2026-10-13; both modes, host only).** `DataMover::check_as` now requires every read's or write's L1
 range, top-level, encoded or expanded from a record, to lie in the data arena (`tt_isa::l1::DATA`, `0x2_0000` to the mailbox
 base): a list cannot be aimed at the mover's key, its list ring, its mailbox or its image, which neither mode's card-side
