@@ -14,8 +14,11 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: three pretrained networks run on a card, slowly.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2.
-  They are 105x, 7.8x and 25x behind burn-flex per forward pass, and a token embedding alone costs 15.9 s
+  They are 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)).
+  A token's F32 embedding lookup, 15.9 s then, is 260 us since the row select
+  ([log](../learnings/performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0));
+  BF16 tables still take the staged path.
   The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
 - **Performance: behind the CPU unless traced.** Untraced training is 2–3× slower than
   burn-flex ([scoreboard](../learnings/performance-scoreboard.md)); the cost is host-side
@@ -331,8 +334,25 @@ and so the order to work in.** Against burn-flex on the same machine: ResNet-18 
 each, and the cheapest wins; ViT and decode are host submission, the fusers' territory. The `.ttinsn` trigger (SFPU
 push above ~20% of device time with the model device-bound) has not fired: no model is device-bound yet.
 
-- [ ] **1. Gather without staging, now measured (15.9 s a token).** See the item below: this alone makes a decoded
-  token 14 s and the simulator lane of every language-model gate unaffordable.
+- [x] **1. Gather without staging** (2026-10-13, F32, I32 and Bool; ttsim and card 0). `select` along dim 0 of a
+  rank-2 table with 1-D I32 indices runs `Session::select_rows` (`tt-kernels/src/index.rs`): per batch one tile of 32
+  resident indices is read and B's new `SELECT_ROWS` record (`tt-isa/src/dm/record.rs`) turns each into the table's
+  two 64-byte face-row reads a tile column, the source tile found on the card, so a lookup reads the rows it returns and
+  builds no host address (`select_native` routes to it, `ops.rs` `select_rows_native`; `embedding` reaches it, asserted by the
+  gate; `gather_nd` also calls `select_native` and its gate, `step127`, still passes, but which path it takes is not asserted). Gate `step171_select_rows` (10 tests; card 0 run `1791851883`): bit for bit the host indexing
+  (signed zeros, subnormals, NaN payloads, infinities, `f32::MAX`; I32; Bool; ragged `n` and widths; a table of 25 tile
+  columns, past one batch; a view starting mid-grid), `DOMAIN` for an index at the row count or negative, residency and
+  padding chains, and a **trace replay with changed indices**; four mutations of the record (halves swapped, source row
+  mod 31, `bound` one too large, output row off by one) each fail it, and the record's unit tests hold the addresses to
+  the face layout independently. **Measured, card 0, release:** one token from SmolLM2's 49,152 x 576 table
+  **260 us, was 15.9 s** (five tokens 278 us, was 63.3 s; `probe_embedding_cost`, `1791851940`, validated against the host's
+  rows); `step167_smollm2` F32, 30 layers, **33 s, was 575 s** (`1791851959`); a decode step from a token id 623 ms with
+  the lookup about 1.4 ms of it (`1791852097`): a decoded token is the host-bound 24x of item 3 again. Burn's own
+  select, gather, embedding and index tests: 200 of 200 on ttsim, plain and under `Fusion<TtBackend>`, `--strict`.
+  **Left:** BF16, F16 and BFP tables, rank 3 and up, other dims and `gather` with per-element indices still stage
+  (item 5 and the entry below). Cost to know: the mover image has 172 bytes left of its 24 KiB
+  ([operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-has-little-room-left-2026-10-13-ttsim-and-card-0));
+  also found: `cargo clippy` inflated every firmware image by 900 bytes (`build.rs` now strips `RUSTC_WORKSPACE_WRAPPER`).
 - [ ] **2. Chunk-free convolution and pooling (ResNet-18: 16.3 s, 105x).** Convolution issues one `float_matmul`
   per 32 output positions, each with a host-built patch gather (`ops/conv.rs:5,181-192`: a 56x56 convolution is 98
   matmuls, conv1 392); max pool splits its windows into chunks of 32, each a host-built `repack`, argmax and gather
@@ -349,14 +369,16 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   item 3 at a smaller scale, so it moves with the fusers (B13b/B13c/reduce-norm below) and with traces. Layer norm is
   composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a pass), GELU and attention are native.
   Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
-- [ ] **5. BF16 lookup 2.7x slower than F32's.** A BF16 decoded token costs 37.5 s against F32's 14 s (six layers,
-  `1791848957`); `gather_indexed_bf16` is the path. Fixed by item 1 if the new read is dtype-generic; measure BF16
-  separately afterwards.
+- [ ] **5. BF16 lookup (open; the row select does not take it).** `step167` BF16 (six layers) takes 229 s on card 0 (run
+  `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
+  BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the
+  half) and the other options are in the
+  [operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-has-little-room-left-2026-10-13-ttsim-and-card-0).
 - [ ] **6. Traced execution of the three models.** Not measured: a decode step is the host cost a trace removes, but
   trace segmentation (next item) is open and a forward this size does not fit the 240 KB program cache. Record
   traced against untraced rows for ResNet-18, ViT-Tiny and a decode step once segmentation lands.
-- [ ] **7. Put SmolLM2 back in `SMOKE`.** `step167` and `step168` are out of the smoke tier (a token costs 14-37 s);
-  restore them, with the six-layer BF16 gate, once item 1 lands (`xtask/src/silicon.rs`, `SMOKE`).
+- [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
+  card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).
@@ -380,18 +402,13 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   columns) cut taps per output from 16/36 to 4/6 and the staged addresses with them, at the cost of
   Flex's single-sum term order for bicubic and Lanczos3 (both already bound-checked, not bit-exact).
   Chunk the gather over planes. Measure on a real model before building it.
-- [ ] **Gather without staging.** `gather_native` stages every row of its table for every element it returns
-  (`select`, `gather`, `embedding` and `deform_conv2d` all go through it), so a lookup costs
-  `elements x table rows` host addresses. **Measured on a real vocabulary (2026-10-12): an embedding of one token
-  from SmolLM2's 49,152 x 576 table takes 15.9 s, five take 63.3 s (`probe_embedding_cost`, `1791845218`)**, which is
-  576 x 49,152 = 28.3 million host-built addresses a token, and is the whole of a decoded token's cost (14 s;
-  `step167_smollm2`). It is not refused, because the 2^24 limit is `deform_conv2d`'s. `select_native` expands the
-  indices to the output's shape and calls `gather_native`; the primitive underneath (`Session::gather_indexed`) reads
-  from a matrix of at most 32 rows, which is why the host builds a candidate row per element. Candidates for the fix:
-  hold the table transposed and read 32-row windows of the resident buffer as views, so a token is 18 index-driven
-  jobs and no host addresses; or a row-select kernel on B (it reads the index, computes the NoC address and copies
-  the row). Either needs the new-op gates (an independent oracle, a negative control, silicon on one card). Until
-  then SmolLM2's gates are out of `SMOKE` (`step167`, `step168`).
+- [ ] **Gather without staging, what is left** (the dim-0 F32/I32/Bool lookup is done: item 1). `gather_native` still stages
+  every row of its table for every element it returns, for: packed tables (BF16, F16, BFP: item 5), rank 3 and up
+  (`select` of a `[V, a, b]` table: an index would yield `a` rows, which do not line up with 32-row output tiles; a
+  `[V*a, b]` select with the index expanded by the host is the cheap fix), `select` along other dims, `gather` with
+  per-element indices (`float_gather`, `nd_flat_rows`'s metadata, `scatter_add_native`'s domain check, `deform_conv2d`'s
+  four corner gathers: the 2^24-address refusal there is unchanged), and a `[1, n]` index layout is the only one
+  `SELECT_ROWS` reads (a column of indices would be a flag). Each needs the new-op gates.
 - [ ] **B7** batched readback (`download_many`, batched `tr_execute`). (The `Backend::sync` barrier of B8 is
   done with B1.)
 - [ ] **X7** small-transfer latency; 9.14 per-request cost (note X6 found the fast

@@ -67,12 +67,44 @@ pub const WRITE_RUN: u32 = 0x16;
 /// tile `first..first + count`, as [`FILL_PAD`] numbers them, goes from its
 /// slot at `stage` (the reader filled it) back to its place in `A`.
 pub const PAD_WRITE: u32 = 0x17;
+/// Whole rows of a table, chosen by indices already in L1, GDDR -> L1:
+/// `[SELECT_ROWS, idx_at, count, bound, j0, cols, stage_at, flags]` + `X`.
+/// The slot at `idx_at` holds one tile of I32 indices, in tile row 0 (a
+/// `[1, n]` index tensor's tile): index `r` is the datum at `(0, r)`. For each
+/// of the first `count` (1..=32) indices `v`, row `v` of `X` (a table of
+/// `bound` rows) goes to row `r` of the output tile, for tile columns
+/// `j0..j0 + cols` of `X`, into the slot `j - j0` from `stage_at` -- two
+/// 64-byte face-row reads a tile column, as `tensor::gather_rows` makes them,
+/// except that the source tile is found here, from the index the card holds.
+/// The mover refuses an index at or past `bound` ([`super::error::DOMAIN`])
+/// before it issues a read, the contract of [`op::INDEX_PICK`] (which reads
+/// the index as `u32`, so a negative one is refused too). Rows `count..32` of
+/// each output tile are left as the slot held them.
+///
+/// `flags` is `0`: 32-bit datums (F32, I32, Bool). **Packed BF16 is not
+/// implemented.** Its face-rows are 32 bytes, congruent to `TILE_DATA` mod 64
+/// only on an even row, so a read must take the pair a row is half of and the
+/// wanted half be moved; that code, in this record, measured 400 bytes more
+/// in RISCV B's image, which has 172 of its 24 KiB left (a mover image may
+/// not pass `IMAGE_MAX`). `docs/plans/roadmap.md`, "Gather without staging",
+/// has the options.
+///
+/// The slots are not checked against the data arena here (the mover's image has
+/// no room for it; `tt_kernels::index::select_rows_jobs` places them from its
+/// plan and refuses any outside it); each read's L1 range is checked as any
+/// read's is.
+///
+/// The one record whose expansion depends on L1 data: the reader the caller
+/// gives [`expand_reads`] says what an index word holds. The host's
+/// [`expand`] has no L1, reads every index as `0` and so checks the record's
+/// geometry (alignment, range) and nothing about the indices.
+pub const SELECT_ROWS: u32 = 0x18;
 
 /// Does a record's expansion read GDDR (so B runs it) or write it (so NC
 /// does)? `None` for a plain entry.
 pub const fn direction(op: u32) -> Option<Direction> {
     match op {
-        GATHER | READ_RUN | FILL_PAD => Some(Direction::Read),
+        GATHER | READ_RUN | FILL_PAD | SELECT_ROWS => Some(Direction::Read),
         SCATTER | WRITE_RUN | PAD_WRITE => Some(Direction::Write),
         _ => None,
     }
@@ -95,7 +127,7 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 pub const fn len(op: u32) -> usize {
     match op {
         GATHER => 5,
-        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN => 3,
+        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN | SELECT_ROWS => 3,
         _ => 1,
     }
 }
@@ -231,18 +263,24 @@ fn extent(v: u32) -> Result<u32, u32> {
 /// The entries are what `tt_kernels::tensor`'s list builders produced before
 /// records existed, with an [`op::WAIT`] wherever one of their lists ended
 /// inside a job: exactly the list the session used to send.
+///
+/// The host's expansion, for validation: it has no L1, so a [`SELECT_ROWS`]
+/// index reads as `0` (see there).
 pub fn expand(rec: &[[u32; 8]], emit: impl FnMut([u32; 8]) -> Result<(), u32>) -> Result<(), u32> {
-    expand_for::<true, true>(rec, emit)
+    expand_for::<true, true>(rec, &mut |_| 0, emit)
 }
 
 /// [`expand`] of the reading records only ([`Direction::Read`]): what RISCV
 /// B's firmware calls, so the writing records' code is not in its image. A
-/// writing record is [`super::error::DIRECTION`].
+/// writing record is [`super::error::DIRECTION`]. `index` reads the L1 word
+/// at an address, for [`SELECT_ROWS`]; the caller has made the indices
+/// visible (waited for the reads that fetched them) before it calls.
 pub fn expand_reads(
     rec: &[[u32; 8]],
+    mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<true, false>(rec, emit)
+    expand_for::<true, false>(rec, &mut index, emit)
 }
 
 /// [`expand`] of the writing records only: what RISCV NC's firmware calls.
@@ -250,12 +288,13 @@ pub fn expand_writes(
     rec: &[[u32; 8]],
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<false, true>(rec, emit)
+    expand_for::<false, true>(rec, &mut |_| 0, emit)
 }
 
 #[inline(always)]
 fn expand_for<const READS: bool, const WRITES: bool>(
     rec: &[[u32; 8]],
+    index: &mut impl FnMut(u32) -> u32,
     mut emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
     let h = rec[0];
@@ -476,6 +515,59 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 })?;
             }
         }
+        SELECT_ROWS => {
+            let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
+            if flags != 0 {
+                // Packed BF16 is not implemented.
+                return Err(super::error::RANGE);
+            }
+            if count == 0 || count > 32 || bound == 0 || bound > i32::MAX as u32 {
+                return Err(super::error::LENGTH);
+            }
+            let cols = extent(cols)?;
+            let table = tensor(rec, 1)?;
+            // Every tile number a checked index can name fits a `u32` (the
+            // cursor adds without checking: an index comes from L1).
+            let tiles = bound
+                .div_ceil(32)
+                .checked_mul(table.ct)
+                .and_then(|t| t.checked_add(table.first));
+            if table.ct == 0
+                || tiles.is_none()
+                || j0.checked_add(cols).is_none_or(|end| end > table.ct)
+            {
+                return Err(super::error::RANGE);
+            }
+            // Every index is read, and checked, before any read is issued; each
+            // is read again where it is used, which keeps the mover's image
+            // (its 24 KiB are nearly all spoken for) free of a copy of them.
+            // 32-bit arithmetic throughout: on this core a `u64` costs
+            // instructions at every step.
+            const DATA: u32 = TILE_DATA as u32;
+            let word = |r: u32| idx_at + DATA + (r / 16 * 256 + r % 16) * 4;
+            for r in 0..count {
+                if index(word(r)) >= bound {
+                    return Err(super::error::DOMAIN);
+                }
+            }
+            // A tile row's face-row `h` of row `r`: two 64-byte reads a row a
+            // tile column, each congruent to `TILE_DATA` mod 64 in every slot.
+            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
+            let mut port = 0;
+            for r in 0..count {
+                let v = index(word(r));
+                let mut row = table.cursor(v / 32, j0)?;
+                for j in 0..cols {
+                    let (ch, off) = row.next()?;
+                    for half in 0..core::hint::black_box(2) {
+                        let from = off + face_row(v % 32, half);
+                        let to = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
+                        emit([op::READ, ch, port, from, to, 64, 0, 0])?;
+                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                    }
+                }
+            }
+        }
         FILL_PAD => pad::<false>(rec, &mut emit)?,
         PAD_WRITE => pad::<true>(rec, &mut emit)?,
         _ => return Err(super::error::OP),
@@ -554,10 +646,14 @@ mod tests {
         b0[5] = 35;
         let head = [GATHER, GATHER_BF16 | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
         let mut got = Vec::new();
-        expand_reads(&[head, a0, a1, b0, b1], |e| {
-            got.push(e);
-            Ok(())
-        })
+        expand_reads(
+            &[head, a0, a1, b0, b1],
+            |_| 0,
+            |e| {
+                got.push(e);
+                Ok(())
+            },
+        )
         .unwrap();
         let mut next = 0;
         for (x, height, width, nr, nc, at) in
@@ -608,9 +704,9 @@ mod tests {
         assert_eq!(next, got.len());
         let mut bad = head;
         bad[1] |= 1; // A BF16 transpose cannot enter the F32 mover transform.
-        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| Ok(())).is_err());
+        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
         a0[5] = 32; // Descriptor dimensions must agree with its grid.
-        assert!(expand_reads(&[head, a0, a1, b0, b1], |_| Ok(())).is_err());
+        assert!(expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
         assert!(expand_writes(&[head, a0, a1, b0, b1], |_| Ok(())).is_err());
     }
 
@@ -708,6 +804,154 @@ mod tests {
                 "flags {flags}"
             );
         }
+    }
+
+    const IDX: u32 = 0x2_0000;
+    const STAGE: u32 = 0x4_0000;
+
+    /// An L1 holding `values` as the index tile at `IDX`: the reader a record
+    /// is expanded with, which refuses any address but an index word's.
+    fn l1_of(values: &[u32]) -> impl FnMut(u32) -> u32 {
+        let mut words = std::collections::HashMap::new();
+        for (r, &v) in values.iter().enumerate() {
+            words.insert(IDX + 16 + crate::dm::face_index(0, r) as u32 * 4, v);
+        }
+        move |at| *words.get(&at).unwrap_or_else(|| panic!("read of {at:#x}"))
+    }
+
+    /// A `SELECT_ROWS` of `count` indices from `bound` rows, tile columns
+    /// `j0..j0 + cols` of `table`.
+    fn select(table: TensorRef, bound: u32, count: u32, j0: u32, cols: u32) -> [[u32; 8]; 3] {
+        let [m0, m1] = table.encode();
+        [[SELECT_ROWS, IDX, count, bound, j0, cols, STAGE, 0], m0, m1]
+    }
+
+    /// Each index's two face-rows of every tile column are read to the output
+    /// row's, from the tile `TensorRef::tile` names, in an order and by an
+    /// offset the face layout (`face_index`) gives independently of `expand`'s
+    /// own arithmetic -- across a channel wrap mid-row, a view that starts
+    /// mid-grid, the first and last rows, and a row either side of a tile.
+    #[test]
+    fn select_rows_reads_the_face_rows_of_each_index() {
+        let mut table = t(3, 5);
+        table.first = 2;
+        let bound = 100; // four tile rows, the last ragged
+        let values = [
+            0u32, 99, 31, 32, 33, 5, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 5, 6,
+        ];
+        let (j0, cols) = (1u32, 3u32);
+        let rec = select(table, bound, values.len() as u32, j0, cols);
+        let mut got = Vec::new();
+        expand_reads(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let mut want = Vec::new();
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = table.tile(v / 32, j0 + j).unwrap();
+                for h in 0..2usize {
+                    let from = off as u64
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index((v % 32) as usize, 16 * h) as u64;
+                    let to = STAGE as u64
+                        + j as u64 * TILE_SLOT
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index(r, 16 * h) as u64;
+                    let n = want.len() as u32;
+                    want.push([op::READ, ch, n % PORTS, from as u32, to as u32, 64, 0, 0]);
+                }
+            }
+        }
+        assert_eq!(got, want);
+        // What a GDDR read needs (`Descriptor::decode`): source and
+        // destination congruent mod 64, whichever row either is.
+        for e in &got {
+            assert_eq!(e[3] % 64, e[4] % 64);
+        }
+        assert_eq!(got.len(), values.len() * cols as usize * 2);
+    }
+
+    /// An index at or past `bound`, or a negative one, is `DOMAIN` before a
+    /// single read is issued -- whichever position it is in -- and the last
+    /// row is the last that passes. The host's `expand` reads every index as 0
+    /// and still checks the geometry.
+    #[test]
+    fn select_rows_refuses_an_index_out_of_range_before_any_read() {
+        let table = t(4, 3);
+        for (values, ok) in [
+            ([0u32, 99, 5], true),
+            ([0, 100, 5], false),
+            ([0, 1, 100], false),
+            ([u32::MAX, 1, 2], false),
+            ([1, 2, 0x8000_0000], false),
+        ] {
+            let rec = select(table, 100, values.len() as u32, 0, 3);
+            let mut issued = 0;
+            let got = expand_reads(&rec, l1_of(&values), |_| {
+                issued += 1;
+                Ok(())
+            });
+            if ok {
+                assert_eq!((got, issued), (Ok(()), 3 * 3 * 2), "{values:?}");
+            } else {
+                assert_eq!(
+                    (got, issued),
+                    (Err(crate::dm::error::DOMAIN), 0),
+                    "{values:?}"
+                );
+            }
+        }
+        let rec = select(table, 100, 4, 0, 3);
+        let mut issued = 0;
+        expand(&rec, |_| {
+            issued += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(issued, 4 * 3 * 2);
+    }
+
+    #[test]
+    fn select_rows_refuses_what_it_should() {
+        use crate::dm::error::{DIRECTION, LENGTH, RANGE};
+        let table = t(3, 4);
+        let ok = select(table, 64, 3, 1, 3);
+        let run = |rec: &[[u32; 8]]| expand_reads(rec, |_| 0, |_| Ok(()));
+        assert_eq!(run(&ok), Ok(()));
+        // The writer's code does not hold it.
+        assert_eq!(expand_writes(&ok, |_| Ok(())), Err(DIRECTION));
+        assert_eq!(direction(SELECT_ROWS), Some(Direction::Read));
+        assert_eq!(len(SELECT_ROWS), 3);
+        for (word, value, want) in [
+            (2, 0, LENGTH),       // no indices
+            (2, 33, LENGTH),      // more than a tile of them
+            (3, 0, LENGTH),       // no rows
+            (3, 1 << 31, LENGTH), // more than an I32 names
+            (5, 0, LENGTH),       // no tile columns
+            (4, 2, RANGE),        // columns 2..5 of 4
+            (5, 4, RANGE),        // columns 1..5 of 4
+            (7, 1, RANGE),        // packed BF16 is not implemented
+            (7, 2, RANGE),        // an unknown flag
+        ] {
+            let mut bad = ok;
+            bad[0][word] = value;
+            assert_eq!(run(&bad), Err(want), "word {word} = {value:#x}");
+        }
+        // A table so tall and wide that a tile number could pass a `u32`.
+        let wide = TensorRef {
+            ct: 1 << 16,
+            ..t(3, 1)
+        };
+        let mut huge = select(wide, i32::MAX as u32, 3, 0, 3);
+        assert_eq!(run(&huge), Err(RANGE));
+        huge[0][3] = 1 << 10; // 32 tile rows of 65,536 tiles do fit
+        assert_eq!(run(&huge), Ok(()));
+        // No table: its channel count is zero.
+        let mut none = ok;
+        none[1][0] = 0;
+        assert_eq!(run(&none), Err(RANGE));
     }
 
     fn t(n: u8, ct: u32) -> TensorRef {

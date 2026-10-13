@@ -195,8 +195,12 @@ pub const SMOKE: &[&str] = &[
     "autodiff_bf16::base::matmul::",
     "step164_grid_sample_bf16::",
     // The model ladder (`crates/tt-models`): pretrained weights, so `silicon` implies the `weights`
-    // feature. SmolLM2 (step167, step168) is not here: one embedding lookup costs 15 s a token until the
-    // gather stops staging its table (roadmap, "Gather without staging").
+    // feature. SmolLM2 in F32 (33 s) and the mixed-precision plans (about 3 minutes) are here since the row
+    // select (`step171`) took the embedding lookup from 15 s a token to 0.3 ms; the BF16 gate (229 s) is not,
+    // as the BF16 lookup still stages its table (roadmap, "Gather without staging").
+    "step171_select_rows::",
+    "step167_smollm2::smollm2_in_f32",
+    "step168_smollm2_mixed_precision::",
     "step165_resnet18::",
     "step166_vit_tiny::",
     "step170_checkpoint_round_trip::",

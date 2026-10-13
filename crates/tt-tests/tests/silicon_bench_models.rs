@@ -8,9 +8,11 @@
 //! convolution and pooling submit many more than they report). Outputs are validated outside the timing
 //! (the same finite logits and the same top-1 as burn-flex).
 //!
-//! `smollm2_decode_without_the_embedding_lookup` feeds the model a precomputed embedding row: the
-//! lookup itself costs 15 s a token (`probe_embedding_cost`), and the point is to see what the
-//! other three thousand operations of a decoded token cost.
+//! `smollm2_decode_without_the_embedding_lookup` feeds the model a precomputed embedding row. The
+//! lookup cost 15 s a token when it was measured (`probe_embedding_cost`, 2026-10-12: `select`
+//! staged the whole table for every element), and the point was to see what the other three
+//! thousand operations of a decoded token cost. `smollm2_decode_with_the_embedding_lookup` is the
+//! whole step from a token id, which the row select (`step171_select_rows`) made affordable.
 //!
 //! Silicon only, `#[ignore]`d (run with `cargo xtask bench --filter silicon_bench_models`), and
 //! independent of each other, so two can run at once on two cards.
@@ -221,6 +223,50 @@ fn smollm2_decode_without_the_embedding_lookup() {
                     .unwrap()
             },
         );
+        assert!(got.iter().all(|v| v.is_finite()));
+    });
+}
+
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_decode_with_the_embedding_lookup() {
+    use burn::tensor::Int;
+    // A whole decode step from a token id: the lookup, the thirty layers and the output head.
+    let ids = |data: Vec<i32>| TensorData::new(data, [1, 1]);
+    {
+        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let mut cache = m.cache(64, DType::F32, &FlexDevice);
+        let mut step = 0usize;
+        baseline("smollm2-135m decode step from a token id", || {
+            let t = Tensor::<Flex, 2, Int>::from_data(ids(vec![7042]), &FlexDevice);
+            step += 1;
+            if step > 60 {
+                cache = m.cache(64, DType::F32, &FlexDevice);
+                step = 1;
+            }
+            m.forward(t, &mut cache, DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        });
+    }
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let mut cache = m.cache(64, DType::F32, &d);
+        let mut step = 0usize;
+        let got = measure("smollm2-135m decode step from a token id", || {
+            let t = Tensor::<TtBackend, 2, Int>::from_data(ids(vec![7042]), &d);
+            step += 1;
+            if step > 60 {
+                cache = m.cache(64, DType::F32, &d);
+                step = 1;
+            }
+            m.forward(t, &mut cache, DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        });
         assert!(got.iter().all(|v| v.is_finite()));
     });
 }

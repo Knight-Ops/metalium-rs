@@ -936,6 +936,55 @@ to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x
 faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
 matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
+## RISCV B's image has little room left (2026-10-13, ttsim and card 0)
+
+RISCV B's mover image (`dm_b`) may not pass `tt_isa::dm::IMAGE_MAX`, 0x6000 = 24,576 bytes: T0's default
+reset PC is where the next image starts, and B (entry hardwired at 0) has no reset-PC override. The link fails
+("section '.text' will not fit in region 'L1'") rather than clobbering T0. Measured with `size -A` on the ELF
+(`.text` + `.rodata` + `.bss`; git `e17f4c9` plus the row select):
+
+| Image | Bytes | Left |
+|---|--:|--:|
+| `dm_b` before `SELECT_ROWS` | 23,644 | 932 |
+| with `SELECT_ROWS` (32-bit datums), first build | 24,532 | 44 |
+| the same arm with the half-loop kept rolled (`black_box`), as built | 24,404 | 172 |
+
+Packed BF16, measured against the first build (24,532): a branch that reads the 64-byte pair into a scratch
+slot and then runs `COPY_HALFWORDS` of the wanted half linked at 24,932 (**356 over**; a second emit site in
+the loop instead of one made it 684 over), and the pair read alone, with no copy, at 24,600 (**24 over**).
+These were not re-measured after the rolled loop saved 108 bytes, so the pair read alone should now fit.
+
+What the numbers taught (each from a build, not from reading code):
+- **One record arm cost 760 bytes.** On rv32im every `u64` add or multiply is several instructions: a checked
+  `u64` tile-number computation in `Cursor::new` cost 164 bytes on its own, so the record checks the product
+  once (`bound.div_ceil(32) x ct`) and the cursor adds in `u32`.
+- **LLVM unrolled the two-iteration loop over a face-row's halves** and duplicated the emit and address code:
+  `for half in 0..core::hint::black_box(2)` kept it a loop and saved 108 bytes. Look for this before cutting a
+  check.
+- **Sizes move by tens of bytes with unrelated changes** (inlining decisions shift): one build of the same arm
+  was 8 bytes worse after a change that removed code. Measure each candidate; do not add the estimates.
+- **`cargo clippy` made every image about 900 bytes larger** (`dm_b` 24,540 against 23,644 for the same
+  source): `tt-firmware-images/build.rs` stripped `RUSTC_WRAPPER` from the nested firmware `cargo` but not
+  `RUSTC_WORKSPACE_WRAPPER`, which clippy sets to `clippy-driver`. A change that fit a build overflowed the
+  CI lint. It strips both now, so the firmware is the same bytes whoever builds it; firmware is linted on its own
+  (`cargo clippy --manifest-path crates/tt-firmware/Cargo.toml ...`).
+- RISCV NC's image (`dm_nc`, 14,240 bytes of the same 24,576) has about 10 KB free.
+
+**Open: a packed-BF16 row select** (roadmap, Track 2, "Gather without staging"). A BF16 face-row is 32 bytes at
+`TILE_DATA + face x 512 + row x 32`: congruent to `TILE_DATA` mod 64 (the GDDR read rule) only on an even row,
+and a read's L1 destination must be congruent to its source, so a wanted row of one parity cannot be read
+straight into an output row of the other. Every arrangement that lands the wanted row at one fixed L1 place
+fails the same congruence for one of the two source parities. The candidates:
+1. The B-side branch above: 400 bytes at the time it was measured, more than B had.
+2. **Split it.** B reads the 64-byte pair containing the wanted row into a staged tile (a stride and a mask on the
+   F32 arm: about 70 bytes on B, which fits) and NC, which has the room, writes the 32 bytes at `pair + 32 x
+   (index & 1)` to the output tile's face-row (a write needs only 16-byte congruence). That needs a writing
+   record that reads the index tile, so each half of the staging needs its own index slot (B reads the next
+   batch's indices while NC still writes the last), and the output's rows past `n` are not written, so its padding
+   is `Undefined`.
+3. Make room in B: the unrolled `copy16`s of `tile_layout` (a cold path, 1.7 KB) are the obvious candidate and
+   want a silicon measurement of upload time before and after.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

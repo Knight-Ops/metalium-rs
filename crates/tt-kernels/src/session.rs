@@ -4137,6 +4137,37 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Rows of `table` chosen by `indices`, a resident `[1, n]` I32 tensor:
+    /// `out[i] = table[indices[i]]`, bit for bit, with no host address
+    /// ([`crate::index::select_rows_jobs`]). An index outside `0..table.rows`
+    /// is `DOMAIN` from the mover, queued as any list's error. The padding is
+    /// zero where the table's is: the rows past `n` are filled with zero.
+    pub fn select_rows(
+        &mut self,
+        table: &DramTensor,
+        indices: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let out = DramTensor::alloc_elem(
+            &mut self.dram_state()?.alloc,
+            indices.cols,
+            table.cols,
+            table.elem,
+        )?;
+        let result = crate::index::select_rows_jobs(table, indices, &out, units)
+            .and_then(|jobs| self.submit_jobs(jobs, RESET_BUDGET));
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        out.set_pad(if table.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
+    }
+
     pub fn gather_indexed_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,

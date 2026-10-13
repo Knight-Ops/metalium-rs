@@ -252,6 +252,13 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    fn select_rows(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     fn repack_many(
         &mut self,
         _inputs: &[BufferId],
@@ -261,7 +268,9 @@ pub trait Engine {
         Err(unsupported())
     }
     /// Rows of `sources` gathered into a new buffer
-    /// (`Session::gather_rows`): an embedding's lookup.
+    /// (`Session::gather_rows`): rows a list the host built names (a matmul's
+    /// output, a broadcast, a pooling window). A lookup by indices the card
+    /// holds, an embedding's, is [`Engine::select_rows`].
     fn gather_rows(
         &mut self,
         _sources: &[BufferId],
@@ -1086,6 +1095,26 @@ impl DramBuffers {
                 .map_err(TtError::from)?;
             Ok(self.insert(out))
         }
+    }
+
+    /// `table`'s rows chosen by the resident `[1, n]` index tensor `indices`
+    /// ([`Session::select_rows`]): a 32-bit table only, a packed one refused.
+    pub fn select_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+            return Err(TtError::Device(
+                "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
+            ));
+        }
+        let indices = self.get(indices)?.clone();
+        let out = s
+            .select_rows(self.get(table)?, &indices)
+            .map_err(TtError::from)?;
+        Ok(self.insert(out))
     }
 
     pub fn repack_many<T: tt_device::Transport>(
@@ -2594,6 +2623,23 @@ pub(crate) fn gather_indexed(
     )
 }
 
+/// `table`'s rows chosen by `indices` (a resident `[1, n]` I32 buffer): the
+/// result is `dims`, `[n, table columns]`.
+pub(crate) fn select_rows(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "select_rows",
+        device,
+        dims,
+        || "checked resident row select".into(),
+        move |engine, ids| engine.select_rows(ids.get(table)?, ids.get(indices)?),
+    )
+}
+
 pub(crate) fn repack_many(
     device: TtDevice,
     inputs: Vec<BufferId>,
@@ -2939,6 +2985,17 @@ impl Engine for KmdEngine {
             .as_mut()
             .ok_or_else(unsupported)?
             .gather_indexed(&mut self.session, input, indices)
+    }
+    fn select_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers.as_mut().ok_or_else(unsupported)?.select_rows(
+            &mut self.session,
+            table,
+            indices,
+        )
     }
     fn repack_many(
         &mut self,
@@ -3563,6 +3620,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .gather_indexed(self.fabric.chips[0].session(), input, indices)
+    }
+    fn select_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .select_rows(self.fabric.chips[0].session(), table, indices)
     }
     fn repack_many(
         &mut self,

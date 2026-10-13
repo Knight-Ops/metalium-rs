@@ -954,7 +954,14 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     if IS_NC {
         record::expand_writes(&rec[..n], |e| record_entry(me, usable, e))
     } else {
-        record::expand_reads(&rec[..n], |e| record_entry(me, usable, e))
+        if rec[0][0] == record::SELECT_ROWS {
+            // Its indices were read into L1 by entries before it: they have
+            // landed, and are visible to this core, before the first is read
+            // (as `INDEX_PICK`'s).
+            noc::wait(TXN);
+            publish();
+        }
+        record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e))
     }
 }
 

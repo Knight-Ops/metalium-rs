@@ -67,8 +67,17 @@ fn main() {
     }
     // A nested cargo inherits variables that redirect it back at the parent
     // workspace; strip them so the firmware build is genuinely independent.
+    // `RUSTC_WORKSPACE_WRAPPER` is `cargo clippy`'s `clippy-driver`: left in, the
+    // images of a clippy run came out about 900 bytes larger than a build's
+    // (`dm_b` 24,540 bytes against 23,644, of the 24,576 it may have), so a
+    // mover change that fit a build overflowed clippy. Firmware is linted on
+    // its own (`AGENTS.md`).
     for (key, _) in std::env::vars() {
-        if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" {
+        if key.starts_with("CARGO_")
+            || key == "RUSTFLAGS"
+            || key == "RUSTC_WRAPPER"
+            || key == "RUSTC_WORKSPACE_WRAPPER"
+        {
             cmd.env_remove(key);
         }
     }

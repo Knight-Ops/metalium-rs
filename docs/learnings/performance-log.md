@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
 | [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
 | [Accurate matmul cost](#accurate-matmul-cost-2026-10-12-card-0) | 2026-10-12 | opt-in F32-accuracy matmul on the Matrix Unit: 19x to 64x slower than the fast one; the element-wise work around the matmuls dominates |
 | [Exact matmul cost](#exact-matmul-cost-2026-10-11-card-0) | 2026-10-11 | opt-in F32 matmul 1,000x to 22,000x slower than the fast one; linear in products |
@@ -41,6 +42,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-13 | 1791851940 / 1791852097 | Row select (`Session::select_rows`, B's `SELECT_ROWS`): the embedding lookup of SmolLM2's 49,152 x 576 table, 15.9 s -> 260 us a token, validated against the host's rows; a decode step from a token id 623 ms; see "Row select" below. | Scoreboard rows updated in place. |
 | 2026-10-12 | 1791846735 / 1791846823 | Model ladder: ResNet-18, ViT-Tiny and SmolLM2-135M forward passes against burn-flex on the same weights, cards 0 and 1 (one job per card), validated; see "Model ladder" below. | New scoreboard rows. |
 | 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
 | 2026-10-11 | 1791761944 | Exact matmul (`MatmulMode::Exact`) against the fast Matrix Unit matmul, four shapes, card 0, validated; see "Exact matmul cost" below. | New scoreboard row. |
@@ -277,6 +279,51 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Row select: an embedding lookup without staging (2026-10-13, card 0)
+
+`select` along dimension 0 of a rank-2 F32, I32 or Bool table now runs `Session::select_rows`
+(`crates/tt-kernels/src/index.rs`; B's `SELECT_ROWS` record in `tt_isa::dm::record`): each batch reads
+one tile of 32 resident indices, and B turns each into two 64-byte face-row reads a tile column, finding the source
+tile on the card, so a lookup reads the rows it returns and builds no host address. Before, `gather_native`
+staged every row of the table for every element it returned (576 x 49,152 = 28.3 million host addresses a token).
+Gates: `step171_select_rows` (ttsim; card 0 run `1791851883`, 10 of 10), which compares with the host indexing bit
+for bit (specials, I32, Bool, views, ragged shapes), refuses an index outside the table with `DOMAIN`, and replays a
+trace with changed indices. Release build, git `e17f4c9` plus the change, card 0, nothing else on the card.
+
+### The lookup alone (`probe_embedding_cost`, run `1791851940`)
+
+A 49,152 x 576 table through Burn's own `Embedding`. A warm-up lookup, then seven timed, each of different rows, from
+host dispatch through the readback, and each validated bit for bit against the host's copy of the weights.
+
+| Lookup | Before (`1791845218`, 2026-10-12) | After: median of 7 (min to max) |
+|---|--:|--:|
+| 1 token | 15.9 s | 260.2 us (259.1 to 267.0) |
+| 5 tokens | 63.3 s | 278.1 us (273.0 to 371.8) |
+| 32 tokens | not measured | 343.7 us (338.0 to 352.1) |
+
+The first lookup of all, 404.5 us, is not a cold table upload: the probe had already downloaded the table
+(for the validation), which materialised it. Before, the cost was linear in tokens; now a token adds 3 to 5 us
+(4.5 us from 1 to 5 tokens, 2.7 us from 1 to 32) to the fixed cost of a dispatch and a readback.
+
+### SmolLM2-135M on card 0
+
+| | Before | After | Run |
+|---|--:|--:|---|
+| `step167_smollm2` F32, 30 layers, greedy 16 tokens, agrees with burn-flex | 575 s (`1791844568`) | 33.2 s | `1791851959` |
+| Decode step from a token id, median of 9 (p10 to p90) | about 14 s a token (`step167_smollm2`, 2026-10-12; the lookup alone was 15.9 s) | 623.1 ms (525.4 to 709.2), 2,781 reported ops | `1791852097` |
+| The same step, the lookup excluded | 619 ms (card 1, `1791846823`) | 621.7 ms (525.7 to 707.4), 2,779 reported ops | `1791852097` |
+| burn-flex, the same steps, same run | 25.0 ms | 26.4 ms from a token id, 26.2 ms without the lookup | `1791852097` |
+
+So the lookup is now about 1.4 ms of a 623 ms step, and a decoded token is back to what the roadmap's item 3 describes:
+about 24x burn-flex, host submission (2,781 operations at about 220 us each). The two decode numbers before and
+after come from different cards (1, then 0); the with-lookup and without-lookup rows of one run are the comparison.
+
+### What did not change
+
+BF16, F16 and BFP tables, tables of rank 3 and up, other dimensions, and `gather` with per-element indices still take
+the staged path (`gather_native`), and their gates pass unchanged on card 0 (run `1791852139`): `step167` BF16, six layers, 229 s (441 s in `1791848957`, a different load; the BF16 lookup was not touched), and all seven `step168` mixed-precision plans, 5 to 101 s each. The B image has no room for a packed-BF16 branch
+([silicon-operating-notes.md](silicon-operating-notes.md), "RISCV B's image has little room left").
 
 ## Model ladder: real models on the card (2026-10-12, cards 0 and 1)
 
