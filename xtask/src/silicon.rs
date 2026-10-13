@@ -357,8 +357,10 @@ usage: cargo xtask silicon [options]
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
   --timeout-secs N      per-test wall-clock limit (default 120)
-  --feature NAME        also build `tt-tests` with this feature (repeatable); only for
-                        opt-in experiments such as `ttinsn-experiment`, never a suite
+  --feature NAME        also build `tt-tests` with this feature (repeatable): the opt-in
+                        experiment `ttinsn-experiment`, or the B mover's read mode,
+                        `fast-reads` (host-encoded reads) or `encoded-guard` (and the card's
+                        guard); the default is the safe mode
   --release             build the suite optimised; every timing worth quoting
                         comes from this, since the dev build is not a baseline
   --list                print the selection and exit without touching a card";

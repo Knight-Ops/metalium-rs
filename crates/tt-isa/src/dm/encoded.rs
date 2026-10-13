@@ -41,6 +41,9 @@ pub const ENDPOINT_WORDS: usize = 128;
 const _: () = assert!(ENDPOINTS + ENDPOINT_WORDS as u64 * 4 <= MAILBOX_BASE + 0x1000);
 const _: () = assert!(ENDPOINTS >= MAILBOX_BASE + 0x100);
 
+// The target bound of `guard` (`MMIO_START`) is the channel's own extent, as `Descriptor::decode` checks it.
+const _: () = assert!(crate::dram::CHANNEL_BYTES == MMIO_START as u64);
+
 /// `PACKET_TAG` of B's reads: its transaction ID in bits 10..14.
 pub const TAG: u32 = (TXN_B as u32) << 10;
 /// `NOC_CTRL` of a read request, as `DramMove` makes it.
@@ -168,9 +171,11 @@ pub fn guard(e: &[u32; 8], me_hi: u32, endpoint_ok: impl FnOnce(u32) -> bool) ->
     // `len - 1 < MAX` is `1 <= len <= MAX`; `MMIO_START - len` wraps for a `len` the first
     // test has already refused.
     let room = MMIO_START.wrapping_sub(len);
+    // The destination is L1, which `Descriptor::decode` bounds by `L1_SIZE`, not by `MMIO_START` as `DramMove` does.
+    let l1_room = (crate::tensix::L1_SIZE as u32).wrapping_sub(len);
     (len.wrapping_sub(1) < MAX_REQUEST_BYTES)
         & (targ <= room)
-        & (ret <= room)
+        & (ret <= l1_room)
         & ((targ ^ ret) & (crate::dram::ALIGN as u32 - 1) == 0)
         & (ret_hi == me_hi)
         & (e[6] == 0)
@@ -406,6 +411,10 @@ mod tests {
             ("a harvested tile", forged(e, 2, endpoint_hi(0, 0))),
             ("an impossible coordinate", forged(e, 2, 0xFFFF_FFFF)),
             ("a reserved word set", forged(e, 6, 1)),
+            (
+                "destination past L1",
+                forged(e, 3, crate::tensix::L1_SIZE as u32 - 64 + 128),
+            ),
         ] {
             assert!(
                 !guard(&bad, me_hi, ok_bit(&bits)),
@@ -433,5 +442,264 @@ mod tests {
             assert!(set <= want, "{usable:#x}: {set} bits for {want} endpoints");
             assert!(set > 0);
         }
+    }
+}
+
+/// Differential property tests: the encoder against an independent assembly of the same request
+/// (`Command::Read`, which builds the NIU words by hand, not through `DramMove`), and the card's guard
+/// against the facts it promises. 100,000 cases by default; `TT_FUZZ_ITERS` sets the count and the
+/// `#[ignore]` tests run millions.
+#[cfg(test)]
+mod fuzz {
+    extern crate std;
+    use super::*;
+    use crate::dm::Mover;
+    use crate::noc::niu::Command;
+    use crate::tensix::L1_SIZE;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+
+    fn iters(default: u64) -> u64 {
+        std::env::var("TT_FUZZ_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    const CHANNEL: u32 = crate::dram::CHANNEL_BYTES as u32;
+    const MAX_REQ: u32 = MAX_REQUEST_BYTES;
+
+    /// A plain `READ` the mover might be sent: mostly well-formed, biased to the edges of every check.
+    fn plain_case(r: &mut Rng) -> (u32, (u8, u8), [u32; 8]) {
+        let (r_usable, r_len, r_off, r_page, r_l1, r_any, r_ch) = (
+            r.below(256) as u32,
+            r.below(40_000) as u32,
+            (r.below(1 << 18) as u32) * 64,
+            (r.below(20_000) as u32) * 64,
+            r.next() as u32 & 0x00FF_FFFF,
+            r.next() as u32,
+            r.below(12) as u32,
+        );
+        let usable = r.pick(&[0xFFu32, 0xFF, 0xFF, 0x0F, 0xF0, 0x81, r_usable]);
+        let me = (r.below(64) as u8, r.below(64) as u8);
+        let len = r.pick(&[
+            0,
+            1,
+            16,
+            63,
+            64,
+            65,
+            2048,
+            4096,
+            4160,
+            MAX_REQ - 64,
+            MAX_REQ - 1,
+            MAX_REQ,
+            MAX_REQ + 1,
+            MAX_REQ + 64,
+            r_len,
+        ]);
+        let off = r.pick(&[
+            0,
+            64,
+            r_off,
+            CHANNEL.wrapping_sub(len),
+            CHANNEL.wrapping_sub(len).wrapping_add(64),
+            CHANNEL - 64,
+            r_any,
+        ]);
+        let top = (L1_SIZE as u32).wrapping_sub(len) / 64 * 64 + off % 64;
+        let l1 = r.pick(&[
+            off % 64 + r_page,
+            off % 64,
+            top,
+            top.wrapping_add(64),
+            off % 64 + 16,
+            off.wrapping_add(16),
+            r_l1,
+        ]);
+        let ch = r.pick(&[0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, r_ch]);
+        let port = r.pick(&[0u32, 1, 2, 3]);
+        (usable, me, [op::READ, ch, port, off, l1, len, 0, 0])
+    }
+
+    /// What the safe mover's checks and an independent assembly of the request say about `e`.
+    /// `Err(code)` refused; `Ok(None)` more than one request; `Ok(Some(words))` the request.
+    fn oracle(usable: u32, me: (u8, u8), e: [u32; 8]) -> Result<Option<[u32; 7]>, u32> {
+        assert!(Mover::B.permits(op::READ));
+        let d = Descriptor::decode(usable, op::READ, e[1], e[2], e[3], e[4], e[5])?;
+        if d.range.len() > MAX_REQ as u64 {
+            return Ok(None);
+        }
+        let port = d.range.channel().port_for(Niu::Noc0, d.port);
+        let at = d
+            .range
+            .channel()
+            .endpoint(Niu::Noc0, port)
+            .ok_or(error::ALIGNMENT)?;
+        let from = Endpoint {
+            x: at.x(),
+            y: at.y(),
+            addr: d.range.offset() as u32,
+        };
+        let txn = TxnId::new(TXN_B).unwrap();
+        let regs = Command::Read {
+            from,
+            to_local: d.l1,
+            len: d.range.len() as u32,
+        }
+        .registers(me, txn, Niu::Noc0)
+        .map_err(|_| error::ALIGNMENT)?;
+        let v: [u32; 10] = core::array::from_fn(|i| regs[i].1);
+        // (TARG_LO, MID, TARG_HI, RET_LO, MID, RET_HI, TAG, CTRL, LEN, DATA)
+        assert_eq!((v[1], v[4], v[9]), (0, 0, 0));
+        Ok(Some([v[0], v[2], v[3], v[5], v[6], v[7], v[8]]))
+    }
+
+    #[test]
+    fn the_encoder_agrees_with_an_independent_assembly_of_the_request() {
+        let mut r = Rng(0xE1);
+        let (mut accepted, mut refused, mut long) = (0u64, 0u64, 0u64);
+        for _ in 0..iters(100_000) {
+            let (usable, me, e) = plain_case(&mut r);
+            let got = encode(usable, me, e);
+            match oracle(usable, me, e) {
+                Err(code) => {
+                    assert!(
+                        got.is_err(),
+                        "{usable:#x} {me:?} {e:x?}: the oracle refuses ({code}), encode accepts"
+                    );
+                    // The decoder's refusals keep their codes; a request-level refusal is `ALIGNMENT`.
+                    if Descriptor::decode(usable, op::READ, e[1], e[2], e[3], e[4], e[5]).is_err() {
+                        assert_eq!(got, Err(code), "{e:x?}");
+                    }
+                    refused += 1;
+                }
+                Ok(None) => {
+                    assert_eq!(got, Ok(None), "{usable:#x} {e:x?}");
+                    long += 1;
+                }
+                Ok(Some([targ, targ_hi, ret, ret_hi, tag, ctrl, len])) => {
+                    assert_eq!((tag, ctrl), (TAG, CTRL), "{e:x?}");
+                    let mut want = [op::READ_ENCODED, targ, targ_hi, ret, ret_hi, 0, 0, len];
+                    want[CHECK_WORD] = check(&want);
+                    assert_eq!(got, Ok(Some(want)), "{usable:#x} {me:?} {e:x?}");
+                    assert_eq!(
+                        validate(usable, me, want),
+                        Ok(()),
+                        "{usable:#x} {me:?} {want:x?}"
+                    );
+                    accepted += 1;
+                }
+            }
+        }
+        // The generator reaches all three outcomes.
+        assert!(
+            accepted > 100 && refused > 100 && long > 10,
+            "{accepted} {refused} {long}"
+        );
+    }
+
+    /// Entries that are encoder output with some words replaced and the checksum made good again,
+    /// or built from scratch: what a bug in `encode` or a forger would hand the card.
+    fn raw_case(r: &mut Rng) -> (u32, (u8, u8), [u32; 8]) {
+        let (usable, me, p) = plain_case(r);
+        let scratch = [
+            op::READ_ENCODED,
+            r.next() as u32,
+            r.below(1 << 13) as u32,
+            r.next() as u32,
+            r.below(1 << 13) as u32,
+            0,
+            0,
+            r.below(40_000) as u32,
+        ];
+        let mut e = match encode(usable, me, p) {
+            Ok(Some(e)) => e,
+            _ => scratch,
+        };
+        for _ in 0..r.below(3) {
+            let k = r.pick(&[1usize, 2, 3, 4, 6, 7]);
+            let (any, small) = (r.next() as u32, r.below(1 << 13) as u32);
+            let l1_end = (L1_SIZE as u32).wrapping_sub(e[7]);
+            e[k] = r.pick(&[
+                0,
+                any,
+                small,
+                e[k].wrapping_add(16),
+                e[k].wrapping_add(64),
+                l1_end,
+                l1_end.wrapping_add(64),
+                CHANNEL.wrapping_sub(e[7]),
+                endpoint_hi(me.0, me.1),
+            ]);
+        }
+        e[CHECK_WORD] = check(&e);
+        (usable, me, e)
+    }
+
+    #[test]
+    fn the_guard_promises_what_the_safe_decode_checks() {
+        let mut r = Rng(0x6A);
+        let (mut passed, mut valid) = (0u64, 0u64);
+        for _ in 0..iters(100_000) {
+            let (usable, me, e) = raw_case(&mut r);
+            let bits = endpoint_bitmap(usable);
+            let me_hi = endpoint_hi(me.0, me.1);
+            let ok = |hi: u32| bits[(hi / 32) as usize] >> (hi % 32) & 1 != 0;
+            let g = guard(&e, me_hi, ok);
+            if validate(usable, me, e).is_ok() {
+                valid += 1;
+                assert!(
+                    g,
+                    "validate accepts, the guard refuses: {usable:#x} {me:?} {e:x?}"
+                );
+            }
+            if g {
+                passed += 1;
+                let (targ, hi, ret, ret_hi, len) = (e[1], e[2], e[3], e[4], e[7]);
+                assert!((1..=MAX_REQ).contains(&len), "{e:x?}");
+                assert!(
+                    targ as u64 + len as u64 <= CHANNEL as u64,
+                    "target past the channel: {e:x?}"
+                );
+                assert!(
+                    ret as u64 + len as u64 <= L1_SIZE,
+                    "destination past L1: {usable:#x} {me:?} {e:x?}"
+                );
+                assert_eq!((targ ^ ret) & 63, 0, "{e:x?}");
+                assert_eq!(ret_hi, me_hi, "{e:x?}");
+                assert!(
+                    hi < 4096 && ok(hi),
+                    "target is not a usable endpoint: {e:x?}"
+                );
+                assert_eq!(e[6], 0, "{e:x?}");
+            }
+        }
+        assert!(passed > 100 && valid > 100, "{passed} {valid}");
+    }
+
+    #[test]
+    #[ignore = "millions of cases; TT_FUZZ_ITERS overrides"]
+    fn millions_of_cases() {
+        let n = iters(5_000_000);
+        std::env::set_var("TT_FUZZ_ITERS", std::format!("{n}"));
+        the_encoder_agrees_with_an_independent_assembly_of_the_request();
+        the_guard_promises_what_the_safe_decode_checks();
     }
 }

@@ -85,6 +85,15 @@ jobs:
       - name: Instruction set blacklist gate
         run: cargo check -p tt-firmware-images
 
+      # The B mover's other read modes (AGENTS.md, "Avoid hardware failures"): `fast-reads` runs host-encoded
+      # reads, `encoded-guard` adds the card's semantic guard. They are separate images, so they are linted
+      # and put through the instruction gate separately.
+      - name: Clippy (firmware, encoded-guard)
+        run: cargo clippy --manifest-path crates/tt-firmware/Cargo.toml --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings
+
+      - name: Instruction set blacklist gate (fast images)
+        run: cargo check -p tt-firmware-images --features encoded-guard
+
   lint-and-silicon:
     name: Lints & Silicon compilation
     runs-on: ubuntu-24.04
@@ -210,6 +219,14 @@ jobs:
       - name: Test (simulator smoke)
         run: cargo test -p tt-tests --test step1_harness --test step4_tensix --test step8_eltwise
 
+      # The B mover's three read modes, each against its own firmware image: the safe image refuses an
+      # encoded read, a fast one runs it, an encoded-guard one also guards it.
+      - name: Test (encoded reads - safe, fast, guard)
+        run: |
+          cargo test -p tt-tests --test step172_encoded_reads
+          cargo test -p tt-tests --features fast-reads --test step172_encoded_reads
+          cargo test -p tt-tests --features encoded-guard --test step172_encoded_reads
+
   simulator-full:
     name: Full simulator & E2E regression
     # Run on scheduled nightly, manual trigger, or push to main
@@ -265,6 +282,11 @@ jobs:
       # Full simulator gate suite across all 80+ steps
       - name: Test (simulator all)
         run: cargo test -p tt-tests
+
+      # The same suite against the fast read mode's firmware (host-encoded reads on every list that has a
+      # plain read): the nightly proof that turning it on changes no result.
+      - name: Test (simulator all, fast-reads)
+        run: cargo test -p tt-tests --features fast-reads
 
       # The end-to-end tier: Burn training on ttsim against the golden loss curve
       - name: Test (end-to-end)
