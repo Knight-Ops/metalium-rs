@@ -68,6 +68,21 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Exact matmul (opt-in `MatmulMode::Exact`), F32 `[256, 256] @ [256, 256]`, card 0, host | 8.19 s (about 0.5 us per product, 16 chunks; `1791761944`) | the fast Matrix Unit matmul: 376 us (22,000x); 64x32x64 1,000x, 1024x27x32 3,300x | cut the host-side table cost: a k-loop of broadcast multiply-adds (m + n addresses a step) instead of two `k x outputs` gathers; see roadmap Track 1 |
 | Requests that waited under the in-flight cap (120 tiles × 300 × 16 KiB, one channel) | 8762 per run | — | watch: revisit `MAX_IN_FLIGHT` if it binds below the NoC's own limit |
 
+### Model ladder: now against target
+
+Pretrained models, batch 1, F32, release, medians, burn-flex timed in the same run (`silicon_bench_models`; method and
+conditions in the [log](performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)). Update a
+row in place when its fix lands, add the run ID, and keep the old row in the log. Work items: roadmap Track 2, items 1-7.
+
+| Workload | burn-flex | Now (run) | Slowdown | Target | Roadmap item |
+|---|--:|--:|--:|---|---|
+| ResNet-18 forward, 224x224 (card 0) | 154.8 ms | 16,288 ms (`1791846735`) | 105x | at or below burn-flex | 2 |
+| ViT-Tiny forward, 224x224 (card 1) | 104.7 ms | 815 ms (`1791846823`) | 7.8x | at or below burn-flex | 4 |
+| SmolLM2-135M decode step, lookup excluded (card 1) | 25.0 ms | 619 ms (`1791846823`) | 24.8x | at or below burn-flex | 3 |
+| SmolLM2-135M embedding lookup, one token (card 0) | not measured | 15.9 s (`1791845218`) | n/a | milliseconds | 1 |
+| SmolLM2-135M BF16 decoded token, six layers, lookup included (card 0) | not measured | 37.5 s (`1791848957`) | n/a | no slower than F32 | 5 |
+| Traced rows for the three models | n/a | not measured | n/a | measure once segmentation lands | 6 |
+
 ### Where each row is evidenced
 
 | Scoreboard rows | Evidence in performance-log.md |

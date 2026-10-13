@@ -345,6 +345,18 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   halves), plus tens of thousands of reshapes, slices and `float_device` calls over 33 passes. A native `cat`, a
   fused RoPE and the fusers below shrink it; a trace would remove it, which needs trace segmentation. ViT-Tiny
   (709 operations at 1.1 ms) is the same cost at a smaller scale.
+- [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms: host submission, the same cost as
+  item 3 at a smaller scale, so it moves with the fusers (B13b/B13c/reduce-norm below) and with traces. Layer norm is
+  composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a pass), GELU and attention are native.
+  Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
+- [ ] **5. BF16 lookup 2.7x slower than F32's.** A BF16 decoded token costs 37.5 s against F32's 14 s (six layers,
+  `1791848957`); `gather_indexed_bf16` is the path. Fixed by item 1 if the new read is dtype-generic; measure BF16
+  separately afterwards.
+- [ ] **6. Traced execution of the three models.** Not measured: a decode step is the host cost a trace removes, but
+  trace segmentation (next item) is open and a forward this size does not fit the 240 KB program cache. Record
+  traced against untraced rows for ResNet-18, ViT-Tiny and a decode step once segmentation lands.
+- [ ] **7. Put SmolLM2 back in `SMOKE`.** `step167` and `step168` are out of the smoke tier (a token costs 14-37 s);
+  restore them, with the six-layer BF16 gate, once item 1 lands (`xtask/src/silicon.rs`, `SMOKE`).
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).
