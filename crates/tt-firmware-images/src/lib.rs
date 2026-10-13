@@ -115,6 +115,14 @@ pub const NOC_PROBE_B: Image = (
     tt_isa::dm::IMAGE_BASE,
 );
 
+/// The bare read-loop probe (`tt-firmware/src/bin/read_loop_b.rs`) for RISCV B, at
+/// L1 0: B's GDDR reads with none of the interpreter, for `silicon_probe_read_loop`.
+pub const READ_LOOP_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_READ_LOOP_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+
 /// The instruction-cache probes for T0, T1 and T2, each at its core's
 /// default reset PC.
 pub const ICACHE_T: [Image; 3] = [
@@ -147,7 +155,7 @@ pub const TTINSN_T1: Image = (
 );
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 19] = [
+const ENTRIES: [(&str, &str); 20] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
@@ -167,6 +175,7 @@ const ENTRIES: [(&str, &str); 19] = [
     ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
     ("tag_search_b", env!("FIRMWARE_TAG_SEARCH_B_ENTRY")),
     ("noc_probe_b", env!("FIRMWARE_NOC_PROBE_B_ENTRY")),
+    ("read_loop_b", env!("FIRMWARE_READ_LOOP_B_ENTRY")),
 ];
 
 /// The entry point of the image called `name`, as linked.
@@ -245,6 +254,7 @@ mod tests {
             ("dm_b", DM_B),
             ("tag_search_b", TAG_SEARCH_B),
             ("noc_probe_b", NOC_PROBE_B),
+            ("read_loop_b", READ_LOOP_B),
         ] {
             assert_eq!(entry(name).map(u64::from), Some(at));
             assert_eq!(at, core.default_reset_pc() as u64);

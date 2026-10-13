@@ -17,9 +17,11 @@ device init. The tt-metal side is from its source and the kernel ELFs in its JIT
   `dm_b` is 1,744 bytes smaller. At `s`/`z` the mover is 1.6x slower per entry and the roles' push loop is ~7x slower.
   Not adopted yet (only two benches measured); worth a follow-up with an end-to-end run.
 - **Our design is not "tt-metal's firmware with more in it".** tt-metal ships a ~5 KB resident firmware plus per-program
-  JIT kernels; we ship fixed interpreters. The ~350 cycles per mover entry are mostly decode and register setup, which
-  a specialised kernel would remove, but at a cost in per-launch binary traffic and tooling. Nothing measured says
-  this is where our time goes: the models are bound by host submission (220 us to 1.1 ms per op), not by the mover.
+  JIT kernels; we ship fixed interpreters. A probe (below) measured what the interpreter costs per 4 KiB read entry on
+  card 0: **359 device cycles, against 90-106 for a bare loop or a replay of host-encoded requests** (3.4-4x), the
+  shipped path being decode and validation (~95), then ~170 in the list loop and `exec` around them. The host-timed
+  0.48 us per entry people quote includes ~0.21 us of PCIe upload of the 32-byte entry. The saving is real on one tile
+  and unmeasured end to end; the models are still bound by host submission (220 us to 1.1 ms per op).
 - **Not done:** the loadable-kernel prototype (V5), the cold-code-at-`s` split (V2) and a segmented image (V4). V3a
   removed the size pressure that motivated V2/V4; V5 is only worth building to measure specialisation speed, and is
   several days. See "What was not built".
@@ -60,13 +62,41 @@ arithmetic on rv32im is expensive, LLVM unrolls two-iteration loops.
 | `opt-level` s / z | 21,220 / 21,164 | mover 0.48 / 0.52 us WAIT (1.5-1.7x); roles 21-23 cycles/word (7x) |
 | **V3a roles repacked (adopted)** | 24,404 (**18,604 free**) | identical speed; B slot 43,008 B |
 
+## What the interpreter costs per read entry (probe, card 0)
+
+Prompted by "could we remove the interpreter?". `silicon_probe_read_loop` (`crates/tt-tests/tests/`) runs the same 256
+one-channel reads, 64 B or 4 KiB, through a bare B image (`read_loop_b`, no list, decode or dispatch: the host encodes the
+first request with `DramMove`, the image steps it) and through the shipped mover. Device cycles per request by the tile wall
+clock, cap 8 (the default); every repetition of every probe run is checked (checksum of the destination window, refilled with
+poison between repetitions, then byte for byte), and a probe with its last request dropped fails the check in each mode.
+
+| Path | 4 KiB | 64 B |
+|---|--:|--:|
+| bare loop, `issue_dram_on` (what the mover issues with) | 95 | 91 |
+| bare loop, X6 fast path (`issue_read`) | 89 | 69 |
+| replay of host-encoded requests from L1 (7 words each) | 106 | 101 |
+| the mover's `Entry::decode` + `DramMove` + issue, no list loop or `exec` | 189 | 188 |
+| **shipped mover**, list-level device stamps | **359** | **359** |
+| (a `WAIT` entry, shipped) | 139 | |
+
+With per-entry stamps (about 12 cycles of stamp cost) the shipped mover splits into `exec` ~312 and the list loop outside it ~59.
+What the host sees, 0.48 us (648 cycles) per entry, is the 359 plus ~290 cycles (0.21 us) to write the 32-byte entry into the
+ring over PCIe: a host-timed list includes its upload. The in-flight cap does not matter past 4 (host-timed us per entry,
+64 B / 4 KiB: cap 1 0.585 / 0.680, cap 2 0.518 / 0.520, cap 4 0.492 / 0.496, cap 8 0.479 / 0.483, cap 128 0.477 / 0.475).
+
+Sanity: 4 KiB in 95 cycles is 58 GB/s from one tile and one port, under the NoC link's 86 GB/s and the 62.9 GB/s one port holds
+at 64 KiB entries (performance-scoreboard), so the clock and the bytes are consistent. What it does not show: many tiles
+(there the card's GDDR bandwidth, 452-480 GB/s at 4 KiB entries, limits, not the entry), writes on NC, other entry
+kinds, or any end-to-end gain. Setting the probe's device cycles against the interpreter's host-timed ones would read 7x;
+that mixes clocks and the upload. The like-for-like gap is 3.4-4x.
+
 ## The design space for five cores
 
 Each approach: what it changes, what it should cost or buy, and whether it was measured.
 
-1. **Status quo** (B reads and orchestrates, NC writes, T0-T2 push). Measured: ~350 cycles per ~4 KiB entry,
-   of which fetch 30, decode 88, command registers 110, cap check 14, busy poll 9, NIU writes 10, issue 6, return/trace 47
-   (scoreboard, stage table): the NIU is nearly free, the software around it is not. Empty kernel B->T->B 0.42 us.
+1. **Status quo** (B reads and orchestrates, NC writes, T0-T2 push). Measured (probe below): 359 device cycles per read
+   entry of 64 B or 4 KiB alike (WAIT 139), a bare issue loop 90-106: the NIU is nearly free, the software around it is
+   not. Empty kernel B->T->B 0.42 us.
 2. **Same roles, size hygiene, `opt-level` 2.** Measured above. Cheap, worth taking once an end-to-end run confirms it.
 3. **Relocated/repacked images (V3a).** Measured and adopted. A further step available if B needs more than 42 KiB:
    a 2-instruction jump stub at 0 (as NC has, `dm::nc::stub`) and the image anywhere, at the price of taking the space from
@@ -75,13 +105,18 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    13%, i.e. a few hundred bytes. **Paper**, and unnecessary after V3a. Not built.
 5. **Loadable mover kernels, tt-metal style (V5).** A resident core (list loop, plain reads, credits, launch) plus op families
    as L1 overlays called through a table; B can invalidate its own icache (T1's was measured at ~330 cycles, B's not yet).
-   Buys: specialisation by constant folding. Upper bound from the stage table: decode + register setup is 198 of ~350
-   cycles per entry, so specialisation could save at most ~55% of the per-entry cost, and only on the entries where the
-   host cannot already batch them (16-64 KiB entries are NoC-bound already: 54-66 GB/s at 64 KiB). **Counter-evidence:** X6 (`dm::READ_FAST`,
-   a leaner NIU issue path) gained only 3-4% (17 ns of 0.48 us per request) and the log concludes the request's cost is
-   its round trip, with more requests in flight the lever ([X6 section](../learnings/performance-log.md#x6-mover-niu-fast-path-2026-10-10-card-0)); the 350-cycle stage table is ~0.26 us of the
-   measured 0.48 us. So this bound may be far from reachable; a probe with a hand-specialised read loop would settle it. Costs: overlay shipping
+   Buys: specialisation by constant folding. The probe bounds it: the whole per-entry interpretation is ~270 of 359 device
+   cycles (bare loop 90), and a replay of host-encoded requests already gets 106 with no overlays at all (item 5a). So
+   overlays are not needed for per-entry speed; they would only buy resident size, which the repacking has. Costs: overlay shipping
    and residency, a second build path, a function-table ABI. **Paper; not built.**
+5a. **Host-encoded read entries (a thin replay inside the interpreter).** An entry is eight words: the op word and the
+   seven words of an encoded request (`TARG`, `TARG_HI`, `RET`, `RET_HI`, `TAG`, `CTRL`, `LEN`), exactly what
+   `DramMove::words` yields on the host. B issues it with no decode and no on-card validation. **Measured as a probe**
+   (`mode::TABLE`): 106 cycles per 4 KiB request, 3.4x under the shipped 359, in the same 32 bytes per entry, so
+   list upload and ring size do not change. Costs: the host becomes the only validator of those entries
+   (`DramMove::new` already checks every request there; the card-side check is what a bad access to a harvested tile
+   would otherwise meet, and it costs ~95 of the 359 cycles), and trace lists in GDDR would hold encoded requests, tied
+   to the tile and NoC they were encoded for. Not implemented.
 6. **Role rebalancing.** (a) Swap to tt-metal's convention (NC reads, B writes): no expected gain, the cores cost the same.
    (b) Move control-plane entries (`KERNEL`, `LAUNCH`, barriers, pairs) to NC, which has 10 KB free, so B is only a reader:
    unmeasured and constrained by NoC endpoint ownership (SYS-1419: each GDDR endpoint is owned by one NoC; NC's reset
@@ -103,17 +138,20 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    select (B-side branch, ~400 B) and the rank-3+ and other-dimension selects can use it.
 2. Take `opt-level` 2 after an end-to-end run (`cargo xtask bench` default selection, MNIST step, one model) shows nothing
    moved. 1.7 KB for free.
-3. Do not build overlays (5) for size. Build the V5 prototype only if per-entry mover cost becomes the measured bottleneck;
-   today the host is.
+3. Do not build overlays (5). If per-entry mover cost matters for a workload, take the replay of host-encoded read entries
+   (5a) first: 3.4x per entry on one tile in the probe, in the same entry size, with the interpreter's other ops
+   untouched. First measure an end-to-end case on 1-4 tiles (where the models run) to see whether it is worth the loss of
+   on-card validation for those entries.
 4. Use SFPI only as a development oracle for SFPU encodings and instruction counts, not as a build dependency
    ([recipe and a checked example](../plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only)).
-5. Prioritise by what the numbers say: dispatch/host submission (8) > fewer pushed words (7) > mover specialisation (5)
+5. Prioritise by what the numbers say: dispatch/host submission (8) > fewer pushed words (7) > host-encoded read entries (5a)
    > core reshuffling (6).
 
 ## What was not built, and the evidence gap
 
-- **V5 loadable-kernel prototype, V2, V4:** not built (see above). The "specialisation upper bound" in item 5 is
-  arithmetic on the recorded stage table, not a measurement.
+- **V5 loadable-kernel prototype, V2, V4:** not built (see above). The read-loop probe replaced the paper bound on
+  what removing the interpreter could save, for one-tile 4 KiB and 64 B reads on one channel; it does not say what
+  a model gains end to end, nor how the gain holds with many tiles (where GDDR bandwidth, not the entry, limits).
 - **Live tt-metal numbers:** none. `crates/tt-tests/bench/ttnn_reference.py` (add, matmul, embedding; eager, batched and
   traced) is written and untested end to end; it needs a ttnn whose SFPI matches the machine's.
   The one `ttnn_reference.py --only "add f32 64"` attempt with the venv's ttnn printed the compile failures and crashed

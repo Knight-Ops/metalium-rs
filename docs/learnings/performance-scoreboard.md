@@ -213,6 +213,10 @@ reductions stage through L1 on chip 0 and are limited by L1/program capacity.
     made every decode about 100 cycles slower, as did decoding rare kinds out
     of line. Both were fixed by a one-byte `dm::Peer` and inline decode.
   - ~350 cycles per entry at any size up to 4 KiB.
+  - **Re-measured 2026-10-13** ([read-loop probe](performance-log.md#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0)):
+    359 device cycles per read entry (64 B or 4 KiB), against 90-106 for a bare loop or a replay of host-encoded
+    requests; `Entry::decode` + `DramMove` + issue alone is 189. The host-timed 0.48 us an entry is those 359 cycles
+    plus ~0.21 us of list upload.
   - Each request rebuilds and writes ten NIU registers.
   - GATHER records expand into one ~4 KiB read per tile.
 - [x] **Resident compute streams, fresh and traced** (checklist 9.15).

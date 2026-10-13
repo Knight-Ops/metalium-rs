@@ -33,6 +33,7 @@ const BINARIES: &[&str] = &[
     "icache_t2",
     "tag_search_b",
     "noc_probe_b",
+    "read_loop_b",
 ];
 
 /// The one image the `ttinsn-experiment` feature adds, and the only one whose

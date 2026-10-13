@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
 | [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
 | [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
 | [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
@@ -280,6 +281,46 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Read-loop probe: what the interpreter costs per read entry (2026-10-13, card 0)
+
+`silicon_probe_read_loop::{interpreter_cap_sweep, bare_loop_against_interpreter}` (release, card 0, AICLK 1350 MHz, branch
+`fw-architecture-review`; runs `1791859752` (cap sweep, bare loop), `1791859931` (adds the decoded mode)). One tile, one
+channel, 256 reads of 64 B or 4 KiB per list. The bare image is `read_loop_b` (`tt_isa::noc::read_loop`), timed by the tile
+wall clock around nine repetitions after a warm-up. Every repetition's window checksum is compared with the expected
+bytes (the window is poisoned between repetitions) and the last window byte for byte; a probe with the last request
+dropped must fail, and does, in every mode.
+
+**Device cycles per request, cap 8 / cap 128** (4 KiB; 64 B):
+
+| Path | cap 8, 4 KiB | cap 8, 64 B | cap 128, 4 KiB | cap 128, 64 B |
+|---|--:|--:|--:|--:|
+| bare, `issue_dram_on`, address stepped | 95.4 | 90.5 | 88.5 | 78.1 |
+| bare, `issue_read` (X6 fast path) | 88.6 | 69.0 | 88.6 | 51.1 |
+| replay of encoded requests from L1 | 105.9 | 101.3 | 89.6 | 89.1 |
+| `Entry::decode` + `DramMove` + issue per entry | 188.8 | 188.4 | 180.6 | 180.3 |
+| shipped mover (list-level stamps, a temporary build) | 359.3 | 358.9 | | |
+
+The temporary build (not committed) also stamped around `exec`: `exec` 312, the list loop outside it 59, a `WAIT` entry 139
+in all (151 with the stamps). The host-timed numbers of `mover_read_shapes` and `interpreter_cap_sweep` are 648 cycles
+(0.48 us) per entry: the 359 device cycles plus ~290 cycles (0.21 us) for the host to write the 32-byte entry into the
+list ring over PCIe, which a host-timed list includes. The same split fits a `WAIT` entry (0.31 us host, 0.11 device).
+
+**In-flight cap sweep** through the shipped mover, host-timed us per entry (64 B / 4 KiB): cap 1 0.585 / 0.680, 2 0.518 /
+0.520, 4 0.492 / 0.496, 8 0.479 / 0.483, 16 0.481 / 0.479, 32 0.477 / 0.479, 64 0.477 / 0.475, 128 0.477 / 0.475.
+
+**Read, and what it refutes.**
+- The X6 section below concluded that a request's cost is its round trip and that more requests in flight is the lever. The
+  X6 measurement stands (the register writes are ~17 ns of an entry); the explanation does not. Past cap 4 more requests in
+  flight change nothing, and a bare loop issues a 4 KiB read in 95 cycles at the same cap: the entry is software, 359
+  cycles of it, about 95 of them decode and validation and the rest the loop and `exec` around them. Roadmap X7's
+  "the cost is the request round trip" is corrected accordingly.
+- A replay of host-encoded requests (an entry of the op word and seven request words: the same 32 bytes) is 3.4x under the
+  shipped path with the rest of the interpreter intact.
+- The probe's device cycles set against the interpreter's host-timed cycles would read 7x; that mixes clocks. The like-for-like
+  gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
+- Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
+  entry kinds, any model.
 
 ## Firmware image budget and core-assignment (2026-10-13, card 0)
 
@@ -579,6 +620,10 @@ entry; 2 KiB: 0.482 -> 0.464 (one port), 0.485 -> 0.471 (all channels); 4 KiB: 0
 0.961-0.972 everywhere: about 17 ns of the ~0.48 us a request costs. The request's cost is its round
 trip, not the register writes, so a gather's share of a step does not move; more requests in flight
 is the lever, not cheaper issue.
+
+> **Superseded in part (2026-10-13).** The measurement holds; the explanation does not. A cap sweep and a bare read loop
+> show the entry is software (359 device cycles, a bare loop 90-106) and that the cap does not matter past 4: see
+> [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0).
 
 ## Approx transcendentals, per-tile saving (2026-10-10, card 0)
 

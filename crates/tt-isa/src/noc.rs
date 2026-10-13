@@ -179,6 +179,7 @@ pub const fn endpoint_tile_index(endpoint_id: u32) -> u8 {
 pub mod atomic;
 pub mod multicast;
 pub mod probe;
+pub mod read_loop;
 
 #[cfg(test)]
 mod tests {
