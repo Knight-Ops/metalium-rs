@@ -130,7 +130,12 @@ pub fn run_one(
 ) -> Result<Verdict, String> {
     let out = File::create(out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
+    // Its own process group: the gates do their device work in a forked child
+    // (`tt_ttsim::fork_scope`), and a timeout that killed only the process it spawned left that
+    // child running, still holding the card, until the next run found it "in use".
+    use std::os::unix::process::CommandExt;
     let mut child = Command::new(exe)
+        .process_group(0)
         .args([
             test,
             "--exact",
@@ -156,6 +161,7 @@ pub fn run_one(
         if Instant::now() >= deadline {
             // A process blocked in an MMIO read against a hung NoC may not die;
             // the verdict is recorded either way, and the log already says START.
+            kill_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
             break Verdict::Timeout;
@@ -166,4 +172,67 @@ pub fn run_one(
         let _ = f.sync_all();
     }
     Ok(verdict)
+}
+
+/// SIGKILL every process in the group `pgid` leads (the test and any child it forked).
+fn kill_group(pgid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--"])
+        .arg(format!("-{pgid}"))
+        .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timeout must take the test's forked children with it: the gates fork their device work, and
+    /// a survivor keeps the card "in use" for the next run.
+    #[test]
+    fn a_timeout_kills_the_forked_child_too() {
+        let dir = std::env::temp_dir().join(format!("xtask-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-test.sh");
+        let pid_file = dir.join("child.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > {}\nsleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let verdict = run_one(
+            &script,
+            "ignored",
+            &dir,
+            &[],
+            Duration::from_millis(1500),
+            &dir.join("out.txt"),
+        )
+        .unwrap();
+        assert!(matches!(verdict, Verdict::Timeout));
+
+        let child: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script started its child before the deadline")
+            .trim()
+            .parse()
+            .unwrap();
+        // `kill -0` succeeds only for a live process (a reaped one has no entry; a zombie of ours
+        // would, but the child's parent was the script, which is gone, so init reaps it).
+        std::thread::sleep(Duration::from_millis(300));
+        let alive = Command::new("kill")
+            .args(["-0", &child.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!alive, "the forked child {child} survived the timeout");
+    }
 }

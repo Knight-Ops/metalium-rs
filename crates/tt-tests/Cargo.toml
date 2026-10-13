@@ -29,7 +29,12 @@ path = "src/lib.rs"
 # "silicon"))]` for the same reason.
 #
 # Silicon runs every tier, so it implies `e2e`.
-silicon = ["e2e"]
+silicon = ["e2e", "weights"]
+
+# The model ladder's gates (step165 onward) read pretrained weights and test photographs fetched by
+# `cargo xtask fetch-weights`; without this they are ignored rather than failing on a checkout that
+# has not fetched them. Silicon runs them, so it implies this.
+weights = []
 
 # The test tiers. The simulator is for *validation*: the ISA, kernel, mover and
 # residency gates, where ttsim's bit-exactness and its refusal of undefined
@@ -70,5 +75,7 @@ burn-tensor.workspace = true
 burn.workspace = true
 # The general-model gate trains the model `tt-mnist --model transformer` times.
 tt-mnist = { path = "../tt-mnist" }
+# The model ladder (step165 onward): pretrained models and their loader.
+tt-models = { path = "../tt-models" }
 # step145: the f64 oracle for `gelu` (`erfc`), independent of the programs.
 libm.workspace = true

@@ -91,6 +91,11 @@ pub fn sha256_stdin(bytes: &[u8]) -> Result<String, String> {
 /// Download a URL to a path, via a `.partial` file so an interrupted fetch cannot
 /// leave a truncated result that later hashes as "wrong version".
 pub fn download(url: &str, dest: &Path) -> Result<(), String> {
+    download_within(url, dest, 300)
+}
+
+/// [`download`] with its own time limit, for files too large for five minutes on a slow link.
+pub fn download_within(url: &str, dest: &Path, max_seconds: u32) -> Result<(), String> {
     println!("fetching {url}");
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -104,9 +109,9 @@ pub fn download(url: &str, dest: &Path) -> Result<(), String> {
             "--silent",
             "--show-error",
             "--max-time",
-            "300",
-            "-o",
         ])
+        .arg(max_seconds.to_string())
+        .arg("-o")
         .arg(&tmp)
         .arg(url)
         .status()

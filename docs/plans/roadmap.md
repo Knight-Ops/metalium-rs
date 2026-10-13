@@ -11,8 +11,12 @@ linking to its evidence and to the detailed plan. Closed work lives in
   ([close-out record](../completed-plans/hardware-coverage-closeout.md)). The Burn operation
   traits have no unsupported float, int or bool methods
   ([burn-op-coverage.md](burn-op-coverage.md)).
-- **Models: toy scale only.** MNIST MLP (91.96%), a 938-parameter CNN and a one-layer
-  TinyTransformer, all trained from scratch in `tt-mnist`. Nothing loads pretrained weights.
+- **Models: three pretrained networks run on a card, slowly.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
+  30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
+  (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2.
+  They are 105x, 7.8x and 25x behind burn-flex per forward pass, and a token embedding alone costs 15.9 s
+  ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)).
+  The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
 - **Performance: behind the CPU unless traced.** Untraced training is 2–3× slower than
   burn-flex ([scoreboard](../learnings/performance-scoreboard.md)); the cost is host-side
   submission, not the device. Traced MNIST inference already beats the CPU.
@@ -261,14 +265,55 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   profile; two are CTC gradients, per-operation binary16 rounding in Burn's default composition, matched by burn-flex's F16),
   15 `timeout` (all pass on silicon) and two F64. Left: the exact-profile timeouts were not run on silicon (the exact matmul is
   about 1,000x slower), and the F16 conformance modules that pass are not in `--smoke` (only the gate is).
-- [ ] **B15** `burn-store` safetensors load (F32 and BF16), `Learner` checkpoint round trip,
-  one `burn-onnx` model. Nothing in the code uses `burn-store` yet.
-- [ ] **Model ladder**, each rung checked against burn-flex; every failure becomes an op or
-  shape item here:
-  1. pretrained small CNN/ResNet inference
-  2. small ViT
-  3. small decoder-only LLM inference (RMSNorm, RoPE, SiLU, KV-cache `slice_assign`)
-  4. fine-tuning
+- [x] **B15, loading and checkpoints** (2026-10-12; [`crates/tt-models`](../../crates/tt-models/README.md)).
+  `burn-store` (safetensors only) loads ResNet-18, ViT-Tiny (F32) and SmolLM2-135M (BF16) strictly
+  ([`load.rs`](../../crates/tt-models/src/load.rs)): `burn-store`'s own `load_from` leaves a tensor the file lacks at
+  its random initialisation and skips a shape mismatch, so every disagreement is an error naming the tensors. Two
+  `burn-store` behaviours found and worked around: it lists a norm layer's `weight` and `bias` as unused although
+  it applied them as `gamma` and `beta`, and its PyTorch adapter renames only batch, layer and group norms, so
+  `RmsNorm` needs explicit remaps. The weights and five test photographs are pinned in `PINS.toml` and fetched by
+  `cargo xtask fetch-weights` (340 MB, SHA-256 verified). **The BF16 note in [burn-backend-parity.md](burn-backend-parity.md)
+  3.4 ("a BF16 model that runs entirely on the host") is stale**: a BF16 checkpoint loads as a BF16 model and
+  computes on the device since D1/D2; the B4 warning it asked for names no cast. Gate `step170_checkpoint_round_trip`
+  (ttsim 208 s, card 0 2.6 s, run `1791847160`): train, save with Burn's `BinFileRecorder` (what the `Learner`'s file
+  checkpointer uses), load into a fresh model, continue, bit-identical to an uninterrupted run, with controls (a model
+  that was not loaded does not match; save, load, save is byte-stable).
+- [ ] **B15, left:** a real `Learner` run (the gate uses the recorder directly, with plain SGD, which keeps no
+  state, so a stateful optimiser's record is unclaimed), and one `burn-onnx` model (`burn-onnx` is not in the lock or
+  the registry; deferred by decision 2026-10-12).
+- [x] **Model ladder, rungs 1 to 3** (2026-10-12, card 0, `--strict`-style `assert_native_model`: no staged compute,
+  no host arithmetic, no downloaded operand). Each compares `TtBackend` with burn-flex on the same weights and
+  input, and each host model is first checked against the world (the cat photo is a cat) or the reference
+  implementation (SmolLM2 reproduces HuggingFace `transformers`: the same top-10 next tokens on two prompts, logits
+  to 5e-5):
+  1. **ResNet-18**, `step165_resnet18` (run `1791847160`): the same top-5 in the same order as Flex; largest logit
+     difference 5.1e-2 on 14.6 (the fast matmul's TF32 rounding). 17.8 s including the host reference.
+  2. **ViT-Tiny/16**, `step166_vit_tiny` (`1791847160`): the same top-5; 6.5e-2 on 12.5; 2.1 s. Layer norm, GELU,
+     softmax and Burn's `attention` all native.
+  3. **SmolLM2-135M**, `step167_smollm2` (`1791844568`, F32, all 30 layers): the same 16 greedy tokens as Flex,
+     teacher-forced top-1 equal at every position, largest logit difference 6.9e-2 on 33.2. RoPE's `sin` and `cos`
+     run on the device, grouped-query attention reads a cache filled by `slice_assign`, the output head is the
+     tied embedding table. 575 s, almost all of it the embedding lookup (below). **In the checkpoint's own BF16**
+     (BF16 parameters, activations and cache; 6 layers and 4 tokens, `1791848957`, 441 s): teacher-forced top-1
+     equal at every position, the four greedy tokens identical to Flex, largest logit difference 0.75 on 63.3 (BF16's
+     8-bit mantissa). A BF16 token costs **37.5 s against F32's 14 s**: the BF16 lookup is 2.7x slower still; the
+     whole 30-layer BF16 model timed out at 1,500 s (`1791847160`).
+  4. **Fine-tuning** is open.
+- [x] **Mixed precision in one model** (2026-10-12; requested: BFP2/4/8, BF16, FP16 and F32 together):
+  [`quant.rs`](../../crates/tt-models/src/quant.rs) names a format per matrix (and per activation boundary) by
+  parameter path; `step168_smollm2_mixed_precision` (card 0, `1791845324`, 6 layers, 7 plans, all pass) runs each plan
+  natively and against an independent host model (`bfp_round_trip`, the packer's rule decoded with `tt_isa`'s
+  unpackers; plain F32 from there, which is what the device computes with after decoding). BFP8, BFP4, BFP2 land
+  0.097, 0.094 and 0.045 from their references against 0.59, 16.5 and 34.9 from the unquantised model (the F32
+  plan's own device-vs-Flex noise is 0.12), so the device really compressed; one model holding all six formats
+  (weights in BFP8/4/2, BF16 and F16, activations in BF16 and BFP8) lands 0.38 from its reference against 34.9.
+  **Caveat:** BF16 and F16 are weaker evidence. Their effect on the logits (0.26 and 0.30) is the size of the
+  difference between two valid roundings of a half type, and for F16 the device is nearer the unquantised model
+  (0.07) than Flex's F16 run (0.34): burn-tt computes in F32 and rounds once per op (D1), Flex rounds per
+  primitive. The gate asserts native execution, finite logits and top-1 agreement where the margin allows, and
+  nothing more for them. What the formats cost the model (host, 30 layers, one position): F16 0.017, BF16 0.26,
+  BFP8 1.4, BFP4 19.8, BFP2 23.0 (top-1 holds through BFP8). Left: the full 30 layers per plan (the lookup makes each
+  plan two minutes), the half formats against a per-matmul reference, and BFP in a trace or under autodiff.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL
@@ -280,6 +325,26 @@ Goal: training at or below burn-flex per step on MNIST and the transformer, then
 Track 1 model. Evidence and bottlenecks:
 [performance-scoreboard.md](../learnings/performance-scoreboard.md) ("Where the overhead is").
 
+**What the model ladder measured (2026-10-12, [profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)),
+and so the order to work in.** Against burn-flex on the same machine: ResNet-18 105x slower (16.3 s), SmolLM2 decode
+25x (619 ms a step) and ViT-Tiny 7.8x (815 ms), with a token embedding alone 15.9 s. The first two have a single cause
+each, and the cheapest wins; ViT and decode are host submission, the fusers' territory. The `.ttinsn` trigger (SFPU
+push above ~20% of device time with the model device-bound) has not fired: no model is device-bound yet.
+
+- [ ] **1. Gather without staging, now measured (15.9 s a token).** See the item below: this alone makes a decoded
+  token 14 s and the simulator lane of every language-model gate unaffordable.
+- [ ] **2. Chunk-free convolution and pooling (ResNet-18: 16.3 s, 105x).** Convolution issues one `float_matmul`
+  per 32 output positions, each with a host-built patch gather (`ops/conv.rs:5,181-192`: a 56x56 convolution is 98
+  matmuls, conv1 392); max pool splits its windows into chunks of 32, each a host-built `repack`, argmax and gather
+  (`ops/pool.rs:153-200`: 6,272 chunks for 64x112x112). On card 0 a max pool on 64x112x112 takes 2.8 s, a 3x3
+  convolution 0.5-1.4 s, an add + relu 0.6 ms (`probe_resnet_op_cost`, `1791846963`). Build one product (or one
+  windowed reduction) per op, from one table, or an implicit-GEMM kernel; the patch tables depend on the shapes
+  alone, so cache them by geometry too. Gate: `silicon_bench_models::resnet18_forward` against burn-flex's 154.8 ms.
+- [ ] **3. The decode step's host cost (25x).** 2,779 reported operations (more submitted) at about 220 us each:
+  `cat` is built from `slice_assign` (722 `float_slice_assign` calls a step: the nine-way `repeat_kv`, the rotary
+  halves), plus tens of thousands of reshapes, slices and `float_device` calls over 33 passes. A native `cat`, a
+  fused RoPE and the fusers below shrink it; a trace would remove it, which needs trace segmentation. ViT-Tiny
+  (709 operations at 1.1 ms) is the same cost at a smaller scale.
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).
@@ -305,10 +370,16 @@ Track 1 model. Evidence and bottlenecks:
   Chunk the gather over planes. Measure on a real model before building it.
 - [ ] **Gather without staging.** `gather_native` stages every row of its table for every element it returns
   (`select`, `gather`, `embedding` and `deform_conv2d` all go through it), so a lookup costs
-  `elements x table rows` host addresses. `deform_conv2d` refuses more than 2^24 of them by name, which is far
-  below a real detector head (a 64x64 plane with thousands of samples); an embedding of a real vocabulary has the
-  same shape of problem. A device-side indexed read that takes the table once, instead of one staged row per
-  element, is the fix; profile `embedding` and `deform_conv2d` first.
+  `elements x table rows` host addresses. **Measured on a real vocabulary (2026-10-12): an embedding of one token
+  from SmolLM2's 49,152 x 576 table takes 15.9 s, five take 63.3 s (`probe_embedding_cost`, `1791845218`)**, which is
+  576 x 49,152 = 28.3 million host-built addresses a token, and is the whole of a decoded token's cost (14 s;
+  `step167_smollm2`). It is not refused, because the 2^24 limit is `deform_conv2d`'s. `select_native` expands the
+  indices to the output's shape and calls `gather_native`; the primitive underneath (`Session::gather_indexed`) reads
+  from a matrix of at most 32 rows, which is why the host builds a candidate row per element. Candidates for the fix:
+  hold the table transposed and read 32-row windows of the resident buffer as views, so a token is 18 index-driven
+  jobs and no host addresses; or a row-select kernel on B (it reads the index, computes the NoC address and copies
+  the row). Either needs the new-op gates (an independent oracle, a negative control, silicon on one card). Until
+  then SmolLM2's gates are out of `SMOKE` (`step167`, `step168`).
 - [ ] **B7** batched readback (`download_many`, batched `tr_execute`). (The `Backend::sync` barrier of B8 is
   done with B1.)
 - [ ] **X7** small-transfer latency; 9.14 per-request cost (note X6 found the fast

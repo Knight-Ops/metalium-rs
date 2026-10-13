@@ -32,6 +32,16 @@ fn main() -> ExitCode {
         Some("fetch-spec") => fetch::fetch_spec(args.any(|a| a == "--force")),
         Some("fetch-kmd") => fetch::fetch_kmd(args.any(|a| a == "--force")),
         Some("fetch-mnist") => fetch::fetch_mnist(args.any(|a| a == "--force")),
+        Some("fetch-weights") => {
+            let rest: Vec<String> = args.collect();
+            let force = rest.iter().any(|a| a == "--force");
+            let model = rest
+                .iter()
+                .position(|a| a == "--model")
+                .and_then(|i| rest.get(i + 1))
+                .map(String::as_str);
+            fetch::fetch_weights(model, force)
+        }
         Some("fetch-burn-tests") => fetch::fetch_burn_tests(args.any(|a| a == "--force")),
         Some("check-isa-sources") => gen_isa::check_sources(),
         Some("gen-isa") => gen_isa::generate(args.any(|a| a == "--check")),
@@ -64,6 +74,11 @@ tasks:
   fetch-mnist [--force]   download MNIST into vendor/mnist/, decompressed and
                           verified against the pinned hashes; the Phase 7
                           training gate reads it
+  fetch-weights [--model <name>] [--force]
+                          download the pinned pretrained weights (resnet18,
+                          vit-tiny, smollm2-135m) and test images (images) into
+                          vendor/weights/<name>/ and verify each against its
+                          pinned length and SHA-256; tt-models reads them
   fetch-burn-tests [--force]
                           download Burn's backend test suite (the pinned tag's
                           crates/burn-backend-tests/tests) into

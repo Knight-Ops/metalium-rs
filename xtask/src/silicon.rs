@@ -194,6 +194,12 @@ pub const SMOKE: &[&str] = &[
     "autodiff_bf16::base::mul::",
     "autodiff_bf16::base::matmul::",
     "step164_grid_sample_bf16::",
+    // The model ladder (`crates/tt-models`): pretrained weights, so `silicon` implies the `weights`
+    // feature. SmolLM2 (step167, step168) is not here: one embedding lookup costs 15 s a token until the
+    // gather stops staging its table (roadmap, "Gather without staging").
+    "step165_resnet18::",
+    "step166_vit_tiny::",
+    "step170_checkpoint_round_trip::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
     "silicon_card_lock::a_second",
@@ -537,7 +543,7 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 
     let dir = root.join("target/silicon");
     std::fs::create_dir_all(dir.join("out")).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let stamp = unix_secs();
+    let stamp = claim_stamp(&dir)?;
     let log_path = dir.join(format!("{stamp}.log"));
     let mut log = Log::open(&log_path)?;
     let boot = boot_id();
@@ -663,6 +669,22 @@ pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
+}
+
+/// A run ID no other run has: the clock, bumped past any `<stamp>.log` that already exists. The
+/// file is created exclusively, so two runs that finish building in the same second (one job per
+/// card, in parallel) take different IDs instead of sharing a log and overwriting each other's
+/// collected benchmark files.
+fn claim_stamp(dir: &Path) -> Result<u64, String> {
+    let mut stamp = unix_secs();
+    loop {
+        let path = dir.join(format!("{stamp}.log"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(stamp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => stamp += 1,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
 }
 
 pub(crate) fn unix_secs() -> u64 {

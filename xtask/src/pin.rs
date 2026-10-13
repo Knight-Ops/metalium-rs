@@ -71,6 +71,91 @@ pub const BURN_TESTS_TAG: &str = "v0.21.0";
 pub const BURN_TESTS_CONTENT_SHA256: &str =
     "45c5b2f9c8903944bbfe0af1e31ef929377e2ec5e705000204a57acacfff9d16";
 
+/// One pretrained-weights file of the model ladder (`PINS.toml`, `[weights]`).
+/// Fetched by `cargo xtask fetch-weights` into `vendor/weights/<model>/<file>`.
+pub struct WeightFile {
+    /// The short name `tt-models` and `--model` use.
+    pub model: &'static str,
+    /// Hugging Face repository.
+    pub repo: &'static str,
+    /// A commit of that repository, never a branch.
+    pub revision: &'static str,
+    pub file: &'static str,
+    pub bytes: u64,
+    pub sha256: &'static str,
+}
+
+pub const WEIGHTS_URL: &str = "https://huggingface.co";
+
+pub const WEIGHT_FILES: &[WeightFile] = &[
+    WeightFile {
+        model: "resnet18",
+        repo: "timm/resnet18.a1_in1k",
+        revision: "491b427b45c94c7fb0e78b5474cc919aff584bbf",
+        file: "model.safetensors",
+        bytes: 46_807_446,
+        sha256: "80c49dee3da4822c009c5a7fe591e9223c5a2cfcf95a4067ca4dfb5a7b89c612",
+    },
+    WeightFile {
+        model: "vit-tiny",
+        repo: "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
+        revision: "7d3afdd0cf93ad84d986eb2d6bcc5812ebd0b106",
+        file: "model.safetensors",
+        bytes: 22_883_348,
+        sha256: "fecf81b492bd13ee7a5297cb74d1d417aac8bf7e1b7d96aed89c4691984587ed",
+    },
+    WeightFile {
+        model: "smollm2-135m",
+        repo: "HuggingFaceTB/SmolLM2-135M",
+        revision: "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+        file: "model.safetensors",
+        bytes: 269_060_552,
+        sha256: "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+    },
+];
+
+/// One pinned test image of the model ladder (`PINS.toml`, `[[weights.images]]`), fetched by
+/// `cargo xtask fetch-weights --model images` into `vendor/weights/images/<name>`.
+pub struct ImageFile {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub bytes: u64,
+    pub sha256: &'static str,
+}
+
+pub const IMAGE_FILES: &[ImageFile] = &[
+    ImageFile {
+        name: "cats.jpg",
+        url: "http://images.cocodataset.org/val2017/000000039769.jpg",
+        bytes: 173_131,
+        sha256: "dea9e7ef97386345f7cff32f9055da4982da5471c48d575146c796ab4563b04e",
+    },
+    ImageFile {
+        name: "dog.jpg",
+        url: "https://raw.githubusercontent.com/pytorch/hub/master/images/dog.jpg",
+        bytes: 661_378,
+        sha256: "f3f87bb8ab3c26c7ecfd3ac60421d7f32b0503d1d6c5baf8bac42ed93d86351a",
+    },
+    ImageFile {
+        name: "bear.jpg",
+        url: "http://images.cocodataset.org/val2017/000000000285.jpg",
+        bytes: 335_861,
+        sha256: "f3a2974ce3686332609124c70e3e6a2e3aca43fccf1cd1bd7c5c03820977f57d",
+    },
+    ImageFile {
+        name: "living_room.jpg",
+        url: "http://images.cocodataset.org/val2017/000000000139.jpg",
+        bytes: 161_811,
+        sha256: "ffe0f0cec3b2e27aab1967229cdf0a0d7751dcdd5800322f0b8ac0dffb3b8a8d",
+    },
+    ImageFile {
+        name: "bedroom.jpg",
+        url: "http://images.cocodataset.org/val2017/000000000632.jpg",
+        bytes: 155_667,
+        sha256: "a4cd7f45ac1ce27eaafb254b23af7c0b18a064be08870ceaaf03b2147f2ce550",
+    },
+];
+
 /// MNIST, for the Phase 7 training gate. Fetched by `cargo xtask fetch-mnist`
 /// from the Google CVDF mirror (the original host is unreliable), verified
 /// against both the published `.gz` hash and the decompressed IDX file's.

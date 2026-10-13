@@ -12,6 +12,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `fetch-spec [--force]` | Pinned tt-isa-documentation tree into `vendor/`, verified by content digest. |
 | `fetch-kmd [--force]` | Pinned tt-kmd `ioctl.h` into `vendor/` (the driver ABI `tt-kmd` binds). |
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |
+| `fetch-weights [--model <name>] [--force]` | The model ladder's pretrained weights (`resnet18`, `vit-tiny`, `smollm2-135m`) and test images (`images`) into `vendor/weights/<name>/`, checked against the pinned length and SHA-256; `tt-models` reads them. |
 | `fetch-burn-tests [--force]` | Burn's own backend tests (`crates/burn-backend-tests/tests/` at the pinned tag) into `vendor/burn-backend-tests/`, verified by content digest. |
 | `gen-cfg [--check]` | `tt-isa/src/cfg/generated.rs` from the pinned `cfg_defines.h` (fetched if absent). |
 | `gen-isa [--check]` | `tt-isa/src/isa/generated.rs` from `Bits32.lua`, cross-checked against the spec's syntax blocks, plus the measured Blackhole layouts in `src/gen_isa/Bits32_BH.lua`. |

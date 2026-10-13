@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
 | [Accurate matmul cost](#accurate-matmul-cost-2026-10-12-card-0) | 2026-10-12 | opt-in F32-accuracy matmul on the Matrix Unit: 19x to 64x slower than the fast one; the element-wise work around the matmuls dominates |
 | [Exact matmul cost](#exact-matmul-cost-2026-10-11-card-0) | 2026-10-11 | opt-in F32 matmul 1,000x to 22,000x slower than the fast one; linear in products |
 | [`.ttinsn` push fusion, precise `gelu`](#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) | 2026-10-10 | experiment: 2.77x on a push-bound kernel; not adopted |
@@ -40,6 +41,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-12 | 1791846735 / 1791846823 | Model ladder: ResNet-18, ViT-Tiny and SmolLM2-135M forward passes against burn-flex on the same weights, cards 0 and 1 (one job per card), validated; see "Model ladder" below. | New scoreboard rows. |
 | 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
 | 2026-10-11 | 1791761944 | Exact matmul (`MatmulMode::Exact`) against the fast Matrix Unit matmul, four shapes, card 0, validated; see "Exact matmul cost" below. | New scoreboard row. |
 | 2026-10-10 | 1791597495 | Release card-0 smoke tier after the Phase 10 close-out: 486/486 pass (baseline before the close-out: 258/258, run `1791558187`). | None; correctness record. |
@@ -275,6 +277,77 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Model ladder: real models on the card (2026-10-12, cards 0 and 1)
+
+First measurements of pretrained models (`crates/tt-models`, `tests/silicon_bench_models.rs`), taken to
+order the performance work. Release build (`dd8172b769f1+dirty`), two warm-ups and nine timed forward
+passes, medians in milliseconds, timed from host dispatch through the final readback, batch 1, the
+photograph `cats.jpg`, F32. Each device number's output is validated outside the timing (the top-1 equals
+burn-flex's). The two jobs ran at the same time, one per card, each single-card, which is why the ResNet run
+is card 0 (`1791846735`) and the other two card 1 (`1791846823`); a number is compared only with the baseline
+measured in the same run, on the same card.
+
+| Workload | burn-flex (host) | burn-tt (card) | Slowdown | Reported device ops | Backend calls | Run |
+|---|--:|--:|--:|--:|--:|---|
+| ResNet-18, 224x224 | 154.8 ms | 16,288 ms | 105x | 211 | 509 | `1791846735` (card 0) |
+| ViT-Tiny/16, 224x224, 12 blocks | 104.7 ms | 815 ms | 7.8x | 709 | 764 | `1791846823` (card 1) |
+| SmolLM2-135M decode step, 30 layers, the embedding lookup excluded | 25.0 ms | 619 ms (p10 523, p90 706) | 24.8x | 2,779 | 3,874 | `1791846823` (card 1) |
+| SmolLM2-135M, the embedding lookup of one token alone | n/a | 15.9 s | n/a | one gather | | `1791845218` (card 0) |
+| SmolLM2-135M in BF16, 6 layers, a decoded token end to end (lookup included) | n/a | 37.5 s (prompt 87-90 s) | n/a | | | `1791848957` (card 0) |
+
+Reading them:
+
+* **The embedding lookup is the SmolLM2 decode.** One token from the 49,152 x 576 table takes 15.9 s and five
+  take 63.3 s (`probe_embedding_cost`), so a decoded token costs 14 s end to end (`step167_smollm2`, run
+  `1791844568`: prompt 66-69 s, then 13.8-14.3 s a token, growing only with the attention's cache length). The
+  cause is in `gather_native`: it builds, for each chunk of 32 output elements, a host address list of
+  `32 x rows` entries, so one token costs 576 x 49,152 = 28.3 million host-built addresses. It is the
+  roadmap's "Gather without staging", now measured on a real vocabulary.
+* **ResNet-18's cost is convolution and pooling, and it is chunking, not the count of reported ops.** The
+  211 and 709 above count the top-level operations the report lists as run on the device; one reported
+  `conv2d` or `max_pool2d` hides many more submissions. Convolution issues one `float_matmul` per
+  `PATCH_ROWS = 32` output positions, each with its own host-built patch gather (`ops/conv.rs:5,181-192`: a
+  56x56 convolution is 98 matmuls, conv1 on 112x112 is 392), and max pool splits its windows into chunks of
+  32, each a host-built `repack`, an argmax and a gather (`ops/pool.rs:153-200`: 6,272 chunks for 64x112x112).
+  The weights are resident (588 KiB goes up a pass, the patch tables). Isolated on card 0 (`1791846963`,
+  `probe_resnet_op_cost`, median of three): max pool 3x3/2 on 64x112x112 **2,817 ms**; conv 7x7/2 (conv1)
+  1,170 ms; conv 3x3 64->64 on 56x56 895 ms; 128->128 on 28x28 517 ms; 256->256 on 14x14 529 ms; 512->512 on
+  7x7 **1,411 ms**; against 0.6 ms for an add + relu on 64x56x56 and 3.8 ms for the global average pool (one
+  reported op, one submission each). The layer-4 convolution (7x7, few positions, 2.4 million weights)
+  costs more than layer 2's (28x28), so the weight gather per chunk matters as much as the chunk count. The
+  warm-up passes did not make a forward faster (p10 16,266 ms, p90 16,334 ms), so none of this is
+  amortised across calls.
+* **BF16 is slower still.** The same decoded token in the checkpoint's own BF16 costs 37.5 s (six layers, so the
+  layers are a small part of it) against F32's 14 s, so the BF16 lookup is about 2.7x the F32 one
+  (`step167_smollm2` BF16, run `1791848957`); the whole 30-layer BF16 model did not finish inside 1,500 s
+  (`1791847160`).
+* **A decoded token is about 2,800 reported device operations** at about 220 us each: the decode step is
+  host-bound like the transformer training step was (the report does not see submissions nested inside an
+  op, so the true count is higher). `cat` is built from `slice_assign` (23,826 `float_slice_assign` calls in
+  33 forward passes, 722 a pass: the nine-way `repeat_kv` and the rotary halves), and `float_reshape`,
+  `float_slice` and `float_device` calls number in the tens of thousands.
+* **ViT-Tiny is the nearest to usable**: 709 reported operations, about 1.1 ms each.
+
+Not measured: traced execution of any of the three (a decode step has the host cost a trace would remove, but
+trace segmentation is open, so a forward this size does not fit the 240 KB program cache), the other card for
+a model that ran on card 0 (the single-card rule), and BF16. The same three forward passes are the
+correctness gates `step165_resnet18`, `step166_vit_tiny` and `step167_smollm2` (runs `1791843753`,
+`1791843886`, `1791844568`).
+
+**A tooling defect found on the way:** two `cargo xtask` runs that finish building in the same second took the
+same run ID, so the second collected-benchmark file (`target/silicon/bench/<stamp>.jsonl`) replaced the first
+(the per-test output files, named by stamp, device and test, were intact). The stamp is now claimed by
+creating its log exclusively (`xtask/src/silicon.rs`, `claim_stamp`), so one job per card is safe. Run
+`1791846398` is the pair that collided; its numbers are the first measurement without the burn-flex baselines
+and agree with the rerun. The runs `1791846735` and `1791846823` label the operation count "device jobs";
+it is the reported-operation count described above, and the benchmark now says so.
+
+**A second tooling defect:** when a test passed its per-test time limit the runner killed only the process it had
+started. The gates do their device work in a forked child (`tt_ttsim::fork_scope`), which survived, kept running
+and kept holding the card, so the next run failed with "card 0 is in use by another process". Each test now runs
+in its own process group and a timeout kills the group (`xtask/src/testrun.rs`; the unit test
+`a_timeout_kills_the_forked_child_too` fails without the change).
 
 ## Accurate matmul cost (2026-10-12, card 0)
 

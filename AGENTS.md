@@ -20,6 +20,8 @@ C/C++ specification models and simulator FFI are development-only test oracles.
 - `tt-tests`: cross-crate gates, simulator engines and external Flex comparisons.
   `burn-tt-conformance`: Burn's own backend tests against `burn-tt`
   (`cargo xtask conformance`; dev-only). `tt-mnist`: application/model workloads.
+  `tt-models`: pretrained models (ResNet-18, ViT-Tiny, SmolLM2-135M), strict safetensors loading and
+  mixed-precision plans, checked against Flex (`cargo xtask fetch-weights`; dev-only).
   `xtask`: fetchers, generators and runners.
 
 Crates live under `crates/`. When adding a host workspace crate, classify it in
@@ -72,7 +74,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
 `fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
-`cargo xtask conformance`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
+`cargo xtask conformance`), `fetch-weights` (needed by the `tt-models` tests and the model-ladder
+gates, which are ignored without `--features weights`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:
 

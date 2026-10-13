@@ -33,6 +33,7 @@ cargo xtask fetch-ttsim   # pinned libttsim builds (1, 2 and 4 chip) into vendor
 cargo xtask fetch-spec    # pinned ISA specification tree into vendor/
 cargo xtask fetch-mnist   # MNIST into vendor/mnist/; tt-mnist's build.rs needs it
 cargo xtask fetch-kmd     # optional: tt-kmd's ioctl.h, for its ABI layout test
+cargo xtask fetch-weights # optional: pretrained weights and photos for tt-models (340 MB)
 cargo test                # builds the riscv32im firmware and runs the validation tier
 ```
 
@@ -70,6 +71,7 @@ build that depends on it. `rust-toolchain.toml` requests the
 | [`tt-firmware`](crates/tt-firmware) | (embedded) | Bare-metal `riscv32im` firmware. A separate workspace. |
 | [`tt-ttsim-sys`](crates/tt-ttsim-sys), [`tt-ttsim`](crates/tt-ttsim) | no | The simulator binding and its `Transport`. |
 | [`tt-tests`](crates/tt-tests) | no | Every cross-crate gate, on ttsim or on silicon. |
+| [`tt-models`](crates/tt-models) | no | The model ladder: pretrained ResNet-18, ViT-Tiny and SmolLM2 on `burn-tt`, checked against `burn-flex`; mixed-precision plans. |
 | [`xtask`](xtask) | no | Fetching pins, generators, ship check, silicon runner. |
 
 **Dev-only crates never reach a shipped artifact.** `cargo xtask check-no-sim-in-ship`
