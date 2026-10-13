@@ -77,7 +77,10 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    as L1 overlays called through a table; B can invalidate its own icache (T1's was measured at ~330 cycles, B's not yet).
    Buys: specialisation by constant folding. Upper bound from the stage table: decode + register setup is 198 of ~350
    cycles per entry, so specialisation could save at most ~55% of the per-entry cost, and only on the entries where the
-   host cannot already batch them (16-64 KiB entries are NoC-bound already: 54-66 GB/s at 64 KiB). Costs: overlay shipping
+   host cannot already batch them (16-64 KiB entries are NoC-bound already: 54-66 GB/s at 64 KiB). **Counter-evidence:** X6 (`dm::READ_FAST`,
+   a leaner NIU issue path) gained only 3-4% (17 ns of 0.48 us per request) and the log concludes the request's cost is
+   its round trip, with more requests in flight the lever ([X6 section](../learnings/performance-log.md#x6-mover-niu-fast-path-2026-10-10-card-0)); the 350-cycle stage table is ~0.26 us of the
+   measured 0.48 us. So this bound may be far from reachable; a probe with a hand-specialised read loop would settle it. Costs: overlay shipping
    and residency, a second build path, a function-table ABI. **Paper; not built.**
 6. **Role rebalancing.** (a) Swap to tt-metal's convention (NC reads, B writes): no expected gain, the cores cost the same.
    (b) Move control-plane entries (`KERNEL`, `LAUNCH`, barriers, pairs) to NC, which has 10 KB free, so B is only a reader:
