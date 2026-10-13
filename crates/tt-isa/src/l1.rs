@@ -40,6 +40,25 @@ pub const IMAGES: Region = Region {
     end: tensix::Core::NC.default_reset_pc() as u64 + 0x2000,
 };
 
+/// Where the three role images (T0 unpack, T1 math, T2 pack) are linked and
+/// loaded: packed against the end of the image area, each in a [`roles::SLOT`]
+/// reached through its core's reset-PC override (`Device::load_and_start` sets it
+/// for every core but B). The slots are what T0..T2's default reset PCs would
+/// leave -- 16 KiB each, of which the images used about half -- and the space
+/// they free goes to B's mover ([`dm::IMAGE_MAX`]), which cannot be moved: its
+/// entry point is L1 offset 0.
+pub mod roles {
+    use crate::tensix::Core;
+
+    /// One role image's slot.
+    pub const SLOT: u64 = 0x2800;
+    /// The end of the last slot: NC's default reset PC, where its stub lives.
+    pub const END: u64 = Core::NC.default_reset_pc() as u64;
+    /// The load address (and link address) of the T0, T1 and T2 role images.
+    pub const BASE: [u64; 3] = [END - 3 * SLOT, END - 2 * SLOT, END - SLOT];
+    const _: () = assert!(BASE[0] % 32 == 0);
+}
+
 /// The data mover's descriptor list, its transpose scratch slot, and the
 /// chunk a trace streams through (`dm::op::CALL`).
 pub const MOVER: Region = Region {
@@ -127,7 +146,7 @@ const _: () = assert!(ordered(&REGIONS));
 // The mover's mailbox, last of the four, ends where the program slots begin.
 const _: () = assert!(dm::MAILBOX_BASE + 0x100 <= MAILBOXES.end);
 // Every image fits its slot below the next core's reset PC.
-const _: () = assert!(tensix::Core::T0.default_reset_pc() as u64 == dm::IMAGE_BASE + dm::IMAGE_MAX);
+const _: () = assert!(roles::BASE[0] == dm::IMAGE_BASE + dm::IMAGE_MAX);
 // The data arena is slot- and DRAM-aligned at its base.
 const _: () = assert!(DATA.base % crate::dram::ALIGN == 0);
 

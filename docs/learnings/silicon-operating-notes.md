@@ -936,9 +936,22 @@ to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x
 faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
 matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
-## RISCV B's image has little room left (2026-10-13, ttsim and card 0)
+## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
-RISCV B's mover image (`dm_b`) may not pass `tt_isa::dm::IMAGE_MAX`, 0x6000 = 24,576 bytes: T0's default
+**Update 2026-10-13: B's slot is 42 KiB, not 24 KiB.** The role images moved (below); the measurements and
+lessons that follow were taken against the old 24,576-byte slot and still describe how code size moves.
+
+B's entry point is hardwired to L1 offset 0, so its image can only grow upward, up to whatever is placed next. That
+used to be T0's *default* reset PC (0x6000). The three role images use about 8 KB each, but each sat in a 16 KiB
+slot at its core's default reset PC; T0, T1 and T2 have reset-PC overrides, and `Device::load_held` sets one for
+every core but B. The role images are now linked at `tt_isa::l1::roles::BASE` (T0 `0xA800`, T1 `0xD000`, T2
+`0xF800`, 10 KiB slots ending at NC's reset PC), so `tt_isa::dm::IMAGE_MAX` is 43,008 bytes (`dm_b`: 24,404, so 18,604
+left). Only the production role images moved; probe images (`corpus`, `icache_t*`, ...) keep the default PCs and are
+never loaded beside the mover. Silicon is unchanged in speed ([performance-log.md](performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0)).
+Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller; `s` and `z` are not usable (mover 1.6x
+slower, role push loop 7x).
+
+Before the role images moved, RISCV B's mover image (`dm_b`) could not pass 0x6000 = 24,576 bytes: T0's default
 reset PC is where the next image starts, and B (entry hardwired at 0) has no reset-PC override. The link fails
 ("section '.text' will not fit in region 'L1'") rather than clobbering T0. Measured with `size -A` on the ELF
 (`.text` + `.rodata` + `.bss`; git `e17f4c9` plus the row select):
@@ -968,7 +981,7 @@ What the numbers taught (each from a build, not from reading code):
   `RUSTC_WORKSPACE_WRAPPER`, which clippy sets to `clippy-driver`. A change that fit a build overflowed the
   CI lint. It strips both now, so the firmware is the same bytes whoever builds it; firmware is linted on its own
   (`cargo clippy --manifest-path crates/tt-firmware/Cargo.toml ...`).
-- RISCV NC's image (`dm_nc`, 14,240 bytes of the same 24,576) has about 10 KB free.
+- RISCV NC's image (`dm_nc`, 14,240 bytes of its 24,576-byte slot, `dm::nc::IMAGE_MAX`) has about 10 KB free.
 
 **Open: a packed-BF16 row select** (roadmap, Track 2, "Gather without staging"). A BF16 face-row is 32 bytes at
 `TILE_DATA + face x 512 + row x 32`: congruent to `TILE_DATA` mod 64 (the GDDR read rule) only on an even row,
@@ -982,8 +995,7 @@ fails the same congruence for one of the two source parities. The candidates:
    record that reads the index tile, so each half of the staging needs its own index slot (B reads the next
    batch's indices while NC still writes the last), and the output's rows past `n` are not written, so its padding
    is `Undefined`.
-3. Make room in B: the unrolled `copy16`s of `tile_layout` (a cold path, 1.7 KB) are the obvious candidate and
-   want a silicon measurement of upload time before and after.
+3. Make room in B: no longer needed -- B's slot grew by 18 KiB (above), so the B-side branch (1) fits.
 
 ## Handling silicon runs
 

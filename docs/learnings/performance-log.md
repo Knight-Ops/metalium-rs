@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
 | [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
 | [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
 | [Accurate matmul cost](#accurate-matmul-cost-2026-10-12-card-0) | 2026-10-12 | opt-in F32-accuracy matmul on the Matrix Unit: 19x to 64x slower than the fast one; the element-wise work around the matmuls dominates |
@@ -280,6 +281,46 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Firmware image budget and core-assignment (2026-10-13, card 0)
+
+Why: `dm_b` had 172 bytes left of its 24,576 (silicon-operating-notes, "RISCV B's image has little room
+left"). Review and design space: [firmware-architecture-review.md](../proposals/firmware-architecture-review.md).
+Conditions: card 0, AICLK 1350 MHz, release, branch `fw-architecture-review` on `7f18dde`; the benches are
+`silicon_perf::mover_read_shapes` and `silicon_bench_path::null_kernel`, medians as those tests report them.
+Not measured here: live tt-metal/ttnn timings (the installed ttnn 0.72 needs SFPI 7.52.0 and the machine has
+7.83.0, so its JIT compile of the dispatch kernel fails; `/home/carl/projects/tt-metal-v077`'s ttnn hangs in device
+init). `crates/tt-tests/bench/ttnn_reference.py` is the script for when a matching toolchain exists.
+
+**Whole-image `opt-level`** (the Cargo profile of `crates/tt-firmware`; all five images change together):
+
+| opt-level | `dm_b` | `dm_nc` | `role_t0/1/2` | WAIT entry | 64 B read entry | 16 KiB reads | 64 KiB reads | 1024-NOP role, list begin->end | role push rate | run |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 3 (shipped) | 24,404 | 14,252 | 8,340 / 7,996 / 8,408 | 0.31 us | 0.48 us | 34.0 GB/s | 53.9 GB/s | 3,593 cycles | 2.91 cycles/word | `1791855052` |
+| 2 | 22,660 | 13,004 | 8,232 / 7,900 / 8,296 | 0.31 us | 0.48 us | 33.8 GB/s | 53.4 GB/s | 3,604 cycles | 2.93 cycles/word | `1791855317` |
+| s | 21,220 | 12,996 | 7,056 / 6,796 / 7,044 | 0.48 us | 0.76 us | 21.6 GB/s | 53.0 GB/s | 22,648 cycles | 21.05 cycles/word | `1791855151` |
+| z | 21,164 | 13,824 | 6,872 / 6,500 / 6,920 | 0.52 us | 0.83 us | 19.8 GB/s | 51.1 GB/s | 24,964 cycles | 23.2 cycles/word | `1791855234` |
+
+`opt-level` 2 costs nothing measurable and saves 1,744 bytes on `dm_b`; `s` and `z` save at most 3.2 KB and make
+the mover 1.6x slower per entry and the roles' instruction push about 7x slower (the push loop is the
+roles' whole job). Size optimisation is not a lever for the roles. `opt-level` 2 was measured on these two
+benches only, not adopted: the shipped profile stays at 3.
+
+**Repacked images (V3a), adopted.** The role images are linked in 10 KiB slots packed against NC's slot
+(`tt_isa::l1::roles`: T0 `0xA800`, T1 `0xD000`, T2 `0xF800`) instead of at the cores' default reset PCs;
+`Device::load_held` already sets the reset-PC override for every core but B, so the host needed no change. B's
+slot is now everything below T0's: `dm::IMAGE_MAX` 24,576 -> 43,008 bytes, **+18 KiB of room with the images
+byte-identical in size** (`dm_b` 24,404, 18,604 left). No arena or other region moved. Role images use 8.0-8.4 KB
+of their 10,240-byte slots. Silicon, same benches: WAIT 0.31 us, 64 B read 0.48 us, 16 KiB 33.7 GB/s, 64 KiB
+53.2 GB/s, 1024-NOP list 3,599 cycles, push rate 2.92 cycles/word (run `1791855559`): no change from the
+shipped layout. Smoke selection on card 0: 1,030 of 1,030 passed (run `1791855592`, one boot throughout).
+ttsim: `step16_dm`, `step52_nc_mover`, `step171_select_rows`, `step24_padding`.
+
+**Negative result: refusing the other direction's ops before decoding them** (`M.permits(w[0])` ahead of
+`Entry::decode` in `exec`, so each image could drop the decode arms it never runs). Predicted from symbol sizes:
+about 240 bytes on B, 1.9 KB on NC. Built: `dm_b` -4 bytes, `dm_nc` +96. LLVM already shares the decode arms, so
+the check only adds a compare chain. Reverted. Symbol-size estimates of what a check will remove are not
+evidence; measure the build.
+
 ## Row select: an embedding lookup without staging (2026-10-13, card 0)
 
 `select` along dimension 0 of a rank-2 F32, I32 or Bool table now runs `Session::select_rows`
@@ -323,7 +364,7 @@ after come from different cards (1, then 0); the with-lookup and without-lookup 
 
 BF16, F16 and BFP tables, tables of rank 3 and up, other dimensions, and `gather` with per-element indices still take
 the staged path (`gather_native`), and their gates pass unchanged on card 0 (run `1791852139`): `step167` BF16, six layers, 229 s (441 s in `1791848957`, a different load; the BF16 lookup was not touched), and all seven `step168` mixed-precision plans, 5 to 101 s each. The B image has no room for a packed-BF16 branch
-([silicon-operating-notes.md](silicon-operating-notes.md), "RISCV B's image has little room left").
+([silicon-operating-notes.md](silicon-operating-notes.md), "RISCV B's image budget").
 
 ## Model ladder: real models on the card (2026-10-12, cards 0 and 1)
 

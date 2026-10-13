@@ -53,7 +53,7 @@ kernel measurably shorter, and does that survive into op time?**
 - A scalar-free unary kind therefore fits a **build-time image per kind** with no run-time code
   generator. The row-loop body is about 300 words (about 1.2 KiB), which fits the ~4 KiB I-cache
   (`performance-log.md:357-370`); the whole precise-`gelu` program is about 9,200 words.
-- The T1 image is linked at 0xA000, LENGTH 0x4000 (`crates/tt-firmware/link_t1.x`).
+- The T1 image is linked in T1's role slot, 0xD000, LENGTH 0x2800 (`crates/tt-firmware/link_role_t1.x`; it was 0xA000, LENGTH 0x4000, `link_t1.x`, before the role images were repacked).
 
 ## Constraints that shape the plan
 

@@ -30,8 +30,11 @@ const _: () = assert!(MAILBOX_BASE % 16 == 0);
 /// Where the image is linked and loaded: RISCV B has no reset-PC override and
 /// always starts at L1 offset 0 (`tensix::Core::B`).
 pub const IMAGE_BASE: u64 = crate::tensix::Core::B.default_reset_pc() as u64;
-/// The image may not reach T0's default reset PC.
-pub const IMAGE_MAX: u64 = crate::tensix::Core::T0.default_reset_pc() as u64 - IMAGE_BASE;
+/// The image may not reach the first role image ([`crate::l1::roles`]): the
+/// three role images are packed against NC's slot with reset-PC overrides, so
+/// B's slot is everything below them rather than only what lies under T0's
+/// default reset PC.
+pub const IMAGE_MAX: u64 = crate::l1::roles::BASE[0] - IMAGE_BASE;
 
 // The runtime's own words (status, heartbeat, panic code) sit at the start of
 // the mailbox, as in every image (`crate::mailbox::offset`); the descriptor

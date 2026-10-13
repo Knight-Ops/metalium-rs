@@ -111,7 +111,7 @@ unchallenged.
 | L1 is shared by the five cores and reachable from other tiles over the NoC | both | Part 1 | C | |
 | L1 holds kernel code and CBs | both | Part 1 | C | `l1.rs` regions |
 | tt-metal mailbox at L1 offset 16, 12 768 B (`dev_msgs_t`, runtime args, sync flags, NCRISC halt SP at +4) | WH tt-metal | Part 1 | A (software) | tt-metal BH: ARC FW scratch at 16, **inline-write staging at 32..95** (16 B per NoC per mover), mailbox at 96, 13 440 B. Ours: `MAILBOX_BASE = 0x10_0000` (`mailbox.rs:12`), images from 0 to `0x14000` (`l1.rs:35-41`). We are not bound by theirs. |
-| Firmware and kernel space: B 6 KB fw + 48 KB kernel; NC 2 KB fw + 16 KB IRAM; TRISC 1.5 KB fw + 24 KB kernel | WH tt-metal | Part 1 | X for BH | BH tt-metal: firmware 6 KiB + 2.5 KiB for B and 2.5 KiB for each other core, kernels up to 1497 KiB from L1. Ours: fixed slots between reset PCs (`tensix.rs:50-57`): B 24 KiB, T0..T2 16 KiB each, NC 8 KiB. |
+| Firmware and kernel space: B 6 KB fw + 48 KB kernel; NC 2 KB fw + 16 KB IRAM; TRISC 1.5 KB fw + 24 KB kernel | WH tt-metal | Part 1 | X for BH | BH tt-metal: firmware slots 8.5 KiB for B and 2.5 KiB for each other core (measured `.text`: BRISC ~4.8 KB, NCRISC ~1.2 KB, TRISC ~0.6-1.1 KB), kernels up to 1497 KiB from L1, in a ~69 KB config ring. Ours (2026-10-13): B's slot 42 KiB (`dm::IMAGE_MAX`), the role images in 10 KiB slots packed against NC's (`tt_isa::l1::roles`, via reset-PC overrides), NC's mover 24 KiB (`dm::nc::IMAGE_MAX`). |
 
 ### 2.4 Reset, boot and caches
 

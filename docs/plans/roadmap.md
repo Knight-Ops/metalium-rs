@@ -350,8 +350,8 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   the lookup about 1.4 ms of it (`1791852097`): a decoded token is the host-bound 24x of item 3 again. Burn's own
   select, gather, embedding and index tests: 200 of 200 on ttsim, plain and under `Fusion<TtBackend>`, `--strict`.
   **Left:** BF16, F16 and BFP tables, rank 3 and up, other dims and `gather` with per-element indices still stage
-  (item 5 and the entry below). Cost to know: the mover image has 172 bytes left of its 24 KiB
-  ([operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-has-little-room-left-2026-10-13-ttsim-and-card-0));
+  (item 5 and the entry below). Cost to know: the mover image had 172 bytes left of its 24 KiB (since raised to 42 KiB by repacking the role images, which unblocks a B-side packed-BF16 branch)
+  ([operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-budget-2026-10-13-ttsim-and-card-0));
   also found: `cargo clippy` inflated every firmware image by 900 bytes (`build.rs` now strips `RUSTC_WORKSPACE_WRAPPER`).
 - [ ] **2. Chunk-free convolution and pooling (ResNet-18: 16.3 s, 105x).** Convolution issues one `float_matmul`
   per 32 output positions, each with a host-built patch gather (`ops/conv.rs:5,181-192`: a 56x56 convolution is 98
@@ -373,12 +373,19 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
   BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the
   half) and the other options are in the
-  [operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-has-little-room-left-2026-10-13-ttsim-and-card-0).
+  [operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-budget-2026-10-13-ttsim-and-card-0).
 - [ ] **6. Traced execution of the three models.** Not measured: a decode step is the host cost a trace removes, but
   trace segmentation (next item) is open and a forward this size does not fit the 240 KB program cache. Record
   traced against untraced rows for ResNet-18, ViT-Tiny and a decode step once segmentation lands.
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
+- [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),
+  [measurements](../learnings/performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0)). The role
+  images are repacked into 10 KiB slots (`tt_isa::l1::roles`), so B's mover slot is 42 KiB, not 24: 18 KiB free, same speed
+  (smoke 1,030 of 1,030, run `1791855592`). Found: `opt-level` 2 is as fast as 3 and 1.7 KB smaller (measured on two
+  benches); `s`/`z` slow the mover 1.6x and the roles' push loop 7x. **Left:** an end-to-end check of `opt-level` 2, then adopt
+  it; the loadable-kernel prototype (only if mover per-entry cost becomes the bottleneck: it is not today); live tt-metal
+  timings once a ttnn whose SFPI matches the machine's is available (`crates/tt-tests/bench/ttnn_reference.py`).
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).

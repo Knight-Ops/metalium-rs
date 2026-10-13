@@ -15,27 +15,29 @@ use tt_isa::tensix::Core;
 pub type Image = (Core, &'static [u8], u64);
 
 /// Where `link.x` places an image: RISCV T0's default reset PC, which every
-/// image but the T1 and T2 role images uses (`crates/tt-firmware/build.rs`).
+/// image but the role images and the per-core probes uses
+/// (`crates/tt-firmware/build.rs`).
 pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
 
 /// The three role images of the LLK-shaped datapath -- unpack on T0, math on
-/// T1, pack on T2 -- each linked at its core's default reset PC, so all three fit
-/// in one tile's L1 at once and none needs a reset-PC override.
+/// T1, pack on T2 -- each linked at its own slot (`tt_isa::l1::roles`), so all
+/// three fit in one tile's L1 at once alongside the mover and each starts
+/// through its reset-PC override.
 pub const ROLES: [Image; 3] = [
     (
         Core::T0,
         include_bytes!(env!("FIRMWARE_ROLE_T0")),
-        Core::T0.default_reset_pc() as u64,
+        tt_isa::l1::roles::BASE[0],
     ),
     (
         Core::T1,
         include_bytes!(env!("FIRMWARE_ROLE_T1")),
-        Core::T1.default_reset_pc() as u64,
+        tt_isa::l1::roles::BASE[1],
     ),
     (
         Core::T2,
         include_bytes!(env!("FIRMWARE_ROLE_T2")),
-        Core::T2.default_reset_pc() as u64,
+        tt_isa::l1::roles::BASE[2],
     ),
 ];
 
@@ -141,7 +143,7 @@ pub const ICACHE_T: [Image; 3] = [
 pub const TTINSN_T1: Image = (
     Core::T1,
     include_bytes!(env!("FIRMWARE_TTINSN_T1")),
-    Core::T1.default_reset_pc() as u64,
+    tt_isa::l1::roles::BASE[1],
 );
 
 /// The ELF entry points `build.rs` read, by image name.
@@ -198,7 +200,11 @@ mod tests {
             assert_eq!(
                 entry(name).map(u64::from),
                 Some(*at),
-                "{name} is linked away from {core:?}'s default reset PC"
+                "{name} is linked away from {core:?}'s slot"
+            );
+            assert!(
+                image.len() as u64 <= tt_isa::l1::roles::SLOT,
+                "{name} outgrew its slot"
             );
         }
     }
@@ -210,7 +216,7 @@ mod tests {
         assert_eq!(
             entry("ttinsn_t1").map(u64::from),
             Some(TTINSN_T1.2),
-            "ttinsn_t1 is linked away from T1's default reset PC"
+            "ttinsn_t1 is linked away from T1's slot"
         );
     }
 
@@ -232,7 +238,7 @@ mod tests {
     }
 
     /// B cannot be redirected, so its image must be linked at 0 and stay below
-    /// T0's entry point.
+    /// the first role image.
     #[test]
     fn the_data_mover_is_linked_where_b_starts() {
         for (name, (core, image, at)) in [

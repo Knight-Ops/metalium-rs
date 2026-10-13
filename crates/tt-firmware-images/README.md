@@ -8,7 +8,7 @@ gets the role images from a crate it can depend on, not from the test harness.
 
 | Item | Image |
 |---|---|
-| `ROLES: [Image; 3]` | Unpack (T0), math (T1), pack (T2), each at its core's default reset PC. What `tt_kernels::runtime` and `Session` load. |
+| `ROLES: [Image; 3]` | Unpack (T0), math (T1), pack (T2), each in its slot of `tt_isa::l1::roles`. What `tt_kernels::runtime` and `Session` load. |
 | `DM_B: Image` | The RISCV B data mover, loaded at `tt_isa::dm::IMAGE_BASE` (L1 offset 0). |
 | `ETH_E1` | The Ethernet E1 mover, loaded at `tt_isa::eth::E1_IMAGE`. |
 | `CORPUS`, `CORPUS_T0` | The single-thread program runner for T1 (ttsim) and T0 (silicon). |
