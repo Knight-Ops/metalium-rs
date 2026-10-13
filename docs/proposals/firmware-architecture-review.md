@@ -102,7 +102,9 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    moved. 1.7 KB for free.
 3. Do not build overlays (5) for size. Build the V5 prototype only if per-entry mover cost becomes the measured bottleneck;
    today the host is.
-4. Prioritise by what the numbers say: dispatch/host submission (8) > fewer pushed words (7) > mover specialisation (5)
+4. Use SFPI only as a development oracle for SFPU encodings and instruction counts, not as a build dependency
+   ([recipe and a checked example](../plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only)).
+5. Prioritise by what the numbers say: dispatch/host submission (8) > fewer pushed words (7) > mover specialisation (5)
    > core reshuffling (6).
 
 ## What was not built, and the evidence gap

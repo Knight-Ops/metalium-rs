@@ -169,6 +169,12 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   for exact program results and derive approximation bounds beside the gate.
   Cover signed zeros, subnormals, NaNs, infinities and extremes. Preserve stated
   accumulation order; `SFPMAD` is not IEEE fused multiply-add.
+- SFPI (Tenstorrent's GCC toolchain, `riscv-tt-elf-g++`, which compiles C++ `vFloat` kernels to SFPU
+  instructions) is a development-only cross-check of SFPU encodings and instruction counts, in the
+  same class as the C/C++ specification models: never a dependency of a shipped crate, never the only
+  oracle (the specification models still predict results), and any gate that runs it must first pin its
+  version and hash in `PINS.toml`. No gate uses it yet. Recipe:
+  [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only).
 - New ops need an independent oracle, a simulator gate with a meaningful
   negative control, silicon validation on one card (both only for
   mesh/multi-card ops), native Burn routing,
