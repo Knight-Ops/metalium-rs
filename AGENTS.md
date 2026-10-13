@@ -99,8 +99,11 @@ cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
 ```
 
 The mover has two read modes (`fast-reads`, see below); a change to `mover.rs` or `tt_isa::dm::encoded`
-is run through the encoded-read gate in both: `cargo test -p tt-tests --test step172_encoded_reads` and
-the same with `--features tt-tests/fast-reads` (and `tt-tests/encoded-guard`).
+is run through the encoded-read gate and the differential gate in both: `cargo test -p tt-tests --test
+step172_encoded_reads --test step173_mover_differential` and the same with `--features tt-tests/fast-reads` (and
+`tt-tests/encoded-guard`). An encoded read's checksum is bound to a per-start key, the tile, the chip and the op
+(`encoded::Context`); the host's `validate` also runs the independent `guard`; `enqueue_checked` validates every
+`READ_ENCODED`, and only the `#[doc(hidden)] enqueue_raw` sends an entry unchecked (for gates that forge one).
 
 Arithmetic, routing or execution-order changes also need the training regression:
 

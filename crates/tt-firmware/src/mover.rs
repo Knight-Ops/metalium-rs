@@ -426,7 +426,7 @@ const CAPS: u32 = dm::caps::VALID
 #[inline(never)]
 fn read_encoded(me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
     reader_only()?;
-    if !encoded::verify(&e) {
+    if !encoded::verify_with(&e, unsafe { ENCODE_SEED }) {
         return Err(dm::error::ENCODED);
     }
     if ENCODED_GUARD {
@@ -814,6 +814,20 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
 const IS_CALL: u32 = u32::MAX;
 
 static mut CALL_BASE: u32 = 0;
+/// The seed of an encoded read's checksum (`encoded::context_seed`): this mover's key, tile,
+/// chip and op, set once at boot; flipped by `encoded::TRACE_DOMAIN` while a trace replays,
+/// so an encoded read inside a trace fails its check.
+static mut ENCODE_SEED: u32 = 0;
+
+/// Enter or leave a trace's domain of [`ENCODE_SEED`] (a safe image has none).
+#[inline(always)]
+fn flip_trace_domain() {
+    if FAST_READS {
+        unsafe {
+            ENCODE_SEED ^= encoded::TRACE_DOMAIN;
+        }
+    }
+}
 static mut PAIR_ACTIVE: bool = false;
 static mut TRACE_DEPTH: u32 = 0;
 
@@ -1089,7 +1103,9 @@ fn call(
         unsafe {
             CALL_BASE = generation_base;
         }
+        flip_trace_domain();
         let result = run_entries(me, usable, chunk, n);
+        flip_trace_domain();
         unsafe {
             CALL_BASE = previous;
         }
@@ -1117,6 +1133,12 @@ pub extern "Rust" fn firmware_main() -> ! {
         };
     }
     let usable = rd(M.at(dm::USABLE));
+    if FAST_READS {
+        unsafe {
+            ENCODE_SEED =
+                encoded::context_seed(rd(M.at(dm::ENCODE_KEY)), me, usable, op::READ_ENCODED);
+        }
+    }
     let mut beat: u32 = 0;
     noc::set_clock(wall_clock);
     let mut stalls = noc::stalls();

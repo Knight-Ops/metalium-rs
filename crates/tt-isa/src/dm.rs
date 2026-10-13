@@ -156,7 +156,14 @@ const _: () = assert!(TRACE_PROGRESS + 4 <= READ_FAST);
 /// reads it instead of assuming which firmware it loaded.
 pub const CAPS: u64 = MAILBOX_BASE + 0xEC;
 const _: () = assert!(READ_FAST + 4 <= CAPS);
-const _: () = assert!(CAPS + 4 <= MAILBOX_BASE + 0x100);
+
+/// Host -> mover: the key the checksum of a host-encoded read is bound to
+/// ([`encoded::context_seed`]), written before the image starts and read once at boot.
+/// A fresh random word each start, so an encoded entry left in L1 by an earlier run, or
+/// made for another mover, fails the card's check. Ignored by an image without `fast-reads`.
+pub const ENCODE_KEY: u64 = MAILBOX_BASE + 0xF0;
+const _: () = assert!(CAPS + 4 <= ENCODE_KEY);
+const _: () = assert!(ENCODE_KEY + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`CAPS`]'s bits.
 pub mod caps {

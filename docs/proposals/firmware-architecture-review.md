@@ -133,8 +133,10 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    16 queued small matmuls 10% an op, a 512^3 matmul and the copy and aggregate benchmarks unchanged. Freshly uploaded
    lists gain 1.35x, since the 32-byte upload (~300 cycles an entry) is now larger than the card's time. What it gives up: in
    fast mode the card no longer re-derives a read, so an encoder bug that produces a consistent, wrong entry reaches the NIU
-   unless `encoded-guard` is built (a checksum sees damage and forgeries, not that). Trace lists in GDDR still hold plain
-   entries, and records (most of a streaming op's reads) are untouched.
+   unless `encoded-guard` is built (a checksum sees damage and forgeries, not that). The checksum is bound to a per-start key,
+   the tile, the chip and the op, so an entry from an earlier run or another mover fails it, and the host's `validate` also runs
+   the independent `guard` (both builds; [phase 1](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0)).
+   Trace lists in GDDR still hold plain entries, and records (most of a streaming op's reads) are untouched.
 6. **Role rebalancing.** (a) Swap to tt-metal's convention (NC reads, B writes): no expected gain, the cores cost the same.
    (b) Move control-plane entries (`KERNEL`, `LAUNCH`, barriers, pairs) to NC, which has 10 KB free, so B is only a reader:
    unmeasured and constrained by NoC endpoint ownership (SYS-1419: each GDDR endpoint is owned by one NoC; NC's reset

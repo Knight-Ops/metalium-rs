@@ -102,6 +102,7 @@ pub const SMOKE: &[&str] = &[
     // The B mover's read mode, whichever way the firmware was built: the safe image's
     // refusals, or with `--feature fast-reads` the encoded reads' (step172).
     "step172_encoded_reads::",
+    "step173_mover_differential::",
     "step19_eltwise::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",

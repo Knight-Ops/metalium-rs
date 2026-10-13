@@ -11,18 +11,28 @@
 //! ```
 //!
 //! `TAG` and `CTRL` of a B read are constants the card supplies ([`TAG`], [`CTRL`]),
-//! so they are not carried; the freed word is [`check`], an integrity word over the rest.
+//! so they are not carried; the freed word is [`check_with`], an integrity word over the rest.
 //!
 //! **Who checks what.** [`validate`] is the whole check, on the host: the entry must
 //! equal, word for word, what [`encode`] makes (from `Descriptor::decode` and
-//! `DramMove`, the code the mover itself ran) for some valid plain `READ`. The card
-//! verifies only [`check`], a few ALU operations: it refuses an entry damaged on its way
-//! to L1 or overwritten there, and an entry that did not come from [`encode`] (a hand-made
-//! one has the right check only by deliberately computing it). What a checksum cannot
-//! catch is an entry that is consistent and wrong, which only a bug in [`encode`] makes;
-//! [`guard`] is the independent card-side check for that (constant-time compares and a
-//! usable-endpoint bitmap staged at [`ENDPOINTS`]), built only with the `encoded-guard`
-//! feature, ~50 cycles an entry.
+//! `DramMove`, the code the mover itself ran) for some valid plain `READ`, and must also
+//! pass [`guard`], the independent semantic check, so a bug that made `encode` and
+//! `validate` agree on a wrong request is still refused. The card verifies only the
+//! checksum, a few ALU operations: it refuses an entry damaged on its way to L1 or
+//! overwritten there, and an entry that did not come from [`encode`] (a hand-made one has
+//! the right check only by deliberately computing it).
+//!
+//! **The checksum is bound to a context** ([`Context::seed`]): a random key the host wrote
+//! when it started this mover, the tile, the usable-channel mask and the op. An entry
+//! encoded for another mover instance (an earlier run's list left in L1), another tile or chip,
+//! or another op fails the check, and a trace replay uses a different domain, so an encoded
+//! entry inside a trace fails it. This is a binding against mix-ups, not a MAC: whoever can
+//! write L1 can read the key.
+//!
+//! What a checksum cannot catch is an entry that is consistent and wrong, which only a bug in
+//! [`encode`] makes; [`guard`] is the independent card-side check for that (constant-time
+//! compares and a usable-endpoint bitmap staged at [`ENDPOINTS`]), built only with the
+//! `encoded-guard` feature, ~40 cycles an entry.
 //!
 //! One request per entry: a read longer than `MAX_REQUEST_BYTES` stays a plain entry
 //! (its decode is amortised over its requests anyway).
@@ -49,26 +59,74 @@ pub const TAG: u32 = (TXN_B as u32) << 10;
 /// `NOC_CTRL` of a read request, as `DramMove` makes it.
 pub const CTRL: u32 = CMD_RD | RESP_MARKED | STATIC_VC_1;
 
-/// Word index of [`check`] in an encoded entry.
+/// Word index of the checksum in an encoded entry.
 pub const CHECK_WORD: usize = 5;
-/// Added into [`check`] so an entry of zeros is not its own checksum.
+/// Mixed into every [`context_seed`] so an all-zero context is not its own checksum.
 const CHECK_SEED: u32 = 0x9E37_79B9;
+/// What a trace replay (`CALL`) flips in the seed: no encoded entry a host sent as
+/// a list entry verifies inside a trace, and the host never encodes one there.
+pub const TRACE_DOMAIN: u32 = 0x5A5A_C3C3;
 
-/// The integrity word over an entry's other words (all but the op and the check itself):
-/// each multiplied by its own odd constant and XORed, so a change to any one word changes
-/// it (an odd multiplier is a bijection of `u32`), and so, in practice, does swapping two
-/// words -- the check word with one of them included, which is why no word is left unmixed
-/// (found by `the_checksum_catches_damage`). Multiplies, not rotations: a rotation is three
-/// instructions on these cores and a multiply one.
+/// The seed of a checksum for `op` on the tile at `me` of a chip whose usable channels are `usable`,
+/// for a mover the host keyed with `key`. A bijection of `key` for any other three, and of the
+/// others for any `key`, so two contexts never share a seed.
+pub const fn context_seed(key: u32, me: (u8, u8), usable: u32, op: u32) -> u32 {
+    let ctx = me.0 as u32 | (me.1 as u32) << 8 | (usable & 0xFF) << 16 | (op & 0xFF) << 24;
+    (key ^ ctx).wrapping_mul(0x9E37_79B1) ^ CHECK_SEED
+}
+
+/// The integrity word over an entry's other words (all but the op and the check itself),
+/// started from `seed` ([`context_seed`]): each word multiplied by its own odd constant and
+/// XORed, so a change to any one word changes it (an odd multiplier is a bijection of
+/// `u32`), and so, in practice, does swapping two words -- the check word with one of them
+/// included, which is why no word is left unmixed (found by `the_checksum_catches_damage`).
+/// Multiplies, not rotations: a rotation is three instructions on these cores and a multiply one.
 #[inline(always)]
-pub const fn check(e: &[u32; 8]) -> u32 {
+pub const fn check_with(e: &[u32; 8], seed: u32) -> u32 {
     e[1].wrapping_mul(0x9E37_79B1)
         ^ e[2].wrapping_mul(0x85EB_CA77)
         ^ e[3].wrapping_mul(0xC2B2_AE3D)
         ^ e[4].wrapping_mul(0x27D4_EB2F)
         ^ e[6].wrapping_mul(0x1656_67B1)
         ^ e[7].wrapping_mul(0xD3A2_646D)
-        ^ CHECK_SEED
+        ^ seed
+}
+
+/// What the host knows about the mover an entry is for: the chip's usable channels, the tile
+/// the mover runs on, and the key written to its mailbox ([`super::ENCODE_KEY`]) when it started.
+/// Holds the endpoint bitmap [`guard`] needs, built once.
+#[derive(Clone)]
+pub struct Context {
+    pub usable: u32,
+    pub me: (u8, u8),
+    pub key: u32,
+    bitmap: [u32; ENDPOINT_WORDS],
+}
+
+impl Context {
+    pub fn new(usable: u32, me: (u8, u8), key: u32) -> Self {
+        Context {
+            usable,
+            me,
+            key,
+            bitmap: endpoint_bitmap(usable),
+        }
+    }
+
+    /// The seed for `op`'s checksums in this context.
+    pub const fn seed(&self, op: u32) -> u32 {
+        context_seed(self.key, self.me, self.usable, op)
+    }
+
+    /// The bitmap of usable read targets the card holds at [`ENDPOINTS`].
+    pub fn bitmap(&self) -> &[u32; ENDPOINT_WORDS] {
+        &self.bitmap
+    }
+
+    /// Whether `hi` (a `TARG_ADDR_HI`) is in the bitmap.
+    fn endpoint_ok(&self, hi: u32) -> bool {
+        self.bitmap[(hi / 32) as usize % ENDPOINT_WORDS] >> (hi % 32) & 1 != 0
+    }
 }
 
 /// `TARG_ADDR_HI` / `RET_ADDR_HI` for the tile at `(x, y)`.
@@ -94,7 +152,8 @@ pub fn endpoint_bitmap(usable: u32) -> [u32; ENDPOINT_WORDS] {
 /// A plain `READ` entry as an encoded one, for the tile at `me`. `Ok(None)` if
 /// `entry` is not a `READ` of at most one request (it stays as it is); `Err` if it
 /// is a `READ` the mover would refuse.
-pub fn encode(usable: u32, me: (u8, u8), entry: [u32; 8]) -> Result<Option<[u32; 8]>, u32> {
+pub fn encode(ctx: &Context, entry: [u32; 8]) -> Result<Option<[u32; 8]>, u32> {
+    let (usable, me) = (ctx.usable, ctx.me);
     if entry[0] != op::READ {
         return Ok(None);
     }
@@ -132,13 +191,14 @@ pub fn encode(usable: u32, me: (u8, u8), entry: [u32; 8]) -> Result<Option<[u32;
         0,
         r.len,
     ];
-    e[CHECK_WORD] = check(&e);
+    e[CHECK_WORD] = check_with(&e, ctx.seed(op::READ_ENCODED));
     Ok(Some(e))
 }
 
 /// The host's full check of an encoded entry: it equals what [`encode`] makes for
-/// some valid plain `READ` on this chip, for the tile at `me`.
-pub fn validate(usable: u32, me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
+/// some valid plain `READ` in this context, and it passes [`guard`] -- two checks that share
+/// no code, so an encoder that agrees with this function about a wrong request is still caught.
+pub fn validate(ctx: &Context, e: [u32; 8]) -> Result<(), u32> {
     if e[0] != op::READ_ENCODED {
         return Err(error::OP);
     }
@@ -147,18 +207,25 @@ pub fn validate(usable: u32, me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
     for channel in 0..CHANNELS as u32 {
         for port in 0..PORTS as u32 {
             let plain = [op::READ, channel, port, e[1], e[3], e[7], 0, 0];
-            if encode(usable, me, plain) == Ok(Some(e)) {
-                return Ok(());
+            if encode(ctx, plain) == Ok(Some(e)) {
+                return if guard(&e, endpoint_hi(ctx.me.0, ctx.me.1), |hi| {
+                    ctx.endpoint_ok(hi)
+                }) {
+                    Ok(())
+                } else {
+                    Err(error::ENCODED)
+                };
             }
         }
     }
     Err(error::ENCODED)
 }
 
-/// The card's integrity check of an encoded entry.
+/// The card's integrity check of an encoded entry, against the seed it computed when it started
+/// (`context_seed(.., op::READ_ENCODED)`, flipped by [`TRACE_DOMAIN`] in a trace).
 #[inline(always)]
-pub const fn verify(e: &[u32; 8]) -> bool {
-    e[CHECK_WORD] == check(e)
+pub const fn verify_with(e: &[u32; 8], seed: u32) -> bool {
+    e[CHECK_WORD] == check_with(e, seed)
 }
 
 /// The optional semantic check, for the `encoded-guard` build: constant time, no loops,
@@ -188,6 +255,20 @@ mod tests {
     use super::*;
 
     const ME: (u8, u8) = (1, 2);
+    const KEY: u32 = 0xC0FF_EE11;
+
+    fn ctx() -> Context {
+        Context::new(0xFF, ME, KEY)
+    }
+
+    /// The checksum in `ctx()`: what a forger who knows the key, or a bug in `encode`, computes.
+    fn check(e: &[u32; 8]) -> u32 {
+        check_with(e, ctx().seed(op::READ_ENCODED))
+    }
+
+    fn verify(e: &[u32; 8]) -> bool {
+        verify_with(e, ctx().seed(op::READ_ENCODED))
+    }
 
     fn plain(channel: u32, port: u32, offset: u32, l1: u32, len: u32) -> [u32; 8] {
         [op::READ, channel, port, offset, l1, len, 0, 0]
@@ -198,7 +279,7 @@ mod tests {
     }
 
     fn good() -> [u32; 8] {
-        encode(0xFF, ME, plain(1, 0, 0x1000, 0x2_1000, 4096))
+        encode(&ctx(), plain(1, 0, 0x1000, 0x2_1000, 4096))
             .unwrap()
             .unwrap()
     }
@@ -218,7 +299,7 @@ mod tests {
         assert_eq!((e[6], e[7]), (0, 4096));
         assert_eq!(e[4], endpoint_hi(ME.0, ME.1));
         assert!(verify(&e));
-        assert_eq!(validate(0xFF, ME, e), Ok(()));
+        assert_eq!(validate(&ctx(), e), Ok(()));
         // What the card supplies in place of the two words the entry does not carry is
         // exactly what `DramMove` makes.
         let t = TxnId::new(TXN_B).unwrap();
@@ -238,27 +319,27 @@ mod tests {
 
     #[test]
     fn what_is_not_a_single_request_read_stays_plain() {
-        assert_eq!(encode(0xFF, ME, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]), Ok(None));
+        assert_eq!(encode(&ctx(), [op::WAIT, 0, 0, 0, 0, 0, 0, 0]), Ok(None));
         assert_eq!(
-            encode(0xFF, ME, plain(0, 0, 0, 0x2_0000, MAX_REQUEST_BYTES + 64)),
+            encode(&ctx(), plain(0, 0, 0, 0x2_0000, MAX_REQUEST_BYTES + 64)),
             Ok(None)
         );
         // ... and what the mover would refuse is refused, with its code.
         assert_eq!(
-            encode(0xFF, ME, plain(9, 0, 0, 0x2_0000, 64)),
+            encode(&ctx(), plain(9, 0, 0, 0x2_0000, 64)),
             Err(error::RANGE)
         );
         assert_eq!(
-            encode(0xFF, ME, plain(0, 0, 0x40, 0x2_0020, 64)),
+            encode(&ctx(), plain(0, 0, 0x40, 0x2_0020, 64)),
             Err(error::ALIGNMENT)
         );
         assert_eq!(
-            encode(0xFF, ME, plain(0, 0, 0, 0x2_0000, 0)),
+            encode(&ctx(), plain(0, 0, 0, 0x2_0000, 0)),
             Err(error::LENGTH)
         );
         // A channel the chip does not report usable.
         assert_eq!(
-            encode(0xFE, ME, plain(0, 0, 0, 0x2_0000, 64)),
+            encode(&Context::new(0xFE, ME, KEY), plain(0, 0, 0, 0x2_0000, 64)),
             Err(error::RANGE)
         );
     }
@@ -296,6 +377,78 @@ mod tests {
             0,
             4096
         ]));
+    }
+
+    /// An entry made for one mover verifies for no other: not after a restart (a new key), not on
+    /// another tile or chip, not as another op, and not in a trace's domain.
+    #[test]
+    fn an_entry_is_bound_to_the_mover_it_was_made_for() {
+        let e = good();
+        let seed = ctx().seed(op::READ_ENCODED);
+        assert!(verify_with(&e, seed));
+        let others = [
+            (
+                "another key",
+                context_seed(KEY ^ 1, ME, 0xFF, op::READ_ENCODED),
+            ),
+            (
+                "another x",
+                context_seed(KEY, (ME.0 + 1, ME.1), 0xFF, op::READ_ENCODED),
+            ),
+            (
+                "another y",
+                context_seed(KEY, (ME.0, ME.1 + 1), 0xFF, op::READ_ENCODED),
+            ),
+            (
+                "another chip",
+                context_seed(KEY, ME, 0xFE, op::READ_ENCODED),
+            ),
+            ("another op", context_seed(KEY, ME, 0xFF, op::READ)),
+            ("a trace", seed ^ TRACE_DOMAIN),
+        ];
+        for (what, other) in others {
+            assert!(!verify_with(&e, other), "an entry verified for {what}");
+        }
+        // The host refuses it the same way: it validates in its own context.
+        assert!(validate(&Context::new(0xFF, ME, KEY ^ 1), e).is_err());
+        assert!(validate(&Context::new(0xFF, (ME.0 + 1, ME.1), KEY), e).is_err());
+    }
+
+    /// No two contexts share a seed: one flipped bit of any component changes it.
+    #[test]
+    fn a_seed_depends_on_every_bit_of_its_context() {
+        let seed =
+            |key: u32, x: u8, y: u8, usable: u32, o: u32| context_seed(key, (x, y), usable, o);
+        let base = seed(KEY, 1, 2, 0xFF, op::READ_ENCODED);
+        for bit in 0..32 {
+            assert_ne!(
+                seed(KEY ^ 1 << bit, 1, 2, 0xFF, op::READ_ENCODED),
+                base,
+                "key {bit}"
+            );
+        }
+        for bit in 0..8 {
+            assert_ne!(
+                seed(KEY, 1 ^ 1 << bit, 2, 0xFF, op::READ_ENCODED),
+                base,
+                "x {bit}"
+            );
+            assert_ne!(
+                seed(KEY, 1, 2 ^ 1 << bit, 0xFF, op::READ_ENCODED),
+                base,
+                "y {bit}"
+            );
+            assert_ne!(
+                seed(KEY, 1, 2, 0xFF ^ 1 << bit, op::READ_ENCODED),
+                base,
+                "usable {bit}"
+            );
+            assert_ne!(
+                seed(KEY, 1, 2, 0xFF, op::READ_ENCODED ^ 1 << bit),
+                base,
+                "op {bit}"
+            );
+        }
     }
 
     /// The same over many entries, not the one: single-bit damage and swaps of every pair of
@@ -361,15 +514,18 @@ mod tests {
                 "{what}: the forged entry should carry a good check"
             );
             assert!(
-                validate(0xFF, ME, bad).is_err(),
+                validate(&ctx(), bad).is_err(),
                 "validate let through {what}: {bad:x?}"
             );
         }
         // A channel the chip does not report usable.
-        assert_eq!(validate(0xFD, ME, good()), Err(error::ENCODED));
+        assert_eq!(
+            validate(&Context::new(0xFD, ME, KEY), good()),
+            Err(error::ENCODED)
+        );
         // And a plain entry is not an encoded one.
         assert_eq!(
-            validate(0xFF, ME, plain(1, 0, 0, 0x2_0000, 64)),
+            validate(&ctx(), plain(1, 0, 0, 0x2_0000, 64)),
             Err(error::OP)
         );
     }
@@ -383,10 +539,8 @@ mod tests {
             (4, 1, 0x40, 0xF_F000 + 0x40, 2048),
             (2, 0, 0, 0x2_0000, MAX_REQUEST_BYTES),
         ] {
-            let e = encode(0xFF, ME, plain(c, p, off, l1, len))
-                .unwrap()
-                .unwrap();
-            assert_eq!(validate(0xFF, ME, e), Ok(()), "{e:x?}");
+            let e = encode(&ctx(), plain(c, p, off, l1, len)).unwrap().unwrap();
+            assert_eq!(validate(&ctx(), e), Ok(()), "{e:x?}");
             assert!(verify(&e));
             assert!(guard(&e, endpoint_hi(ME.0, ME.1), ok_bit(&bits)), "{e:x?}");
         }
@@ -481,6 +635,7 @@ mod fuzz {
             .unwrap_or(default)
     }
 
+    const KEY: u32 = 0x5EED_1234;
     const CHANNEL: u32 = crate::dram::CHANNEL_BYTES as u32;
     const MAX_REQ: u32 = MAX_REQUEST_BYTES;
 
@@ -577,7 +732,8 @@ mod fuzz {
         let (mut accepted, mut refused, mut long) = (0u64, 0u64, 0u64);
         for _ in 0..iters(100_000) {
             let (usable, me, e) = plain_case(&mut r);
-            let got = encode(usable, me, e);
+            let ctx = Context::new(usable, me, KEY);
+            let got = encode(&ctx, e);
             match oracle(usable, me, e) {
                 Err(code) => {
                     assert!(
@@ -597,13 +753,9 @@ mod fuzz {
                 Ok(Some([targ, targ_hi, ret, ret_hi, tag, ctrl, len])) => {
                     assert_eq!((tag, ctrl), (TAG, CTRL), "{e:x?}");
                     let mut want = [op::READ_ENCODED, targ, targ_hi, ret, ret_hi, 0, 0, len];
-                    want[CHECK_WORD] = check(&want);
+                    want[CHECK_WORD] = check_with(&want, ctx.seed(op::READ_ENCODED));
                     assert_eq!(got, Ok(Some(want)), "{usable:#x} {me:?} {e:x?}");
-                    assert_eq!(
-                        validate(usable, me, want),
-                        Ok(()),
-                        "{usable:#x} {me:?} {want:x?}"
-                    );
+                    assert_eq!(validate(&ctx, want), Ok(()), "{usable:#x} {me:?} {want:x?}");
                     accepted += 1;
                 }
             }
@@ -629,7 +781,8 @@ mod fuzz {
             0,
             r.below(40_000) as u32,
         ];
-        let mut e = match encode(usable, me, p) {
+        let ctx = Context::new(usable, me, KEY);
+        let mut e = match encode(&ctx, p) {
             Ok(Some(e)) => e,
             _ => scratch,
         };
@@ -649,7 +802,7 @@ mod fuzz {
                 endpoint_hi(me.0, me.1),
             ]);
         }
-        e[CHECK_WORD] = check(&e);
+        e[CHECK_WORD] = check_with(&e, ctx.seed(op::READ_ENCODED));
         (usable, me, e)
     }
 
@@ -659,11 +812,12 @@ mod fuzz {
         let (mut passed, mut valid) = (0u64, 0u64);
         for _ in 0..iters(100_000) {
             let (usable, me, e) = raw_case(&mut r);
+            let ctx = Context::new(usable, me, KEY);
             let bits = endpoint_bitmap(usable);
             let me_hi = endpoint_hi(me.0, me.1);
             let ok = |hi: u32| bits[(hi / 32) as usize] >> (hi % 32) & 1 != 0;
             let g = guard(&e, me_hi, ok);
-            if validate(usable, me, e).is_ok() {
+            if validate(&ctx, e).is_ok() {
                 valid += 1;
                 assert!(
                     g,

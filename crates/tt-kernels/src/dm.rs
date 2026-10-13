@@ -154,6 +154,19 @@ impl From<Niu> for WriteNoc {
     }
 }
 
+/// A fresh key for [`encoded::context_seed`]: the standard library's per-process random state
+/// hashed with the clock, so two starts in one process differ. Not a secret.
+fn random_key() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_nanos()),
+    );
+    h.finish() as u32
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
@@ -173,6 +186,9 @@ pub struct DataMover<N: NocId> {
     /// ([`DataMover::set_encode_reads`]). On at start exactly when the image was built
     /// for them (`fast-reads`); a safe image never is.
     encode_reads: bool,
+    /// What an encoded read is bound to: this chip, this tile and the key written to the
+    /// mover's mailbox as it started (`encoded::Context`), plus the endpoint bitmap `validate` needs.
+    context: encoded::Context,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -214,6 +230,10 @@ impl<N: NocId> DataMover<N> {
         d.write32(w, tile, mover.at(dm::MY_X), tile.x() as u32)?;
         d.write32(w, tile, mover.at(dm::MY_Y), tile.y() as u32)?;
         d.write32(w, tile, mover.at(dm::USABLE), dram.usable_mask() as u32)?;
+        // The key an encoded read's checksum is bound to (`encoded::context_seed`): fresh each
+        // start, so an entry left in L1 by an earlier run fails the card's check.
+        let key = random_key();
+        d.write32(w, tile, mover.at(dm::ENCODE_KEY), key)?;
         // L1 survives between processes: a stale `TRACE` from a profiled run
         // would have the mover store to a timestamper ttsim does not model.
         for word in [
@@ -281,6 +301,7 @@ impl<N: NocId> DataMover<N> {
             write_at: 0,
             caps,
             encode_reads: caps & dm::caps::FAST_READS != 0,
+            context: encoded::Context::new(dram.usable_mask() as u32, (tile.x(), tile.y()), key),
             deadline: Duration::from_secs(1),
         })
     }
@@ -339,6 +360,12 @@ impl<N: NocId> DataMover<N> {
         Ok(())
     }
 
+    /// What this mover's encoded reads are bound to (its key, tile and chip), for an entry
+    /// that has to be made by hand (the gates that forge one).
+    pub fn encode_context(&self) -> &encoded::Context {
+        &self.context
+    }
+
     /// Whether [`DataMover::set_encode_reads`] is on.
     pub fn encodes_reads(&self) -> bool {
         self.encode_reads
@@ -352,8 +379,6 @@ impl<N: NocId> DataMover<N> {
         if !self.encode_reads || entries.is_empty() {
             return std::borrow::Cow::Borrowed(entries);
         }
-        let me = (self.tile.x(), self.tile.y());
-        let usable = self.usable as u32;
         let encode_section = |section: &mut [[u32; 8]]| {
             let mut i = 0;
             while i < section.len() {
@@ -361,7 +386,7 @@ impl<N: NocId> DataMover<N> {
                 if n == 1 {
                     // `check` passed this entry as a plain one, so `encode` cannot
                     // refuse it; one that is not a short read stays as it is.
-                    if let Ok(Some(e)) = encoded::encode(usable, me, section[i]) {
+                    if let Ok(Some(e)) = encoded::encode(&self.context, section[i]) {
                         section[i] = e;
                     }
                 }
@@ -581,8 +606,7 @@ impl<N: NocId> DataMover<N> {
                 }
                 // The host's whole check of an encoded read, which the card only
                 // verifies (`encoded::verify`).
-                let me = (self.tile.x(), self.tile.y());
-                encoded::validate(usable, me, entries[i]).map_err(DmError::Invalid)?;
+                encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
             } else if n == 1 {
                 Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
             } else {
@@ -621,8 +645,35 @@ impl<N: NocId> DataMover<N> {
 
     /// [`DataMover::enqueue`] for entries [`DataMover::check_list`] passed on
     /// this mover just now. Nothing checks them again: an unchecked list can
-    /// hang a card, so a caller passes the very entries it checked.
+    /// hang a card, so a caller passes the very entries it checked. Except an
+    /// encoded read: the one entry a caller could build by hand and which the
+    /// card trusts on a checksum alone, so each `READ_ENCODED` is validated here
+    /// whatever the caller checked (a walk of the op words; nothing to do in a
+    /// list without one).
     pub fn enqueue_checked<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<u32> {
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i][0] == op::READ_ENCODED {
+                if !self.fast_reads() {
+                    return Err(DmError::Invalid(dm::error::OP));
+                }
+                encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
+            }
+            i += record::len(entries[i][0]);
+        }
+        self.enqueue_raw(d, w, entries)
+    }
+
+    /// [`DataMover::enqueue_checked`] with nothing checked at all, not even an encoded
+    /// read: for the gates that send a card a damaged or forged entry on purpose, to see
+    /// that the card refuses it. Never for a list that came from anywhere else.
+    #[doc(hidden)]
+    pub fn enqueue_raw<T: Transport>(
         &mut self,
         d: &mut Device<T>,
         w: &Window,

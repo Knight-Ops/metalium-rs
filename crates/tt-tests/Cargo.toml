@@ -56,7 +56,7 @@ ttinsn-experiment = ["tt-firmware-images/ttinsn-experiment"]
 
 # The B mover's host-encoded reads (`tt_isa::dm::encoded`), and with `encoded-guard` its
 # semantic guard: build the firmware images in the "fast" mode and run the gates and
-# measurements that exist only there (`step172_encoded_reads`, the encoded half of
+# measurements that exist only there (`step172_encoded_reads`, `step173_mover_differential`, the encoded half of
 # `silicon_probe_read_loop`). Off by default: the safe mode, in which the same gate
 # holds that the card refuses an encoded read.
 fast-reads = ["tt-firmware-images/fast-reads"]

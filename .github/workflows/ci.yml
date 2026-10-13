@@ -223,9 +223,9 @@ jobs:
       # encoded read, a fast one runs it, an encoded-guard one also guards it.
       - name: Test (encoded reads - safe, fast, guard)
         run: |
-          cargo test -p tt-tests --test step172_encoded_reads
-          cargo test -p tt-tests --features fast-reads --test step172_encoded_reads
-          cargo test -p tt-tests --features encoded-guard --test step172_encoded_reads
+          cargo test -p tt-tests --test step172_encoded_reads --test step173_mover_differential
+          cargo test -p tt-tests --features fast-reads --test step172_encoded_reads --test step173_mover_differential
+          cargo test -p tt-tests --features encoded-guard --test step172_encoded_reads --test step173_mover_differential
 
   simulator-full:
     name: Full simulator & E2E regression

@@ -359,6 +359,31 @@ plain single-request `READ` after the usual check (outside records; in a packet'
 Gate `step172_encoded_reads` (ttsim and card 0), in whichever mode is built. `dm_b`: safe 24,412 bytes (24,404 before the
 capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
 
+**Closing the safety gap to safe mode (plan phase 1, 2026-10-13, branch `fast-mode-hardening`).**
+- *Context-bound checksum.* The checksum's seed is `encoded::context_seed(key, tile, usable, op)`: `key` is a fresh random word the
+  host writes to `dm::ENCODE_KEY` before it starts the mover (the firmware reads it once at boot into a `static`), so an entry
+  made for an earlier mover instance (a list left in L1), another tile or chip, or another op fails the card's check
+  (`step172 ... refuses_an_entry_made_for_an_earlier_mover`, a valid read in every other respect, so safe to send on silicon). A trace
+  replay (`CALL`) flips the seed by `TRACE_DOMAIN`, so an encoded entry inside a trace fails it; the host never encodes in a trace.
+  A binding against mix-ups, not a MAC: whoever can write L1 can read the key. Unit tests: every bit of key, x, y, usable and
+  op changes the seed; an entry verifies for no other context. Watched failing with the key removed from the seed.
+- *`validate` is not circular.* It still reconstructs the entry through `encode` (so the card cannot run a request the safe decode
+  would refuse), and now also requires `guard`, a check that shares no code with it, so an encoder bug that `validate` agrees with is
+  caught on the host in both builds. The fuzz property "validate accepts => guard accepts" holds over 5 million cases.
+- *`enqueue_checked` validates every `READ_ENCODED`* (an unknown op, `error::OP`, on a safe image) and the gates that forge entries on
+  purpose use the `#[doc(hidden)]` `enqueue_raw`.
+- *A destination moved by 64 bytes is not refusable.* The earlier plan expected `encoded-guard` to refuse an encoded entry with
+  `ret += 64` and a recomputed check. It is another valid read (congruent, inside L1): neither `validate` nor the guard can call it
+  wrong, because only the caller knows where it was meant to land. What protects against it is that the host only makes entries from
+  plain reads it has checked, and the card's checksum is keyed. `step173_mover_differential` holds the end-to-end property instead:
+  seeded random lists (mixed sizes, one request and several, every channel and port, `WAIT`s between, disjoint destinations)
+  land the host-memcpy oracle's bytes in the safe build, in fast mode with plain entries and with encoded ones. Its negative control
+  is that very `ret += 64` entry, which the comparison reports as a mismatch (the comparison has teeth).
+- *Cost.* Silicon, card 0 (gate runs `1791925982` safe and `1791926071` fast, entry cost `1791926086`, safe plain entry `1791926103`): all 14 gate runs pass in the safe and fast builds; the encoded
+  entry is **180.5 cycles** (175 before: the seed is a load from local RAM instead of an immediate; P2's tight loop hoists it) and the
+  safe build's plain entry unchanged (362 / 359 / 360 against 362 / 362 / 361 before at N = 64 / 256 / 448). `dm_b`: safe 24,400
+  bytes, fast 24,924, fast + guard 25,092; `dm_nc` 14,252.
+
 **Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
 reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:
 

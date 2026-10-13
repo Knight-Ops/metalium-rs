@@ -426,6 +426,12 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   175 device cycles an entry (215 with `encoded-guard`), 1.95x on mover read lists, ~10% on 16 queued small matmuls, nothing
   on a 512^3 matmul ([measurements](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0)). Left: trace
   lists, records, which mode a deployment ships, the GATHER/SCATTER-direct and multicast-list ideas).
+  **Fast-mode hardening** (branch `fast-mode-hardening`): done: P0 baselines (a record's tile costs a plain entry's ~340 cycles
+  on B's reads and NC's writes; NC's writes are 0-4% top-level `WRITE` in the matmul, Burn and scatter flows), P1 safety (the
+  checksum bound to a per-start key, tile, chip and op; `validate` also runs the guard; `enqueue_checked` validates;
+  `step173_mover_differential`; the encoded entry is 180.5 cycles with the seed load). Open: P2 tight read loop (X6 default,
+  batched issue, hoisted seed; target <= 120), P3 per-list in-flight cap, P4 sealed static read records, P5 NC writes
+  (`fast-writes`; sealed `WRITE_RUN`/`SCATTER` first), P7 L1 containment check.
   **9.13** role `START` traced before the role's descriptor and config work, so the push
   timings leave part of the launch out; measure instruction-heavy kernels (SFPU `exp`, roles
   87% busy) before rewriting the push loop. Evidence:

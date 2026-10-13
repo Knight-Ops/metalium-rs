@@ -71,23 +71,25 @@ fn plain(channel: u32, port: u32, offset: u32, l1: u32, len: u32) -> [u32; 8] {
     [op::READ, channel, port, offset, l1, len, 0, 0]
 }
 
+/// Where `good`'s source data lies in channel 0.
+const GOOD_AT: u64 = DRAM_AT + 0xC0_0000;
+
+/// A good encoded read of 4 KiB from channel 0 into `L1_AT`, bound to `m`'s context (its key,
+/// tile and chip): an entry made for one mover verifies on no other.
+fn entry_for(m: &DataMover<Noc0>) -> [u32; 8] {
+    encoded::encode(m.encode_context(), plain(0, 0, GOOD_AT as u32, L1_AT, 4096))
+        .unwrap()
+        .unwrap()
+}
+
 /// A good encoded read of 4 KiB from channel 0 into `L1_AT`, and its source data.
 fn good(d: &mut Dev<'_>, w: &Window, w4: &Window, m: &DataMover<Noc0>) -> ([u32; 8], Vec<u8>) {
     let dram = d.dram_grid(w).unwrap();
     let ch = dram.channel(0).unwrap();
-    let base = DRAM_AT + 0xC0_0000;
     let data = pattern(4096, 99);
-    d.dram_write(w4, ch.range(base, 4096).unwrap(), &data)
+    d.dram_write(w4, ch.range(GOOD_AT, 4096).unwrap(), &data)
         .unwrap();
-    let t = m.tile();
-    let e = encoded::encode(
-        dram.usable_mask() as u32,
-        (t.x(), t.y()),
-        plain(0, 0, base as u32, L1_AT, 4096),
-    )
-    .unwrap()
-    .unwrap();
-    (e, data)
+    (entry_for(m), data)
 }
 
 #[test]
@@ -176,10 +178,13 @@ mod safe {
             // The host refuses it first, with the same code the card gives.
             let r = m.run_list(d, &w, &[e]);
             assert!(matches!(r, Err(DmError::Invalid(dm::error::OP))), "{r:?}");
-            // Sent past the host (`enqueue_checked` trusts its caller), a valid entry
+            // `enqueue_checked` refuses it as well, on a safe image an unknown op.
+            let r = m.enqueue_checked(d, &w, &[e]);
+            assert!(matches!(r, Err(DmError::Invalid(dm::error::OP))), "{r:?}");
+            // Sent past the host altogether (`enqueue_raw` trusts its caller), a valid entry
             // is still refused: the entry is good, so a card that ran it would be
             // a valid read into this test's L1, which the poison would show.
-            let n = m.enqueue_checked(d, &w, &[e]).unwrap();
+            let n = m.enqueue_raw(d, &w, &[e]).unwrap();
             let r = m.wait_for(d, &w, n);
             assert!(
                 matches!(r, Err(DmError::Queued { code, .. }) if code == dm::error::OP),
@@ -328,9 +333,9 @@ mod fast {
 
     /// The same with the checksum made good again: a bug in the host's encoder, or a
     /// forger, which a checksum cannot see.
-    fn forged(e: [u32; 8], k: usize, v: u32) -> [u32; 8] {
+    fn forged(seed: u32, e: [u32; 8], k: usize, v: u32) -> [u32; 8] {
         let mut e = damaged(e, k, v);
-        e[encoded::CHECK_WORD] = encoded::check(&e);
+        e[encoded::CHECK_WORD] = encoded::check_with(&e, seed);
         e
     }
 
@@ -375,22 +380,28 @@ mod fast {
 
     /// Consistent and wrong: what only `validate` (and, built with `encoded-guard`, the card)
     /// can refuse.
-    fn wrong(good: [u32; 8]) -> Vec<(&'static str, [u32; 8])> {
+    fn wrong(seed: u32, good: [u32; 8]) -> Vec<(&'static str, [u32; 8])> {
         vec![
-            ("zero length", forged(good, 7, 0)),
-            ("two requests", forged(good, 7, 16384 + 64)),
-            ("target at MMIO", forged(good, 1, 0xFF00_0000 - 64)),
-            ("destination at MMIO", forged(good, 3, 0xFF00_0000 - 64)),
-            ("destination not congruent", forged(good, 3, good[3] + 16)),
+            ("zero length", forged(seed, good, 7, 0)),
+            ("two requests", forged(seed, good, 7, 16384 + 64)),
+            ("target at MMIO", forged(seed, good, 1, 0xFF00_0000 - 64)),
+            (
+                "destination at MMIO",
+                forged(seed, good, 3, 0xFF00_0000 - 64),
+            ),
+            (
+                "destination not congruent",
+                forged(seed, good, 3, good[3] + 16),
+            ),
             (
                 "another tile's return",
-                forged(good, 4, encoded::endpoint_hi(5, 6)),
+                forged(seed, good, 4, encoded::endpoint_hi(5, 6)),
             ),
             (
                 "a tile that is not DRAM",
-                forged(good, 2, encoded::endpoint_hi(0, 0)),
+                forged(seed, good, 2, encoded::endpoint_hi(0, 0)),
             ),
-            ("a reserved word set", forged(good, 6, 1)),
+            ("a reserved word set", forged(seed, good, 6, 1)),
         ]
     }
 
@@ -406,12 +417,18 @@ mod fast {
             let bad = damage(e)
                 .into_iter()
                 .map(|(what, e, _)| (what, e))
-                .chain(wrong(e));
+                .chain(wrong(m.encode_context().seed(op::READ_ENCODED), e));
             for (what, bad) in bad {
                 let r = m.run_list(d, &w, &[bad]);
                 assert!(
                     matches!(r, Err(DmError::Invalid(dm::error::ENCODED))),
                     "{what}: {r:?}"
+                );
+                // The queue's trusting entry point validates an encoded read too.
+                let r = m.enqueue_checked(d, &w, &[bad]);
+                assert!(
+                    matches!(r, Err(DmError::Invalid(dm::error::ENCODED))),
+                    "{what}: enqueue_checked answered {r:?}"
                 );
             }
             let mut back = [0u8; 4096];
@@ -431,13 +448,20 @@ mod fast {
     /// Sends `entry` to the card as it is, on a fresh mover (a failed list stops the queue
     /// until the mover restarts), and returns what the card answered and whether any
     /// destination byte changed.
-    fn send(d: &mut Dev<'_>, w: &Window, entry: [u32; 8]) -> (Result<(), DmError>, bool) {
+    ///
+    /// `make` builds the entry from the fresh mover: its checksum is bound to that mover's key,
+    /// so an entry made for another mover would fail the card's check whatever else it was.
+    fn send(
+        d: &mut Dev<'_>,
+        w: &Window,
+        make: impl FnOnce(&DataMover<Noc0>) -> [u32; 8],
+    ) -> (Result<(), DmError>, bool) {
         let mut m = start(d, w, Mover::B);
+        let entry = make(&m);
         let t = m.tile();
         d.l1_write(w, t, L1_AT as u64, &[POISON; 4096]).unwrap();
-        // `enqueue_checked` is the path that trusts its caller: the entry goes to the
-        // card as it is.
-        let n = m.enqueue_checked(d, w, &[entry]).unwrap();
+        // `enqueue_raw` trusts its caller entirely: the entry goes to the card as it is.
+        let n = m.enqueue_raw(d, w, &[entry]).unwrap();
         let r = m.wait_for(d, w, n);
         let mut back = [0u8; 4096];
         d.l1_read(w, t, L1_AT as u64, &mut back).unwrap();
@@ -455,11 +479,11 @@ mod fast {
             let (e, data) = good(d, &w, &w4, &m);
             m.stop(d, &w).unwrap();
             let mut ran = 0;
-            for (what, bad, safe_on_silicon) in damage(e) {
+            for (i, (what, _, safe_on_silicon)) in damage(e).into_iter().enumerate() {
                 if !simulated && !safe_on_silicon {
                     continue;
                 }
-                let (r, moved) = send(d, &w, bad);
+                let (r, moved) = send(d, &w, |m| damage(entry_for(m)).swap_remove(i).1);
                 assert!(
                     matches!(r, Err(DmError::Queued { code, .. }) if code == dm::error::ENCODED),
                     "{what}: the card answered {r:?}"
@@ -473,13 +497,46 @@ mod fast {
                 "the checksum's decisions were not exercised ({ran})"
             );
             // The control, and the mover's survival: a restarted mover runs the good entry.
-            let (r, moved) = send(d, &w, e);
+            let (r, moved) = send(d, &w, entry_for);
             r.unwrap();
             assert!(moved);
             let m = start(d, &w, Mover::B);
             let t = m.tile();
             let mut back = [0u8; 4096];
             d.l1_read(&w, t, L1_AT as u64, &mut back).unwrap();
+            assert!(back[..] == data[..]);
+            m.stop(d, &w).unwrap();
+        });
+    }
+
+    /// The checksum is bound to the mover's key (`encoded::context_seed`), fresh at every start:
+    /// an entry made for an earlier mover instance -- a list an earlier run left in L1 -- is refused
+    /// by the next one's card and moves nothing, though it is a valid read in every other respect
+    /// (so sending it is safe on silicon). The control: the same read made for the new instance runs.
+    #[test]
+    fn the_card_refuses_an_entry_made_for_an_earlier_mover() {
+        in_device(|d| {
+            let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+            let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+            let m = start(d, &w, Mover::B);
+            let (stale, data) = good(d, &w, &w4, &m);
+            let key = m.encode_context().key;
+            m.stop(d, &w).unwrap();
+            let (r, moved) = send(d, &w, |m| {
+                assert_ne!(m.encode_context().key, key, "two starts shared a key");
+                stale
+            });
+            assert!(
+                matches!(r, Err(DmError::Queued { code, .. }) if code == dm::error::ENCODED),
+                "the card answered {r:?}"
+            );
+            assert!(!moved, "the card ran an entry from an earlier mover");
+            let (r, moved) = send(d, &w, entry_for);
+            r.unwrap();
+            assert!(moved);
+            let m = start(d, &w, Mover::B);
+            let mut back = [0u8; 4096];
+            d.l1_read(&w, m.tile(), L1_AT as u64, &mut back).unwrap();
             assert!(back[..] == data[..]);
             m.stop(d, &w).unwrap();
         });
@@ -500,8 +557,11 @@ mod fast {
             let m = start(d, &w, Mover::B);
             let (e, _) = good(d, &w, &w4, &m);
             m.stop(d, &w).unwrap();
-            for (what, bad) in wrong(e) {
-                let (r, moved) = send(d, &w, bad);
+            for (i, (what, _)) in wrong(0, e).into_iter().enumerate() {
+                let (r, moved) = send(d, &w, |m| {
+                    let seed = m.encode_context().seed(op::READ_ENCODED);
+                    wrong(seed, entry_for(m)).swap_remove(i).1
+                });
                 assert!(
                     matches!(r, Err(DmError::Queued { code, .. }) if code == dm::error::ENCODED),
                     "{what}: the card answered {r:?}"
