@@ -721,7 +721,16 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
             .sum::<u64>()
     };
     let stalls_before = throttle(d, f);
+    // The lists' own events and the barrier's release are all the timing needs. Tracing every read
+    // (`AGG_TRACE=full`, what these runs did before) adds ~94 cycles to an encoded read and keeps a
+    // run of them out of the tight loop: it halved the rate one tile showed (29, not 58 GB/s).
+    let trace_mode = match std::env::var("AGG_TRACE").as_deref() {
+        Ok("full") => dm::trace_mode::FULL,
+        _ => dm::trace_mode::LISTS,
+    };
     for m in &f.movers[..n] {
+        d.write32(&f.w, m.tile(), m.mover().at(dm::TRACE), trace_mode)
+            .unwrap();
         d.configure_trace(&f.w, m.tile(), TRACE_BUFFER, TRACE_BUFFER_BYTES)
             .unwrap();
     }

@@ -99,7 +99,8 @@ For DRAM reads there are now live numbers, on card 1 ([performance-log](../learn
 - **The compiled kernel is faster per entry.** A 4 KiB page costs tt-metal's compiled reader ~125 cycles, our fast mode 91 (175 before the tight loop of phase 2 of fast-mode hardening), our safe
   mode 359. At one core, 44 / 29 / 15 GB/s. The interpreter's cost is real, and `fast-reads` closes about four fifths of the gap to
   the compiled kernel in cycles (359 -> 175 against 125; 3.0x -> 1.5x in rate at 4 KiB), and with the tight loop passes it
-  (91 cycles: the entry no longer bounds a tile, and neither does its in-flight depth; see the cap sweep).
+  (91 cycles; a tile reads 57 GB/s at 4 KiB against 15 in the safe default, and the card reaches 66% of its bandwidth with 8 tiles
+  against 23%; [measurements](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0), "What bounds one tile's read rate").
 - **At scale the interpreter is not what limits us.** With 64 or more cores ours reaches 94-97% of the card (4 and 16 KiB), where the
   plain interleaved tt-metal pattern reaches 71-81%: entry cost stops mattering once enough cores are issuing, and the data path
   (ports, placement) decides. tt-metal's own report says the same about placement; I did not run its tuned layout, so the

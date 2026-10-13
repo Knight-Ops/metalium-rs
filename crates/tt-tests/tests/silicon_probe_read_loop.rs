@@ -631,3 +631,140 @@ fn records_against_entries() {
         }
     });
 }
+
+/// What bounds one tile's read rate: the aggregate benchmark (`silicon_bench_memory::gddr_aggregate`) reads 4 KiB
+/// entries into one tile at ~29 GB/s whatever the in-flight cap, while a resident list of the same entries on
+/// one channel runs at ~91 cycles an entry (~61 GB/s). This runs the factors one at a time on one tile with
+/// resident lists rerun from the sequence word, device cycles by the host clock less an empty list's time, and
+/// every repetition's landed bytes compared with the source: the channel pattern (one channel, or the
+/// aggregate's eight in turn), the mover traced (`dm::TRACE`, the timestamper's events around every entry, as
+/// every `gddr_aggregate` run is) or not, and plain or host-encoded entries (a `fast-reads` build).
+#[test]
+#[ignore = "benchmark"]
+fn what_bounds_one_tiles_read_rate() {
+    use tt_isa::mailbox::{TRACE_BUFFER, TRACE_BUFFER_BYTES};
+    const LEN: u32 = 4096;
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let chans: Vec<_> = dram.channels().collect();
+        assert_eq!(chans.len(), 8);
+        let base = 64u64 << 20;
+        let data: Vec<Vec<u8>> = (0..8).map(|c| pattern(TOTAL as usize, 40 + c)).collect();
+        for (c, ch) in chans.iter().enumerate() {
+            d.dram_write(&w4, ch.range(base, TOTAL as u64).unwrap(), &data[c])
+                .unwrap();
+        }
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let empty_list = [[op::WAIT, 0, 0, 0, 0, 0, 0, 0]];
+        for (pname, eight) in [("one channel", false), ("eight channels in turn", true)] {
+            // The same entries the aggregate builds: channel (i % 8) at offset (i / 8) * len, or all on channel 0.
+            let at = |i: u32| -> (usize, u32) {
+                if eight {
+                    ((i % 8) as usize, (i / 8) * LEN)
+                } else {
+                    (0, i * LEN)
+                }
+            };
+            let reads: Vec<[u32; 8]> = (0..ENTRIES)
+                .map(|i| {
+                    let (c, off) = at(i);
+                    [
+                        op::READ,
+                        chans[c].index() as u32,
+                        0,
+                        base as u32 + off,
+                        L1 + (i * LEN) % L1_SPAN,
+                        LEN,
+                        0,
+                        0,
+                    ]
+                })
+                .collect();
+            let mut expected = vec![0xA5u8; L1_SPAN as usize];
+            for i in 0..ENTRIES {
+                let (c, off) = at(i);
+                let to = ((i * LEN) % L1_SPAN) as usize;
+                expected[to..to + LEN as usize]
+                    .copy_from_slice(&data[c][off as usize..off as usize + LEN as usize]);
+            }
+            for traced in [false, true] {
+                for encode in [false, true] {
+                    let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+                    if encode && !m.fast_reads() {
+                        m.stop(d, &w).unwrap();
+                        continue;
+                    }
+                    m.set_encode_reads(encode).unwrap();
+                    let mover = m.mover();
+                    d.write32(&w, t, mover.at(dm::TRACE), u32::from(traced))
+                        .unwrap();
+                    let arm = |d: &mut Dev<'_>| {
+                        if traced {
+                            d.configure_trace(&w, t, TRACE_BUFFER, TRACE_BUFFER_BYTES)
+                                .unwrap();
+                        }
+                    };
+                    let rerun = |d: &mut Dev<'_>| {
+                        arm(d);
+                        let seq = d
+                            .read32(&w, t, mover.at(dm::SEQ))
+                            .unwrap()
+                            .wrapping_add(1)
+                            .max(1);
+                        let t0 = Instant::now();
+                        d.write32(&w, t, mover.at(dm::SEQ), seq).unwrap();
+                        while d.read32(&w, t, mover.at(dm::DONE)).unwrap() != seq {
+                            assert!(
+                                t0.elapsed() < Duration::from_secs(5),
+                                "the mover did not finish"
+                            );
+                        }
+                        t0.elapsed()
+                    };
+                    m.submit_list(d, &w, &empty_list).unwrap();
+                    m.wait(d, &w).unwrap();
+                    rerun(d);
+                    let empty = median((0..REPS).map(|_| rerun(d)).collect());
+                    arm(d);
+                    m.submit_list(d, &w, &reads).unwrap();
+                    m.wait(d, &w).unwrap();
+                    rerun(d);
+                    let mut gbps = Vec::new();
+                    let samples: Vec<f64> = (0..REPS)
+                        .map(|_| {
+                            d.l1_write(&w, t, L1 as u64, &vec![0xA5u8; L1_SPAN as usize])
+                                .unwrap();
+                            let dt = rerun(d).saturating_sub(empty);
+                            let mut back = vec![0u8; L1_SPAN as usize];
+                            d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+                            assert!(back == expected, "{pname}: the reads did not land");
+                            gbps.push((ENTRIES * LEN) as f64 / dt.as_secs_f64() / 1e9);
+                            dt.as_secs_f64() * 1e6 * CYCLES_PER_US / ENTRIES as f64
+                        })
+                        .collect();
+                    let label = format!(
+                        "{pname}, {}, {}",
+                        if traced { "traced" } else { "untraced" },
+                        if encode { "encoded" } else { "plain" }
+                    );
+                    report(
+                        &format!("4 KiB reads, {label}: per entry"),
+                        "cycles",
+                        "host",
+                        Stats::of(samples),
+                    );
+                    report(
+                        &format!("4 KiB reads, {label}: rate"),
+                        "GB/s",
+                        "host",
+                        Stats::of(gbps),
+                    );
+                    m.stop(d, &w).unwrap();
+                }
+            }
+        }
+    });
+}

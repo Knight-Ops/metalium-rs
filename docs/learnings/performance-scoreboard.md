@@ -50,9 +50,9 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Matrix ELW row multiply, 65×70, two tiles, host | F32 41.6 / 42.0 µs; BF16 60.8 / 61.3 µs (cards 0 / 1) | initial materialized RHS F32 ~1129 / 1133 µs; BF16 ~1157 / 1161 µs | hold direct broadcast addressing; reduce per-tile dispatch costs |
 | GDDR6, one tile, 64 KiB entries | 81.4 GB/s | 94% NoC link | hold |
 | GDDR6, one tile, 4 KiB entries | 16.3 GB/s | 26% channel | cut per-entry cost |
-| GDDR6, one tile, 4 KiB entries, `fast-reads` build (host-encoded reads) | 28.8 GB/s (14.7 in the safe default, 2026-10-13) | 45% channel | the bare-loop limit is ~58 |
-| GDDR6 reads, card, 8 / 32 tiles, 4 KiB entries: safe -> `fast-reads` | 117 -> 227 / 407 -> 446 GB/s | 23% -> 44% / 79% -> 87% | 512 GB/s |
-| GDDR6 reads, card, 120 tiles, 2 KiB entries: safe -> `fast-reads` | 392 -> 442 GB/s | 77% -> 86% | 512 GB/s |
+| GDDR6, one tile, 4 KiB entries, `fast-reads` build (host-encoded reads, tight loop; list-level trace) | 57.0 GB/s (14.9 in the safe default; 2026-10-13, card 1) | 89% channel | hold: one channel's own rate |
+| GDDR6 reads, card, 4 / 8 / 32 tiles, 4 KiB entries: safe -> `fast-reads` | 59 -> 219 / 119 -> 340 / 411 -> 461 GB/s (card 1) | 12% -> 43% / 23% -> 66% / 80% -> 90% | 512 GB/s |
+| GDDR6 reads, card, 120 tiles, 2 KiB entries: safe -> `fast-reads` | 401 -> 452 GB/s (card 0; three runs 451-453) | 78% -> 88% | 512 GB/s |
 | GDDR6 reads, card, 120 tiles | 469 GB/s | 92% | 512 GB/s |
 | GDDR6 writes, card, 120 tiles (writes on NoC #1) | 389 GB/s | 76% | 512 GB/s |
 | GDDR6 reads + writes, card, 120 tiles (writes on NoC #1) | 403 GB/s | 79% | 512 GB/s |

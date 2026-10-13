@@ -73,6 +73,17 @@ pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
 /// off between lists. Zero on the simulator, which does not model the event
 /// stream (divergence row 54).
 pub const TRACE: u64 = MAILBOX_BASE + 0x50;
+
+/// [`TRACE`]'s non-zero values.
+pub mod trace_mode {
+    /// Every list, entry and record, as the host has always asked for: two timestamper stores around each
+    /// entry, which also keep a run of reads out of the tight loop (the cost of tracing: ~94 cycles an
+    /// encoded read, `docs/learnings/performance-log.md`, "What bounds one tile's read rate").
+    pub const FULL: u32 = 1;
+    /// The list's own begin and end and every entry but a plain or encoded read (a barrier's release, a
+    /// kernel, a wait): what a benchmark that times lists needs, with the reads running as they do untraced.
+    pub const LISTS: u32 = 2;
+}
 /// Mover -> host: how many of the mover's NoC requests had to wait for room
 /// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
 /// zeroed it. Written only when one did, so the normal path never touches it.

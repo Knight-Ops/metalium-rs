@@ -430,7 +430,9 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   on B's reads and NC's writes; NC's writes are 0-4% top-level `WRITE` in the matmul, Burn and scatter flows), P1 safety (the
   checksum bound to a per-start key, tile, chip and op; `validate` also runs the guard; `enqueue_checked` validates;
   `step173_mover_differential`; the encoded entry is 180.5 cycles with the seed load), P2 tight read loop (X6 default,
-  `ReadBatch`, `run_encoded_reads`: 91 cycles an entry, 109 with the guard; card-wide GB/s unchanged: a tile is not bound by the entry). P3 per-list in-flight cap: not built, the sweep refuted it (one tile reads 29 GB/s at every cap from 8 to 128; what bounds a tile is open). Open: P4 sealed static read records, P5 NC writes
+  `ReadBatch`, `run_encoded_reads`: 91 cycles an entry, 109 with the guard; **one tile reads 57 GB/s at 4 KiB, 3.8x the safe
+  default, and 8 tiles 340 GB/s, 2.9x**: the 29 GB/s the aggregate benchmark first showed was its own per-read tracing, now a
+  list-level `dm::trace_mode::LISTS`), P3 per-list in-flight cap: not built, the honest sweep shows no effect of the cap (2-8) at any tile count. Open: P4 sealed static read records, P5 NC writes
   (`fast-writes`; sealed `WRITE_RUN`/`SCATTER` first). P7 L1 containment is done: reads and writes name only the data arena, enforced
   on the host in both modes (a survey of the whole suite found no violator).
   **9.13** role `START` traced before the role's descriptor and config work, so the push

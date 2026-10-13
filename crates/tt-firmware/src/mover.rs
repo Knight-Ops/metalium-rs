@@ -970,7 +970,8 @@ fn pair_call(
 #[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
-    let traced = rd(M.at(dm::TRACE)) != 0;
+    let mode = rd(M.at(dm::TRACE));
+    let traced = mode != 0;
     let outer = traced && unsafe { TRACE_DEPTH == 0 };
     if traced {
         unsafe {
@@ -984,13 +985,16 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
         while i < count as u64 {
             let head = at(i);
             let n = record::len(head[0]) as u64;
-            let entry_traced = traced && head[0] != op::PAIR_CALL;
+            // `trace_mode::LISTS` leaves the reads out, so they keep the untraced paths.
+            let entry_traced = traced
+                && head[0] != op::PAIR_CALL
+                && !(mode == dm::trace_mode::LISTS && (head[0] == op::READ || head[0] == op::READ_ENCODED));
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
             if n == 1 {
                 // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
                 // fast read path; past it, each goes straight to its issue, past `exec`'s
                 // prologue and decode (`exec` also takes it, for the other callers).
-                if FAST_READS && !traced && head[0] == op::READ_ENCODED && noc::read_fast() {
+                if FAST_READS && !entry_traced && head[0] == op::READ_ENCODED && noc::read_fast() {
                     let (done, code) =
                         run_encoded_reads(me, base + i * dm::ENTRY_BYTES, (count as u64 - i) as u32);
                     if code != 0 {
