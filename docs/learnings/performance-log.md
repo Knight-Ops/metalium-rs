@@ -384,6 +384,18 @@ capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
   safe build's plain entry unchanged (362 / 359 / 360 against 362 / 362 / 361 before at N = 64 / 256 / 448). `dm_b`: safe 24,400
   bytes, fast 24,924, fast + guard 25,092; `dm_nc` 14,252.
 
+**Containment (plan phase 7, 2026-10-13; both modes, host only).** `DataMover::check_as` now requires every read's or write's L1
+range, top-level, encoded or expanded from a record, to lie in the data arena (`tt_isa::l1::DATA`, `0x2_0000` to the mailbox
+base): a list cannot be aimed at the mover's key, its list ring, its mailbox or its image, which neither mode's card-side
+decode forbids (`Descriptor::decode` bounds by `L1_SIZE`). A survey first (`TT_CONTAIN=report`, the whole simulator suite, 1,484 tests
+passing) found **no list that names another region**, so nothing needed a named exception and enforcement is the default
+(`TT_CONTAIN=off` or `report` override it). `step172 a_read_cannot_be_aimed_at_the_movers_own_l1`, in both builds: the encode key,
+the mailbox, the ring, the image and a read running past the arena's end are refused (`error::RANGE`) before any PCIe, and the same
+test fails with `TT_CONTAIN=off` (the read onto the key is accepted). Not covered, and what remains trusted: the other entry kinds
+that name L1 (`INDEX_PICK`, `COPY_WORDS`, `FILL`), `MY_X`, `MY_Y` and `USABLE` (host-written in both modes), and the key, which
+is a binding against mix-ups and not a MAC. The survey also met one failing test unrelated to the movers, `burn-tt`
+`essentials::dtype_capabilities_advertise_what_the_device_computes_and_no_more`, which fails the same on the commit before this change.
+
 **The tight read loop (plan phase 2, 2026-10-13, card 0).** Three steps, each measured on card 0 with a resident list rerun from the
 sequence word (device cycles per encoded entry, 4 KiB; 64 B in brackets):
 

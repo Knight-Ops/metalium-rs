@@ -111,6 +111,39 @@ fn nc_refuses_an_encoded_read() {
     });
 }
 
+/// A list's reads land in the data arena (`tt_isa::l1::DATA`), in both modes: one aimed at the mover's
+/// key, its list ring, its mailbox or the image is refused by the host before any PCIe, whatever the
+/// read would otherwise be (a valid, aligned, in-range one). The control: the same read into the arena runs.
+#[test]
+fn a_read_cannot_be_aimed_at_the_movers_own_l1() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let mut m = start(d, &w, Mover::B);
+        let (_, data) = good(d, &w, &w4, &m);
+        let off = GOOD_AT as u32;
+        for (what, l1) in [
+            ("the encode key", (dm::ENCODE_KEY & !63) as u32),
+            ("the mailbox", Mover::B.mailbox as u32),
+            ("the list ring", Mover::B.list as u32),
+            ("the image", Mover::B.image_base as u32),
+            ("past the arena's end", tt_isa::l1::DATA.end as u32 - 64),
+        ] {
+            // 128 bytes: the last aligned unit of the arena and the one after it.
+            let r = m.run_list(d, &w, &[plain(0, 0, off, l1 + off % 64, 128)]);
+            assert!(
+                matches!(r, Err(DmError::Invalid(dm::error::RANGE))),
+                "{what}: {r:?}"
+            );
+        }
+        m.run_list(d, &w, &[plain(0, 0, off, L1_AT, 4096)]).unwrap();
+        let mut back = [0u8; 4096];
+        d.l1_read(&w, m.tile(), L1_AT as u64, &mut back).unwrap();
+        assert!(back[..] == data[..], "the control read did not land");
+        m.stop(d, &w).unwrap();
+    });
+}
+
 /// Safe mode: the default build.
 #[cfg(not(feature = "fast-reads"))]
 mod safe {

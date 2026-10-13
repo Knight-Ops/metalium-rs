@@ -154,6 +154,50 @@ impl From<Niu> for WriteNoc {
     }
 }
 
+/// What the host does about a list that reads or writes L1 outside the data arena
+/// (`tt_isa::l1::DATA`): the mover's own regions, the images and the mailboxes are not a list's to name.
+/// Enforced unless `TT_CONTAIN` is `report` (print each violation and carry on, the survey that found
+/// the whole simulator suite names none) or `off`. Both modes' hosts; a list that was checked cannot
+/// aim a read at the mover's key, ring or image.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Containment {
+    Off,
+    /// Print each violation to stderr (the survey of which lists name other regions).
+    Report,
+    Enforce,
+}
+
+fn containment() -> Containment {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<Containment> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TT_CONTAIN").as_deref() {
+        Ok("report") => Containment::Report,
+        Ok("off") => Containment::Off,
+        _ => Containment::Enforce,
+    })
+}
+
+/// `op`'s access of `len` bytes at L1 address `l1` lies in the data arena.
+fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
+    let mode = containment();
+    if mode == Containment::Off || tt_isa::l1::DATA.contains(l1 as u64, len) {
+        return Ok(());
+    }
+    if mode == Containment::Report {
+        eprintln!("CONTAIN op={op:#x} l1={l1:#x} len={len}");
+        return Ok(());
+    }
+    Err(DmError::Invalid(dm::error::RANGE))
+}
+
+/// [`Entry::decode`], and a read or write's L1 range must be in the data arena.
+fn decode_contained(usable: u32, e: [u32; 8]) -> std::result::Result<(), u32> {
+    if let Entry::Move { descriptor, .. } = Entry::decode(usable, e)? {
+        contained(e[0], descriptor.l1, descriptor.range.len()).map_err(|_| dm::error::RANGE)?;
+    }
+    Ok(())
+}
+
 /// A fresh key for [`encoded::context_seed`]: the standard library's per-process random state
 /// hashed with the clock, so two starts in one process differ. Not a secret.
 fn random_key() -> u32 {
@@ -612,14 +656,14 @@ impl<N: NocId> DataMover<N> {
                 // The host's whole check of an encoded read, which the card only
                 // verifies (`encoded::verify`).
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
+                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
             } else if n == 1 {
-                Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
+                decode_contained(usable, entries[i]).map_err(DmError::Invalid)?;
             } else {
                 let rec = entries
                     .get(i..i + n)
                     .ok_or(DmError::Invalid(dm::error::LENGTH))?;
-                record::expand(rec, |e| Entry::decode(usable, e).map(|_| ()))
-                    .map_err(DmError::Invalid)?;
+                record::expand(rec, |e| decode_contained(usable, e)).map_err(DmError::Invalid)?;
             }
             i += n;
         }
@@ -668,6 +712,7 @@ impl<N: NocId> DataMover<N> {
                     return Err(DmError::Invalid(dm::error::OP));
                 }
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
+                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
             }
             i += record::len(entries[i][0]);
         }
