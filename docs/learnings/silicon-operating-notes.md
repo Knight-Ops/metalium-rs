@@ -1014,3 +1014,21 @@ Rules that held through the Phase 10 close-out; follow them for any new probe.
   the pattern, so it never ends and leaks shells; wait on the run's log or exit status instead.
 - **A worktree needs `vendor/`.** It is git-ignored, so copy it from the main checkout before building
   there (`cargo xtask fetch-ttsim`/`fetch-spec` also work).
+
+## Running tt-metal after this repo's gates (2026-10-13, card 1)
+
+tt-metal (v077, UMD 0.77) will not open a card that this repo's Ethernet gates have touched. The first thing it does is return the
+active Ethernet cores to base firmware, and the image `tt-firmware`'s `eth_e1` leaves on E1 persists across processes:
+`Device 0: Timed out while waiting for active ethernet core 24-25 to become active again. Try resetting the board. Minimum
+tt-firmware version is 18.10.0` (`return_to_base_firmware_and_wait_for_heartbeat`). With both cards visible the same state showed as a
+hang after "Opening subset of mmio devices" (the first attempt, killed by its 500 s timeout).
+
+- **Fix:** `tt-smi -r <PCI address>` for the card, with nothing else on it (`tt-smi -ls` lists the addresses; card 1 is `0000:02:00.0`
+  here). After it, tt-metal opens the card. Nothing else in the repo needed re-establishing: the gates start from a known state.
+- **Fence the cards:** `TT_VISIBLE_DEVICES=<PCIe device number>` restricts UMD to that card, so tt-metal's cluster start (which
+  touches every card it can see) cannot disturb a job on the other one.
+- **First import is slow:** `import ttnn` took about three minutes cold (the libraries come off disk); a C++ program linked against
+  `build_Release` does not pay it. The installed ttnn 0.72 needs SFPI 7.52.0 and the machine has 7.83.0 in `/opt/tenstorrent/sfpi` (its
+  kernel JIT fails), so the working route is a tree with its own SFPI: `tt-metal-v077`'s `build_Release` (SFPI 7.69), which JIT-compiles
+  kernels itself.
+- **Fast dispatch reserves cores:** the compute grid is 11x10 = 110 on a card where this repo has 12x10 = 120.

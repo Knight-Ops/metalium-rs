@@ -3,9 +3,10 @@
 2026-10-13. Prompted by `dm_b` having 172 bytes left of its 24 KiB slot. Method: read both firmwares,
 size every image by symbol (`llvm-nm -C -S --size-sort`), then build and measure variants on card 0.
 What was measured is in [performance-log.md](../learnings/performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0);
-what was only reasoned is marked **paper** below. **No live tt-metal timings exist**: the installed ttnn 0.72 wants
-SFPI 7.52.0 and the machine has 7.83.0 (its JIT compile fails), and the `tt-metal-v077` tree's ttnn hangs in
-device init. The tt-metal side is from its source and the kernel ELFs in its JIT cache.
+what was only reasoned is marked **paper** below. **The tt-metal side** is from its source and the kernel ELFs in its JIT cache,
+plus, for DRAM reads only, a live measurement on card 1 ("tt-metal measured, same card", below). It was not possible at first: the
+installed ttnn 0.72 wants SFPI 7.52.0 and the machine has 7.83.0 (its JIT compile fails), and tt-metal v077 would not open a card
+this repo's Ethernet gates had touched until the board was reset.
 
 ## Summary
 
@@ -89,6 +90,19 @@ at 64 KiB entries (performance-scoreboard), so the clock and the bytes are consi
 (there the card's GDDR bandwidth, 452-480 GB/s at 4 KiB entries, limits, not the entry), writes on NC, other entry
 kinds, or any end-to-end gain. Setting the probe's device cycles against the interpreter's host-timed ones would read 7x;
 that mixes clocks and the upload. The like-for-like gap is 3.4-4x.
+
+## tt-metal measured, same card
+
+Its toolchain did not run here at first (the installed ttnn's SFPI mismatch, and an Ethernet image left by our gates,
+[silicon-operating-notes](../learnings/silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)).
+For DRAM reads there are now live numbers, on card 1 ([performance-log](../learnings/performance-log.md#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1)):
+- **The compiled kernel is faster per entry.** A 4 KiB page costs tt-metal's compiled reader ~125 cycles, our fast mode 175, our safe
+  mode 359. At one core, 44 / 29 / 15 GB/s. The interpreter's cost is real, and `fast-reads` closes about four fifths of the gap to
+  the compiled kernel in cycles (359 -> 175 against 125; 3.0x -> 1.5x in rate at 4 KiB).
+- **At scale the interpreter is not what limits us.** With 64 or more cores ours reaches 94-97% of the card (4 and 16 KiB), where the
+  plain interleaved tt-metal pattern reaches 71-81%: entry cost stops mattering once enough cores are issuing, and the data path
+  (ports, placement) decides. tt-metal's own report says the same about placement; I did not run its tuned layout, so the
+  comparison is idiom against idiom, not best against best.
 
 ## The design space for five cores
 

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
 | [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
@@ -282,6 +283,60 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## tt-metal reference: DRAM reads by core count (2026-10-13, card 1)
+
+The same measurement on tt-metal (`crates/tt-tests/bench/tt_metal_dram_read/`, v077 `d53c2a71fb0`, fast dispatch): N cores each
+read their share of one interleaved DRAM buffer page by page (`noc_async_read_page`, a `TensorAccessor`), `--batch` requests then a
+barrier, into a 256 KiB window of their own L1, timed by the tile wall clock inside the kernel (first request to last landing; all
+bytes checked against a poisoned window). Card 1, AICLK 1350 MHz; ours is `gddr_aggregate` (Read mix, rotating channels, cap 8)
+on the same card in the same session. GB/s for the whole card, and per core in brackets. tt-metal's fast dispatch reserves cores:
+**110 here, ours 120**.
+
+| Cores | 2 KiB: ours safe | ours fast | tt-metal | 4 KiB: ours safe | ours fast | tt-metal | 16 KiB: ours safe | ours fast | tt-metal |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 7.4 | 14.4 | 25.5 | 14.7 | 28.8 | 44.2 | 58.2 | 85.1 | 69.2 |
+| 4 | 29.4 | 57.1 | 101 | 58.6 | 114 | 174 | 232 | 330 | 257 |
+| 8 | 58.7 | 114 | 197 | 117 | 227 | 314 | 463 | 452 | 368 |
+| 16 | 117 | 226 | 240 | 234 | 343 | 321 | 483 | 482 | 374 |
+| 32 | 233 | 288 | 250 | 397 | 447 | 361 | 484 | 484 | 370 |
+| 64 | 335 | 393 | 357 | 462 | 474 | 402 | 488 | 489 | 383 |
+| 110 (tt-metal) / 120 (ours) | 386 | 446 | 378 | 480 | 491 | 415 | 496 | 496 | 387 |
+
+Ours: 2 KiB safe / fast `1791910320` / `1791910651`, 4 KiB `1791910902` / `1791911151`, 16 KiB `1791907949` / `1791908197`. tt-metal's
+logs: `target/silicon/bench/ttmetal-v077-card1-*.log`.
+
+**Per core, few cores** (the entry cost; 1 core): a 4 KiB page is ~125 cycles on tt-metal (44.2 GB/s), 175 on ours fast (28.8), 359 on
+ours safe (14.7); a 2 KiB page ~108 / 175 / 359. Ours fast is within 1.5x of tt-metal's compiled reader at 4 KiB (1.8x at 2 KiB), safe
+within 3x (3.4x). At 16 KiB, where the NoC is the limit, ours fast is faster, 85 against 69 GB/s: our window of requests slides, where
+tt-metal's loop drains at every barrier.
+
+**Whole card, many cores:** ours reaches 94-97% of the 512 GB/s at 4 and 16 KiB (safe and fast alike) and 77 / 87% at 2 KiB; the plain
+interleaved tt-metal pattern reaches 81% at 4 KiB, 76% at 16 KiB, 74% at 2 KiB. The difference is already there at 64 cores (tt-metal 402
+against our 462 / 474 at 4 KiB), so it is not the 110 cores.
+
+Variants of tt-metal's side (4 KiB unless noted; whole-card GB/s at 1 / 8 / 110 cores):
+
+| Variant | 1 | 8 | 110 |
+|---|--:|--:|--:|
+| barrier every 8 pages, NoC0 (the table) | 44.2 | 314 | 415 |
+| barrier every 32 pages | 68.0 | 322 | 415 |
+| NoC1 (NCRISC, tt-metal's default reader), batch 8 | 42.1 | 96.3 | 249 |
+| core i reads bank i mod 8 directly (`--pinned`), batch 8 | 35.8 | 264 | 371 |
+| the same, batch 32 | 54.1 | 293 | 339 |
+| 16 KiB pinned, batch 8 | 54.1 | 307 | 364 |
+| 2 KiB, one request in flight (the stock `6_dram_offchip` pattern) | 5.3 | 42.3 | 299 |
+
+**Read this with its limits.**
+- Two things I did not do: tt-metal's tuned DRAM benchmark (its report places one reader per bank next to it to avoid NoC
+  congestion; this run uses the first N cores in row order), and a port choice: its interleaved and bank-id addressing reach each bank
+  through one port, where ours rotates over the channel's three (`gddr_aggregate_affinity`'s Nearest mixes, one port, reach only
+  50-70% on our side too). So "tt-metal tops out at 76-81%" is the idiomatic pattern on this placement, not tt-metal's limit; their
+  published figure on Wormhole is 92.7% with the tuned layout. **The port spreading is my hypothesis for the gap, not something tested
+  on tt-metal.**
+- Their barrier-per-batch loop leaves bubbles that our sliding cap does not; the batch-32 row shows it only helps at one core.
+- Timing is by the same wall clock and the bytes are checked on both sides; ours and tt-metal's ran on card 1, one after the other, at 1350 MHz,
+  16,000 MT/s, 8 channels. tt-metal's `compute_with_storage_grid_size` is 11x10 under fast dispatch.
 
 ## Host-encoded read entries (2026-10-13, card 0)
 
