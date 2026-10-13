@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
 | [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
 | [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
@@ -281,6 +282,104 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Host-encoded read entries (2026-10-13, card 0)
+
+`op::READ_ENCODED` (`tt_isa::dm::encoded`). The host sends a read as `[READ_ENCODED, TARG, TARG_HI, RET, RET_HI, CHECK, 0,
+LEN]` (the same 32 bytes; `TAG` and `CTRL` of a B read are constants the card supplies) and validates it in full
+(`encoded::validate`, by reconstruction: it must equal what `Descriptor::decode` + `DramMove` make for some valid move).
+The card verifies `CHECK`, an integrity word, and issues. It is a **build-time mode of the B mover**, firmware feature
+`fast-reads` (`cargo xtask silicon --feature fast-reads`):
+
+| Mode | Build | The card |
+|---|---|---|
+| **safe** (default) | no feature | decodes and checks every read itself; `READ_ENCODED` is an unknown op (`error::OP`), refused before any NIU write |
+| **fast** | `fast-reads` | verifies a checksum; issues |
+| **fast + guard** | `encoded-guard` | the checksum, and `encoded::guard` (usable-endpoint bitmap, return coordinate, bounds, mod-64 congruence) |
+
+The image writes `dm::CAPS` as it starts and the host reads it (`DataMover::fast_reads`): a safe image is never encoded for
+(`set_encode_reads(true)` is `DmError::FastReadsNotBuilt`), a fast one is by default. `DataMover::set_encode_reads` rewrites every
+plain single-request `READ` after the usual check (outside records; in a packet's reader section too; one entry for one).
+Gate `step172_encoded_reads` (ttsim and card 0), in whichever mode is built. `dm_b`: safe 24,412 bytes (24,404 before the
+capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
+
+**Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
+reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:
+
+| Entry | 64 B | 4 KiB | run |
+|---|--:|--:|---|
+| plain `READ` (safe mode) | 359 | 359 | `1791904598` |
+| **fast: checksum** (rotate-and-XOR form) | 175 | 175 | `1791904598` |
+| fast: checksum (multiply form, shipped) | 176 | 176 | `1791904722` |
+| fast, the check removed (not a build) | 138 | 138 | `1791904816` |
+| **fast + guard** | 215 | 215 | `1791904922` |
+
+Freshly uploaded lists (`submit_list` + `wait`): plain 651, fast 481, fast + guard 521. The upload (~300 cycles an entry, 32 B
+written over PCIe) is now more than the card's time.
+
+- **The check costs ~37 cycles however it is written.** The rotation form and the multiply form cost the same, and 138 cycles
+  without either: it is two more words read and combined, not the arithmetic. The semantic guard on top is ~40 more.
+- **What a checksum protects.** Any one word damaged, any two swapped (the check word included), a hand-made entry that did not
+  come from the encoder (it has the right check only by computing it). It cannot see an entry that is consistent and wrong, which
+  only a bug in `encode` makes; the guard is the independent check for that. A first checksum, a plain XOR of an unrotated word,
+  let a swap of that word with the check pass: found by the unit test and fixed (every word is mixed with its own constant).
+- **Negative controls, watched failing.** With the checksum verification removed, `the_card_refuses_a_damaged_encoded_read_...`
+  fails (ttsim) and the other fast tests pass; with the guard removed in an `encoded-guard` build, `the_guard_refuses_a_
+  consistent_but_wrong_encoded_read` fails and the others pass. In safe mode the gate holds the opposite: the card refuses a
+  *valid* encoded entry. On silicon the entries sent past the host are only ones whose acceptance would still be a valid read into
+  the test's own L1/DRAM (a moved address, a flipped checksum bit, a halved length): a bad coordinate is the hang `AGENTS.md`
+  warns of, so those are held on ttsim and by `encoded`'s unit tests (the code the card runs).
+- An earlier layout (the seven NIU words, and a guard only) measured 194 with the guard and 141 without (runs `1791900861`,
+  `1791900958`); the guard written branch-free cost the same as the `&&` chain (`1791901089`), and alone the bitmap lookup
+  added 24 cycles and the eight compares 36 (`1791901194`, `1791901286`).
+
+**Real flows, fast mode against safe** (`1791905017` against `1791901818`; host-timed unless marked; card 0):
+
+| Benchmark | safe | fast |
+|---|--:|--:|
+| `mover_read_sweep`, 64 B to 4 KiB, cycles per entry (device) | 374 | 191 |
+| `mover_read_sweep`, 16 KiB entries, cycles per entry | 387 | 355 |
+| `mover_overhead`, 256 x 4 KiB, untraced | 128.3 us | 96.2 us |
+| `queue_steady_state`, 16 x matmul 32x256x32, host per op | 137.1 us | 123.4 us |
+| the same, device first list -> last per op | 128.9 us | 115.5 us |
+| `workflow_ops`, matmul 512x512x512 HiFi4 | 1869 us | 1871 us |
+| `workflow_ops`, sum rows 64 tiles on sfpu | 789 us | 770 us |
+| `copy_pipeline`, 16 to 120 tiles | | within 3% |
+
+Counting entries per upload in six ttsim Session gates, most lists held no plain `READ` at all: their reads are record entries
+(`GATHER`, `READ_RUN`), which expand on the card and are not touched; a few packets held 180 to 256 plain reads. Where a flow's
+reads are plain entries it gets the saving; where compute or the host dominates it gets nothing. With encoding forced on for
+every mover (the earlier layout, with its guard), the whole smoke selection passed on card 0: 1,026 of 1,026.
+
+**Card-wide reads by entry size and tile count** (`gddr_aggregate`, the Read mix: every tile reads its own lists at once; device
+clock, GB/s, % of the card's 512 GB/s; `AGG_LEN` sets the entry size, safe image against `--feature fast-reads` on the same
+card; the 64 KiB baseline of the scoreboard is unchanged, 466 to 496 GB/s in both). Safe -> fast:
+
+| Tiles | 2 KiB entries (card 0) | 4 KiB (card 0) | 16 KiB (card 1) |
+|--:|---|---|---|
+| 1 | 7.4 -> 14.4 (1.4% -> 2.8%) | 14.7 -> 28.8 (2.9% -> 5.6%) | 58.2 -> 85.1 (11% -> 17%) |
+| 4 | 29.4 -> 57.1 | 58.6 -> 114 (11% -> 22%) | 231 -> 330 (45% -> 65%) |
+| 8 | 58.8 -> 114 | 117 -> 227 (23% -> 44%) | 463 -> 452 (90% -> 88%) |
+| 16 | 117 -> 226 (23% -> 44%) | 234 -> 344 (46% -> 67%) | 483 -> 482 |
+| 32 | 233 -> 290 (46% -> 57%) | 407 -> 446 (79% -> 87%) | 484 -> 484 |
+| 64 | 339 -> 392 (66% -> 77%) | 456 -> 464 (89% -> 91%) | 488 -> 489 |
+| 120 | 392 -> 442 (77% -> 86%) | 479 -> 489 (94% -> 96%) | 496 -> 496 |
+
+Runs, safe / fast: 2 KiB `1791907945` / `1791908194`; 4 KiB `1791907286` / `1791907626`; 16 KiB `1791907949` / `1791908197`.
+Per tile the encoded entry is 1.95x at 2 KiB and 4 KiB (the entry costs 359 against 175 cycles, whatever its size) and 1.45x
+at 16 KiB, where the NoC begins to share the time. **Where it matters:** the smaller the entry, the more tiles it takes
+to fill the card: 16 KiB entries fill it with 8 tiles in either mode, 4 KiB entries with about 64, and 2 KiB entries
+(BF16 tiles) not at all in safe mode (77% with all 120) and 86% in fast mode. On one DRAM channel, 4 KiB entries
+fill it (89%) with 2 tiles in fast mode and 4 in safe. The 16 KiB column ran on card 1 and the others on card 0 (two jobs at
+once, one card each); a size is compared only with the same size on the same card. The post-run data check of
+`gddr_aggregate` compared 64 KiB whatever the entry size; it now compares the entry size run.
+
+**Not changed, and what else this run met** (none of it related to the change):
+- Trace lists in GDDR (`CALL` replays) hold plain entries; encoding them is open.
+- `silicon_bench_path::matmul_pipeline_sweep` fails with `event 119: an entry began outside a list or inside one`, with the
+  committed `mover.rs` as well; it is the role-profile export problem `streaming-dataflow-architecture.md` ("Profiling")
+  already records for `sfpu_pipeline_sweep`. `silicon_bench_memory::gddr_aggregate_nocs` fails with `Invalid(10)`
+  (`DIRECTION`): it still asks B to write, which the reader/writer split removed.
 
 ## Read-loop probe: what the interpreter costs per read entry (2026-10-13, card 0)
 

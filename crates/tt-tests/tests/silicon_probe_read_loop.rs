@@ -24,6 +24,8 @@
 use std::time::{Duration, Instant};
 
 use tt_device::tlb::WindowKind;
+#[cfg(feature = "fast-reads")]
+use tt_isa::dm;
 use tt_isa::dm::op;
 use tt_kernels::dm::DataMover;
 use tt_tests::bench::{median, on_card, pattern, report, Stats, REPS};
@@ -346,5 +348,130 @@ fn bare_loop_against_interpreter() {
         mv.set_in_flight_cap(d, &w, tt_isa::dm::TILE_IN_FLIGHT_CAP)
             .unwrap();
         mv.stop(d, &w).unwrap();
+    });
+}
+
+/// `encoded_entries_against_plain_entries` (a `fast-reads` build; `cargo xtask bench --feature
+/// fast-reads`): the same 256 one-channel reads as lists of plain
+/// `READ` entries and as host-encoded ones (`DataMover::set_encode_reads`), timed two ways
+/// by the host clock:
+/// - **fresh**: `submit_list` then `wait`, as a caller pays it, with the list's upload;
+/// - **resident**: the list uploaded once, then started again by writing the mailbox's
+///   sequence word alone, so no upload is in the time. Less an empty list's time, that is
+///   the card's time per entry to within the host's poll.
+///
+/// Every resident repetition is preceded by a poisoned window and followed by a byte-for-byte
+/// comparison with what the reads must have written.
+#[cfg(feature = "fast-reads")]
+#[test]
+#[ignore = "benchmark"]
+fn encoded_entries_against_plain_entries() {
+    on_card(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
+        let dram = d.dram_grid(&w).unwrap();
+        let t = tt_tests::harness::tensix_tile();
+        let chans: Vec<_> = dram.channels().collect();
+        let base = 64u64 << 20;
+        let data = pattern(TOTAL as usize, 7);
+        d.dram_write(&w4, chans[0].range(base, TOTAL as u64).unwrap(), &data)
+            .unwrap();
+        let (_, image, _) = tt_firmware_images::DM_B;
+        let empty_list = [[op::WAIT, 0, 0, 0, 0, 0, 0, 0]];
+        for len in [64u32, 4096] {
+            let reads: Vec<[u32; 8]> = (0..ENTRIES)
+                .map(|i| {
+                    [
+                        op::READ,
+                        chans[0].index() as u32,
+                        0,
+                        (base as u32) + i * len,
+                        L1 + (i * len) % L1_SPAN,
+                        len,
+                        0,
+                        0,
+                    ]
+                })
+                .collect();
+            let mut expected = vec![0xA5u8; L1_SPAN as usize];
+            for i in 0..ENTRIES {
+                let (from, to) = ((i * len) as usize, ((i * len) % L1_SPAN) as usize);
+                expected[to..to + len as usize].copy_from_slice(&data[from..from + len as usize]);
+            }
+            for encode in [false, true] {
+                let name = if encode { "encoded" } else { "plain" };
+                let mut m = DataMover::start(d, &w, t, &dram, image).unwrap();
+                m.set_encode_reads(encode).unwrap();
+                let mover = m.mover();
+
+                // Fresh lists: what a caller pays, upload included.
+                let mut fresh = |d: &mut Dev<'_>, l: &[[u32; 8]]| {
+                    let t0 = Instant::now();
+                    m.submit_list(d, &w, l).unwrap();
+                    m.wait(d, &w).unwrap();
+                    t0.elapsed()
+                };
+                let empty = median((0..REPS).map(|_| fresh(d, &empty_list)).collect());
+                fresh(d, &reads);
+                let samples: Vec<f64> = (0..REPS)
+                    .map(|_| {
+                        let dt = fresh(d, &reads).saturating_sub(empty);
+                        dt.as_secs_f64() * 1e6 * CYCLES_PER_US / ENTRIES as f64
+                    })
+                    .collect();
+                report(
+                    &format!("{name} {len} B read, fresh list: per entry"),
+                    "cycles",
+                    "host",
+                    Stats::of(samples),
+                );
+
+                // Resident lists: started again with the sequence word alone.
+                let rerun = |d: &mut Dev<'_>| {
+                    let seq = d
+                        .read32(&w, t, mover.at(dm::SEQ))
+                        .unwrap()
+                        .wrapping_add(1)
+                        .max(1);
+                    let t0 = Instant::now();
+                    d.write32(&w, t, mover.at(dm::SEQ), seq).unwrap();
+                    while d.read32(&w, t, mover.at(dm::DONE)).unwrap() != seq {
+                        assert!(
+                            t0.elapsed() < Duration::from_secs(5),
+                            "the mover did not finish"
+                        );
+                    }
+                    t0.elapsed()
+                };
+                m.submit_list(d, &w, &empty_list).unwrap();
+                m.wait(d, &w).unwrap();
+                rerun(d);
+                let empty = median((0..REPS).map(|_| rerun(d)).collect());
+                m.submit_list(d, &w, &reads).unwrap();
+                m.wait(d, &w).unwrap();
+                rerun(d);
+                let samples: Vec<f64> = (0..REPS)
+                    .map(|_| {
+                        d.l1_write(&w, t, L1 as u64, &vec![0xA5u8; L1_SPAN as usize])
+                            .unwrap();
+                        let dt = rerun(d).saturating_sub(empty);
+                        let mut back = vec![0u8; L1_SPAN as usize];
+                        d.l1_read(&w, t, L1 as u64, &mut back).unwrap();
+                        assert!(back == expected, "{name} {len} B reads did not land");
+                        dt.as_secs_f64() * 1e6 * CYCLES_PER_US / ENTRIES as f64
+                    })
+                    .collect();
+                report(
+                    &format!("{name} {len} B read, resident list: per entry"),
+                    "cycles",
+                    "host",
+                    Stats::of(samples),
+                );
+                // The list the card ran is the form under test.
+                let first = d.read32(&w, t, mover.list).unwrap();
+                assert_eq!(first, if encode { op::READ_ENCODED } else { op::READ });
+                m.stop(d, &w).unwrap();
+            }
+        }
     });
 }

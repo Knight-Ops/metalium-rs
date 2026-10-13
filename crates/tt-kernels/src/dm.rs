@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dataflow::{Channel, Endpoint};
-use tt_isa::dm::{self, op, record, Descriptor, Entry, Mover};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::Niu;
@@ -44,6 +44,10 @@ pub enum DmError {
         list: u32,
         code: u32,
     },
+    /// Host-encoded reads were asked for of a mover image built without them (the
+    /// default "safe" image, which decodes and checks every read itself): the image's
+    /// `dm::CAPS` lacks `FAST_READS`. Build the firmware with `fast-reads`.
+    FastReadsNotBuilt,
 }
 
 impl From<TransportError> for DmError {
@@ -71,6 +75,11 @@ impl std::fmt::Display for DmError {
                     "queued list {list} failed (code {code}); the queue has stopped"
                 )
             }
+            DmError::FastReadsNotBuilt => write!(
+                f,
+                "this data mover image was built without host-encoded reads \
+                 (firmware feature `fast-reads`)"
+            ),
         }
     }
 }
@@ -158,6 +167,12 @@ pub struct DataMover<N: NocId> {
     in_flight: std::collections::VecDeque<(u32, u32, u32)>,
     /// The ring entry the next list is written from.
     write_at: u32,
+    /// What the image said it can do (`dm::CAPS`), read as it started.
+    caps: u32,
+    /// Whether single-request `READ` entries are sent as host-encoded reads
+    /// ([`DataMover::set_encode_reads`]). On at start exactly when the image was built
+    /// for them (`fast-reads`); a safe image never is.
+    encode_reads: bool,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -210,6 +225,7 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::THROTTLE_CYCLES),
             mover.at(dm::WRITE_NOC),
             mover.at(dm::READ_FAST),
+            mover.at(dm::CAPS),
             mover.at(dm::QUEUE_HEAD),
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),
@@ -219,6 +235,15 @@ impl<N: NocId> DataMover<N> {
             d.write32(w, tile, word, 0)?;
         }
         d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
+        if mover.core == tt_isa::tensix::Core::B {
+            // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
+            // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
+            let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            d.l1_write(w, tile, mover.at(encoded::ENDPOINTS), &bits)?;
+        }
         let status_at = mover.mailbox + offset::STATUS;
         d.write32(w, tile, status_at, 0)?;
         match mover.core {
@@ -234,6 +259,18 @@ impl<N: NocId> DataMover<N> {
             |s| s == status::RUNNING,
         )?;
         started.map_err(|_| DmError::NotStarted)?;
+        // What this image was built to do: written as `firmware_main` starts, after the
+        // status word the wait above is for.
+        let caps = d
+            .wait_for_mailbox(
+                w,
+                tile,
+                mover.at(dm::CAPS),
+                mover.mailbox + offset::PANIC_CODE,
+                1_000_000,
+                |c| c & dm::caps::VALID != 0,
+            )?
+            .map_err(|_| DmError::NotStarted)?;
         Ok(DataMover {
             tile,
             mover,
@@ -242,6 +279,8 @@ impl<N: NocId> DataMover<N> {
             head: 0,
             in_flight: Default::default(),
             write_at: 0,
+            caps,
+            encode_reads: caps & dm::caps::FAST_READS != 0,
             deadline: Duration::from_secs(1),
         })
     }
@@ -278,6 +317,69 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<()> {
         d.write32(w, self.tile, self.mover.at(dm::IN_FLIGHT_CAP), cap)?;
         Ok(())
+    }
+
+    /// Whether this mover's image runs host-encoded reads (`dm::caps::FAST_READS`): the
+    /// firmware was built with `fast-reads`. Only B's can.
+    pub fn fast_reads(&self) -> bool {
+        self.caps & dm::caps::FAST_READS != 0
+    }
+
+    /// Send this mover's single-request `READ` entries as host-encoded reads
+    /// ([`tt_isa::dm::encoded`]) from the next list: the host checks each one in full
+    /// ([`encoded::validate`]) and the card only verifies its checksum, so a read entry
+    /// costs ~150 cycles on the card instead of ~360. Every list is still checked as plain
+    /// entries first. On by default for an image built with `fast-reads`, which is what
+    /// makes this possible: [`DmError::FastReadsNotBuilt`] for `true` on any other.
+    pub fn set_encode_reads(&mut self, on: bool) -> Result<()> {
+        if on && !self.fast_reads() {
+            return Err(DmError::FastReadsNotBuilt);
+        }
+        self.encode_reads = on;
+        Ok(())
+    }
+
+    /// Whether [`DataMover::set_encode_reads`] is on.
+    pub fn encodes_reads(&self) -> bool {
+        self.encode_reads
+    }
+
+    /// `entries` as they are uploaded: with [`DataMover::set_encode_reads`], each
+    /// plain single-request `READ` (outside records, in a packet's reader section
+    /// and its trailing barrier part as well) replaced by its encoded form, one entry
+    /// for one, so no length or offset changes. Called after `check`.
+    fn upload_form<'a>(&self, entries: &'a [[u32; 8]]) -> std::borrow::Cow<'a, [[u32; 8]]> {
+        if !self.encode_reads || entries.is_empty() {
+            return std::borrow::Cow::Borrowed(entries);
+        }
+        let me = (self.tile.x(), self.tile.y());
+        let usable = self.usable as u32;
+        let encode_section = |section: &mut [[u32; 8]]| {
+            let mut i = 0;
+            while i < section.len() {
+                let n = record::len(section[i][0]);
+                if n == 1 {
+                    // `check` passed this entry as a plain one, so `encode` cannot
+                    // refuse it; one that is not a short read stays as it is.
+                    if let Ok(Some(e)) = encoded::encode(usable, me, section[i]) {
+                        section[i] = e;
+                    }
+                }
+                i += n;
+            }
+        };
+        let mut out = entries.to_vec();
+        if out[0][0] == op::PAIR {
+            let (readers, writers) = (out[0][1] as usize, out[0][2] as usize);
+            let writer_end = 1 + readers + writers;
+            encode_section(&mut out[1..1 + readers]);
+            if out[0][4] != 0 {
+                encode_section(&mut out[writer_end..]);
+            }
+        } else {
+            encode_section(&mut out);
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     /// Issue this mover's GDDR reads through the fast path from its next list
@@ -389,7 +491,8 @@ impl<N: NocId> DataMover<N> {
         }
         // The mover's own checks, run first, so a bad entry costs no PCIe.
         self.check(entries)?;
-        let bytes: Vec<u8> = entries
+        let bytes: Vec<u8> = self
+            .upload_form(entries)
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())
@@ -471,7 +574,16 @@ impl<N: NocId> DataMover<N> {
             if !mover.permits(entries[i][0]) {
                 return Err(DmError::Invalid(dm::error::DIRECTION));
             }
-            if n == 1 {
+            if n == 1 && entries[i][0] == op::READ_ENCODED {
+                // A safe image has no such op, and says so (`error::OP`), as the card would.
+                if !self.fast_reads() {
+                    return Err(DmError::Invalid(dm::error::OP));
+                }
+                // The host's whole check of an encoded read, which the card only
+                // verifies (`encoded::verify`).
+                let me = (self.tile.x(), self.tile.y());
+                encoded::validate(usable, me, entries[i]).map_err(DmError::Invalid)?;
+            } else if n == 1 {
                 Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
             } else {
                 let rec = entries
@@ -543,7 +655,8 @@ impl<N: NocId> DataMover<N> {
                 .0;
             self.wait_for(d, w, oldest)?;
         };
-        let bytes: Vec<u8> = entries
+        let bytes: Vec<u8> = self
+            .upload_form(entries)
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())

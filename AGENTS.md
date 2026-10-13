@@ -94,7 +94,13 @@ Firmware changes also need the separate workspace lint:
 ```bash
 cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   --target riscv32im-unknown-none-elf --bins --lib -- -D warnings
+cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
+  --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings
 ```
+
+The mover has two read modes (`fast-reads`, see below); a change to `mover.rs` or `tt_isa::dm::encoded`
+is run through the encoded-read gate in both: `cargo test -p tt-tests --test step172_encoded_reads` and
+the same with `--features tt-tests/fast-reads` (and `tt-tests/encoded-guard`).
 
 Arithmetic, routing or execution-order changes also need the training regression:
 
@@ -186,7 +192,15 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
 
 Use checked APIs and `Session` bring-up. Discover each chip's grids from ARC
 before tile access; never probe surviving coordinates or copy ttsim's full grid
-onto silicon. Harvested-tile accesses can hang the NoC and reboot the host.
+onto silicon. Harvested-tile accesses can hang the NoC and reboot the host. The B mover is built in one of two
+read modes, chosen at build time by the firmware feature `fast-reads` (off by default; `cargo xtask
+silicon --feature fast-reads`). The default **safe** image decodes and checks every read on the card
+and refuses `READ_ENCODED` as an unknown op. A **fast** image runs host-encoded reads (`dm::encoded`):
+validated in full on the host (`encoded::validate`), integrity-checked on the card (`encoded::verify`,
+a checksum), and with `encoded-guard` also semantically guarded on the card (`encoded::guard`). The
+image reports its mode in `dm::CAPS`, which the host reads; never queue an encoded entry that did not
+pass `validate` (`enqueue_checked` trusts its caller), and never send a hand-made one to silicon whose
+refusal you have not checked on ttsim.
 Keep one `Device` per chip because power policy is chip-wide. Local data RAM
 cannot answer NoC accesses while its owning core is in reset.
 

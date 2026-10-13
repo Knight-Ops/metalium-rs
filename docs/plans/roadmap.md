@@ -422,8 +422,10 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   path gains only 3–4%. **Corrected 2026-10-13:** that is not the request round trip. A read entry is 359 device cycles of
   software and a bare loop issues one in 90–106; the in-flight cap does not matter past 4 (see the
   [read-loop probe](../learnings/performance-log.md#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0)).
-  Candidates: host-encoded read entries (3.4x per entry in the probe, the same 32-byte entry; costs the on-card check), plus
-  the GATHER/SCATTER-direct and multicast-list ideas).
+  Host-encoded read entries are in as a build-time mode (firmware feature `fast-reads`, safe by default; 2026-10-13): 359 ->
+  175 device cycles an entry (215 with `encoded-guard`), 1.95x on mover read lists, ~10% on 16 queued small matmuls, nothing
+  on a 512^3 matmul ([measurements](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0)). Left: trace
+  lists, records, which mode a deployment ships, the GATHER/SCATTER-direct and multicast-list ideas).
   **9.13** role `START` traced before the role's descriptor and config work, so the push
   timings leave part of the launch out; measure instruction-heavy kernels (SFPU `exp`, roles
   87% busy) before rewriting the push loop. Evidence:

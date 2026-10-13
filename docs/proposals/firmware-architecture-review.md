@@ -109,14 +109,18 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    cycles (bare loop 90), and a replay of host-encoded requests already gets 106 with no overlays at all (item 5a). So
    overlays are not needed for per-entry speed; they would only buy resident size, which the repacking has. Costs: overlay shipping
    and residency, a second build path, a function-table ABI. **Paper; not built.**
-5a. **Host-encoded read entries (a thin replay inside the interpreter).** An entry is eight words: the op word and the
-   seven words of an encoded request (`TARG`, `TARG_HI`, `RET`, `RET_HI`, `TAG`, `CTRL`, `LEN`), exactly what
-   `DramMove::words` yields on the host. B issues it with no decode and no on-card validation. **Measured as a probe**
-   (`mode::TABLE`): 106 cycles per 4 KiB request, 3.4x under the shipped 359, in the same 32 bytes per entry, so
-   list upload and ring size do not change. Costs: the host becomes the only validator of those entries
-   (`DramMove::new` already checks every request there; the card-side check is what a bad access to a harvested tile
-   would otherwise meet, and it costs ~95 of the 359 cycles), and trace lists in GDDR would hold encoded requests, tied
-   to the tile and NoC they were encoded for. Not implemented.
+5a. **Host-encoded read entries, as a build-time mode.** Implemented (`op::READ_ENCODED`, `tt_isa::dm::encoded`; firmware feature
+   `fast-reads`, off by default). The default image is **safe**: the card decodes and checks every read and refuses
+   `READ_ENCODED` as an unknown op. A **fast** image runs entries the host encoded and validated in full
+   (`encoded::validate`); the card verifies a checksum and issues; `encoded-guard` adds an independent semantic check.
+   No cores are given up: the same B issues the read either way (tt-metal's fast dispatch dedicates cores to prefetch and
+   dispatch). **Measured** ([performance-log](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0)):
+   a read entry 359 -> 175 device cycles (138 with no check at all, 215 with the guard); real flows: mover read lists 1.95x,
+   16 queued small matmuls 10% an op, a 512^3 matmul and the copy and aggregate benchmarks unchanged. Freshly uploaded
+   lists gain 1.35x, since the 32-byte upload (~300 cycles an entry) is now larger than the card's time. What it gives up: in
+   fast mode the card no longer re-derives a read, so an encoder bug that produces a consistent, wrong entry reaches the NIU
+   unless `encoded-guard` is built (a checksum sees damage and forgeries, not that). Trace lists in GDDR still hold plain
+   entries, and records (most of a streaming op's reads) are untouched.
 6. **Role rebalancing.** (a) Swap to tt-metal's convention (NC reads, B writes): no expected gain, the cores cost the same.
    (b) Move control-plane entries (`KERNEL`, `LAUNCH`, barriers, pairs) to NC, which has 10 KB free, so B is only a reader:
    unmeasured and constrained by NoC endpoint ownership (SYS-1419: each GDDR endpoint is owned by one NoC; NC's reset
@@ -138,10 +142,9 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    select (B-side branch, ~400 B) and the rank-3+ and other-dimension selects can use it.
 2. Take `opt-level` 2 after an end-to-end run (`cargo xtask bench` default selection, MNIST step, one model) shows nothing
    moved. 1.7 KB for free.
-3. Do not build overlays (5). If per-entry mover cost matters for a workload, take the replay of host-encoded read entries
-   (5a) first: 3.4x per entry on one tile in the probe, in the same entry size, with the interpreter's other ops
-   untouched. First measure an end-to-end case on 1-4 tiles (where the models run) to see whether it is worth the loss of
-   on-card validation for those entries.
+3. Do not build overlays (5). Host-encoded read entries (5a) are in as a build-time mode, safe by default: 1.95x per entry
+   on the card, 1.0x to 1.1x on the flows measured. Next: encode trace lists, and decide per deployment between `fast-reads`
+   (host is the validator, the card checks integrity) and adding `encoded-guard` (another ~40 cycles for an independent check).
 4. Use SFPI only as a development oracle for SFPU encodings and instruction counts, not as a build dependency
    ([recipe and a checked example](../plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only)).
 5. Prioritise by what the numbers say: dispatch/host submission (8) > fewer pushed words (7) > host-encoded read entries (5a)

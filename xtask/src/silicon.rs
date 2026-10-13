@@ -99,6 +99,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 /// tier that says burn-tt still computes what Burn's CPU backend computes, on
 /// the hardware it is for.
 pub const SMOKE: &[&str] = &[
+    // The B mover's read mode, whichever way the firmware was built: the safe image's
+    // refusals, or with `--feature fast-reads` the encoded reads' (step172).
+    "step172_encoded_reads::",
     "step19_eltwise::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",

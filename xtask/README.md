@@ -40,7 +40,7 @@ directly, one test per process, single-threaded.
 | `--smoke` | Adds the current `SMOKE` filters in `src/silicon.rs`, including native model regressions and step91–96 PRNG/BFP conversion, packed-product, propagation and mixed-training gates. |
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
-| `--feature NAME` | Also build `tt-tests` with this feature (repeatable). Only for opt-in experiments such as `ttinsn-experiment`, never a suite. |
+| `--feature NAME` | Also build `tt-tests` with this feature (repeatable). For opt-in experiments such as `ttinsn-experiment`, and for the B mover's read mode: `fast-reads` (host-encoded reads, checksum on the card) or `encoded-guard` (plus the semantic guard). The default is the safe mode. |
 | `--timeout-secs N` | Per-test wall-clock limit (default 120). |
 | `--release` | Optimised build. Quote timings only from this. |
 | `--list` | Print the selection without touching a card. |

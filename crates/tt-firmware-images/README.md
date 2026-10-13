@@ -37,3 +37,9 @@ in `rust-toolchain.toml`).
   trap on these cores.
 - Rebuilds are driven by per-file `rerun-if-changed` over `tt-firmware` and `tt-isa`
   sources. A firmware edit that does not rebuild is a bug here.
+
+## Features
+
+`fast-reads` and `encoded-guard` build the B mover that runs host-encoded reads (see `tt-firmware`); `FAST_READS` says which
+this build is, and the mover reports the same in `dm::CAPS`, which a host reads. Default: the safe image. `ttinsn-experiment`
+adds the `.ttinsn` experiment image.

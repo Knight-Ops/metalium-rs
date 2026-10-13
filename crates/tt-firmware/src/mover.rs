@@ -4,12 +4,12 @@
 // Protocol and layout are `tt_isa::dm`, which the host shares.
 
 use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
 
-const TXN: TxnId = match TxnId::new(if IS_NC { 4 } else { 2 }) {
+const TXN: TxnId = match TxnId::new(if IS_NC { dm::TXN_NC } else { dm::TXN_B }) {
     Some(t) => t,
     None => panic!(),
 };
@@ -402,11 +402,56 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     Ok(())
 }
 
+/// Whether this image runs host-encoded reads ([`op::READ_ENCODED`]): the `fast-reads`
+/// feature, B only. Without it (the default, "safe" mode) the card decodes and checks
+/// every read itself, and a `READ_ENCODED` entry is an unknown op that reaches no NIU
+/// (`error::OP`). A const, so a safe image carries none of the code below.
+const FAST_READS: bool = cfg!(feature = "fast-reads") && !IS_NC;
+
+/// Whether, besides the checksum, each encoded read is run through [`encoded::guard`]:
+/// the `encoded-guard` feature (about 50 cycles an entry).
+const ENCODED_GUARD: bool = FAST_READS && cfg!(feature = "encoded-guard");
+
+/// What this image tells the host it can do ([`dm::CAPS`]).
+const CAPS: u32 = dm::caps::VALID
+    | if FAST_READS { dm::caps::FAST_READS } else { 0 }
+    | if ENCODED_GUARD { dm::caps::GUARD } else { 0 };
+
+/// `op::READ_ENCODED`: one GDDR read the host validated and encoded
+/// (`tt_isa::dm::encoded`). The card verifies the entry's checksum -- damage in
+/// transit, an overwritten list, or an entry the encoder did not make -- and issues it
+/// as `issue_via` issues the words of a decoded one, with the tag and control word a B
+/// read always has. With `encoded-guard` it also runs the semantic guard first.
+#[link_section = ".text.hot"]
+#[inline(never)]
+fn read_encoded(me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
+    reader_only()?;
+    if !encoded::verify(&e) {
+        return Err(dm::error::ENCODED);
+    }
+    if ENCODED_GUARD {
+        let bit = |hi: u32| rd(M.at(encoded::ENDPOINTS) + (hi as u64 / 32) * 4) >> (hi % 32) & 1 != 0;
+        if !encoded::guard(&e, encoded::endpoint_hi(me.0, me.1), bit) {
+            return Err(dm::error::ENCODED);
+        }
+    }
+    if noc::read_fast() {
+        noc::room_for_read(TXN);
+        noc::issue_read(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7], TXN);
+    } else {
+        noc::issue_dram_on::<false>(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7], TXN);
+    }
+    Ok(())
+}
+
 /// Run one list entry: plain entries are issued without waiting; a transposed
 /// read waits for its own tile before rearranging it; a kernel or a wait entry
 /// first waits for everything before it.
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
+    if FAST_READS && w[0] == op::READ_ENCODED {
+        return read_encoded(me, w);
+    }
     match Entry::decode(usable, w)? {
         Entry::IndexPick { indices, source, output, bound, first, rows, bytes } => {
             reader_only()?;
@@ -891,7 +936,14 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             let entry_traced = traced && head[0] != op::PAIR_CALL;
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
             if n == 1 {
-                if let Err(code) = exec(me, usable, head) {
+                // The host-encoded read goes straight to its issue, past `exec`'s
+                // prologue and decode (`exec` also takes it, for the other callers).
+                let r = if FAST_READS && head[0] == op::READ_ENCODED {
+                    read_encoded(me, head)
+                } else {
+                    exec(me, usable, head)
+                };
+                if let Err(code) = r {
                     wr(M.mailbox + offset::RESULT, head[0]);
                     return Err(code);
                 }
@@ -1052,6 +1104,8 @@ fn call(
 pub extern "Rust" fn firmware_main() -> ! {
     // Gathering off, as on every role (`tt_firmware::disable_gathering`).
     tt_firmware::disable_gathering();
+    // What this image was built to do, before the host's first list.
+    wr(M.at(dm::CAPS), CAPS);
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
     // Local data RAM is not zeroed on the simulator (divergence row 25).
     *launched() = 0;

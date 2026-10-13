@@ -69,3 +69,12 @@ cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   Blackhole cannot execute (compressed, `lr`/`sc`, `fdiv`, `fsqrt`, the `fmadd`
   family, `fence.i`, `pause`, unlisted `fence` orderings, undecodable words).
   Executing an unimplemented instruction is undefined behaviour, not a trap.
+
+## Features
+
+| Feature | What it does |
+|---|---|
+| (none) | The default "safe" images: the B mover decodes and checks every read itself and refuses `READ_ENCODED`. |
+| `fast-reads` | The B mover runs host-encoded reads (`tt_isa::dm::encoded`), verifying their checksum; the host validates them in full. Reported to the host in `dm::CAPS`. |
+| `encoded-guard` | With `fast-reads`: also `encoded::guard`, an independent semantic check of each encoded read (~40 cycles). |
+| `ttinsn-experiment` | The `.ttinsn` push-fusion experiment image (`docs/plans/ttinsn-push-experiment.md`). |

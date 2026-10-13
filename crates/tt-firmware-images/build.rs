@@ -63,8 +63,19 @@ fn main() {
         .args(["build", "--release", "--target", TARGET])
         .arg("--target-dir")
         .arg(&target_dir);
+    let mut features = Vec::new();
     if experiment {
-        cmd.args(["--features", "ttinsn-experiment"]);
+        features.push("ttinsn-experiment");
+    }
+    // The mover's read mode is chosen here, at build time (`tt-firmware`'s features).
+    if std::env::var_os("CARGO_FEATURE_FAST_READS").is_some() {
+        features.push("fast-reads");
+    }
+    if std::env::var_os("CARGO_FEATURE_ENCODED_GUARD").is_some() {
+        features.push("encoded-guard");
+    }
+    if !features.is_empty() {
+        cmd.args(["--features", &features.join(",")]);
     }
     // A nested cargo inherits variables that redirect it back at the parent
     // workspace; strip them so the firmware build is genuinely independent.

@@ -19,6 +19,7 @@
 
 use crate::dram::{Dram, DramRange};
 
+pub mod encoded;
 pub mod record;
 
 /// The mover's mailbox: the slot after the three role mailboxes
@@ -90,6 +91,10 @@ pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
 /// 16 KiB, against 3-4% off one tile's small reads
 /// (`docs/learnings/performance-log.md`, "What holds card reads").
 pub const TILE_IN_FLIGHT_CAP: u32 = 8;
+/// The NoC transaction ID RISCV B's requests carry (`PACKET_TAG` bits 10..14),
+/// and NC's: the mover's `TXN`.
+pub const TXN_B: u8 = 2;
+pub const TXN_NC: u8 = 4;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -145,7 +150,26 @@ pub const TRACE_PROGRESS: u64 = MAILBOX_BASE + 0xE4;
 /// ignores it (its writes are not on this path).
 pub const READ_FAST: u64 = MAILBOX_BASE + 0xE8;
 const _: () = assert!(TRACE_PROGRESS + 4 <= READ_FAST);
-const _: () = assert!(READ_FAST + 4 <= MAILBOX_BASE + 0x100);
+
+/// Mover -> host: what this image was built to do ([`caps`]), written once as the
+/// mover starts. Zero until it has: the host waits for [`caps::VALID`]. The host
+/// reads it instead of assuming which firmware it loaded.
+pub const CAPS: u64 = MAILBOX_BASE + 0xEC;
+const _: () = assert!(READ_FAST + 4 <= CAPS);
+const _: () = assert!(CAPS + 4 <= MAILBOX_BASE + 0x100);
+
+/// [`CAPS`]'s bits.
+pub mod caps {
+    /// The word has been written (every image sets it, so zero means "not yet").
+    pub const VALID: u32 = 1 << 31;
+    /// The image runs host-encoded reads ([`super::op::READ_ENCODED`]): built with the
+    /// `fast-reads` feature. Without it the card decodes and checks every read
+    /// itself and refuses `READ_ENCODED` as an unknown op.
+    pub const FAST_READS: u32 = 1 << 0;
+    /// With `FAST_READS`, the image also runs [`super::encoded::guard`] on each
+    /// encoded read (the `encoded-guard` feature), not only its checksum.
+    pub const GUARD: u32 = 1 << 1;
+}
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {
@@ -206,6 +230,13 @@ pub mod op {
     /// datum_bytes]`. Source holds a 32-column chunk beginning at `first`.
     /// Indices outside `0..bound` report DOMAIN before any indexed access.
     pub const INDEX_PICK: u32 = 0x49;
+    /// B issues one GDDR read the host already encoded ([`super::encoded`]):
+    /// `[READ_ENCODED, TARG, TARG_HI, RET, RET_HI, CHECK, 0, LEN]`, at most
+    /// `MAX_REQUEST_BYTES` of it. The card verifies `CHECK` (an integrity word the host's
+    /// encoder computes over the others), not the move: the host validated that
+    /// ([`super::encoded::validate`]). Only an image built with `fast-reads` runs it
+    /// ([`super::caps::FAST_READS`]); B only.
+    pub const READ_ENCODED: u32 = 0x4A;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
@@ -979,6 +1010,10 @@ pub mod error {
     pub const DIRECTION: u32 = 10;
     /// A native arithmetic operation rejected a logical input (division by zero).
     pub const DOMAIN: u32 = 11;
+    /// A host-encoded read ([`super::op::READ_ENCODED`]) failed the card's checksum
+    /// (or, with `encoded-guard`, its guard, [`super::encoded::guard`]): not what the
+    /// host's encoder makes, or damaged on the way.
+    pub const ENCODED: u32 = 12;
 }
 
 /// A descriptor, as both sides see it.

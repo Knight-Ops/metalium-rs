@@ -9,6 +9,12 @@
 
 use tt_isa::tensix::Core;
 
+/// Whether these images were built with `fast-reads`: the B mover runs host-encoded reads
+/// (`tt_isa::dm::encoded`). The mover reports the same thing at run time (`dm::CAPS`), which
+/// is what a host consults; this is for code that must know at compile time, a gate that
+/// exists only in one mode.
+pub const FAST_READS: bool = cfg!(feature = "fast-reads");
+
 /// One image: the core it runs on, its bytes, and where it is loaded in L1.
 ///
 /// The same shape as `tt_kernels::runtime::RoleImages`' entries.
