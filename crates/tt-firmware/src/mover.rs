@@ -851,17 +851,34 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
 const IS_CALL: u32 = u32::MAX;
 
 static mut CALL_BASE: u32 = 0;
-/// The seed of an encoded read's checksum (`encoded::context_seed`): this mover's key, tile,
-/// chip and op, set once at boot; flipped by `encoded::TRACE_DOMAIN` while a trace replays,
-/// so an encoded read inside a trace fails its check.
+/// The seed an encoded read's checksum is checked against (`encoded::context_seed`: this mover's
+/// key, tile, chip and op), set at boot to [`ENCODE_LIST_SEED`] and, while a trace's entries run (everything
+/// [`call`] streams from GDDR, a streaming region's reader section nested in a trace included), to
+/// that seed in `encoded::TRACE_DOMAIN`. Set, not toggled: a `PAIR_CALL` inside a trace calls again.
 static mut ENCODE_SEED: u32 = 0;
+/// [`ENCODE_SEED`] in the domain of the lists the host sends.
+static mut ENCODE_LIST_SEED: u32 = 0;
 
-/// Enter or leave a trace's domain of [`ENCODE_SEED`] (a safe image has none).
+/// Enter the trace's domain of [`ENCODE_SEED`], returning what to restore (a safe image has none).
 #[inline(always)]
-fn flip_trace_domain() {
+fn enter_trace_domain() -> u32 {
     if FAST_READS {
         unsafe {
-            ENCODE_SEED ^= encoded::TRACE_DOMAIN;
+            let previous = ENCODE_SEED;
+            ENCODE_SEED = ENCODE_LIST_SEED ^ encoded::TRACE_DOMAIN;
+            previous
+        }
+    } else {
+        0
+    }
+}
+
+/// Leave it, as [`enter_trace_domain`] found it.
+#[inline(always)]
+fn leave_trace_domain(previous: u32) {
+    if FAST_READS {
+        unsafe {
+            ENCODE_SEED = previous;
         }
     }
 }
@@ -1155,9 +1172,9 @@ fn call(
         unsafe {
             CALL_BASE = generation_base;
         }
-        flip_trace_domain();
+        let domain = enter_trace_domain();
         let result = run_entries(me, usable, chunk, n);
-        flip_trace_domain();
+        leave_trace_domain(domain);
         unsafe {
             CALL_BASE = previous;
         }
@@ -1187,8 +1204,9 @@ pub extern "Rust" fn firmware_main() -> ! {
     let usable = rd(M.at(dm::USABLE));
     if FAST_READS {
         unsafe {
-            ENCODE_SEED =
+            ENCODE_LIST_SEED =
                 encoded::context_seed(rd(M.at(dm::ENCODE_KEY)), me, usable, op::READ_ENCODED);
+            ENCODE_SEED = ENCODE_LIST_SEED;
         }
     }
     let mut beat: u32 = 0;

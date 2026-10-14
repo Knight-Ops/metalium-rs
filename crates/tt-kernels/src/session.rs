@@ -3293,9 +3293,11 @@ impl<T: Transport> Session<T> {
                     ))
                 })?;
                 let writer_at = 1 + relative[0][1] as usize;
-                let (reader, reader_storage) = self.store_region(u, &relative[1..writer_at])?;
+                let (reader, reader_storage) =
+                    self.store_region(u, &relative[1..writer_at], true)?;
                 out.regions.push(reader_storage);
-                let (writer, writer_storage) = self.store_region(u, &relative[writer_at..])?;
+                let (writer, writer_storage) =
+                    self.store_region(u, &relative[writer_at..], false)?;
                 out.regions.push(writer_storage);
                 out.sections.extend([reader[2], writer[2]]);
                 out.stream.push([
@@ -3512,12 +3514,21 @@ impl<T: Transport> Session<T> {
     }
 
     /// Unit `u`'s captured stream, laid out for streaming and written to GDDR.
+    ///
+    /// `reader` is whether the entries are a streaming region's reader section, which B's `CALL` streams
+    /// and verifies: its plain reads are stored encoded when the unit's mover encodes them
+    /// ([`crate::dm::DataMover::trace_form`]). A writer section is NC's, and stays as it is.
     fn store_region(
         &mut self,
         u: usize,
         entries: &[[u32; 8]],
+        reader: bool,
     ) -> Result<([u32; 3], tensor::Placement), TensorError> {
-        let words = trace::chunked(entries);
+        let entries = match self.units[u].mover.as_ref() {
+            Some(m) if reader => m.trace_form(entries),
+            _ => std::borrow::Cow::Borrowed(entries),
+        };
+        let words = trace::chunked(&entries);
         let mut bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3551,7 +3562,12 @@ impl<T: Transport> Session<T> {
         u: usize,
         uc: &trace::UnitCapture,
     ) -> Result<trace::UnitTrace, TensorError> {
-        let words = trace::chunked(&uc.stream);
+        // A unit's stream runs on its B mover: its plain reads are stored encoded, in the trace's domain.
+        let stream_entries = match self.units[u].mover.as_ref() {
+            Some(m) => m.trace_form(&uc.stream),
+            None => std::borrow::Cow::Borrowed(uc.stream.as_slice()),
+        };
+        let words = trace::chunked(&stream_entries);
         let bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3654,6 +3670,99 @@ impl<T: Transport> Session<T> {
         }
         self.barriers = self.barriers.wrapping_add(barriers);
         Ok(())
+    }
+
+    /// Test hook: the entries unit `u`'s trace `id` streams, read back from GDDR: its stream, then each
+    /// streaming region's section (reader, writer, ...), chunking's `WAIT` padding included.
+    #[doc(hidden)]
+    pub fn trace_entries(
+        &mut self,
+        id: TraceId,
+        u: usize,
+    ) -> Result<Vec<Vec<[u32; 8]>>, TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        let ut = t
+            .units
+            .get(u)
+            .and_then(|u| u.as_ref())
+            .ok_or(TraceError::Unknown(id.0))?;
+        let mut parts: Vec<(tt_isa::dram::DramRange, usize)> = vec![(
+            ut.stream.region().expect("a one-channel placement"),
+            ut.count as usize,
+        )];
+        for (region, &count) in ut.regions.iter().zip(&ut.sections) {
+            parts.push((
+                region.region().expect("a one-channel placement"),
+                count as usize,
+            ));
+        }
+        let Session { dev, dram, .. } = self;
+        let w4 = &dram.as_ref().expect("a trace needs GDDR").w4;
+        let mut out = Vec::new();
+        for (range, count) in parts {
+            let mut bytes = vec![0u8; range.len() as usize];
+            dev.dram_read(w4, range, &mut bytes)?;
+            out.push(
+                bytes
+                    .chunks_exact(32)
+                    .take(count)
+                    .map(|e| {
+                        core::array::from_fn(|k| {
+                            u32::from_le_bytes(e[k * 4..k * 4 + 4].try_into().unwrap())
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Test hook: set word `word` of entry `entry` in part `part` (0 the stream, then each streaming
+    /// region's section, as [`Session::trace_entries`] orders them) of unit `u`'s trace `id` to `value` in
+    /// GDDR, and nothing else: a trace damaged after its capture, for the gates that check what a replay
+    /// refuses.
+    #[doc(hidden)]
+    pub fn poke_trace_entry(
+        &mut self,
+        id: TraceId,
+        u: usize,
+        part: usize,
+        entry: usize,
+        word: usize,
+        value: u32,
+    ) -> Result<(), TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        let ut = t
+            .units
+            .get(u)
+            .and_then(|u| u.as_ref())
+            .ok_or(TraceError::Unknown(id.0))?;
+        let (range, count) = if part == 0 {
+            (ut.stream.region().expect("one channel"), ut.count as usize)
+        } else {
+            (
+                ut.regions[part - 1].region().expect("one channel"),
+                ut.sections[part - 1] as usize,
+            )
+        };
+        assert!(entry < count && word < 8, "outside the part");
+        let Session { dev, dram, .. } = self;
+        let w4 = &dram.as_ref().expect("a trace needs GDDR").w4;
+        let mut bytes = vec![0u8; range.len() as usize];
+        dev.dram_read(w4, range, &mut bytes)?;
+        let at = entry * 32 + word * 4;
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        dev.dram_write(w4, range, &bytes)?;
+        Ok(())
+    }
+
+    /// Test hook: what unit `u`'s encoded reads are bound to (`DataMover::encode_context`), if it has a mover.
+    #[doc(hidden)]
+    pub fn encode_context(&self, u: usize) -> Option<tt_isa::dm::encoded::Context> {
+        self.units[u]
+            .mover
+            .as_ref()
+            .map(|m| m.encode_context().clone())
     }
 
     /// Give trace `id` back: once nothing queued runs it, its programs may be
