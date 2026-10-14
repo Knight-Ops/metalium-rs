@@ -404,10 +404,12 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   tile and each op runs on a fixed count (`Fixed(k)`) or one sized by its work (`Work { share, min }`). At 120
   tiles a fixed spread of 4 is within ~5% of the best small session (MNIST 2.2-2.3 ms/step, transformer ~80);
   spreads that vary per op lose to catch-up and program-placement churn
-  ([performance log](../learnings/performance-log.md#per-op-tile-spread-2026-10-14-card-1)). Open: the default
-  (still `All`, and auto-attach still opens one tile; opening all with a spread of 4 is the measured candidate),
-  a cheaper catch-up (folded into the next list) so a per-op spread can pay, and the per-op work that still
-  scales with the session's tile count. Auto-attach opens one tile (`TileChoice::First`), and a session's tile
+  ([performance log](../learnings/performance-log.md#per-op-tile-spread-2026-10-14-card-1)). Since then a
+  catch-up rides in the unit's first list and no per-op work loops over every open tile: 120 tiles at a fixed
+  spread match the best small session, and `Work { share: 64, min: 4 }` is as fast on small ops and 1.45x on a
+  2048^2 add ([performance log](../learnings/performance-log.md#open-all-made-strictly-better-2026-10-14-cards-0-and-1)).
+  Open: the default (still `All`, and auto-attach still opens one tile; every tile with `Work { 64, 4 }` is the
+  measured candidate, after the models and conformance run on it), and the same per card for a mesh. Auto-attach opens one tile (`TileChoice::First`), and a session's tile
   count is fixed at attach. Open `All` tiles and choose a subset per op: an autotune-style cache keyed by
   `(op, shape, dtype)` that measures candidate counts on first use (`[512,512]^2`: 8 tiles 1.32 ms against
   120 tiles 2.0 ms, checklist 9.7c) and keeps the best. Needs a per-op tile subset in `tt-kernels`; related to

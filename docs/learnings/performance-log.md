@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Open-all made strictly better](#open-all-made-strictly-better-2026-10-14-cards-0-and-1) | 2026-10-14 | no per-op loop over every open tile, and a tile's catch-up rides in its first list for the op: 120 tiles at a fixed spread match the best small session (transformer 77.9 against 79.8 on 2 tiles, MNIST 2.2 = 8 tiles), and a per-op spread now pays on mixed sizes (a 2048^2 add 725 us against 1,054 at a fixed 4, small ops 19.4 us both) |
 | [Per-op tile spread](#per-op-tile-spread-2026-10-14-card-1) | 2026-10-14 | `Session::set_spread` / `TT_SPREAD`: a session can open every tile and give each op a few; at 120 tiles a fixed spread of 4 gives MNIST 2.2-2.3 ms/step (6.7 on every tile, 2.1 on an 8-tile session) and the transformer ~80 (96.8; 74-76 on 2 tiles); spreads that vary per op lose to churn; the default stays every tile |
 | [Barriers on the units an op ran on](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) | 2026-10-14 | a tile an op does not use no longer enqueues a barrier list for it: the all-tiles transformer 404-422 -> 96-98 ms/step (now faster than one tile), all-tiles MNIST 12.9-13.4 -> 6.7, one tile unchanged, losses and accuracy identical |
 | [Descriptor runs in a trace's prologue](#descriptor-runs-in-a-traces-prologue-2026-10-14-card-0) | 2026-10-14 | `record::POKE_RUN`: a trace's 51 `POKE`s become 9 records, 8,824 -> 4,892 device cycles a replay; a replay is 2.3-4.6 us shorter host-timed, its stream 124 -> 91 entries, and the 8-tile chunk boundary is gone |
@@ -639,6 +640,60 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Open-all made strictly better (2026-10-14, cards 0 and 1)
+
+The [per-op tile spread](#per-op-tile-spread-2026-10-14-card-1) left two costs of opening every tile: per-op work that still looped over
+every open tile (~5% of a transformer step), and a catch-up that was a list of its own, which made a spread that varies per op lose to churn.
+
+**The changes** (`Session::enqueue_work_inner`):
+- Everything an op lays out is sized by the units it runs on: its queues, the units that arrive at its barrier, what each must catch up
+  on and which barriers were folded. A capture still involves every unit, as before. Nothing on the fresh path loops over the session's
+  other tiles per op.
+- A unit that sat ops out catches up inside its first list for the op (`lead_with`): the wait-only `BARRIER` goes first in a packet's
+  reader section (its count in the header raised; NC's writes wait on credits only the reader and the roles release, so they follow it
+  too) or first in a plain list, with the list's kernel and wait indices moved past it. Only a list already `LIST_MAX` long gets a wait of
+  its own, still for the target taken before the op's own barrier was counted. Buffers freed while lists may read them are given back
+  only at the next sync, so a write never lands under another unit's read: ordering a unit's reads after the wait is what is needed.
+
+**`tt-mnist`, card 1, one run each (ms/step):**
+
+| Session, spread | transformer | MNIST (300 steps) |
+|---|--:|--:|
+| 2 tiles, all | 79.8 | 3.5 |
+| 8 tiles, all | 81.2 | 2.2 |
+| 120 tiles, all | 89.3 (96.2-96.8 before) | 6.4 (6.7) |
+| 120 tiles, spread 2 | **77.9** | 3.5 |
+| 120 tiles, spread 4 | 79.3 | **2.2** |
+| 120 tiles, `work:64:2` / `work:256:4` | 77.8 / 77.2 | 3.0 / 3.0 |
+
+- **120 tiles at a fixed spread now match or beat the best small session** in the same run: the transformer 77.9 at spread 2 against 79.8 on a
+  2-tile session, MNIST 2.2 at spread 4 equal to an 8-tile session. (The 2-tile transformer measured 73.9-75.7 in earlier runs, so run to run
+  is a few ms.) Every tile with no spread is better too: 96 -> 89 and 6.7 -> 6.4.
+- **A catch-up costs no list**: the barrier stage is 0.9 ms over a 300-step MNIST run under either a fixed or a varying spread (24.5 ms before at
+  `work:64:4`).
+- **Over 300 steps a varying spread still looks worse for MNIST** (2.8-3.2 against 2.2), but that is one-time: starting the movers on the
+  tiles a large op first reaches (~240 ms of enqueue time outside every stage, 116 tiles) and their first programs and descriptors (drains 134
+  against 16). Over 1,000 and 3,000 steps `work:64:4` is 2.4 against 2.3. `work:16:4` stays at 2.7-2.8: it gives a matmul ~13 tiles at ~5 us of
+  host each, so the share has to be large enough for the host's cost a tile.
+
+**Mixed op sizes** (`silicon_bench_spread::small_and_large_ops_by_spread`, card 1, 120 tiles, medians of 7, run `1791988111`): 64 chained
+relus of a 64x64 tensor, host-timed per op, and one 2048x2048 add to its end.
+
+| Spread | small op | large op |
+|---|--:|--:|
+| `All` | 22.7 us | 1,107 us |
+| `Fixed(4)` | 19.6 us | 1,054 us |
+| **`Work { share: 64, min: 4 }`** | **19.4 us** | **725 us** |
+| `Work { share: 16, min: 4 }` | 19.4 us | 1,104 us |
+
+A spread by work is as good as the best fixed one on small ops and 1.45x faster on the large one: `All` is host-bound (120 tiles at ~5 us),
+`Fixed(4)` device-bound (1,024 tiles each), and a share of 64 gives the add 64 tiles. A share of 16 clamps to 120 and is host-bound again.
+
+Gates: `step176` holds the fold -- with the wait dropped from the list the reader reads before the write and fails; with every wait a list
+of its own the units that caught up show one more list than unit 0 (`[1, 2, 2, 2]`) and fail. The default (`All`) folds too -- an op
+with fewer jobs than tiles leaves tiles behind -- so the whole set ran again: 45 simulator binaries, `step12_mnist` with `e2e` (8/8),
+and the smoke selection on card 0, 1,027 of 1,027 (run `1791988149`).
 
 ## Per-op tile spread (2026-10-14, card 1)
 

@@ -134,6 +134,13 @@ fn a_unit_that_sat_an_op_out_waits_for_it_before_reading_its_output() {
                 ran_reader.iter().all(|&l| l > 0),
                 "round {round}: the reader did not run on every unit: {ran_reader:?}"
             );
+            // Units 1-3 caught up, unit 0 did not need to, and each has one job: the same
+            // lists on all four, because the wait rides in the unit's first list for the
+            // op rather than in a list of its own.
+            assert!(
+                ran_reader.iter().all(|&l| l == ran_reader[0]),
+                "round {round}: a catch-up cost a list of its own: {ran_reader:?}"
+            );
 
             let want_slow = host_matmul(&a1, &b1, m1, k1, n1);
             let want = host_matmul(&a2, &want_slow, m2, k2, n1);

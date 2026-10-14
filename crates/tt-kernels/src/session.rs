@@ -1274,6 +1274,36 @@ fn admitted(words: usize, cache: u64) -> bool {
     words > 0 && words as u64 * 4 <= cache / 2
 }
 
+/// Put `entry`, a B entry, ahead of everything else `seg` runs: first in a packet's
+/// reader section (NC's writes wait on credits only the reader and the roles release, so
+/// they follow it too), or first in a plain list. `false`, and `seg` unchanged, if the
+/// list is already as long as a list may be.
+fn lead_with(seg: &mut Segment, entry: [u32; 8]) -> bool {
+    if seg.entries.len() >= tt_isa::dm::LIST_MAX as usize {
+        return false;
+    }
+    let packet = seg
+        .entries
+        .first()
+        .is_some_and(|e| e[0] == tt_isa::dm::op::PAIR);
+    let at = usize::from(packet);
+    seg.entries.insert(at, entry);
+    if packet {
+        seg.entries[0][1] += 1;
+    }
+    for k in &mut seg.kernels {
+        if *k >= at {
+            *k += 1;
+        }
+    }
+    for (w, _) in &mut seg.waits {
+        if *w >= at {
+            *w += 1;
+        }
+    }
+    true
+}
+
 /// A unit's steps as ownership regions and control lists, for a program cache
 /// of `cache` bytes (`Session::limit_program_cache`).
 fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, TensorError> {
@@ -2777,6 +2807,21 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
+    /// A wait-only `BARRIER` for `target` (`dm::op::BARRIER` word 4 = 1).
+    fn barrier_wait(&self, target: u32) -> [u32; 8] {
+        let c = self.units[0].tile;
+        [
+            tt_isa::dm::op::BARRIER,
+            target,
+            c.x() as u32,
+            c.y() as u32,
+            1,
+            0,
+            0,
+            0,
+        ]
+    }
+
     /// The barrier counter and the session's count start again at zero, and no
     /// tile has a target to wait for: on a recovery, with nothing queued.
     fn restart_barriers(&mut self) {
@@ -2796,7 +2841,14 @@ impl<T: Transport> Session<T> {
     /// barrier list of its own (one PCIe enqueue a tile an op: a 2-tile op on 120
     /// tiles was 118 of them, and the all-tiles transformer 355,000 a step).
     fn catch_up(&mut self, u: usize) -> Result<(), TensorError> {
-        if self.units.len() < 2 || self.units[u].barrier_seen == self.barriers {
+        let target = self.barriers;
+        self.catch_up_to(u, target)
+    }
+
+    /// [`Session::catch_up`] to `target`: the latest barrier before the op being
+    /// queued, which its own barrier may already have moved past.
+    fn catch_up_to(&mut self, u: usize, target: u32) -> Result<(), TensorError> {
+        if self.units.len() < 2 || self.units[u].barrier_seen == target {
             return Ok(());
         }
         // A capture's barriers involve every unit, and it starts synced, so no
@@ -2808,18 +2860,7 @@ impl<T: Transport> Session<T> {
             ));
         }
         self.ensure_unit(u)?;
-        let target = self.barriers;
-        let c = self.units[0].tile;
-        let entry = [
-            tt_isa::dm::op::BARRIER,
-            target,
-            c.x() as u32,
-            c.y() as u32,
-            1,
-            0,
-            0,
-            0,
-        ];
+        let entry = self.barrier_wait(target);
         let Session { dev, units, .. } = self;
         let unit = &mut units[u];
         let (r, m) = (
@@ -3016,26 +3057,36 @@ impl<T: Transport> Session<T> {
         for (j, job) in jobs.into_iter().enumerate() {
             queues[j % spread].extend(job);
         }
-        // The units this op runs on, and the ones that arrive at its barrier: the
-        // same, except in a capture, whose barriers keep every unit so a replay's
-        // streams all agree on the count whatever each op used.
+        // The units that arrive at this op's barrier: the ones it runs on, except in
+        // a capture, whose barriers keep every unit so a replay's streams all agree on
+        // the count whatever each op used. Nothing below loops over the session's
+        // other units: on many tiles that was a host cost every op paid.
         let capturing = self.capture.is_some();
-        let runs: Vec<bool> = (0..n)
-            .map(|u| queues.get(u).is_some_and(|q| !q.is_empty()))
-            .collect();
-        let arriving: Vec<bool> = runs.iter().map(|&r| r || capturing).collect();
+        let arriving: Vec<usize> = match capturing {
+            true => (0..n).collect(),
+            false => (0..spread).filter(|&u| !queues[u].is_empty()).collect(),
+        };
+        // What each unit the op runs on must wait for first: the latest barrier
+        // before this op, if it sat out the ops up to it. Taken before this op's
+        // barrier is counted, since that target includes the unit's own arrival,
+        // which it would wait for in vain. It rides at the front of the unit's first
+        // list for the op ([`lead_with`]), not in a list of its own.
+        let mut behind: Vec<Option<u32>> = vec![None; spread];
         if n > 1 {
-            for u in (0..n).filter(|&u| arriving[u]) {
+            for &u in &arriving {
                 self.ensure_unit(u)?;
             }
-            // A unit that sat out the ops since its last barrier waits for them
-            // first, before this op's barrier is counted: that target includes
-            // the unit's own arrival, which it would wait for in vain.
-            let start = self.mark();
-            for u in (0..n).filter(|&u| runs[u]) {
-                self.catch_up(u)?;
+            for (u, b) in behind.iter_mut().enumerate() {
+                if !queues[u].is_empty() && self.units[u].barrier_seen != self.barriers {
+                    // A capture's barriers involve every unit, and it starts synced.
+                    if capturing {
+                        return Err(TensorError::Shape(
+                            "a tile is behind the barrier counter inside a capture".into(),
+                        ));
+                    }
+                    *b = Some(self.barriers);
+                }
             }
-            self.stage(HostStage::Barrier, start);
         }
         // In rounds: every unit's first list, then every unit's second, and
         // so on. A unit whose share is more than its ring holds makes the
@@ -3061,7 +3112,7 @@ impl<T: Transport> Session<T> {
         // list where there is room -- a list of its own was a second enqueue a
         // unit an op, half the host's time on many tiles (checklist 9.17) --
         // except while capturing, whose streams take it as an entry of its own.
-        let arrivals = arriving.iter().filter(|&&a| a).count() as u32;
+        let arrivals = arriving.len() as u32;
         let barrier = (n > 1 && !self.unbarriered && arrivals > 0).then(|| {
             self.barriers = self.barriers.wrapping_add(arrivals);
             let target = self.barriers;
@@ -3078,12 +3129,23 @@ impl<T: Transport> Session<T> {
             ]
         });
         let fold = barrier.filter(|_| self.capture.is_none());
-        let mut folded = vec![false; n];
+        let mut folded = vec![false; spread];
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
                 if let Some(mut seg) = q.pop_front() {
                     if what.is_empty() {
                         *what = seg.what;
+                    }
+                    if let Some(target) = behind[u].take() {
+                        if lead_with(&mut seg, self.barrier_wait(target)) {
+                            self.units[u].barrier_seen = target;
+                        } else {
+                            // A list already as long as a list may be: the wait goes
+                            // ahead of it as a list of its own.
+                            let start = self.mark();
+                            self.catch_up_to(u, target)?;
+                            self.stage(HostStage::Barrier, start);
+                        }
                     }
                     if let Some(entry) = fold {
                         if q.is_empty() && seg.entries.len() < tt_isa::dm::LIST_MAX as usize {
@@ -3110,7 +3172,10 @@ impl<T: Transport> Session<T> {
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
-            for u in (0..n).filter(|&u| arriving[u] && !folded[u]) {
+            for &u in arriving
+                .iter()
+                .filter(|&&u| !folded.get(u).copied().unwrap_or(false))
+            {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let (r, m) = (
@@ -3125,7 +3190,7 @@ impl<T: Transport> Session<T> {
                     what: "barrier",
                 });
             }
-            for u in (0..n).filter(|&u| arriving[u]) {
+            for &u in &arriving {
                 self.units[u].barrier_seen = entry[1];
             }
             self.stage(HostStage::Barrier, start);
