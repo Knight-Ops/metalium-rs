@@ -154,75 +154,6 @@ impl From<Niu> for WriteNoc {
     }
 }
 
-/// Replace each plain single-request `READ` of `section` (outside records) with its encoded form in `domain`,
-/// one entry for one. `check` passed the entries as plain ones, so `encode` cannot refuse one; an entry that
-/// is not a short read stays as it is.
-fn encode_flat(ctx: &encoded::Context, domain: encoded::Domain, section: &mut [[u32; 8]]) {
-    let mut i = 0;
-    while i < section.len() {
-        let n = record::len(section[i][0]);
-        if n == 1 {
-            if let Ok(Some(e)) = encoded::encode_in(ctx, domain, section[i]) {
-                section[i] = e;
-            }
-        }
-        i += n;
-    }
-}
-
-/// Most entries one record is expanded into when a trace is stored: a record that would make more stays a
-/// record (correct, and run at the record's rate), so a trace's size stays within what a capture can write.
-const TRACE_EXPANSION_MAX: usize = 1 << 12;
-
-/// A trace's stream as stored: the plain single-request `READ`s encoded in the trace's domain, and each
-/// static read record replaced by its expansion, itself encoded. Everything else is copied through.
-fn flatten_for_trace(ctx: &encoded::Context, entries: &[[u32; 8]]) -> Vec<[u32; 8]> {
-    let domain = encoded::Domain::Trace;
-    let encode = |e: [u32; 8]| match encoded::encode_in(ctx, domain, e) {
-        Ok(Some(encoded)) => encoded,
-        _ => e,
-    };
-    let mut out = Vec::with_capacity(entries.len());
-    let mut i = 0;
-    while i < entries.len() {
-        let head = entries[i][0];
-        let n = record::len(head).max(1);
-        let rec = &entries[i..(i + n).min(entries.len())];
-        let static_read = n > 1
-            && rec.len() == n
-            && head != record::SELECT_ROWS
-            && record::direction(head) == Some(record::Direction::Read);
-        if static_read {
-            let mut expanded = Vec::new();
-            let mut fits = true;
-            let r = record::expand_reads(
-                rec,
-                |_| 0,
-                |e| {
-                    if expanded.len() >= TRACE_EXPANSION_MAX {
-                        fits = false;
-                        return Err(dm::error::LENGTH);
-                    }
-                    expanded.push(encode(e));
-                    Ok(())
-                },
-            );
-            if r.is_ok() && fits {
-                out.extend(expanded);
-                i += n;
-                continue;
-            }
-        }
-        if n == 1 {
-            out.push(encode(entries[i]));
-        } else {
-            out.extend_from_slice(rec);
-        }
-        i += n;
-    }
-    out
-}
-
 /// What the host does about a list that reads or writes L1 outside the data arena
 /// (`tt_isa::l1::DATA`): the mover's own regions, the images and the mailboxes are not a list's to name.
 /// Enforced unless `TT_CONTAIN` is `report` (print each violation and carry on, the survey that found
@@ -497,45 +428,32 @@ impl<N: NocId> DataMover<N> {
         if !self.encode_reads || entries.is_empty() {
             return std::borrow::Cow::Borrowed(entries);
         }
+        let encode_section = |section: &mut [[u32; 8]]| {
+            let mut i = 0;
+            while i < section.len() {
+                let n = record::len(section[i][0]);
+                if n == 1 {
+                    // `check` passed this entry as a plain one, so `encode` cannot
+                    // refuse it; one that is not a short read stays as it is.
+                    if let Ok(Some(e)) = encoded::encode(&self.context, section[i]) {
+                        section[i] = e;
+                    }
+                }
+                i += n;
+            }
+        };
         let mut out = entries.to_vec();
         if out[0][0] == op::PAIR {
             let (readers, writers) = (out[0][1] as usize, out[0][2] as usize);
             let writer_end = 1 + readers + writers;
-            encode_flat(
-                &self.context,
-                encoded::Domain::List,
-                &mut out[1..1 + readers],
-            );
+            encode_section(&mut out[1..1 + readers]);
             if out[0][4] != 0 {
-                encode_flat(&self.context, encoded::Domain::List, &mut out[writer_end..]);
+                encode_section(&mut out[writer_end..]);
             }
         } else {
-            encode_flat(&self.context, encoded::Domain::List, &mut out);
+            encode_section(&mut out);
         }
         std::borrow::Cow::Owned(out)
-    }
-
-    /// `entries` as a trace stores them for this mover's `CALL` to stream (`tt_kernels::trace`): with
-    /// [`DataMover::set_encode_reads`], each plain single-request `READ` replaced by its encoded form in
-    /// the trace's checksum domain ([`encoded::Domain::Trace`], what the firmware's `call` verifies), once,
-    /// at capture, so a replay's reads cost the tight loop's ~90 cycles and not the safe decode's ~360. And
-    /// each *read record* (`GATHER`, `READ_RUN`, `FILL_PAD`: where nearly every read of a streaming op is)
-    /// is expanded here, by the same [`record::expand_reads`] the card runs, into the entries it would
-    /// have produced, so its tiles' reads are encoded too: a trace is bigger (32 bytes a tile, not three
-    /// entries a run) and a replay faster (records cost ~345 cycles a tile on the card). A record that
-    /// does not expand statically (`SELECT_ROWS` reads its indices from L1), a write record, and any
-    /// entry that is not a short read stay as they are. For a flat run of entries -- a unit's stream, or a
-    /// streaming region's reader section -- that `check` passed. Not a writer section: only B's reads are
-    /// encoded. The entries are bound to this mover's key, so they are good for this mover's life, as a trace
-    /// is (`TraceError::Stale` after a restart).
-    pub(crate) fn trace_form<'a>(
-        &self,
-        entries: &'a [[u32; 8]],
-    ) -> std::borrow::Cow<'a, [[u32; 8]]> {
-        if !self.encode_reads || entries.is_empty() {
-            return std::borrow::Cow::Borrowed(entries);
-        }
-        std::borrow::Cow::Owned(flatten_for_trace(&self.context, entries))
     }
 
     /// Issue this mover's GDDR reads through the fast path from its next list

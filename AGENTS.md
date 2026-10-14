@@ -104,9 +104,6 @@ step172_encoded_reads --test step173_mover_differential` and the same with `--fe
 `tt-tests/encoded-guard`). An encoded read's checksum is bound to a per-start key, the tile, the chip and the op
 (`encoded::Context`); the host's `validate` also runs the independent `guard`; `enqueue_checked` validates every
 `READ_ENCODED`, and only the `#[doc(hidden)] enqueue_raw` sends an entry unchecked (for gates that forge one).
-A trace stores its reads encoded in the trace's checksum domain at capture (`DataMover::trace_form`, which also expands static
-read records; `step174_encoded_traces`): add `step174` and `step39_traces` to the gates for a change to `call`, `trace_form` or
-the checksum domains.
 
 Arithmetic, routing or execution-order changes also need the training regression:
 

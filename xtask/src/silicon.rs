@@ -103,7 +103,6 @@ pub const SMOKE: &[&str] = &[
     // refusals, or with `--feature fast-reads` the encoded reads' (step172).
     "step172_encoded_reads::",
     "step173_mover_differential::",
-    "step174_encoded_traces::",
     "step19_eltwise::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",

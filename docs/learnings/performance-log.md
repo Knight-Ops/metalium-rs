@@ -391,33 +391,6 @@ state: it failed on `--device all` too, and passed on both cards after `tt-smi -
 ([silicon-operating-notes](silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)), so it is link state
 and not the movers. Neither build refused a list.
 
-**Encoded reads in traces (2026-10-14, cards 0 and 1).** A replayed trace streams its entries from GDDR (`CALL`), and until now they were
-plain: the card decoded every read at ~360 cycles, and nearly all of a streaming op's reads are *records*, which cost ~345 a tile
-whatever the entry's encoding. Now a capture stores its reads encoded, once (`DataMover::trace_form`, in `Session::store_stream` and
-for a streaming region's reader section): each plain single-request `READ` in the trace's checksum domain (`encoded::Domain::Trace`,
-the `TRACE_DOMAIN` the firmware's `call` already verified in), and each *static read record* (`GATHER`, `READ_RUN`, `FILL_PAD`)
-**expanded on the host** by the same `record::expand_reads` the card runs, its reads encoded; `SELECT_ROWS` (its indices are in L1),
-write records and anything not a short read are stored as they were, and a record that would expand to more than 4,096 entries stays a
-record. No firmware change in the encoding itself; the tight loop runs the replayed chunks (they are untraced lists to it).
-- *The cost is trace size:* 32 bytes a tile instead of a record's three entries a run. A MNIST layer's forward capture
-  held 0 plain reads and 236 encoded ones after expansion; a trace is read once per replay, a chunk at a time, ~1/128 of the data it moves.
-- *Firmware fix this found:* the seed's domain was toggled by XOR on each `call`, and a streaming region's reader section is a `call`
-  nested in the trace's `call`: two toggles cancelled and the reader ran in the list's domain (`PAIR_CALL` failed with code 12 in
-  `step39/40/147` with fast reads). It is set and restored now (`enter_trace_domain`/`leave_trace_domain`); the safe image is unchanged
-  (plain 348 / 357 / 358 cycles, N = 64 / 256 / 448) and the fast entry is 91.0.
-- *Gate* `step174_encoded_traces` (ttsim and card 0, all three builds): the stored reads, read back from GDDR, are encoded and validate as a
-  trace's and not as a list's, and no static read record survives; replays are bit for bit the fresh ops; a stored entry with a bit of its
-  checksum flipped is refused by the card (`error::ENCODED`) at the replay; an entry carrying the list's checksum is refused in a trace; a
-  safe image stores none. Both refusals fail with the card's verification disabled (watched), and `step39`, `step40`, `step147` (both
-  cards) pass in the fast and guard builds on silicon and ttsim.
-- *What it buys* (card 0, replay time, three alternated runs each, safe -> fast): traced MNIST inference, batch 64, 1 tile 0.494 -> 0.414
-  ms/batch (**-16%**; 0.613 -> 0.484 end to end); all tiles 0.516 -> 0.505 (-2%); batch 1024 on all tiles 0.958 -> 0.916 (-4%); traced
-  CNN training, 1 tile, 145.6 -> **120.2 ms/step (-17%)**, MNIST MLP training all tiles 4.5-4.7 -> 4.4 (-2-5%). Replays are mostly
-  compute and synchronisation, so the saving is the reads' share: large at few tiles where reads dominate (as in the card-wide tables
-  above), small where they do not. (The MLP's traced training on one tile panics at capture in the safe binary too, `a list's programs do
-  not fit an empty program cache`: not this change.) The transformer benchmark has no trace mode, so the host-bound case that motivated this
-  (355,000 enqueues a step) is not yet measured.
-
 **Containment (plan phase 7, 2026-10-13; both modes, host only).** `DataMover::check_as` now requires every read's or write's L1
 range, top-level, encoded or expanded from a record, to lie in the data arena (`tt_isa::l1::DATA`, `0x2_0000` to the mailbox
 base): a list cannot be aimed at the mover's key, its list ring, its mailbox or its image, which neither mode's card-side
@@ -604,7 +577,7 @@ once, one card each); a size is compared only with the same size on the same car
 `gddr_aggregate` compared 64 KiB whatever the entry size; it now compares the entry size run.
 
 **Not changed, and what else this run met** (none of it related to the change):
-- Trace lists in GDDR (`CALL` replays) held plain entries when this was written; they are encoded at capture now ("Encoded reads in traces", above).
+- Trace lists in GDDR (`CALL` replays) hold plain entries; encoding them is open.
 - `silicon_bench_path::matmul_pipeline_sweep` fails with `event 119: an entry began outside a list or inside one`, with the
   committed `mover.rs` as well; it is the role-profile export problem `streaming-dataflow-architecture.md` ("Profiling")
   already records for `sfpu_pipeline_sweep`. `silicon_bench_memory::gddr_aggregate_nocs` fails with `Invalid(10)`

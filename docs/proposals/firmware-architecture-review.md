@@ -138,7 +138,7 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
    unless `encoded-guard` is built (a checksum sees damage and forgeries, not that). The checksum is bound to a per-start key,
    the tile, the chip and the op, so an entry from an earlier run or another mover fails it, and the host's `validate` also runs
    the independent `guard` (both builds; [phase 1](../learnings/performance-log.md#host-encoded-read-entries-2026-10-13-card-0)).
-   A captured trace stores its reads encoded too (read records expanded and encoded at capture; see the performance log's "Encoded reads in traces"); in a list the host sends, records are still untouched.
+   Trace lists in GDDR still hold plain entries, and records (most of a streaming op's reads) are untouched.
 6. **Role rebalancing.** (a) Swap to tt-metal's convention (NC reads, B writes): no expected gain, the cores cost the same.
    (b) Move control-plane entries (`KERNEL`, `LAUNCH`, barriers, pairs) to NC, which has 10 KB free, so B is only a reader:
    unmeasured and constrained by NoC endpoint ownership (SYS-1419: each GDDR endpoint is owned by one NoC; NC's reset
@@ -161,7 +161,7 @@ Each approach: what it changes, what it should cost or buy, and whether it was m
 2. Take `opt-level` 2 after an end-to-end run (`cargo xtask bench` default selection, MNIST step, one model) shows nothing
    moved. 1.7 KB for free.
 3. Do not build overlays (5). Host-encoded read entries (5a) are in as a build-time mode, safe by default: 1.95x per entry
-   on the card, 1.0x to 1.1x on the flows measured. Done since: encoded trace lists. Next: decide per deployment between `fast-reads`
+   on the card, 1.0x to 1.1x on the flows measured. Next: encode trace lists, and decide per deployment between `fast-reads`
    (host is the validator, the card checks integrity) and adding `encoded-guard` (another ~40 cycles for an independent check).
 4. Use SFPI only as a development oracle for SFPU encodings and instruction counts, not as a build dependency
    ([recipe and a checked example](../plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only)).

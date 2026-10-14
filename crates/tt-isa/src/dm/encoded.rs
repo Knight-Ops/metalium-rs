@@ -92,15 +92,6 @@ pub const fn check_with(e: &[u32; 8], seed: u32) -> u32 {
         ^ seed
 }
 
-/// Where an encoded entry runs: in a list the host sent, or in a trace replayed from GDDR (`op::CALL`,
-/// whose firmware verifies in [`TRACE_DOMAIN`]). An entry made for one fails the other's check, so a list
-/// cannot run an entry captured in a trace, nor a trace one written as a list's.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Domain {
-    List,
-    Trace,
-}
-
 /// What the host knows about the mover an entry is for: the chip's usable channels, the tile
 /// the mover runs on, and the key written to its mailbox ([`super::ENCODE_KEY`]) when it started.
 /// Holds the endpoint bitmap [`guard`] needs, built once.
@@ -125,19 +116,6 @@ impl Context {
     /// The seed for `op`'s checksums in this context.
     pub const fn seed(&self, op: u32) -> u32 {
         context_seed(self.key, self.me, self.usable, op)
-    }
-
-    /// The seed for `op`'s checksums in a trace's entries: this context's, in [`TRACE_DOMAIN`].
-    pub const fn trace_seed(&self, op: u32) -> u32 {
-        self.seed(op) ^ TRACE_DOMAIN
-    }
-
-    /// The seed for `op`'s checksums in `domain`.
-    pub const fn seed_in(&self, domain: Domain, op: u32) -> u32 {
-        match domain {
-            Domain::List => self.seed(op),
-            Domain::Trace => self.trace_seed(op),
-        }
     }
 
     /// The bitmap of usable read targets the card holds at [`ENDPOINTS`].
@@ -175,16 +153,6 @@ pub fn endpoint_bitmap(usable: u32) -> [u32; ENDPOINT_WORDS] {
 /// `entry` is not a `READ` of at most one request (it stays as it is); `Err` if it
 /// is a `READ` the mover would refuse.
 pub fn encode(ctx: &Context, entry: [u32; 8]) -> Result<Option<[u32; 8]>, u32> {
-    encode_in(ctx, Domain::List, entry)
-}
-
-/// [`encode`] for an entry of a trace ([`Domain::Trace`]).
-pub fn encode_for_trace(ctx: &Context, entry: [u32; 8]) -> Result<Option<[u32; 8]>, u32> {
-    encode_in(ctx, Domain::Trace, entry)
-}
-
-/// [`encode`] in `domain`.
-pub fn encode_in(ctx: &Context, domain: Domain, entry: [u32; 8]) -> Result<Option<[u32; 8]>, u32> {
     let (usable, me) = (ctx.usable, ctx.me);
     if entry[0] != op::READ {
         return Ok(None);
@@ -223,7 +191,7 @@ pub fn encode_in(ctx: &Context, domain: Domain, entry: [u32; 8]) -> Result<Optio
         0,
         r.len,
     ];
-    e[CHECK_WORD] = check_with(&e, ctx.seed_in(domain, op::READ_ENCODED));
+    e[CHECK_WORD] = check_with(&e, ctx.seed(op::READ_ENCODED));
     Ok(Some(e))
 }
 
@@ -231,16 +199,6 @@ pub fn encode_in(ctx: &Context, domain: Domain, entry: [u32; 8]) -> Result<Optio
 /// some valid plain `READ` in this context, and it passes [`guard`] -- two checks that share
 /// no code, so an encoder that agrees with this function about a wrong request is still caught.
 pub fn validate(ctx: &Context, e: [u32; 8]) -> Result<(), u32> {
-    validate_in(ctx, Domain::List, e)
-}
-
-/// [`validate`] for an entry of a trace ([`Domain::Trace`]).
-pub fn validate_for_trace(ctx: &Context, e: [u32; 8]) -> Result<(), u32> {
-    validate_in(ctx, Domain::Trace, e)
-}
-
-/// [`validate`] in `domain`.
-pub fn validate_in(ctx: &Context, domain: Domain, e: [u32; 8]) -> Result<(), u32> {
     if e[0] != op::READ_ENCODED {
         return Err(error::OP);
     }
@@ -249,7 +207,7 @@ pub fn validate_in(ctx: &Context, domain: Domain, e: [u32; 8]) -> Result<(), u32
     for channel in 0..CHANNELS as u32 {
         for port in 0..PORTS as u32 {
             let plain = [op::READ, channel, port, e[1], e[3], e[7], 0, 0];
-            if encode_in(ctx, domain, plain) == Ok(Some(e)) {
+            if encode(ctx, plain) == Ok(Some(e)) {
                 return if guard(&e, endpoint_hi(ctx.me.0, ctx.me.1), |hi| {
                     ctx.endpoint_ok(hi)
                 }) {
@@ -454,38 +412,6 @@ mod tests {
         // The host refuses it the same way: it validates in its own context.
         assert!(validate(&Context::new(0xFF, ME, KEY ^ 1), e).is_err());
         assert!(validate(&Context::new(0xFF, (ME.0 + 1, ME.1), KEY), e).is_err());
-    }
-
-    /// A trace's entries are in their own domain: one encoded for a trace verifies in the trace's domain (what
-    /// the firmware's `call` seeds with) and not in a list's, and a list's entry the other way. The two differ
-    /// in the checksum word alone, and the host validates each in its own domain.
-    #[test]
-    fn a_traces_entries_and_a_lists_do_not_verify_for_each_other() {
-        let plain = plain(1, 0, 0x1000, 0x2_1000, 4096);
-        let (list, trace) = (
-            encode(&ctx(), plain).unwrap().unwrap(),
-            encode_for_trace(&ctx(), plain).unwrap().unwrap(),
-        );
-        assert_ne!(list, trace);
-        for k in (0..8).filter(|&k| k != CHECK_WORD) {
-            assert_eq!(list[k], trace[k], "word {k}");
-        }
-        let (list_seed, trace_seed) = (
-            ctx().seed(op::READ_ENCODED),
-            ctx().trace_seed(op::READ_ENCODED),
-        );
-        assert_eq!(trace_seed, list_seed ^ TRACE_DOMAIN);
-        assert!(verify_with(&list, list_seed) && !verify_with(&list, trace_seed));
-        assert!(verify_with(&trace, trace_seed) && !verify_with(&trace, list_seed));
-        assert_eq!(validate(&ctx(), list), Ok(()));
-        assert_eq!(validate_for_trace(&ctx(), trace), Ok(()));
-        assert_eq!(validate(&ctx(), trace), Err(error::ENCODED));
-        assert_eq!(validate_for_trace(&ctx(), list), Err(error::ENCODED));
-        // And a trace entry is bound to its mover like a list's.
-        assert_eq!(
-            validate_for_trace(&Context::new(0xFF, ME, KEY ^ 1), trace),
-            Err(error::ENCODED)
-        );
     }
 
     /// No two contexts share a seed: one flipped bit of any component changes it.
