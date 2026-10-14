@@ -1,4 +1,4 @@
-//! `slice_assign` of whole rows as one row gather (`docs/plans/decode-host-cost.md`, P3).
+//! `slice_assign` of whole rows as one row gather (`docs/completed-plans/decode-host-cost.md`, P3).
 //!
 //! `slice_assign` mapped every element of the whole destination on the host and repacked all of
 //! it: a SmolLM2 cache write of one position into a `[1, 3, 64, 64]` cache cost 254 us of server
@@ -183,6 +183,51 @@ fn slice_assign_is_burn_flex_bit_for_bit_in_one_job() {
             &[(1, 3, 1), (0, 2, 1), (0, 64, -1)],
             false,
             10,
+        );
+    });
+}
+
+/// SmolLM2's value: a projection's `[1, 192]` row split into heads (`reshape`, then `swap_dims`), a
+/// view whose rows are parts of a buffer row, written at a cache position. The value is made plain
+/// first (a repack of its own elements), then written by rows: never a map of the whole cache.
+#[test]
+fn a_value_split_into_heads_is_made_plain_then_written_by_rows() {
+    with_device(Config::default(), |d| {
+        let (cache, k) = (raw_bits(61, 3 * 64 * 64), raw_bits(62, 192));
+        let want: Vec<f32> = Tensor::<Flex, 4>::from_data(
+            TensorData::new(cache.clone(), [1, 3, 64, 64]),
+            &FlexDevice,
+        )
+        .slice_assign(
+            [0..1, 0..3, 9..10, 0..64],
+            Tensor::<Flex, 3>::from_data(TensorData::new(k.clone(), [1, 1, 192]), &FlexDevice)
+                .reshape([1, 1, 3, 64])
+                .swap_dims(1, 2),
+        )
+        .into_data()
+        .to_vec()
+        .unwrap();
+        let c = on_card(Tensor::<TtBackend, 4>::from_data(
+            TensorData::new(cache, [1, 3, 64, 64]),
+            &d,
+        ));
+        let heads = on_card(Tensor::<TtBackend, 3>::from_data(
+            TensorData::new(k, [1, 1, 192]),
+            &d,
+        ))
+        .reshape([1, 1, 3, 64])
+        .swap_dims(1, 2);
+        let (writes, repacks) = (ran("assign_rows"), ran("repack_many") + ran("repack"));
+        let got: Vec<f32> = c
+            .slice_assign([0..1, 0..3, 9..10, 0..64], heads)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(bits(&got), bits(&want));
+        assert_eq!(ran("assign_rows") - writes, 1, "written by rows");
+        assert!(
+            ran("repack_many") + ran("repack") - repacks <= 1,
+            "at most the value's own repack"
         );
     });
 }

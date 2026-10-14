@@ -1,5 +1,5 @@
 //! Copy-shaped ops as one device job: `cat`, `repeat_dim` and `slice_assign`
-//! (`docs/plans/decode-host-cost.md`).
+//! (`docs/completed-plans/decode-host-cost.md`).
 //!
 //! Burn's default `cat` is a zero-filled tensor and one `slice_assign` a piece, and each
 //! `slice_assign` maps every element of the whole destination on the host and copies all of it

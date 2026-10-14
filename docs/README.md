@@ -91,6 +91,7 @@ Plans whose checklists are closed move here as a record, with their evidence. Th
 - [`hardware-coverage-closeout.md`](completed-plans/hardware-coverage-closeout.md): the Phase 10 close-out.
 - [`tensix-next-features.md`](completed-plans/tensix-next-features.md): the 2026-10-05 sprint record.
 - [`remaining-firmware-instructions.md`](completed-plans/remaining-firmware-instructions.md) and the ADC copy, source-bank and scalar-movement plans.
+- [`decode-host-cost.md`](completed-plans/decode-host-cost.md): roadmap Track 2 items 3 and 4 (2026-10-14): jobs counted per Burn op, a native `cat`, cache writes as a tile copy, slices and swaps as views.
 
 ---
 

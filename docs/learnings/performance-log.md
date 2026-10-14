@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Slices and swaps as views](#slices-and-swaps-as-views-2026-10-14-card-0) | 2026-10-14 | a positive-step slice is a view, a swap of a view stays one, a ragged view is a tile copy: ViT-Tiny 401.4 -> 283.4 ms on every tile (burn-flex 106.7), the SmolLM2 decode step 108.5 -> 99.6 |
 | [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
 | [Native `cat`](#native-cat-2026-10-14-card-0) | 2026-10-14 | `cat` and `repeat_dim` are one row gather or one element repack, not a zero-fill and a `slice_assign` a piece: the SmolLM2 decode step 232.6 -> 117.3 ms on every tile (burn-flex 26.3), 623.9 -> 458.1 on one; its 121 `cat`s 196.6 -> 4.6 ms of server time |
 | [Decode step: where the host time goes](#decode-step-where-the-host-time-goes-2026-10-14-card-0) | 2026-10-14 | jobs and server-thread time per Burn op: on one tile the SmolLM2 decode (624 ms) waits on m=1 matmuls; on every tile (233 ms) `cat`'s zero-fill and `slice_assign` are 61% of the server thread; ViT-Tiny is attention and repacking `swap_dims`/`slice`, not per-op submission |
@@ -297,9 +298,42 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Slices and swaps as views (2026-10-14, card 0)
+
+P2 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). Three changes:
+- **Slices are views.** A slice whose steps are all positive is a view of the same buffer (`sliced_native`) and
+  queues no job.
+- **A swap of a view stays a view.** `float_swap_dims` uploads only a tensor with no device copy, where it used to
+  materialise any view first.
+- **Ragged views are tile copies.** A view made plain is a tile copy wherever each output tile is one source block,
+  now including a ragged last tile row or column where the source ends there too (`Strided::tile_moves`).
+
+ViT's attention therefore reads q, k and v as blocks of the fused projection (`matrix_blocks`), with no copy. Same
+conditions as "Native `cat`".
+
+| Workload, card 0 | Before | After | burn-flex |
+|---|--:|--:|--:|
+| ViT-Tiny forward, every tile at `work:64:4` | 401.4 ms (`1792005220`, P0) | **283.4 ms** (`1792013104`) | 106.7 ms |
+| ViT-Tiny forward, one tile | 855.9 ms (`1792005205`) | 663.0 ms (`1792013112`) | 112.5 ms |
+| SmolLM2 decode step, every tile | 108.5 ms (`1792010467`, P3) | **99.6 ms** (`1792013124`) | 26.2 ms |
+| SmolLM2 decode step, one tile | 451.7 ms (`1792010476`) | 450.4 ms (`1792013133`) | 26.6 ms |
+
+- **ViT queues 766 jobs, was 853.** Its 37 slices and 49 swaps queue none, where they cost 83 ms of server time at
+  P0. What is left on every tile is `attention`, 336 jobs and 187 of 270 ms (0.56 ms a job, device work). Then come
+  the patch embedding's convolution (5 jobs, 44 ms) and the heads merged back by `reshape` (12 jobs, 10 ms). That
+  merge is an element repack: flattened, a tile row of the 197-row heads crosses from one head into the next, so no
+  tile copy applies.
+- **The decode step queues 3,316 jobs, was 3,617.** Its `slice` jobs are gone. SmolLM2's value `v` is now a view
+  of parts of rows (a projection split into heads), so a cache write first makes it plain: 30 small repacks, and
+  the 90 jobs together take 1.9 ms. Before that fix the cache writes had fallen back to the whole-cache element map,
+  at 149 us a job (`1792011825`).
+- **Correctness.** Gate `step182_region_views` passes on ttsim and card 0 (`1792012830`); `step165`-`step168` pass on
+  card 0 (`1792012839` to `1792012885`). Burn's conformance on ttsim: 3,025 run, 0 unexpected, plain and `--fusion`. The smoke
+  tier on card 0 passes 1,052 of 1,052 (`1792013157`).
+
 ## Cache writes as a tile copy and written rows (2026-10-14, card 0)
 
-P3 of [decode-host-cost.md](../plans/decode-host-cost.md). A `slice_assign` whose region writes the last dimension whole and in
+P3 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). A `slice_assign` whose region writes the last dimension whole and in
 order (a key/value cache's positions) is now `Session::assign_rows`: a tile copy of the destination (`Session::copy`, a few run
 records) with the value's rows written over it (`write_rows`, entries for the written rows only). A destination that is a view is one
 row gather; anything else keeps the element map. The destination is never written in place. Same conditions as "Native `cat`".
@@ -317,7 +351,7 @@ this 64-position cache) grow with the cache's length; the tile copy's do not. On
 
 ## Native `cat` (2026-10-14, card 0)
 
-P1 of [decode-host-cost.md](../plans/decode-host-cost.md). `float_cat`, `int_cat`, `bool_cat` and the three `repeat_dim`s are
+P1 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). `float_cat`, `int_cat`, `bool_cat` and the three `repeat_dim`s are
 overridden (`crates/burn-tt/src/ops/region.rs`):
 - A `cat` along any dimension but the last, of pieces that are whole rows of their buffers, is **one row gather**
   (`gather_rows`). The host names one source row per output row.
@@ -358,7 +392,7 @@ Server-thread time and jobs on every tile, one reported pass:
 
 ## Decode step: where the host time goes (2026-10-14, card 0)
 
-P0 of [decode-host-cost.md](../plans/decode-host-cost.md). The model benchmarks' reported pass now also counts the
+P0 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). The model benchmarks' reported pass now also counts the
 **jobs each Burn op queues on the server thread** (`OpStat::jobs`, charged to the innermost op on the calling thread)
 and the **server thread's wall time per op** (`burn_tt::server_report`), so a view no longer counts as device work
 and a slow op can be told from a slow device. Release build, `0ba8d00` plus the counters, card 0, nothing else on

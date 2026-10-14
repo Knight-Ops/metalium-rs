@@ -212,6 +212,8 @@ pub const SMOKE: &[&str] = &[
     "step180_native_cat::",
     // `slice_assign` of whole rows (a cache's positions) as one row gather (`decode-host-cost.md` P3).
     "step181_region_assign::",
+    // Slices and swaps as views, ragged views copied by tiles (`decode-host-cost.md` P2).
+    "step182_region_views::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

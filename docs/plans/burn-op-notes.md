@@ -21,8 +21,8 @@ path today, `~` when only some shapes do.
 | `float_sum_dim` | all F32 axes/layouts on SFPU; both-card validated; BF16 via native adapters | R1 |
 | `float_mean_dim` | `~` native sum_dim plus scaling on supported axes | R1 |
 | `float_sum`, `float_mean` | x native nonempty F32, bounded full reductions; uploads host inputs,  unsupported inputs fail | R1b |
-| `float_slice`, `float_flip` | x nonempty resident F32/BF16, arbitrary steps/axes via bit-preserving copies; both-card validated | D4 |
-| `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial | M3, D2 |
+| `float_slice`, `float_flip` | x nonempty resident F32/BF16, arbitrary steps/axes via bit-preserving copies; both-card validated. Since 2026-10-14 a slice whose steps are all positive is a view (no job; `int_`/`bool_slice` too), made plain by a tile copy where each output tile is one source block (a ragged edge where the source ends too), else a repack (step182) | D4, `decode-host-cost.md` P2 |
+| `float_transpose`, `float_swap_dims`, `float_permute` | native rank-N views and device materialization; BFP shares exponent-preserving views, regrouping returns decoded F32; arbitrary payload-preserving Src transpose remains partial. A swap of a view stays a view (2026-10-14; only a tensor with no device copy is uploaded first) | M3, D2 |
 | `float_add_scalar`, `float_sub_scalar` | x (SFPU) | S1 |
 | `float_div{,_scalar}`, `float_recip` | x (SFPU, within 1 ulp) | S3 |
 | `float_remainder{,_scalar}` | x exact SFPU fmod (Flex's `((a%b)+b)%b` bit for bit; NaN payload canonical); 2362 words, long division on integers; card 0 (step133-134) | S6 (T4) |

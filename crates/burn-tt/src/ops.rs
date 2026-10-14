@@ -560,8 +560,10 @@ fn repack_shape(tensor: &TtTensor, shape: Vec<usize>) -> TtTensor {
     )
 }
 
-/// Copy a stepped logical slice on the card; negative steps traverse the
-/// selected interval backward, as Burn's pinned Slice contract specifies.
+/// A stepped logical slice on the card: a view of the same buffer when every
+/// step is positive (the base moved to the first element, each stride scaled by
+/// its step; no job), else a copy, negative steps traversing the selected
+/// interval backward as Burn's pinned Slice contract specifies.
 fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<TtTensor> {
     let shape = tensor.shape().to_vec();
     if !tensor.is_storable()
@@ -571,6 +573,7 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
         return None;
     }
     let mut ranges = Vec::new();
+    let mut forward = true;
     for (dim, &n) in shape.iter().enumerate() {
         let slice = slices
             .get(dim)
@@ -581,6 +584,7 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
         if step == 0 {
             return None;
         }
+        forward &= slice.step > 0;
         let indices: Vec<_> = if slice.step > 0 {
             range.step_by(step).collect()
         } else {
@@ -596,6 +600,22 @@ fn sliced_native(tensor: &TtTensor, slices: &[burn_backend::Slice]) -> Option<Tt
     let view = tensor
         .as_strided()
         .unwrap_or_else(|| crate::views::Strided::of(tensor.to_dram(), &shape));
+    if forward {
+        let mut v = view;
+        for (d, r) in ranges.iter().enumerate() {
+            let [sr, sc] = v.strides[d];
+            v.base = [v.base[0] + r[0] * sr, v.base[1] + r[0] * sc];
+            // Consecutive indices are a step apart (one index: any stride reads the same).
+            let step = r.get(1).map_or(1, |&next| next - r[0]);
+            v.strides[d] = [sr * step, sc * step];
+        }
+        return Some(TtTensor::view(
+            v,
+            burn_backend::Shape::from(output),
+            tensor.dtype(),
+            tensor.device,
+        ));
+    }
     let sources = (0..count)
         .map(|mut i| {
             let mut coords = vec![0; shape.len()];
@@ -1048,14 +1068,24 @@ fn slice_assign_native(
         .try_fold(1usize, |n, &d| n.checked_mul(d))
         .expect("slice assignment overflow");
     let dims = crate::tensor::stored_dims(&shape).expect("nonempty slice assignment");
-    let buffers = vec![tv.src.buffer.id, vv.src.buffer.id];
     // A region of whole rows (a cache's positions): the value's rows written over a tile copy of a
     // plain destination, else one row gather. BF16 and F16 buffers are packed, which neither reads.
     let half = crate::tensor::is_half(tensor.dtype());
     let plain = tv.as_plain(&shape).is_some_and(|d| !d.transposed);
-    let written = (!half && plain)
+    let whole_rows = ranges
+        .last()
+        .is_some_and(|r| r.iter().copied().eq(0..shape[shape.len() - 1]));
+    let mut written = (!half && plain)
         .then(|| region::assign_written(&shape, &ranges, (&vv, &vs)))
         .flatten();
+    let mut vv = vv;
+    if written.is_none() && !half && plain && whole_rows {
+        // A value that is a view of parts of rows (a key split into heads): made a plain tensor
+        // first, which costs the value's elements, not the destination's.
+        vv = crate::views::Strided::of(value.to_dram(), &vs);
+        written = region::assign_written(&shape, &ranges, (&vv, &vs));
+    }
+    let buffers = vec![tv.src.buffer.id, vv.src.buffer.id];
     let rows = (!half && written.is_none())
         .then(|| region::assign_rows((&tv, &shape), &ranges, (&vv, &vs)))
         .flatten();
@@ -2311,7 +2341,10 @@ pub mod float {
         } else {
             tensor
         };
-        if tensor.is_storable()
+        // A tensor with no device copy is uploaded so the swap can be a view of it; a
+        // view is swapped as it is, not materialised first.
+        if tensor.as_strided().is_none()
+            && tensor.is_storable()
             && crate::server::attachable(tensor.device)
             && crate::server::supports_dram(tensor.device)
         {

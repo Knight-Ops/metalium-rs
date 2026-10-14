@@ -375,11 +375,11 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   ~95 ms. **Left (chunked path still):** backward passes (weight gradient = `patches^T @ G`, one product; x gradient as a gather over
   taps), `max_pool2d_with_indices`, average pooling, grouped and 3-D convolutions, pooling with `C % 32 != 0`, and the non-Fast
   matmul modes. The default tile choice is what takes ResNet-18 under burn-flex (below).
-- [ ] **3. The decode step's host cost (25x).** 2,779 reported operations (more submitted) at about 220 us each:
+- [x] **3. The decode step's host cost (25x; closed 2026-10-14, 3.8x on every tile; left: item 9).** 2,779 reported operations (more submitted) at about 220 us each:
   `cat` is built from `slice_assign` (722 `float_slice_assign` calls a step: the nine-way `repeat_kv`, the rotary
   halves), plus tens of thousands of reshapes, slices and `float_device` calls over 33 passes. A native `cat`, a
   fused RoPE and the fusers below shrink it; a trace would remove it, which needs trace segmentation. ViT-Tiny
-  (709 operations at 1.1 ms) is the same cost at a smaller scale. Plan: [decode-host-cost.md](decode-host-cost.md)
+  (709 operations at 1.1 ms) is the same cost at a smaller scale. Plan: [decode-host-cost.md](../completed-plans/decode-host-cost.md)
   (copy-shaped ops as row and block moves instead of per-element host maps; a native `cat`).
   **Re-measured 2026-10-14** (P0, card 0, jobs and server-thread time per op, [log](../learnings/performance-log.md#decode-step-where-the-host-time-goes-2026-10-14-card-0)):
   - **One tile:** 624 ms (`1792005087`), mostly waiting on the device's m = 1 matmuls (1.27 ms each). The 2,779
@@ -392,16 +392,22 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   - **Cache writes (P3, 2026-10-14):** a `slice_assign` of whole rows is a tile copy with the value's rows written
     over it (`Session::assign_rows`, gate `step181_region_assign`). A cache write costs 25 us of server time (was 254).
     The step is **108.5 ms on every tile** (`1792010467`, 4.1x burn-flex).
-  - **Next:** P2 (ViT's repacks), then item 9 (attention: 1,920 jobs, about half of what is left), then the m = 1
-    matmuls on one tile.
-- [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms, first read as host submission, the same
+  - **Views (P2, 2026-10-14):** slices with positive steps are views, `swap_dims` no longer materialises a view,
+    and a ragged view is made plain by a tile copy (gate `step182_region_views`). The step is **99.6 ms on every
+    tile** (`1792013124`, 3.8x burn-flex) and 450.4 ms on one tile.
+  - **What is left:** `attention`'s 1,920 jobs (73 of 125 ms of server time) is item 9. On one tile, the m = 1
+    matmuls (270 ms) are "Per-workload tile choice".
+- [x] **4. ViT-Tiny forward (7.8x, 815 ms; closed 2026-10-14, 2.7x on every tile; left: item 9).** 709 reported operations at about 1.1 ms, first read as host submission, the same
   cost as item 3 at a smaller scale. Layer norm is composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a
   pass); GELU and attention are native. Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
   **Re-measured 2026-10-14** (card 0, `1792005205`, `1792005220`): 856 ms on one tile and 401 ms on every tile at `work:64:4`
   (burn-flex 107), from 853 jobs.
   - It is **not per-op submission**. On every tile the time is `attention` (348 jobs, 211 ms of device work), then the element
-    repacks of `swap_dims` and `slice` (74 jobs, 83 ms; [decode-host-cost.md](decode-host-cost.md) P2).
-- [ ] **9. Attention (next, after [decode-host-cost.md](decode-host-cost.md) P3 and P2; decided 2026-10-14).** `module::attention`
+    repacks of `swap_dims` and `slice` (74 jobs, 83 ms; [decode-host-cost.md](../completed-plans/decode-host-cost.md) P2).
+  - **After P2 (2026-10-14):** **283.4 ms on every tile** (`1792013104`, 2.7x burn-flex's 106.7) and 663.0 on one tile.
+    Its slices and swaps queue nothing, and attention reads the heads in place. Attention is now 187 of 270 ms of
+    server time (item 9), then the patch embedding's convolution (44 ms) and the heads' merge (`reshape`, 12 jobs, 10 ms).
+- [ ] **9. Attention (next; decided 2026-10-14, after [decode-host-cost.md](../completed-plans/decode-host-cost.md)).** `module::attention`
   (`ops.rs`) composes `matmul(q, k^T)`, a scale, the masks, a softmax (`max_dim`, `clamp_min`, `sub`, `exp`, `sum_dim`,
   `clamp_min`, `div`) and `matmul(p, v)`. On card 0 it is now the largest cost of both transformers:
   - **SmolLM2 decode step, every tile:** 1,920 jobs, **64 a call**, and 72 of the 146 ms of server-thread time after the

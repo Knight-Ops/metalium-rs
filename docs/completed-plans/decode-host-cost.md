@@ -1,7 +1,7 @@
 # Decode host cost: copies as region moves, not element maps
 
 Roadmap Track 2, item 3 ("The decode step's host cost (25x)"). Written 2026-10-14 against `0ba8d00`.
-Status: **P0, P1 and P3 done (2026-10-14); P2 (ViT's repacks) next.**
+Status: **done (2026-10-14).** P0-P3 and P5 are done; P4 is deferred to roadmap Track 2 item 9 (attention), which is next.
 
 ## Why this item, and what it is not
 
@@ -178,29 +178,59 @@ device ops" counts zero-cost views as device operations (`report.rs` `on_device`
   burn-flex takes 26.3 ms. On every tile the server thread is busy 146 ms, and half of that is `attention`'s
   1,920 jobs.
 
-### P2. `slice` and `swap_dims` without repacks
+### P2. `slice` and `swap_dims` without repacks (done 2026-10-14)
 
-- [ ] Route `float_slice` of any rank through the planner:
-  - a slice of whole stored rows becomes a view;
-  - a slice of any range along any dim becomes a `Strided` view (`views::Strided` already carries a `[row, col]`
-    base, so a column offset needs no job);
-  - what still has to be checked is that each consumer accepts a view with a nonzero column base (below);
-  - a step other than 1 stays on `sliced_native`.
-- [ ] Find out why `float_swap_dims` calls `to_dram()` before `swapped_strided` (`ops.rs:2315`). If nothing
-  needs the materialisation, try the view first. If something does, record which case needs it.
-  `heads()` (`reshape` then `swap_dims`) is in every attention layer of every transformer.
-- [ ] Every consumer of a new view must either accept it or materialise it through `to_dram`. Grep the callers
-  of `as_strided` and `covering_view`, and gate the chains:
-  - view into element-wise op,
-  - view into matmul,
-  - view into reduction,
-  - view into cat,
-  - view into `slice_assign`.
-- [ ] **Gate `step181_region_views`:**
-  - Bit for bit against burn-flex for slices and swaps of ranks 3-4, followed by each consumer above.
-  - Padding: a ragged producer, then a slice, then a reduction.
-  - Job counts: a whole-row slice submits zero jobs.
-  - Negative controls: a view offset off by one row, and a column offset applied to the wrong dim.
+- [x] **Slices are views.** A slice whose steps are all positive, of any rank, F32, I32, Bool, BF16 or F16, is a
+  view of the same buffer: `sliced_native` moves the base to the first element and scales each stride by its
+  step, and queues no job. A negative step stays one copy. The `int_` and `bool_slice` paths share it.
+- [x] **Why `swap_dims` materialised.** The eager `to_dram()` came with the convolution commit (`6d979e7`), and
+  its purpose was to upload a host tensor so that the swap could be a view of it. Materialising a view was a
+  side effect. It now uploads only a tensor with no device copy and no view.
+- [x] **Ragged tile copies.** `Strided::tile_moves`, which makes a view plain, takes a ragged last tile row or
+  column where the source block ends at its own buffer's edge too. Such a view is now one tile copy, not an
+  element repack: a column block of a `[197, 576]` projection, for example.
+  - The old check that each output tile's row run stays inside one row of the view relied on
+    `last % 32 == 0`. It is now explicit.
+  - Unit test `ragged_edges_are_tile_moves_where_the_source_ends_too`, including two refusals: a ragged edge
+    inside the source, and a tile row crossing a row of the view.
+- [x] **Consumers.** Views of every kind already reached the element-wise path (`view_op`, else
+  `plain_dram` -> `to_dram`), the batched matmul (`matrix_blocks`, which reads a head of the projection in place),
+  reductions, `cat` and `slice_assign`.
+  - Gate `step182` reads a stepped, column-offset slice through each of them.
+  - Conformance runs every Burn slice test with no unexpected result.
+  - One consumer needed a change: `slice_assign` of whole rows now makes a value that is a view of parts of rows
+    plain first, which costs the value's elements, not the destination's. SmolLM2's `v` became such a view when
+    `swap_dims` stopped materialising; without this, its cache writes fell back to the whole-cache element map.
+    It has its own `step181` test, watched failing.
+- [x] **Gate `step182_region_views`** (ttsim and card 0, run `1792012830`, 6 of 6; in `SMOKE`). The plan called it
+  `step181`.
+  - **Slices:** ranks 2-4, steps and column offsets queue no job, and a negative step one; bit for bit over every
+    special value.
+  - **Consumers:** each one above, on small integers (exact).
+  - **Ragged copies:** a ragged column block made plain by **one tile copy, no repack**; rows 0..197 of a 300-row
+    buffer by a repack, not a tile copy.
+  - **ViT's heads:** `q k^T` with no slice, swap, reshape or transpose job.
+  - **Dtypes:** I32, Bool, BF16 and F16 slices.
+  - **Padding and replay:** a ragged producer, then a slice, then reductions; a trace through views.
+  - **Negative controls**, each watched failing:
+    - the slice's base one row down;
+    - the column base applied as rows;
+    - a step's stride left unscaled;
+    - a ragged tile copy accepted inside the source.
+- [x] Regression checks:
+  - ttsim: `step84`, `85`, `127`, `152`, `155`, `157`, `160`, `162`, `171`, `178`, `179`, `180`, `181`, `62` and
+    `step12_mnist` e2e (golden unchanged).
+  - Card 0: `step165`-`step168`.
+  - Burn's conformance on ttsim, plain and `--fusion`: 0 unexpected.
+- [x] **Measured** (card 0):
+
+  | | Every tile at `work:64:4` | One tile |
+  |---|--:|--:|
+  | ViT-Tiny | **283.4 ms** (`1792013104`; 401.4 at P0) | 663.0 ms (`1792013112`; 855.9 at P0) |
+  | SmolLM2 decode step | **99.6 ms** (`1792013124`; 108.5 after P3) | 450.4 ms (`1792013133`) |
+
+  burn-flex takes 106.7 ms for ViT and 26.2 ms for the decode step. Neither model queues a slice or swap job
+  any more.
 
 ### P3. `slice_assign` through the planner (done 2026-10-14)
 
@@ -255,36 +285,34 @@ device ops" counts zero-cost views as device operations (`report.rs` `on_device`
   An intermediate version (one row gather over the whole cache, 147 us a job, `1792009767`) was replaced: its
   host entries grow with the cache's length.
 
-### P4. The fixed cost per op (only if P0 shows it matters after P1-P3)
+### P4. The fixed cost per op (deferred to roadmap item 9, 2026-10-14)
 
 The per-op path takes the `DIMS`, `TIMES` and `ATTACHED` mutexes. `supports_dram` takes `ATTACHED` twice and is
 called several times an op. Every dropped `Buffer` sends its own free job, and `report::enter` locks a global map
 on every Burn call (`server.rs:2060-2098`, `2151`, `report.rs:188-218`). On the server thread, each job runs L1
 planning and a program-cache lookup.
 
-- [ ] Re-profile after P1-P3, then fix in order of measured cost. Candidates:
+- [-] **Not built; re-profiled after P1-P3** (`1792013124`). The server thread is still busy for 125 of the pass's
+  126 ms, so caller-side savings would not move the wall time; the 4,278 frees take 1.1 ms in all. What is left is
+  about 25-40 us of server time a job, mostly attention's 1,920 jobs (73 of 125 ms). Fewer jobs (item 9) wins more
+  than cheaper ones there. Revisit the candidates after item 9, measured the same way:
   - batch the free jobs into the next submitted job;
   - cache `supports_dram` per attachment;
   - keep report counters thread-local, merging only on `with_report` exit;
   - cache the L1 plan and work shape per `(op kind, shapes, dtypes, spread)`.
-- [ ] Re-run P0's table after each change. Do not change submission order: `step12_mnist` and its golden file
-  must stay unchanged.
 
-### P5. Close-out
+### P5. Close-out (done 2026-10-14)
 
-- [ ] Measure on card 0, release (`cargo xtask bench --device 0 --filter silicon_bench_models`):
-  - `smollm2_decode_*` and `vit_tiny_forward`, at one tile and with `TT_TILES=all TT_SPREAD=work:64:4`;
-  - a burn-flex baseline in the same run;
-  - every output validated against burn-flex.
-
-  Record the rows in `performance-scoreboard.md` and a dated section in `performance-log.md`.
-- [ ] Correctness on card 0:
-  - `step167_smollm2` F32 must give the same 16 greedy tokens;
-  - `step168` (all seven plans), `step165` and `step166` unchanged.
-- [ ] Add `step180`, `step181` and `step182` to `SMOKE`, then run `cargo xtask silicon --smoke --release
-  --device 0`.
-- [ ] Update `roadmap.md` item 3 with the numbers. Update item 4 (ViT) with what moved. If the decode is still
-  host-bound, write down the next lever (B13b, or a decode trace) with its measured share.
+- [x] Measured on card 0, release, with burn-flex in the same runs and every output validated: the decode step and
+  ViT-Tiny at one tile and every tile (P2's table; the history in `performance-log.md`, current rows in
+  `performance-scoreboard.md`).
+- [x] Correctness on card 0: `step167` F32 gives the same 16 greedy tokens, and `step168` (all seven plans),
+  `step165` and `step166` pass after each phase.
+- [x] `step180`, `step181` and `step182` are in `SMOKE`; the smoke tier on card 0 passes 1,052 of 1,052 (run
+  `1792013157`).
+- [x] Roadmap items 3 and 4 carry the numbers. The decode step is still host-bound on every tile, and the next
+  lever is measured: attention's jobs (item 9). On one tile it is the device's m = 1 matmuls ("Per-workload tile
+  choice").
 
 ## Checks this change needs (from AGENTS.md)
 

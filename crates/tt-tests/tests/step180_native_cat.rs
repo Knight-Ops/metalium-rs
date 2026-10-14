@@ -1,5 +1,5 @@
 //! A native `cat` and `repeat_dim`: one device job, not a zero-fill and a `slice_assign` a piece
-//! (`docs/plans/decode-host-cost.md`, P1).
+//! (`docs/completed-plans/decode-host-cost.md`, P1).
 //!
 //! Burn's default `cat` fills an empty tensor and writes each piece with `slice_assign`, which maps
 //! every element of the whole destination on the host and copies all of it: a SmolLM2 decode step
