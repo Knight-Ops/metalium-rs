@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Per-op tile spread](#per-op-tile-spread-2026-10-14-card-1) | 2026-10-14 | `Session::set_spread` / `TT_SPREAD`: a session can open every tile and give each op a few; at 120 tiles a fixed spread of 4 gives MNIST 2.2-2.3 ms/step (6.7 on every tile, 2.1 on an 8-tile session) and the transformer ~80 (96.8; 74-76 on 2 tiles); spreads that vary per op lose to churn; the default stays every tile |
 | [Barriers on the units an op ran on](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) | 2026-10-14 | a tile an op does not use no longer enqueues a barrier list for it: the all-tiles transformer 404-422 -> 96-98 ms/step (now faster than one tile), all-tiles MNIST 12.9-13.4 -> 6.7, one tile unchanged, losses and accuracy identical |
 | [Descriptor runs in a trace's prologue](#descriptor-runs-in-a-traces-prologue-2026-10-14-card-0) | 2026-10-14 | `record::POKE_RUN`: a trace's 51 `POKE`s become 9 records, 8,824 -> 4,892 device cycles a replay; a replay is 2.3-4.6 us shorter host-timed, its stream 124 -> 91 entries, and the 8-tile chunk boundary is gone |
 | [Trace replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) | 2026-10-14 | a replayed tiny streaming op costs ~7.4-8.7 us, about half of it control (pair begin ~1.05 us, finish ~1.3-1.6, credits ~0.9, barrier ~0.6-0.7 on many tiles); the 51-`POKE` prologue is 7.2 us a replay; a chunk boundary is 0.75 us; the host adds ~2 us a tile |
@@ -638,6 +639,62 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Per-op tile spread (2026-10-14, card 1)
+
+After the [barrier change](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) a tile an op does not use costs nothing, so a
+session can open every tile and give each op only some. **The best session-wide tile count differs by workload** (card 1, release,
+`tt-mnist`, one run each; ms/step):
+
+| Session tiles | 1 | 2 | 4 | 8 | 16 | 32 | all (120) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| transformer, 50 steps | 104.3 | **73.9** | 79.2 | 82.0 | 81.9 | 85.5 | 96.8 |
+| MNIST, 300 steps | 4.6 | 3.5 | 2.2 | **2.1** | 2.8 | 3.6 | 6.7 |
+
+**The change.** `Session::set_spread` (`tt_kernels::session::Spread`; burn-tt `TT_SPREAD`): `All` (every unit, the default, as
+before), `Fixed(k)`, or `Work { share, min }` (one unit for each `share` of the op's work, at least `min`). The work is output tiles
+for an element-wise op, input tiles for a reduction, tiles moved for a copy, gather or transfer, and tile products `mt * nt * kt` for
+a matmul. Each op builder gets the unit count it builds for, and `execute_on`/`submit_jobs_on` carry the same count to
+`enqueue_work`, which deals the jobs round-robin over those units; builders that take no unit count (`repack`, `repack_many`,
+`gather_indexed`, ...) are sized by their output (or their job count) and dealt over the units the spread gives them. Jobs of one op
+are independent -- two jobs on different units already have no order between them -- so dealing them over fewer units only adds order.
+
+**What it took to make a fixed spread on 120 tiles match a small session.** The first sweep (spread 2 at 120 tiles: 93-96 ms/step
+against 74 on a 2-tile session) had two causes, both found with the new `TT_HOST_TIMES=1` (burn-tt prints `Session::host_times`
+and lists per tile when it detaches):
+- `repack`/`repack_many` (918 calls a transformer step), the host DMA transfers and the matrix-unit ops dealt their jobs over every
+  unit whatever the spread; now they follow it.
+- `enqueue_work` laid out one segment queue for every unit of the session on every op, empty or not: `Segments` 1,034.5 ms over 50
+  steps against 238.9 on the 2-tile session, ~7 us an op against 1.6. Now one queue a unit the op can run on: 388.5 ms.
+
+**At 120 tiles, after both** (card 1, one run each, ms/step):
+
+| `TT_SPREAD` | all | 2 | 4 | `work:16:2` | `work:64:2` | `work:256:2` | `work:16:4` | `work:64:4` |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| transformer | 96.2 | 80.3-80.9 | 80.7-82.0 | 79.7 | 80.6 | 80.6 | 80.6 | 79.0 |
+| MNIST | 6.7 | 3.6-3.7 | **2.2-2.3** | 3.1 | 3.0 | 4.3 | 3.2 | 2.9 |
+
+- **A fixed spread on every tile is close to the best small session**: MNIST 2.2-2.3 at spread 4 (2.1 on an 8-tile session, 6.7 on
+  every tile), the transformer ~80 at 2-4 (74-76 on 2 tiles, 96.8 on every tile). The ~5 ms a transformer step that is left is the
+  per-op work that still scales with the session (per-op vectors of every unit, the barrier loops): 4,069 ms attached over 50 steps
+  against 3,832 on 2 tiles, 388 ms of `Segments` against 239.
+- **The transformer is bound by its lead tile.** At spread 2 tile 0 takes 151,737 of 283,024 lists and the host waits for ring room
+  (394k reads in `List`); a wider spread does not move it (spread 4: 81-82), so what is left there is per-op device time, not the host.
+- **A spread that varies per op loses to churn.** `work:16` with no floor put nearly every transformer op on one tile, as slow as a
+  one-tile session (106 ms; 154k lists on one tile). A floor (`work:<share>:<min>`) fixes that (79-81) but does not beat a fixed
+  spread, and for MNIST it is worse (2.9 at `work:64:4` against 2.2): its lists land on all 120 tiles, units that join a large op and
+  sit out the small ones rejoin with a catch-up each time (barrier writes 37,311 against 13,503 over 300 steps) and programs are
+  uploaded to more tiles (`Place` writes 2,037 against 907). Varying the spread per op would pay only with a cheaper catch-up (folded
+  into the unit's next list) and program placement that knows which tiles hold what.
+- **The default is unchanged** (`All`; and burn-tt's auto-attach still opens one tile). Opening every tile with a fixed spread of 4
+  would take the transformer from 104 to ~80 ms/step and MNIST from 4.5 to ~2.3 against today's one-tile default; it changes every
+  model's tile count, so it is a decision, not part of this change.
+
+Gates: `step177_op_spread` (ttsim and card 0): six ops (a matmul with each operand transposed and `K` in blocks, a row-broadcast add, a
+relu, sums over rows and columns, a copy) against the host bit for bit under `All`, `Fixed(1)`, `Fixed(2)` and two work spreads, with
+the units each spread chose the only ones that enqueued anything; watched failing with the spread ignored. With every session forced to
+`Work { share: 16, min: 1 }`, every numerical check of the 41 multi-tile simulator gates passes (only the checks that count units or
+arrivals differ, by design: `step20`'s "every unit worked", `step34`'s arrival count, `step176`'s reader on all four units).
 
 ## Barriers on the units an op ran on (2026-10-14, card 0)
 

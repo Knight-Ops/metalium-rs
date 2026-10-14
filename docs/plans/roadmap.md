@@ -400,7 +400,14 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   `BARRIER` before their next list: the all-tiles transformer 404-422 -> 96-98 ms/step (faster than one tile,
   105), all-tiles MNIST 12.9-13.4 -> 6.7 ([performance log](../learnings/performance-log.md#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0)).
   What is left at many tiles is each participating unit's own cost, ~4.6 us a unit an op: the next item.
-- [ ] **Per-workload tile choice.** Auto-attach opens one tile (`TileChoice::First`), and a session's tile
+- [ ] **Per-workload tile choice.** `Session::set_spread` / `TT_SPREAD` (2026-10-14): a session opens every
+  tile and each op runs on a fixed count (`Fixed(k)`) or one sized by its work (`Work { share, min }`). At 120
+  tiles a fixed spread of 4 is within ~5% of the best small session (MNIST 2.2-2.3 ms/step, transformer ~80);
+  spreads that vary per op lose to catch-up and program-placement churn
+  ([performance log](../learnings/performance-log.md#per-op-tile-spread-2026-10-14-card-1)). Open: the default
+  (still `All`, and auto-attach still opens one tile; opening all with a spread of 4 is the measured candidate),
+  a cheaper catch-up (folded into the next list) so a per-op spread can pay, and the per-op work that still
+  scales with the session's tile count. Auto-attach opens one tile (`TileChoice::First`), and a session's tile
   count is fixed at attach. Open `All` tiles and choose a subset per op: an autotune-style cache keyed by
   `(op, shape, dtype)` that measures candidate counts on first use (`[512,512]^2`: 8 tiles 1.32 ms against
   120 tiles 2.0 ms, checklist 9.7c) and keeps the best. Needs a per-op tile subset in `tt-kernels`; related to
