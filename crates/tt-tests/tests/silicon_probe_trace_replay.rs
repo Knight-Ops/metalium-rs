@@ -188,7 +188,8 @@ enum Part {
     /// of the next 64 entries and the patch pass over them. A replay with a stream of more than
     /// 64 entries has one of these per extra chunk.
     ChunkGap,
-    /// The trace's `POKE`s: role descriptor words written before the ops (entry spans and the gaps between).
+    /// The trace's prologue: the role descriptor words written before the ops, as
+    /// `POKE`s or `POKE_RUN` records (entry spans and the gaps between).
     Pokes,
     /// The trace's setup `KERNEL` entry (the host-run semaphore setup), span and gaps.
     SetupKernel,
@@ -220,7 +221,7 @@ enum Part {
 fn class(word: u32) -> Part {
     use tt_isa::dm::record;
     match word {
-        op::POKE => Part::Pokes,
+        op::POKE | record::POKE_RUN => Part::Pokes,
         op::KERNEL => Part::SetupKernel,
         op::LAUNCH => Part::Launch,
         op::KERNEL_WAIT => Part::KernelWait,

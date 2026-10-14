@@ -428,6 +428,18 @@ pub struct Mover {
     pub trace_chunk: u64,
 }
 
+/// A word a mover may write with [`op::POKE`] or [`record::POKE_RUN`]: aligned, and
+/// inside one of the three role mailboxes. Shared so the host's check, the entry decode
+/// and the firmware's run of a record agree on what is pokeable.
+pub const fn is_role_mailbox_word(address: u32) -> bool {
+    let base = crate::mailbox::role::BASE;
+    let end = base + 3 * crate::mailbox::role::STRIDE;
+    address % 4 == 0
+        && (address as u64) >= base
+        && (address as u64) < end
+        && (address as u64 - base) % crate::mailbox::role::STRIDE < crate::mailbox::MAILBOX_SIZE
+}
+
 impl Mover {
     /// Whether this mover runs the entry or record whose first word is `op`.
     /// The direction table both sides use: the host refuses what the firmware
@@ -900,14 +912,7 @@ impl Entry {
             });
         }
         if w[0] == op::POKE {
-            let base = crate::mailbox::role::BASE;
-            let end = base + 3 * crate::mailbox::role::STRIDE;
-            let ok = w[1] % 4 == 0
-                && (w[1] as u64) >= base
-                && (w[1] as u64) < end
-                && (w[1] as u64 - base) % crate::mailbox::role::STRIDE
-                    < crate::mailbox::MAILBOX_SIZE;
-            if !ok || w[3..].iter().any(|&v| v != 0) {
+            if !is_role_mailbox_word(w[1]) || w[3..].iter().any(|&v| v != 0) {
                 return Err(error::OP);
             }
             return Ok(Entry::Poke {

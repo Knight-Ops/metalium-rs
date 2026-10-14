@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Descriptor runs in a trace's prologue](#descriptor-runs-in-a-traces-prologue-2026-10-14-card-0) | 2026-10-14 | `record::POKE_RUN`: a trace's 51 `POKE`s become 9 records, 8,824 -> 4,892 device cycles a replay; a replay is 2.3-4.6 us shorter host-timed, its stream 124 -> 91 entries, and the 8-tile chunk boundary is gone |
 | [Trace replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) | 2026-10-14 | a replayed tiny streaming op costs ~7.4-8.7 us, about half of it control (pair begin ~1.05 us, finish ~1.3-1.6, credits ~0.9, barrier ~0.6-0.7 on many tiles); the 51-`POKE` prologue is 7.2 us a replay; a chunk boundary is 0.75 us; the host adds ~2 us a tile |
 | [Trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim) | 2026-10-14 | a captured op costs ~18 stream entries (~0.6 KiB) but ~8 KiB of GDDR (whole-slot sections) and, per distinct op, ~4 KiB of pinned program cache (~0.6 KiB a program); programs are shared by hash; chunk padding is 0-1% |
 | [Records and NC writes](#per-tile-cost-of-the-movers-records-and-ncs-writes-2026-10-13-cards-0-and-1) | 2026-10-13 | A record's tile costs a plain entry's ~340 cycles on B (read) and ~320-345 on NC (write); only plain entries gain from encoding |
@@ -636,6 +637,44 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Descriptor runs in a trace's prologue (2026-10-14, card 0)
+
+The first thing the [replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) found: every replay
+re-establishes the three roles' descriptors with 51 `op::POKE` entries, 8,824 device cycles (6.5 us), the same on every replay.
+Each `POKE` writes one word and fences it (`publish`), so the cost is seventeen entries and seventeen fences a role.
+
+`record::POKE_RUN` writes a run of consecutive role-mailbox words in one two-entry record, with one fence for the run
+(`mover::poke_run`). A descriptor is three runs -- the program's address and length divide it, since each `KERNEL` and `LAUNCH`
+writes those itself, and the live handshake words (`generation`, `ack`) sit between two of them -- so the prologue is 9 records
+of 2, 4 and 11 words instead of 51 entries. `trace::UnitCapture::poke_descriptor` emits them; a run of one word stays a `POKE`,
+which is the smaller of the two.
+
+Card 0, release, safe image, `silicon_probe_trace_replay::replay_breakdown`, medians of 7 (runs `1791944369` before,
+`1791945827` after; the before column is the published breakdown):
+
+| us a replay | chain8, 1 tile | chain8, 8 tiles | layer, 1 tile | layer, 8 tiles |
+|---|--:|--:|--:|--:|
+| **host-timed, unstamped**: before -> after | 73.5 -> **71.2** | 79.0 -> **76.3** | 129.0 -> **124.4** | 82.5 -> **78.2** |
+| device span: before -> after | 69.8 -> 68.1 | 59.3 -> 56.3 | 125.0 -> 120.4 | 64.1 -> 60.0 |
+| the prologue in it | 6.54 -> **3.62** | 6.54 -> **3.63** | 6.54 -> **3.63** | 6.54 -> **3.62** |
+
+- **The prologue is 8,824 -> 4,892 cycles (6.54 -> 3.62 us), and a replay is 2.3-4.6 us shorter by the host's clock.** The host
+  number is the one to read: the device span also falls because there are 84 fewer stamps (~12 cycles each), which the host-timed
+  runs do not pay.
+- **A record is ~544 cycles against ~173 for a `POKE`**, so it pays from three words up; the 2-word run is a wash and is left as a
+  record for one rule rather than two (worth ~0.4 us a replay to split, not measured).
+- **The stream is 124 -> 91 entries and its top level 57 -> 24** (`step174_trace_footprint`), which puts the layer's top-level
+  stream back under one 64-entry chunk: the 0.75 us chunk boundary an 8-tile replay paid is gone, and the padding stays zero.
+  The pinned program cache and the GDDR a trace holds do not change.
+- **What is left of the prologue** is 9 records, 544 cycles each. Writing the descriptor as one run would need the program's
+  address and length in it, and those change per op, so the run would be re-emitted for every op rather than once a trace.
+
+Gates: `step175_poke_run` (ttsim) holds the firmware's own loop to the `POKE`s the record expands to -- the same words through
+one entry each, bit for bit in all three mailboxes, at every length a record carries -- and watched failing with the loop one word
+short. Its controls: a count of none or past the record, a value past the count, an address outside a role mailbox, a run that
+starts inside one and ends past it, and NC, which refuses the record as it refuses a `POKE` (`Mover::permits`); each is refused by
+the host with the code the tile gives, and the tile, sent it past the check (`enqueue_raw`), writes none of the words.
 
 ## Trace replay: where a replayed op's device time goes (2026-10-14, card 0)
 

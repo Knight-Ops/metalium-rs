@@ -199,22 +199,54 @@ pub(crate) struct UnitCapture {
 }
 
 impl UnitCapture {
-    /// `POKE`s setting role `thread`'s descriptor to `d`, word by word where
-    /// the stream has not already: all but the program's address and length,
-    /// which each `KERNEL` entry writes itself.
+    /// Entries setting role `thread`'s descriptor to `d`, where the stream has not
+    /// already: all but the program's address and length, which each `KERNEL` entry
+    /// writes itself.
+    ///
+    /// A descriptor's words are written in runs of consecutive addresses
+    /// (`record::POKE_RUN`), not one `op::POKE` each: a run costs the mover one record
+    /// and one fence instead of one entry and one fence a word, and the prologue of a
+    /// trace was 51 `POKE`s, 7.2 us of every replay
+    /// (`docs/learnings/performance-log.md`, "Trace replay"). The words the program's
+    /// address and length divide the runs, as the live handshake words
+    /// (`generation`, `ack`) do; a run of one word stays a `POKE`, which is the
+    /// smaller of the two.
     pub(crate) fn poke_descriptor(&mut self, thread: usize, d: &mailbox::Descriptor) {
         let mb = Mailbox::of(thread as u32);
-        let words = d.writes(mb);
+        // Address order, which `Descriptor::writes` is not in, so a run is consecutive
+        // entries of this array.
+        let mut words = d.writes(mb);
+        words.sort_unstable_by_key(|&(at, _)| at);
+        let ours = |at: u64| at != mb.program_len() && at != mb.program_addr();
         let have = self.descriptors[thread];
-        for (k, &(at, v)) in words.iter().enumerate() {
-            if at == mb.program_len() || at == mb.program_addr() {
+        let values = words.map(|(_, v)| v);
+        let mut k = 0;
+        while k < words.len() {
+            if !ours(words[k].0) {
+                k += 1;
                 continue;
             }
-            if have.is_none_or(|h| h[k] != v) {
-                self.stream.push([op::POKE, at as u32, v, 0, 0, 0, 0, 0]);
+            // The longest run of consecutive words this record can carry.
+            let mut end = k + 1;
+            while end < words.len()
+                && ours(words[end].0)
+                && words[end].0 == words[end - 1].0 + 4
+                && end - k < record::POKE_RUN_MAX
+            {
+                end += 1;
             }
+            if have.is_none_or(|h| h[k..end] != values[k..end]) {
+                let at = words[k].0 as u32;
+                if end - k == 1 {
+                    self.stream.push([op::POKE, at, values[k], 0, 0, 0, 0, 0]);
+                } else {
+                    self.stream
+                        .extend_from_slice(&record::poke_run(at, &values[k..end]));
+                }
+            }
+            k = end;
         }
-        self.descriptors[thread] = Some(words.map(|(_, v)| v));
+        self.descriptors[thread] = Some(values);
     }
 }
 

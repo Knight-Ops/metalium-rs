@@ -1067,6 +1067,9 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     for (k, e) in rec[..n].iter_mut().enumerate() {
         *e = entry_at(at + k as u64 * dm::ENTRY_BYTES);
     }
+    if rec[0][0] == record::POKE_RUN {
+        return poke_run(&rec[..n]);
+    }
     // Each mover expands its own direction's records, so the other's code is
     // not in its image.
     if IS_NC {
@@ -1081,6 +1084,46 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
         }
         record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e))
     }
+}
+
+/// [`record::POKE_RUN`]: a run of consecutive role-mailbox words, written with one
+/// fence for the run instead of [`dm::op::POKE`]'s one for each. What the record
+/// expands to (`record::expand_reads`, which the host checks the list with) is exactly
+/// these stores in this order; the loop is here so a descriptor costs a record rather
+/// than seventeen entries.
+///
+/// The roles read these words only once a later `KERNEL` or `LAUNCH` posts their
+/// generation, so one fence after the run is what orders them, as `op::POKE`'s is.
+#[inline(never)]
+fn poke_run(rec: &[[u32; 8]]) -> Result<(), u32> {
+    reader_only()?;
+    let count = rec[0][2];
+    if count == 0 || count as usize > record::POKE_RUN_MAX {
+        return Err(dm::error::RANGE);
+    }
+    // A value past the run would be a word the host's expansion never writes.
+    let mut k = count as usize;
+    while k < record::POKE_RUN_MAX {
+        if record::poke_run_word(rec, k) != 0 {
+            return Err(dm::error::OP);
+        }
+        k += 1;
+    }
+    let first = rec[0][1];
+    // The run is at most 48 bytes and the mailboxes are 0x4000 apart, so first and
+    // last inside a mailbox puts every word of it in that one.
+    let last = match first.checked_add(4 * (count - 1)) {
+        Some(last) => last,
+        None => return Err(dm::error::RANGE),
+    };
+    if !dm::is_role_mailbox_word(first) || !dm::is_role_mailbox_word(last) {
+        return Err(dm::error::OP);
+    }
+    for k in 0..count {
+        wr((first + 4 * k) as u64, record::poke_run_word(rec, k as usize));
+    }
+    publish();
+    Ok(())
 }
 
 /// [`dm::op::CALL`]: a trace's entries from GDDR, a chunk at a time into

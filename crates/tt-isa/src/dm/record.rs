@@ -99,6 +99,50 @@ pub const PAD_WRITE: u32 = 0x17;
 /// [`expand`] has no L1, reads every index as `0` and so checks the record's
 /// geometry (alignment, range) and nothing about the indices.
 pub const SELECT_ROWS: u32 = 0x18;
+/// A run of consecutive words of one role's mailbox: `[POKE_RUN, address,
+/// count, v0, v1, v2, v3, v4]` + `[v5, ..., v12]`, `count` in
+/// `1..=`[`POKE_RUN_MAX`], the values past `count` zero. The same words
+/// [`op::POKE`] writes one at a time and in the same order, so a descriptor
+/// goes in two records (the live handshake words, `generation` and `ack`,
+/// divide it) instead of seventeen entries, each of which fences. Neither a
+/// GDDR read nor a write: RISCV B runs it, NC refuses it as a direction it
+/// does not serve.
+pub const POKE_RUN: u32 = 0x19;
+/// Words one [`POKE_RUN`] carries: five in its header, eight in the entry after it.
+pub const POKE_RUN_MAX: usize = 13;
+
+/// A [`POKE_RUN`] of `values` into the words from `address`, which the caller
+/// has checked is a role mailbox's (`Entry::decode` refuses what is not, of
+/// every word the record expands to).
+///
+/// # Panics
+/// If `values` is empty or longer than [`POKE_RUN_MAX`].
+pub fn poke_run(address: u32, values: &[u32]) -> [[u32; 8]; 2] {
+    assert!(
+        !values.is_empty() && values.len() <= POKE_RUN_MAX,
+        "a POKE_RUN carries 1..={POKE_RUN_MAX} words, not {}",
+        values.len()
+    );
+    let mut rec = [[0u32; 8]; 2];
+    rec[0][0] = POKE_RUN;
+    rec[0][1] = address;
+    rec[0][2] = values.len() as u32;
+    for (k, &v) in values.iter().enumerate() {
+        let (entry, slot) = if k < 5 { (0, 3 + k) } else { (1, k - 5) };
+        rec[entry][slot] = v;
+    }
+    rec
+}
+
+/// The `k`th word a [`POKE_RUN`] carries, by the layout [`poke_run`] writes.
+#[inline(always)]
+pub const fn poke_run_word(rec: &[[u32; 8]], k: usize) -> u32 {
+    if k < 5 {
+        rec[0][3 + k]
+    } else {
+        rec[1][k - 5]
+    }
+}
 
 /// Does a record's expansion read GDDR (so B runs it) or write it (so NC
 /// does)? `None` for a plain entry.
@@ -128,6 +172,7 @@ pub const fn len(op: u32) -> usize {
     match op {
         GATHER => 5,
         SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN | SELECT_ROWS => 3,
+        POKE_RUN => 2,
         _ => 1,
     }
 }
@@ -568,6 +613,29 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 }
             }
         }
+        POKE_RUN => {
+            // RISCV B's, as `Mover::permits` has it: it is not a write, so NC does not
+            // reach the mailbox words through a record either.
+            if !READS {
+                return Err(super::error::DIRECTION);
+            }
+            let count = h[2] as usize;
+            if count == 0 || count > POKE_RUN_MAX {
+                return Err(super::error::RANGE);
+            }
+            // The words past the run are zero, so a record cannot carry a value
+            // the expansion never writes and the card's own loop would.
+            for k in count..POKE_RUN_MAX {
+                if poke_run_word(rec, k) != 0 {
+                    return Err(super::error::OP);
+                }
+            }
+            for k in 0..count {
+                let at = h[1].checked_add(4 * k as u32).ok_or(super::error::RANGE)?;
+                // Every word through `op::POKE`, which bounds it to one role's mailbox.
+                emit([op::POKE, at, poke_run_word(rec, k), 0, 0, 0, 0, 0])?;
+            }
+        }
         FILL_PAD => pad::<false>(rec, &mut emit)?,
         PAD_WRITE => pad::<true>(rec, &mut emit)?,
         _ => return Err(super::error::OP),
@@ -632,6 +700,94 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    /// The POKEs a record expands to, or the error.
+    fn poked(rec: &[[u32; 8]; 2]) -> Result<Vec<(u32, u32)>, u32> {
+        let mut got = Vec::new();
+        expand(rec, |e| {
+            assert_eq!(e[0], op::POKE);
+            assert_eq!(&e[3..], &[0; 5], "a POKE carries nothing past its value");
+            got.push((e[1], e[2]));
+            Ok(())
+        })?;
+        Ok(got)
+    }
+
+    /// The mailbox of role 1, whose words are the ones a trace pokes.
+    fn mailbox_word(k: u32) -> u32 {
+        (crate::mailbox::role::Mailbox::of(1).base() + 0x1C + 4 * k as u64) as u32
+    }
+
+    #[test]
+    fn a_poke_run_expands_to_the_pokes_it_was_built_from() {
+        for count in 1..=POKE_RUN_MAX {
+            let values: Vec<u32> = (0..count as u32).map(|k| 0xA000_0000 + k).collect();
+            let at = mailbox_word(0);
+            let rec = poke_run(at, &values);
+            assert_eq!(len(rec[0][0]), rec.len());
+            let want: Vec<(u32, u32)> = values
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| (at + 4 * k as u32, v))
+                .collect();
+            assert_eq!(poked(&rec).unwrap(), want, "{count} words");
+        }
+    }
+
+    #[test]
+    fn a_poke_run_is_refused_for_a_count_or_a_stray_word_the_pokes_would_not_have() {
+        let at = mailbox_word(0);
+        let mut rec = poke_run(at, &[1, 2, 3]);
+        assert!(poked(&rec).is_ok());
+        // A value past the count: the card's own loop would not write it, so the
+        // record is not one the host built.
+        let mut stray = rec;
+        stray[0][6] = 9;
+        assert_eq!(poked(&stray), Err(super::super::error::OP));
+        let mut stray = rec;
+        stray[1][7] = 9;
+        assert_eq!(poked(&stray), Err(super::super::error::OP));
+        for count in [0, POKE_RUN_MAX as u32 + 1, u32::MAX] {
+            rec[0][2] = count;
+            assert_eq!(
+                poked(&rec),
+                Err(super::super::error::RANGE),
+                "count {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_poke_run_outside_a_role_mailbox_is_refused_word_by_word() {
+        let usable = 0xFF;
+        let decode = |rec: &[[u32; 8]; 2]| -> Result<(), u32> {
+            expand(rec, |e| super::super::Entry::decode(usable, e).map(|_| ()))
+        };
+        // The last word of role 2's mailbox: in, and one word past it: out.
+        let last =
+            (crate::mailbox::role::Mailbox::of(2).base() + crate::mailbox::MAILBOX_SIZE - 4) as u32;
+        assert!(decode(&poke_run(last, &[7])).is_ok());
+        assert!(decode(&poke_run(last + 4, &[7])).is_err());
+        // A run that starts inside and runs past the end is refused, though its
+        // first word is pokeable.
+        assert!(decode(&poke_run(last - 4, &[7, 7])).is_ok());
+        assert!(decode(&poke_run(last, &[7, 7])).is_err());
+        // The mover's own mailbox and L1 are not pokeable at all.
+        assert!(decode(&poke_run(0x2_0000, &[7, 7])).is_err());
+    }
+
+    #[test]
+    fn only_the_reader_runs_a_poke_run() {
+        let rec = poke_run(mailbox_word(0), &[1, 2]);
+        assert_eq!(direction(POKE_RUN), None);
+        assert!(super::super::Mover::B.permits(POKE_RUN));
+        assert!(!super::super::Mover::NC.permits(POKE_RUN));
+        assert_eq!(
+            expand_writes(&rec, |_| Ok(())),
+            Err(super::super::error::DIRECTION)
+        );
+        assert!(expand_reads(&rec, &mut |_| 0, |_| Ok(())).is_ok());
+    }
 
     #[test]
     fn packed_gather_uses_halfword_slots_and_only_fills_edges() {
