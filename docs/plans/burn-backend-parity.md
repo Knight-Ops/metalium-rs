@@ -686,7 +686,9 @@ nothing" line in the Definition of done is checked.
    `burn::Dispatch` users and `cargo test-tt` work without vendoring?
 5. **What is a Burn device on a multi-card host:** each card a `TtDevice` (Burn's model,
    DDP-friendly) or the mesh as one device (today's `Topology::Cards`)? Possibly both, as
-   distinct `type_id`s.
+   distinct `type_id`s. **Decided 2026-10-14:** each card a `TtDevice`, data parallelism through a
+   native `DistributedBackend` (B14); a mesh device stays possible later for tensor parallelism
+   ([roadmap, Track 3](roadmap.md#track-3-multi-chip-after-the-single-chip-path-is-fast)).
 6. **`burn-backend/distributed` without a cubecl feature** -- `distributed/ops.rs:1`
    imports `cubecl::device::DeviceId`; compile-check before making `distributed` default-on.
 7. **Poisoned tensors vs. Burn's expectations.** Does any Burn wrapper (autodiff,

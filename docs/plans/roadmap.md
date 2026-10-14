@@ -465,10 +465,73 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
 
 Evidence: [phases-0-10-checklist.md](../completed-plans/phases-0-10-checklist.md) Phase 8/9.
 
+### Design decisions (2026-10-14)
+
+Training and inference both have to run across cards, so data parallelism, pipelining and
+(eventually) tensor parallelism must all stay possible. What is decided:
+
+- **A Burn device is one card.** Each card is its own `TtDevice` -- what both of Burn's
+  multi-device systems assume, and what pipelining (`to_device` between layers) needs. This answers
+  [burn-backend-parity.md](burn-backend-parity.md) open question 5 for now; the mesh as one device
+  stays possible as a separate device type later (below).
+- **Data-parallel training goes through `DistributedBackend`, implemented natively (B14).** Autodiff
+  hands each gradient to the backend as it is computed (`submit_gradient_sync`), and the backend's
+  `all_reduce` runs once every card has submitted, so gradient traffic overlaps the backward pass.
+  Native means an Ethernet ring driven by the E1 movers, in an order we fix, and later inside per-card
+  traces. It is needed regardless: Burn's `distributed` feature (turned on by `burn-train`'s DDP and
+  by `burn-core`/`burn-optim`'s `distributed`) makes `Autodiff<TtBackend>` require the trait, whose
+  `all_reduce` and `sync_collective` default to `unimplemented!()`.
+- **Numerics contract for data-parallel training: deterministic, fixed order.** The all-reduce sums in a
+  fixed ring order: the same bits run to run, and bit-exact against a host all-reduce in the same order
+  (the oracle). It is not bit-identical to one card, since the gradient sums are reordered; the
+  difference from one card is bounded and documented beside the gate, as the numerics rules ask.
+- **A single tensor across several devices stays in the design, not built yet.** Today a device tensor
+  belongs to one card's session (and `MeshEngine` splits a matmul's operands per op). The placement a
+  tensor carries should be able to say *one card*, *replicated on these cards* or *split along a
+  dimension across these cards*, with the buffers in per-card sessions, so tensor parallelism can be
+  added later without redoing the foundation. **Tensor parallelism (one op across cards, a custom mesh
+  device) is an eventual large goal, deliberately not pursued now**; nothing built here should rule it out.
+- **`burn-collective` reviewed (0.21.0 source), not the primary path.** It is a library outside the backend,
+  generic over any Burn backend, used by `burn-optim`'s `collective` feature (`GradientsParams::all_reduce`
+  after backward, one gradient at a time). It moves data with ordinary backend ops (`float_to_device` to copy
+  a slice between devices, `float_add`, `float_slice`, `float_cat`), so it works with burn-tt today at the
+  speed of our card-to-card `to_device` (a host round trip), with no overlap with backward and no hook for
+  our own transport. Its peers are held in a `HashMap`: the Ring and Centralized strategies take their order
+  from it (it differs run to run), Tree sorts by device id. With two cards every strategy is deterministic
+  (a two-term sum and a halving are exact either way round); from three, only Tree meets the contract above.
+  It becomes a usable fallback once card-to-card `to_device` runs over Ethernet. It also brings a
+  multi-machine layer (`tokio`, `burn-communication`) this project does not need.
+
+### Foundation (shared by every scheme), in order
+
+- [ ] **Per-card sessions on every tile, with a spread.** Each card's session opens all its tiles and gives
+  each op as many as its work pays for (`Session::set_spread`, Track 2). Barriers, catch-ups, program caches
+  and the barrier counter are per chip (two cards share no NoC); ordering between cards is explicit Ethernet
+  transfers and their acknowledgements. Today a `Fabric` opens one tile per chip (`TileChoice::Exactly`).
+- [ ] **Fast card-to-card `to_device` over Ethernet.** The shared primitive: pipelines hand activations over
+  with it, `burn-collective` gets fast with no further work, and the native all-reduce builds on the same
+  movers. Today it is a host round trip.
+- [ ] **Tensor placement** able to express one card, replicated or split along a dimension (see above); only
+  the one-card case needs to work at first.
+- [ ] **Per-card submission.** One server thread drives every card today, and mesh traces run phase by phase
+  with the host doing each Ethernet transfer. Cards are independent between Ethernet sync points: a
+  submission queue per card, and cross-card send/wait entries inside each card's trace stream, so a
+  training step does not return to the host mid-step.
+
+### Schemes
+
+- [ ] **Data-parallel training: B14 `DistributedBackend`**, a host all-reduce first (the oracle; download, sum
+  in the fixed order, upload), then the Ethernet ring.
+- [ ] **Pipelining** (layers on different cards) over card-to-card `to_device`; micro-batching later.
+- [ ] **Tensor parallelism / a mesh device** (one op across cards): an eventual goal, not scheduled. Today's
+  `Topology::Cards` (a matmul split along `N`, bit-identical to one card) is the proof of concept.
+
+### Existing items
+
 - [ ] **9.11** device-resident mesh with chips running concurrently, and `copy_into` on the
   mesh (today `MeshEngine` keeps buffers in chip 0's GDDR).
 - [ ] Gradient all-reduce over Ethernet, data-parallel training, **B14**
-  `DistributedBackend`.
+  `DistributedBackend` (see Schemes above).
 - [ ] Mesh training traces (mesh inference traces work, step147).
 - [ ] Ethernet pipelining: both 800G links together reach 27 GB/s (27% of ceiling).
 - [ ] Investigate the two-card accuracy gap (0.9195 vs 0.9196 after step 32).
