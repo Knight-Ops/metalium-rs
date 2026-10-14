@@ -70,7 +70,11 @@ pub const PAD_WRITE: u32 = 0x17;
 /// Whole rows of a table, chosen by indices already in L1, GDDR -> L1:
 /// `[SELECT_ROWS, idx_at, count, bound, j0, cols, stage_at, flags]` + `X`.
 /// The slot at `idx_at` holds one tile of I32 indices, in tile row 0 (a
-/// `[1, n]` index tensor's tile): index `r` is the datum at `(0, r)`. For each
+/// `[1, n]` index tensor's tile): index `r` is the datum at `(0, r)`. Row `q`
+/// of a slot is read as row 0 of one `idx_at` moved by that row's place in
+/// the face layout, `(q / 16 * 512 + q % 16 * 16) * 4` bytes, which is how a
+/// `[taps, n]` index tensor gives each tap its own row
+/// (`tt_kernels::index::select_taps_jobs`, a convolution's im2col). For each
 /// of the first `count` (1..=32) indices `v`, row `v` of `X` (a table of
 /// `bound` rows) goes to row `r` of the output tile, for tile columns
 /// `j0..j0 + cols` of `X`, into the slot `j - j0` from `stage_at` -- two
@@ -85,9 +89,10 @@ pub const PAD_WRITE: u32 = 0x17;
 /// implemented.** Its face-rows are 32 bytes, congruent to `TILE_DATA` mod 64
 /// only on an even row, so a read must take the pair a row is half of and the
 /// wanted half be moved; that code, in this record, measured 400 bytes more
-/// in RISCV B's image, which has 172 of its 24 KiB left (a mover image may
-/// not pass `IMAGE_MAX`). `docs/plans/roadmap.md`, "Gather without staging",
-/// has the options.
+/// in RISCV B's image, which then had 172 of its 24 KiB left (a mover image
+/// may not pass `IMAGE_MAX`; the slot is 42 KiB since the role images were
+/// repacked). `docs/plans/roadmap.md`, "Gather without staging", has the
+/// options.
 ///
 /// The slots are not checked against the data arena here (the mover's image has
 /// no room for it; `tt_kernels::index::select_rows_jobs` places them from its
@@ -585,7 +590,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             }
             // Every index is read, and checked, before any read is issued; each
             // is read again where it is used, which keeps the mover's image
-            // (its 24 KiB are nearly all spoken for) free of a copy of them.
+            // free of a copy of them.
             // 32-bit arithmetic throughout: on this core a `u64` costs
             // instructions at every step.
             const DATA: u32 = TILE_DATA as u32;

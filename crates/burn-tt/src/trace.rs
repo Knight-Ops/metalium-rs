@@ -39,10 +39,52 @@ pub struct Trace {
 struct Capturing {
     device: TtDevice,
     open: bool,
+    /// A training step's capture ([`TracedTrainingStep`]), counted in
+    /// [`TRAINING`].
+    training: bool,
+}
+
+/// The devices capturing a training step now, in this process (a device once
+/// for each open training [`Capturing`]).
+static TRAINING: std::sync::Mutex<Vec<TtDevice>> = std::sync::Mutex::new(Vec::new());
+
+/// Is `device` capturing a training step? Its replays write the parameters in
+/// place (`copy_into`), so a tensor derived from one and kept (a convolution's
+/// relaid weights, `TtTensor::derived`) is neither read nor filled then: the
+/// capture recomputes it, and so does each replay. An inference trace's
+/// capture uses what is kept: its replays read the parameters as they were,
+/// and a later in-place write drops what was derived from them.
+pub(crate) fn capturing_training(device: TtDevice) -> bool {
+    TRAINING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&device)
+}
+
+impl Capturing {
+    fn new(device: TtDevice, training: bool) -> Self {
+        if training {
+            TRAINING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(device);
+        }
+        Capturing {
+            device,
+            open: true,
+            training,
+        }
+    }
 }
 
 impl Drop for Capturing {
     fn drop(&mut self) {
+        if self.training {
+            let mut c = TRAINING.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(i) = c.iter().position(|&d| d == self.device) {
+                c.swap_remove(i);
+            }
+        }
         if self.open {
             // Whatever it captured, it is no trace: ended, and released.
             if let Some(Ok(id)) = server::run_if_attached(self.device, |e, _| e.end_trace()) {
@@ -78,8 +120,10 @@ impl Trace {
             ));
         }
         let input_id = d.buffer.id;
+        // Each replay writes it.
+        server::written_in_place(input_id);
         server::run(device, |e, _| e.begin_trace())?;
-        let mut guard = Capturing { device, open: true };
+        let mut guard = Capturing::new(device, false);
         let out = f();
         let output = match out.dram() {
             Some(d) if !d.transposed && out.device == device && out.is_stored_f32() => {
@@ -187,10 +231,12 @@ impl TracedInference {
                 ));
             }
             in_ids.push(d.buffer.id);
+            // Each replay writes it.
+            server::written_in_place(d.buffer.id);
         }
 
         server::run(device, |e, _| e.begin_trace())?;
-        let mut guard = Capturing { device, open: true };
+        let mut guard = Capturing::new(device, false);
         let outs = f();
         let mut out_info = Vec::with_capacity(outs.len());
         for out in &outs {
@@ -355,10 +401,12 @@ impl TracedTrainingStep {
                 ));
             }
             in_ids.push(d.buffer.id);
+            // Each replay writes it.
+            server::written_in_place(d.buffer.id);
         }
 
         server::run(device, |e, _| e.begin_trace())?;
-        let mut guard = Capturing { device, open: true };
+        let mut guard = Capturing::new(device, true);
 
         let (loss, updates) = f();
 

@@ -203,6 +203,10 @@ pub const SMOKE: &[&str] = &[
     // select (`step171`) took the embedding lookup from 15 s a token to 0.3 ms; the BF16 gate (229 s) is not,
     // as the BF16 lookup still stages its table (roadmap, "Gather without staging").
     "step171_select_rows::",
+    // Chunk-free convolution and max pooling (roadmap Track 2 item 2): the tap select, then
+    // one product a convolution and one fold a pool, on NHWC views.
+    "step178_select_taps::",
+    "step179_nhwc_conv_pool::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

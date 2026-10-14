@@ -430,6 +430,10 @@ copy or zero XMOV can execute. A supported NOP
 control and DMANOP survive. Byte/GPR reference models and a separate program
 interpreter retain host test coverage; resident movement and instruction semantics
 are silicon gates. Do not skip C0/C9 waits to make a simulator path executable.
+`Session::zeros_xmov` (the XMOV zero fill) now stops ttsim earlier still, at
+`UnimplementedFunctionality: tensix_stallwait: wait_res=0x200` (2026-10-14), so a
+host-side helper that needs zeroed storage on both targets uses a mover `FILL`
+instead (`tt_kernels::index::zero_tile_row_jobs`, `Session::select_taps`'s zero row).
 
 Card 0's independent raw STOREIND size sweep (`1791385416`) also corrects the
 pinned Wormhole functional model: sizes 1/2 are 2/4 bytes on Blackhole, while

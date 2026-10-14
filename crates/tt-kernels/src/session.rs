@@ -4453,6 +4453,91 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Rows of `table` for several taps side by side: `indices` a resident
+    /// `[taps, n]` I32 tensor, the result `[n, select_taps_cols(table.cols,
+    /// taps)]` with row `i` holding row `indices[t][i]` of `table` for each
+    /// tap `t` from tile column `t x ceil(table.cols / 32)`
+    /// ([`crate::index::select_taps_jobs`]) -- an im2col with no host
+    /// address when `table` is an NHWC activation.
+    ///
+    /// With `zero_row`, an index may also be `table.rows`, which reads a row
+    /// of zeros: what a convolution's padding taps read. It is the table's
+    /// first padding row, made zero; a table with no padding row (whole tile
+    /// rows) is first copied, by whole tiles, into a zeroed one a row longer.
+    /// Every tap but the last takes the table's padding columns into its own,
+    /// so they are made zero too whenever `taps > 1` (a matmul's `K` runs over
+    /// them). Bit for bit; an index past the bound is `DOMAIN` from the mover.
+    pub fn select_taps(
+        &mut self,
+        table: &DramTensor,
+        indices: &DramTensor,
+        zero_row: bool,
+    ) -> Result<DramTensor, TensorError> {
+        let longer = if zero_row && table.rows % 32 == 0 {
+            let out = DramTensor::alloc_elem(
+                &mut self.dram_state()?.alloc,
+                table.rows + 1,
+                table.cols,
+                table.elem,
+            )?;
+            let copied = out
+                .rows_view(0, table.rows)
+                .and_then(|rows| self.copy_into(table, &rows))
+                .and_then(|()| crate::index::zero_tile_row_jobs(&out, table.rows / 32))
+                .and_then(|jobs| self.submit_jobs(jobs, RESET_BUDGET));
+            if let Err(e) = copied {
+                let _ = self.free(out);
+                return Err(e);
+            }
+            // The copy brought the table's padding columns.
+            out.set_pad(table.pad());
+            Some(out)
+        } else {
+            None
+        };
+        let source = longer.as_ref().unwrap_or(table);
+        let need = if zero_row || indices.rows > 1 {
+            tensor::PadNeed::Zero
+        } else {
+            tensor::PadNeed::Any
+        };
+        let result = (|| {
+            let repaired = self.meet(source, need)?;
+            let used = repaired.as_ref().unwrap_or(source);
+            let cols = crate::index::select_taps_cols(used.cols, indices.rows.max(1));
+            let units = self.spread_for(indices.cols.div_ceil(32) * cols.div_ceil(32));
+            let made = (|| {
+                let out = DramTensor::alloc_elem(
+                    &mut self.dram_state()?.alloc,
+                    indices.cols,
+                    cols,
+                    used.elem,
+                )?;
+                let bound = table.rows + usize::from(zero_row);
+                let result = crate::index::select_taps_jobs(used, indices, bound, &out, units)
+                    .and_then(|jobs| self.submit_jobs_on(jobs, units, RESET_BUDGET));
+                if let Err(error) = result {
+                    self.dram_state()?.alloc.free(&out.placement);
+                    return Err(error);
+                }
+                out.set_pad(if used.pad() == tensor::Pad::Zero {
+                    tensor::Pad::Zero
+                } else {
+                    tensor::Pad::Undefined
+                });
+                Ok(out)
+            })();
+            if let Some(copy) = repaired {
+                let _ = self.free(copy);
+            }
+            made
+        })();
+        if let Some(copy) = longer {
+            let _ = self.free(copy);
+        }
+        result
+    }
+
     pub fn gather_indexed_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,

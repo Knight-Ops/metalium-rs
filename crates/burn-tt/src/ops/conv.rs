@@ -470,6 +470,9 @@ pub fn conv2d(
     bias: Option<TtTensor>,
     options: ConvOptions<2>,
 ) -> TtTensor {
+    if let Some(y) = super::nhwc::conv2d(&x, &weight, bias.as_ref(), &options) {
+        return y;
+    }
     conv(x, weight, bias, options)
 }
 

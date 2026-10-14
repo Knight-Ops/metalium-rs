@@ -1323,6 +1323,9 @@ fn device_op_ungated(
     if !crate::server::supports_dram(device) {
         return None;
     }
+    if let Some(t) = view_op(op, a, b, c) {
+        return Some(t);
+    }
     let (sa, sb) = (a.shape().to_vec(), b.map(|b| b.shape().to_vec()));
     let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
     // `b` the same shape, or one that broadcasts to `a` as one row or one
@@ -1377,6 +1380,152 @@ fn device_op_ungated(
         }
     };
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
+}
+
+/// `t`'s view if it is one that covers its buffer one to one (`base` at the
+/// origin, each element a different buffer element, every one of them
+/// named): an element-wise op on it is the op on the buffer, whatever order
+/// the view reads it in. A convolution's NHWC output viewed as NCHW is one.
+fn covering_view(t: &TtTensor) -> Option<crate::views::Strided> {
+    if !t.is_view() {
+        return None;
+    }
+    let v = t.as_strided()?;
+    (!v.src.transposed
+        && v.src.buffer.storage == crate::storage::StorageFormat::F32
+        && v.covers_source(&t.shape().to_vec()))
+    .then_some(v)
+}
+
+/// An element-wise op on a covering view ([`covering_view`]) run on its
+/// buffer, the result a view of the output buffer with the same strides: no
+/// datum moves to put the view in row-major order first. Every other operand
+/// is a view of the same layout (the same strides on each dimension longer
+/// than one, a buffer of the same dimensions), or broadcasts as one row or
+/// one column of the buffer: its dimensions longer than one are exactly
+/// those the view lays along the buffer's columns (or rows), in the order the
+/// view lays them -- a BatchNorm's `[1, C, 1, 1]` against an NHWC activation
+/// is a row of `C`. `None` for anything else (the caller materialises the
+/// view).
+fn view_op(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+) -> Option<TtTensor> {
+    use tt_kernels::kind as k;
+    let kind = op.kind;
+    let (a, b) = match (covering_view(a), b) {
+        (Some(_), _) => (a, b),
+        // A commuting op with the view on the right.
+        (None, Some(rhs)) if c.is_none() && matches!(kind, k::ADD | k::MUL) => {
+            covering_view(rhs)?;
+            (rhs, Some(a))
+        }
+        _ => return None,
+    };
+    let v = covering_view(a)?;
+    let sa = a.shape().to_vec();
+    let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
+    let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
+    let operand = |x: &TtTensor, broadcast: bool| -> Option<crate::tensor::DramRef> {
+        if x.device != a.device {
+            return None;
+        }
+        let sx = x.shape().to_vec();
+        if sx == sa {
+            let w = covering_view(x)?;
+            let same = [w.src.buffer.rows, w.src.buffer.cols] == [rows, cols]
+                && sa
+                    .iter()
+                    .zip(v.strides.iter().zip(&w.strides))
+                    .all(|(&n, (s, t))| n == 1 || s == t);
+            return same.then_some(w.src);
+        }
+        if !broadcast || sx.len() > sa.len() {
+            return None;
+        }
+        // `x`'s dimensions right-aligned to `a`'s: the ones longer than one
+        // must be `a`'s, and all of `a`'s along one axis of the buffer.
+        let lead = sa.len() - sx.len();
+        let long: Vec<usize> = (0..sa.len())
+            .filter(|&d| d >= lead && sx[d - lead] != 1)
+            .collect();
+        if long.iter().any(|&d| sx[d - lead] != sa[d]) {
+            return None;
+        }
+        for axis in 0..2 {
+            let along = |d: usize| v.strides[d][axis] > 0 && v.strides[d][1 - axis] == 0;
+            let spans: Vec<usize> = (0..sa.len()).filter(|&d| sa[d] > 1 && along(d)).collect();
+            if spans.is_empty() || spans != long {
+                continue;
+            }
+            // In `x`'s row-major order: the last dimension stride 1.
+            let mut stride = 1;
+            for &d in long.iter().rev() {
+                if v.strides[d][axis] != stride {
+                    return None;
+                }
+                stride *= sa[d];
+            }
+            if stride != [rows, cols][axis] {
+                return None;
+            }
+            let dims = if axis == 1 { [1, cols] } else { [rows, 1] };
+            // Already that row (or column) of a buffer, read in order: a
+            // parameter `[C]` viewed as `[1, C, 1, 1]`.
+            if let Some(w) = x.as_strided() {
+                let n = dims[0] * dims[1];
+                if w.base == [0, 0]
+                    && !w.src.transposed
+                    && [w.src.buffer.rows, w.src.buffer.cols] == dims
+                    && (0..n).all(|f| w.at(&sx, f) == if axis == 1 { [0, f] } else { [f, 0] })
+                {
+                    return Some(w.src);
+                }
+            }
+            let flat = reshaped(x.clone(), burn_backend::Shape::new(dims));
+            return Some(plain_dram(&flat));
+        }
+        None
+    };
+    let db = match b {
+        Some(b) => Some(operand(b, broadcasts)?),
+        None => None,
+    };
+    let dc = match c {
+        Some(c) => Some(operand(c, false)?),
+        None => None,
+    };
+    let device = a.device;
+    let (id, dims) = crate::server::eltwise_op(
+        device,
+        op,
+        v.src.buffer.id,
+        db.as_ref().map(|d| d.buffer.id),
+        dc.as_ref().map(|d| d.buffer.id),
+    );
+    let sig = tt_kernels::sfpu::ops::elems(kind);
+    let dtype = if sig.out == sig.inputs[0] {
+        a.dtype()
+    } else {
+        match sig.out {
+            Elem::F32 => DType::F32,
+            Elem::I32 => DType::I32,
+            Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
+        }
+    };
+    let out = device_view(device, id, dims, None, dtype).to_dram().clone();
+    Some(TtTensor::view(
+        crate::views::Strided {
+            src: out,
+            base: [0, 0],
+            strides: v.strides,
+        },
+        a.shape(),
+        dtype,
+        device,
+    ))
 }
 
 /// What [`device_pow`] raises to.
@@ -3237,6 +3386,7 @@ pub use accurate_matmul::set_slicing as set_accurate_matmul_slicing;
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
+mod nhwc;
 mod pool;
 mod scan;
 mod sort;

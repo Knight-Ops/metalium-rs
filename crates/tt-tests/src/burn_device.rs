@@ -524,6 +524,15 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.select_rows(&mut self.session, table, indices)
         }
+        fn select_taps(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            zero_row: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .select_taps(&mut self.session, table, indices, zero_row)
+        }
         fn repack_many(
             &mut self,
             inputs: &[burn_tt::BufferId],

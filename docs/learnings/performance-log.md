@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Chunk-free convolution and max pooling](#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1) | 2026-10-14 | one tap select and one product a convolution, NHWC views between layers: ResNet-18 16.3 s -> 782 ms on one tile (5.0x burn-flex), 131 ms on every tile at `work:64:4` (burn-flex 151) |
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
@@ -53,6 +54,8 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-14 | 1792000003 | ResNet-18 forward traced, every tile: 17.6 ms a replay against 205.7 untraced and burn-flex 151.7, card 1, bit for bit the eager forward; one tile does not capture (program cache); see "Chunk-free convolution and max pooling" below. | New scoreboard row. |
+| 2026-10-14 | 1791996580 / 1791996716 / 1791996730 | Chunk-free convolution and max pooling (NHWC tap select, one product, views between layers): ResNet-18 forward 16,288 -> 782.3 ms on one tile, 131.1 ms on every tile at `work:64:4` (burn-flex 151-157 ms), card 1, top-1 validated; see "Chunk-free convolution and max pooling" below. | ResNet-18 rows updated in place. |
 | 2026-10-13 | 1791851940 / 1791852097 | Row select (`Session::select_rows`, B's `SELECT_ROWS`): the embedding lookup of SmolLM2's 49,152 x 576 table, 15.9 s -> 260 us a token, validated against the host's rows; a decode step from a token id 623 ms; see "Row select" below. | Scoreboard rows updated in place. |
 | 2026-10-12 | 1791846735 / 1791846823 | Model ladder: ResNet-18, ViT-Tiny and SmolLM2-135M forward passes against burn-flex on the same weights, cards 0 and 1 (one job per card), validated; see "Model ladder" below. | New scoreboard rows. |
 | 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
@@ -290,6 +293,78 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Chunk-free convolution and max pooling (2026-10-14, cards 0 and 1)
+
+ResNet-18 took 16.3 s a forward (105x burn-flex) because `conv2d` was one `float_matmul` per 32 output positions, each with a
+host-built patch gather (`mapped_native`: about one 32-byte `COPY_WORDS` mover entry a datum), plus per-element weight and NCHW
+joins, and `max_pool2d` was 32 windows at a time (6,272 chunks of repack, argmax and gather for 64x112x112).
+
+**The change** (roadmap Track 2 item 2; `crates/burn-tt/src/ops/nhwc.rs`, `Session::select_taps`):
+- A 2-D convolution is one tap select and one product. The activation's NHWC table `[N H W, C]` and a resident `[taps, P]` I32
+  index of table rows (depends on the shapes alone: made once by `server::metadata` and kept per attachment) give the patch
+  matrix `[P, taps x C]` through B's existing `SELECT_ROWS` record, one record a tap and output tile row (tap `t`'s indices are row
+  `t % 32` of an index tile, reached by moving `idx_at`; no firmware change). Its K order (tap, channel) is burn-flex's im2col
+  order. The weights relaid to `[taps x C, O]` are kept on the weight's cell (`TtTensor::derived`; not while capturing, nor for a
+  buffer written in place). A padding tap reads the table's zero row (its first padding row, made zero; a table of whole tile rows
+  is first copied into a zeroed one a row longer).
+- The `[P, O]` result is returned as an NCHW view (`nhwc_strides`), and element-wise ops run on a view that covers its buffer
+  one to one in place (`ops::view_op`): BatchNorm's `[1, C, 1, 1]` is a row of the buffer, relu and the residual add are
+  same-layout. The next convolution and max pool read the view's buffer as their table: nothing is relaid between layers.
+- Max pooling (F32, `C % 32 == 0`) is one select, a padding tap reading its window's first valid datum (the same bits), and a
+  fold over the taps' column blocks with exact compares and selects: the first NaN, else the first maximum.
+
+**Card 1, release, `silicon_bench_models::resnet18_forward`** (cats.jpg, pretrained weights, batch 1, 2 warm-ups, median of 9,
+burn-flex timed in the same run; top-1 equal to Flex's):
+
+| Session | burn-tt | burn-flex | Run |
+|---|--:|--:|---|
+| one tile (the default, unchanged) | 782.3 ms (was 16,288 ms, card 0, `1791846735`) | 156.9 ms | `1791996580` |
+| every tile, `TT_SPREAD=work:64:4` | **131.1 ms** | 151.4 ms | `1791996716` |
+| every tile, spread `all` (the default spread) | 203.8 ms | 151.3 ms | `1791996730` |
+
+A first run of the one-tile row while ttsim gates loaded the host gave 781.8 ms against burn-flex 182.5 (`1791996284`): the
+card time does not move, burn-flex does.
+
+**Where the one-tile forward goes** (warm, card 1, device-time per op kind): the host submits the whole forward in ~15 ms; the
+other ~768 ms is the card, waited on at the final download. Of it, conv1 alone is ~366 ms from an NHWC view (49 taps of a
+3-channel table: each 64-byte face-row read carries 3 useful datums, ~1.2M reads on one tile's mover) and relaying the image
+into its table ~95 ms (a per-element repack, the one left in the forward).
+
+**`probe_resnet_op_cost`** (card 1, `1791996580`; one tile, median of 3 warm). The first rows start from a plain NCHW tensor
+and read the result back, so they now include relaying the input in and the output out, a datum an entry each; the second
+set is as in the model (an NHWC view in, the result left on the card, timed to a `sync`):
+
+| Op | was (card 0, `1791846963`) | NCHW in, read back | NHWC view in, on the card |
+|---|--:|--:|--:|
+| max pool 3x3/2 on 64x112x112 | 2,817 ms | 558.0 ms | 37.4 ms |
+| conv 3x3/1 64->64 on 56x56 | 895 ms | 232.3 ms | 29.9 ms |
+| conv 3x3/1 128->128 on 28x28 | 517 ms | 111.8 ms | 15.5 ms |
+| conv 3x3/1 256->256 on 14x14 | 529 ms | 56.4 ms | 9.9 ms |
+| conv 3x3/1 512->512 on 7x7 | 1,411 ms | 32.8 ms | 8.2 ms |
+| add + relu 64x56x56 | 0.6 ms | 0.6 ms | 0.1 ms |
+
+**Accuracy.** `step165_resnet18` on card 0 (`1791996290`): Flex's top-5, max |flex - device| 5.69e-2 against a largest logit of
+14.65 (5.13e-2 before; not asserted: no derived bound for a whole network). On ttsim at 64x64: Flex's top-5, 1.45e-1 against
+17.11.
+
+**Traced** (`silicon_bench_models::resnet18_forward_traced`, card 1, run `1792000003`, every tile with the default spread;
+one eager forward first, which makes and keeps the relaid weights, then one capture; each timed pass writes the image, replays
+and reads the logits back):
+
+| `TT_TILES=all` | burn-tt | burn-flex |
+|---|--:|--:|
+| untraced | 205.7 ms | 156.7 ms |
+| traced replay | **17.6 ms** (p10 17.59, p90 17.64) | 151.7 ms |
+
+The replay's logits equal the eager forward's bit for bit. On one tile, or at `TT_SPREAD=work:64:4`, the capture fails: an op's
+list of programs does not fit the 240 KB program cache (`a list's programs do not fit an empty program cache`); spread over every
+tile it does. The benchmark skips with that reason until traces are segmented (roadmap Track 2, "Trace segmentation").
+
+**What is left:** the default session is one tile, and the grid (`TT_SPREAD=work:64:4`) is what takes ResNet-18 under burn-flex:
+roadmap Track 2, "Per-workload tile choice". On one tile, conv1's sparse table is the largest op (a wider table, or the image's
+relayout fused into its select, would cut its reads). Backward passes, max pooling with indices, average pooling, grouped and
+3-D convolutions still take the chunked path.
 
 ## tt-metal reference: DRAM reads by core count (2026-10-13, card 1)
 
