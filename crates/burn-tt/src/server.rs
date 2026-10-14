@@ -259,6 +259,16 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// Rows of `table` for each of the `[taps, n]` resident indices' taps, side
+    /// by side (`Session::select_taps`): an im2col with no host address.
+    fn select_taps(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+        _zero_row: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     fn repack_many(
         &mut self,
         _inputs: &[BufferId],
@@ -286,6 +296,16 @@ pub trait Engine {
         _t: BufferId,
         _indices: &[usize],
         _value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// A copy of `t` with `value`'s row `s` at row `d` for each `(d, s)`
+    /// (`Session::assign_rows`): a `slice_assign` of whole rows.
+    fn assign_rows(
+        &mut self,
+        _t: BufferId,
+        _value: BufferId,
+        _rows: &[(usize, usize)],
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -1042,6 +1062,18 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    pub fn assign_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
+        let c = s.assign_rows(&tt, &tv, rows).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
     pub fn repack<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1113,6 +1145,27 @@ impl DramBuffers {
         let indices = self.get(indices)?.clone();
         let out = s
             .select_rows(self.get(table)?, &indices)
+            .map_err(TtError::from)?;
+        Ok(self.insert(out))
+    }
+
+    /// `table`'s rows for each tap of the resident `[taps, n]` index tensor
+    /// ([`Session::select_taps`]): a 32-bit table only, a packed one refused.
+    pub fn select_taps<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+        zero_row: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+            return Err(TtError::Device(
+                "a tap select of a packed (BF16, F16 or BFP) table is not implemented".into(),
+            ));
+        }
+        let indices = self.get(indices)?.clone();
+        let out = s
+            .select_taps(self.get(table)?, &indices, zero_row)
             .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
@@ -1480,6 +1533,22 @@ pub(crate) fn cast_f16(
 
 type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 
+/// `job`, charged to `op` on the server thread for the time it takes
+/// (`report::server_report`).
+fn timed_job(op: &'static str, job: Job) -> Job {
+    Box::new(move |engine, ids| {
+        let t0 = std::time::Instant::now();
+        job(engine, ids);
+        crate::report::served(op, t0.elapsed());
+    })
+}
+
+/// `job`, counted against the innermost op on this thread (`OpStat::jobs`)
+/// and timed on the server thread under that op.
+fn tagged(job: Job) -> Job {
+    timed_job(crate::report::queued(), job)
+}
+
 /// Each buffer the callers have named, as the engine numbers it -- or why it
 /// was never made. Kept on the server thread, one per attachment: a caller
 /// names a result before it exists (B8, asynchronous dispatch), and the
@@ -1616,6 +1685,10 @@ struct Attached {
     epoch: u32,
     /// Whether the engine keeps tensors on the device, asked once.
     supports_dram: Arc<OnceLock<bool>>,
+    /// This attachment's number, unique in the process: what a cache of
+    /// device buffers made for it ([`attachment`]) is keyed by, so a later
+    /// attachment of the same device never reads them.
+    serial: u64,
 }
 
 impl Attached {
@@ -1661,6 +1734,16 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn with_attached<R>(f: impl FnOnce(&mut HashMap<TtDevice, Attached>) -> R) -> R {
     let mut guard = locked(&ATTACHED);
     f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// Numbers each attachment ([`Attached::serial`]).
+static SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// The number of `device`'s running attachment in this process, if any: a
+/// cache of buffers made on the device keeps it beside them and drops them
+/// once it changes (the buffers were another attachment's).
+pub(crate) fn attachment(device: TtDevice) -> Option<u64> {
+    with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.serial))
 }
 
 /// The devices with a running attachment, in this process.
@@ -1852,6 +1935,7 @@ where
                     config,
                     epoch,
                     supports_dram: Arc::default(),
+                    serial: SERIAL.fetch_add(1, Ordering::Relaxed),
                 },
             );
             None
@@ -1954,11 +2038,11 @@ pub(crate) fn try_run<R: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     let caught = poison.clone();
     sender
-        .send(Box::new(move |engine, ids| {
+        .send(tagged(Box::new(move |engine, ids| {
             // Caught here, not only by the server loop, so the caller is
             // answered with the panic after it is recorded.
             let _ = tx.send(guarded(&caught, device, || job(engine, ids)));
-        }))
+        })))
         .map_err(|_| stopped(device, &poison))?;
     match rx.recv() {
         Ok(reply) => reply,
@@ -1970,7 +2054,7 @@ pub(crate) fn try_run<R: Send + 'static>(
 fn send(device: TtDevice, job: Job) {
     let (sender, poison) = handle(device).unwrap_or_else(|e| panic!("{e}"));
     sender
-        .send(job)
+        .send(tagged(job))
         .unwrap_or_else(|_| panic!("{}", stopped(device, &poison)));
 }
 
@@ -2372,13 +2456,16 @@ pub(crate) fn free(device: TtDevice, id: BufferId) {
     if let Some(sender) =
         with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.jobs.clone()))
     {
-        let _ = sender.send(Box::new(move |engine, ids| {
-            // A buffer this attachment never made (a stale tensor's) is not
-            // anyone's here: nothing to free.
-            if let Some(Ok(e)) = ids.map.remove(&id) {
-                engine.free(e);
-            }
-        }));
+        let _ = sender.send(timed_job(
+            crate::report::FREE,
+            Box::new(move |engine, ids| {
+                // A buffer this attachment never made (a stale tensor's) is not
+                // anyone's here: nothing to free.
+                if let Some(Ok(e)) = ids.map.remove(&id) {
+                    engine.free(e);
+                }
+            }),
+        ));
     }
 }
 
@@ -2562,6 +2649,24 @@ pub(crate) fn rows_add(
     )
 }
 
+/// A copy of `t` with rows of `value` written over it (`Engine::assign_rows`),
+/// without waiting: `dims` is `t`'s.
+pub(crate) fn assign_rows(
+    device: TtDevice,
+    t: BufferId,
+    value: BufferId,
+    rows: Vec<(usize, usize)>,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "assign_rows",
+        device,
+        dims,
+        || "rows written over a copy".into(),
+        move |engine, ids| engine.assign_rows(ids.get(t)?, ids.get(value)?, &rows),
+    )
+}
+
 /// A block copy on the device, without waiting.
 pub(crate) fn copy_blocks(
     device: TtDevice,
@@ -2637,6 +2742,24 @@ pub(crate) fn select_rows(
         dims,
         || "checked resident row select".into(),
         move |engine, ids| engine.select_rows(ids.get(table)?, ids.get(indices)?),
+    )
+}
+
+/// `table`'s rows for each tap of `indices` (a resident `[taps, n]` I32
+/// buffer), side by side: `dims` is `[n, tt_kernels::index::select_taps_cols(..)]`.
+pub(crate) fn select_taps(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    zero_row: bool,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "select_taps",
+        device,
+        dims,
+        || "checked resident tap select".into(),
+        move |engine, ids| engine.select_taps(ids.get(table)?, ids.get(indices)?, zero_row),
     )
 }
 
@@ -2997,6 +3120,19 @@ impl Engine for KmdEngine {
             indices,
         )
     }
+    fn select_taps(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        zero_row: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers.as_mut().ok_or_else(unsupported)?.select_taps(
+            &mut self.session,
+            table,
+            indices,
+            zero_row,
+        )
+    }
     fn repack_many(
         &mut self,
         inputs: &[BufferId],
@@ -3023,6 +3159,15 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rows_add(&mut self.session, t, indices, value)
+    }
+    fn assign_rows(
+        &mut self,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.assign_rows(&mut self.session, t, value, rows)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
@@ -3093,7 +3238,26 @@ impl Engine for KmdEngine {
     }
 }
 
+/// Buffers whose contents something other than the op that made them has
+/// written ([`copy_into`], a trace's replays of its inputs): a value derived
+/// from one and cached ([`derived`](crate::tensor::TtTensor::derived)) could
+/// be stale, so none is kept for them.
+static WRITTEN: Mutex<Option<std::collections::HashSet<BufferId>>> = Mutex::new(None);
+
+/// Record that `id`'s contents change after it is made.
+pub(crate) fn written_in_place(id: BufferId) {
+    locked(&WRITTEN)
+        .get_or_insert_with(Default::default)
+        .insert(id);
+}
+
+/// Has `id` been written after it was made ([`written_in_place`])?
+pub(crate) fn is_written_in_place(id: BufferId) -> bool {
+    locked(&WRITTEN).as_ref().is_some_and(|w| w.contains(&id))
+}
+
 pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), TtError> {
+    written_in_place(dst);
     run(device, move |engine, ids| {
         ids.healthy()?;
         engine.copy_into(ids.get(src)?, ids.get(dst)?)
@@ -3693,6 +3857,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .select_rows(self.fabric.chips[0].session(), table, indices)
     }
+    fn select_taps(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        zero_row: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .select_taps(self.fabric.chips[0].session(), table, indices, zero_row)
+    }
     fn repack_many(
         &mut self,
         inputs: &[BufferId],
@@ -3720,6 +3893,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn assign_rows(
+        &mut self,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.assign_rows(self.fabric.chips[0].session(), t, value, rows)
     }
     fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
         Some(self.fabric.execution().clone())

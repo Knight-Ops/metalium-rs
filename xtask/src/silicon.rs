@@ -203,6 +203,17 @@ pub const SMOKE: &[&str] = &[
     // select (`step171`) took the embedding lookup from 15 s a token to 0.3 ms; the BF16 gate (229 s) is not,
     // as the BF16 lookup still stages its table (roadmap, "Gather without staging").
     "step171_select_rows::",
+    // Chunk-free convolution and max pooling (roadmap Track 2 item 2): the tap select, then
+    // one product a convolution and one fold a pool, on NHWC views.
+    "step178_select_taps::",
+    "step179_nhwc_conv_pool::",
+    // A native `cat` and `repeat_dim`: one row gather or one element repack, not a zero-fill
+    // and a `slice_assign` a piece (roadmap Track 2 item 3, `decode-host-cost.md` P1).
+    "step180_native_cat::",
+    // `slice_assign` of whole rows (a cache's positions) as one row gather (`decode-host-cost.md` P3).
+    "step181_region_assign::",
+    // Slices and swaps as views, ragged views copied by tiles (`decode-host-cost.md` P2).
+    "step182_region_views::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

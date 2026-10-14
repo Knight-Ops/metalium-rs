@@ -80,25 +80,14 @@ fn regular(
         "pooling kernel, stride and dilation must be positive"
     );
     let output_dim = |len: usize, axis: usize| {
-        let effective = (kernel[axis] - 1)
-            .checked_mul(dilation[axis])
-            .unwrap()
-            .checked_add(1)
-            .unwrap();
-        let padded = len
-            .checked_add(padding[axis].checked_mul(2).unwrap())
-            .unwrap();
-        let span = padded as i128 - effective as i128;
-        let mut count = if ceil {
-            -(-span).div_euclid(stride[axis] as i128)
-        } else {
-            span.div_euclid(stride[axis] as i128)
-        } + 1;
-        if ceil && (count - 1) * stride[axis] as i128 >= (len + padding[axis]) as i128 {
-            count -= 1;
-        }
-        assert!(count > 0, "empty pooling output");
-        usize::try_from(count).expect("pooling output overflow")
+        pooled_len(
+            len,
+            kernel[axis],
+            stride[axis],
+            padding[axis],
+            dilation[axis],
+            ceil,
+        )
     };
     let [oh, ow] = [output_dim(h, 0), output_dim(w, 1)];
     checked_elements(&[n, c, oh, ow]);
@@ -141,6 +130,37 @@ fn regular(
         windows,
         divisors,
     }
+}
+
+/// The output length along one axis of a pooling window: `kernel` taps
+/// `dilation` apart, moved by `stride` over `len` padded by `padding` on each
+/// side, the last partial window kept with `ceil` if it starts inside the
+/// input or its left padding.
+pub(super) fn pooled_len(
+    len: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    ceil: bool,
+) -> usize {
+    let effective = (kernel - 1)
+        .checked_mul(dilation)
+        .unwrap()
+        .checked_add(1)
+        .unwrap();
+    let padded = len.checked_add(padding.checked_mul(2).unwrap()).unwrap();
+    let span = padded as i128 - effective as i128;
+    let mut count = if ceil {
+        -(-span).div_euclid(stride as i128)
+    } else {
+        span.div_euclid(stride as i128)
+    } + 1;
+    if ceil && (count - 1) * stride as i128 >= (len + padding) as i128 {
+        count -= 1;
+    }
+    assert!(count > 0, "empty pooling output");
+    usize::try_from(count).expect("pooling output overflow")
 }
 
 pub(super) fn constant(device: TtDevice, values: Vec<f32>, dims: [usize; 2]) -> TtTensor {
@@ -394,6 +414,10 @@ pub fn max_pool2d(
     dilation: [usize; 2],
     ceil_mode: bool,
 ) -> TtTensor {
+    if let Some(y) = super::nhwc::max_pool2d(&x, kernel_size, stride, padding, dilation, ceil_mode)
+    {
+        return y;
+    }
     let g = regular(&x, kernel_size, stride, padding, dilation, false, ceil_mode);
     sfpu_forward(&x, &g, true, false).0
 }

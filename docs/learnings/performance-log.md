@@ -12,6 +12,11 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Slices and swaps as views](#slices-and-swaps-as-views-2026-10-14-card-0) | 2026-10-14 | a positive-step slice is a view, a swap of a view stays one, a ragged view is a tile copy: ViT-Tiny 401.4 -> 283.4 ms on every tile (burn-flex 106.7), the SmolLM2 decode step 108.5 -> 99.6 |
+| [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
+| [Native `cat`](#native-cat-2026-10-14-card-0) | 2026-10-14 | `cat` and `repeat_dim` are one row gather or one element repack, not a zero-fill and a `slice_assign` a piece: the SmolLM2 decode step 232.6 -> 117.3 ms on every tile (burn-flex 26.3), 623.9 -> 458.1 on one; its 121 `cat`s 196.6 -> 4.6 ms of server time |
+| [Decode step: where the host time goes](#decode-step-where-the-host-time-goes-2026-10-14-card-0) | 2026-10-14 | jobs and server-thread time per Burn op: on one tile the SmolLM2 decode (624 ms) waits on m=1 matmuls; on every tile (233 ms) `cat`'s zero-fill and `slice_assign` are 61% of the server thread; ViT-Tiny is attention and repacking `swap_dims`/`slice`, not per-op submission |
+| [Chunk-free convolution and max pooling](#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1) | 2026-10-14 | one tap select and one product a convolution, NHWC views between layers: ResNet-18 16.3 s -> 782 ms on one tile (5.0x burn-flex), 131 ms on every tile at `work:64:4` (burn-flex 151) |
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
@@ -53,6 +58,8 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-14 | 1792000003 | ResNet-18 forward traced, every tile: 17.6 ms a replay against 205.7 untraced and burn-flex 151.7, card 1, bit for bit the eager forward; one tile does not capture (program cache); see "Chunk-free convolution and max pooling" below. | New scoreboard row. |
+| 2026-10-14 | 1791996580 / 1791996716 / 1791996730 | Chunk-free convolution and max pooling (NHWC tap select, one product, views between layers): ResNet-18 forward 16,288 -> 782.3 ms on one tile, 131.1 ms on every tile at `work:64:4` (burn-flex 151-157 ms), card 1, top-1 validated; see "Chunk-free convolution and max pooling" below. | ResNet-18 rows updated in place. |
 | 2026-10-13 | 1791851940 / 1791852097 | Row select (`Session::select_rows`, B's `SELECT_ROWS`): the embedding lookup of SmolLM2's 49,152 x 576 table, 15.9 s -> 260 us a token, validated against the host's rows; a decode step from a token id 623 ms; see "Row select" below. | Scoreboard rows updated in place. |
 | 2026-10-12 | 1791846735 / 1791846823 | Model ladder: ResNet-18, ViT-Tiny and SmolLM2-135M forward passes against burn-flex on the same weights, cards 0 and 1 (one job per card), validated; see "Model ladder" below. | New scoreboard rows. |
 | 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
@@ -290,6 +297,222 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Slices and swaps as views (2026-10-14, card 0)
+
+P2 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). Three changes:
+- **Slices are views.** A slice whose steps are all positive is a view of the same buffer (`sliced_native`) and
+  queues no job.
+- **A swap of a view stays a view.** `float_swap_dims` uploads only a tensor with no device copy, where it used to
+  materialise any view first.
+- **Ragged views are tile copies.** A view made plain is a tile copy wherever each output tile is one source block,
+  now including a ragged last tile row or column where the source ends there too (`Strided::tile_moves`).
+
+ViT's attention therefore reads q, k and v as blocks of the fused projection (`matrix_blocks`), with no copy. Same
+conditions as "Native `cat`".
+
+| Workload, card 0 | Before | After | burn-flex |
+|---|--:|--:|--:|
+| ViT-Tiny forward, every tile at `work:64:4` | 401.4 ms (`1792005220`, P0) | **283.4 ms** (`1792013104`) | 106.7 ms |
+| ViT-Tiny forward, one tile | 855.9 ms (`1792005205`) | 663.0 ms (`1792013112`) | 112.5 ms |
+| SmolLM2 decode step, every tile | 108.5 ms (`1792010467`, P3) | **99.6 ms** (`1792013124`) | 26.2 ms |
+| SmolLM2 decode step, one tile | 451.7 ms (`1792010476`) | 450.4 ms (`1792013133`) | 26.6 ms |
+
+- **ViT queues 766 jobs, was 853.** Its 37 slices and 49 swaps queue none, where they cost 83 ms of server time at
+  P0. What is left on every tile is `attention`, 336 jobs and 187 of 270 ms (0.56 ms a job, device work). Then come
+  the patch embedding's convolution (5 jobs, 44 ms) and the heads merged back by `reshape` (12 jobs, 10 ms). That
+  merge is an element repack: flattened, a tile row of the 197-row heads crosses from one head into the next, so no
+  tile copy applies.
+- **The decode step queues 3,316 jobs, was 3,617.** Its `slice` jobs are gone. SmolLM2's value `v` is now a view
+  of parts of rows (a projection split into heads), so a cache write first makes it plain: 30 small repacks, and
+  the 90 jobs together take 1.9 ms. Before that fix the cache writes had fallen back to the whole-cache element map,
+  at 149 us a job (`1792011825`).
+- **Correctness.** Gate `step182_region_views` passes on ttsim and card 0 (`1792012830`); `step165`-`step168` pass on
+  card 0 (`1792012839` to `1792012885`). Burn's conformance on ttsim: 3,025 run, 0 unexpected, plain and `--fusion`. The smoke
+  tier on card 0 passes 1,052 of 1,052 (`1792013157`).
+
+## Cache writes as a tile copy and written rows (2026-10-14, card 0)
+
+P3 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). A `slice_assign` whose region writes the last dimension whole and in
+order (a key/value cache's positions) is now `Session::assign_rows`: a tile copy of the destination (`Session::copy`, a few run
+records) with the value's rows written over it (`write_rows`, entries for the written rows only). A destination that is a view is one
+row gather; anything else keeps the element map. The destination is never written in place. Same conditions as "Native `cat`".
+
+| SmolLM2 decode step, lookup excluded, every tile at `work:64:4` | `slice_assign` (60 a step) | Step |
+|---|--:|--:|
+| After the native `cat` (`1792006312`): whole-destination element map | 15.3 ms, 254 us a job | 117.3 ms |
+| One row gather over the whole cache (`1792009767`, not kept) | 8.8 ms, 147 us a job | 114.0 ms |
+| **Tile copy and written rows** (`1792010467`) | **1.5 ms, 25 us a job** | **108.5 ms** (p10 90.7, p90 125.5) |
+
+The row gather was the first version. It copies the cache row by row, so its host entries (two a row a tile column, about 768 for
+this 64-position cache) grow with the cache's length; the tile copy's do not. On one tile the step is 451.7 ms (`1792010476`;
+`slice_assign` 5.5 ms there, waiting on the device's matmuls). Gate `step181_region_assign`, ttsim and card 0 (`1792010463`);
+`step167` F32, `step168` and `step166` pass on card 0 (`1792010494`, `1792010546`, `1792010734`).
+
+## Native `cat` (2026-10-14, card 0)
+
+P1 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). `float_cat`, `int_cat`, `bool_cat` and the three `repeat_dim`s are
+overridden (`crates/burn-tt/src/ops/region.rs`):
+- A `cat` along any dimension but the last, of pieces that are whole rows of their buffers, is **one row gather**
+  (`gather_rows`). The host names one source row per output row.
+- Any other `cat` is **one element repack** over every piece.
+- `repeat_dim` is a `cat` of the tensor.
+
+Burn's default was a zero-fill (`Session::metadata`, mover immediates) and one whole-destination `slice_assign` a piece.
+Release build, `0ba8d00` plus P0 and P1, card 0, nothing else on either card; `silicon_bench_models`, two warm-ups and
+nine timed passes, burn-flex in the same run.
+
+| SmolLM2-135M decode step, lookup excluded | Before (P0) | After | burn-flex |
+|---|--:|--:|--:|
+| every tile, `TT_SPREAD=work:64:4` | 232.6 ms (`1792005178`) | **117.3 ms** (p10 100.8, p90 136.0; `1792006312`) | 26.3 ms |
+| one tile (default) | 623.9 ms (`1792005087`) | 458.1 ms (p10 425.2, p90 475.9; `1792006329`) | 26.5 ms |
+
+Server-thread time and jobs on every tile, one reported pass:
+
+| | Before | After |
+|---|--:|--:|
+| Jobs a step | 4,279 | 3,617 |
+| Server thread busy | 323 ms | 146 ms |
+| `cat` (`float_empty` + `float_slice_assign`, then `float_cat`) | 843 jobs, 196.6 ms | 121 jobs, **4.6 ms** (38 us a job) |
+| `float_slice_assign` left (the two cache writes a layer) | (in the above) | 60 jobs, 15.3 ms (254 us each) |
+| `attention` | 1,920 jobs, 71.9 ms | 1,920 jobs, 72.4 ms |
+| `float_matmul` | 211 jobs, 18.6 ms | 211 jobs, 18.0 ms |
+| `float_slice` | 361 jobs, 9.4 ms | 361 jobs, 10.4 ms |
+
+- **What is left on every tile is attention.** Its 1,920 jobs (64 a call) take half the server thread. Then come the
+  matmuls, and the cache's `slice_assign` (each still maps the whole `[1, 3, 64, 64]` cache on the host: P3).
+- **On one tile the step waits on the device.** Matmuls take 268.6 ms (1.27 ms each, unchanged), which is the tile
+  choice, not submission.
+- **The models are unchanged.** On card 0 `step167_smollm2` F32 (30 layers, 16 greedy tokens equal to burn-flex's)
+  passes in 23.4 s (was 33.2 s, `1791851959`; run `1792006367`). `step165`, `step166` and all seven `step168` plans
+  pass (`1792006351`, `1792006363`, `1792006391`).
+- **The gate.** `step180_native_cat` passes on ttsim and on card 0 (`1792006303`, 6 of 6). Burn's conformance suite on
+  ttsim: 3,025 run, 2,973 pass, 52 failed as listed, 0 unexpected (`--fusion`: 2,970 pass, 55 failed as listed, 0
+  unexpected). The smoke tier on card 0 passes 1,040 of 1,040 (`1792006807`).
+
+## Decode step: where the host time goes (2026-10-14, card 0)
+
+P0 of [decode-host-cost.md](../completed-plans/decode-host-cost.md). The model benchmarks' reported pass now also counts the
+**jobs each Burn op queues on the server thread** (`OpStat::jobs`, charged to the innermost op on the calling thread)
+and the **server thread's wall time per op** (`burn_tt::server_report`), so a view no longer counts as device work
+and a slow op can be told from a slow device. Release build, `0ba8d00` plus the counters, card 0, nothing else on
+either card, `silicon_bench_models`, two warm-ups and nine timed passes, burn-flex in the same run.
+
+| Workload | Tiles | burn-flex | burn-tt | Server jobs | Server busy, reported pass | Run |
+|---|---|--:|--:|--:|--:|---|
+| SmolLM2-135M decode step, lookup excluded | 1 (default) | 25.8 ms | 623.9 ms (p10 525, p90 705) | 4,279 | 770 of 771 ms | `1792005087` |
+| the same | all 120, `TT_SPREAD=work:64:4` | 26.2 ms | **232.6 ms** (p10 178, p90 293) | 4,279 | 323 of 326 ms | `1792005178` |
+| ViT-Tiny/16 forward | 1 (default) | 106.8 ms | 855.9 ms | 853 | 846 of 856 ms | `1792005205` |
+| the same | all 120, `work:64:4` | 106.5 ms | **401.4 ms** | 853 | 392 of 401 ms | `1792005220` |
+
+The one-tile decode is the 623 ms of `1791852097` again: the Oct 14 barrier and spread changes did not move it (they
+help only a session with many tiles open). The 2,779 "reported device ops" are 4,279 jobs; 1,091 `float_device` calls
+and 363 of 393 `float_reshape` calls queue nothing.
+
+**Server-thread time by op, decode step** (ms in one pass, then us a job):
+
+| Op | Jobs | 1 tile | all tiles, `work:64:4` |
+|---|--:|--:|--:|
+| `float_slice_assign` | 722 | 100.5 (139) | 99.4 (138) |
+| `float_empty` (`cat`'s zero-fill) | 121 | 224.8 (1,858) | 97.2 (803) |
+| `attention` (64 jobs a call) | 1,920 | 100.7 (52) | 71.9 (37) |
+| `float_matmul` | 211 | 268.2 (1,271) | 18.6 (88) |
+| `float_slice` | 361 | 9.5 (26) | 9.4 (26) |
+| `float_neg` | 60 | 13.4 (223) | 0.6 (10) |
+| `float_swap_dims` | 90 | 13.1 (146) | 1.8 (20) |
+| everything else (incl. 4,278 frees, 1.1 ms) | | 39.9 | 24.6 |
+
+Reading them:
+
+* **On one tile the decode is waiting on the device, not on submission.** `TT_HOST_TIMES=1` (run `1792005154`, the whole
+  attachment, 12 passes): of 6,519 ms queueing, 6,055 ms is the `List` stage with 5.5 million PCIe reads, about 70 a list,
+  which is the host waiting for room in the one tile's ring. On all tiles (`1792005178`) the same stage is 1,085 ms and
+  140 thousand reads. The device work that fills the ring is mostly the m = 1 matmuls (1.27 ms a matmul on one tile, 88
+  us on all tiles). The roadmap's "host submission, 2,779 operations at about 220 us each" was the per-op average of a
+  device-bound step.
+* **On all tiles, `cat` is the cost.** Burn's default `cat` (no override in burn-tt) is a zero-fill and one
+  `slice_assign` a piece. `float_empty` and `float_slice_assign` are 196.6 of the 323 ms (61%). A `slice_assign` costs
+  ~138 us on either session, so it is host work: the whole-destination element map. A zero-fill costs 800-1,860 us, because
+  `Session::metadata` writes the zeros as mover immediates. A native `cat` removes all 121 fills and turns the 720 piece writes
+  into 120 jobs (P1).
+* **Attention is the next cost after `cat`.** 1,920 jobs, 64 a call, 37-52 us each. That is the composed attention's own job
+  count, and outside this plan's P1-P3.
+* **The per-op fixed cost is small.** Frees cost 0.3 us each (1.1 ms in all), and element-wise ops 8-30 us a job, so P4 waits.
+* **ViT-Tiny is not per-op submission either.** It has 853 jobs. At all tiles the time is `attention` (348 jobs, 211 ms, 0.6 ms
+  each, device work on 197 tokens), then `float_swap_dims` (37 jobs, 55 ms, 1.5 ms each) and `float_slice` (37, 28 ms). Both are
+  whole-tensor element repacks, which P2 targets. Its convolution (patch embedding) is 44 ms in 5 jobs.
+
+## Chunk-free convolution and max pooling (2026-10-14, cards 0 and 1)
+
+ResNet-18 took 16.3 s a forward (105x burn-flex) because `conv2d` was one `float_matmul` per 32 output positions, each with a
+host-built patch gather (`mapped_native`: about one 32-byte `COPY_WORDS` mover entry a datum), plus per-element weight and NCHW
+joins, and `max_pool2d` was 32 windows at a time (6,272 chunks of repack, argmax and gather for 64x112x112).
+
+**The change** (roadmap Track 2 item 2; `crates/burn-tt/src/ops/nhwc.rs`, `Session::select_taps`):
+- A 2-D convolution is one tap select and one product. The activation's NHWC table `[N H W, C]` and a resident `[taps, P]` I32
+  index of table rows (depends on the shapes alone: made once by `server::metadata` and kept per attachment) give the patch
+  matrix `[P, taps x C]` through B's existing `SELECT_ROWS` record, one record a tap and output tile row (tap `t`'s indices are row
+  `t % 32` of an index tile, reached by moving `idx_at`; no firmware change). Its K order (tap, channel) is burn-flex's im2col
+  order. The weights relaid to `[taps x C, O]` are kept on the weight's cell (`TtTensor::derived`; not while capturing, nor for a
+  buffer written in place). A padding tap reads the table's zero row (its first padding row, made zero; a table of whole tile rows
+  is first copied into a zeroed one a row longer).
+- The `[P, O]` result is returned as an NCHW view (`nhwc_strides`), and element-wise ops run on a view that covers its buffer
+  one to one in place (`ops::view_op`): BatchNorm's `[1, C, 1, 1]` is a row of the buffer, relu and the residual add are
+  same-layout. The next convolution and max pool read the view's buffer as their table: nothing is relaid between layers.
+- Max pooling (F32, `C % 32 == 0`) is one select, a padding tap reading its window's first valid datum (the same bits), and a
+  fold over the taps' column blocks with exact compares and selects: the first NaN, else the first maximum.
+
+**Card 1, release, `silicon_bench_models::resnet18_forward`** (cats.jpg, pretrained weights, batch 1, 2 warm-ups, median of 9,
+burn-flex timed in the same run; top-1 equal to Flex's):
+
+| Session | burn-tt | burn-flex | Run |
+|---|--:|--:|---|
+| one tile (the default, unchanged) | 782.3 ms (was 16,288 ms, card 0, `1791846735`) | 156.9 ms | `1791996580` |
+| every tile, `TT_SPREAD=work:64:4` | **131.1 ms** | 151.4 ms | `1791996716` |
+| every tile, spread `all` (the default spread) | 203.8 ms | 151.3 ms | `1791996730` |
+
+A first run of the one-tile row while ttsim gates loaded the host gave 781.8 ms against burn-flex 182.5 (`1791996284`): the
+card time does not move, burn-flex does.
+
+**Where the one-tile forward goes** (warm, card 1, device-time per op kind): the host submits the whole forward in ~15 ms; the
+other ~768 ms is the card, waited on at the final download. Of it, conv1 alone is ~366 ms from an NHWC view (49 taps of a
+3-channel table: each 64-byte face-row read carries 3 useful datums, ~1.2M reads on one tile's mover) and relaying the image
+into its table ~95 ms (a per-element repack, the one left in the forward).
+
+**`probe_resnet_op_cost`** (card 1, `1791996580`; one tile, median of 3 warm). The first rows start from a plain NCHW tensor
+and read the result back, so they now include relaying the input in and the output out, a datum an entry each; the second
+set is as in the model (an NHWC view in, the result left on the card, timed to a `sync`):
+
+| Op | was (card 0, `1791846963`) | NCHW in, read back | NHWC view in, on the card |
+|---|--:|--:|--:|
+| max pool 3x3/2 on 64x112x112 | 2,817 ms | 558.0 ms | 37.4 ms |
+| conv 3x3/1 64->64 on 56x56 | 895 ms | 232.3 ms | 29.9 ms |
+| conv 3x3/1 128->128 on 28x28 | 517 ms | 111.8 ms | 15.5 ms |
+| conv 3x3/1 256->256 on 14x14 | 529 ms | 56.4 ms | 9.9 ms |
+| conv 3x3/1 512->512 on 7x7 | 1,411 ms | 32.8 ms | 8.2 ms |
+| add + relu 64x56x56 | 0.6 ms | 0.6 ms | 0.1 ms |
+
+**Accuracy.** `step165_resnet18` on card 0 (`1791996290`): Flex's top-5, max |flex - device| 5.69e-2 against a largest logit of
+14.65 (5.13e-2 before; not asserted: no derived bound for a whole network). On ttsim at 64x64: Flex's top-5, 1.45e-1 against
+17.11.
+
+**Traced** (`silicon_bench_models::resnet18_forward_traced`, card 1, run `1792000003`, every tile with the default spread;
+one eager forward first, which makes and keeps the relaid weights, then one capture; each timed pass writes the image, replays
+and reads the logits back):
+
+| `TT_TILES=all` | burn-tt | burn-flex |
+|---|--:|--:|
+| untraced | 205.7 ms | 156.7 ms |
+| traced replay | **17.6 ms** (p10 17.59, p90 17.64) | 151.7 ms |
+
+The replay's logits equal the eager forward's bit for bit. On one tile, or at `TT_SPREAD=work:64:4`, the capture fails: an op's
+list of programs does not fit the 240 KB program cache (`a list's programs do not fit an empty program cache`); spread over every
+tile it does. The benchmark skips with that reason until traces are segmented (roadmap Track 2, "Trace segmentation").
+
+**What is left:** the default session is one tile, and the grid (`TT_SPREAD=work:64:4`) is what takes ResNet-18 under burn-flex:
+roadmap Track 2, "Per-workload tile choice". On one tile, conv1's sparse table is the largest op (a wider table, or the image's
+relayout fused into its select, would cut its reads). Backward passes, max pooling with indices, average pooling, grouped and
+3-D convolutions still take the chunked path.
 
 ## tt-metal reference: DRAM reads by core count (2026-10-13, card 1)
 

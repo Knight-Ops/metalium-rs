@@ -14,8 +14,9 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: three pretrained networks run on a card, slowly.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2.
-  They are 105x, 7.8x and 24x behind burn-flex per forward pass
-  ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)).
+  They were 105x, 7.8x and 24x behind burn-flex per forward pass
+  ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
+  5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
   A token's F32 embedding lookup, 15.9 s then, is 260 us since the row select
   ([log](../learnings/performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0));
   BF16 tables still take the staged path.
@@ -353,30 +354,84 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   (item 5 and the entry below). Cost to know: the mover image had 172 bytes left of its 24 KiB (since raised to 42 KiB by repacking the role images, which unblocks a B-side packed-BF16 branch)
   ([operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-budget-2026-10-13-ttsim-and-card-0));
   also found: `cargo clippy` inflated every firmware image by 900 bytes (`build.rs` now strips `RUSTC_WORKSPACE_WRAPPER`).
-- [ ] **2. Chunk-free convolution and pooling (ResNet-18: 16.3 s, 105x).** Convolution issues one `float_matmul`
-  per 32 output positions, each with a host-built patch gather (`ops/conv.rs:5,181-192`: a 56x56 convolution is 98
-  matmuls, conv1 392); max pool splits its windows into chunks of 32, each a host-built `repack`, argmax and gather
-  (`ops/pool.rs:153-200`: 6,272 chunks for 64x112x112). On card 0 a max pool on 64x112x112 takes 2.8 s, a 3x3
-  convolution 0.5-1.4 s, an add + relu 0.6 ms (`probe_resnet_op_cost`, `1791846963`). Build one product (or one
-  windowed reduction) per op, from one table, or an implicit-GEMM kernel; the patch tables depend on the shapes
-  alone, so cache them by geometry too. Gate: `silicon_bench_models::resnet18_forward` against burn-flex's 154.8 ms.
-- [ ] **3. The decode step's host cost (25x).** 2,779 reported operations (more submitted) at about 220 us each:
+- [x] **2. Chunk-free convolution and pooling** (2026-10-14, F32/BF16/F16 forward; ttsim and cards 0 and 1;
+  [log](../learnings/performance-log.md#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1)). A 2-D convolution is one
+  tap select and one product (`ops/nhwc.rs`): `Session::select_taps` (`tt-kernels/src/index.rs`) builds the patch matrix `[P, taps x C]`
+  from the NHWC table with B's existing `SELECT_ROWS` (a `[taps, P]` index of table rows, geometry-only, kept per attachment; tap `t`'s
+  row reached by moving `idx_at`, no firmware change), in Flex's im2col order; the weights relaid to `[taps x C, O]` are kept on the
+  weight (`TtTensor::derived`). The `[P, O]` result is an NCHW view of NHWC, and element-wise ops run on such views in place
+  (`ops::view_op`: BatchNorm's `[1, C, 1, 1]` is a row), so nothing is relaid between layers. Max pooling (F32, `C % 32 == 0`) is one
+  select (a padding tap reads its window's first valid datum) and an exact fold over the taps. Gates: `step178_select_taps` (bit for
+  bit against host indexing, specials, 49 taps across index tile rows and staging, the zero row of a dirty table and of a whole-tile
+  one, `DOMAIN`), `step179_nhwc_conv_pool` (scalar oracle on integers for conv1-like, 3x3/64, whole-tile-row, 1x1 s2, dilated and
+  biased cases; max pool bit for bit with NaN payloads, signed-zero ties, subnormals, ceil and dilation; a warm ResNet block with no
+  repack; a trace replay), each watched failing under five mutations; both in `SMOKE`; step85/78/162/165 and MNIST e2e unchanged;
+  smoke on card 0 1,024 of 1,024 (run `1791997050`, the selection less its 10 mesh tests); Burn's conformance on ttsim with no
+  unexpected result in the plain, `Fusion<TtBackend>`, `--exact` and `--accurate` profiles.
+  **Measured (card 1, release):** ResNet-18 forward **16,288 -> 782.3 ms on one tile** (5.0x burn-flex's 156.9, `1791996580`), and
+  **131.1 ms on every tile at `TT_SPREAD=work:64:4`, faster than burn-flex's 151.4** (`1791996716`); per op, NHWC in and on the card,
+  max pool 2,817 -> 37 ms and a 3x3 convolution 30 / 16 / 10 / 8 ms (was 895 / 517 / 529 / 1,411). The host now submits a forward
+  in ~15 ms: on one tile the rest is the card, conv1 ~366 ms of it (a 3-channel table read 64 bytes a row) and the image's relayout
+  ~95 ms. **Left (chunked path still):** backward passes (weight gradient = `patches^T @ G`, one product; x gradient as a gather over
+  taps), `max_pool2d_with_indices`, average pooling, grouped and 3-D convolutions, pooling with `C % 32 != 0`, and the non-Fast
+  matmul modes. The default tile choice is what takes ResNet-18 under burn-flex (below).
+- [x] **3. The decode step's host cost (25x; closed 2026-10-14, 3.8x on every tile; left: item 9).** 2,779 reported operations (more submitted) at about 220 us each:
   `cat` is built from `slice_assign` (722 `float_slice_assign` calls a step: the nine-way `repeat_kv`, the rotary
   halves), plus tens of thousands of reshapes, slices and `float_device` calls over 33 passes. A native `cat`, a
   fused RoPE and the fusers below shrink it; a trace would remove it, which needs trace segmentation. ViT-Tiny
-  (709 operations at 1.1 ms) is the same cost at a smaller scale.
-- [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms: host submission, the same cost as
-  item 3 at a smaller scale, so it moves with the fusers (B13b/B13c/reduce-norm below) and with traces. Layer norm is
-  composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a pass), GELU and attention are native.
-  Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
+  (709 operations at 1.1 ms) is the same cost at a smaller scale. Plan: [decode-host-cost.md](../completed-plans/decode-host-cost.md)
+  (copy-shaped ops as row and block moves instead of per-element host maps; a native `cat`).
+  **Re-measured 2026-10-14** (P0, card 0, jobs and server-thread time per op, [log](../learnings/performance-log.md#decode-step-where-the-host-time-goes-2026-10-14-card-0)):
+  - **One tile:** 624 ms (`1792005087`), mostly waiting on the device's m = 1 matmuls (1.27 ms each). The 2,779
+    "operations" are 4,279 jobs.
+  - **Every tile with `work:64:4`:** 233 ms (`1792005178`). `cat`'s zero-fills and `slice_assign`s are 61% of the
+    server thread and `attention`'s 1,920 jobs 22%.
+  - **Native `cat` (P1, 2026-10-14):** `cat` and `repeat_dim` are one row gather or one element repack (`ops/region.rs`,
+    gate `step180_native_cat`, ttsim and card 0). The decode step is **117.3 ms on every tile** (`1792006312`; burn-flex
+    26.3, so 4.5x) and 458 ms on one tile. `step167` F32 takes 23.4 s, was 33.2.
+  - **Cache writes (P3, 2026-10-14):** a `slice_assign` of whole rows is a tile copy with the value's rows written
+    over it (`Session::assign_rows`, gate `step181_region_assign`). A cache write costs 25 us of server time (was 254).
+    The step is **108.5 ms on every tile** (`1792010467`, 4.1x burn-flex).
+  - **Views (P2, 2026-10-14):** slices with positive steps are views, `swap_dims` no longer materialises a view,
+    and a ragged view is made plain by a tile copy (gate `step182_region_views`). The step is **99.6 ms on every
+    tile** (`1792013124`, 3.8x burn-flex) and 450.4 ms on one tile.
+  - **What is left:** `attention`'s 1,920 jobs (73 of 125 ms of server time) is item 9. On one tile, the m = 1
+    matmuls (270 ms) are "Per-workload tile choice".
+- [x] **4. ViT-Tiny forward (7.8x, 815 ms; closed 2026-10-14, 2.7x on every tile; left: item 9).** 709 reported operations at about 1.1 ms, first read as host submission, the same
+  cost as item 3 at a smaller scale. Layer norm is composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a
+  pass); GELU and attention are native. Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
+  **Re-measured 2026-10-14** (card 0, `1792005205`, `1792005220`): 856 ms on one tile and 401 ms on every tile at `work:64:4`
+  (burn-flex 107), from 853 jobs.
+  - It is **not per-op submission**. On every tile the time is `attention` (348 jobs, 211 ms of device work), then the element
+    repacks of `swap_dims` and `slice` (74 jobs, 83 ms; [decode-host-cost.md](../completed-plans/decode-host-cost.md) P2).
+  - **After P2 (2026-10-14):** **283.4 ms on every tile** (`1792013104`, 2.7x burn-flex's 106.7) and 663.0 on one tile.
+    Its slices and swaps queue nothing, and attention reads the heads in place. Attention is now 187 of 270 ms of
+    server time (item 9), then the patch embedding's convolution (44 ms) and the heads' merge (`reshape`, 12 jobs, 10 ms).
+- [ ] **9. Attention (next; decided 2026-10-14, after [decode-host-cost.md](../completed-plans/decode-host-cost.md)).** `module::attention`
+  (`ops.rs`) composes `matmul(q, k^T)`, a scale, the masks, a softmax (`max_dim`, `clamp_min`, `sub`, `exp`, `sum_dim`,
+  `clamp_min`, `div`) and `matmul(p, v)`. On card 0 it is now the largest cost of both transformers:
+  - **SmolLM2 decode step, every tile:** 1,920 jobs, **64 a call**, and 72 of the 146 ms of server-thread time after the
+    native `cat` (`1792006312`).
+  - **ViT-Tiny, every tile:** 348 jobs and 211 of 392 ms, device work at 0.6 ms a job (`1792005220`).
+
+  First find which of the 64 jobs are batched-matmul splits per head, broadcast copies for the `sub` and `div`, and the
+  causal mask's upload. P0's counters give the jobs per op inside the call. Then fuse what the numbers favour: one
+  batched product per matmul, a softmax over rows in one job or a few (the reduce/norm fuser below), and the mask as
+  geometry. The arithmetic order stays Burn's: the existing attention gates must hold bit for bit or within their derived
+  bounds. FlashAttention ("Later") is the end state, not this item.
 - [ ] **5. BF16 lookup (open; the row select does not take it).** `step167` BF16 (six layers) takes 229 s on card 0 (run
   `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
   BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the
   half) and the other options are in the
   [operating notes](../learnings/silicon-operating-notes.md#riscv-bs-image-budget-2026-10-13-ttsim-and-card-0).
-- [ ] **6. Traced execution of the three models.** Not measured: a decode step is the host cost a trace removes, but
-  trace segmentation (next item) is open and a forward this size does not fit the 240 KB program cache. Record
-  traced against untraced rows for ResNet-18, ViT-Tiny and a decode step once segmentation lands.
+- [ ] **6. Traced execution of the three models.** ResNet-18 measured (2026-10-14, card 1,
+  `silicon_bench_models::resnet18_forward_traced`, run `1792000003`): with every tile open (`TT_TILES=all`, default spread) a
+  replayed forward is **17.6 ms against 205.7 ms untraced and burn-flex's 151.7 ms (8.6x faster than the CPU)**, its logits the
+  eager forward's bit for bit. It captures only when the programs are spread over many tiles: on one tile, or at
+  `TT_SPREAD=work:64:4`, a list's programs do not fit the 240 KB program cache (the bench says so and skips), which is trace
+  segmentation (next item). An inference capture reads the relaid weights an eager forward kept (a training capture remakes
+  them: its replays write the parameters in place; `step179`'s trace test, watched failing). **Left:** ViT-Tiny and a decode
+  step, and ResNet-18 on fewer tiles once segmentation lands.
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),
@@ -409,7 +464,9 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   spread match the best small session, and `Work { share: 64, min: 4 }` is as fast on small ops and 1.45x on a
   2048^2 add ([performance log](../learnings/performance-log.md#open-all-made-strictly-better-2026-10-14-cards-0-and-1)).
   Open: the default (still `All`, and auto-attach still opens one tile; every tile with `Work { 64, 4 }` is the
-  measured candidate, after the models and conformance run on it), and the same per card for a mesh. Auto-attach opens one tile (`TileChoice::First`), and a session's tile
+  measured candidate, after the models and conformance run on it), and the same per card for a mesh. **ResNet-18 since item 2
+  (card 1): one tile 782.3 ms, every tile with `work:64:4` 131.1 ms (burn-flex 151.4), every tile with `all` 203.8 ms**
+  ([log](../learnings/performance-log.md#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1)). Auto-attach opens one tile (`TileChoice::First`), and a session's tile
   count is fixed at attach. Open `All` tiles and choose a subset per op: an autotune-style cache keyed by
   `(op, shape, dtype)` that measures candidate counts on first use (`[512,512]^2`: 8 tiles 1.32 ms against
   120 tiles 2.0 ms, checklist 9.7c) and keeps the best. Needs a per-op tile subset in `tt-kernels`; related to

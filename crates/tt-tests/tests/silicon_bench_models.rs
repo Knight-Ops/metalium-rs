@@ -4,8 +4,9 @@
 //! Each benchmark loads a pretrained model, runs two warm-ups and nine timed forward passes, and
 //! reports the median in milliseconds with its spread, timed from host dispatch through the final
 //! readback (the convention of the other silicon benchmarks). One more pass runs under
-//! `with_report` and its count of reported device operations is reported with it (an indication of what the host submitted;
-//! convolution and pooling submit many more than they report). Outputs are validated outside the timing
+//! `with_report`: its reported device operations (views included), the jobs it queued on the server
+//! thread, and the server thread's busy time, with a table of that time by the Burn op that queued
+//! each job (`burn_tt::server_report`). Outputs are validated outside the timing
 //! (the same finite logits and the same top-1 as burn-flex).
 //!
 //! `smollm2_decode_without_the_embedding_lookup` feeds the model a precomputed embedding row. The
@@ -62,17 +63,53 @@ fn measure(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     report(key, "ms", "host", Stats::of(ms));
+    burn_tt::server_report_reset();
+    let t0 = Instant::now();
     let (_, ops) = burn_tt::with_report(&mut forward);
+    let wall = t0.elapsed();
     eprintln!("{ops}");
-    // Operations the report lists as run on the device. One reported `conv2d` or `max_pool2d` hides many
-    // more submissions (a chunk of 32 positions or windows each), so this undercounts them.
-    let jobs: u64 = ops.0.iter().map(|s| s.on_device).sum();
+    // Operations the report lists as run on the device (a view counts, though it submits nothing).
+    let reported: u64 = ops.0.iter().map(|s| s.on_device).sum();
     let calls: u64 = ops.0.iter().map(|s| s.calls).sum();
+    // Jobs queued on the server thread, each charged to the innermost Burn op that queued it.
+    let jobs: u64 = ops.0.iter().map(|s| s.jobs).sum();
     report(
         &format!("{key} reported device ops"),
         "ops",
         "count",
+        Stats::of([reported as f64]),
+    );
+    report(
+        &format!("{key} server jobs"),
+        "jobs",
+        "count",
         Stats::of([jobs as f64]),
+    );
+    // Where the server thread's time went, by the op that queued the work. The forward's readback
+    // waited for every job it depends on; frees queued after it may still be running.
+    let server = burn_tt::server_report();
+    let busy: std::time::Duration = server.iter().map(|s| s.time).sum();
+    eprintln!(
+        "server thread: {:.1} ms busy of a {:.1} ms pass",
+        busy.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e3
+    );
+    eprintln!("{:<34} {:>8} {:>10} {:>10}", "op", "jobs", "ms", "us/job");
+    for s in &server {
+        let ms = s.time.as_secs_f64() * 1e3;
+        eprintln!(
+            "{:<34} {:>8} {:>10.2} {:>10.1}",
+            s.op,
+            s.jobs,
+            ms,
+            ms * 1e3 / s.jobs.max(1) as f64
+        );
+    }
+    report(
+        &format!("{key} server thread busy"),
+        "ms",
+        "host",
+        Stats::of([busy.as_secs_f64() * 1e3]),
     );
     report(
         &format!("{key} backend calls"),
@@ -131,6 +168,86 @@ fn resnet18_forward() {
                 Tensor::<TtBackend, 4>::from_data(TensorData::new(x.clone(), [1, 3, 224, 224]), &d);
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         });
+        assert_eq!(argmax(&got), argmax(&host));
+    });
+}
+
+/// `resnet18_forward` as a trace (`burn_tt::Trace`): one eager forward first (the relaid weights
+/// and tap indices are made and kept then), one captured, then each timed pass a replay that writes
+/// the image and reads the logits back, with no op submitted by the host. Its logits equal the eager
+/// forward's bit for bit (the same ops), and its top-1 burn-flex's. Until traces are segmented the
+/// capture fits only with the programs spread over many tiles (`TT_TILES=all`); on fewer it is
+/// skipped with the reason printed.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn resnet18_forward_traced() {
+    use burn::tensor::TensorPrimitive;
+    let x = load_chw("cats.jpg", 224, IMAGENET_MEAN, IMAGENET_STD).unwrap();
+    let host = {
+        let (m, _) = ResNet18::<Flex>::pretrained(&FlexDevice).unwrap();
+        baseline("resnet18 224x224 batch 1 forward, traced", || {
+            let t = Tensor::<Flex, 4>::from_data(
+                TensorData::new(x.clone(), [1, 3, 224, 224]),
+                &FlexDevice,
+            );
+            m.forward(t).into_data().to_vec::<f32>().unwrap()
+        })
+    };
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
+        let input =
+            Tensor::<TtBackend, 4>::from_data(TensorData::new(x.clone(), [1, 3, 224, 224]), &d);
+        let eager = m
+            .forward(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let TensorPrimitive::Float(image) = input.clone().into_primitive() else {
+            unreachable!()
+        };
+        let captured = burn_tt::Trace::capture(&image, || {
+            let TensorPrimitive::Float(y) = m.forward(input.clone()).into_primitive() else {
+                unreachable!()
+            };
+            y
+        });
+        let (trace, first) = match captured {
+            Ok(t) => t,
+            Err(e) => {
+                // A forward's programs fit the program cache only when spread over enough tiles
+                // (every tile with the default spread does; one tile does not) until traces are
+                // segmented (roadmap Track 2, "Trace segmentation"): that is reported, not timed.
+                let cause = format!(
+                    "{:?}",
+                    <TtBackend as burn::tensor::backend::Backend>::sync(&d)
+                );
+                assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+                eprintln!(
+                    "SKIP resnet18 traced: the forward's programs do not fit one tile's program \
+                     cache (run with TT_TILES=all until traces are segmented): {cause}"
+                );
+                return;
+            }
+        };
+        assert_eq!(first, eager, "the capture's run is the eager forward");
+        for _ in 0..WARMUPS {
+            trace.run(x.clone()).unwrap();
+        }
+        let mut ms = Vec::new();
+        let mut got = Vec::new();
+        for _ in 0..SAMPLES {
+            let t0 = Instant::now();
+            got = trace.run(x.clone()).unwrap();
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        report(
+            "resnet18 224x224 batch 1 forward, traced",
+            "ms",
+            "host",
+            Stats::of(ms),
+        );
+        assert_eq!(got, eager, "a replay is the eager forward");
         assert_eq!(argmax(&got), argmax(&host));
     });
 }

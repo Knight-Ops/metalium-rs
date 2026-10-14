@@ -1,8 +1,12 @@
-//! Where ResNet-18's 16 s forward goes: each of its op shapes, alone, on the card.
+//! Where ResNet-18's forward goes: each of its op shapes, alone, on the card.
 //!
-//! `silicon_bench_models` shows 211 device jobs taking 16 s (ViT-Tiny's 709 take 0.8 s), so the
-//! time is host work inside a few ops. This times the shapes ResNet-18 uses, one op at a time,
-//! after a warm-up, with the weights resident. A measurement, not a gate. Silicon only.
+//! `silicon_bench_models` showed 211 device jobs taking 16 s (ViT-Tiny's 709 take 0.8 s), so the
+//! time was host work inside a few ops. This times the shapes ResNet-18 uses, one op at a time,
+//! after a warm-up, with the weights resident, two ways: from a plain NCHW input with the result
+//! read back (which, since convolution and max pooling run on NHWC tables, includes relaying the
+//! input in and the output out, a datum a mover entry each), and as in the model, from an NHWC
+//! view a previous convolution made, the result left on the card (to a `sync`). A measurement,
+//! not a gate. Silicon only.
 
 #![cfg(feature = "silicon")]
 
@@ -82,6 +86,38 @@ fn resnet18_ops_one_at_a_time() {
         let y = input(64, 56);
         time("elementwise add + relu 64x56x56", || {
             burn::tensor::activation::relu(y.clone() + y.clone()).into_data()
+        });
+
+        // As in the model: the input an NHWC view a 1x1 convolution made (outside the timing),
+        // the output left on the card.
+        let view = |c, hw| conv(c, c, 1, 1, 0).forward(input(c, hw));
+        let sync = || <B as burn::tensor::backend::Backend>::sync(&d).unwrap();
+        let x = view(64, 112);
+        time(
+            "maxpool 3x3/2 on 64x112x112, NHWC view in, on the card",
+            || {
+                let y = pool.forward(x.clone());
+                sync();
+                y
+            },
+        );
+        for (ch, hw) in [(64, 56), (128, 28), (256, 14), (512, 7)] {
+            let x = view(ch, hw);
+            let c = conv(ch, ch, 3, 1, 1);
+            time(
+                &format!("conv 3x3/1  {ch}->{ch} on {hw}x{hw}, NHWC view in, on the card"),
+                || {
+                    let y = c.forward(x.clone());
+                    sync();
+                    y
+                },
+            );
+        }
+        let y = view(64, 56);
+        time("add + relu 64x56x56, NHWC views, on the card", || {
+            let z = burn::tensor::activation::relu(y.clone() + y.clone());
+            sync();
+            z
         });
     });
 }

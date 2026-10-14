@@ -258,11 +258,14 @@ impl Strided {
     /// holding this view's elements (of a tensor of `from`) in row-major
     /// order -- `to` may be `from` itself, or a reshape no strides express,
     /// such as attention's heads merged back into `[b, s, d]`. Each output
-    /// tile must be one source tile, or one source tile transposed: the
-    /// output whole tiles, the view's last dimension a run of whole tiles
-    /// along the source's rows (or, transposed, down its columns), and each
-    /// output tile's rows the source's next rows (columns). Adjacent tiles
-    /// that are adjacent in the source too are one move.
+    /// tile must be one source tile, or one source tile transposed: the view's
+    /// last dimension contiguous along the source's rows (or, transposed, down
+    /// its columns), each of the tile's rows inside one row of the view, and
+    /// each output tile's rows the source's next rows (columns). A ragged last
+    /// tile row or column is taken where the source block ends at the source's
+    /// own edge too ([`Strided::block_fits`]): 197 tokens' heads, a slice of
+    /// columns of a projection. Adjacent tiles that are adjacent in the source
+    /// too are one move.
     pub(crate) fn tile_moves(&self, from: &[usize], to: &[usize]) -> Option<Vec<BlockMove>> {
         let [p, c] = stored_dims(to)?;
         let last = *from.last()?;
@@ -271,7 +274,7 @@ impl Strided {
             [1, 0] => true,
             _ => return None,
         };
-        if p % 32 != 0 || c % 32 != 0 || last % 32 != 0 {
+        if p == 0 || c == 0 || last == 0 {
             return None;
         }
         // Along an output row, and down an output column, in the source.
@@ -282,29 +285,42 @@ impl Strided {
             s
         };
         let mut moves: Vec<BlockMove> = Vec::new();
-        for ti in 0..p / 32 {
-            for tj in 0..c / 32 {
+        for ti in 0..p.div_ceil(32) {
+            let rows = (p - ti * 32).min(32);
+            for tj in 0..c.div_ceil(32) {
+                let cols = (c - tj * 32).min(32);
                 let f0 = ti * 32 * c + tj * 32;
                 let s0 = self.at(from, f0);
-                if !self.block_fits(s0, [32, 32]) {
+                let extent = if transposed {
+                    [cols, rows]
+                } else {
+                    [rows, cols]
+                };
+                if !self.block_fits(s0, extent) {
                     return None;
                 }
-                if (1..32).any(|a| self.at(from, f0 + a * c) != step(s0, down, a)) {
+                // Each row of the tile is a run inside one row of the view, so the last
+                // dimension's stride carries it along the source; and the rows are the
+                // source's next ones.
+                if (0..rows).any(|a| (f0 + a * c) % last + cols > last)
+                    || (1..rows).any(|a| self.at(from, f0 + a * c) != step(s0, down, a))
+                {
                     return None;
                 }
                 let to_at = [ti * 32, tj * 32];
                 match moves.last_mut() {
                     Some(m)
                         if m.to[0] == to_at[0]
+                            && m.extent[0] == rows
                             && m.to[1] + m.extent[1] == to_at[1]
                             && step(m.from, along, m.extent[1]) == s0 =>
                     {
-                        m.extent[1] += 32;
+                        m.extent[1] += cols;
                     }
                     _ => moves.push(BlockMove {
                         from: s0,
                         to: to_at,
-                        extent: [32, 32],
+                        extent: [rows, cols],
                         transposed,
                     }),
                 }
@@ -417,6 +433,42 @@ mod tests {
         assert_eq!(sources(&moves, h * dk, want.len()), want);
         // One move per head and batch element's 2 tile rows.
         assert_eq!(moves.len(), b * h * (s / 32));
+    }
+
+    #[test]
+    fn ragged_edges_are_tile_moves_where_the_source_ends_too() {
+        // ViT's fused projection `[197, 576]`: the columns of `k`.
+        let qkv = view(197, 576, &[1, 197, 576]);
+        let mut k = qkv.clone();
+        k.base = [0, 192];
+        let from = [1, 197, 192];
+        let moves = k
+            .tile_moves(&from, &from)
+            .expect("a column block to the source's last row");
+        let want = elements(&k, &from);
+        assert_eq!(sources(&moves, 192, want.len()), want);
+        // Its heads `[1, 3, 197, 64]` laid out flat are `[591, 64]`: a tile row crosses from one
+        // head's last rows to the next head's first, which no single source block holds (a batched
+        // matmul reads the heads in place instead, `matrix_blocks`).
+        let heads = k.reshaped(&from, &[1, 197, 3, 64]).unwrap().swapped(1, 2);
+        assert!(heads
+            .tile_moves(&[1, 3, 197, 64], &[1, 3, 197, 64])
+            .is_none());
+        // Transposed: a `[70, 40]` buffer read as `[40, 70]`, ragged both ways at its edges.
+        let t = view(70, 40, &[70, 40]).swapped(0, 1);
+        let moves = t
+            .tile_moves(&[40, 70], &[40, 70])
+            .expect("a transposed ragged copy");
+        let want = elements(&t, &[40, 70]);
+        assert_eq!(sources(&moves, 70, want.len()), want);
+        // Not at the source's edge: rows 0..197 of a 300-row buffer end inside a tile.
+        let tall = view(300, 64, &[300, 64]);
+        let mut first = tall.clone();
+        first.strides = vec![[1, 0], [0, 1]];
+        assert!(first.tile_moves(&[197, 64], &[197, 64]).is_none());
+        // A tile row of the output that crosses a row of the view: `[2, 40]` read as `[80]`.
+        let v = view(2, 40, &[2, 40]);
+        assert!(v.tile_moves(&[2, 40], &[1, 80]).is_none());
     }
 
     /// Where each output element of `moves` comes from, by the moves.

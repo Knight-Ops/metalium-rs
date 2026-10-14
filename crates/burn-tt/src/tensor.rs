@@ -64,6 +64,10 @@ pub(crate) struct Cell {
     strided: Option<Strided>,
     shape: Shape,
     dtype: DType,
+    /// Tensors made from this one and kept ([`TtTensor::derived`]): a
+    /// convolution's weights relaid for its product, made once per parameter
+    /// rather than once per forward pass.
+    derived: std::sync::Mutex<Vec<(String, TtTensor)>>,
 }
 
 /// A device buffer, read transposed or not.
@@ -108,6 +112,7 @@ impl TtTensor {
                 strided: None,
                 shape,
                 dtype,
+                derived: Default::default(),
             }),
             device,
         }
@@ -130,6 +135,7 @@ impl TtTensor {
                 strided: None,
                 shape,
                 dtype,
+                derived: Default::default(),
             }),
             device,
         }
@@ -150,9 +156,58 @@ impl TtTensor {
                 strided: Some(v),
                 shape,
                 dtype,
+                derived: Default::default(),
             }),
             device,
         }
+    }
+
+    /// The tensor `make` derives from this one, made once and kept beside it
+    /// under `key` (which names what `make` does): a parameter's relayout,
+    /// reused by every forward pass. Not kept -- made each time -- while the
+    /// device is capturing a training step (its replays write the parameters
+    /// in place, so they must recompute it) or once
+    /// this tensor's buffer has been written in place (`copy_into`, a trace's
+    /// replays: what was derived could be stale), and not for a host tensor.
+    pub(crate) fn derived(
+        &self,
+        key: String,
+        make: impl FnOnce(&TtTensor) -> TtTensor,
+    ) -> TtTensor {
+        let id = match (self.cell.dram.get(), &self.cell.strided) {
+            (Some(d), _) => Some(d.buffer.id),
+            (None, Some(v)) => Some(v.src.buffer.id),
+            (None, None) => None,
+        };
+        // A host tensor's device copy is made here, so what is derived from it
+        // can be kept from the first use.
+        let id = id.or_else(|| {
+            (self.is_stored_f32() && server::supports_dram(self.device))
+                .then(|| self.to_dram().buffer.id)
+        });
+        let keep = id.is_some_and(|id| !server::is_written_in_place(id))
+            && !crate::trace::capturing_training(self.device);
+        if !keep {
+            self.cell
+                .derived
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            return make(self);
+        }
+        {
+            let kept = self.cell.derived.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((_, t)) = kept.iter().find(|(k, _)| *k == key) {
+                return t.clone();
+            }
+        }
+        let t = make(self);
+        self.cell
+            .derived
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((key, t.clone()));
+        t
     }
 
     /// Is this a 2-D transposed view of a device buffer?
@@ -354,6 +409,7 @@ impl TtTensor {
                 strided: None,
                 shape,
                 dtype: self.cell.dtype,
+                derived: Default::default(),
             }),
             device: self.device,
         }

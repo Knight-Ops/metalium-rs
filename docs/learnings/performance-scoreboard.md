@@ -62,9 +62,9 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Device busy, 16 queued 32×256×32 matmuls | 12.6% of wall | — | ~100% |
 | MNIST training, card 0, 1 tile (`tt-mnist --host`) | 1.4 ms/step | burn-flex 0.5 | ≤ burn-flex |
 | Transformer training, card 0, 1 tile (`tt-mnist --model transformer`) | 8.8 ms/step | burn-flex 4.35 | ≤ burn-flex |
-| ResNet-18 forward, 224x224, batch 1, card 0, host (`silicon_bench_models`) | 16,288 ms, 211 reported ops (`1791846735`) | burn-flex 154.8 ms (105x slower) | max pool 2.8 s and 0.5-1.4 s a convolution: one 32-row chunk, one host-built table and one small matmul or reduction at a time; a chunk-free convolution and pooling (roadmap Track 2) |
-| ViT-Tiny forward, 224x224, batch 1, card 1, host | 815 ms, 709 reported ops (`1791846823`) | burn-flex 104.7 ms (7.8x slower) | about 1.1 ms an op: host submission; fusers and traces (roadmap Track 2) |
-| SmolLM2-135M decode step, embedding lookup excluded, card 1, host | 619 ms, 2,779 reported ops (`1791846823`) | burn-flex 25.0 ms (24.8x slower) | about 220 us an op; `cat` is `slice_assign` (722 calls a step); fusers and traces |
+| ResNet-18 forward, 224x224, batch 1, card 1, host (`silicon_bench_models`) | one tile (the default): 782.3 ms, 211 reported ops (`1791996580`; was 16,288 ms, `1791846735`); every tile, `TT_SPREAD=work:64:4`: **131.1 ms** (`1791996716`); every tile, spread `all`: 203.8 ms (`1791996730`) | burn-flex 156.9 / 151.4 / 151.3 ms in the same runs (one tile 5.0x slower; every tile at `work:64:4` 1.15x **faster**) | chunk-free convolution and pooling landed (roadmap Track 2 item 2): the host submits a forward in ~15 ms, the rest is the card. On one tile conv1 alone is ~366 ms (49 taps of a 3-channel table, ~1.2M 64-byte reads) and the image's relayout ~95 ms; the default tile choice (roadmap, "Per-workload tile choice") is what is left |
+| ViT-Tiny forward, 224x224, batch 1, card 0, host | every tile, `TT_SPREAD=work:64:4`: **283.4 ms** (`1792013104`; 401.4 before slice and swap views, `1792005220`); one tile: 663.0 ms (`1792013112`); 766 server jobs | burn-flex 106.7 / 112.5 ms in the same runs (2.7x and 5.9x slower) | slices and swaps are views (`decode-host-cost.md` P2). Left on every tile: `attention` (336 jobs, 187 of 270 ms; roadmap Track 2 item 9), the patch convolution (44 ms) and the heads' merge (10 ms) |
+| SmolLM2-135M decode step, embedding lookup excluded, card 0, host | every tile, `TT_SPREAD=work:64:4`: **99.6 ms** (p10 85, p90 116), 3,316 server jobs (`1792013124`; 232.6 ms before the native `cat`, `1792005178`); one tile: 450.4 ms (`1792013133`; was 623.9, `1792005087`) | burn-flex 26.2 ms in the same run (3.8x slower on every tile) | `decode-host-cost.md` P1-P3: `cat` 4.5-5.3 ms of server time (was 196.6), cache writes 1.9 ms, no `slice` or swap jobs. Left on every tile: `attention`'s 1,920 jobs (73 ms of 125; roadmap Track 2 item 9), then matmuls (18). One tile waits on its m = 1 matmuls (1.28 ms each) |
 | SmolLM2-135M decode step from a token id, lookup included, card 0, host | 623 ms (p10 525, p90 709), 2,781 reported ops (`1791852097`) | burn-flex 26.4 ms (23.6x slower); the same run without the lookup 622 ms | the lookup is about 1.4 ms of it; the rest is the host submission above |
 | SmolLM2-135M embedding lookup, one token from 49,152 x 576, card 0, host (`probe_embedding_cost`) | 260 us, median of 7 warm, validated against the host's rows (`1791851940`); five tokens 278 us, 32 tokens 344 us | was 15.9 s (`1791845218`): `gather_native` staged 28.3 million host addresses a token; now `Session::select_rows` reads only the rows it returns | hold; BF16, F16 and BFP tables still take the staged path (roadmap Track 2, "Gather without staging") |
 | SFPU precise `gelu`, three-role kernel, device cycles per tile (`probe_ttinsn_push`, card 0) | 38,053 cycles (T1 push 3.31 cycles/word: push-bound) | `.ttinsn` fused push, experiment only: 13,734 cycles, 2.77x (run-time translated: 2.67x) | decide the follow-on (roadmap Track 2) |
@@ -80,13 +80,15 @@ row in place when its fix lands, add the run ID, and keep the old row in the log
 
 | Workload | burn-flex | Now (run) | Slowdown | Target | Roadmap item |
 |---|--:|--:|--:|---|---|
-| ResNet-18 forward, 224x224 (card 0) | 154.8 ms | 16,288 ms (`1791846735`) | 105x | at or below burn-flex | 2 |
-| ViT-Tiny forward, 224x224 (card 1) | 104.7 ms | 815 ms (`1791846823`) | 7.8x | at or below burn-flex | 4 |
-| SmolLM2-135M decode step, lookup excluded (card 1) | 25.0 ms | 619 ms (`1791846823`) | 24.8x | at or below burn-flex | 3 |
+| ResNet-18 forward, 224x224 (card 1), one tile (default) | 156.9 ms | 782.3 ms (`1791996580`; was 16,288 ms on card 0, `1791846735`) | 5.0x | at or below burn-flex | 2 (done), then the default tile choice |
+| ResNet-18 forward, 224x224 (card 1), every tile, `TT_SPREAD=work:64:4` | 151.4 ms | 131.1 ms (`1791996716`) | 0.87x | at or below burn-flex: **met** with every tile | default tile choice |
+| ViT-Tiny forward, 224x224 (card 0), every tile, `work:64:4` | 106.7 ms | 283.4 ms (`1792013104`; 401.4 before P2; one tile 663.0, `1792013112`) | 2.7x | at or below burn-flex | 4, then 9 (attention) |
+| SmolLM2-135M decode step, lookup excluded (card 0), every tile, `work:64:4` | 26.2 ms | 99.6 ms (`1792013124`; 232.6 before the native `cat`; one tile 450.4, `1792013133`) | 3.8x | at or below burn-flex | 3, then 9 (attention) |
 | SmolLM2-135M embedding lookup, one token (card 0) | not measured | 260 us (`1791851940`; was 15.9 s, `1791845218`) | n/a | milliseconds: **met** for F32 | 1 |
 | SmolLM2-135M decode step from a token id, lookup included (card 0) | 26.4 ms | 623 ms (`1791852097`) | 23.6x | at or below burn-flex | 3 |
 | SmolLM2-135M BF16 decoded token, six layers, lookup included (card 0) | not measured | 37.5 s (`1791848957`) | n/a | no slower than F32 | 5 |
-| Traced rows for the three models | n/a | not measured | n/a | measure once segmentation lands | 6 |
+| ResNet-18 forward, 224x224 (card 1), every tile (`TT_TILES=all`), traced replay | 151.7 ms | 17.6 ms (`1792000003`; untraced, same settings, 205.7 ms) | 0.12x | at or below burn-flex: **met** (one tile does not capture: program cache, item "Trace segmentation") | 6 |
+| Traced rows for ViT-Tiny and SmolLM2 | n/a | not measured | n/a | measure once segmentation lands | 6 |
 
 ### Where each row is evidenced
 
@@ -102,7 +104,7 @@ row in place when its fix lands, add the run ID, and keep the old row in the log
 | Operation baselines (BF16, packed, mesh) | [Native](performance-log.md#native-operation-baselines-2026-10-05), [BF16 and mesh](performance-log.md#bf16-and-mesh-operation-baselines-2026-10-05), [Packed BF16](performance-log.md#packed-bf16-update-2026-10-05) |
 | Accurate matmul against the fast one | [Accurate matmul cost](performance-log.md#accurate-matmul-cost-2026-10-12-card-0) |
 | Exact matmul against the fast one | [Exact matmul cost](performance-log.md#exact-matmul-cost-2026-10-11-card-0) |
-| Model forward passes (ResNet-18, ViT-Tiny, SmolLM2) | [Model ladder](performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) |
+| Model forward passes (ResNet-18, ViT-Tiny, SmolLM2) | [Model ladder](performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1); ResNet-18 since: [Chunk-free convolution and max pooling](performance-log.md#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1) |
 | Embedding lookup, SmolLM2 decode from a token id | [Row select](performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) |
 | SFPU `gelu` kernel, `.ttinsn` push fusion | [`.ttinsn` push fusion](performance-log.md#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) |
 | P2 K-blocking, R3 norm, Approx, X6 | [P2/R3](performance-log.md#p2-k-blocking-and-r3-norm-release-baselines-2026-10-10), [Approx transcendentals](performance-log.md#approx-transcendentals-per-tile-saving-2026-10-10-card-0), [X6](performance-log.md#x6-mover-niu-fast-path-2026-10-10-card-0) |
