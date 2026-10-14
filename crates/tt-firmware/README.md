@@ -10,7 +10,7 @@ by hand.
 
 | Binary | Core | Link script | Purpose |
 |---|---|---|---|
-| `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link.x`, `link_t1.x`, `link_t2.x` | The unpack / math / pack role runners. Each at its core's default reset PC, so all three sit in one tile's L1. Resident in a `Session`. |
+| `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link_role_t0.x`, `link_role_t1.x`, `link_role_t2.x` | The unpack / math / pack role runners. Each in its 10 KiB slot (`tt_isa::l1::roles`), reached through its reset-PC override, so all three and B's mover sit in one tile's L1. Resident in a `Session`. |
 | `dm_b` | B | `link_b.x` | The reader (`tt_isa::dm`): GDDR to L1, list entries, reading op records expanded on the tile, padding fills, tilizes, PCIe moves, barriers, `KERNEL` entries that point the resident roles at their programs and run them, and the shared packets that start NC. It never writes GDDR. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
 | `dm_nc` | NC | `link_nc.x` | The writer, loaded above the data arena via NC's reset stub: L1 to GDDR on NoC1, writing op records expanded on the tile, and the credits that order them. It runs no read, kernel launch, barrier or PCIe move. |
 
@@ -69,3 +69,12 @@ cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   Blackhole cannot execute (compressed, `lr`/`sc`, `fdiv`, `fsqrt`, the `fmadd`
   family, `fence.i`, `pause`, unlisted `fence` orderings, undecodable words).
   Executing an unimplemented instruction is undefined behaviour, not a trap.
+
+## Features
+
+| Feature | What it does |
+|---|---|
+| (none) | The default "safe" images: the B mover decodes and checks every read itself and refuses `READ_ENCODED`. |
+| `fast-reads` | The B mover runs host-encoded reads (`tt_isa::dm::encoded`), verifying their checksum; the host validates them in full. Reported to the host in `dm::CAPS`. |
+| `encoded-guard` | With `fast-reads`: also `encoded::guard`, an independent semantic check of each encoded read (~40 cycles). |
+| `ttinsn-experiment` | The `.ttinsn` push-fusion experiment image (`docs/plans/ttinsn-push-experiment.md`). |

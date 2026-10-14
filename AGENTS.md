@@ -20,6 +20,8 @@ C/C++ specification models and simulator FFI are development-only test oracles.
 - `tt-tests`: cross-crate gates, simulator engines and external Flex comparisons.
   `burn-tt-conformance`: Burn's own backend tests against `burn-tt`
   (`cargo xtask conformance`; dev-only). `tt-mnist`: application/model workloads.
+  `tt-models`: pretrained models (ResNet-18, ViT-Tiny, SmolLM2-135M), strict safetensors loading and
+  mixed-precision plans, checked against Flex (`cargo xtask fetch-weights`; dev-only).
   `xtask`: fetchers, generators and runners.
 
 Crates live under `crates/`. When adding a host workspace crate, classify it in
@@ -72,7 +74,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
 `fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
-`cargo xtask conformance`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
+`cargo xtask conformance`), `fetch-weights` (needed by the `tt-models` tests and the model-ladder
+gates, which are ignored without `--features weights`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:
 
@@ -91,7 +94,16 @@ Firmware changes also need the separate workspace lint:
 ```bash
 cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   --target riscv32im-unknown-none-elf --bins --lib -- -D warnings
+cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
+  --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings
 ```
+
+The mover has two read modes (`fast-reads`, see below); a change to `mover.rs` or `tt_isa::dm::encoded`
+is run through the encoded-read gate and the differential gate in both: `cargo test -p tt-tests --test
+step172_encoded_reads --test step173_mover_differential` and the same with `--features tt-tests/fast-reads` (and
+`tt-tests/encoded-guard`). An encoded read's checksum is bound to a per-start key, the tile, the chip and the op
+(`encoded::Context`); the host's `validate` also runs the independent `guard`; `enqueue_checked` validates every
+`READ_ENCODED`, and only the `#[doc(hidden)] enqueue_raw` sends an entry unchecked (for gates that forge one).
 
 Arithmetic, routing or execution-order changes also need the training regression:
 
@@ -166,6 +178,12 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   for exact program results and derive approximation bounds beside the gate.
   Cover signed zeros, subnormals, NaNs, infinities and extremes. Preserve stated
   accumulation order; `SFPMAD` is not IEEE fused multiply-add.
+- SFPI (Tenstorrent's GCC toolchain, `riscv-tt-elf-g++`, which compiles C++ `vFloat` kernels to SFPU
+  instructions) is a development-only cross-check of SFPU encodings and instruction counts, in the
+  same class as the C/C++ specification models: never a dependency of a shipped crate, never the only
+  oracle (the specification models still predict results), and any gate that runs it must first pin its
+  version and hash in `PINS.toml`. No gate uses it yet. Recipe:
+  [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md#cross-check-against-sfpi-development-only).
 - New ops need an independent oracle, a simulator gate with a meaningful
   negative control, silicon validation on one card (both only for
   mesh/multi-card ops), native Burn routing,
@@ -177,7 +195,15 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
 
 Use checked APIs and `Session` bring-up. Discover each chip's grids from ARC
 before tile access; never probe surviving coordinates or copy ttsim's full grid
-onto silicon. Harvested-tile accesses can hang the NoC and reboot the host.
+onto silicon. Harvested-tile accesses can hang the NoC and reboot the host. The B mover is built in one of two
+read modes, chosen at build time by the firmware feature `fast-reads` (off by default; `cargo xtask
+silicon --feature fast-reads`). The default **safe** image decodes and checks every read on the card
+and refuses `READ_ENCODED` as an unknown op. A **fast** image runs host-encoded reads (`dm::encoded`):
+validated in full on the host (`encoded::validate`), integrity-checked on the card (`encoded::verify`,
+a checksum), and with `encoded-guard` also semantically guarded on the card (`encoded::guard`). The
+image reports its mode in `dm::CAPS`, which the host reads; never queue an encoded entry that did not
+pass `validate` (`enqueue_checked` validates them; only the doc-hidden `enqueue_raw` sends one unchecked), and never
+send a hand-made one to silicon whose refusal you have not checked on ttsim.
 Keep one `Device` per chip because power policy is chip-wide. Local data RAM
 cannot answer NoC accesses while its owning core is in reset.
 

@@ -118,8 +118,9 @@ fn a_gather_by_target_and_its_backward_are_flex_s_bits_on_the_card() {
 }
 
 /// D4, second part: an embedding on the card. `select` along dimension 0 of
-/// a resident table moves each row where it lies (`Session::gather_rows`),
-/// bit for bit; `select_add` -- the embedding's gradient -- adds rows by
+/// a resident table moves each row where it lies (`Session::select_rows`,
+/// read from the indices the card holds; this gate first ran on
+/// `Session::gather_rows`, whose row list the host built), bit for bit; `select_add` -- the embedding's gradient -- adds rows by
 /// index in Flex's order (`Session::rows_add`), with repeats; and Burn's
 /// `nn::Embedding` trains through them under autodiff, matching Flex. Indices
 /// come from the host, as token ids do; nothing is downloaded.

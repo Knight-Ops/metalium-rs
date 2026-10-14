@@ -12,6 +12,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `fetch-spec [--force]` | Pinned tt-isa-documentation tree into `vendor/`, verified by content digest. |
 | `fetch-kmd [--force]` | Pinned tt-kmd `ioctl.h` into `vendor/` (the driver ABI `tt-kmd` binds). |
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |
+| `fetch-weights [--model <name>] [--force]` | The model ladder's pretrained weights (`resnet18`, `vit-tiny`, `smollm2-135m`) and test images (`images`) into `vendor/weights/<name>/`, checked against the pinned length and SHA-256; `tt-models` reads them. |
 | `fetch-burn-tests [--force]` | Burn's own backend tests (`crates/burn-backend-tests/tests/` at the pinned tag) into `vendor/burn-backend-tests/`, verified by content digest. |
 | `gen-cfg [--check]` | `tt-isa/src/cfg/generated.rs` from the pinned `cfg_defines.h` (fetched if absent). |
 | `gen-isa [--check]` | `tt-isa/src/isa/generated.rs` from `Bits32.lua`, cross-checked against the spec's syntax blocks, plus the measured Blackhole layouts in `src/gen_isa/Bits32_BH.lua`. |
@@ -39,7 +40,7 @@ directly, one test per process, single-threaded.
 | `--smoke` | Adds the current `SMOKE` filters in `src/silicon.rs`, including native model regressions and step91–96 PRNG/BFP conversion, packed-product, propagation and mixed-training gates. |
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
-| `--feature NAME` | Also build `tt-tests` with this feature (repeatable). Only for opt-in experiments such as `ttinsn-experiment`, never a suite. |
+| `--feature NAME` | Also build `tt-tests` with this feature (repeatable). For opt-in experiments such as `ttinsn-experiment`, and for the B mover's read mode: `fast-reads` (host-encoded reads, checksum on the card) or `encoded-guard` (plus the semantic guard). The default is the safe mode. |
 | `--timeout-secs N` | Per-test wall-clock limit (default 120). |
 | `--release` | Optimised build. Quote timings only from this. |
 | `--list` | Print the selection without touching a card. |

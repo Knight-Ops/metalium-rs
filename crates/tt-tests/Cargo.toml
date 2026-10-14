@@ -29,7 +29,12 @@ path = "src/lib.rs"
 # "silicon"))]` for the same reason.
 #
 # Silicon runs every tier, so it implies `e2e`.
-silicon = ["e2e"]
+silicon = ["e2e", "weights"]
+
+# The model ladder's gates (step165 onward) read pretrained weights and test photographs fetched by
+# `cargo xtask fetch-weights`; without this they are ignored rather than failing on a checkout that
+# has not fetched them. Silicon runs them, so it implies this.
+weights = []
 
 # The test tiers. The simulator is for *validation*: the ISA, kernel, mover and
 # residency gates, where ttsim's bit-exactness and its refusal of undefined
@@ -48,6 +53,14 @@ e2e = []
 # (`docs/plans/ttinsn-push-experiment.md`, `tests/probe_ttinsn_push.rs`): builds the
 # experiment image into `tt-firmware-images`. Off by default, and in no suite.
 ttinsn-experiment = ["tt-firmware-images/ttinsn-experiment"]
+
+# The B mover's host-encoded reads (`tt_isa::dm::encoded`), and with `encoded-guard` its
+# semantic guard: build the firmware images in the "fast" mode and run the gates and
+# measurements that exist only there (`step172_encoded_reads`, `step173_mover_differential`, the encoded half of
+# `silicon_probe_read_loop`). Off by default: the safe mode, in which the same gate
+# holds that the card refuses an encoded read.
+fast-reads = ["tt-firmware-images/fast-reads"]
+encoded-guard = ["fast-reads", "tt-firmware-images/encoded-guard"]
 
 # Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
 # is classified DEV_ONLY in `xtask/src/ship.rs`, so the simulator binding still
@@ -70,5 +83,7 @@ burn-tensor.workspace = true
 burn.workspace = true
 # The general-model gate trains the model `tt-mnist --model transformer` times.
 tt-mnist = { path = "../tt-mnist" }
+# The model ladder (step165 onward): pretrained models and their loader.
+tt-models = { path = "../tt-models" }
 # step145: the f64 oracle for `gelu` (`erfc`), independent of the programs.
 libm.workspace = true

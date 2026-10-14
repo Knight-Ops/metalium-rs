@@ -11,6 +11,7 @@ members = [
     "crates/tt-firmware-images",
     "crates/burn-tt",
     "crates/tt-mnist",
+    "crates/tt-models",
     "crates/tt-tests",
     "crates/burn-tt-conformance",
     "xtask",
@@ -48,6 +49,9 @@ burn-ir = { version = "=0.21.0", default-features = false }
 burn-fusion = { version = "=0.21.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
+# Pretrained-weight loading for `tt-models` (B15): safetensors only, no PyTorch pickle
+# reader and no burnpack. The same release as every other burn crate.
+burn-store = { version = "=0.21.0", default-features = false, features = ["std", "safetensors"] }
 # The independent Lanczos3 oracle of `tt-tests` (step155_interpolate): dev-only, no codecs.
 image = { version = "=0.25.10", default-features = false }
 libloading = "0.8"

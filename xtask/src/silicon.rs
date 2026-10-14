@@ -99,6 +99,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 /// tier that says burn-tt still computes what Burn's CPU backend computes, on
 /// the hardware it is for.
 pub const SMOKE: &[&str] = &[
+    // The B mover's read mode, whichever way the firmware was built: the safe image's
+    // refusals, or with `--feature fast-reads` the encoded reads' (step172).
+    "step172_encoded_reads::",
+    "step173_mover_differential::",
     "step19_eltwise::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",
@@ -194,6 +198,16 @@ pub const SMOKE: &[&str] = &[
     "autodiff_bf16::base::mul::",
     "autodiff_bf16::base::matmul::",
     "step164_grid_sample_bf16::",
+    // The model ladder (`crates/tt-models`): pretrained weights, so `silicon` implies the `weights`
+    // feature. SmolLM2 in F32 (33 s) and the mixed-precision plans (about 3 minutes) are here since the row
+    // select (`step171`) took the embedding lookup from 15 s a token to 0.3 ms; the BF16 gate (229 s) is not,
+    // as the BF16 lookup still stages its table (roadmap, "Gather without staging").
+    "step171_select_rows::",
+    "step167_smollm2::smollm2_in_f32",
+    "step168_smollm2_mixed_precision::",
+    "step165_resnet18::",
+    "step166_vit_tiny::",
+    "step170_checkpoint_round_trip::",
     "step20_many_tiles::eltwise",
     "step20_many_tiles::column_sums",
     "silicon_card_lock::a_second",
@@ -344,8 +358,10 @@ usage: cargo xtask silicon [options]
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
   --timeout-secs N      per-test wall-clock limit (default 120)
-  --feature NAME        also build `tt-tests` with this feature (repeatable); only for
-                        opt-in experiments such as `ttinsn-experiment`, never a suite
+  --feature NAME        also build `tt-tests` with this feature (repeatable): the opt-in
+                        experiment `ttinsn-experiment`, or the B mover's read mode,
+                        `fast-reads` (host-encoded reads) or `encoded-guard` (and the card's
+                        guard); the default is the safe mode
   --release             build the suite optimised; every timing worth quoting
                         comes from this, since the dev build is not a baseline
   --list                print the selection and exit without touching a card";
@@ -537,7 +553,7 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 
     let dir = root.join("target/silicon");
     std::fs::create_dir_all(dir.join("out")).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let stamp = unix_secs();
+    let stamp = claim_stamp(&dir)?;
     let log_path = dir.join(format!("{stamp}.log"));
     let mut log = Log::open(&log_path)?;
     let boot = boot_id();
@@ -663,6 +679,22 @@ pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
+}
+
+/// A run ID no other run has: the clock, bumped past any `<stamp>.log` that already exists. The
+/// file is created exclusively, so two runs that finish building in the same second (one job per
+/// card, in parallel) take different IDs instead of sharing a log and overwriting each other's
+/// collected benchmark files.
+fn claim_stamp(dir: &Path) -> Result<u64, String> {
+    let mut stamp = unix_secs();
+    loop {
+        let path = dir.join(format!("{stamp}.log"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(stamp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => stamp += 1,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
 }
 
 pub(crate) fn unix_secs() -> u64 {

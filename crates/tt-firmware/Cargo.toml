@@ -16,6 +16,17 @@ description = "Bare-metal Rust for the Blackhole baby RISC-V cores."
 # without it contains a `.ttinsn` word.
 [features]
 ttinsn-experiment = []
+# Host-encoded GDDR reads (`tt_isa::dm::encoded`): the B mover runs `READ_ENCODED`
+# entries, verifying their checksum, in place of decoding and checking each read itself.
+# Off by default: the default image is "safe", every read checked on the card, and
+# refuses `READ_ENCODED` as an unknown op. The mover tells the host which it is
+# (`dm::CAPS`), so a host never encodes for a safe image.
+fast-reads = []
+# With `fast-reads`, also run the independent semantic check (`encoded::guard`: a
+# usable-DRAM-endpoint bitmap, this tile as the return, address and length bounds) on
+# each encoded read: ~50 cycles more an entry, protecting against a bug in the
+# host's encoder as well as damage.
+encoded-guard = ["fast-reads"]
 
 [[bin]]
 name = "ttinsn_t1"

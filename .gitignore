@@ -27,6 +27,10 @@
 # Phase 7 training gate's data.
 /vendor/mnist/
 
+# Fetched by `cargo xtask fetch-weights`, pinned by SHA-256 in PINS.toml; the
+# model ladder's pretrained weights (tt-models).
+/vendor/weights/
+
 # Fetched by `cargo xtask fetch-burn-tests`, pinned by content digest in PINS.toml:
 # the tests of Burn's own `burn-backend-tests` crate (not on crates.io), which
 # `burn-tt-conformance` runs against `TtBackend`. Third-party, so fetched and

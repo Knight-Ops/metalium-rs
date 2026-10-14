@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::burn_tests;
 use crate::pin;
 use crate::spec;
-use crate::util::{download, sha256, workspace_root};
+use crate::util::{download, download_within, sha256, workspace_root};
 
 /// Fetch every pinned simulator build.
 ///
@@ -380,5 +380,96 @@ pub fn fetch_mnist(force: bool) -> Result<(), String> {
         let _ = std::fs::remove_file(&gz);
         println!("{} verified", dest.display());
     }
+    Ok(())
+}
+
+/// The model ladder's pinned inputs under `vendor/weights/`: each model's weights (name them
+/// with `only`) and the test images (`only = "images"`). `None` fetches everything.
+///
+/// The bytes are checked against the pinned length and SHA-256 before they are left under their
+/// final name, so a truncated or substituted file is never mistaken for the pin.
+pub fn fetch_weights(only: Option<&str>, force: bool) -> Result<(), String> {
+    if let Some(name) = only {
+        if name != "images" && !pin::WEIGHT_FILES.iter().any(|f| f.model == name) {
+            let known: Vec<&str> = pin::WEIGHT_FILES
+                .iter()
+                .map(|f| f.model)
+                .chain(["images"])
+                .collect();
+            return Err(format!(
+                "no pinned weights named `{name}`; known: {}",
+                known.join(", ")
+            ));
+        }
+    }
+    let root = workspace_root().join("vendor").join("weights");
+    for f in pin::WEIGHT_FILES
+        .iter()
+        .filter(|f| only.is_none_or(|name| f.model == name))
+    {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            pin::WEIGHTS_URL,
+            f.repo,
+            f.revision,
+            f.file
+        );
+        // Ten minutes: the largest pinned file is 269 MB.
+        fetch_pinned(
+            &url,
+            &root.join(f.model).join(f.file),
+            f.bytes,
+            f.sha256,
+            force,
+            600,
+        )?;
+    }
+    if only.is_none_or(|name| name == "images") {
+        for f in pin::IMAGE_FILES {
+            fetch_pinned(
+                f.url,
+                &root.join("images").join(f.name),
+                f.bytes,
+                f.sha256,
+                force,
+                120,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Download `url` to `dest` unless `dest` already matches the pin, and verify it either way.
+fn fetch_pinned(
+    url: &str,
+    dest: &Path,
+    bytes: u64,
+    sha: &str,
+    force: bool,
+    seconds: u32,
+) -> Result<(), String> {
+    if dest.exists() && !force {
+        let h = sha256(dest)?;
+        if h == sha {
+            println!("{} is already present and matches the pin", dest.display());
+            return Ok(());
+        }
+        return Err(format!(
+            "{} exists but hashes {h}, not the pinned {sha}. Re-run with --force.",
+            dest.display()
+        ));
+    }
+    download_within(url, dest, seconds)?;
+    let len = std::fs::metadata(dest)
+        .map_err(|e| format!("reading {}: {e}", dest.display()))?
+        .len();
+    let h = sha256(dest)?;
+    if len != bytes || h != sha {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!(
+            "{url} is {len} bytes hashing {h}; the pin is {bytes} bytes hashing {sha}"
+        ));
+    }
+    println!("{} verified", dest.display());
     Ok(())
 }

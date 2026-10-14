@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dataflow::{Channel, Endpoint};
-use tt_isa::dm::{self, op, record, Descriptor, Entry, Mover};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::Niu;
@@ -44,6 +44,10 @@ pub enum DmError {
         list: u32,
         code: u32,
     },
+    /// Host-encoded reads were asked for of a mover image built without them (the
+    /// default "safe" image, which decodes and checks every read itself): the image's
+    /// `dm::CAPS` lacks `FAST_READS`. Build the firmware with `fast-reads`.
+    FastReadsNotBuilt,
 }
 
 impl From<TransportError> for DmError {
@@ -71,6 +75,11 @@ impl std::fmt::Display for DmError {
                     "queued list {list} failed (code {code}); the queue has stopped"
                 )
             }
+            DmError::FastReadsNotBuilt => write!(
+                f,
+                "this data mover image was built without host-encoded reads \
+                 (firmware feature `fast-reads`)"
+            ),
         }
     }
 }
@@ -145,6 +154,63 @@ impl From<Niu> for WriteNoc {
     }
 }
 
+/// What the host does about a list that reads or writes L1 outside the data arena
+/// (`tt_isa::l1::DATA`): the mover's own regions, the images and the mailboxes are not a list's to name.
+/// Enforced unless `TT_CONTAIN` is `report` (print each violation and carry on, the survey that found
+/// the whole simulator suite names none) or `off`. Both modes' hosts; a list that was checked cannot
+/// aim a read at the mover's key, ring or image.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Containment {
+    Off,
+    /// Print each violation to stderr (the survey of which lists name other regions).
+    Report,
+    Enforce,
+}
+
+fn containment() -> Containment {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<Containment> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TT_CONTAIN").as_deref() {
+        Ok("report") => Containment::Report,
+        Ok("off") => Containment::Off,
+        _ => Containment::Enforce,
+    })
+}
+
+/// `op`'s access of `len` bytes at L1 address `l1` lies in the data arena.
+fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
+    let mode = containment();
+    if mode == Containment::Off || tt_isa::l1::DATA.contains(l1 as u64, len) {
+        return Ok(());
+    }
+    if mode == Containment::Report {
+        eprintln!("CONTAIN op={op:#x} l1={l1:#x} len={len}");
+        return Ok(());
+    }
+    Err(DmError::Invalid(dm::error::RANGE))
+}
+
+/// [`Entry::decode`], and a read or write's L1 range must be in the data arena.
+fn decode_contained(usable: u32, e: [u32; 8]) -> std::result::Result<(), u32> {
+    if let Entry::Move { descriptor, .. } = Entry::decode(usable, e)? {
+        contained(e[0], descriptor.l1, descriptor.range.len()).map_err(|_| dm::error::RANGE)?;
+    }
+    Ok(())
+}
+
+/// A fresh key for [`encoded::context_seed`]: the standard library's per-process random state
+/// hashed with the clock, so two starts in one process differ. Not a secret.
+fn random_key() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_nanos()),
+    );
+    h.finish() as u32
+}
+
 /// The resident mover on one tile.
 pub struct DataMover<N: NocId> {
     tile: NocCoord<N>,
@@ -158,6 +224,15 @@ pub struct DataMover<N: NocId> {
     in_flight: std::collections::VecDeque<(u32, u32, u32)>,
     /// The ring entry the next list is written from.
     write_at: u32,
+    /// What the image said it can do (`dm::CAPS`), read as it started.
+    caps: u32,
+    /// Whether single-request `READ` entries are sent as host-encoded reads
+    /// ([`DataMover::set_encode_reads`]). On at start exactly when the image was built
+    /// for them (`fast-reads`); a safe image never is.
+    encode_reads: bool,
+    /// What an encoded read is bound to: this chip, this tile and the key written to the
+    /// mover's mailbox as it started (`encoded::Context`), plus the endpoint bitmap `validate` needs.
+    context: encoded::Context,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -199,6 +274,10 @@ impl<N: NocId> DataMover<N> {
         d.write32(w, tile, mover.at(dm::MY_X), tile.x() as u32)?;
         d.write32(w, tile, mover.at(dm::MY_Y), tile.y() as u32)?;
         d.write32(w, tile, mover.at(dm::USABLE), dram.usable_mask() as u32)?;
+        // The key an encoded read's checksum is bound to (`encoded::context_seed`): fresh each
+        // start, so an entry left in L1 by an earlier run fails the card's check.
+        let key = random_key();
+        d.write32(w, tile, mover.at(dm::ENCODE_KEY), key)?;
         // L1 survives between processes: a stale `TRACE` from a profiled run
         // would have the mover store to a timestamper ttsim does not model.
         for word in [
@@ -210,6 +289,7 @@ impl<N: NocId> DataMover<N> {
             mover.at(dm::THROTTLE_CYCLES),
             mover.at(dm::WRITE_NOC),
             mover.at(dm::READ_FAST),
+            mover.at(dm::CAPS),
             mover.at(dm::QUEUE_HEAD),
             mover.at(dm::QUEUE_DONE),
             mover.at(dm::QUEUE_ERROR),
@@ -219,6 +299,15 @@ impl<N: NocId> DataMover<N> {
             d.write32(w, tile, word, 0)?;
         }
         d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
+        if mover.core == tt_isa::tensix::Core::B {
+            // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
+            // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
+            let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            d.l1_write(w, tile, mover.at(encoded::ENDPOINTS), &bits)?;
+        }
         let status_at = mover.mailbox + offset::STATUS;
         d.write32(w, tile, status_at, 0)?;
         match mover.core {
@@ -234,6 +323,23 @@ impl<N: NocId> DataMover<N> {
             |s| s == status::RUNNING,
         )?;
         started.map_err(|_| DmError::NotStarted)?;
+        // What this image was built to do: written as `firmware_main` starts, after the
+        // status word the wait above is for.
+        let caps = d
+            .wait_for_mailbox(
+                w,
+                tile,
+                mover.at(dm::CAPS),
+                mover.mailbox + offset::PANIC_CODE,
+                1_000_000,
+                |c| c & dm::caps::VALID != 0,
+            )?
+            .map_err(|_| DmError::NotStarted)?;
+        // A fast image issues its reads on request initiator 1 (`set_read_fast`), with the
+        // words that do not change written once per list, not per read.
+        if caps & dm::caps::FAST_READS != 0 {
+            d.write32(w, tile, mover.at(dm::READ_FAST), 1)?;
+        }
         Ok(DataMover {
             tile,
             mover,
@@ -242,6 +348,9 @@ impl<N: NocId> DataMover<N> {
             head: 0,
             in_flight: Default::default(),
             write_at: 0,
+            caps,
+            encode_reads: caps & dm::caps::FAST_READS != 0,
+            context: encoded::Context::new(dram.usable_mask() as u32, (tile.x(), tile.y()), key),
             deadline: Duration::from_secs(1),
         })
     }
@@ -278,6 +387,73 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<()> {
         d.write32(w, self.tile, self.mover.at(dm::IN_FLIGHT_CAP), cap)?;
         Ok(())
+    }
+
+    /// Whether this mover's image runs host-encoded reads (`dm::caps::FAST_READS`): the
+    /// firmware was built with `fast-reads`. Only B's can.
+    pub fn fast_reads(&self) -> bool {
+        self.caps & dm::caps::FAST_READS != 0
+    }
+
+    /// Send this mover's single-request `READ` entries as host-encoded reads
+    /// ([`tt_isa::dm::encoded`]) from the next list: the host checks each one in full
+    /// ([`encoded::validate`]) and the card only verifies its checksum, so a read entry
+    /// costs ~150 cycles on the card instead of ~360. Every list is still checked as plain
+    /// entries first. On by default for an image built with `fast-reads`, which is what
+    /// makes this possible: [`DmError::FastReadsNotBuilt`] for `true` on any other.
+    pub fn set_encode_reads(&mut self, on: bool) -> Result<()> {
+        if on && !self.fast_reads() {
+            return Err(DmError::FastReadsNotBuilt);
+        }
+        self.encode_reads = on;
+        Ok(())
+    }
+
+    /// What this mover's encoded reads are bound to (its key, tile and chip), for an entry
+    /// that has to be made by hand (the gates that forge one).
+    pub fn encode_context(&self) -> &encoded::Context {
+        &self.context
+    }
+
+    /// Whether [`DataMover::set_encode_reads`] is on.
+    pub fn encodes_reads(&self) -> bool {
+        self.encode_reads
+    }
+
+    /// `entries` as they are uploaded: with [`DataMover::set_encode_reads`], each
+    /// plain single-request `READ` (outside records, in a packet's reader section
+    /// and its trailing barrier part as well) replaced by its encoded form, one entry
+    /// for one, so no length or offset changes. Called after `check`.
+    fn upload_form<'a>(&self, entries: &'a [[u32; 8]]) -> std::borrow::Cow<'a, [[u32; 8]]> {
+        if !self.encode_reads || entries.is_empty() {
+            return std::borrow::Cow::Borrowed(entries);
+        }
+        let encode_section = |section: &mut [[u32; 8]]| {
+            let mut i = 0;
+            while i < section.len() {
+                let n = record::len(section[i][0]);
+                if n == 1 {
+                    // `check` passed this entry as a plain one, so `encode` cannot
+                    // refuse it; one that is not a short read stays as it is.
+                    if let Ok(Some(e)) = encoded::encode(&self.context, section[i]) {
+                        section[i] = e;
+                    }
+                }
+                i += n;
+            }
+        };
+        let mut out = entries.to_vec();
+        if out[0][0] == op::PAIR {
+            let (readers, writers) = (out[0][1] as usize, out[0][2] as usize);
+            let writer_end = 1 + readers + writers;
+            encode_section(&mut out[1..1 + readers]);
+            if out[0][4] != 0 {
+                encode_section(&mut out[writer_end..]);
+            }
+        } else {
+            encode_section(&mut out);
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     /// Issue this mover's GDDR reads through the fast path from its next list
@@ -389,7 +565,8 @@ impl<N: NocId> DataMover<N> {
         }
         // The mover's own checks, run first, so a bad entry costs no PCIe.
         self.check(entries)?;
-        let bytes: Vec<u8> = entries
+        let bytes: Vec<u8> = self
+            .upload_form(entries)
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())
@@ -471,14 +648,22 @@ impl<N: NocId> DataMover<N> {
             if !mover.permits(entries[i][0]) {
                 return Err(DmError::Invalid(dm::error::DIRECTION));
             }
-            if n == 1 {
-                Entry::decode(usable, entries[i]).map_err(DmError::Invalid)?;
+            if n == 1 && entries[i][0] == op::READ_ENCODED {
+                // A safe image has no such op, and says so (`error::OP`), as the card would.
+                if !self.fast_reads() {
+                    return Err(DmError::Invalid(dm::error::OP));
+                }
+                // The host's whole check of an encoded read, which the card only
+                // verifies (`encoded::verify`).
+                encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
+                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+            } else if n == 1 {
+                decode_contained(usable, entries[i]).map_err(DmError::Invalid)?;
             } else {
                 let rec = entries
                     .get(i..i + n)
                     .ok_or(DmError::Invalid(dm::error::LENGTH))?;
-                record::expand(rec, |e| Entry::decode(usable, e).map(|_| ()))
-                    .map_err(DmError::Invalid)?;
+                record::expand(rec, |e| decode_contained(usable, e)).map_err(DmError::Invalid)?;
             }
             i += n;
         }
@@ -509,8 +694,36 @@ impl<N: NocId> DataMover<N> {
 
     /// [`DataMover::enqueue`] for entries [`DataMover::check_list`] passed on
     /// this mover just now. Nothing checks them again: an unchecked list can
-    /// hang a card, so a caller passes the very entries it checked.
+    /// hang a card, so a caller passes the very entries it checked. Except an
+    /// encoded read: the one entry a caller could build by hand and which the
+    /// card trusts on a checksum alone, so each `READ_ENCODED` is validated here
+    /// whatever the caller checked (a walk of the op words; nothing to do in a
+    /// list without one).
     pub fn enqueue_checked<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+    ) -> Result<u32> {
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i][0] == op::READ_ENCODED {
+                if !self.fast_reads() {
+                    return Err(DmError::Invalid(dm::error::OP));
+                }
+                encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
+                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+            }
+            i += record::len(entries[i][0]);
+        }
+        self.enqueue_raw(d, w, entries)
+    }
+
+    /// [`DataMover::enqueue_checked`] with nothing checked at all, not even an encoded
+    /// read: for the gates that send a card a damaged or forged entry on purpose, to see
+    /// that the card refuses it. Never for a list that came from anywhere else.
+    #[doc(hidden)]
+    pub fn enqueue_raw<T: Transport>(
         &mut self,
         d: &mut Device<T>,
         w: &Window,
@@ -543,7 +756,8 @@ impl<N: NocId> DataMover<N> {
                 .0;
             self.wait_for(d, w, oldest)?;
         };
-        let bytes: Vec<u8> = entries
+        let bytes: Vec<u8> = self
+            .upload_form(entries)
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())

@@ -1,8 +1,11 @@
 //! Pick each image's link script, and tell it where its mailbox is.
 //!
-//! Every Tensix image uses `link.x` (T0's default reset PC) except the T1 and T2
-//! role images, which live at their own cores' default reset PCs so that one tile
-//! can hold all three role images at once. The Ethernet image uses `link_e1.x`.
+//! Every Tensix image uses `link.x` (T0's default reset PC) except the three role
+//! images, which live in their own slots (`link_role_t{0,1,2}.x`,
+//! `tt_isa::l1::roles`) so that one tile can hold all three role images and a
+//! mover of up to `dm::IMAGE_MAX` at once, and the per-core probes
+//! (`icache_t1`, `icache_t2`), which use their cores' default reset PCs. The
+//! Ethernet image uses `link_e1.x`.
 //! Per-binary link arguments are the only way to vary this within one crate.
 //!
 //! The mailbox base is a `--defsym` taken from `tt-isa` (a build-dependency), not
@@ -18,9 +21,9 @@ fn main() {
         ("prng_seed", "link.x"),
         ("corpus", "link.x"),
         ("corpus_t0", "link.x"),
-        ("role_t0", "link.x"),
-        ("role_t1", "link_t1.x"),
-        ("role_t2", "link_t2.x"),
+        ("role_t0", "link_role_t0.x"),
+        ("role_t1", "link_role_t1.x"),
+        ("role_t2", "link_role_t2.x"),
     ];
     for (bin, script) in tensix {
         link(bin, script, tt_isa::mailbox::MAILBOX_BASE);
@@ -32,6 +35,7 @@ fn main() {
     link("icache_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("tag_search_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("noc_probe_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
+    link("read_loop_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     for (bin, script, t) in [
         ("icache_t0", "link.x", 0),
@@ -48,12 +52,15 @@ fn main() {
     // (`docs/plans/ttinsn-push-experiment.md`). Only when the feature is on: cargo
     // refuses link arguments for a binary it is not building.
     if std::env::var_os("CARGO_FEATURE_TTINSN_EXPERIMENT").is_some() {
-        link("ttinsn_t1", "link_t1.x", tt_isa::mailbox::MAILBOX_BASE);
+        link("ttinsn_t1", "link_role_t1.x", tt_isa::mailbox::MAILBOX_BASE);
     }
     for f in [
         "link.x",
         "link_t1.x",
         "link_t2.x",
+        "link_role_t0.x",
+        "link_role_t1.x",
+        "link_role_t2.x",
         "link_e1.x",
         "link_b.x",
         "link_nc.x",

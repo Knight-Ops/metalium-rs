@@ -50,6 +50,9 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Matrix ELW row multiply, 65×70, two tiles, host | F32 41.6 / 42.0 µs; BF16 60.8 / 61.3 µs (cards 0 / 1) | initial materialized RHS F32 ~1129 / 1133 µs; BF16 ~1157 / 1161 µs | hold direct broadcast addressing; reduce per-tile dispatch costs |
 | GDDR6, one tile, 64 KiB entries | 81.4 GB/s | 94% NoC link | hold |
 | GDDR6, one tile, 4 KiB entries | 16.3 GB/s | 26% channel | cut per-entry cost |
+| GDDR6, one tile, 4 KiB entries, `fast-reads` build (host-encoded reads, tight loop; list-level trace) | 57.0 GB/s (14.9 in the safe default; 2026-10-13, card 1) | 89% channel | hold: one channel's own rate |
+| GDDR6 reads, card, 4 / 8 / 32 tiles, 4 KiB entries: safe -> `fast-reads` | 59 -> 219 / 119 -> 340 / 411 -> 461 GB/s (card 1) | 12% -> 43% / 23% -> 66% / 80% -> 90% | 512 GB/s |
+| GDDR6 reads, card, 120 tiles, 2 KiB entries: safe -> `fast-reads` | 401 -> 452 GB/s (card 0; three runs 451-453) | 78% -> 88% | 512 GB/s |
 | GDDR6 reads, card, 120 tiles | 469 GB/s | 92% | 512 GB/s |
 | GDDR6 writes, card, 120 tiles (writes on NoC #1) | 389 GB/s | 76% | 512 GB/s |
 | GDDR6 reads + writes, card, 120 tiles (writes on NoC #1) | 403 GB/s | 79% | 512 GB/s |
@@ -59,10 +62,31 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Device busy, 16 queued 32×256×32 matmuls | 12.6% of wall | — | ~100% |
 | MNIST training, card 0, 1 tile (`tt-mnist --host`) | 1.4 ms/step | burn-flex 0.5 | ≤ burn-flex |
 | Transformer training, card 0, 1 tile (`tt-mnist --model transformer`) | 8.8 ms/step | burn-flex 4.35 | ≤ burn-flex |
+| ResNet-18 forward, 224x224, batch 1, card 0, host (`silicon_bench_models`) | 16,288 ms, 211 reported ops (`1791846735`) | burn-flex 154.8 ms (105x slower) | max pool 2.8 s and 0.5-1.4 s a convolution: one 32-row chunk, one host-built table and one small matmul or reduction at a time; a chunk-free convolution and pooling (roadmap Track 2) |
+| ViT-Tiny forward, 224x224, batch 1, card 1, host | 815 ms, 709 reported ops (`1791846823`) | burn-flex 104.7 ms (7.8x slower) | about 1.1 ms an op: host submission; fusers and traces (roadmap Track 2) |
+| SmolLM2-135M decode step, embedding lookup excluded, card 1, host | 619 ms, 2,779 reported ops (`1791846823`) | burn-flex 25.0 ms (24.8x slower) | about 220 us an op; `cat` is `slice_assign` (722 calls a step); fusers and traces |
+| SmolLM2-135M decode step from a token id, lookup included, card 0, host | 623 ms (p10 525, p90 709), 2,781 reported ops (`1791852097`) | burn-flex 26.4 ms (23.6x slower); the same run without the lookup 622 ms | the lookup is about 1.4 ms of it; the rest is the host submission above |
+| SmolLM2-135M embedding lookup, one token from 49,152 x 576, card 0, host (`probe_embedding_cost`) | 260 us, median of 7 warm, validated against the host's rows (`1791851940`); five tokens 278 us, 32 tokens 344 us | was 15.9 s (`1791845218`): `gather_native` staged 28.3 million host addresses a token; now `Session::select_rows` reads only the rows it returns | hold; BF16, F16 and BFP tables still take the staged path (roadmap Track 2, "Gather without staging") |
 | SFPU precise `gelu`, three-role kernel, device cycles per tile (`probe_ttinsn_push`, card 0) | 38,053 cycles (T1 push 3.31 cycles/word: push-bound) | `.ttinsn` fused push, experiment only: 13,734 cycles, 2.77x (run-time translated: 2.67x) | decide the follow-on (roadmap Track 2) |
 | Accurate matmul (opt-in `MatmulMode::Accurate`), F32 `[256, 256] @ [256, 256]`, card 0, host | 10.96 ms (`1791818553`) | the fast Matrix Unit matmul: 277 us (39.6x); 19.1x to 64.4x over seven shapes, 18.7x at 1024 cubed; the exact mode is 750x slower than this at 256 cubed | the element-wise slicing and NaN/infinity classification are 64% to 86% of it (127 device jobs a matmul): fuse the slicing into one SFPU kind a slice, cheapen the classification, one matmul for the pairs; see roadmap, "Fused slicing for `MatmulMode::Accurate`" |
 | Exact matmul (opt-in `MatmulMode::Exact`), F32 `[256, 256] @ [256, 256]`, card 0, host | 8.19 s (about 0.5 us per product, 16 chunks; `1791761944`) | the fast Matrix Unit matmul: 376 us (22,000x); 64x32x64 1,000x, 1024x27x32 3,300x | cut the host-side table cost: a k-loop of broadcast multiply-adds (m + n addresses a step) instead of two `k x outputs` gathers; see roadmap Track 1 |
 | Requests that waited under the in-flight cap (120 tiles × 300 × 16 KiB, one channel) | 8762 per run | — | watch: revisit `MAX_IN_FLIGHT` if it binds below the NoC's own limit |
+
+### Model ladder: now against target
+
+Pretrained models, batch 1, F32, release, medians, burn-flex timed in the same run (`silicon_bench_models`; method and
+conditions in the [log](performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)). Update a
+row in place when its fix lands, add the run ID, and keep the old row in the log. Work items: roadmap Track 2, items 1-7.
+
+| Workload | burn-flex | Now (run) | Slowdown | Target | Roadmap item |
+|---|--:|--:|--:|---|---|
+| ResNet-18 forward, 224x224 (card 0) | 154.8 ms | 16,288 ms (`1791846735`) | 105x | at or below burn-flex | 2 |
+| ViT-Tiny forward, 224x224 (card 1) | 104.7 ms | 815 ms (`1791846823`) | 7.8x | at or below burn-flex | 4 |
+| SmolLM2-135M decode step, lookup excluded (card 1) | 25.0 ms | 619 ms (`1791846823`) | 24.8x | at or below burn-flex | 3 |
+| SmolLM2-135M embedding lookup, one token (card 0) | not measured | 260 us (`1791851940`; was 15.9 s, `1791845218`) | n/a | milliseconds: **met** for F32 | 1 |
+| SmolLM2-135M decode step from a token id, lookup included (card 0) | 26.4 ms | 623 ms (`1791852097`) | 23.6x | at or below burn-flex | 3 |
+| SmolLM2-135M BF16 decoded token, six layers, lookup included (card 0) | not measured | 37.5 s (`1791848957`) | n/a | no slower than F32 | 5 |
+| Traced rows for the three models | n/a | not measured | n/a | measure once segmentation lands | 6 |
 
 ### Where each row is evidenced
 
@@ -78,6 +102,8 @@ rows were refreshed in run `1791060908`; these bypass the streaming executor.
 | Operation baselines (BF16, packed, mesh) | [Native](performance-log.md#native-operation-baselines-2026-10-05), [BF16 and mesh](performance-log.md#bf16-and-mesh-operation-baselines-2026-10-05), [Packed BF16](performance-log.md#packed-bf16-update-2026-10-05) |
 | Accurate matmul against the fast one | [Accurate matmul cost](performance-log.md#accurate-matmul-cost-2026-10-12-card-0) |
 | Exact matmul against the fast one | [Exact matmul cost](performance-log.md#exact-matmul-cost-2026-10-11-card-0) |
+| Model forward passes (ResNet-18, ViT-Tiny, SmolLM2) | [Model ladder](performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) |
+| Embedding lookup, SmolLM2 decode from a token id | [Row select](performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) |
 | SFPU `gelu` kernel, `.ttinsn` push fusion | [`.ttinsn` push fusion](performance-log.md#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) |
 | P2 K-blocking, R3 norm, Approx, X6 | [P2/R3](performance-log.md#p2-k-blocking-and-r3-norm-release-baselines-2026-10-10), [Approx transcendentals](performance-log.md#approx-transcendentals-per-tile-saving-2026-10-10-card-0), [X6](performance-log.md#x6-mover-niu-fast-path-2026-10-10-card-0) |
 
@@ -190,6 +216,10 @@ reductions stage through L1 on chip 0 and are limited by L1/program capacity.
     made every decode about 100 cycles slower, as did decoding rare kinds out
     of line. Both were fixed by a one-byte `dm::Peer` and inline decode.
   - ~350 cycles per entry at any size up to 4 KiB.
+  - **Re-measured 2026-10-13** ([read-loop probe](performance-log.md#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0)):
+    359 device cycles per read entry (64 B or 4 KiB), against 90-106 for a bare loop or a replay of host-encoded
+    requests; `Entry::decode` + `DramMove` + issue alone is 189. The host-timed 0.48 us an entry is those 359 cycles
+    plus ~0.21 us of list upload.
   - Each request rebuilds and writes ten NIU registers.
   - GATHER records expand into one ~4 KiB read per tile.
 - [x] **Resident compute streams, fresh and traced** (checklist 9.15).

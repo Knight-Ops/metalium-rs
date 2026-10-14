@@ -517,6 +517,13 @@ fn sim_factory(
             self.buffers
                 .gather_indexed(&mut self.session, input, indices)
         }
+        fn select_rows(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.select_rows(&mut self.session, table, indices)
+        }
         fn repack_many(
             &mut self,
             inputs: &[burn_tt::BufferId],

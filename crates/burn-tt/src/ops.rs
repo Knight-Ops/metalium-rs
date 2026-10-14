@@ -829,9 +829,53 @@ fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
     mapped_native(&refs, sources, output)
 }
 
+/// Rows of a 32-bit matrix chosen by 1-D resident indices
+/// (`Session::select_rows`): a lookup that reads the rows it returns and builds
+/// no host address, where [`gather_native`] stages the whole table for every
+/// element. `None` for what the primitive does not take (the caller
+/// falls back): a table of rank other than two, one packed as two-byte or
+/// BFP storage, indices that are not I32, an empty selection.
+fn select_rows_native(tensor: &TtTensor, indices: &TtTensor) -> Option<TtTensor> {
+    let n = indices.shape().num_elements();
+    if tensor.shape().num_dims() != 2
+        || tensor.elem().is_none()
+        || indices.dtype() != DType::I32
+        || indices.shape().num_dims() != 1
+        || n == 0
+        || tensor.device != indices.device
+    {
+        return None;
+    }
+    let [rows, cols] = tensor.stored()?;
+    let (table, index) = (plain_dram(tensor), plain_dram(indices));
+    let f32_storage =
+        |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    if !f32_storage(&table)
+        || !f32_storage(&index)
+        || [table.buffer.rows, table.buffer.cols] != [rows, cols]
+        || [index.buffer.rows, index.buffer.cols] != [1, n]
+    {
+        return None;
+    }
+    let (id, dims) =
+        crate::server::select_rows(tensor.device, table.buffer.id, index.buffer.id, [n, cols]);
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        vec![n, cols].into(),
+        tensor.dtype(),
+    ))
+}
+
 fn select_native(tensor: TtTensor, dim: usize, indices: TtTensor) -> TtTensor {
     let mut shape = tensor.shape().to_vec();
     assert!(dim < shape.len() && indices.shape().num_dims() == 1);
+    if dim == 0 {
+        if let Some(rows) = select_rows_native(&tensor, &indices) {
+            return rows;
+        }
+    }
     shape[dim] = indices.shape().num_elements();
     let mut index_shape = vec![1; shape.len()];
     index_shape[dim] = shape[dim];

@@ -4,12 +4,12 @@
 // Protocol and layout are `tt_isa::dm`, which the host shares.
 
 use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, op, record, Descriptor, Entry, Transform};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Transform};
 use tt_isa::mailbox::role::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
 
-const TXN: TxnId = match TxnId::new(if IS_NC { 4 } else { 2 }) {
+const TXN: TxnId = match TxnId::new(if IS_NC { dm::TXN_NC } else { dm::TXN_B }) {
     Some(t) => t,
     None => panic!(),
 };
@@ -350,30 +350,33 @@ fn trace(on: bool, event: u32, detail: u32) {
     }
 }
 
-/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter,
-/// then NoC reads of it until it reaches `target`. The reads land in this
-/// tile's L1, which the NoC writes without invalidating the L0 cache: every
-/// check goes through a fence (`publish`).
+/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter
+/// (unless `arrive` is false, the wait-only form), then NoC reads of it until
+/// it reaches `target`. The reads land in this tile's L1, which the NoC writes
+/// without invalidating the L0 cache: every check goes through a fence
+/// (`publish`).
 #[inline(never)]
-fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
+fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), u32> {
     use tt_isa::noc::niu::Endpoint;
     let counter = Endpoint {
         x,
         y,
         addr: dm::BARRIER_COUNTER as u32,
     };
-    noc::issue(
-        Niu::Noc0,
-        &Command::AtomicIncrement {
-            to: counter,
-            value: 1,
-            ret_local: M.at(dm::BARRIER_RET) as u32,
-        },
-        me,
-        BARRIER_TXN,
-    )
-    .map_err(|_| dm::error::ALIGNMENT)?;
-    noc::wait(BARRIER_TXN);
+    if arrive {
+        noc::issue(
+            Niu::Noc0,
+            &Command::AtomicIncrement {
+                to: counter,
+                value: 1,
+                ret_local: M.at(dm::BARRIER_RET) as u32,
+            },
+            me,
+            BARRIER_TXN,
+        )
+        .map_err(|_| dm::error::ALIGNMENT)?;
+        noc::wait(BARRIER_TXN);
+    }
     loop {
         noc::issue(
             Niu::Noc0,
@@ -402,11 +405,93 @@ fn run(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     Ok(())
 }
 
+/// Whether this image runs host-encoded reads ([`op::READ_ENCODED`]): the `fast-reads`
+/// feature, B only. Without it (the default, "safe" mode) the card decodes and checks
+/// every read itself, and a `READ_ENCODED` entry is an unknown op that reaches no NIU
+/// (`error::OP`). A const, so a safe image carries none of the code below.
+const FAST_READS: bool = cfg!(feature = "fast-reads") && !IS_NC;
+
+/// Whether, besides the checksum, each encoded read is run through [`encoded::guard`]:
+/// the `encoded-guard` feature (about 50 cycles an entry).
+const ENCODED_GUARD: bool = FAST_READS && cfg!(feature = "encoded-guard");
+
+/// What this image tells the host it can do ([`dm::CAPS`]).
+const CAPS: u32 = dm::caps::VALID
+    | if FAST_READS { dm::caps::FAST_READS } else { 0 }
+    | if ENCODED_GUARD { dm::caps::GUARD } else { 0 };
+
+/// `op::READ_ENCODED`: one GDDR read the host validated and encoded
+/// (`tt_isa::dm::encoded`). The card verifies the entry's checksum -- damage in
+/// transit, an overwritten list, or an entry the encoder did not make -- and issues it
+/// as `issue_via` issues the words of a decoded one, with the tag and control word a B
+/// read always has. With `encoded-guard` it also runs the semantic guard first.
+#[link_section = ".text.hot"]
+#[inline(never)]
+fn read_encoded(me: (u8, u8), e: [u32; 8]) -> Result<(), u32> {
+    reader_only()?;
+    if !encoded::verify_with(&e, unsafe { ENCODE_SEED }) {
+        return Err(dm::error::ENCODED);
+    }
+    if ENCODED_GUARD {
+        let bit = |hi: u32| rd(M.at(encoded::ENDPOINTS) + (hi as u64 / 32) * 4) >> (hi % 32) & 1 != 0;
+        if !encoded::guard(&e, encoded::endpoint_hi(me.0, me.1), bit) {
+            return Err(dm::error::ENCODED);
+        }
+    }
+    if noc::read_fast() {
+        noc::room_for_read(TXN);
+        noc::issue_read(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7], TXN);
+    } else {
+        noc::issue_dram_on::<false>(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7], TXN);
+    }
+    Ok(())
+}
+
+/// A run of host-encoded reads from the ring at `base`, at most `max` entries, stopping at the first
+/// entry that is not one: `(entries issued, error code or 0)`. [`read_encoded`] for each, as a loop of
+/// its own: the seed, the guard's tile word and the issue's state stay in registers for the run, one
+/// `CMD_CTRL` read-back fences the run ([`noc::ReadBatch`]), and no entry is copied through an array.
+/// Entries before a bad one are issued, as they would be one at a time; the run is always ended, so
+/// they are counted. For the fast read path only, untraced.
+#[link_section = ".text.hot"]
+#[inline(never)]
+fn run_encoded_reads(me: (u8, u8), base: u64, max: u32) -> (u32, u32) {
+    let seed = unsafe { ENCODE_SEED };
+    let me_hi = encoded::endpoint_hi(me.0, me.1);
+    let mut batch = noc::ReadBatch::begin(TXN);
+    let mut k = 0u32;
+    let mut code = 0;
+    while k < max {
+        let e = entry_at(base + k as u64 * dm::ENTRY_BYTES);
+        if e[0] != op::READ_ENCODED {
+            break;
+        }
+        if !encoded::verify_with(&e, seed) {
+            code = dm::error::ENCODED;
+            break;
+        }
+        if ENCODED_GUARD {
+            let bit = |hi: u32| rd(M.at(encoded::ENDPOINTS) + (hi as u64 / 32) * 4) >> (hi % 32) & 1 != 0;
+            if !encoded::guard(&e, me_hi, bit) {
+                code = dm::error::ENCODED;
+                break;
+            }
+        }
+        batch.issue(e[1], e[2], e[3], e[4], encoded::TAG, encoded::CTRL, e[7]);
+        k += 1;
+    }
+    batch.end();
+    (k, code)
+}
+
 /// Run one list entry: plain entries are issued without waiting; a transposed
 /// read waits for its own tile before rearranging it; a kernel or a wait entry
 /// first waits for everything before it.
 #[link_section = ".text.hot"]
 fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
+    if FAST_READS && w[0] == op::READ_ENCODED {
+        return read_encoded(me, w);
+    }
     match Entry::decode(usable, w)? {
         Entry::IndexPick { indices, source, output, bound, first, rows, bytes } => {
             reader_only()?;
@@ -524,12 +609,17 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             noc::wait(TXN);
             publish();
         }
-        Entry::Barrier { target, x, y } => {
+        Entry::Barrier {
+            target,
+            x,
+            y,
+            arrive,
+        } => {
             reader_only()?;
             // Everything this unit moved before it has landed.
             noc::wait(TXN);
             publish();
-            barrier(me, target, x, y)?;
+            barrier(me, target, x, y, arrive)?;
         }
         Entry::Poke { address, value } => {
             reader_only()?;
@@ -769,6 +859,20 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
 const IS_CALL: u32 = u32::MAX;
 
 static mut CALL_BASE: u32 = 0;
+/// The seed of an encoded read's checksum (`encoded::context_seed`): this mover's key, tile,
+/// chip and op, set once at boot; flipped by `encoded::TRACE_DOMAIN` while a trace replays,
+/// so an encoded read inside a trace fails its check.
+static mut ENCODE_SEED: u32 = 0;
+
+/// Enter or leave a trace's domain of [`ENCODE_SEED`] (a safe image has none).
+#[inline(always)]
+fn flip_trace_domain() {
+    if FAST_READS {
+        unsafe {
+            ENCODE_SEED ^= encoded::TRACE_DOMAIN;
+        }
+    }
+}
 static mut PAIR_ACTIVE: bool = false;
 static mut TRACE_DEPTH: u32 = 0;
 
@@ -874,7 +978,8 @@ fn pair_call(
 #[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
-    let traced = rd(M.at(dm::TRACE)) != 0;
+    let mode = rd(M.at(dm::TRACE));
+    let traced = mode != 0;
     let outer = traced && unsafe { TRACE_DEPTH == 0 };
     if traced {
         unsafe {
@@ -888,10 +993,31 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
         while i < count as u64 {
             let head = at(i);
             let n = record::len(head[0]) as u64;
-            let entry_traced = traced && head[0] != op::PAIR_CALL;
+            // `trace_mode::LISTS` leaves the reads out, so they keep the untraced paths.
+            let entry_traced = traced
+                && head[0] != op::PAIR_CALL
+                && !(mode == dm::trace_mode::LISTS && (head[0] == op::READ || head[0] == op::READ_ENCODED));
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
             if n == 1 {
-                if let Err(code) = exec(me, usable, head) {
+                // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
+                // fast read path; past it, each goes straight to its issue, past `exec`'s
+                // prologue and decode (`exec` also takes it, for the other callers).
+                if FAST_READS && !entry_traced && head[0] == op::READ_ENCODED && noc::read_fast() {
+                    let (done, code) =
+                        run_encoded_reads(me, base + i * dm::ENTRY_BYTES, (count as u64 - i) as u32);
+                    if code != 0 {
+                        wr(M.mailbox + offset::RESULT, head[0]);
+                        return Err(code);
+                    }
+                    i += done as u64;
+                    continue;
+                }
+                let r = if FAST_READS && head[0] == op::READ_ENCODED {
+                    read_encoded(me, head)
+                } else {
+                    exec(me, usable, head)
+                };
+                if let Err(code) = r {
                     wr(M.mailbox + offset::RESULT, head[0]);
                     return Err(code);
                 }
@@ -949,13 +1075,63 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     for (k, e) in rec[..n].iter_mut().enumerate() {
         *e = entry_at(at + k as u64 * dm::ENTRY_BYTES);
     }
+    if rec[0][0] == record::POKE_RUN {
+        return poke_run(&rec[..n]);
+    }
     // Each mover expands its own direction's records, so the other's code is
     // not in its image.
     if IS_NC {
         record::expand_writes(&rec[..n], |e| record_entry(me, usable, e))
     } else {
-        record::expand_reads(&rec[..n], |e| record_entry(me, usable, e))
+        if rec[0][0] == record::SELECT_ROWS {
+            // Its indices were read into L1 by entries before it: they have
+            // landed, and are visible to this core, before the first is read
+            // (as `INDEX_PICK`'s).
+            noc::wait(TXN);
+            publish();
+        }
+        record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e))
     }
+}
+
+/// [`record::POKE_RUN`]: a run of consecutive role-mailbox words, written with one
+/// fence for the run instead of [`dm::op::POKE`]'s one for each. What the record
+/// expands to (`record::expand_reads`, which the host checks the list with) is exactly
+/// these stores in this order; the loop is here so a descriptor costs a record rather
+/// than seventeen entries.
+///
+/// The roles read these words only once a later `KERNEL` or `LAUNCH` posts their
+/// generation, so one fence after the run is what orders them, as `op::POKE`'s is.
+#[inline(never)]
+fn poke_run(rec: &[[u32; 8]]) -> Result<(), u32> {
+    reader_only()?;
+    let count = rec[0][2];
+    if count == 0 || count as usize > record::POKE_RUN_MAX {
+        return Err(dm::error::RANGE);
+    }
+    // A value past the run would be a word the host's expansion never writes.
+    let mut k = count as usize;
+    while k < record::POKE_RUN_MAX {
+        if record::poke_run_word(rec, k) != 0 {
+            return Err(dm::error::OP);
+        }
+        k += 1;
+    }
+    let first = rec[0][1];
+    // The run is at most 48 bytes and the mailboxes are 0x4000 apart, so first and
+    // last inside a mailbox puts every word of it in that one.
+    let last = match first.checked_add(4 * (count - 1)) {
+        Some(last) => last,
+        None => return Err(dm::error::RANGE),
+    };
+    if !dm::is_role_mailbox_word(first) || !dm::is_role_mailbox_word(last) {
+        return Err(dm::error::OP);
+    }
+    for k in 0..count {
+        wr((first + 4 * k) as u64, record::poke_run_word(rec, k as usize));
+    }
+    publish();
+    Ok(())
 }
 
 /// [`dm::op::CALL`]: a trace's entries from GDDR, a chunk at a time into
@@ -1030,7 +1206,9 @@ fn call(
         unsafe {
             CALL_BASE = generation_base;
         }
+        flip_trace_domain();
         let result = run_entries(me, usable, chunk, n);
+        flip_trace_domain();
         unsafe {
             CALL_BASE = previous;
         }
@@ -1045,6 +1223,8 @@ fn call(
 pub extern "Rust" fn firmware_main() -> ! {
     // Gathering off, as on every role (`tt_firmware::disable_gathering`).
     tt_firmware::disable_gathering();
+    // What this image was built to do, before the host's first list.
+    wr(M.at(dm::CAPS), CAPS);
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
     // Local data RAM is not zeroed on the simulator (divergence row 25).
     *launched() = 0;
@@ -1056,6 +1236,12 @@ pub extern "Rust" fn firmware_main() -> ! {
         };
     }
     let usable = rd(M.at(dm::USABLE));
+    if FAST_READS {
+        unsafe {
+            ENCODE_SEED =
+                encoded::context_seed(rd(M.at(dm::ENCODE_KEY)), me, usable, op::READ_ENCODED);
+        }
+    }
     let mut beat: u32 = 0;
     noc::set_clock(wall_clock);
     let mut stalls = noc::stalls();

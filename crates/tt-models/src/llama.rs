@@ -1,0 +1,538 @@
+//! A decoder-only Llama-architecture language model: SmolLM2-135M.
+//!
+//! 30 pre-norm layers of grouped-query attention (9 query heads, 3 key/value heads, head size 64)
+//! with rotary position embeddings, and a SwiGLU MLP, over a 49,152-token vocabulary whose
+//! embedding table is also the output projection (`tie_word_embeddings`). Written with Burn's own
+//! `Embedding`, `Linear` and `RmsNorm`, so it exercises what a real model uses: RMSNorm, SiLU, RoPE
+//! (`sin` and `cos` computed on the device from the positions), `cat`/`slice` for the rotation,
+//! and a key/value cache kept in preallocated tensors and filled with `slice_assign`.
+//!
+//! Field names follow the checkpoint, so only the `model.` prefix and the norms' `weight` need
+//! remapping on load (`Layout::remaps`: Burn's `RmsNorm` calls its scale `gamma`, and `burn-store`'s
+//! PyTorch adapter renames only batch, layer and group norms).
+//!
+//! The checkpoint is BF16. [`Precision::Bf16`] keeps it so, and every activation follows;
+//! [`Precision::F32`] widens each parameter once after loading (lossless), which is what makes a
+//! comparison with burn-flex a comparison of the same arithmetic on the same values.
+
+use burn::module::{Module, ModuleMapper, Param};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::tensor::activation::silu;
+use burn::tensor::backend::Backend;
+use burn::tensor::module::attention;
+use burn::tensor::ops::AttentionModuleOptions;
+use burn::tensor::{DType, Int, Tensor, TensorData};
+
+use crate::load::{load_safetensors, weights_path, Layout, LoadError, Loaded};
+
+pub const HIDDEN: usize = 576;
+pub const HEADS: usize = 9;
+pub const KV_HEADS: usize = 3;
+pub const HEAD_DIM: usize = HIDDEN / HEADS;
+pub const GROUPS: usize = HEADS / KV_HEADS;
+pub const FF: usize = 1536;
+pub const VOCAB: usize = 49_152;
+pub const FULL_LAYERS: usize = 30;
+const ROPE_THETA: f64 = 100_000.0;
+const EPS: f64 = 1e-5;
+
+/// The dtype the model computes in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// The checkpoint's own BF16: parameters, activations and the cache.
+    Bf16,
+    /// Parameters widened to F32 after loading.
+    F32,
+}
+
+impl Precision {
+    pub fn dtype(self) -> DType {
+        match self {
+            Precision::Bf16 => DType::BF16,
+            Precision::F32 => DType::F32,
+        }
+    }
+}
+
+fn linear<B: Backend>(inp: usize, out: usize, device: &B::Device) -> Linear<B> {
+    LinearConfig::new(inp, out).with_bias(false).init(device)
+}
+
+fn rms_norm<B: Backend>(device: &B::Device) -> RmsNorm<B> {
+    RmsNormConfig::new(HIDDEN).with_epsilon(EPS).init(device)
+}
+
+#[derive(Module, Debug)]
+pub struct SelfAttn<B: Backend> {
+    q_proj: Linear<B>,
+    k_proj: Linear<B>,
+    v_proj: Linear<B>,
+    o_proj: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct Mlp<B: Backend> {
+    gate_proj: Linear<B>,
+    up_proj: Linear<B>,
+    down_proj: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct Layer<B: Backend> {
+    input_layernorm: RmsNorm<B>,
+    self_attn: SelfAttn<B>,
+    post_attention_layernorm: RmsNorm<B>,
+    mlp: Mlp<B>,
+}
+
+/// Rotary tables for a run of positions: `[1, 1, t, HEAD_DIM]` each.
+struct Rope<B: Backend> {
+    cos: Tensor<B, 4>,
+    sin: Tensor<B, 4>,
+}
+
+impl<B: Backend> Rope<B> {
+    /// `angle = position * theta^(-2i / HEAD_DIM)`, the first half of the row repeated as the
+    /// second (the rotate-half layout). The positions and the frequencies are host data that
+    /// the shapes fix; the products and the `sin` and `cos` run on the device.
+    fn new(start: usize, t: usize, dtype: DType, device: &B::Device) -> Self {
+        let positions: Vec<f32> = (start..start + t).map(|p| p as f32).collect();
+        let freqs: Vec<f32> = (0..HEAD_DIM / 2)
+            .map(|i| ROPE_THETA.powf(-(2.0 * i as f64) / HEAD_DIM as f64) as f32)
+            .collect();
+        let pos = Tensor::<B, 2>::from_data(TensorData::new(positions, [t, 1]), device);
+        let freq = Tensor::<B, 2>::from_data(TensorData::new(freqs, [1, HEAD_DIM / 2]), device);
+        let angles = pos * freq;
+        let angles = Tensor::cat(vec![angles.clone(), angles], 1).reshape([1, 1, t, HEAD_DIM]);
+        Self {
+            cos: angles.clone().cos().cast(dtype),
+            sin: angles.sin().cast(dtype),
+        }
+    }
+
+    fn apply(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let [n, h, t, d] = x.dims();
+        let half = d / 2;
+        let x1 = x.clone().slice([0..n, 0..h, 0..t, 0..half]);
+        let x2 = x.clone().slice([0..n, 0..h, 0..t, half..d]);
+        let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
+        x * self.cos.clone() + rotated * self.sin.clone()
+    }
+}
+
+/// Each key/value head repeated for its group of query heads (`repeat_interleave`).
+fn repeat_kv<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [n, kv, l, d] = x.dims();
+    let mut heads = Vec::with_capacity(kv * GROUPS);
+    for h in 0..kv {
+        let one = x.clone().slice([0..n, h..h + 1, 0..l, 0..d]);
+        heads.extend((0..GROUPS).map(|_| one.clone()));
+    }
+    Tensor::cat(heads, 1)
+}
+
+/// A named activation boundary: `"layers.3.mlp_hidden"` and `"layers.3.attn_ctx"` pass through it,
+/// so a precision plan can hold an activation in another format ([`crate::quant`]).
+pub type ActFn<B> = std::sync::Arc<dyn Fn(&str, Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>;
+
+/// `x @ W` for a projection, computed in the weight's own dtype: the activation is cast in and the
+/// result cast back to the residual stream's dtype, so matrices held in different formats (F32,
+/// BF16, F16, block floating point) share one stream.
+fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
+    let stream = x.dtype();
+    let weight = linear.weight.val().dtype();
+    if weight == stream {
+        linear.forward(x)
+    } else {
+        linear.forward(x.cast(weight)).cast(stream)
+    }
+}
+
+impl<B: Backend> Layer<B> {
+    fn new(device: &B::Device) -> Self {
+        Self {
+            input_layernorm: rms_norm(device),
+            self_attn: SelfAttn {
+                q_proj: linear(HIDDEN, HEADS * HEAD_DIM, device),
+                k_proj: linear(HIDDEN, KV_HEADS * HEAD_DIM, device),
+                v_proj: linear(HIDDEN, KV_HEADS * HEAD_DIM, device),
+                o_proj: linear(HEADS * HEAD_DIM, HIDDEN, device),
+            },
+            post_attention_layernorm: rms_norm(device),
+            mlp: Mlp {
+                gate_proj: linear(HIDDEN, FF, device),
+                up_proj: linear(HIDDEN, FF, device),
+                down_proj: linear(FF, HIDDEN, device),
+            },
+        }
+    }
+
+    fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &Rope<B>,
+        cache: &mut LayerCache<B>,
+        start: usize,
+        index: usize,
+        act: Option<&ActFn<B>>,
+    ) -> Tensor<B, 3> {
+        let hook = |name: &str, t: Tensor<B, 3>| match act {
+            Some(f) => f(&format!("layers.{index}.{name}"), t),
+            None => t,
+        };
+        let [n, t, _] = x.dims();
+        let h = self.input_layernorm.forward(x.clone());
+        let a = &self.self_attn;
+        let heads =
+            |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, HEAD_DIM]).swap_dims(1, 2);
+        let q = rope.apply(heads(project(h.clone(), &a.q_proj), HEADS));
+        let k = rope.apply(heads(project(h.clone(), &a.k_proj), KV_HEADS));
+        let v = heads(project(h, &a.v_proj), KV_HEADS);
+
+        let total = start + t;
+        cache.k = cache
+            .k
+            .clone()
+            .slice_assign([0..n, 0..KV_HEADS, start..total, 0..HEAD_DIM], k);
+        cache.v = cache
+            .v
+            .clone()
+            .slice_assign([0..n, 0..KV_HEADS, start..total, 0..HEAD_DIM], v);
+        let keys = repeat_kv(
+            cache
+                .k
+                .clone()
+                .slice([0..n, 0..KV_HEADS, 0..total, 0..HEAD_DIM]),
+        );
+        let values = repeat_kv(
+            cache
+                .v
+                .clone()
+                .slice([0..n, 0..KV_HEADS, 0..total, 0..HEAD_DIM]),
+        );
+
+        // A prompt attends causally to itself; one new token attends to everything cached.
+        let out = attention(
+            q,
+            keys,
+            values,
+            None,
+            None,
+            AttentionModuleOptions {
+                scale: None,
+                softcap: None,
+                is_causal: t > 1,
+            },
+        );
+        let context = hook(
+            "attn_ctx",
+            out.swap_dims(1, 2).reshape([n, t, HEADS * HEAD_DIM]),
+        );
+        let x = x + project(context, &a.o_proj);
+
+        let h = self.post_attention_layernorm.forward(x.clone());
+        let m = &self.mlp;
+        let hidden = hook(
+            "mlp_hidden",
+            silu(project(h.clone(), &m.gate_proj)) * project(h, &m.up_proj),
+        );
+        x + project(hidden, &m.down_proj)
+    }
+}
+
+/// One layer's keys and values, `[batch, KV_HEADS, max_len, HEAD_DIM]`, filled front to back.
+struct LayerCache<B: Backend> {
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+}
+
+/// The keys and values of every position a model has seen.
+pub struct KvCache<B: Backend> {
+    layers: Vec<LayerCache<B>>,
+    len: usize,
+    max_len: usize,
+    act: Option<ActFn<B>>,
+}
+
+impl<B: Backend> KvCache<B> {
+    /// Pass every named activation of the run through `act`.
+    pub fn with_activations(mut self, act: ActFn<B>) -> Self {
+        self.act = Some(act);
+        self
+    }
+
+    /// Positions already cached.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Llama<B: Backend> {
+    embed_tokens: Embedding<B>,
+    layers: Vec<Layer<B>>,
+    norm: RmsNorm<B>,
+}
+
+/// Widens every float parameter to F32.
+struct ToF32;
+
+impl<B: Backend> ModuleMapper<B> for ToF32 {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        param.map(|t| t.cast(DType::F32))
+    }
+}
+
+impl<B: Backend> Llama<B> {
+    /// The architecture with `layers` layers and its initialiser's weights.
+    pub fn new(layers: usize, device: &B::Device) -> Self {
+        assert!((1..=FULL_LAYERS).contains(&layers), "layers {layers}");
+        Self {
+            embed_tokens: EmbeddingConfig::new(VOCAB, HIDDEN).init(device),
+            layers: (0..layers).map(|_| Layer::new(device)).collect(),
+            norm: rms_norm(device),
+        }
+    }
+
+    /// The pretrained model (`cargo xtask fetch-weights --model smollm2-135m`), keeping the first
+    /// `layers` of its thirty, computing in `precision`.
+    pub fn pretrained(
+        layers: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        let mut model = Self::new(layers, device);
+        let dropped = move |name: &str| {
+            name.strip_prefix("layers.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|i| i.parse::<usize>().ok())
+                .is_some_and(|i| i >= layers)
+        };
+        let loaded = load_safetensors(
+            &mut model,
+            &weights_path("smollm2-135m"),
+            &Layout {
+                remaps: &[
+                    (
+                        r"^model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.weight$",
+                        "layers.$1.$2.gamma",
+                    ),
+                    (r"^model\.norm\.weight$", "norm.gamma"),
+                    (r"^model\.", ""),
+                ],
+                pytorch: true,
+                ignore: &dropped,
+            },
+        )?;
+        let model = match precision {
+            Precision::Bf16 => model,
+            Precision::F32 => model.map(&mut ToF32),
+        };
+        Ok((model, loaded))
+    }
+
+    /// The embedding rows of `tokens` `[1, t]`, as `[1, t, HIDDEN]`.
+    pub fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.embed_tokens.forward(tokens)
+    }
+
+    /// An empty cache for `max_len` positions of one sequence.
+    pub fn cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> KvCache<B> {
+        let shape = [1, KV_HEADS, max_len, HEAD_DIM];
+        KvCache {
+            layers: self
+                .layers
+                .iter()
+                .map(|_| LayerCache {
+                    k: Tensor::zeros(shape, (device, dtype)),
+                    v: Tensor::zeros(shape, (device, dtype)),
+                })
+                .collect(),
+            len: 0,
+            max_len,
+            act: None,
+        }
+    }
+
+    /// The logits `[1, VOCAB]` after the last of `tokens` (`[1, t]`), which are appended to
+    /// `cache`. Either a prompt into an empty cache, or one token into a filled one.
+    pub fn forward(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        cache: &mut KvCache<B>,
+        dtype: DType,
+    ) -> Tensor<B, 2> {
+        let x = self.embed_tokens.forward(tokens);
+        self.forward_embedded(x, cache, dtype)
+    }
+
+    /// [`Self::forward`] from the embedded tokens `[1, t, HIDDEN]`: everything after the table
+    /// lookup. It exists to time the model apart from the lookup (`silicon_bench_models`).
+    pub fn forward_embedded(
+        &self,
+        mut x: Tensor<B, 3>,
+        cache: &mut KvCache<B>,
+        dtype: DType,
+    ) -> Tensor<B, 2> {
+        let [n, t, _] = x.dims();
+        assert_eq!(n, 1, "one sequence at a time");
+        let start = cache.len;
+        assert!(
+            start == 0 || t == 1,
+            "a cache holding {start} positions takes one token, not {t}"
+        );
+        assert!(start + t <= cache.max_len, "the cache is full");
+        let device = x.device();
+
+        if x.dtype() != dtype {
+            x = x.cast(dtype);
+        }
+        let rope = Rope::new(start, t, dtype, &device);
+        let act = cache.act.clone();
+        for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            x = layer.forward(x, &rope, c, start, index, act.as_ref());
+        }
+        cache.len += t;
+
+        let last = self
+            .norm
+            .forward(x)
+            .slice([0..1, t - 1..t, 0..HIDDEN])
+            .reshape([1, HIDDEN]);
+        // The output projection is the embedding table, transposed, computed in its dtype.
+        let table = self.embed_tokens.weight.val();
+        let last = if table.dtype() == last.dtype() {
+            last
+        } else {
+            last.cast(table.dtype())
+        };
+        last.matmul(table.transpose())
+    }
+}
+
+/// The logits a run of next-token predictions produced.
+#[derive(Debug)]
+pub struct Generation {
+    /// Wall time of each forward pass, the prompt's first, including reading its logits back.
+    pub times: Vec<std::time::Duration>,
+    /// The tokens chosen (greedy), or fed (teacher-forced), after the prompt.
+    pub tokens: Vec<i32>,
+    /// `logits[i]` is the prediction for the position after `prompt + tokens[..i]`, `[VOCAB]`.
+    pub logits: Vec<Vec<f32>>,
+}
+
+impl Generation {
+    /// Run one forward pass, read its logits back and record the wall time of both.
+    fn step<B: Backend>(&mut self, forward: impl FnOnce() -> Tensor<B, 2>) {
+        let t0 = std::time::Instant::now();
+        self.logits.push(read(forward()));
+        self.times.push(t0.elapsed());
+        if std::env::var_os("TT_MODELS_TRACE").is_some() {
+            eprintln!("forward {}: {:.2?}", self.times.len() - 1, t0.elapsed());
+        }
+    }
+}
+
+fn argmax(v: &[f32]) -> usize {
+    (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap()
+}
+
+fn read<B: Backend>(logits: Tensor<B, 2>) -> Vec<f32> {
+    // BF16 logits widen exactly; F32 ones are unchanged.
+    logits
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .expect("F32 logits")
+}
+
+fn ids<B: Backend>(tokens: &[i32], device: &B::Device) -> Tensor<B, 2, Int> {
+    Tensor::from_data(TensorData::new(tokens.to_vec(), [1, tokens.len()]), device)
+}
+
+impl<B: Backend> Llama<B> {
+    /// Greedy decoding: `steps` tokens after `prompt`, each chosen from the previous step's logits.
+    pub fn generate(
+        &self,
+        prompt: &[i32],
+        steps: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        self.generate_with(prompt, steps, precision, None, device)
+    }
+
+    /// [`Self::generate`] with named activations passed through `act`.
+    pub fn generate_with(
+        &self,
+        prompt: &[i32],
+        steps: usize,
+        precision: Precision,
+        act: Option<ActFn<B>>,
+        device: &B::Device,
+    ) -> Generation {
+        assert!(steps >= 1);
+        let dtype = precision.dtype();
+        let mut cache = self.cache(prompt.len() + steps, dtype, device);
+        if let Some(act) = act {
+            cache = cache.with_activations(act);
+        }
+        let mut out = Generation {
+            times: Vec::new(),
+            tokens: Vec::with_capacity(steps),
+            logits: Vec::with_capacity(steps),
+        };
+        out.step(|| self.forward(ids(prompt, device), &mut cache, dtype));
+        for step in 0..steps {
+            let next = argmax(out.logits.last().expect("one prediction per step")) as i32;
+            out.tokens.push(next);
+            if step + 1 < steps {
+                out.step(|| self.forward(ids(&[next], device), &mut cache, dtype));
+            }
+        }
+        out
+    }
+
+    /// The predictions after `prompt` and after each prefix of `continuation`, feeding the
+    /// continuation's own tokens, so two backends are compared on the same inputs at every step
+    /// however their own argmax would have gone.
+    pub fn forced(
+        &self,
+        prompt: &[i32],
+        continuation: &[i32],
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        self.forced_with(prompt, continuation, precision, None, device)
+    }
+
+    /// [`Self::forced`] with named activations passed through `act`.
+    pub fn forced_with(
+        &self,
+        prompt: &[i32],
+        continuation: &[i32],
+        precision: Precision,
+        act: Option<ActFn<B>>,
+        device: &B::Device,
+    ) -> Generation {
+        let dtype = precision.dtype();
+        let mut cache = self.cache(prompt.len() + continuation.len() + 1, dtype, device);
+        if let Some(act) = act {
+            cache = cache.with_activations(act);
+        }
+        let mut out = Generation {
+            times: Vec::new(),
+            tokens: continuation.to_vec(),
+            logits: Vec::with_capacity(continuation.len() + 1),
+        };
+        out.step(|| self.forward(ids(prompt, device), &mut cache, dtype));
+        for &token in continuation {
+            out.step(|| self.forward(ids(&[token], device), &mut cache, dtype));
+        }
+        out
+    }
+}

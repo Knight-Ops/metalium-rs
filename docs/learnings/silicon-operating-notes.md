@@ -936,6 +936,67 @@ to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x
 faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
 matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
+## RISCV B's image budget (2026-10-13, ttsim and card 0)
+
+**Update 2026-10-13: B's slot is 42 KiB, not 24 KiB.** The role images moved (below); the measurements and
+lessons that follow were taken against the old 24,576-byte slot and still describe how code size moves.
+
+B's entry point is hardwired to L1 offset 0, so its image can only grow upward, up to whatever is placed next. That
+used to be T0's *default* reset PC (0x6000). The three role images use about 8 KB each, but each sat in a 16 KiB
+slot at its core's default reset PC; T0, T1 and T2 have reset-PC overrides, and `Device::load_held` sets one for
+every core but B. The role images are now linked at `tt_isa::l1::roles::BASE` (T0 `0xA800`, T1 `0xD000`, T2
+`0xF800`, 10 KiB slots ending at NC's reset PC), so `tt_isa::dm::IMAGE_MAX` is 43,008 bytes (`dm_b`: 24,404, so 18,604
+left). Only the production role images moved; probe images (`corpus`, `icache_t*`, ...) keep the default PCs and are
+never loaded beside the mover. Silicon is unchanged in speed ([performance-log.md](performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0)).
+Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller; `s` and `z` are not usable (mover 1.6x
+slower, role push loop 7x).
+
+Before the role images moved, RISCV B's mover image (`dm_b`) could not pass 0x6000 = 24,576 bytes: T0's default
+reset PC is where the next image starts, and B (entry hardwired at 0) has no reset-PC override. The link fails
+("section '.text' will not fit in region 'L1'") rather than clobbering T0. Measured with `size -A` on the ELF
+(`.text` + `.rodata` + `.bss`; git `e17f4c9` plus the row select):
+
+| Image | Bytes | Left |
+|---|--:|--:|
+| `dm_b` before `SELECT_ROWS` | 23,644 | 932 |
+| with `SELECT_ROWS` (32-bit datums), first build | 24,532 | 44 |
+| the same arm with the half-loop kept rolled (`black_box`), as built | 24,404 | 172 |
+
+Packed BF16, measured against the first build (24,532): a branch that reads the 64-byte pair into a scratch
+slot and then runs `COPY_HALFWORDS` of the wanted half linked at 24,932 (**356 over**; a second emit site in
+the loop instead of one made it 684 over), and the pair read alone, with no copy, at 24,600 (**24 over**).
+These were not re-measured after the rolled loop saved 108 bytes, so the pair read alone should now fit.
+
+What the numbers taught (each from a build, not from reading code):
+- **One record arm cost 760 bytes.** On rv32im every `u64` add or multiply is several instructions: a checked
+  `u64` tile-number computation in `Cursor::new` cost 164 bytes on its own, so the record checks the product
+  once (`bound.div_ceil(32) x ct`) and the cursor adds in `u32`.
+- **LLVM unrolled the two-iteration loop over a face-row's halves** and duplicated the emit and address code:
+  `for half in 0..core::hint::black_box(2)` kept it a loop and saved 108 bytes. Look for this before cutting a
+  check.
+- **Sizes move by tens of bytes with unrelated changes** (inlining decisions shift): one build of the same arm
+  was 8 bytes worse after a change that removed code. Measure each candidate; do not add the estimates.
+- **`cargo clippy` made every image about 900 bytes larger** (`dm_b` 24,540 against 23,644 for the same
+  source): `tt-firmware-images/build.rs` stripped `RUSTC_WRAPPER` from the nested firmware `cargo` but not
+  `RUSTC_WORKSPACE_WRAPPER`, which clippy sets to `clippy-driver`. A change that fit a build overflowed the
+  CI lint. It strips both now, so the firmware is the same bytes whoever builds it; firmware is linted on its own
+  (`cargo clippy --manifest-path crates/tt-firmware/Cargo.toml ...`).
+- RISCV NC's image (`dm_nc`, 14,240 bytes of its 24,576-byte slot, `dm::nc::IMAGE_MAX`) has about 10 KB free.
+
+**Open: a packed-BF16 row select** (roadmap, Track 2, "Gather without staging"). A BF16 face-row is 32 bytes at
+`TILE_DATA + face x 512 + row x 32`: congruent to `TILE_DATA` mod 64 (the GDDR read rule) only on an even row,
+and a read's L1 destination must be congruent to its source, so a wanted row of one parity cannot be read
+straight into an output row of the other. Every arrangement that lands the wanted row at one fixed L1 place
+fails the same congruence for one of the two source parities. The candidates:
+1. The B-side branch above: 400 bytes at the time it was measured, more than B had.
+2. **Split it.** B reads the 64-byte pair containing the wanted row into a staged tile (a stride and a mask on the
+   F32 arm: about 70 bytes on B, which fits) and NC, which has the room, writes the 32 bytes at `pair + 32 x
+   (index & 1)` to the output tile's face-row (a write needs only 16-byte congruence). That needs a writing
+   record that reads the index tile, so each half of the staging needs its own index slot (B reads the next
+   batch's indices while NC still writes the last), and the output's rows past `n` are not written, so its padding
+   is `Undefined`.
+3. Make room in B: no longer needed -- B's slot grew by 18 KiB (above), so the B-side branch (1) fits.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.
@@ -953,3 +1014,26 @@ Rules that held through the Phase 10 close-out; follow them for any new probe.
   the pattern, so it never ends and leaks shells; wait on the run's log or exit status instead.
 - **A worktree needs `vendor/`.** It is git-ignored, so copy it from the main checkout before building
   there (`cargo xtask fetch-ttsim`/`fetch-spec` also work).
+
+## Running tt-metal after this repo's gates (2026-10-13, card 1)
+
+tt-metal (v077, UMD 0.77) will not open a card that this repo's Ethernet gates have touched. The first thing it does is return the
+active Ethernet cores to base firmware, and the image `tt-firmware`'s `eth_e1` leaves on E1 persists across processes:
+`Device 0: Timed out while waiting for active ethernet core 24-25 to become active again. Try resetting the board. Minimum
+tt-firmware version is 18.10.0` (`return_to_base_firmware_and_wait_for_heartbeat`). With both cards visible the same state showed as a
+hang after "Opening subset of mmio devices" (the first attempt, killed by its 500 s timeout).
+
+- **Fix:** `tt-smi -r <PCI address>` for the card, with nothing else on it (`tt-smi -ls` lists the addresses; card 1 is `0000:02:00.0`
+  here). After it, tt-metal opens the card. Nothing else in the repo needed re-establishing: the gates start from a known state.
+- **The other direction, 2026-10-13:** after tt-metal runs on card 1 and many benchmark processes, the two-card Ethernet gate
+  `step76_burn_bf16::bf16_mesh_product_uses_resident_ethernet_execution_across_two_cards` failed on both card-0 smoke runs and with
+  `--device all` (`resident Ethernet transfer: transfer 1 was not acknowledged (last acknowledged: 0)`); `tt-smi -r 0000:01:00.0
+  0000:02:00.0` and it passed on both cards, with the same build. A mesh gate that fails like that after tt-metal has touched the
+  cards is link state: reset both boards before suspecting the code.
+- **Fence the cards:** `TT_VISIBLE_DEVICES=<PCIe device number>` restricts UMD to that card, so tt-metal's cluster start (which
+  touches every card it can see) cannot disturb a job on the other one.
+- **First import is slow:** `import ttnn` took about three minutes cold (the libraries come off disk); a C++ program linked against
+  `build_Release` does not pay it. The installed ttnn 0.72 needs SFPI 7.52.0 and the machine has 7.83.0 in `/opt/tenstorrent/sfpi` (its
+  kernel JIT fails), so the working route is a tree with its own SFPI: `tt-metal-v077`'s `build_Release` (SFPI 7.69), which JIT-compiles
+  kernels itself.
+- **Fast dispatch reserves cores:** the compute grid is 11x10 = 110 on a card where this repo has 12x10 = 120.

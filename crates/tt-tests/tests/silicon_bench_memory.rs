@@ -721,7 +721,16 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
             .sum::<u64>()
     };
     let stalls_before = throttle(d, f);
+    // The lists' own events and the barrier's release are all the timing needs. Tracing every read
+    // (`AGG_TRACE=full`, what these runs did before) adds ~94 cycles to an encoded read and keeps a
+    // run of them out of the tight loop: it halved the rate one tile showed (29, not 58 GB/s).
+    let trace_mode = match std::env::var("AGG_TRACE").as_deref() {
+        Ok("full") => dm::trace_mode::FULL,
+        _ => dm::trace_mode::LISTS,
+    };
     for m in &f.movers[..n] {
+        d.write32(&f.w, m.tile(), m.mover().at(dm::TRACE), trace_mode)
+            .unwrap();
         d.configure_trace(&f.w, m.tile(), TRACE_BUFFER, TRACE_BUFFER_BYTES)
             .unwrap();
     }
@@ -914,15 +923,14 @@ fn gddr_aggregate() {
                 card.as_ref()
             };
             for &n in &counts {
-                measure(
-                    d,
-                    &mut f,
-                    n,
-                    mix,
-                    Shape::AGG,
-                    peak,
-                    &format!("gddr {mix:?} {n:>3} tiles"),
-                );
+                // `AGG_LEN` set (not the 64 KiB the baseline has) is part of the label.
+                let shape = agg_shape();
+                let label = if shape.len == AGG_LEN {
+                    format!("gddr {mix:?} {n:>3} tiles")
+                } else {
+                    format!("gddr {mix:?} {n:>3} tiles, {} B entries", shape.len)
+                };
+                measure(d, &mut f, n, mix, shape, peak, &label);
             }
             if mix == Mix::Read {
                 // The timed lists reuse L1 slots across channels, so which
@@ -930,19 +938,20 @@ fn gddr_aggregate() {
                 // tile's last four entries alone -- one slot each, through the
                 // same mover -- and compares them with the GDDR they read.
                 for &t in &check {
-                    let list = agg_list(&f, t, have, Mix::Read, Shape::AGG);
+                    let list = agg_list(&f, t, have, Mix::Read, agg_shape());
                     let last = &list[list.len() - 4..];
                     f.movers[t].run_list(d, &f.w, last).unwrap();
                     let mut back = vec![0u8; L1_SPAN as usize];
                     d.l1_read(&f.w, f.movers[t].tile(), L1 as u64, &mut back)
                         .unwrap();
+                    let len = agg_shape().len as usize;
                     for (k, e) in last.iter().enumerate() {
                         let ch = e[1];
                         let at = (e[3] as u64 - BASE - t as u64 * (1 << 20)) as usize;
                         let want = pattern(1 << 20, t as u32 * 16 + ch + 1);
                         let l1 = (e[4] - L1) as usize;
                         assert!(
-                            back[l1..l1 + AGG_LEN as usize] == want[at..at + AGG_LEN as usize],
+                            back[l1..l1 + len] == want[at..at + len],
                             "tile {t}'s read entry {k} (ch {ch}, +{at:#x}) did not land"
                         );
                     }

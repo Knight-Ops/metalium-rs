@@ -26,6 +26,8 @@ hooks = [
     # `--all-targets`: there are no test targets, and asking for them fails
     # looking for a `test` crate that does not exist for a no_std target.
     { id = "cargo-clippy-firmware", name = "cargo clippy (firmware)", entry = "cargo clippy --manifest-path crates/tt-firmware/Cargo.toml --target riscv32im-unknown-none-elf --bins --lib -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+    # The same for the mover's fast read modes (`fast-reads`, which `encoded-guard` implies): a different image.
+    { id = "cargo-clippy-firmware-guard", name = "cargo clippy (firmware, encoded-guard)", entry = "cargo clippy --manifest-path crates/tt-firmware/Cargo.toml --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
 
     # The backend-configuration table is generated from a pinned header. This
     # catches a hand-edit to the generated file, which would otherwise survive

@@ -12,6 +12,19 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
+| [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
+| [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Open-all made strictly better](#open-all-made-strictly-better-2026-10-14-cards-0-and-1) | 2026-10-14 | no per-op loop over every open tile, and a tile's catch-up rides in its first list for the op: 120 tiles at a fixed spread match the best small session (transformer 77.9 against 79.8 on 2 tiles, MNIST 2.2 = 8 tiles), and a per-op spread now pays on mixed sizes (a 2048^2 add 725 us against 1,054 at a fixed 4, small ops 19.4 us both) |
+| [Per-op tile spread](#per-op-tile-spread-2026-10-14-card-1) | 2026-10-14 | `Session::set_spread` / `TT_SPREAD`: a session can open every tile and give each op a few; at 120 tiles a fixed spread of 4 gives MNIST 2.2-2.3 ms/step (6.7 on every tile, 2.1 on an 8-tile session) and the transformer ~80 (96.8; 74-76 on 2 tiles); spreads that vary per op lose to churn; the default stays every tile |
+| [Barriers on the units an op ran on](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) | 2026-10-14 | a tile an op does not use no longer enqueues a barrier list for it: the all-tiles transformer 404-422 -> 96-98 ms/step (now faster than one tile), all-tiles MNIST 12.9-13.4 -> 6.7, one tile unchanged, losses and accuracy identical |
+| [Descriptor runs in a trace's prologue](#descriptor-runs-in-a-traces-prologue-2026-10-14-card-0) | 2026-10-14 | `record::POKE_RUN`: a trace's 51 `POKE`s become 9 records, 8,824 -> 4,892 device cycles a replay; a replay is 2.3-4.6 us shorter host-timed, its stream 124 -> 91 entries, and the 8-tile chunk boundary is gone |
+| [Trace replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) | 2026-10-14 | a replayed tiny streaming op costs ~7.4-8.7 us, about half of it control (pair begin ~1.05 us, finish ~1.3-1.6, credits ~0.9, barrier ~0.6-0.7 on many tiles); the 51-`POKE` prologue is 7.2 us a replay; a chunk boundary is 0.75 us; the host adds ~2 us a tile |
+| [Trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim) | 2026-10-14 | a captured op costs ~18 stream entries (~0.6 KiB) but ~8 KiB of GDDR (whole-slot sections) and, per distinct op, ~4 KiB of pinned program cache (~0.6 KiB a program); programs are shared by hash; chunk padding is 0-1% |
+| [Records and NC writes](#per-tile-cost-of-the-movers-records-and-ncs-writes-2026-10-13-cards-0-and-1) | 2026-10-13 | A record's tile costs a plain entry's ~340 cycles on B (read) and ~320-345 on NC (write); only plain entries gain from encoding |
+| [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
+| [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
+| [Model ladder: real models on the card](#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1) | 2026-10-12 | ResNet-18 105x, ViT-Tiny 7.8x and a SmolLM2 decode step 25x slower than burn-flex; a token embedding alone 15.9 s; 32-row chunking with host-built tables in convolution, pooling and gathers is the cost |
 | [Accurate matmul cost](#accurate-matmul-cost-2026-10-12-card-0) | 2026-10-12 | opt-in F32-accuracy matmul on the Matrix Unit: 19x to 64x slower than the fast one; the element-wise work around the matmuls dominates |
 | [Exact matmul cost](#exact-matmul-cost-2026-10-11-card-0) | 2026-10-11 | opt-in F32 matmul 1,000x to 22,000x slower than the fast one; linear in products |
 | [`.ttinsn` push fusion, precise `gelu`](#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0) | 2026-10-10 | experiment: 2.77x on a push-bound kernel; not adopted |
@@ -40,6 +53,8 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-13 | 1791851940 / 1791852097 | Row select (`Session::select_rows`, B's `SELECT_ROWS`): the embedding lookup of SmolLM2's 49,152 x 576 table, 15.9 s -> 260 us a token, validated against the host's rows; a decode step from a token id 623 ms; see "Row select" below. | Scoreboard rows updated in place. |
+| 2026-10-12 | 1791846735 / 1791846823 | Model ladder: ResNet-18, ViT-Tiny and SmolLM2-135M forward passes against burn-flex on the same weights, cards 0 and 1 (one job per card), validated; see "Model ladder" below. | New scoreboard rows. |
 | 2026-10-12 | 1791818553 | Accurate matmul (`MatmulMode::Accurate`) against the fast Matrix Unit matmul, seven shapes, card 0, validated; see "Accurate matmul cost" below. | New scoreboard row. |
 | 2026-10-11 | 1791761944 | Exact matmul (`MatmulMode::Exact`) against the fast Matrix Unit matmul, four shapes, card 0, validated; see "Exact matmul cost" below. | New scoreboard row. |
 | 2026-10-10 | 1791597495 | Release card-0 smoke tier after the Phase 10 close-out: 486/486 pass (baseline before the close-out: 258/258, run `1791558187`). | None; correctness record. |
@@ -276,6 +291,829 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## tt-metal reference: DRAM reads by core count (2026-10-13, card 1)
+
+The same measurement on tt-metal (`crates/tt-tests/bench/tt_metal_dram_read/`, v077 `d53c2a71fb0`, fast dispatch): N cores each
+read their share of one interleaved DRAM buffer page by page (`noc_async_read_page`, a `TensorAccessor`), `--batch` requests then a
+barrier, into a 256 KiB window of their own L1, timed by the tile wall clock inside the kernel (first request to last landing; all
+bytes checked against a poisoned window). Card 1, AICLK 1350 MHz; ours is `gddr_aggregate` (Read mix, rotating channels, cap 8)
+on the same card in the same session. GB/s for the whole card, and per core in brackets. tt-metal's fast dispatch reserves cores:
+**110 here, ours 120**.
+
+| Cores | 2 KiB: ours safe | ours fast | tt-metal | 4 KiB: ours safe | ours fast | tt-metal | 16 KiB: ours safe | ours fast | tt-metal |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 7.4 | 14.4 | 25.5 | 14.7 | 28.8 | 44.2 | 58.2 | 85.1 | 69.2 |
+| 4 | 29.4 | 57.1 | 101 | 58.6 | 114 | 174 | 232 | 330 | 257 |
+| 8 | 58.7 | 114 | 197 | 117 | 227 | 314 | 463 | 452 | 368 |
+| 16 | 117 | 226 | 240 | 234 | 343 | 321 | 483 | 482 | 374 |
+| 32 | 233 | 288 | 250 | 397 | 447 | 361 | 484 | 484 | 370 |
+| 64 | 335 | 393 | 357 | 462 | 474 | 402 | 488 | 489 | 383 |
+| 110 (tt-metal) / 120 (ours) | 386 | 446 | 378 | 480 | 491 | 415 | 496 | 496 | 387 |
+
+Ours: 2 KiB safe / fast `1791910320` / `1791910651`, 4 KiB `1791910902` / `1791911151`, 16 KiB `1791907949` / `1791908197`. tt-metal's
+logs: `target/silicon/bench/ttmetal-v077-card1-*.log`.
+
+**Per core, few cores** (the entry cost; 1 core): a 4 KiB page is ~125 cycles on tt-metal (44.2 GB/s), 175 on ours fast (28.8), 359 on
+ours safe (14.7); a 2 KiB page ~108 / 175 / 359. Ours fast is within 1.5x of tt-metal's compiled reader at 4 KiB (1.8x at 2 KiB), safe
+within 3x (3.4x). At 16 KiB, where the NoC is the limit, ours fast is faster, 85 against 69 GB/s: our window of requests slides, where
+tt-metal's loop drains at every barrier.
+
+**Whole card, many cores:** ours reaches 94-97% of the 512 GB/s at 4 and 16 KiB (safe and fast alike) and 77 / 87% at 2 KiB; the plain
+interleaved tt-metal pattern reaches 81% at 4 KiB, 76% at 16 KiB, 74% at 2 KiB. The difference is already there at 64 cores (tt-metal 402
+against our 462 / 474 at 4 KiB), so it is not the 110 cores.
+
+Variants of tt-metal's side (4 KiB unless noted; whole-card GB/s at 1 / 8 / 110 cores):
+
+| Variant | 1 | 8 | 110 |
+|---|--:|--:|--:|
+| barrier every 8 pages, NoC0 (the table) | 44.2 | 314 | 415 |
+| barrier every 32 pages | 68.0 | 322 | 415 |
+| NoC1 (NCRISC, tt-metal's default reader), batch 8 | 42.1 | 96.3 | 249 |
+| core i reads bank i mod 8 directly (`--pinned`), batch 8 | 35.8 | 264 | 371 |
+| the same, batch 32 | 54.1 | 293 | 339 |
+| 16 KiB pinned, batch 8 | 54.1 | 307 | 364 |
+| 2 KiB, one request in flight (the stock `6_dram_offchip` pattern) | 5.3 | 42.3 | 299 |
+
+**Read this with its limits.**
+- Two things I did not do: tt-metal's tuned DRAM benchmark (its report places one reader per bank next to it to avoid NoC
+  congestion; this run uses the first N cores in row order), and a port choice: its interleaved and bank-id addressing reach each bank
+  through one port, where ours rotates over the channel's three (`gddr_aggregate_affinity`'s Nearest mixes, one port, reach only
+  50-70% on our side too). So "tt-metal tops out at 76-81%" is the idiomatic pattern on this placement, not tt-metal's limit; their
+  published figure on Wormhole is 92.7% with the tuned layout. **The port spreading is my hypothesis for the gap, not something tested
+  on tt-metal.**
+- Their barrier-per-batch loop leaves bubbles that our sliding cap does not; the batch-32 row shows it only helps at one core.
+- Timing is by the same wall clock and the bytes are checked on both sides; ours and tt-metal's ran on card 1, one after the other, at 1350 MHz,
+  16,000 MT/s, 8 channels. tt-metal's `compute_with_storage_grid_size` is 11x10 under fast dispatch.
+
+## Host-encoded read entries (2026-10-13, card 0)
+
+`op::READ_ENCODED` (`tt_isa::dm::encoded`). The host sends a read as `[READ_ENCODED, TARG, TARG_HI, RET, RET_HI, CHECK, 0,
+LEN]` (the same 32 bytes; `TAG` and `CTRL` of a B read are constants the card supplies) and validates it in full
+(`encoded::validate`, by reconstruction: it must equal what `Descriptor::decode` + `DramMove` make for some valid move).
+The card verifies `CHECK`, an integrity word, and issues. It is a **build-time mode of the B mover**, firmware feature
+`fast-reads` (`cargo xtask silicon --feature fast-reads`):
+
+| Mode | Build | The card |
+|---|---|---|
+| **safe** (default) | no feature | decodes and checks every read itself; `READ_ENCODED` is an unknown op (`error::OP`), refused before any NIU write |
+| **fast** | `fast-reads` | verifies a checksum; issues |
+| **fast + guard** | `encoded-guard` | the checksum, and `encoded::guard` (usable-endpoint bitmap, return coordinate, bounds, mod-64 congruence) |
+
+The image writes `dm::CAPS` as it starts and the host reads it (`DataMover::fast_reads`): a safe image is never encoded for
+(`set_encode_reads(true)` is `DmError::FastReadsNotBuilt`), a fast one is by default. `DataMover::set_encode_reads` rewrites every
+plain single-request `READ` after the usual check (outside records; in a packet's reader section too; one entry for one).
+Gate `step172_encoded_reads` (ttsim and card 0), in whichever mode is built. `dm_b`: safe 24,412 bytes (24,404 before the
+capability word), fast 24,832, fast + guard 24,992; `dm_nc` unchanged.
+
+**Closing the safety gap to safe mode (plan phase 1, 2026-10-13, branch `fast-mode-hardening`).**
+- *Context-bound checksum.* The checksum's seed is `encoded::context_seed(key, tile, usable, op)`: `key` is a fresh random word the
+  host writes to `dm::ENCODE_KEY` before it starts the mover (the firmware reads it once at boot into a `static`), so an entry
+  made for an earlier mover instance (a list left in L1), another tile or chip, or another op fails the card's check
+  (`step172 ... refuses_an_entry_made_for_an_earlier_mover`, a valid read in every other respect, so safe to send on silicon). A trace
+  replay (`CALL`) flips the seed by `TRACE_DOMAIN`, so an encoded entry inside a trace fails it; the host never encodes in a trace.
+  A binding against mix-ups, not a MAC: whoever can write L1 can read the key. Unit tests: every bit of key, x, y, usable and
+  op changes the seed; an entry verifies for no other context. Watched failing with the key removed from the seed.
+- *`validate` is not circular.* It still reconstructs the entry through `encode` (so the card cannot run a request the safe decode
+  would refuse), and now also requires `guard`, a check that shares no code with it, so an encoder bug that `validate` agrees with is
+  caught on the host in both builds. The fuzz property "validate accepts => guard accepts" holds over 5 million cases.
+- *`enqueue_checked` validates every `READ_ENCODED`* (an unknown op, `error::OP`, on a safe image) and the gates that forge entries on
+  purpose use the `#[doc(hidden)]` `enqueue_raw`.
+- *A destination moved by 64 bytes is not refusable.* The earlier plan expected `encoded-guard` to refuse an encoded entry with
+  `ret += 64` and a recomputed check. It is another valid read (congruent, inside L1): neither `validate` nor the guard can call it
+  wrong, because only the caller knows where it was meant to land. What protects against it is that the host only makes entries from
+  plain reads it has checked, and the card's checksum is keyed. `step173_mover_differential` holds the end-to-end property instead:
+  seeded random lists (mixed sizes, one request and several, every channel and port, `WAIT`s between, disjoint destinations)
+  land the host-memcpy oracle's bytes in the safe build, in fast mode with plain entries and with encoded ones. Its negative control
+  is that very `ret += 64` entry, which the comparison reports as a mismatch (the comparison has teeth).
+- *Cost.* Silicon, card 0 (gate runs `1791925982` safe and `1791926071` fast, entry cost `1791926086`, safe plain entry `1791926103`): all 14 gate runs pass in the safe and fast builds; the encoded
+  entry is **180.5 cycles** (175 before: the seed is a load from local RAM instead of an immediate; P2's tight loop hoists it) and the
+  safe build's plain entry unchanged (362 / 359 / 360 against 362 / 362 / 361 before at N = 64 / 256 / 448). `dm_b`: safe 24,400
+  bytes, fast 24,924, fast + guard 25,092; `dm_nc` 14,252.
+
+**End-to-end, after phases 0-3 and 7 (card 0, release, runs `1791930590` safe, `1791931447` `--feature fast-reads`).** The smoke
+selection, one card, one boot each: safe 606 of 607 pass, fast 611 of 612 (the five extra are step173 and the new step172 gates); the one
+failure in both is the two-card Ethernet gate `step76 bf16_mesh_product`, which needs both cards and the Ethernet link in a known
+state: it failed on `--device all` too, and passed on both cards after `tt-smi -r` of both boards
+([silicon-operating-notes](silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)), so it is link state
+and not the movers. Neither build refused a list.
+
+**Traced execution, with the traces left plain (2026-10-14, card 0; the capture-time encoding of a trace's reads was built, measured and
+reverted: `ff39af0`, `2315646`).** Replay time, three runs each, pre-branch commit (`7f18dde`) / this branch's safe build / its fast build: traced
+MNIST inference, batch 64, 1 tile 0.493 / 0.494 / 0.469 ms per batch, all tiles 0.510-0.522 / 0.509-0.524 / 0.513-0.524; traced CNN training, 1
+tile, 146.2 / 145.6 / 146.8 ms per step. So **the branch's safety and speed commits did not slow traced execution** (safe equals the
+pre-branch commit), and **fast mode alone does not speed it up**: a trace holds plain entries, which the card decodes at the safe rate, and the
+fast image's one effect on them is the initiator-1 issue path (`READ_FAST`, on by default there: plain reads 361 -> 334 cycles), worth ~5% on a
+one-tile replay. Encoding a trace's reads needs the trace's reads to be encodable, and nearly all of a streaming op's reads are records
+(a captured layer held 0 plain reads); expanding the records at capture gave -16% (inference, 1 tile) and -17% (CNN training, 1 tile) but grew a
+trace 1.3x to 7x in entries (1.0x in the default build), needing a size budget and an unexpanded fallback, for replays that are mostly compute
+and synchronisation. Not kept. If a traced workload turns out to be read-bound, the size-neutral route is sealed static read records (the
+card validates a record once and issues its tiles at the encoded rate, the record staying three entries), not expansion.
+
+**Containment (plan phase 7, 2026-10-13; both modes, host only).** `DataMover::check_as` now requires every read's or write's L1
+range, top-level, encoded or expanded from a record, to lie in the data arena (`tt_isa::l1::DATA`, `0x2_0000` to the mailbox
+base): a list cannot be aimed at the mover's key, its list ring, its mailbox or its image, which neither mode's card-side
+decode forbids (`Descriptor::decode` bounds by `L1_SIZE`). A survey first (`TT_CONTAIN=report`, the whole simulator suite, 1,484 tests
+passing) found **no list that names another region**, so nothing needed a named exception and enforcement is the default
+(`TT_CONTAIN=off` or `report` override it). `step172 a_read_cannot_be_aimed_at_the_movers_own_l1`, in both builds: the encode key,
+the mailbox, the ring, the image and a read running past the arena's end are refused (`error::RANGE`) before any PCIe, and the same
+test fails with `TT_CONTAIN=off` (the read onto the key is accepted). Not covered, and what remains trusted: the other entry kinds
+that name L1 (`INDEX_PICK`, `COPY_WORDS`, `FILL`), `MY_X`, `MY_Y` and `USABLE` (host-written in both modes), and the key, which
+is a binding against mix-ups and not a MAC. The survey also met one failing test unrelated to the movers, `burn-tt`
+`essentials::dtype_capabilities_advertise_what_the_device_computes_and_no_more`, which fails the same on the commit before this change.
+
+**The tight read loop (plan phase 2, 2026-10-13, card 0).** Three steps, each measured on card 0 with a resident list rerun from the
+sequence word (device cycles per encoded entry, 4 KiB; 64 B in brackets):
+
+| Step | Fast | Fast + guard | Safe (plain) | Run |
+|---|--:|--:|--:|---|
+| after phase 1 (keyed checksum) | 180.5 (180.5) | | 361 | `1791926086` |
+| 1. request initiator 1 (X6) by default in a fast image | 159.7 (155.2) | | 361 (fast image's plain entry 334) | `1791926392` |
+| 2-3. `noc::ReadBatch` and `run_encoded_reads`, a loop of its own | **90.8 (81.0)** | **108.7 (108.6)** | 363 / 358 / 360 (N = 64 / 256 / 448; unchanged) | `1791926751`, `1791926891`, `1791926977` |
+| 4. software pipelining | not done: the bare issue loop is ~88 at 4 KiB, 69 at 64 B (read-loop probe) | | | |
+
+- *Step 1* costs nothing but a host write (`READ_FAST = 1` in `start_on` when the image reports `FAST_READS`): each request
+  writes the address words, `CTRL` and the command, and the rest of initiator 1 once per list (`step118` holds it
+  byte-identical to the slow path on silicon, with its negative controls). It takes the fast image's plain entries from 361 to 334 too.
+- *Steps 2-3.* `run_encoded_reads` runs a list's consecutive `READ_ENCODED` entries in one loop, untraced, on the fast path:
+  the checksum seed, the guard's tile word, the in-flight room and the initiator's key stay in registers for the run;
+  the entry is read word by word, not copied into an array; and `CMD_CTRL` is read back **once per run**
+  (`noc::ReadBatch`, over `tt_isa::noc::niu::Batch`) instead of after every request -- the next request's own wait for the
+  initiator to be free reads the same register behind the same store, so only the counter reads need the fence (before a
+  refill, and when the run ends). Error semantics are the one-at-a-time path's: entries before a bad one are issued, then
+  `RESULT = READ_ENCODED` and the code, with no final wait; `step172` holds it for a bad first, middle and last entry of a run
+  of eight, watched failing with the issue moved before the check. The accounting is unit-tested on the host against the
+  NIU model (the counter never passes the cap, it is read only when the batch is out of room and always after a fence, one
+  fence per refill and per non-empty batch). 90.8 is within 3 cycles of the bare issue loop, so there is nothing left for
+  software pipelining to win; the guard costs 18 cycles in the loop (it was 40).
+- *What it did to the card.* The first card-wide runs after the tight loop read the same as before (1 tile 29.1 GB/s at 4 KiB) and
+  were taken as the loop not mattering; they were traced runs, which bypass the loop. Untraced it takes a tile from 15 GB/s to
+  57 (see "What bounds one tile's read rate" in this section).
+
+**What bounds one tile's read rate (2026-10-13, cards 0 and 1; this corrects the first card-wide runs after the tight loop, and the first
+in-flight cap sweep).** Those read 29 GB/s for one tile at every cap, with the bound unexplained, and were taken as the tight loop not
+mattering. They measured the benchmark, not the mover: `gddr_aggregate` times its lists with the timestamper, which stores two events
+around every entry (`dm::TRACE`), and a traced run does not take the tight loop (`run_encoded_reads` is for untraced lists) and pays the
+events on top. The probe `silicon_probe_read_loop::what_bounds_one_tiles_read_rate` (card 1, fast build, one tile, 256 reads of 4 KiB,
+resident lists rerun from the sequence word, every repetition's landed bytes compared; run `1791932966`) isolates it:
+
+| 4 KiB reads, one tile | per entry | rate |
+|---|--:|--:|
+| one channel, untraced, plain (the safe path's cost) | 346.5 cycles | 16.0 GB/s |
+| one channel, untraced, **encoded** | **90.1** | **61.4 GB/s** |
+| eight channels in turn, untraced, plain | 354.7 | 15.6 |
+| eight channels in turn, untraced, **encoded** | **94.7** | **58.4** |
+| one channel, **traced**, encoded | 184.0 | 30.0 |
+| eight channels in turn, traced, encoded | 186.2 | 29.7 |
+| traced, plain | 359-369 | 15.0-15.4 |
+
+Tracing costs an encoded read ~94 cycles (the events, and the loop it excludes) and a plain read ~13: the benchmark understated the fast mode
+by 2x and the safe mode by 4%. A new `dm::trace_mode::LISTS` (`TRACE = 2`: the list's begin and end and every entry but a plain or encoded
+read) gives `gddr_aggregate` what it needs (the barrier's release and the list's end) with the reads untraced; it is the default now, and
+`AGG_TRACE=full` restores the old runs. The safe image is unchanged by the firmware change (plain 358 / 358 / 358 cycles at N = 64 / 256 /
+448; 363 / 358 / 360 before), the fast entry is 91.5.
+
+**Card-wide reads, list-level trace** (GB/s; safe and fast builds, card 1 at 4 KiB, card 0 at 2 KiB; runs `1791933129` and `1791933479`
+at 4 KiB, `1791933130` and `1791933480` at 2 KiB):
+
+| Tiles | 4 KiB safe | 4 KiB fast | fast / safe | 2 KiB safe | 2 KiB fast | fast / safe |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 14.9 | 57.0 | 3.8x | 7.5 | 30.0 | 4.0x |
+| 2 | 29.7 | 112.1 | 3.8x | 14.9 | 58.9 | 4.0x |
+| 4 | 59.4 | 219.3 | 3.7x | 29.8 | 115.0 | 3.9x |
+| 8 | 118.8 | 340.0 | 2.9x | 59.6 | 222.1 | 3.7x |
+| 16 | 237.4 | 376.0 | 1.6x | 118.8 | 252.3 | 2.1x |
+| 32 | 411.2 | 460.7 | 1.12x | 229.7 | 315.5 | 1.37x |
+| 64 | 454.0 | 484.0 | 1.07x | 353.3 | 404-414 | 1.15-1.17x |
+| 120 | 480.1 | 494.8 | 1.03x | 401.3 | 451-453 | 1.13x |
+
+(That lane's 2 KiB fast run read 312 and 375 GB/s at 64 and 120 tiles, an outlier: three other runs of the same configuration, the cap
+sweep's cap 8 included, read 404-414 and 451-453, so those two are not used.) A tile reads 57-61 GB/s, 89-95% of one channel; the card is
+3.7-3.8x the safe default up to 4 tiles at 4 KiB, at 66% of its bandwidth with 8 tiles (23% safe) and 90% with 32; the channels, not the
+movers, bound it from 16 tiles at 4 KiB and from 32 at 2 KiB.
+
+**In-flight depth** (plan phase 3, not built): with the list-level trace the cap (2, 3, 4, 6, 8; fast; card 0 at 2 KiB, card 1 at 4 KiB)
+changes nothing beyond noise at any tile count: 4 KiB, 8 tiles 338 / 326 / 337 / 337 / 335 GB/s, 32 tiles 450 / 455 / 449 / 460 / 459, 120 tiles
+492 / 494 / 492 / 494 / 494; 2 KiB, 8 tiles 222 / 223 / 185 / 204 / 222, 120 tiles 447 / 450 / 440 / 450 / 451 (one cap-4 point is low). The plan
+gated a per-list cap on 5% at 1-4 tiles with no regression at 16 or more; the cap does not matter either way, so it stays 8 and the machinery
+is not built. (The first sweep, with every read traced, showed no effect either, for the wrong reason.)
+
+**End to end (`tt-mnist`, card 0, release, the safe and the `fast-reads` firmware embedded in otherwise identical binaries, alternated, three
+runs each; built with `cargo build --release -p tt-mnist -p tt-firmware-images --features tt-firmware-images/fast-reads`).**
+
+| Workload | safe | fast | change |
+|---|--:|--:|--:|
+| transformer training, 1 tile, 50 steps | 104.7 ms/step (104.6, 104.8, 104.8) | **89.9** (90.1, 89.8, 89.7) | **-14%** |
+| transformer training, all tiles | 416 ms/step (413-420) | 434-444 (418-431 in other runs) | +4-6% slower |
+| MNIST training, 1 tile, 300 steps | 4.5 ms/step | 4.5 | none (the host bounds it) |
+| MNIST training, all tiles | 12.7 ms/step | 13.2 | +4% slower (one run each) |
+
+The fast mode helps where a step is bound by the device reading a tile's operands (one tile, 14%) and loses a few percent at all tiles.
+**That loss is not the host's encoding** (my first reading, from a run with encoding switched off, was noise): timing the host's phases in the
+all-tiles transformer (temporary counters in `DataMover`, reverted; 50 steps) found **17.7 million enqueues, 355,000 a step -- one per tile per
+op -- taking 19.8 s in the safe build and 20.3 s in the fast one, ~390-400 ms of every ~416 ms step**: the host's PCIe writes of the
+list, the queue slot and the head to each of 120 tiles, for each of ~3,000 ops. Encoding is 0.17 s of that in total (3.4 ms a step, 0.8%);
+list checking ~1 s in both. The fast build's ~20 ms a step over the safe one is mostly the same per-enqueue work (the encoder, and the
+`enqueue_checked` walk over the entries' op words) multiplied by 355,000, not a new cost. The all-tiles transformer is bound by the number of
+enqueues; the fix is fewer of them (a replayed trace, or a tile subset per op), not a cheaper entry. The one-tile run is not bound by them
+(~3,000 enqueues, ~3 ms a step): its ~100 ms is the device busy.
+All of these runs are **an order of magnitude slower than the scoreboard's** (transformer
+1 tile 8.8 ms/step, MNIST 1.0-1.1) and the same on the commit that recorded them (`7495436`: 329 ms/step), on the branch's merge-base
+(`7f18dde`: 105) and on both cards, after a reset of both boards; the host (`burn-flex` 3.7 ms/step) and the cards' PCIe links (Gen4 x16
+today, 32 GT/s capable) look normal and the micro-benchmarks' cycle counts are as before. **Unexplained**, and independent of this branch: the
+step is the device busy (a 40 ms wait for the last download, 64 ms of caller-side time), so these absolute numbers are comparable only with
+each other, not with the scoreboard.
+
+**Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
+reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:
+
+| Entry | 64 B | 4 KiB | run |
+|---|--:|--:|---|
+| plain `READ` (safe mode) | 359 | 359 | `1791904598` |
+| **fast: checksum** (rotate-and-XOR form) | 175 | 175 | `1791904598` |
+| fast: checksum (multiply form, shipped) | 176 | 176 | `1791904722` |
+| fast, the check removed (not a build) | 138 | 138 | `1791904816` |
+| **fast + guard** | 215 | 215 | `1791904922` |
+
+Freshly uploaded lists (`submit_list` + `wait`): plain 651, fast 481, fast + guard 521. The upload (~300 cycles an entry, 32 B
+written over PCIe) is now more than the card's time.
+
+- **The check costs ~37 cycles however it is written.** The rotation form and the multiply form cost the same, and 138 cycles
+  without either: it is two more words read and combined, not the arithmetic. The semantic guard on top is ~40 more.
+- **What a checksum protects.** Any one word damaged, any two swapped (the check word included), a hand-made entry that did not
+  come from the encoder (it has the right check only by computing it). It cannot see an entry that is consistent and wrong, which
+  only a bug in `encode` makes; the guard is the independent check for that. A first checksum, a plain XOR of an unrotated word,
+  let a swap of that word with the check pass: found by the unit test and fixed (every word is mixed with its own constant).
+- **Negative controls, watched failing.** With the checksum verification removed, `the_card_refuses_a_damaged_encoded_read_...`
+  fails (ttsim) and the other fast tests pass; with the guard removed in an `encoded-guard` build, `the_guard_refuses_a_
+  consistent_but_wrong_encoded_read` fails and the others pass. In safe mode the gate holds the opposite: the card refuses a
+  *valid* encoded entry. On silicon the entries sent past the host are only ones whose acceptance would still be a valid read into
+  the test's own L1/DRAM (a moved address, a flipped checksum bit, a halved length): a bad coordinate is the hang `AGENTS.md`
+  warns of, so those are held on ttsim and by `encoded`'s unit tests (the code the card runs).
+- An earlier layout (the seven NIU words, and a guard only) measured 194 with the guard and 141 without (runs `1791900861`,
+  `1791900958`); the guard written branch-free cost the same as the `&&` chain (`1791901089`), and alone the bitmap lookup
+  added 24 cycles and the eight compares 36 (`1791901194`, `1791901286`).
+
+**Real flows, fast mode against safe** (`1791905017` against `1791901818`; host-timed unless marked; card 0):
+
+| Benchmark | safe | fast |
+|---|--:|--:|
+| `mover_read_sweep`, 64 B to 4 KiB, cycles per entry (device) | 374 | 191 |
+| `mover_read_sweep`, 16 KiB entries, cycles per entry | 387 | 355 |
+| `mover_overhead`, 256 x 4 KiB, untraced | 128.3 us | 96.2 us |
+| `queue_steady_state`, 16 x matmul 32x256x32, host per op | 137.1 us | 123.4 us |
+| the same, device first list -> last per op | 128.9 us | 115.5 us |
+| `workflow_ops`, matmul 512x512x512 HiFi4 | 1869 us | 1871 us |
+| `workflow_ops`, sum rows 64 tiles on sfpu | 789 us | 770 us |
+| `copy_pipeline`, 16 to 120 tiles | | within 3% |
+
+Counting entries per upload in six ttsim Session gates, most lists held no plain `READ` at all: their reads are record entries
+(`GATHER`, `READ_RUN`), which expand on the card and are not touched; a few packets held 180 to 256 plain reads. Where a flow's
+reads are plain entries it gets the saving; where compute or the host dominates it gets nothing. With encoding forced on for
+every mover (the earlier layout, with its guard), the whole smoke selection passed on card 0: 1,026 of 1,026.
+
+**Card-wide reads by entry size and tile count** (`gddr_aggregate`, the Read mix: every tile reads its own lists at once; device
+clock, GB/s, % of the card's 512 GB/s; `AGG_LEN` sets the entry size, safe image against `--feature fast-reads` on the same
+card; the 64 KiB baseline of the scoreboard is unchanged, 466 to 496 GB/s in both). Safe -> fast:
+
+| Tiles | 2 KiB entries (card 0) | 4 KiB (card 0) | 16 KiB (card 1) |
+|--:|---|---|---|
+| 1 | 7.4 -> 14.4 (1.4% -> 2.8%) | 14.7 -> 28.8 (2.9% -> 5.6%) | 58.2 -> 85.1 (11% -> 17%) |
+| 4 | 29.4 -> 57.1 | 58.6 -> 114 (11% -> 22%) | 231 -> 330 (45% -> 65%) |
+| 8 | 58.8 -> 114 | 117 -> 227 (23% -> 44%) | 463 -> 452 (90% -> 88%) |
+| 16 | 117 -> 226 (23% -> 44%) | 234 -> 344 (46% -> 67%) | 483 -> 482 |
+| 32 | 233 -> 290 (46% -> 57%) | 407 -> 446 (79% -> 87%) | 484 -> 484 |
+| 64 | 339 -> 392 (66% -> 77%) | 456 -> 464 (89% -> 91%) | 488 -> 489 |
+| 120 | 392 -> 442 (77% -> 86%) | 479 -> 489 (94% -> 96%) | 496 -> 496 |
+
+Runs, safe / fast: 2 KiB `1791907945` / `1791908194`; 4 KiB `1791907286` / `1791907626`; 16 KiB `1791907949` / `1791908197`.
+Per tile the encoded entry is 1.95x at 2 KiB and 4 KiB (the entry costs 359 against 175 cycles, whatever its size) and 1.45x
+at 16 KiB, where the NoC begins to share the time. **Where it matters:** the smaller the entry, the more tiles it takes
+to fill the card: 16 KiB entries fill it with 8 tiles in either mode, 4 KiB entries with about 64, and 2 KiB entries
+(BF16 tiles) not at all in safe mode (77% with all 120) and 86% in fast mode. On one DRAM channel, 4 KiB entries
+fill it (89%) with 2 tiles in fast mode and 4 in safe. The 16 KiB column ran on card 1 and the others on card 0 (two jobs at
+once, one card each); a size is compared only with the same size on the same card. The post-run data check of
+`gddr_aggregate` compared 64 KiB whatever the entry size; it now compares the entry size run.
+
+**Not changed, and what else this run met** (none of it related to the change):
+- Trace lists in GDDR (`CALL` replays) hold plain entries; encoding them is open.
+- `silicon_bench_path::matmul_pipeline_sweep` fails with `event 119: an entry began outside a list or inside one`, with the
+  committed `mover.rs` as well; it is the role-profile export problem `streaming-dataflow-architecture.md` ("Profiling")
+  already records for `sfpu_pipeline_sweep`. `silicon_bench_memory::gddr_aggregate_nocs` fails with `Invalid(10)`
+  (`DIRECTION`): it still asks B to write, which the reader/writer split removed.
+
+## Read-loop probe: what the interpreter costs per read entry (2026-10-13, card 0)
+
+`silicon_probe_read_loop::{interpreter_cap_sweep, bare_loop_against_interpreter}` (release, card 0, AICLK 1350 MHz, branch
+`fw-architecture-review`; runs `1791859752` (cap sweep, bare loop), `1791859931` (adds the decoded mode)). One tile, one
+channel, 256 reads of 64 B or 4 KiB per list. The bare image is `read_loop_b` (`tt_isa::noc::read_loop`), timed by the tile
+wall clock around nine repetitions after a warm-up. Every repetition's window checksum is compared with the expected
+bytes (the window is poisoned between repetitions) and the last window byte for byte; a probe with the last request
+dropped must fail, and does, in every mode.
+
+**Device cycles per request, cap 8 / cap 128** (4 KiB; 64 B):
+
+| Path | cap 8, 4 KiB | cap 8, 64 B | cap 128, 4 KiB | cap 128, 64 B |
+|---|--:|--:|--:|--:|
+| bare, `issue_dram_on`, address stepped | 95.4 | 90.5 | 88.5 | 78.1 |
+| bare, `issue_read` (X6 fast path) | 88.6 | 69.0 | 88.6 | 51.1 |
+| replay of encoded requests from L1 | 105.9 | 101.3 | 89.6 | 89.1 |
+| `Entry::decode` + `DramMove` + issue per entry | 188.8 | 188.4 | 180.6 | 180.3 |
+| shipped mover (list-level stamps, a temporary build) | 359.3 | 358.9 | | |
+
+The temporary build (not committed) also stamped around `exec`: `exec` 312, the list loop outside it 59, a `WAIT` entry 139
+in all (151 with the stamps). The host-timed numbers of `mover_read_shapes` and `interpreter_cap_sweep` are 648 cycles
+(0.48 us) per entry: the 359 device cycles plus ~290 cycles (0.21 us) for the host to write the 32-byte entry into the
+list ring over PCIe, which a host-timed list includes. The same split fits a `WAIT` entry (0.31 us host, 0.11 device).
+
+**In-flight cap sweep** through the shipped mover, host-timed us per entry (64 B / 4 KiB): cap 1 0.585 / 0.680, 2 0.518 /
+0.520, 4 0.492 / 0.496, 8 0.479 / 0.483, 16 0.481 / 0.479, 32 0.477 / 0.479, 64 0.477 / 0.475, 128 0.477 / 0.475.
+
+**Read, and what it refutes.**
+- The X6 section below concluded that a request's cost is its round trip and that more requests in flight is the lever. The
+  X6 measurement stands (the register writes are ~17 ns of an entry); the explanation does not. Past cap 4 more requests in
+  flight change nothing, and a bare loop issues a 4 KiB read in 95 cycles at the same cap: the entry is software, 359
+  cycles of it, about 95 of them decode and validation and the rest the loop and `exec` around them. Roadmap X7's
+  "the cost is the request round trip" is corrected accordingly.
+- A replay of host-encoded requests (an entry of the op word and seven request words: the same 32 bytes) is 3.4x under the
+  shipped path with the rest of the interpreter intact.
+- The probe's device cycles set against the interpreter's host-timed cycles would read 7x; that mixes clocks. The like-for-like
+  gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
+- Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
+  entry kinds, any model.
+
+## Open-all made strictly better (2026-10-14, cards 0 and 1)
+
+The [per-op tile spread](#per-op-tile-spread-2026-10-14-card-1) left two costs of opening every tile: per-op work that still looped over
+every open tile (~5% of a transformer step), and a catch-up that was a list of its own, which made a spread that varies per op lose to churn.
+
+**The changes** (`Session::enqueue_work_inner`):
+- Everything an op lays out is sized by the units it runs on: its queues, the units that arrive at its barrier, what each must catch up
+  on and which barriers were folded. A capture still involves every unit, as before. Nothing on the fresh path loops over the session's
+  other tiles per op.
+- A unit that sat ops out catches up inside its first list for the op (`lead_with`): the wait-only `BARRIER` goes first in a packet's
+  reader section (its count in the header raised; NC's writes wait on credits only the reader and the roles release, so they follow it
+  too) or first in a plain list, with the list's kernel and wait indices moved past it. Only a list already `LIST_MAX` long gets a wait of
+  its own, still for the target taken before the op's own barrier was counted. Buffers freed while lists may read them are given back
+  only at the next sync, so a write never lands under another unit's read: ordering a unit's reads after the wait is what is needed.
+
+**`tt-mnist`, card 1, one run each (ms/step):**
+
+| Session, spread | transformer | MNIST (300 steps) |
+|---|--:|--:|
+| 2 tiles, all | 79.8 | 3.5 |
+| 8 tiles, all | 81.2 | 2.2 |
+| 120 tiles, all | 89.3 (96.2-96.8 before) | 6.4 (6.7) |
+| 120 tiles, spread 2 | **77.9** | 3.5 |
+| 120 tiles, spread 4 | 79.3 | **2.2** |
+| 120 tiles, `work:64:2` / `work:256:4` | 77.8 / 77.2 | 3.0 / 3.0 |
+
+- **120 tiles at a fixed spread now match or beat the best small session** in the same run: the transformer 77.9 at spread 2 against 79.8 on a
+  2-tile session, MNIST 2.2 at spread 4 equal to an 8-tile session. (The 2-tile transformer measured 73.9-75.7 in earlier runs, so run to run
+  is a few ms.) Every tile with no spread is better too: 96 -> 89 and 6.7 -> 6.4.
+- **A catch-up costs no list**: the barrier stage is 0.9 ms over a 300-step MNIST run under either a fixed or a varying spread (24.5 ms before at
+  `work:64:4`).
+- **Over 300 steps a varying spread still looks worse for MNIST** (2.8-3.2 against 2.2), but that is one-time: starting the movers on the
+  tiles a large op first reaches (~240 ms of enqueue time outside every stage, 116 tiles) and their first programs and descriptors (drains 134
+  against 16). Over 1,000 and 3,000 steps `work:64:4` is 2.4 against 2.3. `work:16:4` stays at 2.7-2.8: it gives a matmul ~13 tiles at ~5 us of
+  host each, so the share has to be large enough for the host's cost a tile.
+
+**Mixed op sizes** (`silicon_bench_spread::small_and_large_ops_by_spread`, card 1, 120 tiles, medians of 7, run `1791988111`): 64 chained
+relus of a 64x64 tensor, host-timed per op, and one 2048x2048 add to its end.
+
+| Spread | small op | large op |
+|---|--:|--:|
+| `All` | 22.7 us | 1,107 us |
+| `Fixed(4)` | 19.6 us | 1,054 us |
+| **`Work { share: 64, min: 4 }`** | **19.4 us** | **725 us** |
+| `Work { share: 16, min: 4 }` | 19.4 us | 1,104 us |
+
+A spread by work is as good as the best fixed one on small ops and 1.45x faster on the large one: `All` is host-bound (120 tiles at ~5 us),
+`Fixed(4)` device-bound (1,024 tiles each), and a share of 64 gives the add 64 tiles. A share of 16 clamps to 120 and is host-bound again.
+
+Gates: `step176` holds the fold -- with the wait dropped from the list the reader reads before the write and fails; with every wait a list
+of its own the units that caught up show one more list than unit 0 (`[1, 2, 2, 2]`) and fail. The default (`All`) folds too -- an op
+with fewer jobs than tiles leaves tiles behind -- so the whole set ran again: 45 simulator binaries, `step12_mnist` with `e2e` (8/8),
+and the smoke selection on card 0, 1,027 of 1,027 (run `1791988149`).
+
+## Per-op tile spread (2026-10-14, card 1)
+
+After the [barrier change](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) a tile an op does not use costs nothing, so a
+session can open every tile and give each op only some. **The best session-wide tile count differs by workload** (card 1, release,
+`tt-mnist`, one run each; ms/step):
+
+| Session tiles | 1 | 2 | 4 | 8 | 16 | 32 | all (120) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| transformer, 50 steps | 104.3 | **73.9** | 79.2 | 82.0 | 81.9 | 85.5 | 96.8 |
+| MNIST, 300 steps | 4.6 | 3.5 | 2.2 | **2.1** | 2.8 | 3.6 | 6.7 |
+
+**The change.** `Session::set_spread` (`tt_kernels::session::Spread`; burn-tt `TT_SPREAD`): `All` (every unit, the default, as
+before), `Fixed(k)`, or `Work { share, min }` (one unit for each `share` of the op's work, at least `min`). The work is output tiles
+for an element-wise op, input tiles for a reduction, tiles moved for a copy, gather or transfer, and tile products `mt * nt * kt` for
+a matmul. Each op builder gets the unit count it builds for, and `execute_on`/`submit_jobs_on` carry the same count to
+`enqueue_work`, which deals the jobs round-robin over those units; builders that take no unit count (`repack`, `repack_many`,
+`gather_indexed`, ...) are sized by their output (or their job count) and dealt over the units the spread gives them. Jobs of one op
+are independent -- two jobs on different units already have no order between them -- so dealing them over fewer units only adds order.
+
+**What it took to make a fixed spread on 120 tiles match a small session.** The first sweep (spread 2 at 120 tiles: 93-96 ms/step
+against 74 on a 2-tile session) had two causes, both found with the new `TT_HOST_TIMES=1` (burn-tt prints `Session::host_times`
+and lists per tile when it detaches):
+- `repack`/`repack_many` (918 calls a transformer step), the host DMA transfers and the matrix-unit ops dealt their jobs over every
+  unit whatever the spread; now they follow it.
+- `enqueue_work` laid out one segment queue for every unit of the session on every op, empty or not: `Segments` 1,034.5 ms over 50
+  steps against 238.9 on the 2-tile session, ~7 us an op against 1.6. Now one queue a unit the op can run on: 388.5 ms.
+
+**At 120 tiles, after both** (card 1, one run each, ms/step):
+
+| `TT_SPREAD` | all | 2 | 4 | `work:16:2` | `work:64:2` | `work:256:2` | `work:16:4` | `work:64:4` |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| transformer | 96.2 | 80.3-80.9 | 80.7-82.0 | 79.7 | 80.6 | 80.6 | 80.6 | 79.0 |
+| MNIST | 6.7 | 3.6-3.7 | **2.2-2.3** | 3.1 | 3.0 | 4.3 | 3.2 | 2.9 |
+
+- **A fixed spread on every tile is close to the best small session**: MNIST 2.2-2.3 at spread 4 (2.1 on an 8-tile session, 6.7 on
+  every tile), the transformer ~80 at 2-4 (74-76 on 2 tiles, 96.8 on every tile). The ~5 ms a transformer step that is left is the
+  per-op work that still scales with the session (per-op vectors of every unit, the barrier loops): 4,069 ms attached over 50 steps
+  against 3,832 on 2 tiles, 388 ms of `Segments` against 239.
+- **The transformer is bound by its lead tile.** At spread 2 tile 0 takes 151,737 of 283,024 lists and the host waits for ring room
+  (394k reads in `List`); a wider spread does not move it (spread 4: 81-82), so what is left there is per-op device time, not the host.
+- **A spread that varies per op loses to churn.** `work:16` with no floor put nearly every transformer op on one tile, as slow as a
+  one-tile session (106 ms; 154k lists on one tile). A floor (`work:<share>:<min>`) fixes that (79-81) but does not beat a fixed
+  spread, and for MNIST it is worse (2.9 at `work:64:4` against 2.2): its lists land on all 120 tiles, units that join a large op and
+  sit out the small ones rejoin with a catch-up each time (barrier writes 37,311 against 13,503 over 300 steps) and programs are
+  uploaded to more tiles (`Place` writes 2,037 against 907). Varying the spread per op would pay only with a cheaper catch-up (folded
+  into the unit's next list) and program placement that knows which tiles hold what.
+- **The default is unchanged** (`All`; and burn-tt's auto-attach still opens one tile). Opening every tile with a fixed spread of 4
+  would take the transformer from 104 to ~80 ms/step and MNIST from 4.5 to ~2.3 against today's one-tile default; it changes every
+  model's tile count, so it is a decision, not part of this change.
+
+Gates: `step177_op_spread` (ttsim and card 0): six ops (a matmul with each operand transposed and `K` in blocks, a row-broadcast add, a
+relu, sums over rows and columns, a copy) against the host bit for bit under `All`, `Fixed(1)`, `Fixed(2)` and two work spreads, with
+the units each spread chose the only ones that enqueued anything; watched failing with the spread ignored. With every session forced to
+`Work { share: 16, min: 1 }`, every numerical check of the 41 multi-tile simulator gates passes (only the checks that count units or
+arrivals differ, by design: `step20`'s "every unit worked", `step34`'s arrival count, `step176`'s reader on all four units).
+
+## Barriers on the units an op ran on (2026-10-14, card 0)
+
+The host-time split (`silicon_bench_path::host_time_per_op`, run `1791946223`) showed what the all-tiles transformer's 355,000
+enqueues a step were: every op on a multi-tile session ended with a `BARRIER` on **every** unit, and a unit the op gave no job to
+got a barrier list of its own -- one PCIe enqueue (three posted writes) a tile an op. A 64x784 add on 120 tiles runs on 50 of them
+and paid 70 us and 210 writes for the other 70; the transformer's ops are 2-16 tiles, so nearly all of its 120 enqueues an op were
+those lists.
+
+**The change.** The barrier counter now counts arrivals, and an op's barrier adds only the units it runs on (`Session::barriers` is
+the latest target). A unit that sat ops out catches up before its next list with one wait-only `BARRIER` for the latest target
+(`Session::catch_up`; `dm::op::BARRIER` word 4 = 1 polls without the atomic increment), which the units that ran those ops reach
+only after their writes have landed. The catch-up is taken *before* the op's own barrier is counted -- that target includes the
+unit's own arrival, which it would otherwise wait for in vain -- and a successful `sync` marks every unit caught up. A capture's
+barriers still involve every unit, so a trace's streams and its `k * n` targets are unchanged; a replay catches its units up first
+and advances the count by `barriers * n`.
+
+Card 0, release, `tt-mnist` from the commit before (`8205dce`) and with the change, alternated, three runs each (same session):
+
+| Workload | before | after |
+|---|--:|--:|
+| transformer training, all tiles, 50 steps | 404.2 / 407.9 / 422.2 ms/step | **96.3 / 96.2 / 97.8** |
+| transformer training, 1 tile | 105.1 / 105.0 / 105.2 | 105.3 / 105.5 / 105.3 |
+| MNIST training, all tiles, 300 steps | 12.9 / 13.1 / 13.4 ms/step | **6.7 / 6.7 / 6.7** |
+| MNIST training, 1 tile | 4.5 / 4.5 / 4.5 | 4.5 / 4.5 / 4.5 |
+
+- **The all-tiles transformer is 4.2x faster, and now faster than one tile** (96-98 against 105 ms/step) for the first time. Its losses
+  are the same to every printed digit (card 4.4355 -> 3.4883), and MNIST's test accuracy is the same (89.63%) at all tiles.
+- **Per op** (`host_time_per_op`, run `1791947516`, against `1791946223`): at 120 tiles the barrier stage is 70.3 -> 0.7 us for the
+  64x784 add and 54.9 -> 0.6 for the 256^3 matmul, writes an op 360 -> 150 and 336 -> 192, and the call 331 -> 276 us and 379 ->
+  328. An op that fills every tile (the 512^2 add on 120, everything on 8 and 32) is unchanged, as it should be: every unit arrives.
+- **What is left at many tiles** is each *participating* unit's own cost, ~4.6 us a unit an op (segments, placement, reserve, check,
+  three posted writes): the 64x784 add still takes 50 tiles for 50 output tiles and 276 us. That is plan item 1a (an op on as many
+  tiles as its work pays for), and why all-tiles MNIST (6.7 ms/step) is still slower than one tile (4.5).
+
+Gates: `step176_barrier_participants` (ttsim and card 0). A slow op on unit 0 alone (one output tile, `K` 1024), then an op on four
+units that gathers its output as `B`: the result is the host's product bit for bit on binary operands (exact in TF32 and FP32) over
+three rounds; the slow op ran on one unit and the others enqueued nothing for it; the reader ran on all four. **With the catch-up
+skipped, the reader reads the slow op's output before it is written and the gate fails** (round 0, ttsim). A second test captures and
+replays a trace between partial ops (behind units before the capture and between replays) against the host. The `BARRIER` decode
+refuses a word 4 other than 0 or 1. All 39 multi-tile simulator gates, `step12_mnist` with `e2e` (8/8, golden unchanged), and on card 0
+`step33_barrier`, `step39_traces`, `step60_streaming` and `step176` pass. The smoke selection on card 0: 1,027 of 1,027 (the five
+two-card tests first failed to attach because a benchmark held card 1, and passed when rerun with it free).
+
+## Descriptor runs in a trace's prologue (2026-10-14, card 0)
+
+The first thing the [replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) found: every replay
+re-establishes the three roles' descriptors with 51 `op::POKE` entries, 8,824 device cycles (6.5 us), the same on every replay.
+Each `POKE` writes one word and fences it (`publish`), so the cost is seventeen entries and seventeen fences a role.
+
+`record::POKE_RUN` writes a run of consecutive role-mailbox words in one two-entry record, with one fence for the run
+(`mover::poke_run`). A descriptor is three runs -- the program's address and length divide it, since each `KERNEL` and `LAUNCH`
+writes those itself, and the live handshake words (`generation`, `ack`) sit between two of them -- so the prologue is 9 records
+of 2, 4 and 11 words instead of 51 entries. `trace::UnitCapture::poke_descriptor` emits them; a run of one word stays a `POKE`,
+which is the smaller of the two.
+
+Card 0, release, safe image, `silicon_probe_trace_replay::replay_breakdown`, medians of 7 (runs `1791944369` before,
+`1791945827` after; the before column is the published breakdown):
+
+| us a replay | chain8, 1 tile | chain8, 8 tiles | layer, 1 tile | layer, 8 tiles |
+|---|--:|--:|--:|--:|
+| **host-timed, unstamped**: before -> after | 73.5 -> **71.2** | 79.0 -> **76.3** | 129.0 -> **124.4** | 82.5 -> **78.2** |
+| device span: before -> after | 69.8 -> 68.1 | 59.3 -> 56.3 | 125.0 -> 120.4 | 64.1 -> 60.0 |
+| the prologue in it | 6.54 -> **3.62** | 6.54 -> **3.63** | 6.54 -> **3.63** | 6.54 -> **3.62** |
+
+- **The prologue is 8,824 -> 4,892 cycles (6.54 -> 3.62 us), and a replay is 2.3-4.6 us shorter by the host's clock.** The host
+  number is the one to read: the device span also falls because there are 84 fewer stamps (~12 cycles each), which the host-timed
+  runs do not pay.
+- **A record is ~544 cycles against ~173 for a `POKE`**, so it pays from three words up; the 2-word run is a wash and is left as a
+  record for one rule rather than two (worth ~0.4 us a replay to split, not measured).
+- **The stream is 124 -> 91 entries and its top level 57 -> 24** (`step174_trace_footprint`), which puts the layer's top-level
+  stream back under one 64-entry chunk: the 0.75 us chunk boundary an 8-tile replay paid is gone, and the padding stays zero.
+  The pinned program cache and the GDDR a trace holds do not change.
+- **What is left of the prologue** is 9 records, 544 cycles each. Writing the descriptor as one run would need the program's
+  address and length in it, and those change per op, so the run would be re-emitted for every op rather than once a trace.
+
+Gates: `step175_poke_run` (ttsim) holds the firmware's own loop to the `POKE`s the record expands to -- the same words through
+one entry each, bit for bit in all three mailboxes, at every length a record carries -- and watched failing with the loop one word
+short. Its controls: a count of none or past the record, a value past the count, an address outside a role mailbox, a run that
+starts inside one and ends past it, and NC, which refuses the record as it refuses a `POKE` (`Mover::permits`); each is refused by
+the host with the code the tile gives, and the tile, sent it past the check (`enqueue_raw`), writes none of the words.
+
+## Trace replay: where a replayed op's device time goes (2026-10-14, card 0)
+
+`silicon_probe_trace_replay::replay_breakdown` (and `replay_dump`, the raw stamps), release, card 0, safe image, plain traces, branch
+`fast-mode-hardening`; runs `1791944369` (breakdown) and `1791944173` / `1791944389` (dumps, 1 and 8 tiles). One replay is profiled at
+a time (`profile_start`, `replay`, `sync`, `profile_stop`; the roles do not stamp, `set_profile_roles(false)`), unit 0's mover stamps
+are split by what lies between two of them, and the parts are checked to sum exactly to the replay's `LIST_BEGIN`..`LIST_END` span
+(a replay whose stream is more than 64 entries is several lists: the gaps between them are the chunk boundaries). Medians of 7.
+Two traces: the MNIST-size layer forward (matmul, add row, relu, matmul) and **chain8**, eight relus of one 64x64 tensor, which has
+next to no compute or data, so what is left is the replay's own cost.
+
+| Device us per replay (unit 0) | chain8, 1 tile | chain8, 8 tiles | layer, 1 tile | layer, 8 tiles |
+|---|--:|--:|--:|--:|
+| **span** (per op) | **69.8** (8.73) | **59.3** (7.41) | **125.0** (31.2) | **64.1** (16.0) |
+| host, `replay` + `sync`, unstamped | 73.5 | 79.0 | 129.0 | 82.5 |
+| `POKE` prologue + setup `KERNEL` | 7.2 | 7.2 | 7.8 | 7.8 |
+| chunk boundary (`LIST_END` to next `LIST_BEGIN`) | 0 | 0.75 | 0 | 0 |
+| pair begin (first op) + pair gap (later ops) | 22.1 | 7.5 | 10.2 | 4.4 |
+| `LAUNCH` | 1.9 | 1.9 | 0.9 | 0.9 |
+| `CB` credits | 5.6 | 5.4 | 3.3 | 2.7 |
+| data records (`READ_RUN`, `GATHER`) | 12.9 | 6.7 | 63.7 | 19.6 |
+| `KERNEL_WAIT` (the roles' run) | 16.7 | 7.2 | 34.4 | 9.7 |
+| `BARRIER` | 0 | 9.7 | 0 | 12.7 |
+| loop gaps between entries | 1.4 | 11.9 | 2.9 | 6.2 |
+| last entry to `LIST_END` | 2.0 | 0.1 | 1.6 | 0.05 |
+
+- **A tiny streaming op costs 7.4-8.7 us on the device, about half of it control.** In chain8 on one tile, data (2.2 k cycles an op) and the
+  roles' run (2.8 k) are 42% of an op; pair begin/finish, launch, credits, loop gaps and the last-entry gap are the other ~4.1 us. The
+  steady-state op is ~10.6 k cycles (7.8 us) after the prologue.
+- **A streaming op's fixed costs, in cycles** (dump, 8 tiles, steady state): starting the `PAIR_CALL` ~1,420 (its mailbox handshakes
+  and the reader section's fetch from GDDR; the same ~1,405 for the first op, where nothing precedes it); `LAUNCH` ~320; two `CB`
+  entries ~345 + ~560 (they wait on NC and the roles, so part of that is not overhead); finishing the pair ~1,800 (B waits for NC's
+  output writes, which are real data movement, 4 tiles here); `BARRIER` ~800-950 once the tiles are aligned (6,100 the first time,
+  which absorbs the skew of the `CALL`s' start); ~55 cycles a gap between entries.
+- **The 51 `POKE`s cost ~173 cycles each (116 for the entry, ~58 of loop gap), 6.5 us a replay, 9-11% of a small trace.** They write
+  role descriptor words one by one and are the same on every replay. Their stamps are ~12 cycles of the 116.
+- **A chunk boundary is 1,012 cycles (0.75 us)**: the progress write, the next 64 entries' fetch from GDDR, the patch pass. Seen where
+  the top-level stream (51 `POKE`s, a `KERNEL`, the `PAIR_CALL`s, `BARRIER`s) passes 64 entries (8 tiles); each reader section's fetch is
+  inside "pair begin". So the chunk loop is not where a replay's time is: one boundary is under 1.3% of chain8 on 8 tiles. The filler
+  `WAIT`s the host pads with are zero in these traces ([trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim)).
+- **On many tiles the host is the larger part.** Host minus device is 3.7-4.0 us on one tile (the 4.25 us round trip, with the device's own
+  tail) and 18.5-19.7 us on 8: ~2 us a tile for the `CALL` entry's three posted writes and the sync's per-unit polls. A replay of 8
+  tiles is 79 us by the host's clock for a 59 us device span; the device is not what bounds the small ones.
+- **The barrier is 16-20% of an 8-tile replay.** 4,300 cycles an op in the layer (it includes waiting for the slowest tile), ~1,600 in chain8.
+
+Reading with its limits: unit 0 only; spans include waiting for the other tiles at barriers; NC is not stamped, so the pair gap
+and the last-entry gap include the wait for its writes; stamping costs ~12 cycles a stamp (204 stamps, ~2.6% of chain8's span, and
+host minus device agrees with the known round trip, so it is not distorting the shape); the safe image, plain entries, one card.
+
+## Trace footprint: what a trace costs a tile (2026-10-14, ttsim)
+
+`Session::trace_footprint` and `step174_trace_footprint` (ttsim; the counts are host-side and do not depend on the card, so silicon
+reads the same for a given tile count). A trace is bounded by two things per tile, the program cache (`l1::PROGRAM_CACHE`, 240 KiB of
+L1, every program a trace names pinned for its life) and its streams in GDDR. Branch `fast-mode-hardening`, safe image, plain traces.
+
+| Capture | Entries (top level + sections) | Padding | Entry bytes | GDDR allocated | Programs pinned |
+|---|--:|--:|--:|--:|--:|
+| layer forward 64x784x128x10 (matmul, add row, relu, matmul), 1 tile | 124 (57 + 67) | 0 | 3,968 B | 36 KiB | 28, 16 KiB (6.9% of the cache) |
+| the same x2 / x4 in one trace | 195 / 337 | 0 | | 69 / 134 KiB | 28, 16 KiB (unchanged) |
+| the same, 2 tiles (each) | 116 | 0 | 3,712 B | 36 KiB | 26, 9 KiB |
+| two layer shapes in one trace (x2), 1 tile | 221 | 0 | 7,072 B | 69 KiB | 49, 35 KiB (14.9%) |
+| add 2048x2048, 1 tile | 1,668 | 16 (1.0%) | 52 KiB | 77 KiB | 23, 59 KiB (24.6%) |
+
+- **Programs are shared by hash.** The same pass captured again adds entries and pins no program (28, 28, 28), and a pass of another shape
+  does (28 -> 49): the control that shows the count can move. So a trace's pinned set is the number of *distinct* (op, shape) programs,
+  about 4 KiB each for a layer's four ops (roles and streaming bodies), not the number of ops. At that rate ~60 distinct op shapes fill the
+  cache, which is the shape of the model-ladder overflow (roadmap "Trace segmentation"); the per-model count has not been measured.
+- **A pass of four ops is ~71 stream entries (~2.3 KiB) but ~32 KiB of GDDR.** Each `PAIR_CALL` stores its reader and writer sections as
+  allocations of their own, and an allocation is whole tile slots (4,160 B): a 17-entry section takes a slot. GDDR per op is therefore set
+  by the number of allocations (~8 KiB an op here), not by entries. GDDR is not the tight limit (a 2,779-op decode step on one tile at this
+  rate is ~22 MB), but it is the one place a trace's size is 13x what its entries need.
+- **Chunk padding is small where the sections are short.** 0 entries in the layer forward (every section is under one 64-entry chunk) and
+  1.0% in the 2048x2048 add (16 of 1,668 entries), whose sections are long enough to cross chunks. The padding is not a large share of a
+  trace's bytes; its cost is the cycles the mover spends running each filler `WAIT` (139 cycles each, from the read-loop probe), which this
+  does not measure.
+- **The 51 `POKE`s are one per trace, not one per op.** The capture pokes only the descriptor words that changed (`poke_descriptor`), so
+  1, 2 and 4 passes all hold 51. A trace prologue for invariant setup would save nothing in entries; what it could save is the
+  `KERNEL`/`LAUNCH` round trips, which are per op.
+- **Per-op entries are mostly `CB` (credit) records:** 5 a packet in the layer forward, beside a `LAUNCH` and a `KERNEL_WAIT` each and a
+  `GATHER`/`SCATTER` or `READ_RUN`/`WRITE_RUN` pair. The 2048x2048 add is `CB` 456, `READ_RUN` 228, `WRITE_RUN` 114 and `RELEASED` 106
+  (`op::RELEASED`) in 4 packets.
+
+Not measured: footprints of the three models (they do not capture yet), of CNN training, or on more than 2 tiles.
+
+## Per-tile cost of the movers' records and NC's writes (2026-10-13, cards 0 and 1)
+
+`silicon_probe_read_loop::records_against_entries` (card 0) and `silicon_probe_nc_writes::nc_writes_against_records`
+(card 1; `cargo xtask bench --device 1 --filter silicon_probe_nc_writes`, run `1791925106`, release, branch
+`fast-mode-hardening`). Resident lists rerun from the sequence word, device cycles by the host clock less an empty list's
+time, per tile, N = 64 / 256 / 448 tiles of a tensor over the eight channels. Every repetition poisons the destination,
+reruns, and compares every tile's datums (writes: the 4096 datum bytes, header untouched), so a form that is cheap
+because it moved nothing fails.
+
+| Per tile, device cycles | N = 64 | N = 256 | N = 448 |
+|---|--:|--:|--:|
+| B, plain 4160 B `READ` (card 0) | 351-363 | | |
+| B, host-encoded `READ_ENCODED` (card 0) | 175-177 | | |
+| B, `READ_RUN` record, 32 tiles each (card 0) | 340-351 | | |
+| NC, plain `WRITE` (card 1) | 328 | 345 | 343 |
+| NC, `WRITE_RUN` record, 32 tiles each (card 1) | 327 | 326 | 320 |
+
+- A record's tile costs what a plain entry does: the record is expanded into the same `DramMove` per tile, so encoding a
+  plain entry (175) saves nothing there, and only a validated static record path (plan phase 4/5) can. NC's writes
+  cost the same ~330-345 cycles as B's reads; a record saves 0-7% on the write side.
+- The probe's first run failed on its own error, not the mover's: a tile's slot holds 4096 datum bytes and 48 bytes of
+  padding (`TILE_DATA + 4096 <= TILE_SLOT`), which a `WRITE_RUN` correctly does not write; the probe had compared and written the
+  padding. Both forms now move exactly the datums.
+- `gddr_aggregate_nocs` is still unusable for NC, and is not fixed here: its lists begin with a `BARRIER`, which only B runs,
+  so NC answers `DIRECTION`. The probe above does what it was for without one.
+
+**Where NC's requests come from** (ttsim, temporary instrumentation in `DataMover::check_as`, reverted; the NC list of every
+upload, top-level `WRITE` entries against writes a record expands to):
+
+| Gate | Lists | Top-level `WRITE` | Records | Record-expanded writes |
+|---|--:|--:|--:|--:|
+| `step68_k_block_matmul` | 114 | 0 | 287 | 1,765 |
+| `step56_scatter_on_nc` | 64 | 0 | 1,076 | 22,848 |
+| `step11_burn` | 91 | 14 | 100 | 367 |
+| `step171_select_rows` | 141 | 321 | 87 | 210 |
+| `step62_gather_rows` | 97 | 596 | 52 | 212 |
+| `step52_nc_mover` (plain writes by design) | 2 | 312 | 0 | 0 |
+
+Matmul, Burn and scatter flows write through records (0-4% top-level); only the row-select and gather gates, whose output rows
+are ragged, write plain entries in bulk. An NC fast path therefore has little to win from encoding plain entries (~340 -> ~170
+cycles at best) and most from a validated static record path; sealed `WRITE_RUN`/`SCATTER` first, `WRITE_ENCODED` only if a
+model flow needs the row writers. This is a tally of gates, not of production flows on silicon.
+
+## Firmware image budget and core-assignment (2026-10-13, card 0)
+
+Why: `dm_b` had 172 bytes left of its 24,576 (silicon-operating-notes, "RISCV B's image has little room
+left"). Review and design space: [firmware-architecture-review.md](../proposals/firmware-architecture-review.md).
+Conditions: card 0, AICLK 1350 MHz, release, branch `fw-architecture-review` on `7f18dde`; the benches are
+`silicon_perf::mover_read_shapes` and `silicon_bench_path::null_kernel`, medians as those tests report them.
+Not measured here: live tt-metal/ttnn timings (the installed ttnn 0.72 needs SFPI 7.52.0 and the machine has
+7.83.0, so its JIT compile of the dispatch kernel fails; `/home/carl/projects/tt-metal-v077`'s ttnn hangs in device
+init). `crates/tt-tests/bench/ttnn_reference.py` is the script for when a matching toolchain exists.
+
+**Whole-image `opt-level`** (the Cargo profile of `crates/tt-firmware`; all five images change together):
+
+| opt-level | `dm_b` | `dm_nc` | `role_t0/1/2` | WAIT entry | 64 B read entry | 16 KiB reads | 64 KiB reads | 1024-NOP role, list begin->end | role push rate | run |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 3 (shipped) | 24,404 | 14,252 | 8,340 / 7,996 / 8,408 | 0.31 us | 0.48 us | 34.0 GB/s | 53.9 GB/s | 3,593 cycles | 2.91 cycles/word | `1791855052` |
+| 2 | 22,660 | 13,004 | 8,232 / 7,900 / 8,296 | 0.31 us | 0.48 us | 33.8 GB/s | 53.4 GB/s | 3,604 cycles | 2.93 cycles/word | `1791855317` |
+| s | 21,220 | 12,996 | 7,056 / 6,796 / 7,044 | 0.48 us | 0.76 us | 21.6 GB/s | 53.0 GB/s | 22,648 cycles | 21.05 cycles/word | `1791855151` |
+| z | 21,164 | 13,824 | 6,872 / 6,500 / 6,920 | 0.52 us | 0.83 us | 19.8 GB/s | 51.1 GB/s | 24,964 cycles | 23.2 cycles/word | `1791855234` |
+
+`opt-level` 2 costs nothing measurable and saves 1,744 bytes on `dm_b`; `s` and `z` save at most 3.2 KB and make
+the mover 1.6x slower per entry and the roles' instruction push about 7x slower (the push loop is the
+roles' whole job). Size optimisation is not a lever for the roles. `opt-level` 2 was measured on these two
+benches only, not adopted: the shipped profile stays at 3.
+
+**Repacked images (V3a), adopted.** The role images are linked in 10 KiB slots packed against NC's slot
+(`tt_isa::l1::roles`: T0 `0xA800`, T1 `0xD000`, T2 `0xF800`) instead of at the cores' default reset PCs;
+`Device::load_held` already sets the reset-PC override for every core but B, so the host needed no change. B's
+slot is now everything below T0's: `dm::IMAGE_MAX` 24,576 -> 43,008 bytes, **+18 KiB of room with the images
+byte-identical in size** (`dm_b` 24,404, 18,604 left). No arena or other region moved. Role images use 8.0-8.4 KB
+of their 10,240-byte slots. Silicon, same benches: WAIT 0.31 us, 64 B read 0.48 us, 16 KiB 33.7 GB/s, 64 KiB
+53.2 GB/s, 1024-NOP list 3,599 cycles, push rate 2.92 cycles/word (run `1791855559`): no change from the
+shipped layout. Smoke selection on card 0: 1,030 of 1,030 passed (run `1791855592`, one boot throughout).
+ttsim: `step16_dm`, `step52_nc_mover`, `step171_select_rows`, `step24_padding`.
+
+**Negative result: refusing the other direction's ops before decoding them** (`M.permits(w[0])` ahead of
+`Entry::decode` in `exec`, so each image could drop the decode arms it never runs). Predicted from symbol sizes:
+about 240 bytes on B, 1.9 KB on NC. Built: `dm_b` -4 bytes, `dm_nc` +96. LLVM already shares the decode arms, so
+the check only adds a compare chain. Reverted. Symbol-size estimates of what a check will remove are not
+evidence; measure the build.
+
+## Row select: an embedding lookup without staging (2026-10-13, card 0)
+
+`select` along dimension 0 of a rank-2 F32, I32 or Bool table now runs `Session::select_rows`
+(`crates/tt-kernels/src/index.rs`; B's `SELECT_ROWS` record in `tt_isa::dm::record`): each batch reads
+one tile of 32 resident indices, and B turns each into two 64-byte face-row reads a tile column, finding the source
+tile on the card, so a lookup reads the rows it returns and builds no host address. Before, `gather_native`
+staged every row of the table for every element it returned (576 x 49,152 = 28.3 million host addresses a token).
+Gates: `step171_select_rows` (ttsim; card 0 run `1791851883`, 10 of 10), which compares with the host indexing bit
+for bit (specials, I32, Bool, views, ragged shapes), refuses an index outside the table with `DOMAIN`, and replays a
+trace with changed indices. Release build, git `e17f4c9` plus the change, card 0, nothing else on the card.
+
+### The lookup alone (`probe_embedding_cost`, run `1791851940`)
+
+A 49,152 x 576 table through Burn's own `Embedding`. A warm-up lookup, then seven timed, each of different rows, from
+host dispatch through the readback, and each validated bit for bit against the host's copy of the weights.
+
+| Lookup | Before (`1791845218`, 2026-10-12) | After: median of 7 (min to max) |
+|---|--:|--:|
+| 1 token | 15.9 s | 260.2 us (259.1 to 267.0) |
+| 5 tokens | 63.3 s | 278.1 us (273.0 to 371.8) |
+| 32 tokens | not measured | 343.7 us (338.0 to 352.1) |
+
+The first lookup of all, 404.5 us, is not a cold table upload: the probe had already downloaded the table
+(for the validation), which materialised it. Before, the cost was linear in tokens; now a token adds 3 to 5 us
+(4.5 us from 1 to 5 tokens, 2.7 us from 1 to 32) to the fixed cost of a dispatch and a readback.
+
+### SmolLM2-135M on card 0
+
+| | Before | After | Run |
+|---|--:|--:|---|
+| `step167_smollm2` F32, 30 layers, greedy 16 tokens, agrees with burn-flex | 575 s (`1791844568`) | 33.2 s | `1791851959` |
+| Decode step from a token id, median of 9 (p10 to p90) | about 14 s a token (`step167_smollm2`, 2026-10-12; the lookup alone was 15.9 s) | 623.1 ms (525.4 to 709.2), 2,781 reported ops | `1791852097` |
+| The same step, the lookup excluded | 619 ms (card 1, `1791846823`) | 621.7 ms (525.7 to 707.4), 2,779 reported ops | `1791852097` |
+| burn-flex, the same steps, same run | 25.0 ms | 26.4 ms from a token id, 26.2 ms without the lookup | `1791852097` |
+
+So the lookup is now about 1.4 ms of a 623 ms step, and a decoded token is back to what the roadmap's item 3 describes:
+about 24x burn-flex, host submission (2,781 operations at about 220 us each). The two decode numbers before and
+after come from different cards (1, then 0); the with-lookup and without-lookup rows of one run are the comparison.
+
+### What did not change
+
+BF16, F16 and BFP tables, tables of rank 3 and up, other dimensions, and `gather` with per-element indices still take
+the staged path (`gather_native`), and their gates pass unchanged on card 0 (run `1791852139`): `step167` BF16, six layers, 229 s (441 s in `1791848957`, a different load; the BF16 lookup was not touched), and all seven `step168` mixed-precision plans, 5 to 101 s each. The B image has no room for a packed-BF16 branch
+([silicon-operating-notes.md](silicon-operating-notes.md), "RISCV B's image budget").
+
+## Model ladder: real models on the card (2026-10-12, cards 0 and 1)
+
+First measurements of pretrained models (`crates/tt-models`, `tests/silicon_bench_models.rs`), taken to
+order the performance work. Release build (`dd8172b769f1+dirty`), two warm-ups and nine timed forward
+passes, medians in milliseconds, timed from host dispatch through the final readback, batch 1, the
+photograph `cats.jpg`, F32. Each device number's output is validated outside the timing (the top-1 equals
+burn-flex's). The two jobs ran at the same time, one per card, each single-card, which is why the ResNet run
+is card 0 (`1791846735`) and the other two card 1 (`1791846823`); a number is compared only with the baseline
+measured in the same run, on the same card.
+
+| Workload | burn-flex (host) | burn-tt (card) | Slowdown | Reported device ops | Backend calls | Run |
+|---|--:|--:|--:|--:|--:|---|
+| ResNet-18, 224x224 | 154.8 ms | 16,288 ms | 105x | 211 | 509 | `1791846735` (card 0) |
+| ViT-Tiny/16, 224x224, 12 blocks | 104.7 ms | 815 ms | 7.8x | 709 | 764 | `1791846823` (card 1) |
+| SmolLM2-135M decode step, 30 layers, the embedding lookup excluded | 25.0 ms | 619 ms (p10 523, p90 706) | 24.8x | 2,779 | 3,874 | `1791846823` (card 1) |
+| SmolLM2-135M, the embedding lookup of one token alone | n/a | 15.9 s | n/a | one gather | | `1791845218` (card 0) |
+| SmolLM2-135M in BF16, 6 layers, a decoded token end to end (lookup included) | n/a | 37.5 s (prompt 87-90 s) | n/a | | | `1791848957` (card 0) |
+
+Reading them:
+
+* **The embedding lookup is the SmolLM2 decode.** One token from the 49,152 x 576 table takes 15.9 s and five
+  take 63.3 s (`probe_embedding_cost`), so a decoded token costs 14 s end to end (`step167_smollm2`, run
+  `1791844568`: prompt 66-69 s, then 13.8-14.3 s a token, growing only with the attention's cache length). The
+  cause is in `gather_native`: it builds, for each chunk of 32 output elements, a host address list of
+  `32 x rows` entries, so one token costs 576 x 49,152 = 28.3 million host-built addresses. It is the
+  roadmap's "Gather without staging", now measured on a real vocabulary.
+* **ResNet-18's cost is convolution and pooling, and it is chunking, not the count of reported ops.** The
+  211 and 709 above count the top-level operations the report lists as run on the device; one reported
+  `conv2d` or `max_pool2d` hides many more submissions. Convolution issues one `float_matmul` per
+  `PATCH_ROWS = 32` output positions, each with its own host-built patch gather (`ops/conv.rs:5,181-192`: a
+  56x56 convolution is 98 matmuls, conv1 on 112x112 is 392), and max pool splits its windows into chunks of
+  32, each a host-built `repack`, an argmax and a gather (`ops/pool.rs:153-200`: 6,272 chunks for 64x112x112).
+  The weights are resident (588 KiB goes up a pass, the patch tables). Isolated on card 0 (`1791846963`,
+  `probe_resnet_op_cost`, median of three): max pool 3x3/2 on 64x112x112 **2,817 ms**; conv 7x7/2 (conv1)
+  1,170 ms; conv 3x3 64->64 on 56x56 895 ms; 128->128 on 28x28 517 ms; 256->256 on 14x14 529 ms; 512->512 on
+  7x7 **1,411 ms**; against 0.6 ms for an add + relu on 64x56x56 and 3.8 ms for the global average pool (one
+  reported op, one submission each). The layer-4 convolution (7x7, few positions, 2.4 million weights)
+  costs more than layer 2's (28x28), so the weight gather per chunk matters as much as the chunk count. The
+  warm-up passes did not make a forward faster (p10 16,266 ms, p90 16,334 ms), so none of this is
+  amortised across calls.
+* **BF16 is slower still.** The same decoded token in the checkpoint's own BF16 costs 37.5 s (six layers, so the
+  layers are a small part of it) against F32's 14 s, so the BF16 lookup is about 2.7x the F32 one
+  (`step167_smollm2` BF16, run `1791848957`); the whole 30-layer BF16 model did not finish inside 1,500 s
+  (`1791847160`).
+* **A decoded token is about 2,800 reported device operations** at about 220 us each: the decode step is
+  host-bound like the transformer training step was (the report does not see submissions nested inside an
+  op, so the true count is higher). `cat` is built from `slice_assign` (23,826 `float_slice_assign` calls in
+  33 forward passes, 722 a pass: the nine-way `repeat_kv` and the rotary halves), and `float_reshape`,
+  `float_slice` and `float_device` calls number in the tens of thousands.
+* **ViT-Tiny is the nearest to usable**: 709 reported operations, about 1.1 ms each.
+
+Not measured: traced execution of any of the three (a decode step has the host cost a trace would remove, but
+trace segmentation is open, so a forward this size does not fit the 240 KB program cache), the other card for
+a model that ran on card 0 (the single-card rule), and BF16. The same three forward passes are the
+correctness gates `step165_resnet18`, `step166_vit_tiny` and `step167_smollm2` (runs `1791843753`,
+`1791843886`, `1791844568`).
+
+**A tooling defect found on the way:** two `cargo xtask` runs that finish building in the same second took the
+same run ID, so the second collected-benchmark file (`target/silicon/bench/<stamp>.jsonl`) replaced the first
+(the per-test output files, named by stamp, device and test, were intact). The stamp is now claimed by
+creating its log exclusively (`xtask/src/silicon.rs`, `claim_stamp`), so one job per card is safe. Run
+`1791846398` is the pair that collided; its numbers are the first measurement without the burn-flex baselines
+and agree with the rerun. The runs `1791846735` and `1791846823` label the operation count "device jobs";
+it is the reported-operation count described above, and the benchmark now says so.
+
+**A second tooling defect:** when a test passed its per-test time limit the runner killed only the process it had
+started. The gates do their device work in a forked child (`tt_ttsim::fork_scope`), which survived, kept running
+and kept holding the card, so the next run failed with "card 0 is in use by another process". Each test now runs
+in its own process group and a timeout kills the group (`xtask/src/testrun.rs`; the unit test
+`a_timeout_kills_the_forked_child_too` fails without the change).
+
 ## Accurate matmul cost (2026-10-12, card 0)
 
 `MatmulMode::Accurate` ([`ops/accurate_matmul.rs`](../../crates/burn-tt/src/ops/accurate_matmul.rs)) runs integer slices with
@@ -418,6 +1256,10 @@ entry; 2 KiB: 0.482 -> 0.464 (one port), 0.485 -> 0.471 (all channels); 4 KiB: 0
 0.961-0.972 everywhere: about 17 ns of the ~0.48 us a request costs. The request's cost is its round
 trip, not the register writes, so a gather's share of a step does not move; more requests in flight
 is the lever, not cheaper issue.
+
+> **Superseded in part (2026-10-13).** The measurement holds; the explanation does not. A cap sweep and a bare read loop
+> show the entry is software (359 device cycles, a bare loop 90-106) and that the cap does not matter past 4: see
+> [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0).
 
 ## Approx transcendentals, per-tile saving (2026-10-10, card 0)
 

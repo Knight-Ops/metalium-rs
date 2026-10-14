@@ -64,6 +64,47 @@ pub const ALL_BABIES_HELD: u32 = Core::B.soft_reset_mask()
 /// runner's one-second floor applies.
 pub(crate) const RESET_BUDGET: u64 = 400_000;
 
+/// How many of a session's units an op runs on ([`Session::set_spread`]).
+///
+/// Each unit an op runs on costs the host about 5 us an op (its list built, checked and
+/// enqueued: `silicon_bench_path::host_time_per_op`), so on many tiles a small op is the
+/// host's, and the best tile count differs by workload (card 1, 2026-10-14: the `tt-mnist`
+/// transformer fastest on 2 tiles, MNIST on 8). Choosing per op lets a session open every
+/// tile and still give a small op only a few.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Spread {
+    /// Every unit: what every op did before this setting existed.
+    #[default]
+    All,
+    /// At most this many units.
+    Fixed(usize),
+    /// One unit for each `share` of the op's work, at least `min` and at most every unit.
+    /// The work is output tiles for an element-wise op, input tiles for a reduction, tiles
+    /// moved for a copy or a gather, and tile products (`mt * nt * kt`) for a matmul. The
+    /// floor matters: a small op on one unit leaves that unit doing every op's fixed cost
+    /// alone (the `tt-mnist` transformer at a share of 16, nearly every op on one tile, was
+    /// as slow as a one-tile session).
+    Work { share: usize, min: usize },
+}
+
+impl Spread {
+    /// The units an op with `work` (as [`Spread::Work`] counts it) runs on, of `units`.
+    pub fn units_for(self, work: usize, units: usize) -> usize {
+        let n = units.max(1);
+        match self {
+            Spread::All => n,
+            Spread::Fixed(k) => k.clamp(1, n),
+            Spread::Work { share, min } => work.div_ceil(share.max(1)).max(min).clamp(1, n),
+        }
+    }
+}
+
+/// Tiles of `t`, the unit [`Spread::Work`] counts in.
+fn tiles_of(t: &DramTensor) -> usize {
+    let [r, c] = t.grid();
+    r * c
+}
+
 /// Which of this chip's Tensix tiles a session computes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileChoice {
@@ -363,6 +404,8 @@ pub struct Session<T: Transport> {
     /// overlap its kernels (`Session::set_pipeline`, checklist 9.15). On by
     /// default.
     pipeline: bool,
+    /// How many units an op runs on ([`Session::set_spread`]).
+    spread: Spread,
     matmul_k_block_limit: Option<std::num::NonZeroUsize>,
     /// [`Session::host_times`].
     host: HostTimes,
@@ -397,7 +440,10 @@ pub struct Session<T: Transport> {
     batching: bool,
     /// How the transcendentals run ([`Session::set_math_mode`]).
     math: crate::sfpu::approx::MathMode,
-    /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
+    /// Arrivals at the barrier counter queued so far (`dm::op::BARRIER`): the
+    /// latest barrier's target. A barrier adds the units its op ran on, not
+    /// every unit, so an op on a few of many tiles enqueues on those few
+    /// (`Session::catch_up` orders the others before their next list).
     barriers: u32,
     /// Placements freed while lists that may read them are queued: given back
     /// at the next sync.
@@ -439,6 +485,10 @@ struct Unit {
     queued: std::collections::VecDeque<QueuedList>,
     /// The fixed NC writer, started for a compute region and restarted with B.
     nc: Option<DataMover<Noc0>>,
+    /// The barrier target this tile last waited for, by arriving or by a
+    /// catch-up ([`Session::catch_up`]): behind [`Session::barriers`] while it
+    /// sits ops out.
+    barrier_seen: u32,
 }
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
@@ -1224,6 +1274,36 @@ fn admitted(words: usize, cache: u64) -> bool {
     words > 0 && words as u64 * 4 <= cache / 2
 }
 
+/// Put `entry`, a B entry, ahead of everything else `seg` runs: first in a packet's
+/// reader section (NC's writes wait on credits only the reader and the roles release, so
+/// they follow it too), or first in a plain list. `false`, and `seg` unchanged, if the
+/// list is already as long as a list may be.
+fn lead_with(seg: &mut Segment, entry: [u32; 8]) -> bool {
+    if seg.entries.len() >= tt_isa::dm::LIST_MAX as usize {
+        return false;
+    }
+    let packet = seg
+        .entries
+        .first()
+        .is_some_and(|e| e[0] == tt_isa::dm::op::PAIR);
+    let at = usize::from(packet);
+    seg.entries.insert(at, entry);
+    if packet {
+        seg.entries[0][1] += 1;
+    }
+    for k in &mut seg.kernels {
+        if *k >= at {
+            *k += 1;
+        }
+    }
+    for (w, _) in &mut seg.waits {
+        if *w >= at {
+            *w += 1;
+        }
+    }
+    true
+}
+
 /// A unit's steps as ownership regions and control lists, for a program cache
 /// of `cache` bytes (`Session::limit_program_cache`).
 fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, TensorError> {
@@ -1657,6 +1737,7 @@ impl<T: Transport> Session<T> {
             images,
             profile: runtime::Profile::default(),
             pipeline: true,
+            spread: Spread::All,
             matmul_k_block_limit: None,
             host: HostTimes::new(),
             staging: None,
@@ -1694,6 +1775,7 @@ impl<T: Transport> Session<T> {
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
                 nc: None,
+                barrier_seen: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -2328,7 +2410,12 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
-        let units = self.units.len();
+        let (mt, kt, nt) = (
+            a.rows.div_ceil(32),
+            a.cols.div_ceil(32),
+            b.cols.div_ceil(32),
+        );
+        let units = self.spread_for(mt * nt * kt);
         let k_limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
         let work = crate::bf16::matmul(
             &mut self.dram_state()?.alloc,
@@ -2338,7 +2425,7 @@ impl<T: Transport> Session<T> {
             units,
             k_limit,
         )?;
-        self.execute(work, budget)
+        self.execute_on(work, units, budget)
     }
 
     /// Traceable shape/index constants encoded as mover immediates. Callers
@@ -2530,15 +2617,11 @@ impl<T: Transport> Session<T> {
                 copy_rows(values.bytes(), t.rows, t.cols * 4, &mut buf[at..], stride)
             });
             let base = host.noc_address() + at as u64;
-            let jobs = tensor::row_major_dma_jobs(
-                t.tensor_ref(),
-                [t.rows, t.cols],
-                true,
-                base,
-                self.units.len(),
-            );
+            let units = self.spread_for(tiles);
+            let jobs =
+                tensor::row_major_dma_jobs(t.tensor_ref(), [t.rows, t.cols], true, base, units);
             self.staging_busy = true;
-            self.submit_jobs(jobs, RESET_BUDGET)?;
+            self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
             return Ok(Some(()));
         }
         let slot = tt_isa::dm::TILE_SLOT as usize;
@@ -2550,15 +2633,10 @@ impl<T: Transport> Session<T> {
             // Tilized straight into the pinned memory the card reads.
             host.with_bytes(&mut |buf| values.tilize(t, first..first + n, &mut buf[at..], slot));
             let base = host.noc_address() + at as u64;
-            let jobs = tensor::host_dma_jobs(
-                t.tensor_ref(),
-                first..first + n,
-                true,
-                base,
-                self.units.len(),
-            );
+            let units = self.spread_for(n);
+            let jobs = tensor::host_dma_jobs(t.tensor_ref(), first..first + n, true, base, units);
             self.staging_busy = true;
-            self.submit_jobs(jobs, RESET_BUDGET)?;
+            self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
         }
         Ok(Some(()))
     }
@@ -2579,9 +2657,9 @@ impl<T: Transport> Session<T> {
 
     /// Run a transfer's jobs to their end, without a barrier (nothing is
     /// queued behind them before the sync).
-    fn submit_dma(&mut self, jobs: Vec<tensor::Job>) -> Result<(), TensorError> {
+    fn submit_dma(&mut self, jobs: Vec<tensor::Job>, units: usize) -> Result<(), TensorError> {
         self.unbarriered = true;
-        let r = self.submit_jobs(jobs, RESET_BUDGET);
+        let r = self.submit_jobs_on(jobs, units, RESET_BUDGET);
         self.unbarriered = false;
         r?;
         self.sync()
@@ -2601,14 +2679,10 @@ impl<T: Transport> Session<T> {
         if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
             // The card untilizes; the rows come back as they are.
             let base = self.staging().expect("checked above").noc_address();
-            let jobs = tensor::row_major_dma_jobs(
-                t.tensor_ref(),
-                [t.rows, t.cols],
-                false,
-                base,
-                self.units.len(),
-            );
-            self.submit_dma(jobs)?;
+            let units = self.spread_for(tiles);
+            let jobs =
+                tensor::row_major_dma_jobs(t.tensor_ref(), [t.rows, t.cols], false, base, units);
+            self.submit_dma(jobs, units)?;
             let host = self.staging().expect("checked above");
             // SAFETY: `out` is `rows * cols` plain f32s, whose bytes any
             // pattern is.
@@ -2622,14 +2696,9 @@ impl<T: Transport> Session<T> {
         for first in (0..tiles).step_by(per) {
             let n = (tiles - first).min(per);
             let base = self.staging().expect("checked above").noc_address();
-            let jobs = tensor::host_dma_jobs(
-                t.tensor_ref(),
-                first..first + n,
-                false,
-                base,
-                self.units.len(),
-            );
-            self.submit_dma(jobs)?;
+            let units = self.spread_for(n);
+            let jobs = tensor::host_dma_jobs(t.tensor_ref(), first..first + n, false, base, units);
+            self.submit_dma(jobs, units)?;
             let host = self.staging().expect("checked above");
             // Detilized straight out of the pinned memory the card wrote.
             host.with_bytes(&mut |buf| {
@@ -2715,7 +2784,7 @@ impl<T: Transport> Session<T> {
                 self.units[u].queued.clear();
                 self.recover(&[(u, had_kernels)]);
             }
-            self.barriers = 0;
+            self.restart_barriers();
             if let Some(m) = self.units.first().and_then(|u| u.resident.as_ref()) {
                 let (w, t) = (m.window(), self.units[0].tile);
                 let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
@@ -2729,6 +2798,84 @@ impl<T: Transport> Session<T> {
         // Nothing queued reads host memory any more.
         self.staging_at = 0;
         self.staging_busy = false;
+        // Every list has run, so every barrier's units have arrived: no tile
+        // has anything to catch up on.
+        let target = self.barriers;
+        for unit in &mut self.units {
+            unit.barrier_seen = target;
+        }
+        Ok(())
+    }
+
+    /// A wait-only `BARRIER` for `target` (`dm::op::BARRIER` word 4 = 1).
+    fn barrier_wait(&self, target: u32) -> [u32; 8] {
+        let c = self.units[0].tile;
+        [
+            tt_isa::dm::op::BARRIER,
+            target,
+            c.x() as u32,
+            c.y() as u32,
+            1,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    /// The barrier counter and the session's count start again at zero, and no
+    /// tile has a target to wait for: on a recovery, with nothing queued.
+    fn restart_barriers(&mut self) {
+        self.barriers = 0;
+        for unit in &mut self.units {
+            unit.barrier_seen = 0;
+        }
+    }
+
+    /// Order unit `u` after every barrier it sat out, before its next list: one
+    /// wait-only `BARRIER` for the latest target (`dm::op::BARRIER`), which the
+    /// units that ran those ops reach only once their writes have landed. A unit
+    /// that has passed the latest barrier, or a session of one unit, needs none.
+    ///
+    /// This is what lets an op's barrier involve only the units it ran on: a tile
+    /// an op does not use enqueues nothing for it, where it used to enqueue a
+    /// barrier list of its own (one PCIe enqueue a tile an op: a 2-tile op on 120
+    /// tiles was 118 of them, and the all-tiles transformer 355,000 a step).
+    fn catch_up(&mut self, u: usize) -> Result<(), TensorError> {
+        let target = self.barriers;
+        self.catch_up_to(u, target)
+    }
+
+    /// [`Session::catch_up`] to `target`: the latest barrier before the op being
+    /// queued, which its own barrier may already have moved past.
+    fn catch_up_to(&mut self, u: usize, target: u32) -> Result<(), TensorError> {
+        if self.units.len() < 2 || self.units[u].barrier_seen == target {
+            return Ok(());
+        }
+        // A capture's barriers involve every unit, and it starts synced, so no
+        // tile is behind inside one; a catch-up there would be a list the trace
+        // does not hold.
+        if self.capture.is_some() {
+            return Err(TensorError::Shape(
+                "a tile is behind the barrier counter inside a capture".into(),
+            ));
+        }
+        self.ensure_unit(u)?;
+        let entry = self.barrier_wait(target);
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let (r, m) = (
+            unit.resident.as_ref().unwrap(),
+            unit.mover.as_mut().unwrap(),
+        );
+        let number = m.enqueue(dev, r.window(), &[entry])?;
+        unit.queued.push_back(QueuedList {
+            roles: false,
+            number,
+            kernels: false,
+            what: "barrier catch-up",
+        });
+        unit.lists += 1;
+        unit.barrier_seen = target;
         Ok(())
     }
 
@@ -2848,6 +2995,11 @@ impl<T: Transport> Session<T> {
                 debug_assert!(idle, "the coordinator restarted under queued barriers");
                 dev.write32(r.window(), unit.tile, tt_isa::dm::BARRIER_COUNTER, 0)?;
                 *barriers = 0;
+                // Every tile's last target was on the old count; with nothing
+                // queued, none of them has anything to wait for.
+                for unit in units.iter_mut() {
+                    unit.barrier_seen = 0;
+                }
             }
         }
         Ok(())
@@ -2856,14 +3008,19 @@ impl<T: Transport> Session<T> {
     /// Queue an op's jobs ([`Session::execute`] with batching): each unit's
     /// share as few lists as fit, then -- with more than one unit -- a barrier
     /// on every unit, since the next op may read what any unit wrote.
-    fn enqueue_work(&mut self, jobs: Vec<tensor::Job>, budget: u64) -> Result<(), TensorError> {
+    fn enqueue_work(
+        &mut self,
+        jobs: Vec<tensor::Job>,
+        units: usize,
+        budget: u64,
+    ) -> Result<(), TensorError> {
         let starts: Option<Vec<usize>> = self
             .capture
             .as_ref()
             .map(|c| c.units.iter().map(|u| u.stream.len()).collect());
         let mut what = "";
         let start = self.mark();
-        let result = self.enqueue_work_inner(jobs, budget, &mut what);
+        let result = self.enqueue_work_inner(jobs, units, budget, &mut what);
         self.host.ops += 1;
         self.stage(HostStage::Enqueue, start);
         if let (Some(c), Some(starts)) = (self.capture.as_mut(), starts) {
@@ -2886,17 +3043,49 @@ impl<T: Transport> Session<T> {
     fn enqueue_work_inner(
         &mut self,
         jobs: Vec<tensor::Job>,
+        units: usize,
         budget: u64,
         what: &mut &'static str,
     ) -> Result<(), TensorError> {
         let n = self.units.len();
-        let mut queues: Vec<Vec<Step>> = vec![Vec::new(); n];
+        // The units the jobs were built for: the first `units` of the session's.
+        let spread = units.clamp(1, n);
+        // One queue a unit the op can run on, not one a unit of the session: on many
+        // tiles the empty ones were most of the host's time laying an op out (a
+        // 120-tile session at a spread of 2: 7 us an op against 1.6 on 2 tiles).
+        let mut queues: Vec<Vec<Step>> = vec![Vec::new(); spread];
         for (j, job) in jobs.into_iter().enumerate() {
-            queues[j % n].extend(job);
+            queues[j % spread].extend(job);
         }
+        // The units that arrive at this op's barrier: the ones it runs on, except in
+        // a capture, whose barriers keep every unit so a replay's streams all agree on
+        // the count whatever each op used. Nothing below loops over the session's
+        // other units: on many tiles that was a host cost every op paid.
+        let capturing = self.capture.is_some();
+        let arriving: Vec<usize> = match capturing {
+            true => (0..n).collect(),
+            false => (0..spread).filter(|&u| !queues[u].is_empty()).collect(),
+        };
+        // What each unit the op runs on must wait for first: the latest barrier
+        // before this op, if it sat out the ops up to it. Taken before this op's
+        // barrier is counted, since that target includes the unit's own arrival,
+        // which it would wait for in vain. It rides at the front of the unit's first
+        // list for the op ([`lead_with`]), not in a list of its own.
+        let mut behind: Vec<Option<u32>> = vec![None; spread];
         if n > 1 {
-            for u in 0..n {
+            for &u in &arriving {
                 self.ensure_unit(u)?;
+            }
+            for (u, b) in behind.iter_mut().enumerate() {
+                if !queues[u].is_empty() && self.units[u].barrier_seen != self.barriers {
+                    // A capture's barriers involve every unit, and it starts synced.
+                    if capturing {
+                        return Err(TensorError::Shape(
+                            "a tile is behind the barrier counter inside a capture".into(),
+                        ));
+                    }
+                    *b = Some(self.barriers);
+                }
             }
         }
         // In rounds: every unit's first list, then every unit's second, and
@@ -2910,18 +3099,23 @@ impl<T: Transport> Session<T> {
         let cache = self.units[0].programs.region().len();
         let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
             .into_iter()
-            .map(|steps| streaming_segments(steps, cache).map(Into::into))
+            .map(|steps| match steps.is_empty() {
+                true => Ok(Default::default()),
+                false => streaming_segments(steps, cache).map(Into::into),
+            })
             .collect::<Result<_, _>>()?;
         self.stage(HostStage::Segments, start);
-        // With more than one unit, a barrier on every unit after its share,
-        // since the next op may read what any unit wrote. It rides at the
-        // end of the unit's last list where there is room -- a list of its
-        // own was a second enqueue a unit an op, half the host's time on
-        // many tiles (checklist 9.17) -- except while capturing, whose
-        // streams take it as an entry of its own.
-        let barrier = (n > 1 && !self.unbarriered).then(|| {
-            self.barriers = self.barriers.wrapping_add(1);
-            let target = self.barriers.wrapping_mul(n as u32);
+        // With more than one unit, a barrier on each unit this op ran on, after
+        // its share, since the next op may read what any of them wrote; a unit
+        // it did not run on enqueues nothing, and catches up before its next
+        // list ([`Session::catch_up`]). It rides at the end of the unit's last
+        // list where there is room -- a list of its own was a second enqueue a
+        // unit an op, half the host's time on many tiles (checklist 9.17) --
+        // except while capturing, whose streams take it as an entry of its own.
+        let arrivals = arriving.len() as u32;
+        let barrier = (n > 1 && !self.unbarriered && arrivals > 0).then(|| {
+            self.barriers = self.barriers.wrapping_add(arrivals);
+            let target = self.barriers;
             let c = self.units[0].tile;
             [
                 tt_isa::dm::op::BARRIER,
@@ -2935,12 +3129,23 @@ impl<T: Transport> Session<T> {
             ]
         });
         let fold = barrier.filter(|_| self.capture.is_none());
-        let mut folded = vec![false; n];
+        let mut folded = vec![false; spread];
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
                 if let Some(mut seg) = q.pop_front() {
                     if what.is_empty() {
                         *what = seg.what;
+                    }
+                    if let Some(target) = behind[u].take() {
+                        if lead_with(&mut seg, self.barrier_wait(target)) {
+                            self.units[u].barrier_seen = target;
+                        } else {
+                            // A list already as long as a list may be: the wait goes
+                            // ahead of it as a list of its own.
+                            let start = self.mark();
+                            self.catch_up_to(u, target)?;
+                            self.stage(HostStage::Barrier, start);
+                        }
                     }
                     if let Some(entry) = fold {
                         if q.is_empty() && seg.entries.len() < tt_isa::dm::LIST_MAX as usize {
@@ -2958,15 +3163,19 @@ impl<T: Transport> Session<T> {
         if let Some(entry) = barrier {
             let start = self.mark();
             if let Some(c) = self.capture.as_mut() {
-                // Relative to the capture's first: a replay adds its own.
-                let rel = entry[1].wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
+                // Relative to the capture's first: a replay adds its own. Every
+                // unit arrives at a captured barrier, so the k-th is k * n.
+                let rel = entry[1].wrapping_sub(c.barriers_base);
                 c.barriers += 1;
                 for uc in &mut c.units {
                     uc.stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
-            for u in (0..n).filter(|&u| !folded[u]) {
+            for &u in arriving
+                .iter()
+                .filter(|&&u| !folded.get(u).copied().unwrap_or(false))
+            {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let (r, m) = (
@@ -2980,6 +3189,9 @@ impl<T: Transport> Session<T> {
                     kernels: false,
                     what: "barrier",
                 });
+            }
+            for &u in &arriving {
+                self.units[u].barrier_seen = entry[1];
             }
             self.stage(HostStage::Barrier, start);
         }
@@ -3293,9 +3505,18 @@ impl<T: Transport> Session<T> {
                     ))
                 })?;
                 let writer_at = 1 + relative[0][1] as usize;
-                let (reader, reader_storage) = self.store_region(u, &relative[1..writer_at])?;
+                let (reader, reader_storage, reader_mix) =
+                    self.store_region(u, &relative[1..writer_at])?;
+                let (writer, writer_storage, writer_mix) =
+                    self.store_region(u, &relative[writer_at..])?;
+                for (storage, mix) in [
+                    (&reader_storage, &reader_mix),
+                    (&writer_storage, &writer_mix),
+                ] {
+                    out.sections_gddr_bytes += storage.region().map_or(0, |r| r.len());
+                    out.sections_composition.add(mix);
+                }
                 out.regions.push(reader_storage);
-                let (writer, writer_storage) = self.store_region(u, &relative[writer_at..])?;
                 out.regions.push(writer_storage);
                 out.sections.extend([reader[2], writer[2]]);
                 out.stream.push([
@@ -3516,8 +3737,9 @@ impl<T: Transport> Session<T> {
         &mut self,
         u: usize,
         entries: &[[u32; 8]],
-    ) -> Result<([u32; 3], tensor::Placement), TensorError> {
+    ) -> Result<([u32; 3], tensor::Placement, trace::Composition), TensorError> {
         let words = trace::chunked(entries);
+        let composition = trace::Composition::of(entries, words.len());
         let mut bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3543,6 +3765,7 @@ impl<T: Transport> Session<T> {
                 words.len() as u32,
             ],
             storage,
+            composition,
         ))
     }
 
@@ -3552,6 +3775,7 @@ impl<T: Transport> Session<T> {
         uc: &trace::UnitCapture,
     ) -> Result<trace::UnitTrace, TensorError> {
         let words = trace::chunked(&uc.stream);
+        let own = trace::Composition::of(&uc.stream, words.len());
         let bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3577,6 +3801,8 @@ impl<T: Transport> Session<T> {
             d.alloc.free(&stream);
             return Err(e.into());
         }
+        let mut composition = own;
+        composition.add(&uc.sections_composition);
         Ok(trace::UnitTrace {
             regions: uc.regions.clone(),
             channel: range.channel().index() as u32,
@@ -3585,6 +3811,9 @@ impl<T: Transport> Session<T> {
             generations,
             held_programs: uc.held_programs.clone(),
             sections: uc.sections.clone(),
+            composition,
+            top_level_entries: words.len() as u32,
+            gddr_bytes: range.len() + uc.sections_gddr_bytes,
             stream,
         })
     }
@@ -3621,7 +3850,14 @@ impl<T: Transport> Session<T> {
             .collect();
         let barriers = t.barriers;
         let n = self.units.len() as u32;
-        let barrier_base = self.barriers.wrapping_mul(n);
+        // Every unit that runs the trace starts after the ops before it.
+        for (u, call) in calls.iter().enumerate() {
+            if call.is_some() {
+                self.catch_up(u)?;
+            }
+        }
+        let barrier_base = self.barriers;
+        let ran: Vec<bool> = calls.iter().map(Option::is_some).collect();
         let Session { dev, units, .. } = self;
         for (unit, call) in units.iter_mut().zip(calls) {
             let Some([channel, offset, count, generations]) = call else {
@@ -3652,7 +3888,16 @@ impl<T: Transport> Session<T> {
             // the host.
             r.forget_tile_state();
         }
-        self.barriers = self.barriers.wrapping_add(barriers);
+        // Every unit arrives at each of the trace's barriers.
+        self.barriers = self.barriers.wrapping_add(barriers.wrapping_mul(n));
+        if barriers > 0 {
+            let target = self.barriers;
+            for (unit, ran) in self.units.iter_mut().zip(ran) {
+                if ran {
+                    unit.barrier_seen = target;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3704,6 +3949,46 @@ impl<T: Transport> Session<T> {
             .collect())
     }
 
+    /// What trace `id` costs each unit (`None` for a unit it does not use): its
+    /// stream's entries by op and its chunk padding, the GDDR bytes the stream and its
+    /// sections take, and the program-cache bytes the trace pins, against the cache's
+    /// size. The two limits that bound a trace are the program cache and GDDR, so a
+    /// change that touches traces reports these beside its replay time.
+    pub fn trace_footprint(
+        &self,
+        id: TraceId,
+    ) -> Result<Vec<Option<trace::UnitFootprint>>, TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        Ok(t.units
+            .iter()
+            .zip(&self.units)
+            .map(|(ut, unit)| {
+                let ut = ut.as_ref()?;
+                // One hold per reference, so the same program appears often; a hold
+                // from before a reset names nothing.
+                let live: std::collections::BTreeSet<u64> = ut
+                    .held_programs
+                    .iter()
+                    .filter(|&&(generation, _)| generation == unit.programs.generation())
+                    .map(|&(_, at)| at)
+                    .collect();
+                let region = unit.programs.region();
+                Some(trace::UnitFootprint {
+                    stream: ut.composition.clone(),
+                    top_level_entries: ut.top_level_entries,
+                    gddr_bytes: ut.gddr_bytes,
+                    programs: live.len() as u32,
+                    program_bytes: live
+                        .iter()
+                        .filter_map(|&at| unit.programs.program_bytes(at))
+                        .sum(),
+                    cache_held_bytes: unit.programs.held_bytes(),
+                    cache_bytes: region.end - region.base,
+                })
+            })
+            .collect())
+    }
+
     /// Is a capture open?
     pub fn capturing(&self) -> bool {
         self.capture.is_some()
@@ -3745,7 +4030,7 @@ impl<T: Transport> Session<T> {
         b.expect("matrix elementwise", tensor::Elem::F32)?;
         let dims = [a.rows, a.cols];
         let broadcast = m::broadcast(dims, [b.rows, b.cols])?;
-        let units = self.units.len();
+        let units = self.spread_for(dims[0].div_ceil(32) * dims[1].div_ceil(32));
         let simulated = self.dev.transport().is_simulated();
         let work = m::build(
             &mut self.dram_state()?.alloc,
@@ -3763,7 +4048,7 @@ impl<T: Transport> Session<T> {
             },
             units,
         )?;
-        self.execute(work, RESET_BUDGET)
+        self.execute_on(work, units, RESET_BUDGET)
     }
 
     /// Two matrix stages with an explicit truncated Src precision boundary.
@@ -3787,7 +4072,7 @@ impl<T: Transport> Session<T> {
                 "matrix chain requires equal shapes".into(),
             ));
         }
-        let units = self.units.len();
+        let units = self.spread_for(dims[0].div_ceil(32) * dims[1].div_ceil(32));
         let simulated = self.dev.transport().is_simulated();
         let work = m::build(
             &mut self.dram_state()?.alloc,
@@ -3805,7 +4090,7 @@ impl<T: Transport> Session<T> {
             },
             units,
         )?;
-        self.execute(work, RESET_BUDGET)
+        self.execute_on(work, units, RESET_BUDGET)
     }
 
     /// Packed BF16 operands stay packed through unpack; the result is F32.
@@ -3819,7 +4104,7 @@ impl<T: Transport> Session<T> {
         use crate::matrix_eltwise as m;
         let dims = [a.rows, a.cols];
         let broadcast = m::broadcast(dims, [b.rows, b.cols])?;
-        let units = self.units.len();
+        let units = self.spread_for(dims[0].div_ceil(32) * dims[1].div_ceil(32));
         let simulated = self.dev.transport().is_simulated();
         let work = m::build(
             &mut self.dram_state()?.alloc,
@@ -3837,7 +4122,7 @@ impl<T: Transport> Session<T> {
             },
             units,
         )?;
-        self.execute(work, RESET_BUDGET)
+        self.execute_on(work, units, RESET_BUDGET)
     }
 
     /// Element-wise `a (op) b` in GDDR, on the SFPU ([`tensor::sfpu_eltwise`]).
@@ -3865,7 +4150,7 @@ impl<T: Transport> Session<T> {
         // The session's math mode picks the program: an Approx twin has a kind
         // of its own, so every memo and cache key below carries the mode.
         let op = op.in_mode(self.math);
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(a).max(b.map_or(0, tiles_of)));
         let overlap = self.overlap();
         let alloc = &mut self.dram_state()?.alloc;
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
@@ -3875,7 +4160,7 @@ impl<T: Transport> Session<T> {
                 "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
             )));
         };
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()));
         Ok(out)
     }
@@ -3910,9 +4195,9 @@ impl<T: Transport> Session<T> {
     /// `t`, bit for bit, as a tensor of its own ([`tensor::copy`]): data
     /// movement only, any element type.
     pub fn copy(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(t));
         let work = tensor::copy(&mut self.dram_state()?.alloc, t, units)?;
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(if t.pad() == tensor::Pad::Zero {
             tensor::Pad::Zero
         } else {
@@ -4036,9 +4321,9 @@ impl<T: Transport> Session<T> {
 
     /// Copy `src`, bit for bit, into an existing allocated tensor `dst`.
     pub fn copy_into(&mut self, src: &DramTensor, dst: &DramTensor) -> Result<(), TensorError> {
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(src));
         let work = tensor::copy_into(src, dst, units)?;
-        self.submit_jobs(work.jobs, RESET_BUDGET)?;
+        self.submit_jobs_on(work.jobs, units, RESET_BUDGET)?;
         dst.set_pad(if src.pad() == tensor::Pad::Zero {
             tensor::Pad::Zero
         } else {
@@ -4137,6 +4422,37 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Rows of `table` chosen by `indices`, a resident `[1, n]` I32 tensor:
+    /// `out[i] = table[indices[i]]`, bit for bit, with no host address
+    /// ([`crate::index::select_rows_jobs`]). An index outside `0..table.rows`
+    /// is `DOMAIN` from the mover, queued as any list's error. The padding is
+    /// zero where the table's is: the rows past `n` are filled with zero.
+    pub fn select_rows(
+        &mut self,
+        table: &DramTensor,
+        indices: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(indices.cols.div_ceil(32) * table.cols.div_ceil(32));
+        let out = DramTensor::alloc_elem(
+            &mut self.dram_state()?.alloc,
+            indices.cols,
+            table.cols,
+            table.elem,
+        )?;
+        let result = crate::index::select_rows_jobs(table, indices, &out, units)
+            .and_then(|jobs| self.submit_jobs_on(jobs, units, RESET_BUDGET));
+        if let Err(error) = result {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        out.set_pad(if table.pad() == tensor::Pad::Zero {
+            tensor::Pad::Zero
+        } else {
+            tensor::Pad::Undefined
+        });
+        Ok(out)
+    }
+
     pub fn gather_indexed_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,
@@ -4190,9 +4506,9 @@ impl<T: Transport> Session<T> {
         moves: &[tensor::BlockMove],
         dims: [usize; 2],
     ) -> Result<DramTensor, TensorError> {
-        let units = self.units.len();
+        let units = self.spread_for(dims[0].div_ceil(32) * dims[1].div_ceil(32));
         let work = tensor::copy_blocks(&mut self.dram_state()?.alloc, t, moves, dims, units)?;
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(if t.pad() == tensor::Pad::Zero {
             tensor::Pad::Zero
         } else {
@@ -4210,9 +4526,9 @@ impl<T: Transport> Session<T> {
         rows: &[(usize, usize)],
         cols: usize,
     ) -> Result<DramTensor, TensorError> {
-        let units = self.units.len();
+        let units = self.spread_for(rows.len().div_ceil(32) * cols.div_ceil(32));
         let work = tensor::gather_rows(&mut self.dram_state()?.alloc, sources, rows, cols, units)?;
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         let zero = rows.len() % 32 == 0 && sources.iter().all(|t| t.pad() == tensor::Pad::Zero);
         out.set_pad(if zero {
             tensor::Pad::Zero
@@ -4229,9 +4545,9 @@ impl<T: Transport> Session<T> {
         src: &DramTensor,
         rows: &[(usize, usize)],
     ) -> Result<(), TensorError> {
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(src));
         let jobs = tensor::write_rows(dst, src, rows, units)?;
-        self.submit_jobs(jobs, RESET_BUDGET)?;
+        self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
         if src.pad() != tensor::Pad::Zero {
             dst.set_pad(tensor::Pad::Undefined);
         }
@@ -4314,10 +4630,10 @@ impl<T: Transport> Session<T> {
     /// ([`tensor::sum_rows`]).
     pub fn sum_rows(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(a));
         let overlap = self.overlap();
         let work = tensor::sum_rows(&mut self.dram_state()?.alloc, a, units, overlap)?;
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::SumRows.produces(&[a]));
         Ok(out)
     }
@@ -4337,10 +4653,10 @@ impl<T: Transport> Session<T> {
         if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
             return self.sum_rows(a);
         }
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(a));
         let overlap = self.overlap();
         let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, overlap)?;
-        let out = self.execute(work, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
     }
@@ -4400,16 +4716,16 @@ impl<T: Transport> Session<T> {
         if need == PadNeed::Any || t.pad() == Pad::Zero {
             return Ok(None);
         }
-        let units = self.units.len();
+        let units = self.spread_for(tiles_of(t));
         if t.placement.owned() {
             let jobs = tensor::fill_pad(t, 0.0, units)?;
-            self.submit_jobs(jobs, RESET_BUDGET)?;
+            self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
             t.set_pad(Pad::Zero);
             return Ok(None);
         }
         let copy = self.copy(t)?;
         let jobs = tensor::fill_pad(&copy, 0.0, units)?;
-        if let Err(e) = self.submit_jobs(jobs, RESET_BUDGET) {
+        if let Err(e) = self.submit_jobs_on(jobs, units, RESET_BUDGET) {
             let _ = self.free(copy);
             return Err(e);
         }
@@ -4455,7 +4771,11 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         };
-        let units = self.units.len();
+        let [ar, ac] = a.grid();
+        let [br, bc] = b.grid();
+        let (mt, kt) = if a_transposed { (ac, ar) } else { (ar, ac) };
+        let nt = if b_transposed { br } else { bc };
+        let units = self.spread_for(mt * nt * kt);
         // No `MOP` in the matmul: with its loops replayed it is backend-bound,
         // and the math role's `MOP` measured no faster end to end on silicon
         // (row AE) -- while ttsim's FIFO overflows under one (row 68), so the
@@ -4481,7 +4801,7 @@ impl<T: Transport> Session<T> {
                     max_k_tiles,
                 )
             })
-            .and_then(|work| self.execute(work, budget));
+            .and_then(|work| self.execute_on(work, units, budget));
         for c in [ca, cb].into_iter().flatten() {
             self.free(c)?;
         }
@@ -4522,7 +4842,8 @@ impl<T: Transport> Session<T> {
                 return Err(e);
             }
         };
-        let units = self.units.len();
+        let [m, k, n] = mkn;
+        let units = self.spread_for(items.len() * m.div_ceil(32) * n.div_ceil(32) * k.div_ceil(32));
         let pipeline = self.pipeline;
         let max_k_tiles = self.matmul_k_block_limit;
         let out = self
@@ -4542,7 +4863,7 @@ impl<T: Transport> Session<T> {
                     max_k_tiles,
                 )
             })
-            .and_then(|work| self.execute(work, budget));
+            .and_then(|work| self.execute_on(work, units, budget));
         for c in [ca, cb].into_iter().flatten() {
             self.free(c)?;
         }
@@ -4556,8 +4877,22 @@ impl<T: Transport> Session<T> {
     ///
     /// Enqueue the operation through the ownership scheduler and optionally wait.
     fn execute(&mut self, work: tensor::Work, budget: u64) -> Result<DramTensor, TensorError> {
+        // Work built without a unit count: its jobs go round-robin over the units the
+        // spread gives an op its output's size.
+        let units = self.spread_for(tiles_of(&work.out));
+        self.execute_on(work, units, budget)
+    }
+
+    /// [`Session::execute`] for work built for `units` units (`Session::spread`): its
+    /// jobs go to units `0..units`, as the builder that made them for that many expects.
+    fn execute_on(
+        &mut self,
+        work: tensor::Work,
+        units: usize,
+        budget: u64,
+    ) -> Result<DramTensor, TensorError> {
         let tensor::Work { out, jobs } = work;
-        if let Err(error) = self.submit_jobs(jobs, budget) {
+        if let Err(error) = self.submit_jobs_on(jobs, units, budget) {
             if let Ok(dram) = self.dram_state() {
                 dram.alloc.free(&out.placement);
             }
@@ -4571,8 +4906,21 @@ impl<T: Transport> Session<T> {
         jobs: Vec<tensor::Job>,
         budget: u64,
     ) -> Result<(), TensorError> {
+        // Jobs built without a unit count, and with no output to size them by: as many
+        // units as the spread gives that many jobs' work.
+        let units = self.spread_for(jobs.len());
+        self.submit_jobs_on(jobs, units, budget)
+    }
+
+    /// [`Session::submit_jobs`] for jobs built for `units` units.
+    fn submit_jobs_on(
+        &mut self,
+        jobs: Vec<tensor::Job>,
+        units: usize,
+        budget: u64,
+    ) -> Result<(), TensorError> {
         if self.batching {
-            return self.submit_jobs_inner(jobs, budget);
+            return self.submit_jobs_inner(jobs, units, budget);
         }
         let what = jobs
             .iter()
@@ -4582,21 +4930,22 @@ impl<T: Transport> Session<T> {
                 Step::Kernel { .. } => None,
             })
             .unwrap_or("control kernel");
-        tensor::stats::timed(what, || self.submit_jobs_inner(jobs, budget))
+        tensor::stats::timed(what, || self.submit_jobs_inner(jobs, units, budget))
     }
 
     fn submit_jobs_inner(
         &mut self,
         jobs: Vec<tensor::Job>,
+        units: usize,
         budget: u64,
     ) -> Result<(), TensorError> {
-        let queued = self.enqueue_work(jobs, budget);
+        let queued = self.enqueue_work(jobs, units, budget);
         let synced = match &queued {
             Ok(()) if self.profiling.is_some() || !self.batching => self.sync(),
             Ok(()) => Ok(()),
             Err(_) => {
                 let _ = self.sync();
-                self.barriers = 0;
+                self.restart_barriers();
                 if let Some(resident) = self.units[0].resident.as_ref() {
                     let _ = self.dev.write32(
                         resident.window(),
@@ -4719,6 +5068,24 @@ impl<T: Transport> Session<T> {
     /// twice the operand tiles gathered. The bits are the same. Captures retain
     /// the selected schedule, and replays do not replan it. Streaming mode with
     /// this disabled still uses NC, but waits for each output before slot reuse.
+    /// How many of the session's units each op runs on ([`Spread`]); [`Spread::All`],
+    /// every unit, by default. The results are the same bits whatever it is: a job runs
+    /// the same wherever it runs, and an op's barrier involves the units it ran on
+    /// ([`Session::catch_up`]).
+    pub fn set_spread(&mut self, spread: Spread) {
+        self.spread = spread;
+    }
+
+    /// See [`Session::set_spread`].
+    pub fn spread(&self) -> Spread {
+        self.spread
+    }
+
+    /// The units an op with `work` runs on, by [`Session::set_spread`].
+    fn spread_for(&self, work: usize) -> usize {
+        self.spread.units_for(work, self.units.len())
+    }
+
     pub fn set_pipeline(&mut self, on: bool) {
         self.pipeline = on;
     }
@@ -4877,8 +5244,29 @@ impl Session<tt_kmd::Kmd> {
 mod tests {
     use super::{
         control_segments, healthy_tiles, runtime, streaming_segments, transfer_segments,
-        Instruction, RunError, SessionError, Step,
+        Instruction, RunError, SessionError, Spread, Step,
     };
+
+    #[test]
+    fn a_spread_gives_an_op_between_one_unit_and_all_of_them() {
+        for units in [1, 4, 120] {
+            assert_eq!(Spread::All.units_for(0, units), units);
+            assert_eq!(Spread::All.units_for(1 << 20, units), units);
+            assert_eq!(Spread::Fixed(2).units_for(1 << 20, units), 2.min(units));
+            assert_eq!(Spread::Fixed(0).units_for(1, units), 1);
+            assert_eq!(Spread::Fixed(1000).units_for(1, units), units);
+            // One unit for each share of the work, rounded up, never none.
+            let work = |share, min| Spread::Work { share, min };
+            assert_eq!(work(8, 0).units_for(0, units), 1);
+            assert_eq!(work(8, 1).units_for(8, units), 1);
+            assert_eq!(work(8, 1).units_for(9, units), 2.min(units));
+            assert_eq!(work(8, 1).units_for(8 * 1000, units), units);
+            assert_eq!(work(0, 1).units_for(3, units), 3.min(units));
+            // The floor: a small op still gets `min` units, a large one more.
+            assert_eq!(work(64, 2).units_for(1, units), 2.min(units));
+            assert_eq!(work(64, 2).units_for(64 * 5, units), 5.min(units));
+        }
+    }
     use std::sync::Arc;
     use tt_isa::dm::{op, LIST_MAX};
 

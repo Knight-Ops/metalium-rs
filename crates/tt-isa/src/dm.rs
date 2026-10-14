@@ -19,6 +19,7 @@
 
 use crate::dram::{Dram, DramRange};
 
+pub mod encoded;
 pub mod record;
 
 /// The mover's mailbox: the slot after the three role mailboxes
@@ -30,8 +31,11 @@ const _: () = assert!(MAILBOX_BASE % 16 == 0);
 /// Where the image is linked and loaded: RISCV B has no reset-PC override and
 /// always starts at L1 offset 0 (`tensix::Core::B`).
 pub const IMAGE_BASE: u64 = crate::tensix::Core::B.default_reset_pc() as u64;
-/// The image may not reach T0's default reset PC.
-pub const IMAGE_MAX: u64 = crate::tensix::Core::T0.default_reset_pc() as u64 - IMAGE_BASE;
+/// The image may not reach the first role image ([`crate::l1::roles`]): the
+/// three role images are packed against NC's slot with reset-PC overrides, so
+/// B's slot is everything below them rather than only what lies under T0's
+/// default reset PC.
+pub const IMAGE_MAX: u64 = crate::l1::roles::BASE[0] - IMAGE_BASE;
 
 // The runtime's own words (status, heartbeat, panic code) sit at the start of
 // the mailbox, as in every image (`crate::mailbox::offset`); the descriptor
@@ -69,6 +73,17 @@ pub const USABLE: u64 = MAILBOX_BASE + 0x4C;
 /// off between lists. Zero on the simulator, which does not model the event
 /// stream (divergence row 54).
 pub const TRACE: u64 = MAILBOX_BASE + 0x50;
+
+/// [`TRACE`]'s non-zero values.
+pub mod trace_mode {
+    /// Every list, entry and record, as the host has always asked for: two timestamper stores around each
+    /// entry, which also keep a run of reads out of the tight loop (the cost of tracing: ~94 cycles an
+    /// encoded read, `docs/learnings/performance-log.md`, "What bounds one tile's read rate").
+    pub const FULL: u32 = 1;
+    /// The list's own begin and end and every entry but a plain or encoded read (a barrier's release, a
+    /// kernel, a wait): what a benchmark that times lists needs, with the reads running as they do untraced.
+    pub const LISTS: u32 = 2;
+}
 /// Mover -> host: how many of the mover's NoC requests had to wait for room
 /// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
 /// zeroed it. Written only when one did, so the normal path never touches it.
@@ -87,6 +102,10 @@ pub const IN_FLIGHT_CAP: u64 = MAILBOX_BASE + 0x5C;
 /// 16 KiB, against 3-4% off one tile's small reads
 /// (`docs/learnings/performance-log.md`, "What holds card reads").
 pub const TILE_IN_FLIGHT_CAP: u32 = 8;
+/// The NoC transaction ID RISCV B's requests carry (`PACKET_TAG` bits 10..14),
+/// and NC's: the mover's `TXN`.
+pub const TXN_B: u8 = 2;
+pub const TXN_NC: u8 = 4;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -142,7 +161,33 @@ pub const TRACE_PROGRESS: u64 = MAILBOX_BASE + 0xE4;
 /// ignores it (its writes are not on this path).
 pub const READ_FAST: u64 = MAILBOX_BASE + 0xE8;
 const _: () = assert!(TRACE_PROGRESS + 4 <= READ_FAST);
-const _: () = assert!(READ_FAST + 4 <= MAILBOX_BASE + 0x100);
+
+/// Mover -> host: what this image was built to do ([`caps`]), written once as the
+/// mover starts. Zero until it has: the host waits for [`caps::VALID`]. The host
+/// reads it instead of assuming which firmware it loaded.
+pub const CAPS: u64 = MAILBOX_BASE + 0xEC;
+const _: () = assert!(READ_FAST + 4 <= CAPS);
+
+/// Host -> mover: the key the checksum of a host-encoded read is bound to
+/// ([`encoded::context_seed`]), written before the image starts and read once at boot.
+/// A fresh random word each start, so an encoded entry left in L1 by an earlier run, or
+/// made for another mover, fails the card's check. Ignored by an image without `fast-reads`.
+pub const ENCODE_KEY: u64 = MAILBOX_BASE + 0xF0;
+const _: () = assert!(CAPS + 4 <= ENCODE_KEY);
+const _: () = assert!(ENCODE_KEY + 4 <= MAILBOX_BASE + 0x100);
+
+/// [`CAPS`]'s bits.
+pub mod caps {
+    /// The word has been written (every image sets it, so zero means "not yet").
+    pub const VALID: u32 = 1 << 31;
+    /// The image runs host-encoded reads ([`super::op::READ_ENCODED`]): built with the
+    /// `fast-reads` feature. Without it the card decodes and checks every read
+    /// itself and refuses `READ_ENCODED` as an unknown op.
+    pub const FAST_READS: u32 = 1 << 0;
+    /// With `FAST_READS`, the image also runs [`super::encoded::guard`] on each
+    /// encoded read (the `encoded-guard` feature), not only its checksum.
+    pub const GUARD: u32 = 1 << 1;
+}
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
 pub mod write_noc {
@@ -203,6 +248,13 @@ pub mod op {
     /// datum_bytes]`. Source holds a 32-column chunk beginning at `first`.
     /// Indices outside `0..bound` report DOMAIN before any indexed access.
     pub const INDEX_PICK: u32 = 0x49;
+    /// B issues one GDDR read the host already encoded ([`super::encoded`]):
+    /// `[READ_ENCODED, TARG, TARG_HI, RET, RET_HI, CHECK, 0, LEN]`, at most
+    /// `MAX_REQUEST_BYTES` of it. The card verifies `CHECK` (an integrity word the host's
+    /// encoder computes over the others), not the move: the host validated that
+    /// ([`super::encoded::validate`]). Only an image built with `fast-reads` runs it
+    /// ([`super::caps::FAST_READS`]); B only.
+    pub const READ_ENCODED: u32 = 0x4A;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
@@ -239,13 +291,19 @@ pub mod op {
     /// tensor so read is a whole tile to broadcast across a `[rows, cols]`
     /// one, element for element. Only in a list entry.
     pub const READ_BROADCAST_COL: u32 = 8;
-    /// Wait until every unit of a session has reached this point:
-    /// `[BARRIER, target, x, y, 0, 0, 0, 0]`. The mover waits for its own
-    /// moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the L1
-    /// of the coordinating tile `(x, y)` by a NoC atomic increment, and polls
-    /// that counter over the NoC until it reaches `target` (compared modulo
-    /// 2^32, so the counter may wrap). With `n` units, the `k`-th barrier's
-    /// target is `k * n`. Only in a list entry.
+    /// Wait until the units an op ran on have reached this point:
+    /// `[BARRIER, target, x, y, wait_only, 0, 0, 0]`. The mover waits for its
+    /// own moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the
+    /// L1 of the coordinating tile `(x, y)` by a NoC atomic increment, and
+    /// polls that counter over the NoC until it reaches `target` (compared
+    /// modulo 2^32, so the counter may wrap). The counter counts arrivals, so
+    /// a barrier's target is every arrival before it plus its own units'.
+    ///
+    /// `wait_only` 1: poll without adding one. A unit that ran none of the
+    /// ops since it last passed a barrier waits this way for the latest
+    /// target before its next list, which orders it after those ops' writes
+    /// without making it arrive at barriers it had no part in
+    /// (`tt_kernels::session`). Only 0 or 1. Only in a list entry.
     pub const BARRIER: u32 = 9;
     /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
     /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
@@ -311,7 +369,7 @@ const _: () = {
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
-        assert!(ops[i] < record::GATHER || ops[i] > record::PAD_WRITE);
+        assert!(ops[i] < record::GATHER || ops[i] > record::SELECT_ROWS);
         i += 1;
     }
 };
@@ -374,6 +432,18 @@ pub struct Mover {
     pub list: u64,
     pub scratch: u64,
     pub trace_chunk: u64,
+}
+
+/// A word a mover may write with [`op::POKE`] or [`record::POKE_RUN`]: aligned, and
+/// inside one of the three role mailboxes. Shared so the host's check, the entry decode
+/// and the firmware's run of a record agree on what is pokeable.
+pub const fn is_role_mailbox_word(address: u32) -> bool {
+    let base = crate::mailbox::role::BASE;
+    let end = base + 3 * crate::mailbox::role::STRIDE;
+    address % 4 == 0
+        && (address as u64) >= base
+        && (address as u64) < end
+        && (address as u64 - base) % crate::mailbox::role::STRIDE < crate::mailbox::MAILBOX_SIZE
 }
 
 impl Mover {
@@ -577,8 +647,13 @@ pub enum Entry {
     },
     /// [`op::WAIT`].
     Wait,
-    /// [`op::BARRIER`].
-    Barrier { target: u32, x: u8, y: u8 },
+    /// [`op::BARRIER`]: `arrive` false is its wait-only form.
+    Barrier {
+        target: u32,
+        x: u8,
+        y: u8,
+        arrive: bool,
+    },
     /// [`op::CALL`]: run `count` entries from GDDR.
     Call {
         channel: u32,
@@ -821,13 +896,14 @@ impl Entry {
             return Ok(Entry::Wait);
         }
         if w[0] == op::BARRIER {
-            if w[2] > 0x3f || w[3] > 0x3f || w[4..].iter().any(|&v| v != 0) {
+            if w[2] > 0x3f || w[3] > 0x3f || w[4] > 1 || w[5..].iter().any(|&v| v != 0) {
                 return Err(error::OP);
             }
             return Ok(Entry::Barrier {
                 target: w[1],
                 x: w[2] as u8,
                 y: w[3] as u8,
+                arrive: w[4] == 0,
             });
         }
         if w[0] == op::CALL {
@@ -848,14 +924,7 @@ impl Entry {
             });
         }
         if w[0] == op::POKE {
-            let base = crate::mailbox::role::BASE;
-            let end = base + 3 * crate::mailbox::role::STRIDE;
-            let ok = w[1] % 4 == 0
-                && (w[1] as u64) >= base
-                && (w[1] as u64) < end
-                && (w[1] as u64 - base) % crate::mailbox::role::STRIDE
-                    < crate::mailbox::MAILBOX_SIZE;
-            if !ok || w[3..].iter().any(|&v| v != 0) {
+            if !is_role_mailbox_word(w[1]) || w[3..].iter().any(|&v| v != 0) {
                 return Err(error::OP);
             }
             return Ok(Entry::Poke {
@@ -976,6 +1045,10 @@ pub mod error {
     pub const DIRECTION: u32 = 10;
     /// A native arithmetic operation rejected a logical input (division by zero).
     pub const DOMAIN: u32 = 11;
+    /// A host-encoded read ([`super::op::READ_ENCODED`]) failed the card's checksum
+    /// (or, with `encoded-guard`, its guard, [`super::encoded::guard`]): not what the
+    /// host's encoder makes, or damaged on the way.
+    pub const ENCODED: u32 = 12;
 }
 
 /// A descriptor, as both sides see it.
@@ -1035,6 +1108,34 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    /// Word 4 of a `BARRIER` says whether the unit arrives (0, as every barrier did before
+    /// the wait-only form) or only waits (1); anything else, or a word past it, is refused.
+    #[test]
+    fn a_barrier_arrives_or_only_waits_and_nothing_else() {
+        use super::*;
+        let decode = |w4: u32, w5: u32| Entry::decode(0xFF, [op::BARRIER, 7, 1, 2, w4, w5, 0, 0]);
+        assert_eq!(
+            decode(0, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: true
+            })
+        );
+        assert_eq!(
+            decode(1, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: false
+            })
+        );
+        assert_eq!(decode(2, 0), Err(error::OP));
+        assert_eq!(decode(1, 1), Err(error::OP));
+    }
+
     #[test]
     fn resident_index_selection_checks_every_slot_and_geometry() {
         use super::*;

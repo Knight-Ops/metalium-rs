@@ -179,6 +179,7 @@ pub const fn endpoint_tile_index(endpoint_id: u32) -> u8 {
 pub mod atomic;
 pub mod multicast;
 pub mod probe;
+pub mod read_loop;
 
 #[cfg(test)]
 mod tests {
@@ -428,9 +429,78 @@ pub mod niu {
             self.room -= 1;
         }
 
+        /// Requests that may be issued before the counter must be read.
+        pub const fn room(&self) -> u16 {
+            self.room
+        }
+
+        /// `k` requests were issued, charged together ([`Batch`]).
+        pub fn take(&mut self, k: u16) {
+            self.room -= k;
+        }
+
         /// The counter was seen at zero: every request has completed.
         pub fn drained(&mut self) {
             self.room = self.cap;
+        }
+    }
+
+    /// A run of requests charged to one [`InFlight`] together: the issue path keeps the room in a register,
+    /// `InFlight` is updated when the batch ends or its room runs out, and the fence that orders the issue
+    /// stores before a counter read (`NoC/Counters.md`) is made once per batch, not once per request.
+    /// The protocol, for each request: [`Batch::before_issue`], the issue, [`Batch::issued`]; at the end
+    /// [`Batch::end`], which says whether to fence (any request issued). Every exit from the run, an error
+    /// included, ends it, or the requests it issued are not counted.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct Batch {
+        room: u16,
+        issued: u16,
+    }
+
+    impl Batch {
+        /// A batch over what `f` has room for.
+        pub const fn begin(f: &InFlight) -> Self {
+            Batch {
+                room: f.room(),
+                issued: 0,
+            }
+        }
+
+        /// Is there no room for the next request? Then [`Batch::refill`] first.
+        #[inline(always)]
+        pub const fn full(&self) -> bool {
+            self.room == 0
+        }
+
+        /// Charge what was issued, `fence`, and poll the counter (`outstanding`, its low 8 bits)
+        /// until there is room again, as [`InFlight::before_issue`] does. Returns how many reads found
+        /// the ID still at its cap, as it does.
+        pub fn refill(
+            &mut self,
+            f: &mut InFlight,
+            fence: impl FnOnce(),
+            outstanding: impl FnMut() -> u8,
+        ) -> u32 {
+            f.take(self.issued);
+            self.issued = 0;
+            fence();
+            let full = f.before_issue(outstanding);
+            self.room = f.room();
+            full
+        }
+
+        /// One request was issued.
+        #[inline(always)]
+        pub fn issued(&mut self) {
+            self.room -= 1;
+            self.issued += 1;
+        }
+
+        /// Charge what was issued to `f`; whether any request was, so whether the caller must fence
+        /// before anything reads a counter.
+        pub fn end(self, f: &mut InFlight) -> bool {
+            f.take(self.issued);
+            self.issued != 0
         }
     }
 
@@ -975,6 +1045,101 @@ pub mod niu {
                 assert!(niu.peak < 256);
                 assert!(stalls > 0, "cap {}: the throttle never engaged", f.cap());
             }
+        }
+
+        /// The batch protocol against the same model: the counter never passes the cap, it is read only
+        /// when the batch is out of room, and always after a fence (the issue stores before it are ordered),
+        /// whatever the batch sizes, caps and completions.
+        #[test]
+        fn a_batch_is_the_same_throttle_with_one_fence_a_batch() {
+            for cap in [1u32, 2, 3, 8, 16, 128, 0] {
+                let mut f = InFlight::new();
+                f.set_cap(cap);
+                let mut niu = Niu {
+                    outstanding: 0,
+                    peak: 0,
+                    reads: 0,
+                    seed: 0xBEEF_0001 | cap << 8,
+                };
+                let mut sizes = 0x9E37_79B9u32 ^ cap;
+                let fenced = core::cell::Cell::new(true);
+                let fences = core::cell::Cell::new(0u32);
+                let (mut refills, mut ends) = (0u32, 0u32);
+                for round in 0..2_000u32 {
+                    sizes ^= sizes << 13;
+                    sizes ^= sizes >> 17;
+                    sizes ^= sizes << 5;
+                    let n = sizes % 300;
+                    let mut b = Batch::begin(&f);
+                    fenced.set(true);
+                    for _ in 0..n {
+                        if b.full() {
+                            let before = niu.reads;
+                            b.refill(
+                                &mut f,
+                                || {
+                                    fenced.set(true);
+                                    fences.set(fences.get() + 1);
+                                },
+                                || {
+                                    assert!(fenced.get(), "a counter read without a fence");
+                                    niu.reads += 1;
+                                    niu.complete_some();
+                                    niu.outstanding as u8
+                                },
+                            );
+                            assert!(niu.reads > before, "refill read nothing at no room");
+                            refills += 1;
+                        }
+                        niu.outstanding += 1;
+                        fenced.set(false);
+                        b.issued();
+                        niu.peak = niu.peak.max(niu.outstanding);
+                        assert!(niu.outstanding <= f.cap() as u32, "past the cap");
+                    }
+                    if b.end(&mut f) {
+                        fences.set(fences.get() + 1);
+                        ends += 1;
+                    }
+                    if round % 7 == 6 {
+                        while niu.outstanding > 0 {
+                            niu.complete_some();
+                        }
+                        f.drained();
+                    }
+                }
+                assert!(
+                    niu.peak <= f.cap() as u32,
+                    "cap {}: peak {}",
+                    f.cap(),
+                    niu.peak
+                );
+                assert!(niu.peak < 256);
+                // One fence per refill and per batch end, not one per request.
+                // Exactly one fence per refill and per non-empty batch, and none per request (a refill can come
+                // with nothing yet issued, at the start of a batch whose room the last one used up).
+                assert_eq!(fences.get(), refills + ends, "cap {}", f.cap());
+            }
+        }
+
+        #[test]
+        fn a_batch_charges_what_it_issued_even_when_it_is_cut_short() {
+            let mut f = InFlight::new();
+            f.set_cap(8);
+            let mut b = Batch::begin(&f);
+            for _ in 0..5 {
+                assert!(!b.full());
+                b.issued();
+            }
+            // An error exit: `end` still charges the five.
+            assert!(b.end(&mut f));
+            assert_eq!(f.room(), 3);
+            // An empty batch charges nothing and asks for no fence.
+            let b = Batch::begin(&f);
+            assert!(!b.end(&mut f));
+            assert_eq!(f.room(), 3);
+            f.take(3);
+            assert!(f.at_cap());
         }
 
         #[test]

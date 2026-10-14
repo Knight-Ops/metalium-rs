@@ -1,0 +1,33 @@
+[package]
+name = "tt-models"
+description = "Pretrained models (ResNet-18, ViT-Tiny, SmolLM2-135M) run on burn-tt and checked against burn-flex: the model ladder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The tests that read `vendor/weights/` (`cargo xtask fetch-weights`) are ignored unless this is on, so
+# `cargo test --workspace` passes on a checkout that has not fetched 340 MB of checkpoints.
+[features]
+weights = []
+
+[lib]
+name = "tt_models"
+path = "src/lib.rs"
+
+[dependencies]
+burn.workspace = true
+burn-store.workspace = true
+burn-tt.workspace = true
+# The BFP decoders the device's unpacker is modelled by, for the host reference of a quantised model.
+tt-isa.workspace = true
+# The host reference every model is checked against; this crate is dev-only
+# (`xtask/src/ship.rs`), so Flex never reaches a shipped dependency graph.
+burn-flex.workspace = true
+
+# Decodes the pinned JPEG test inputs (`cargo xtask fetch-weights` also fetches them). Dev-only
+# like the rest of the crate; the workspace's `image` carries no codecs, so this adds one.
+[dependencies.image]
+workspace = true
+features = ["jpeg"]

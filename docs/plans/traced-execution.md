@@ -178,7 +178,7 @@ structs (generalising `collect_parameter_updates` and covering Adam state), not 
 In deep learning models with token inputs (Transformers, LLMs):
 - Standard Tensix ops (GEMMs, normalizations, activations, softmax, attention, reductions) operate dynamically on matrix values in GDDR.
 - In `burn-tt`, generic CrossEntropy already uses `index_mask` and `MASK_WHERE`, which dynamically evaluate changed target indices on-device.
-- `burn::nn::Embedding` composes `float_select` (gather rows) and `float_select_add` (`embedding_backward`), which at the time of writing baked row indices into mover commands. `tt-mnist`'s traced transformer step captures the embedding with token ids as a trace input; whether changed ids take effect on replay through this path is not asserted separately by the gates in section 7, so verify before relying on it.
+- `burn::nn::Embedding` composes `float_select` (gather rows) and `float_select_add` (`embedding_backward`), which at the time of writing baked row indices into mover commands. `tt-mnist`'s traced transformer step captures the embedding with token ids as a trace input; whether changed ids take effect on replay through this path was not asserted by the gates in section 7. **It is now** for the lookup of a rank-2 F32, I32 or Bool table (2026-10-13): `step171_select_rows` captures a `select` whose index is the `argmax` of the traced input and replays three inputs that pick different rows, equal to the host's rows on ttsim and card 0 (`SELECT_ROWS` reads the index where it runs, so the job list depends on shapes alone). The BF16 and BFP lookups still stage and are not covered.
 
 ### Alternative solutions:
 1. **One-Hot GEMM Path**:

@@ -33,6 +33,7 @@ const BINARIES: &[&str] = &[
     "icache_t2",
     "tag_search_b",
     "noc_probe_b",
+    "read_loop_b",
 ];
 
 /// The one image the `ttinsn-experiment` feature adds, and the only one whose
@@ -62,13 +63,33 @@ fn main() {
         .args(["build", "--release", "--target", TARGET])
         .arg("--target-dir")
         .arg(&target_dir);
+    let mut features = Vec::new();
     if experiment {
-        cmd.args(["--features", "ttinsn-experiment"]);
+        features.push("ttinsn-experiment");
+    }
+    // The mover's read mode is chosen here, at build time (`tt-firmware`'s features).
+    if std::env::var_os("CARGO_FEATURE_FAST_READS").is_some() {
+        features.push("fast-reads");
+    }
+    if std::env::var_os("CARGO_FEATURE_ENCODED_GUARD").is_some() {
+        features.push("encoded-guard");
+    }
+    if !features.is_empty() {
+        cmd.args(["--features", &features.join(",")]);
     }
     // A nested cargo inherits variables that redirect it back at the parent
     // workspace; strip them so the firmware build is genuinely independent.
+    // `RUSTC_WORKSPACE_WRAPPER` is `cargo clippy`'s `clippy-driver`: left in, the
+    // images of a clippy run came out about 900 bytes larger than a build's
+    // (`dm_b` 24,540 bytes against 23,644, of the 24,576 it may have), so a
+    // mover change that fit a build overflowed clippy. Firmware is linted on
+    // its own (`AGENTS.md`).
     for (key, _) in std::env::vars() {
-        if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" {
+        if key.starts_with("CARGO_")
+            || key == "RUSTFLAGS"
+            || key == "RUSTC_WRAPPER"
+            || key == "RUSTC_WORKSPACE_WRAPPER"
+        {
             cmd.env_remove(key);
         }
     }

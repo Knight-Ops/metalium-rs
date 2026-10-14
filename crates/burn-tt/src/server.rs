@@ -252,6 +252,13 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    fn select_rows(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     fn repack_many(
         &mut self,
         _inputs: &[BufferId],
@@ -261,7 +268,9 @@ pub trait Engine {
         Err(unsupported())
     }
     /// Rows of `sources` gathered into a new buffer
-    /// (`Session::gather_rows`): an embedding's lookup.
+    /// (`Session::gather_rows`): rows a list the host built names (a matmul's
+    /// output, a broadcast, a pooling window). A lookup by indices the card
+    /// holds, an embedding's, is [`Engine::select_rows`].
     fn gather_rows(
         &mut self,
         _sources: &[BufferId],
@@ -1086,6 +1095,26 @@ impl DramBuffers {
                 .map_err(TtError::from)?;
             Ok(self.insert(out))
         }
+    }
+
+    /// `table`'s rows chosen by the resident `[1, n]` index tensor `indices`
+    /// ([`Session::select_rows`]): a 32-bit table only, a packed one refused.
+    pub fn select_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+            return Err(TtError::Device(
+                "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
+            ));
+        }
+        let indices = self.get(indices)?.clone();
+        let out = s
+            .select_rows(self.get(table)?, &indices)
+            .map_err(TtError::from)?;
+        Ok(self.insert(out))
     }
 
     pub fn repack_many<T: tt_device::Transport>(
@@ -2594,6 +2623,23 @@ pub(crate) fn gather_indexed(
     )
 }
 
+/// `table`'s rows chosen by `indices` (a resident `[1, n]` I32 buffer): the
+/// result is `dims`, `[n, table columns]`.
+pub(crate) fn select_rows(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "select_rows",
+        device,
+        dims,
+        || "checked resident row select".into(),
+        move |engine, ids| engine.select_rows(ids.get(table)?, ids.get(indices)?),
+    )
+}
+
 pub(crate) fn repack_many(
     device: TtDevice,
     inputs: Vec<BufferId>,
@@ -2940,6 +2986,17 @@ impl Engine for KmdEngine {
             .ok_or_else(unsupported)?
             .gather_indexed(&mut self.session, input, indices)
     }
+    fn select_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers.as_mut().ok_or_else(unsupported)?.select_rows(
+            &mut self.session,
+            table,
+            indices,
+        )
+    }
     fn repack_many(
         &mut self,
         inputs: &[BufferId],
@@ -3063,6 +3120,25 @@ pub fn run_generic_trace(
     })
 }
 
+/// `TT_SPREAD`'s value (`Session::set_spread`): `all`, a positive tile count, or
+/// `work:<share>[:<min>]` with positive numbers. `None` for anything else.
+fn parse_spread(v: &str) -> Option<tt_kernels::session::Spread> {
+    use tt_kernels::session::Spread;
+    let positive = |s: &str| s.parse().ok().filter(|&n: &usize| n > 0);
+    match v.trim() {
+        "all" => Some(Spread::All),
+        s => match s.strip_prefix("work:") {
+            Some(rest) => match rest.split_once(':') {
+                Some((share, min)) => positive(share)
+                    .zip(positive(min))
+                    .map(|(share, min)| Spread::Work { share, min }),
+                None => positive(rest).map(|share| Spread::Work { share, min: 1 }),
+            },
+            None => positive(s).map(Spread::Fixed),
+        },
+    }
+}
+
 /// Settings of the executors that were removed: refused with what replaces
 /// them rather than ignored, so a script that still sets one learns why it no
 /// longer does anything. `get` reads a variable, as `std::env::var` does.
@@ -3115,6 +3191,20 @@ pub(crate) fn kmd_engine_with_elementwise(
             Ok("0") => session.set_pipeline(false),
             Ok(v) => return Err(TtError::Device(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
+        // `TT_SPREAD`: how many of the session's tiles each op runs on
+        // (`Session::set_spread`): `all` (the default), a count, or
+        // `work:<share>[:<min>]`, one tile for each `share` of the op's work and at
+        // least `min` (1 if not given). The bits are the same.
+        if let Ok(v) = std::env::var("TT_SPREAD") {
+            match parse_spread(&v) {
+                Some(spread) => session.set_spread(spread),
+                None => {
+                    return Err(TtError::Device(format!(
+                        "TT_SPREAD={v}: expected `all`, a tile count, or `work:<share>[:<min>]`"
+                    )))
+                }
+            }
+        }
         // `TT_HOST_DMA=0`: tensors cross PCIe by the host's own stores and
         // loads through a BAR, not the card's DMA through pinned host memory
         // (`Session::set_host_dma`).
@@ -3156,7 +3246,38 @@ pub(crate) fn kmd_engine_with_elementwise(
             matmul,
         }
         .with_elementwise_mode(elementwise)?;
+        let served = std::time::Instant::now();
         serve.serve(&mut engine);
+        // `TT_HOST_TIMES=1`: where the server thread's time went queueing ops
+        // (`Session::host_times`), against the whole attachment, and how many lists
+        // each tile took, printed when it detaches.
+        if std::env::var("TT_HOST_TIMES").as_deref() == Ok("1") {
+            let total = served.elapsed();
+            let h = engine.session.host_times();
+            eprintln!(
+                "burn-tt: host times, {} ops queued in {:.1} ms attached",
+                h.ops,
+                total.as_secs_f64() * 1e3
+            );
+            for (stage, t) in h.stages.iter().filter(|(_, t)| t.count > 0) {
+                eprintln!(
+                    "  {:<10} {:>9.1} ms  x{:<8} reads {:<8} writes {}",
+                    format!("{stage:?}"),
+                    t.time.as_secs_f64() * 1e3,
+                    t.count,
+                    t.traffic.read_calls,
+                    t.traffic.write_calls
+                );
+            }
+            let lists = engine.session.lists_per_tile();
+            let used = lists.iter().filter(|&&l| l > 0).count();
+            eprintln!(
+                "  lists     {} on {used} of {} tiles; most on one tile {}",
+                lists.iter().sum::<u64>(),
+                lists.len(),
+                lists.iter().max().copied().unwrap_or(0)
+            );
+        }
         if let Some(path) = profile_to {
             let written = engine
                 .session
@@ -3564,6 +3685,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .gather_indexed(self.fabric.chips[0].session(), input, indices)
     }
+    fn select_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .select_rows(self.fabric.chips[0].session(), table, indices)
+    }
     fn repack_many(
         &mut self,
         inputs: &[BufferId],
@@ -3839,6 +3968,34 @@ mod tests {
         let err = try_download_bf16(device, other, 1, 1).unwrap_err();
         assert!(matches!(err.root(), TtError::StaleTensor { .. }), "{err:?}");
         drop(guard);
+    }
+
+    #[test]
+    fn tt_spread_takes_all_a_count_or_a_share_with_a_floor() {
+        use tt_kernels::session::Spread;
+        assert_eq!(super::parse_spread("all"), Some(Spread::All));
+        assert_eq!(super::parse_spread(" 4 "), Some(Spread::Fixed(4)));
+        assert_eq!(
+            super::parse_spread("work:64"),
+            Some(Spread::Work { share: 64, min: 1 })
+        );
+        assert_eq!(
+            super::parse_spread("work:64:2"),
+            Some(Spread::Work { share: 64, min: 2 })
+        );
+        for bad in [
+            "",
+            "0",
+            "-1",
+            "two",
+            "work:",
+            "work:0",
+            "work:64:0",
+            "work:64:x",
+            "work:a:2",
+        ] {
+            assert_eq!(super::parse_spread(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
