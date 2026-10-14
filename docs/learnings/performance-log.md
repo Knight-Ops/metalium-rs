@@ -485,13 +485,20 @@ runs each; built with `cargo build --release -p tt-mnist -p tt-firmware-images -
 | Workload | safe | fast | change |
 |---|--:|--:|--:|
 | transformer training, 1 tile, 50 steps | 104.7 ms/step (104.6, 104.8, 104.8) | **89.9** (90.1, 89.8, 89.7) | **-14%** |
-| transformer training, all tiles | 416 ms/step (413-420) | 434-444 (418-431 in other runs; 412-417 with the host not encoding) | +4-6% slower |
+| transformer training, all tiles | 416 ms/step (413-420) | 434-444 (418-431 in other runs) | +4-6% slower |
 | MNIST training, 1 tile, 300 steps | 4.5 ms/step | 4.5 | none (the host bounds it) |
 | MNIST training, all tiles | 12.7 ms/step | 13.2 | +4% slower (one run each) |
 
-The fast mode helps where a step is bound by the device reading a tile's operands (one tile, 14%) and loses a few percent where the host's
-per-list work grows with the tile count (the host encodes every plain read it uploads; with that switched off in the fast firmware the
-all-tiles transformer was back at 412-417, safe's). All of these runs are **an order of magnitude slower than the scoreboard's** (transformer
+The fast mode helps where a step is bound by the device reading a tile's operands (one tile, 14%) and loses a few percent at all tiles.
+**That loss is not the host's encoding** (my first reading, from a run with encoding switched off, was noise): timing the host's phases in the
+all-tiles transformer (temporary counters in `DataMover`, reverted; 50 steps) found **17.7 million enqueues, 355,000 a step -- one per tile per
+op -- taking 19.8 s in the safe build and 20.3 s in the fast one, ~390-400 ms of every ~416 ms step**: the host's PCIe writes of the
+list, the queue slot and the head to each of 120 tiles, for each of ~3,000 ops. Encoding is 0.17 s of that in total (3.4 ms a step, 0.8%);
+list checking ~1 s in both. The fast build's ~20 ms a step over the safe one is mostly the same per-enqueue work (the encoder, and the
+`enqueue_checked` walk over the entries' op words) multiplied by 355,000, not a new cost. The all-tiles transformer is bound by the number of
+enqueues; the fix is fewer of them (a replayed trace, or a tile subset per op), not a cheaper entry. The one-tile run is not bound by them
+(~3,000 enqueues, ~3 ms a step): its ~100 ms is the device busy.
+All of these runs are **an order of magnitude slower than the scoreboard's** (transformer
 1 tile 8.8 ms/step, MNIST 1.0-1.1) and the same on the commit that recorded them (`7495436`: 329 ms/step), on the branch's merge-base
 (`7f18dde`: 105) and on both cards, after a reset of both boards; the host (`burn-flex` 3.7 ms/step) and the cards' PCIe links (Gen4 x16
 today, 32 GT/s capable) look normal and the micro-benchmarks' cycle counts are as before. **Unexplained**, and independent of this branch: the
