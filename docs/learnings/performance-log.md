@@ -431,6 +431,73 @@ sequence word (device cycles per encoded entry, 4 KiB; 64 B in brackets):
   were taken as the loop not mattering; they were traced runs, which bypass the loop. Untraced it takes a tile from 15 GB/s to
   57 (see "What bounds one tile's read rate" in this section).
 
+**What bounds one tile's read rate (2026-10-13, cards 0 and 1; this corrects the first card-wide runs after the tight loop, and the first
+in-flight cap sweep).** Those read 29 GB/s for one tile at every cap, with the bound unexplained, and were taken as the tight loop not
+mattering. They measured the benchmark, not the mover: `gddr_aggregate` times its lists with the timestamper, which stores two events
+around every entry (`dm::TRACE`), and a traced run does not take the tight loop (`run_encoded_reads` is for untraced lists) and pays the
+events on top. The probe `silicon_probe_read_loop::what_bounds_one_tiles_read_rate` (card 1, fast build, one tile, 256 reads of 4 KiB,
+resident lists rerun from the sequence word, every repetition's landed bytes compared; run `1791932966`) isolates it:
+
+| 4 KiB reads, one tile | per entry | rate |
+|---|--:|--:|
+| one channel, untraced, plain (the safe path's cost) | 346.5 cycles | 16.0 GB/s |
+| one channel, untraced, **encoded** | **90.1** | **61.4 GB/s** |
+| eight channels in turn, untraced, plain | 354.7 | 15.6 |
+| eight channels in turn, untraced, **encoded** | **94.7** | **58.4** |
+| one channel, **traced**, encoded | 184.0 | 30.0 |
+| eight channels in turn, traced, encoded | 186.2 | 29.7 |
+| traced, plain | 359-369 | 15.0-15.4 |
+
+Tracing costs an encoded read ~94 cycles (the events, and the loop it excludes) and a plain read ~13: the benchmark understated the fast mode
+by 2x and the safe mode by 4%. A new `dm::trace_mode::LISTS` (`TRACE = 2`: the list's begin and end and every entry but a plain or encoded
+read) gives `gddr_aggregate` what it needs (the barrier's release and the list's end) with the reads untraced; it is the default now, and
+`AGG_TRACE=full` restores the old runs. The safe image is unchanged by the firmware change (plain 358 / 358 / 358 cycles at N = 64 / 256 /
+448; 363 / 358 / 360 before), the fast entry is 91.5.
+
+**Card-wide reads, list-level trace** (GB/s; safe and fast builds, card 1 at 4 KiB, card 0 at 2 KiB; runs `1791933129` and `1791933479`
+at 4 KiB, `1791933130` and `1791933480` at 2 KiB):
+
+| Tiles | 4 KiB safe | 4 KiB fast | fast / safe | 2 KiB safe | 2 KiB fast | fast / safe |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 14.9 | 57.0 | 3.8x | 7.5 | 30.0 | 4.0x |
+| 2 | 29.7 | 112.1 | 3.8x | 14.9 | 58.9 | 4.0x |
+| 4 | 59.4 | 219.3 | 3.7x | 29.8 | 115.0 | 3.9x |
+| 8 | 118.8 | 340.0 | 2.9x | 59.6 | 222.1 | 3.7x |
+| 16 | 237.4 | 376.0 | 1.6x | 118.8 | 252.3 | 2.1x |
+| 32 | 411.2 | 460.7 | 1.12x | 229.7 | 315.5 | 1.37x |
+| 64 | 454.0 | 484.0 | 1.07x | 353.3 | 404-414 | 1.15-1.17x |
+| 120 | 480.1 | 494.8 | 1.03x | 401.3 | 451-453 | 1.13x |
+
+(That lane's 2 KiB fast run read 312 and 375 GB/s at 64 and 120 tiles, an outlier: three other runs of the same configuration, the cap
+sweep's cap 8 included, read 404-414 and 451-453, so those two are not used.) A tile reads 57-61 GB/s, 89-95% of one channel; the card is
+3.7-3.8x the safe default up to 4 tiles at 4 KiB, at 66% of its bandwidth with 8 tiles (23% safe) and 90% with 32; the channels, not the
+movers, bound it from 16 tiles at 4 KiB and from 32 at 2 KiB.
+
+**In-flight depth** (plan phase 3, not built): with the list-level trace the cap (2, 3, 4, 6, 8; fast; card 0 at 2 KiB, card 1 at 4 KiB)
+changes nothing beyond noise at any tile count: 4 KiB, 8 tiles 338 / 326 / 337 / 337 / 335 GB/s, 32 tiles 450 / 455 / 449 / 460 / 459, 120 tiles
+492 / 494 / 492 / 494 / 494; 2 KiB, 8 tiles 222 / 223 / 185 / 204 / 222, 120 tiles 447 / 450 / 440 / 450 / 451 (one cap-4 point is low). The plan
+gated a per-list cap on 5% at 1-4 tiles with no regression at 16 or more; the cap does not matter either way, so it stays 8 and the machinery
+is not built. (The first sweep, with every read traced, showed no effect either, for the wrong reason.)
+
+**End to end (`tt-mnist`, card 0, release, the safe and the `fast-reads` firmware embedded in otherwise identical binaries, alternated, three
+runs each; built with `cargo build --release -p tt-mnist -p tt-firmware-images --features tt-firmware-images/fast-reads`).**
+
+| Workload | safe | fast | change |
+|---|--:|--:|--:|
+| transformer training, 1 tile, 50 steps | 104.7 ms/step (104.6, 104.8, 104.8) | **89.9** (90.1, 89.8, 89.7) | **-14%** |
+| transformer training, all tiles | 416 ms/step (413-420) | 434-444 (418-431 in other runs; 412-417 with the host not encoding) | +4-6% slower |
+| MNIST training, 1 tile, 300 steps | 4.5 ms/step | 4.5 | none (the host bounds it) |
+| MNIST training, all tiles | 12.7 ms/step | 13.2 | +4% slower (one run each) |
+
+The fast mode helps where a step is bound by the device reading a tile's operands (one tile, 14%) and loses a few percent where the host's
+per-list work grows with the tile count (the host encodes every plain read it uploads; with that switched off in the fast firmware the
+all-tiles transformer was back at 412-417, safe's). All of these runs are **an order of magnitude slower than the scoreboard's** (transformer
+1 tile 8.8 ms/step, MNIST 1.0-1.1) and the same on the commit that recorded them (`7495436`: 329 ms/step), on the branch's merge-base
+(`7f18dde`: 105) and on both cards, after a reset of both boards; the host (`burn-flex` 3.7 ms/step) and the cards' PCIe links (Gen4 x16
+today, 32 GT/s capable) look normal and the micro-benchmarks' cycle counts are as before. **Unexplained**, and independent of this branch: the
+step is the device busy (a 40 ms wait for the last download, 64 ms of caller-side time), so these absolute numbers are comparable only with
+each other, not with the scoreboard.
+
 **Per entry, a resident list rerun from the sequence word alone** (no upload; host clock less an empty list's time; it
 reproduces the 359 device cycles the probe measured by the tile clock), 256 reads, cap 8, card 0, cycles per entry:
 
