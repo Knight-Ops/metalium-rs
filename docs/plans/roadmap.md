@@ -394,6 +394,12 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
 - [ ] **B13c** matmul + bias + activation epilogue (kernel-fusion.md lines 200–204).
 - [ ] **Reduce/norm fuser**, L1 circular-buffer streaming for multi-tile row reductions
   (kernel-fusion.md lines 207–210).
+- [x] **Barriers on the units an op ran on (2026-10-14).** A multi-tile op's barrier was on every unit, and a unit
+  it gave no job to enqueued a barrier list of its own: one PCIe enqueue a tile an op, 355,000 a step for the
+  all-tiles transformer. Now only the units an op runs on arrive, and the others catch up with a wait-only
+  `BARRIER` before their next list: the all-tiles transformer 404-422 -> 96-98 ms/step (faster than one tile,
+  105), all-tiles MNIST 12.9-13.4 -> 6.7 ([performance log](../learnings/performance-log.md#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0)).
+  What is left at many tiles is each participating unit's own cost, ~4.6 us a unit an op: the next item.
 - [ ] **Per-workload tile choice.** Auto-attach opens one tile (`TileChoice::First`), and a session's tile
   count is fixed at attach. Open `All` tiles and choose a subset per op: an autotune-style cache keyed by
   `(op, shape, dtype)` that measures candidate counts on first use (`[512,512]^2`: 8 tiles 1.32 ms against

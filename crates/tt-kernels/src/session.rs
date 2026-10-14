@@ -397,7 +397,10 @@ pub struct Session<T: Transport> {
     batching: bool,
     /// How the transcendentals run ([`Session::set_math_mode`]).
     math: crate::sfpu::approx::MathMode,
-    /// Barriers queued so far: the next one's target is `(barriers + 1) * n`.
+    /// Arrivals at the barrier counter queued so far (`dm::op::BARRIER`): the
+    /// latest barrier's target. A barrier adds the units its op ran on, not
+    /// every unit, so an op on a few of many tiles enqueues on those few
+    /// (`Session::catch_up` orders the others before their next list).
     barriers: u32,
     /// Placements freed while lists that may read them are queued: given back
     /// at the next sync.
@@ -439,6 +442,10 @@ struct Unit {
     queued: std::collections::VecDeque<QueuedList>,
     /// The fixed NC writer, started for a compute region and restarted with B.
     nc: Option<DataMover<Noc0>>,
+    /// The barrier target this tile last waited for, by arriving or by a
+    /// catch-up ([`Session::catch_up`]): behind [`Session::barriers`] while it
+    /// sits ops out.
+    barrier_seen: u32,
 }
 
 /// A list on a mover's queue: its number, whether it reserved kernels (to
@@ -1694,6 +1701,7 @@ impl<T: Transport> Session<T> {
                 programs: ProgramCache::new(tt_isa::l1::PROGRAM_CACHE),
                 queued: Default::default(),
                 nc: None,
+                barrier_seen: 0,
             });
             match session.prepare_unit(session.units.len() - 1) {
                 Ok(()) => Ok(true),
@@ -2715,7 +2723,7 @@ impl<T: Transport> Session<T> {
                 self.units[u].queued.clear();
                 self.recover(&[(u, had_kernels)]);
             }
-            self.barriers = 0;
+            self.restart_barriers();
             if let Some(m) = self.units.first().and_then(|u| u.resident.as_ref()) {
                 let (w, t) = (m.window(), self.units[0].tile);
                 let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
@@ -2729,6 +2737,73 @@ impl<T: Transport> Session<T> {
         // Nothing queued reads host memory any more.
         self.staging_at = 0;
         self.staging_busy = false;
+        // Every list has run, so every barrier's units have arrived: no tile
+        // has anything to catch up on.
+        let target = self.barriers;
+        for unit in &mut self.units {
+            unit.barrier_seen = target;
+        }
+        Ok(())
+    }
+
+    /// The barrier counter and the session's count start again at zero, and no
+    /// tile has a target to wait for: on a recovery, with nothing queued.
+    fn restart_barriers(&mut self) {
+        self.barriers = 0;
+        for unit in &mut self.units {
+            unit.barrier_seen = 0;
+        }
+    }
+
+    /// Order unit `u` after every barrier it sat out, before its next list: one
+    /// wait-only `BARRIER` for the latest target (`dm::op::BARRIER`), which the
+    /// units that ran those ops reach only once their writes have landed. A unit
+    /// that has passed the latest barrier, or a session of one unit, needs none.
+    ///
+    /// This is what lets an op's barrier involve only the units it ran on: a tile
+    /// an op does not use enqueues nothing for it, where it used to enqueue a
+    /// barrier list of its own (one PCIe enqueue a tile an op: a 2-tile op on 120
+    /// tiles was 118 of them, and the all-tiles transformer 355,000 a step).
+    fn catch_up(&mut self, u: usize) -> Result<(), TensorError> {
+        if self.units.len() < 2 || self.units[u].barrier_seen == self.barriers {
+            return Ok(());
+        }
+        // A capture's barriers involve every unit, and it starts synced, so no
+        // tile is behind inside one; a catch-up there would be a list the trace
+        // does not hold.
+        if self.capture.is_some() {
+            return Err(TensorError::Shape(
+                "a tile is behind the barrier counter inside a capture".into(),
+            ));
+        }
+        self.ensure_unit(u)?;
+        let target = self.barriers;
+        let c = self.units[0].tile;
+        let entry = [
+            tt_isa::dm::op::BARRIER,
+            target,
+            c.x() as u32,
+            c.y() as u32,
+            1,
+            0,
+            0,
+            0,
+        ];
+        let Session { dev, units, .. } = self;
+        let unit = &mut units[u];
+        let (r, m) = (
+            unit.resident.as_ref().unwrap(),
+            unit.mover.as_mut().unwrap(),
+        );
+        let number = m.enqueue(dev, r.window(), &[entry])?;
+        unit.queued.push_back(QueuedList {
+            roles: false,
+            number,
+            kernels: false,
+            what: "barrier catch-up",
+        });
+        unit.lists += 1;
+        unit.barrier_seen = target;
         Ok(())
     }
 
@@ -2848,6 +2923,11 @@ impl<T: Transport> Session<T> {
                 debug_assert!(idle, "the coordinator restarted under queued barriers");
                 dev.write32(r.window(), unit.tile, tt_isa::dm::BARRIER_COUNTER, 0)?;
                 *barriers = 0;
+                // Every tile's last target was on the old count; with nothing
+                // queued, none of them has anything to wait for.
+                for unit in units.iter_mut() {
+                    unit.barrier_seen = 0;
+                }
             }
         }
         Ok(())
@@ -2894,10 +2974,24 @@ impl<T: Transport> Session<T> {
         for (j, job) in jobs.into_iter().enumerate() {
             queues[j % n].extend(job);
         }
+        // The units this op runs on, and the ones that arrive at its barrier: the
+        // same, except in a capture, whose barriers keep every unit so a replay's
+        // streams all agree on the count whatever each op used.
+        let capturing = self.capture.is_some();
+        let runs: Vec<bool> = queues.iter().map(|q| !q.is_empty()).collect();
+        let arriving: Vec<bool> = runs.iter().map(|&r| r || capturing).collect();
         if n > 1 {
-            for u in 0..n {
+            for u in (0..n).filter(|&u| arriving[u]) {
                 self.ensure_unit(u)?;
             }
+            // A unit that sat out the ops since its last barrier waits for them
+            // first, before this op's barrier is counted: that target includes
+            // the unit's own arrival, which it would wait for in vain.
+            let start = self.mark();
+            for u in (0..n).filter(|&u| runs[u]) {
+                self.catch_up(u)?;
+            }
+            self.stage(HostStage::Barrier, start);
         }
         // In rounds: every unit's first list, then every unit's second, and
         // so on. A unit whose share is more than its ring holds makes the
@@ -2913,15 +3007,17 @@ impl<T: Transport> Session<T> {
             .map(|steps| streaming_segments(steps, cache).map(Into::into))
             .collect::<Result<_, _>>()?;
         self.stage(HostStage::Segments, start);
-        // With more than one unit, a barrier on every unit after its share,
-        // since the next op may read what any unit wrote. It rides at the
-        // end of the unit's last list where there is room -- a list of its
-        // own was a second enqueue a unit an op, half the host's time on
-        // many tiles (checklist 9.17) -- except while capturing, whose
-        // streams take it as an entry of its own.
-        let barrier = (n > 1 && !self.unbarriered).then(|| {
-            self.barriers = self.barriers.wrapping_add(1);
-            let target = self.barriers.wrapping_mul(n as u32);
+        // With more than one unit, a barrier on each unit this op ran on, after
+        // its share, since the next op may read what any of them wrote; a unit
+        // it did not run on enqueues nothing, and catches up before its next
+        // list ([`Session::catch_up`]). It rides at the end of the unit's last
+        // list where there is room -- a list of its own was a second enqueue a
+        // unit an op, half the host's time on many tiles (checklist 9.17) --
+        // except while capturing, whose streams take it as an entry of its own.
+        let arrivals = arriving.iter().filter(|&&a| a).count() as u32;
+        let barrier = (n > 1 && !self.unbarriered && arrivals > 0).then(|| {
+            self.barriers = self.barriers.wrapping_add(arrivals);
+            let target = self.barriers;
             let c = self.units[0].tile;
             [
                 tt_isa::dm::op::BARRIER,
@@ -2958,15 +3054,16 @@ impl<T: Transport> Session<T> {
         if let Some(entry) = barrier {
             let start = self.mark();
             if let Some(c) = self.capture.as_mut() {
-                // Relative to the capture's first: a replay adds its own.
-                let rel = entry[1].wrapping_sub(c.barriers_base.wrapping_mul(n as u32));
+                // Relative to the capture's first: a replay adds its own. Every
+                // unit arrives at a captured barrier, so the k-th is k * n.
+                let rel = entry[1].wrapping_sub(c.barriers_base);
                 c.barriers += 1;
                 for uc in &mut c.units {
                     uc.stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
-            for u in (0..n).filter(|&u| !folded[u]) {
+            for u in (0..n).filter(|&u| arriving[u] && !folded[u]) {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let (r, m) = (
@@ -2980,6 +3077,9 @@ impl<T: Transport> Session<T> {
                     kernels: false,
                     what: "barrier",
                 });
+            }
+            for u in (0..n).filter(|&u| arriving[u]) {
+                self.units[u].barrier_seen = entry[1];
             }
             self.stage(HostStage::Barrier, start);
         }
@@ -3638,7 +3738,14 @@ impl<T: Transport> Session<T> {
             .collect();
         let barriers = t.barriers;
         let n = self.units.len() as u32;
-        let barrier_base = self.barriers.wrapping_mul(n);
+        // Every unit that runs the trace starts after the ops before it.
+        for (u, call) in calls.iter().enumerate() {
+            if call.is_some() {
+                self.catch_up(u)?;
+            }
+        }
+        let barrier_base = self.barriers;
+        let ran: Vec<bool> = calls.iter().map(Option::is_some).collect();
         let Session { dev, units, .. } = self;
         for (unit, call) in units.iter_mut().zip(calls) {
             let Some([channel, offset, count, generations]) = call else {
@@ -3669,7 +3776,16 @@ impl<T: Transport> Session<T> {
             // the host.
             r.forget_tile_state();
         }
-        self.barriers = self.barriers.wrapping_add(barriers);
+        // Every unit arrives at each of the trace's barriers.
+        self.barriers = self.barriers.wrapping_add(barriers.wrapping_mul(n));
+        if barriers > 0 {
+            let target = self.barriers;
+            for (unit, ran) in self.units.iter_mut().zip(ran) {
+                if ran {
+                    unit.barrier_seen = target;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4684,7 +4800,7 @@ impl<T: Transport> Session<T> {
             Ok(()) => Ok(()),
             Err(_) => {
                 let _ = self.sync();
-                self.barriers = 0;
+                self.restart_barriers();
                 if let Some(resident) = self.units[0].resident.as_ref() {
                     let _ = self.dev.write32(
                         resident.window(),

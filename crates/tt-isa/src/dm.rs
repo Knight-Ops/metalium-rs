@@ -291,13 +291,19 @@ pub mod op {
     /// tensor so read is a whole tile to broadcast across a `[rows, cols]`
     /// one, element for element. Only in a list entry.
     pub const READ_BROADCAST_COL: u32 = 8;
-    /// Wait until every unit of a session has reached this point:
-    /// `[BARRIER, target, x, y, 0, 0, 0, 0]`. The mover waits for its own
-    /// moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the L1
-    /// of the coordinating tile `(x, y)` by a NoC atomic increment, and polls
-    /// that counter over the NoC until it reaches `target` (compared modulo
-    /// 2^32, so the counter may wrap). With `n` units, the `k`-th barrier's
-    /// target is `k * n`. Only in a list entry.
+    /// Wait until the units an op ran on have reached this point:
+    /// `[BARRIER, target, x, y, wait_only, 0, 0, 0]`. The mover waits for its
+    /// own moves, adds one to the counter at [`super::BARRIER_COUNTER`] in the
+    /// L1 of the coordinating tile `(x, y)` by a NoC atomic increment, and
+    /// polls that counter over the NoC until it reaches `target` (compared
+    /// modulo 2^32, so the counter may wrap). The counter counts arrivals, so
+    /// a barrier's target is every arrival before it plus its own units'.
+    ///
+    /// `wait_only` 1: poll without adding one. A unit that ran none of the
+    /// ops since it last passed a barrier waits this way for the latest
+    /// target before its next list, which orders it after those ops' writes
+    /// without making it arrive at barriers it had no part in
+    /// (`tt_kernels::session`). Only 0 or 1. Only in a list entry.
     pub const BARRIER: u32 = 9;
     /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
     /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
@@ -641,8 +647,13 @@ pub enum Entry {
     },
     /// [`op::WAIT`].
     Wait,
-    /// [`op::BARRIER`].
-    Barrier { target: u32, x: u8, y: u8 },
+    /// [`op::BARRIER`]: `arrive` false is its wait-only form.
+    Barrier {
+        target: u32,
+        x: u8,
+        y: u8,
+        arrive: bool,
+    },
     /// [`op::CALL`]: run `count` entries from GDDR.
     Call {
         channel: u32,
@@ -885,13 +896,14 @@ impl Entry {
             return Ok(Entry::Wait);
         }
         if w[0] == op::BARRIER {
-            if w[2] > 0x3f || w[3] > 0x3f || w[4..].iter().any(|&v| v != 0) {
+            if w[2] > 0x3f || w[3] > 0x3f || w[4] > 1 || w[5..].iter().any(|&v| v != 0) {
                 return Err(error::OP);
             }
             return Ok(Entry::Barrier {
                 target: w[1],
                 x: w[2] as u8,
                 y: w[3] as u8,
+                arrive: w[4] == 0,
             });
         }
         if w[0] == op::CALL {
@@ -1096,6 +1108,34 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    /// Word 4 of a `BARRIER` says whether the unit arrives (0, as every barrier did before
+    /// the wait-only form) or only waits (1); anything else, or a word past it, is refused.
+    #[test]
+    fn a_barrier_arrives_or_only_waits_and_nothing_else() {
+        use super::*;
+        let decode = |w4: u32, w5: u32| Entry::decode(0xFF, [op::BARRIER, 7, 1, 2, w4, w5, 0, 0]);
+        assert_eq!(
+            decode(0, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: true
+            })
+        );
+        assert_eq!(
+            decode(1, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: false
+            })
+        );
+        assert_eq!(decode(2, 0), Err(error::OP));
+        assert_eq!(decode(1, 1), Err(error::OP));
+    }
+
     #[test]
     fn resident_index_selection_checks_every_slot_and_geometry() {
         use super::*;

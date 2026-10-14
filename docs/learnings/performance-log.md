@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Barriers on the units an op ran on](#barriers-on-the-units-an-op-ran-on-2026-10-14-card-0) | 2026-10-14 | a tile an op does not use no longer enqueues a barrier list for it: the all-tiles transformer 404-422 -> 96-98 ms/step (now faster than one tile), all-tiles MNIST 12.9-13.4 -> 6.7, one tile unchanged, losses and accuracy identical |
 | [Descriptor runs in a trace's prologue](#descriptor-runs-in-a-traces-prologue-2026-10-14-card-0) | 2026-10-14 | `record::POKE_RUN`: a trace's 51 `POKE`s become 9 records, 8,824 -> 4,892 device cycles a replay; a replay is 2.3-4.6 us shorter host-timed, its stream 124 -> 91 entries, and the 8-tile chunk boundary is gone |
 | [Trace replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) | 2026-10-14 | a replayed tiny streaming op costs ~7.4-8.7 us, about half of it control (pair begin ~1.05 us, finish ~1.3-1.6, credits ~0.9, barrier ~0.6-0.7 on many tiles); the 51-`POKE` prologue is 7.2 us a replay; a chunk boundary is 0.75 us; the host adds ~2 us a tile |
 | [Trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim) | 2026-10-14 | a captured op costs ~18 stream entries (~0.6 KiB) but ~8 KiB of GDDR (whole-slot sections) and, per distinct op, ~4 KiB of pinned program cache (~0.6 KiB a program); programs are shared by hash; chunk padding is 0-1% |
@@ -637,6 +638,49 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Barriers on the units an op ran on (2026-10-14, card 0)
+
+The host-time split (`silicon_bench_path::host_time_per_op`, run `1791946223`) showed what the all-tiles transformer's 355,000
+enqueues a step were: every op on a multi-tile session ended with a `BARRIER` on **every** unit, and a unit the op gave no job to
+got a barrier list of its own -- one PCIe enqueue (three posted writes) a tile an op. A 64x784 add on 120 tiles runs on 50 of them
+and paid 70 us and 210 writes for the other 70; the transformer's ops are 2-16 tiles, so nearly all of its 120 enqueues an op were
+those lists.
+
+**The change.** The barrier counter now counts arrivals, and an op's barrier adds only the units it runs on (`Session::barriers` is
+the latest target). A unit that sat ops out catches up before its next list with one wait-only `BARRIER` for the latest target
+(`Session::catch_up`; `dm::op::BARRIER` word 4 = 1 polls without the atomic increment), which the units that ran those ops reach
+only after their writes have landed. The catch-up is taken *before* the op's own barrier is counted -- that target includes the
+unit's own arrival, which it would otherwise wait for in vain -- and a successful `sync` marks every unit caught up. A capture's
+barriers still involve every unit, so a trace's streams and its `k * n` targets are unchanged; a replay catches its units up first
+and advances the count by `barriers * n`.
+
+Card 0, release, `tt-mnist` from the commit before (`8205dce`) and with the change, alternated, three runs each (same session):
+
+| Workload | before | after |
+|---|--:|--:|
+| transformer training, all tiles, 50 steps | 404.2 / 407.9 / 422.2 ms/step | **96.3 / 96.2 / 97.8** |
+| transformer training, 1 tile | 105.1 / 105.0 / 105.2 | 105.3 / 105.5 / 105.3 |
+| MNIST training, all tiles, 300 steps | 12.9 / 13.1 / 13.4 ms/step | **6.7 / 6.7 / 6.7** |
+| MNIST training, 1 tile | 4.5 / 4.5 / 4.5 | 4.5 / 4.5 / 4.5 |
+
+- **The all-tiles transformer is 4.2x faster, and now faster than one tile** (96-98 against 105 ms/step) for the first time. Its losses
+  are the same to every printed digit (card 4.4355 -> 3.4883), and MNIST's test accuracy is the same (89.63%) at all tiles.
+- **Per op** (`host_time_per_op`, run `1791947516`, against `1791946223`): at 120 tiles the barrier stage is 70.3 -> 0.7 us for the
+  64x784 add and 54.9 -> 0.6 for the 256^3 matmul, writes an op 360 -> 150 and 336 -> 192, and the call 331 -> 276 us and 379 ->
+  328. An op that fills every tile (the 512^2 add on 120, everything on 8 and 32) is unchanged, as it should be: every unit arrives.
+- **What is left at many tiles** is each *participating* unit's own cost, ~4.6 us a unit an op (segments, placement, reserve, check,
+  three posted writes): the 64x784 add still takes 50 tiles for 50 output tiles and 276 us. That is plan item 1a (an op on as many
+  tiles as its work pays for), and why all-tiles MNIST (6.7 ms/step) is still slower than one tile (4.5).
+
+Gates: `step176_barrier_participants` (ttsim and card 0). A slow op on unit 0 alone (one output tile, `K` 1024), then an op on four
+units that gathers its output as `B`: the result is the host's product bit for bit on binary operands (exact in TF32 and FP32) over
+three rounds; the slow op ran on one unit and the others enqueued nothing for it; the reader ran on all four. **With the catch-up
+skipped, the reader reads the slow op's output before it is written and the gate fails** (round 0, ttsim). A second test captures and
+replays a trace between partial ops (behind units before the capture and between replays) against the host. The `BARRIER` decode
+refuses a word 4 other than 0 or 1. All 39 multi-tile simulator gates, `step12_mnist` with `e2e` (8/8, golden unchanged), and on card 0
+`step33_barrier`, `step39_traces`, `step60_streaming` and `step176` pass. The smoke selection on card 0: 1,027 of 1,027 (the five
+two-card tests first failed to attach because a benchmark held card 1, and passed when rerun with it free).
 
 ## Descriptor runs in a trace's prologue (2026-10-14, card 0)
 

@@ -350,30 +350,33 @@ fn trace(on: bool, event: u32, detail: u32) {
     }
 }
 
-/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter,
-/// then NoC reads of it until it reaches `target`. The reads land in this
-/// tile's L1, which the NoC writes without invalidating the L0 cache: every
-/// check goes through a fence (`publish`).
+/// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter
+/// (unless `arrive` is false, the wait-only form), then NoC reads of it until
+/// it reaches `target`. The reads land in this tile's L1, which the NoC writes
+/// without invalidating the L0 cache: every check goes through a fence
+/// (`publish`).
 #[inline(never)]
-fn barrier(me: (u8, u8), target: u32, x: u8, y: u8) -> Result<(), u32> {
+fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), u32> {
     use tt_isa::noc::niu::Endpoint;
     let counter = Endpoint {
         x,
         y,
         addr: dm::BARRIER_COUNTER as u32,
     };
-    noc::issue(
-        Niu::Noc0,
-        &Command::AtomicIncrement {
-            to: counter,
-            value: 1,
-            ret_local: M.at(dm::BARRIER_RET) as u32,
-        },
-        me,
-        BARRIER_TXN,
-    )
-    .map_err(|_| dm::error::ALIGNMENT)?;
-    noc::wait(BARRIER_TXN);
+    if arrive {
+        noc::issue(
+            Niu::Noc0,
+            &Command::AtomicIncrement {
+                to: counter,
+                value: 1,
+                ret_local: M.at(dm::BARRIER_RET) as u32,
+            },
+            me,
+            BARRIER_TXN,
+        )
+        .map_err(|_| dm::error::ALIGNMENT)?;
+        noc::wait(BARRIER_TXN);
+    }
     loop {
         noc::issue(
             Niu::Noc0,
@@ -606,12 +609,17 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             noc::wait(TXN);
             publish();
         }
-        Entry::Barrier { target, x, y } => {
+        Entry::Barrier {
+            target,
+            x,
+            y,
+            arrive,
+        } => {
             reader_only()?;
             // Everything this unit moved before it has landed.
             noc::wait(TXN);
             publish();
-            barrier(me, target, x, y)?;
+            barrier(me, target, x, y, arrive)?;
         }
         Entry::Poke { address, value } => {
             reader_only()?;
