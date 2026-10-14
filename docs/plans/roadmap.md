@@ -379,11 +379,37 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   `cat` is built from `slice_assign` (722 `float_slice_assign` calls a step: the nine-way `repeat_kv`, the rotary
   halves), plus tens of thousands of reshapes, slices and `float_device` calls over 33 passes. A native `cat`, a
   fused RoPE and the fusers below shrink it; a trace would remove it, which needs trace segmentation. ViT-Tiny
-  (709 operations at 1.1 ms) is the same cost at a smaller scale.
-- [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms: host submission, the same cost as
-  item 3 at a smaller scale, so it moves with the fusers (B13b/B13c/reduce-norm below) and with traces. Layer norm is
-  composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a pass), GELU and attention are native.
-  Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
+  (709 operations at 1.1 ms) is the same cost at a smaller scale. Plan: [decode-host-cost.md](decode-host-cost.md)
+  (copy-shaped ops as row and block moves instead of per-element host maps; a native `cat`).
+  **Re-measured 2026-10-14** (P0, card 0, jobs and server-thread time per op, [log](../learnings/performance-log.md#decode-step-where-the-host-time-goes-2026-10-14-card-0)):
+  - **One tile:** 624 ms (`1792005087`), mostly waiting on the device's m = 1 matmuls (1.27 ms each). The 2,779
+    "operations" are 4,279 jobs.
+  - **Every tile with `work:64:4`:** 233 ms (`1792005178`). `cat`'s zero-fills and `slice_assign`s are 61% of the
+    server thread and `attention`'s 1,920 jobs 22%.
+  - **Native `cat` (P1, 2026-10-14):** `cat` and `repeat_dim` are one row gather or one element repack (`ops/region.rs`,
+    gate `step180_native_cat`, ttsim and card 0). The decode step is **117.3 ms on every tile** (`1792006312`; burn-flex
+    26.3, so 4.5x) and 458 ms on one tile. `step167` F32 takes 23.4 s, was 33.2.
+  - **Next:** `attention`'s 1,920 jobs, half of the remaining server thread. Then the cache's `slice_assign`
+    (P3) and the m = 1 matmuls on one tile.
+- [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms, first read as host submission, the same
+  cost as item 3 at a smaller scale. Layer norm is composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a
+  pass); GELU and attention are native. Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.
+  **Re-measured 2026-10-14** (card 0, `1792005205`, `1792005220`): 856 ms on one tile and 401 ms on every tile at `work:64:4`
+  (burn-flex 107), from 853 jobs.
+  - It is **not per-op submission**. On every tile the time is `attention` (348 jobs, 211 ms of device work), then the element
+    repacks of `swap_dims` and `slice` (74 jobs, 83 ms; [decode-host-cost.md](decode-host-cost.md) P2).
+- [ ] **9. Attention (next, after [decode-host-cost.md](decode-host-cost.md) P3 and P2; decided 2026-10-14).** `module::attention`
+  (`ops.rs`) composes `matmul(q, k^T)`, a scale, the masks, a softmax (`max_dim`, `clamp_min`, `sub`, `exp`, `sum_dim`,
+  `clamp_min`, `div`) and `matmul(p, v)`. On card 0 it is now the largest cost of both transformers:
+  - **SmolLM2 decode step, every tile:** 1,920 jobs, **64 a call**, and 72 of the 146 ms of server-thread time after the
+    native `cat` (`1792006312`).
+  - **ViT-Tiny, every tile:** 348 jobs and 211 of 392 ms, device work at 0.6 ms a job (`1792005220`).
+
+  First find which of the 64 jobs are batched-matmul splits per head, broadcast copies for the `sub` and `div`, and the
+  causal mask's upload. P0's counters give the jobs per op inside the call. Then fuse what the numbers favour: one
+  batched product per matmul, a softmax over rows in one job or a few (the reduce/norm fuser below), and the mask as
+  geometry. The arithmetic order stays Burn's: the existing attention gates must hold bit for bit or within their derived
+  bounds. FlashAttention ("Later") is the end state, not this item.
 - [ ] **5. BF16 lookup (open; the row select does not take it).** `step167` BF16 (six layers) takes 229 s on card 0 (run
   `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
   BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the

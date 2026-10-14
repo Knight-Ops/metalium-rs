@@ -207,6 +207,9 @@ pub const SMOKE: &[&str] = &[
     // one product a convolution and one fold a pool, on NHWC views.
     "step178_select_taps::",
     "step179_nhwc_conv_pool::",
+    // A native `cat` and `repeat_dim`: one row gather or one element repack, not a zero-fill
+    // and a `slice_assign` a piece (roadmap Track 2 item 3, `decode-host-cost.md` P1).
+    "step180_native_cat::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

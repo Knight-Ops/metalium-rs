@@ -4,8 +4,9 @@
 //! Each benchmark loads a pretrained model, runs two warm-ups and nine timed forward passes, and
 //! reports the median in milliseconds with its spread, timed from host dispatch through the final
 //! readback (the convention of the other silicon benchmarks). One more pass runs under
-//! `with_report` and its count of reported device operations is reported with it (an indication of what the host submitted;
-//! convolution and pooling submit many more than they report). Outputs are validated outside the timing
+//! `with_report`: its reported device operations (views included), the jobs it queued on the server
+//! thread, and the server thread's busy time, with a table of that time by the Burn op that queued
+//! each job (`burn_tt::server_report`). Outputs are validated outside the timing
 //! (the same finite logits and the same top-1 as burn-flex).
 //!
 //! `smollm2_decode_without_the_embedding_lookup` feeds the model a precomputed embedding row. The
@@ -62,17 +63,53 @@ fn measure(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     report(key, "ms", "host", Stats::of(ms));
+    burn_tt::server_report_reset();
+    let t0 = Instant::now();
     let (_, ops) = burn_tt::with_report(&mut forward);
+    let wall = t0.elapsed();
     eprintln!("{ops}");
-    // Operations the report lists as run on the device. One reported `conv2d` or `max_pool2d` hides many
-    // more submissions (a chunk of 32 positions or windows each), so this undercounts them.
-    let jobs: u64 = ops.0.iter().map(|s| s.on_device).sum();
+    // Operations the report lists as run on the device (a view counts, though it submits nothing).
+    let reported: u64 = ops.0.iter().map(|s| s.on_device).sum();
     let calls: u64 = ops.0.iter().map(|s| s.calls).sum();
+    // Jobs queued on the server thread, each charged to the innermost Burn op that queued it.
+    let jobs: u64 = ops.0.iter().map(|s| s.jobs).sum();
     report(
         &format!("{key} reported device ops"),
         "ops",
         "count",
+        Stats::of([reported as f64]),
+    );
+    report(
+        &format!("{key} server jobs"),
+        "jobs",
+        "count",
         Stats::of([jobs as f64]),
+    );
+    // Where the server thread's time went, by the op that queued the work. The forward's readback
+    // waited for every job it depends on; frees queued after it may still be running.
+    let server = burn_tt::server_report();
+    let busy: std::time::Duration = server.iter().map(|s| s.time).sum();
+    eprintln!(
+        "server thread: {:.1} ms busy of a {:.1} ms pass",
+        busy.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e3
+    );
+    eprintln!("{:<34} {:>8} {:>10} {:>10}", "op", "jobs", "ms", "us/job");
+    for s in &server {
+        let ms = s.time.as_secs_f64() * 1e3;
+        eprintln!(
+            "{:<34} {:>8} {:>10.2} {:>10.1}",
+            s.op,
+            s.jobs,
+            ms,
+            ms * 1e3 / s.jobs.max(1) as f64
+        );
+    }
+    report(
+        &format!("{key} server thread busy"),
+        "ms",
+        "host",
+        Stats::of([busy.as_secs_f64() * 1e3]),
     );
     report(
         &format!("{key} backend calls"),

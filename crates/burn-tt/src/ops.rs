@@ -2789,6 +2789,32 @@ pub mod float {
         slice_assign_native(tensor, slices, value)
     }
 
+    /// One device job (`region`): a row gather off the last dimension, else one element
+    /// repack. Block floating point pieces are decoded first and the result re-encoded, as
+    /// the generated wrappers do for a single operand.
+    pub fn float_cat(tensors: Vec<TtTensor>, dim: usize) -> TtTensor {
+        if tensors
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let storage = bfp_result_storage("float_cat", &tensors.iter().collect::<Vec<_>>());
+            let tensors = tensors.into_iter().map(bfp_compute_input).collect();
+            return bfp_compute_result(float_cat(tensors, dim), storage);
+        }
+        let (device, dtype) = (tensors[0].device, tensors[0].dtype());
+        region::cat(tensors, dim, |shape| {
+            float_empty(shape, &device, dtype.into())
+        })
+    }
+
+    /// `times` copies along `dim`, as one `cat` (`region`).
+    pub fn float_repeat_dim(tensor: TtTensor, dim: usize, times: usize) -> TtTensor {
+        let (device, dtype) = (tensor.device, tensor.dtype());
+        region::repeat_dim(tensor, dim, times, |shape| {
+            float_empty(shape, &device, dtype.into())
+        })
+    }
+
     /// Sliding logical windows: preserve payloads and append the window axis.
     pub fn float_unfold(tensor: TtTensor, dim: usize, size: usize, step: usize) -> TtTensor {
         unfold_native(tensor, dim, size, step)
@@ -3388,6 +3414,7 @@ mod index;
 mod interpolate;
 mod nhwc;
 mod pool;
+mod region;
 mod scan;
 mod sort;
 
@@ -4252,6 +4279,22 @@ pub mod int {
         slice_assign_native(tensor, slices, value)
     }
 
+    /// One device job (`region`), as `float_cat`.
+    pub fn int_cat(tensors: Vec<TtTensor>, dim: usize) -> TtTensor {
+        let (device, dtype) = (tensors[0].device, tensors[0].dtype());
+        region::cat(tensors, dim, |shape| {
+            int_empty(shape, &device, dtype.into())
+        })
+    }
+
+    /// `times` copies along `dim`, as one `cat` (`region`).
+    pub fn int_repeat_dim(tensor: TtTensor, dim: usize, times: usize) -> TtTensor {
+        let (device, dtype) = (tensor.device, tensor.dtype());
+        region::repeat_dim(tensor, dim, times, |shape| {
+            int_empty(shape, &device, dtype.into())
+        })
+    }
+
     pub fn int_slice(
         tensor: IntTensor<TtBackend>,
         slices: &[burn_backend::Slice],
@@ -4643,6 +4686,22 @@ pub mod bool {
         value: TtTensor,
     ) -> TtTensor {
         slice_assign_native(tensor, slices, value)
+    }
+
+    /// One device job (`region`), as `float_cat`.
+    pub fn bool_cat(tensors: Vec<TtTensor>, dim: usize) -> TtTensor {
+        let (device, dtype) = (tensors[0].device, tensors[0].dtype());
+        region::cat(tensors, dim, |shape| {
+            bool_empty(shape, &device, dtype.into())
+        })
+    }
+
+    /// `times` copies along `dim`, as one `cat` (`region`).
+    pub fn bool_repeat_dim(tensor: TtTensor, dim: usize, times: usize) -> TtTensor {
+        let (device, dtype) = (tensor.device, tensor.dtype());
+        region::repeat_dim(tensor, dim, times, |shape| {
+            bool_empty(shape, &device, dtype.into())
+        })
     }
 
     pub fn bool_slice(

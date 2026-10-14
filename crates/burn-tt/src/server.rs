@@ -1511,6 +1511,22 @@ pub(crate) fn cast_f16(
 
 type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 
+/// `job`, charged to `op` on the server thread for the time it takes
+/// (`report::server_report`).
+fn timed_job(op: &'static str, job: Job) -> Job {
+    Box::new(move |engine, ids| {
+        let t0 = std::time::Instant::now();
+        job(engine, ids);
+        crate::report::served(op, t0.elapsed());
+    })
+}
+
+/// `job`, counted against the innermost op on this thread (`OpStat::jobs`)
+/// and timed on the server thread under that op.
+fn tagged(job: Job) -> Job {
+    timed_job(crate::report::queued(), job)
+}
+
 /// Each buffer the callers have named, as the engine numbers it -- or why it
 /// was never made. Kept on the server thread, one per attachment: a caller
 /// names a result before it exists (B8, asynchronous dispatch), and the
@@ -2000,11 +2016,11 @@ pub(crate) fn try_run<R: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     let caught = poison.clone();
     sender
-        .send(Box::new(move |engine, ids| {
+        .send(tagged(Box::new(move |engine, ids| {
             // Caught here, not only by the server loop, so the caller is
             // answered with the panic after it is recorded.
             let _ = tx.send(guarded(&caught, device, || job(engine, ids)));
-        }))
+        })))
         .map_err(|_| stopped(device, &poison))?;
     match rx.recv() {
         Ok(reply) => reply,
@@ -2016,7 +2032,7 @@ pub(crate) fn try_run<R: Send + 'static>(
 fn send(device: TtDevice, job: Job) {
     let (sender, poison) = handle(device).unwrap_or_else(|e| panic!("{e}"));
     sender
-        .send(job)
+        .send(tagged(job))
         .unwrap_or_else(|_| panic!("{}", stopped(device, &poison)));
 }
 
@@ -2418,13 +2434,16 @@ pub(crate) fn free(device: TtDevice, id: BufferId) {
     if let Some(sender) =
         with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.jobs.clone()))
     {
-        let _ = sender.send(Box::new(move |engine, ids| {
-            // A buffer this attachment never made (a stale tensor's) is not
-            // anyone's here: nothing to free.
-            if let Some(Ok(e)) = ids.map.remove(&id) {
-                engine.free(e);
-            }
-        }));
+        let _ = sender.send(timed_job(
+            crate::report::FREE,
+            Box::new(move |engine, ids| {
+                // A buffer this attachment never made (a stale tensor's) is not
+                // anyone's here: nothing to free.
+                if let Some(Ok(e)) = ids.map.remove(&id) {
+                    engine.free(e);
+                }
+            }),
+        ));
     }
 }
 

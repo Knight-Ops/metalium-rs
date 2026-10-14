@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, Once};
+use std::time::Duration;
 
 /// One op's counts. `on_device` and `on_host` count calls by where their
 /// result was made; a call whose result is neither (a shape, a view of a
@@ -30,6 +31,10 @@ pub struct OpStat {
     /// Implemented in `burn-tt`, or an explicit unsupported method.
     pub hand_written: bool,
     pub calls: u64,
+    /// Jobs queued on the device's server thread while this op was the
+    /// innermost one on the calling thread: device work, downloads and
+    /// waits, not frees ([`server_report`] counts those).
+    pub jobs: u64,
     pub on_device: u64,
     pub on_host: u64,
     pub downloads: u64,
@@ -53,6 +58,7 @@ impl OpStat {
 
     fn add(&mut self, o: &OpStat) {
         self.calls += o.calls;
+        self.jobs += o.jobs;
         self.on_device += o.on_device;
         self.on_host += o.on_host;
         self.downloads += o.downloads;
@@ -110,16 +116,17 @@ impl fmt::Display for Report {
         }
         writeln!(
             f,
-            "{:<34} {:>5} {:>8} {:>8} {:>8} {:>11} {:>11} {:>11}  first download",
-            "op", "path", "calls", "device", "host", "down", "up", "staged"
+            "{:<34} {:>5} {:>8} {:>8} {:>8} {:>8} {:>11} {:>11} {:>11}  first download",
+            "op", "path", "calls", "jobs", "device", "host", "down", "up", "staged"
         )?;
         for s in &self.0 {
             writeln!(
                 f,
-                "{:<34} {:>5} {:>8} {:>8} {:>8} {:>11} {:>11} {:>11}  {}",
+                "{:<34} {:>5} {:>8} {:>8} {:>8} {:>8} {:>11} {:>11} {:>11}  {}",
                 s.op,
                 if s.hand_written { "tt" } else { "unsupported" },
                 s.calls,
+                s.jobs,
                 s.on_device,
                 s.on_host,
                 bytes(s.downloaded),
@@ -258,6 +265,65 @@ fn is_readback(op: &str) -> bool {
     op.ends_with("_into_data") || op == "tr_execute"
 }
 
+/// A job is being queued on a server thread: charge it to the innermost op
+/// on this thread, and return that op's name for [`served`]. A job queued
+/// outside every op (a trace's capture, a caller's own `burn-tt` API) is
+/// timed under [`OUTSIDE`] and counted in no op's row.
+pub(crate) fn queued() -> &'static str {
+    match current() {
+        Some(op) => {
+            bump(op, None, |s| s.jobs += 1);
+            op
+        }
+        None => OUTSIDE,
+    }
+}
+
+/// What a server thread spent on the jobs queued by one op.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerStat {
+    pub op: &'static str,
+    pub jobs: u64,
+    /// Wall time on the server thread, from a job's start to its end: the
+    /// host work that builds and enqueues device work, and any wait inside.
+    pub time: Duration,
+}
+
+/// Every server thread's time, by the op that queued the job.
+static SERVER: Mutex<Option<HashMap<&'static str, ServerStat>>> = Mutex::new(None);
+
+/// The name a buffer free is charged to on the server thread.
+pub(crate) const FREE: &str = "(free)";
+
+/// A server thread finished a job that `op` queued, after `time`.
+pub(crate) fn served(op: &'static str, time: Duration) {
+    let mut m = SERVER.lock().unwrap_or_else(|p| p.into_inner());
+    let s = m
+        .get_or_insert_with(HashMap::new)
+        .entry(op)
+        .or_insert_with(|| ServerStat {
+            op,
+            ..ServerStat::default()
+        });
+    s.jobs += 1;
+    s.time += time;
+}
+
+/// Server-thread time by the op that queued each job, most time first. It is
+/// process-wide and asynchronous: a job is counted once it has run, so wait for
+/// the device (a readback, `Backend::sync`) before reading it.
+pub fn server_report() -> Vec<ServerStat> {
+    let m = SERVER.lock().unwrap_or_else(|p| p.into_inner());
+    let mut v: Vec<ServerStat> = m.iter().flat_map(|m| m.values().cloned()).collect();
+    v.sort_by(|a, b| (b.time, a.op).cmp(&(a.time, b.op)));
+    v
+}
+
+/// Forget the server-thread times counted so far.
+pub fn server_report_reset() {
+    *SERVER.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// A tensor of stored `[rows, cols]` was downloaded.
 pub(crate) fn downloaded(rows: usize, cols: usize) {
     downloaded_width(rows, cols, 4);
@@ -355,6 +421,7 @@ pub fn with_report<R>(f: impl FnOnce() -> R) -> (R, Report) {
             op,
             hand_written: a.hand_written,
             calls: a.calls - b.calls,
+            jobs: a.jobs - b.jobs,
             on_device: a.on_device - b.on_device,
             on_host: a.on_host - b.on_host,
             downloads: a.downloads - b.downloads,
@@ -369,7 +436,7 @@ pub fn with_report<R>(f: impl FnOnce() -> R) -> (R, Report) {
                 None
             },
         };
-        if d.calls > 0 || d.moved() > 0 {
+        if d.calls > 0 || d.jobs > 0 || d.moved() > 0 {
             diff.entry(op).or_default().add(&d);
             diff.get_mut(op).expect("inserted").op = op;
             diff.get_mut(op).expect("inserted").hand_written = a.hand_written;
@@ -472,6 +539,26 @@ mod tests {
         );
         assert_eq!(inner.first_download, Some([64, 10]));
         assert_eq!(r.0[0].op, "outer_op", "most bytes first:\n{r}");
+    }
+
+    #[test]
+    fn a_job_is_charged_to_the_innermost_op_and_timed_under_it() {
+        let ((), r) = with_report(|| {
+            let _outer = enter("job_outer_op", true);
+            let op = queued();
+            assert_eq!(op, "job_outer_op");
+            served(op, Duration::from_micros(7));
+            {
+                let _inner = enter("job_inner_op", true);
+                served(queued(), Duration::from_micros(5));
+                served(queued(), Duration::from_micros(5));
+            }
+        });
+        assert_eq!(r.op("job_outer_op").unwrap().jobs, 1);
+        assert_eq!(r.op("job_inner_op").unwrap().jobs, 2);
+        let server = server_report();
+        let inner = server.iter().find(|s| s.op == "job_inner_op").unwrap();
+        assert!(inner.jobs >= 2 && inner.time >= Duration::from_micros(10));
     }
 
     #[test]

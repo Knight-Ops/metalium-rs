@@ -135,6 +135,27 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         let _op = crate::report::enter("float_empty", true);
         crate::ops::float::float_empty(shape, device, dtype)
     }
+    fn float_repeat_dim(
+        tensor: FloatTensor<TtBackend>,
+        dim: usize,
+        times: usize,
+    ) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_repeat_dim", true);
+        let storage_inputs = [&tensor];
+        if storage_inputs
+            .iter()
+            .any(|t| t.storage_format() != crate::storage::StorageFormat::F32)
+        {
+            let result_storage =
+                crate::ops::bfp_result_storage("float_repeat_dim", &storage_inputs);
+            let tensor = crate::ops::bfp_compute_input(tensor);
+            return crate::ops::bfp_compute_result(
+                <Self as FloatTensorOps<Self>>::float_repeat_dim(tensor, dim, times),
+                result_storage,
+            );
+        }
+        crate::ops::float::float_repeat_dim(tensor, dim, times)
+    }
     fn float_add(
         lhs: FloatTensor<TtBackend>,
         rhs: FloatTensor<TtBackend>,
@@ -2062,6 +2083,10 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         }
         crate::ops::float::float_erf(tensor)
     }
+    fn float_cat(tensors: Vec<FloatTensor<TtBackend>>, dim: usize) -> FloatTensor<TtBackend> {
+        let _op = crate::report::enter("float_cat", true);
+        crate::ops::float::float_cat(tensors, dim)
+    }
     fn float_argmax(
         tensor: FloatTensor<TtBackend>,
         dim: usize,
@@ -2516,6 +2541,18 @@ impl IntTensorOps<TtBackend> for TtBackend {
         let _op = crate::report::enter("int_select_add", true);
         crate::ops::int::int_select_add(tensor, dim, indices, value)
     }
+    fn int_repeat_dim(
+        tensor: IntTensor<TtBackend>,
+        dim: usize,
+        times: usize,
+    ) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_repeat_dim", true);
+        crate::ops::int::int_repeat_dim(tensor, dim, times)
+    }
+    fn int_cat(tensors: Vec<IntTensor<TtBackend>>, dim: usize) -> IntTensor<TtBackend> {
+        let _op = crate::report::enter("int_cat", true);
+        crate::ops::int::int_cat(tensors, dim)
+    }
     fn int_equal(
         lhs: IntTensor<TtBackend>,
         rhs: IntTensor<TtBackend>,
@@ -2950,6 +2987,18 @@ impl BoolTensorOps<TtBackend> for TtBackend {
     ) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("bool_select_or", true);
         crate::ops::bool::bool_select_or(tensor, dim, indices, value)
+    }
+    fn bool_repeat_dim(
+        tensor: BoolTensor<TtBackend>,
+        dim: usize,
+        times: usize,
+    ) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_repeat_dim", true);
+        crate::ops::bool::bool_repeat_dim(tensor, dim, times)
+    }
+    fn bool_cat(tensors: Vec<BoolTensor<TtBackend>>, dim: usize) -> BoolTensor<TtBackend> {
+        let _op = crate::report::enter("bool_cat", true);
+        crate::ops::bool::bool_cat(tensors, dim)
     }
     fn bool_equal(lhs: BoolTensor<TtBackend>, rhs: BoolTensor<TtBackend>) -> BoolTensor<TtBackend> {
         let _op = crate::report::enter("bool_equal", true);
