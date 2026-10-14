@@ -210,6 +210,8 @@ pub const SMOKE: &[&str] = &[
     // A native `cat` and `repeat_dim`: one row gather or one element repack, not a zero-fill
     // and a `slice_assign` a piece (roadmap Track 2 item 3, `decode-host-cost.md` P1).
     "step180_native_cat::",
+    // `slice_assign` of whole rows (a cache's positions) as one row gather (`decode-host-cost.md` P3).
+    "step181_region_assign::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

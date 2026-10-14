@@ -4639,6 +4639,25 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
+    /// A copy of `t` with rows of `value` written over some of its rows: `(d, s)`
+    /// puts `value`'s row `s` at row `d` ([`tensor::write_rows`] over a tile copy,
+    /// [`Session::copy`]). Burn's `slice_assign` of whole rows, a cache write:
+    /// the host builds a few run records for the copy and entries for the
+    /// written rows only, and `t` is not written.
+    pub fn assign_rows(
+        &mut self,
+        t: &DramTensor,
+        value: &DramTensor,
+        rows: &[(usize, usize)],
+    ) -> Result<DramTensor, TensorError> {
+        let out = self.copy(t)?;
+        if let Err(e) = self.write_rows(&out, value, rows) {
+            self.free(out)?;
+            return Err(e);
+        }
+        Ok(out)
+    }
+
     /// `t` with `value`'s row `i` added to its row `indices[i]`, for every `i`
     /// in order -- Burn's `select_add` along rows, an embedding's gradient --
     /// on the card, in a new tensor. Only the rows the indices touch are

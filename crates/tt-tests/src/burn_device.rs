@@ -559,6 +559,14 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.rows_add(&mut self.session, t, indices, value)
         }
+        fn assign_rows(
+            &mut self,
+            t: burn_tt::BufferId,
+            value: burn_tt::BufferId,
+            rows: &[(usize, usize)],
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.assign_rows(&mut self.session, t, value, rows)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }

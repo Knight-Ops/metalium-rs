@@ -1043,31 +1043,34 @@ fn slice_assign_native(
     let vv = value
         .as_strided()
         .unwrap_or_else(|| crate::views::Strided::of(value.to_dram(), &vs));
-    let count = shape
+    shape
         .iter()
         .try_fold(1usize, |n, &d| n.checked_mul(d))
         .expect("slice assignment overflow");
-    let mut sources: Vec<_> = (0..count).map(|i| (0, tv.at(&shape, i))).collect();
-    for flat in 0..value.shape().num_elements() {
-        let mut index = flat;
-        let mut coordinates = vec![0; shape.len()];
-        for d in (0..shape.len()).rev() {
-            coordinates[d] = ranges[d][index % vs[d]];
-            index /= vs[d];
-        }
-        let dst = coordinates
-            .iter()
-            .zip(&shape)
-            .fold(0, |n, (&i, &d)| n * d + i);
-        sources[dst] = (1, vv.at(&vs, flat));
-    }
     let dims = crate::tensor::stored_dims(&shape).expect("nonempty slice assignment");
-    let (id, dims) = crate::server::repack_many(
-        tensor.device,
-        vec![tv.src.buffer.id, vv.src.buffer.id],
-        sources,
-        dims,
-    );
+    let buffers = vec![tv.src.buffer.id, vv.src.buffer.id];
+    // A region of whole rows (a cache's positions): the value's rows written over a tile copy of a
+    // plain destination, else one row gather. BF16 and F16 buffers are packed, which neither reads.
+    let half = crate::tensor::is_half(tensor.dtype());
+    let plain = tv.as_plain(&shape).is_some_and(|d| !d.transposed);
+    let written = (!half && plain)
+        .then(|| region::assign_written(&shape, &ranges, (&vv, &vs)))
+        .flatten();
+    let rows = (!half && written.is_none())
+        .then(|| region::assign_rows((&tv, &shape), &ranges, (&vv, &vs)))
+        .flatten();
+    let (id, dims) = match (written, rows) {
+        (Some(written), _) => {
+            crate::server::assign_rows(tensor.device, buffers[0], buffers[1], written, dims)
+        }
+        (None, Some(rows)) => crate::server::gather_rows(tensor.device, buffers, rows, dims[1]),
+        (None, None) => crate::server::repack_many(
+            tensor.device,
+            buffers,
+            region::assign_elements((&tv, &shape), &ranges, (&vv, &vs)),
+            dims,
+        ),
+    };
     device_result_shaped(tensor.device, id, dims, shape.into(), tensor.dtype())
 }
 

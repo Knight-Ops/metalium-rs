@@ -389,8 +389,11 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   - **Native `cat` (P1, 2026-10-14):** `cat` and `repeat_dim` are one row gather or one element repack (`ops/region.rs`,
     gate `step180_native_cat`, ttsim and card 0). The decode step is **117.3 ms on every tile** (`1792006312`; burn-flex
     26.3, so 4.5x) and 458 ms on one tile. `step167` F32 takes 23.4 s, was 33.2.
-  - **Next:** `attention`'s 1,920 jobs, half of the remaining server thread. Then the cache's `slice_assign`
-    (P3) and the m = 1 matmuls on one tile.
+  - **Cache writes (P3, 2026-10-14):** a `slice_assign` of whole rows is a tile copy with the value's rows written
+    over it (`Session::assign_rows`, gate `step181_region_assign`). A cache write costs 25 us of server time (was 254).
+    The step is **108.5 ms on every tile** (`1792010467`, 4.1x burn-flex).
+  - **Next:** P2 (ViT's repacks), then item 9 (attention: 1,920 jobs, about half of what is left), then the m = 1
+    matmuls on one tile.
 - [ ] **4. ViT-Tiny forward (7.8x, 815 ms).** 709 reported operations at about 1.1 ms, first read as host submission, the same
   cost as item 3 at a smaller scale. Layer norm is composed (`float_mean_dim`, `sqrt`, `div`: 50 `mean_dim` and 25 `sqrt` calls a
   pass); GELU and attention are native. Benchmark: `silicon_bench_models::vit_tiny_forward`, against burn-flex's 104.7 ms.

@@ -1,4 +1,4 @@
-//! Copy-shaped ops as one device job: `cat` and `repeat_dim`
+//! Copy-shaped ops as one device job: `cat`, `repeat_dim` and `slice_assign`
 //! (`docs/plans/decode-host-cost.md`).
 //!
 //! Burn's default `cat` is a zero-filled tensor and one `slice_assign` a piece, and each
@@ -17,6 +17,15 @@
 //! Both copy bits, so a result equals Burn's composition bit for bit. A piece in block floating
 //! point storage, an empty result or a device without resident storage keeps Burn's composition
 //! ([`cat_composed`]).
+//!
+//! `slice_assign` of a region of whole rows (the last dimension written in full, in order; a
+//! key/value cache's positions) is a tile copy of the destination with the value's rows written over
+//! it (`Session::assign_rows`): the host builds a few run records for the copy and entries for the
+//! written rows only ([`assign_written`]). A destination that is a view is one row gather instead,
+//! naming the destination's row outside the region and the value's inside ([`assign_rows`]); any
+//! other region is the element map ([`assign_elements`]). The result is a new buffer every way: the
+//! destination is never written in place, so a tensor that still holds it
+//! (`cache.k.clone().slice_assign(..)`) keeps its contents.
 
 use burn_backend::{Shape, TensorMetadata};
 
@@ -87,6 +96,83 @@ pub(crate) fn cat_elements(pieces: &[Piece<'_>], dim: usize) -> Vec<(usize, [usi
         }
     }
     sources
+}
+
+/// The output position, row-major in `shape`, of each element of a `slice_assign`'s value of shape
+/// `vs`, whose dimension `d` lands at `ranges[d]`.
+fn assigned_flat(shape: &[usize], ranges: &[Vec<usize>], vs: &[usize], mut flat: usize) -> usize {
+    let mut coordinates = vec![0; shape.len()];
+    for d in (0..shape.len()).rev() {
+        coordinates[d] = ranges[d][flat % vs[d]];
+        flat /= vs[d];
+    }
+    coordinates
+        .iter()
+        .zip(shape)
+        .fold(0, |n, (&i, &d)| n * d + i)
+}
+
+/// The source of each output element of `slice_assign(tensor, ranges, value)`: `(0, [row, column]
+/// of the destination's buffer)` outside the region, `(1, .. of the value's)` inside, row-major.
+pub(crate) fn assign_elements(
+    dest: Piece<'_>,
+    ranges: &[Vec<usize>],
+    value: Piece<'_>,
+) -> Vec<(usize, [usize; 2])> {
+    let ((tv, shape), (vv, vs)) = (dest, value);
+    let count: usize = shape.iter().product();
+    let mut sources: Vec<_> = (0..count).map(|i| (0, tv.at(shape, i))).collect();
+    for flat in 0..vs.iter().product() {
+        sources[assigned_flat(shape, ranges, vs, flat)] = (1, vv.at(vs, flat));
+    }
+    sources
+}
+
+/// The rows a `slice_assign` writes: `(stored row of the output, row of the value's buffer)` for
+/// each row of the value. `None` unless the region writes the last dimension whole and in order and
+/// the value is [`whole_rows`].
+pub(crate) fn assign_written(
+    shape: &[usize],
+    ranges: &[Vec<usize>],
+    value: Piece<'_>,
+) -> Option<Vec<(usize, usize)>> {
+    let (vv, vs) = value;
+    let last = *shape.last()?;
+    if !ranges.last()?.iter().copied().eq(0..last) || !whole_rows(vv, vs) {
+        return None;
+    }
+    Some(
+        (0..vs[..vs.len() - 1].iter().product())
+            .map(|r| {
+                (
+                    assigned_flat(shape, ranges, vs, r * last) / last,
+                    vv.at(vs, r * last)[0],
+                )
+            })
+            .collect(),
+    )
+}
+
+/// [`assign_elements`] by rows: `(0, row of the destination's buffer)` outside the region, `(1, row
+/// of the value's)` inside, for every stored row of the output. `None` unless the destination is
+/// [`whole_rows`] and [`assign_written`] is not `None`.
+pub(crate) fn assign_rows(
+    dest: Piece<'_>,
+    ranges: &[Vec<usize>],
+    value: Piece<'_>,
+) -> Option<Vec<(usize, usize)>> {
+    let (tv, shape) = dest;
+    if !whole_rows(tv, shape) {
+        return None;
+    }
+    let written = assign_written(shape, ranges, value)?;
+    let last = *shape.last()?;
+    let count: usize = shape[..shape.len() - 1].iter().product();
+    let mut rows: Vec<_> = (0..count).map(|r| (0, tv.at(shape, r * last)[0])).collect();
+    for (d, s) in written {
+        rows[d] = (1, s);
+    }
+    Some(rows)
 }
 
 /// `tensors` concatenated along `dim` as one device job, or `None` where Burn's composition is
@@ -312,6 +398,77 @@ mod tests {
             );
             assert_eq!(cat_elements(&pieces, dim), reference(&pieces, dim));
         }
+    }
+
+    /// A destination's shape, the value's shape, and where each value dimension lands.
+    type Region = (Vec<usize>, Vec<usize>, Vec<Vec<usize>>);
+
+    /// Regions along every dimension, written whole on the last.
+    fn regions() -> Vec<Region> {
+        vec![
+            // A key/value cache `[1, 3, 8, 64]`, positions 5..7.
+            (
+                vec![1, 3, 8, 64],
+                vec![1, 3, 2, 64],
+                vec![vec![0], vec![0, 1, 2], vec![5, 6], (0..64).collect()],
+            ),
+            // Rows of a matrix, stepped and reversed.
+            (
+                vec![40, 33],
+                vec![3, 33],
+                vec![vec![38, 20, 2], (0..33).collect()],
+            ),
+            // A head of a rank-3 tensor.
+            (
+                vec![4, 5, 7],
+                vec![1, 5, 7],
+                vec![vec![2], (0..5).collect(), (0..7).collect()],
+            ),
+            // All of it: the value replaces the destination.
+            (vec![2, 6], vec![2, 6], vec![vec![0, 1], (0..6).collect()]),
+        ]
+    }
+
+    #[test]
+    fn a_region_of_whole_rows_moves_what_the_element_map_does() {
+        for (shape, vs, ranges) in regions() {
+            let (dest, value) = (view(0, &shape), view(1, &vs));
+            let rows = assign_rows((&dest, &shape), &ranges, (&value, &vs)).expect("whole rows");
+            assert_eq!(
+                by_element(&rows, *shape.last().unwrap()),
+                assign_elements((&dest, &shape), &ranges, (&value, &vs)),
+                "{shape:?} <- {vs:?}"
+            );
+        }
+        // The value's elements land where the ranges say, the rest stays: checked once by hand.
+        let (shape, vs) = (vec![3, 2], vec![1, 2]);
+        let (dest, value) = (view(0, &shape), view(1, &vs));
+        let ranges = vec![vec![1], vec![0, 1]];
+        assert_eq!(
+            assign_elements((&dest, &shape), &ranges, (&value, &vs)),
+            vec![
+                (0, [0, 0]),
+                (0, [0, 1]),
+                (1, [0, 0]),
+                (1, [0, 1]),
+                (0, [2, 0]),
+                (0, [2, 1])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_region_that_does_not_write_whole_rows_is_elements() {
+        let (shape, vs) = (vec![4, 64], vec![4, 32]);
+        let (dest, value) = (view(0, &shape), view(1, &vs));
+        let half = vec![(0..4).collect(), (32..64).collect()];
+        assert_eq!(assign_rows((&dest, &shape), &half, (&value, &vs)), None);
+        let reversed = vec![(0..4).collect(), (0..64).rev().collect()];
+        let full = view(1, &shape);
+        assert_eq!(
+            assign_rows((&dest, &shape), &reversed, (&full, &shape)),
+            None
+        );
     }
 
     #[test]

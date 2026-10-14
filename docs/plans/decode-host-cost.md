@@ -1,7 +1,7 @@
 # Decode host cost: copies as region moves, not element maps
 
 Roadmap Track 2, item 3 ("The decode step's host cost (25x)"). Written 2026-10-14 against `0ba8d00`.
-Status: **P0 and P1 done (2026-10-14); P3 next (the cache writes), then P2 (ViT's repacks).**
+Status: **P0, P1 and P3 done (2026-10-14); P2 (ViT's repacks) next.**
 
 ## Why this item, and what it is not
 
@@ -202,24 +202,58 @@ device ops" counts zero-cost views as device operations (`report.rs` `on_device`
   - Job counts: a whole-row slice submits zero jobs.
   - Negative controls: a view offset off by one row, and a column offset applied to the wrong dim.
 
-### P3. `slice_assign` and `repeat_dim` through the planner
+### P3. `slice_assign` through the planner (done 2026-10-14)
 
-- [ ] `float_slice_assign` (and int, bool):
-  - the uniquely owned case writes in place;
-  - the shared case is a tile-run copy plus a region write (see "Ownership rules").
-  - Keep the uniqueness test in one function, with unit tests for each holder that blocks it: a clone, a view
-    parent, a trace hold, a cache pin.
+- [x] `float_slice_assign` (and int, bool, which share `slice_assign_native`), when the region writes the last
+  dimension whole and in order (a cache's positions):
+  - **A plain destination** gets a tile copy with the value's rows written over it. That is one job,
+    `Session::assign_rows` = `Session::copy` then `write_rows`, through `Engine::assign_rows` on the card, mesh
+    and simulator engines. The host builds a few run records and entries for the written rows only
+    (`region::assign_written`).
+  - **A destination that is a view** is one row gather over it and the value (`region::assign_rows`).
+  - **Any other region** keeps the element map (`region::assign_elements`, the old code moved).
+  - BF16 and F16 take the element path.
+- [x] **No in-place write (a decision, not an omission).** The result is always a new buffer, so the
+  ownership rules above are not needed:
+  - The pattern that matters, SmolLM2's `cache.k.clone().slice_assign(..)`, never owns its destination
+    uniquely, so an in-place path would not run there.
+  - The tile copy costs a few records on the host, so being shared costs little.
+  - An in-place write stays the trace work's question (see "Hand-off"), where fixed buffers matter.
 - [x] `float_repeat_dim` (and int, bool): done in P1, as a `cat` of the tensor.
-- [ ] **Gate `step182_region_assign`:**
-  - Bit for bit against burn-flex.
-  - A KV-cache pattern written as SmolLM2 writes it (`clone().slice_assign`): the old tensor must keep its old
-    contents after the write. That is the aliasing check.
-  - The same with a unique destination, which must be written in place (assert no new buffer).
-  - A destination that a trace holds must not be written in place.
-  - Ragged padding, then `slice_assign`, then a reduction.
-  - `repeat_dim` on every dim.
-  - Negative controls: an in-place write while a clone is alive (forced through a test hook) must be caught by
-    the aliasing assertion; a region write one row off.
+- [x] **Gate `step181_region_assign`** (ttsim and card 0, run `1792010463`, 5 of 5; in `SMOKE`). The plan
+  called it `step182`; it is numbered in landing order.
+  - **Oracle:** bit for bit against burn-flex over every special value.
+  - **Regions:** cache positions (8- and 64-position caches), runs across a tile row, stepped and reversed rows,
+    a head, a middle dimension, the whole tensor; half the last dimension and a reversed last dimension (the
+    element path).
+  - **Aliasing:** the SmolLM2 pattern over 16 steps keeps every earlier version intact.
+  - **Inputs:** a view destination (asserted to take the row gather) and view values, a transposed value, I32,
+    Bool, BF16, F16.
+  - **Padding and replay:** a ragged producer, then `slice_assign`, then `sum_dim` and a matmul; a trace of a
+    cache write replayed with changed keys.
+  - **Cost:** each F32 case is one job of the expected kind, with no download.
+  - **Negative controls**, each watched failing:
+    - the written row one down;
+    - the value's rows reversed;
+    - the view path's two sources swapped;
+    - a half row let through by rows.
+
+    The plan's controls for an in-place write do not apply, since there is no in-place write.
+- [x] Regression checks:
+  - ttsim: `step84`, `step85`, `step152`, `step180`, `step62`, `step127`, `step162`, `step12_mnist` e2e (golden
+    unchanged), `stale_buffer`, `burn_server`.
+  - Card 0: `step167` F32, `step168` (7 of 7), `step166`.
+  - Burn's conformance on ttsim, plain and `--fusion`: 0 unexpected.
+- [x] **Measured** (card 0):
+
+  | Decode step | Cache writes | Step |
+  |---|--:|--:|
+  | every tile, before P3 | 15.3 ms (254 us a job) | 117.3 ms |
+  | every tile, after P3 | **1.5 ms (25 us a job)** | **108.5 ms** (`1792010467`) |
+  | one tile, after P3 | | 451.7 ms (`1792010476`) |
+
+  An intermediate version (one row gather over the whole cache, 147 us a job, `1792009767`) was replaced: its
+  host entries grow with the cache's length.
 
 ### P4. The fixed cost per op (only if P0 shows it matters after P1-P3)
 

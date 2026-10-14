@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
 | [Native `cat`](#native-cat-2026-10-14-card-0) | 2026-10-14 | `cat` and `repeat_dim` are one row gather or one element repack, not a zero-fill and a `slice_assign` a piece: the SmolLM2 decode step 232.6 -> 117.3 ms on every tile (burn-flex 26.3), 623.9 -> 458.1 on one; its 121 `cat`s 196.6 -> 4.6 ms of server time |
 | [Decode step: where the host time goes](#decode-step-where-the-host-time-goes-2026-10-14-card-0) | 2026-10-14 | jobs and server-thread time per Burn op: on one tile the SmolLM2 decode (624 ms) waits on m=1 matmuls; on every tile (233 ms) `cat`'s zero-fill and `slice_assign` are 61% of the server thread; ViT-Tiny is attention and repacking `swap_dims`/`slice`, not per-op submission |
 | [Chunk-free convolution and max pooling](#chunk-free-convolution-and-max-pooling-2026-10-14-cards-0-and-1) | 2026-10-14 | one tap select and one product a convolution, NHWC views between layers: ResNet-18 16.3 s -> 782 ms on one tile (5.0x burn-flex), 131 ms on every tile at `work:64:4` (burn-flex 151) |
@@ -295,6 +296,24 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Cache writes as a tile copy and written rows (2026-10-14, card 0)
+
+P3 of [decode-host-cost.md](../plans/decode-host-cost.md). A `slice_assign` whose region writes the last dimension whole and in
+order (a key/value cache's positions) is now `Session::assign_rows`: a tile copy of the destination (`Session::copy`, a few run
+records) with the value's rows written over it (`write_rows`, entries for the written rows only). A destination that is a view is one
+row gather; anything else keeps the element map. The destination is never written in place. Same conditions as "Native `cat`".
+
+| SmolLM2 decode step, lookup excluded, every tile at `work:64:4` | `slice_assign` (60 a step) | Step |
+|---|--:|--:|
+| After the native `cat` (`1792006312`): whole-destination element map | 15.3 ms, 254 us a job | 117.3 ms |
+| One row gather over the whole cache (`1792009767`, not kept) | 8.8 ms, 147 us a job | 114.0 ms |
+| **Tile copy and written rows** (`1792010467`) | **1.5 ms, 25 us a job** | **108.5 ms** (p10 90.7, p90 125.5) |
+
+The row gather was the first version. It copies the cache row by row, so its host entries (two a row a tile column, about 768 for
+this 64-position cache) grow with the cache's length; the tile copy's do not. On one tile the step is 451.7 ms (`1792010476`;
+`slice_assign` 5.5 ms there, waiting on the device's matmuls). Gate `step181_region_assign`, ttsim and card 0 (`1792010463`);
+`step167` F32, `step168` and `step166` pass on card 0 (`1792010494`, `1792010546`, `1792010734`).
 
 ## Native `cat` (2026-10-14, card 0)
 

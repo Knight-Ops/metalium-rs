@@ -299,6 +299,16 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// A copy of `t` with `value`'s row `s` at row `d` for each `(d, s)`
+    /// (`Session::assign_rows`): a `slice_assign` of whole rows.
+    fn assign_rows(
+        &mut self,
+        _t: BufferId,
+        _value: BufferId,
+        _rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
     fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
@@ -1049,6 +1059,18 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
         let c = s.rows_add(&tt, indices, &tv).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn assign_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
+        let c = s.assign_rows(&tt, &tv, rows).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -2627,6 +2649,24 @@ pub(crate) fn rows_add(
     )
 }
 
+/// A copy of `t` with rows of `value` written over it (`Engine::assign_rows`),
+/// without waiting: `dims` is `t`'s.
+pub(crate) fn assign_rows(
+    device: TtDevice,
+    t: BufferId,
+    value: BufferId,
+    rows: Vec<(usize, usize)>,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "assign_rows",
+        device,
+        dims,
+        || "rows written over a copy".into(),
+        move |engine, ids| engine.assign_rows(ids.get(t)?, ids.get(value)?, &rows),
+    )
+}
+
 /// A block copy on the device, without waiting.
 pub(crate) fn copy_blocks(
     device: TtDevice,
@@ -3119,6 +3159,15 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rows_add(&mut self.session, t, indices, value)
+    }
+    fn assign_rows(
+        &mut self,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.assign_rows(&mut self.session, t, value, rows)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
@@ -3844,6 +3893,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn assign_rows(
+        &mut self,
+        t: BufferId,
+        value: BufferId,
+        rows: &[(usize, usize)],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.assign_rows(self.fabric.chips[0].session(), t, value, rows)
     }
     fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
         Some(self.fabric.execution().clone())
