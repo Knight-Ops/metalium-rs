@@ -3293,9 +3293,18 @@ impl<T: Transport> Session<T> {
                     ))
                 })?;
                 let writer_at = 1 + relative[0][1] as usize;
-                let (reader, reader_storage) = self.store_region(u, &relative[1..writer_at])?;
+                let (reader, reader_storage, reader_mix) =
+                    self.store_region(u, &relative[1..writer_at])?;
+                let (writer, writer_storage, writer_mix) =
+                    self.store_region(u, &relative[writer_at..])?;
+                for (storage, mix) in [
+                    (&reader_storage, &reader_mix),
+                    (&writer_storage, &writer_mix),
+                ] {
+                    out.sections_gddr_bytes += storage.region().map_or(0, |r| r.len());
+                    out.sections_composition.add(mix);
+                }
                 out.regions.push(reader_storage);
-                let (writer, writer_storage) = self.store_region(u, &relative[writer_at..])?;
                 out.regions.push(writer_storage);
                 out.sections.extend([reader[2], writer[2]]);
                 out.stream.push([
@@ -3516,8 +3525,9 @@ impl<T: Transport> Session<T> {
         &mut self,
         u: usize,
         entries: &[[u32; 8]],
-    ) -> Result<([u32; 3], tensor::Placement), TensorError> {
+    ) -> Result<([u32; 3], tensor::Placement, trace::Composition), TensorError> {
         let words = trace::chunked(entries);
+        let composition = trace::Composition::of(entries, words.len());
         let mut bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3543,6 +3553,7 @@ impl<T: Transport> Session<T> {
                 words.len() as u32,
             ],
             storage,
+            composition,
         ))
     }
 
@@ -3552,6 +3563,7 @@ impl<T: Transport> Session<T> {
         uc: &trace::UnitCapture,
     ) -> Result<trace::UnitTrace, TensorError> {
         let words = trace::chunked(&uc.stream);
+        let own = trace::Composition::of(&uc.stream, words.len());
         let bytes: Vec<u8> = words
             .iter()
             .flatten()
@@ -3577,6 +3589,8 @@ impl<T: Transport> Session<T> {
             d.alloc.free(&stream);
             return Err(e.into());
         }
+        let mut composition = own;
+        composition.add(&uc.sections_composition);
         Ok(trace::UnitTrace {
             regions: uc.regions.clone(),
             channel: range.channel().index() as u32,
@@ -3585,6 +3599,9 @@ impl<T: Transport> Session<T> {
             generations,
             held_programs: uc.held_programs.clone(),
             sections: uc.sections.clone(),
+            composition,
+            top_level_entries: words.len() as u32,
+            gddr_bytes: range.len() + uc.sections_gddr_bytes,
             stream,
         })
     }
@@ -3701,6 +3718,46 @@ impl<T: Transport> Session<T> {
         Ok(t.units
             .iter()
             .map(|u| u.as_ref().map_or_else(Vec::new, |u| u.sections.clone()))
+            .collect())
+    }
+
+    /// What trace `id` costs each unit (`None` for a unit it does not use): its
+    /// stream's entries by op and its chunk padding, the GDDR bytes the stream and its
+    /// sections take, and the program-cache bytes the trace pins, against the cache's
+    /// size. The two limits that bound a trace are the program cache and GDDR, so a
+    /// change that touches traces reports these beside its replay time.
+    pub fn trace_footprint(
+        &self,
+        id: TraceId,
+    ) -> Result<Vec<Option<trace::UnitFootprint>>, TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        Ok(t.units
+            .iter()
+            .zip(&self.units)
+            .map(|(ut, unit)| {
+                let ut = ut.as_ref()?;
+                // One hold per reference, so the same program appears often; a hold
+                // from before a reset names nothing.
+                let live: std::collections::BTreeSet<u64> = ut
+                    .held_programs
+                    .iter()
+                    .filter(|&&(generation, _)| generation == unit.programs.generation())
+                    .map(|&(_, at)| at)
+                    .collect();
+                let region = unit.programs.region();
+                Some(trace::UnitFootprint {
+                    stream: ut.composition.clone(),
+                    top_level_entries: ut.top_level_entries,
+                    gddr_bytes: ut.gddr_bytes,
+                    programs: live.len() as u32,
+                    program_bytes: live
+                        .iter()
+                        .filter_map(|&at| unit.programs.program_bytes(at))
+                        .sum(),
+                    cache_held_bytes: unit.programs.held_bytes(),
+                    cache_bytes: region.end - region.base,
+                })
+            })
             .collect())
     }
 

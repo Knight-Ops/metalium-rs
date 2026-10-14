@@ -117,9 +117,70 @@ pub struct OpRecord {
     pub barrier: bool,
 }
 
+/// What a stored stream is made of: how many entries it holds, how many of those
+/// are chunk padding, and how many records or entries there are of each op word.
+/// Counted as the stream is laid out for GDDR (nothing keeps the words on the
+/// host), so a size change can be seen entry by entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Composition {
+    /// Entries stored, padding included.
+    pub entries: u32,
+    /// `WAIT`s [`chunked`] added so no record crosses a chunk.
+    pub padding: u32,
+    /// Records (or single entries) by op word, padding not counted.
+    pub heads: std::collections::BTreeMap<u32, u32>,
+}
+
+impl Composition {
+    /// The stream `entries` as [`chunked`] lays it out into `laid` entries.
+    pub(crate) fn of(entries: &[[u32; 8]], laid: usize) -> Self {
+        let mut heads = std::collections::BTreeMap::new();
+        let mut i = 0;
+        while i < entries.len() {
+            *heads.entry(entries[i][0]).or_insert(0) += 1;
+            i += record::len(entries[i][0]).max(1);
+        }
+        Composition {
+            entries: laid as u32,
+            padding: (laid - entries.len()) as u32,
+            heads,
+        }
+    }
+
+    pub(crate) fn add(&mut self, other: &Composition) {
+        self.entries += other.entries;
+        self.padding += other.padding;
+        for (&op, &n) in &other.heads {
+            *self.heads.entry(op).or_insert(0) += n;
+        }
+    }
+}
+
+/// What a finished trace costs one unit: the two things that bound a trace
+/// (the program cache, 240 KiB of L1, and the stream in GDDR) and what the
+/// stream is made of. See [`crate::session::Session::trace_footprint`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitFootprint {
+    /// The unit's stream and every section its `PAIR_CALL`s name, together.
+    pub stream: Composition,
+    /// Entries in the unit's own stream, padding included.
+    pub top_level_entries: u32,
+    /// GDDR bytes of the stream and the sections, as allocated (whole slots).
+    pub gddr_bytes: u64,
+    /// Distinct programs this trace holds in the unit's program cache, and their bytes.
+    pub programs: u32,
+    pub program_bytes: u64,
+    /// Bytes held in the cache by every trace on the unit, and the cache's size.
+    pub cache_held_bytes: u64,
+    pub cache_bytes: u64,
+}
+
 /// One unit's share of a capture in progress.
 #[derive(Default)]
 pub(crate) struct UnitCapture {
+    /// What the sections stored so far are made of, and their GDDR bytes.
+    pub(crate) sections_composition: Composition,
+    pub(crate) sections_gddr_bytes: u64,
     pub(crate) regions: Vec<Placement>,
     /// The unit's entries, in order, generations and barrier targets relative.
     pub(crate) stream: Vec<[u32; 8]>,
@@ -188,6 +249,10 @@ pub(crate) struct UnitTrace {
     pub(crate) held_programs: Vec<(u64, u64)>,
     /// As [`UnitCapture::sections`].
     pub(crate) sections: Vec<u32>,
+    /// What the unit's stream and its sections are made of, and their GDDR bytes.
+    pub(crate) composition: Composition,
+    pub(crate) top_level_entries: u32,
+    pub(crate) gddr_bytes: u64,
 }
 
 /// A finished trace: see the module documentation.
@@ -290,5 +355,35 @@ mod tests {
             assert_eq!(i / chunk, (i + n - 1) / chunk, "record at {i}");
             i += n;
         }
+    }
+
+    #[test]
+    fn a_composition_counts_records_once_and_padding_apart() {
+        let chunk = dm::TRACE_CHUNK_ENTRIES as usize;
+        let rec_len = record::len(record::GATHER);
+        let poke = [op::POKE, 1, 2, 0, 0, 0, 0, 0];
+        let mut stream = vec![poke, poke];
+        // Records until one would straddle the first chunk's end, so there is padding.
+        let records = chunk / rec_len + 1;
+        for tag in 0..records {
+            let mut rec = vec![[0u32; 8]; rec_len];
+            rec[0] = [record::GATHER, tag as u32, 0, 0, 0, 0, 0, 0];
+            stream.extend_from_slice(&rec);
+        }
+        let laid = chunked(&stream);
+        let mix = Composition::of(&stream, laid.len());
+        assert_eq!(mix.entries as usize, laid.len());
+        assert_eq!(mix.padding as usize, laid.len() - stream.len());
+        assert!(mix.padding > 0, "the stream was built to pad");
+        // A five-entry record is one record, not five entries.
+        assert_eq!(mix.heads[&record::GATHER] as usize, records);
+        assert_eq!(mix.heads[&op::POKE], 2);
+        assert_eq!(mix.heads.len(), 2);
+        // Adding is a sum of every field.
+        let mut total = mix.clone();
+        total.add(&mix);
+        assert_eq!(total.entries, 2 * mix.entries);
+        assert_eq!(total.padding, 2 * mix.padding);
+        assert_eq!(total.heads[&record::GATHER], 2 * mix.heads[&record::GATHER]);
     }
 }

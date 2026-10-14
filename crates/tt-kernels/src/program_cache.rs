@@ -273,6 +273,23 @@ impl ProgramCache {
     pub fn resident_bytes(&self) -> u64 {
         self.resident.iter().map(|r| r.words.len() as u64 * 4).sum()
     }
+
+    /// Bytes of the program at `at`, if one is resident there.
+    pub fn program_bytes(&self, at: u64) -> Option<u64> {
+        self.resident
+            .iter()
+            .find(|r| r.at == at)
+            .map(|r| r.words.len() as u64 * 4)
+    }
+
+    /// Bytes of programs some trace holds: what no placement may evict.
+    pub fn held_bytes(&self) -> u64 {
+        self.resident
+            .iter()
+            .filter(|r| r.held > 0)
+            .map(|r| r.words.len() as u64 * 4)
+            .sum()
+    }
 }
 
 fn release(free: &mut BTreeMap<u64, u64>, at: u64, len: u64) {

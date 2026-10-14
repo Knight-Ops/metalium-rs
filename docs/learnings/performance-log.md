@@ -15,6 +15,8 @@ The chronology is the [Change log](#change-log).
 | [tt-metal reference: DRAM reads by core count](#tt-metal-reference-dram-reads-by-core-count-2026-10-13-card-1) | 2026-10-13 | tt-metal's compiled reader takes ~125 cycles a 4 KiB page, ours 359 safe / 175 fast; at scale ours reaches 94-97% of the card, the plain interleaved tt-metal pattern 71-81% |
 | [Host-encoded read entries](#host-encoded-read-entries-2026-10-13-card-0) | 2026-10-13 | a build-time mode of the B mover: a read entry 359 -> 175 device cycles (215 with the semantic guard); real flows 1.0x-1.95x; default stays safe |
 | [Read-loop probe](#read-loop-probe-what-the-interpreter-costs-per-read-entry-2026-10-13-card-0) | 2026-10-13 | a shipped mover read entry is 359 device cycles; a bare loop 90-106; the host-timed 0.48 us includes ~0.21 us of list upload; the in-flight cap does not matter past 4 |
+| [Trace replay breakdown](#trace-replay-where-a-replayed-ops-device-time-goes-2026-10-14-card-0) | 2026-10-14 | a replayed tiny streaming op costs ~7.4-8.7 us, about half of it control (pair begin ~1.05 us, finish ~1.3-1.6, credits ~0.9, barrier ~0.6-0.7 on many tiles); the 51-`POKE` prologue is 7.2 us a replay; a chunk boundary is 0.75 us; the host adds ~2 us a tile |
+| [Trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim) | 2026-10-14 | a captured op costs ~18 stream entries (~0.6 KiB) but ~8 KiB of GDDR (whole-slot sections) and, per distinct op, ~4 KiB of pinned program cache (~0.6 KiB a program); programs are shared by hash; chunk padding is 0-1% |
 | [Records and NC writes](#per-tile-cost-of-the-movers-records-and-ncs-writes-2026-10-13-cards-0-and-1) | 2026-10-13 | A record's tile costs a plain entry's ~340 cycles on B (read) and ~320-345 on NC (write); only plain entries gain from encoding |
 | [Firmware image budget](#firmware-image-budget-and-core-assignment-2026-10-13-card-0) | 2026-10-13 | B's 24 KiB slot repacked to 42 KiB at no speed cost; `opt-level` 2 is as fast as 3 and 1.7 KB smaller, `s`/`z` are 1.6-7x slower |
 | [Row select: an embedding lookup without staging](#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0) | 2026-10-13 | a SmolLM2 token's lookup 15.9 s -> 260 us; the F32 SmolLM2 gate 575 s -> 33 s; a decode step is the host-bound 623 ms again |
@@ -634,6 +636,89 @@ list ring over PCIe, which a host-timed list includes. The same split fits a `WA
   gap is 3.4-4x; host-visible per fresh list it is smaller, 648 -> ~390 cycles (1.7x), because the upload stays.
 - Not measured: more than one tile (the card's GDDR bandwidth limits there: 452-480 GB/s at 4 KiB entries), NC's writes, other
   entry kinds, any model.
+
+## Trace replay: where a replayed op's device time goes (2026-10-14, card 0)
+
+`silicon_probe_trace_replay::replay_breakdown` (and `replay_dump`, the raw stamps), release, card 0, safe image, plain traces, branch
+`fast-mode-hardening`; runs `1791944369` (breakdown) and `1791944173` / `1791944389` (dumps, 1 and 8 tiles). One replay is profiled at
+a time (`profile_start`, `replay`, `sync`, `profile_stop`; the roles do not stamp, `set_profile_roles(false)`), unit 0's mover stamps
+are split by what lies between two of them, and the parts are checked to sum exactly to the replay's `LIST_BEGIN`..`LIST_END` span
+(a replay whose stream is more than 64 entries is several lists: the gaps between them are the chunk boundaries). Medians of 7.
+Two traces: the MNIST-size layer forward (matmul, add row, relu, matmul) and **chain8**, eight relus of one 64x64 tensor, which has
+next to no compute or data, so what is left is the replay's own cost.
+
+| Device us per replay (unit 0) | chain8, 1 tile | chain8, 8 tiles | layer, 1 tile | layer, 8 tiles |
+|---|--:|--:|--:|--:|
+| **span** (per op) | **69.8** (8.73) | **59.3** (7.41) | **125.0** (31.2) | **64.1** (16.0) |
+| host, `replay` + `sync`, unstamped | 73.5 | 79.0 | 129.0 | 82.5 |
+| `POKE` prologue + setup `KERNEL` | 7.2 | 7.2 | 7.8 | 7.8 |
+| chunk boundary (`LIST_END` to next `LIST_BEGIN`) | 0 | 0.75 | 0 | 0 |
+| pair begin (first op) + pair gap (later ops) | 22.1 | 7.5 | 10.2 | 4.4 |
+| `LAUNCH` | 1.9 | 1.9 | 0.9 | 0.9 |
+| `CB` credits | 5.6 | 5.4 | 3.3 | 2.7 |
+| data records (`READ_RUN`, `GATHER`) | 12.9 | 6.7 | 63.7 | 19.6 |
+| `KERNEL_WAIT` (the roles' run) | 16.7 | 7.2 | 34.4 | 9.7 |
+| `BARRIER` | 0 | 9.7 | 0 | 12.7 |
+| loop gaps between entries | 1.4 | 11.9 | 2.9 | 6.2 |
+| last entry to `LIST_END` | 2.0 | 0.1 | 1.6 | 0.05 |
+
+- **A tiny streaming op costs 7.4-8.7 us on the device, about half of it control.** In chain8 on one tile, data (2.2 k cycles an op) and the
+  roles' run (2.8 k) are 42% of an op; pair begin/finish, launch, credits, loop gaps and the last-entry gap are the other ~4.1 us. The
+  steady-state op is ~10.6 k cycles (7.8 us) after the prologue.
+- **A streaming op's fixed costs, in cycles** (dump, 8 tiles, steady state): starting the `PAIR_CALL` ~1,420 (its mailbox handshakes
+  and the reader section's fetch from GDDR; the same ~1,405 for the first op, where nothing precedes it); `LAUNCH` ~320; two `CB`
+  entries ~345 + ~560 (they wait on NC and the roles, so part of that is not overhead); finishing the pair ~1,800 (B waits for NC's
+  output writes, which are real data movement, 4 tiles here); `BARRIER` ~800-950 once the tiles are aligned (6,100 the first time,
+  which absorbs the skew of the `CALL`s' start); ~55 cycles a gap between entries.
+- **The 51 `POKE`s cost ~173 cycles each (116 for the entry, ~58 of loop gap), 6.5 us a replay, 9-11% of a small trace.** They write
+  role descriptor words one by one and are the same on every replay. Their stamps are ~12 cycles of the 116.
+- **A chunk boundary is 1,012 cycles (0.75 us)**: the progress write, the next 64 entries' fetch from GDDR, the patch pass. Seen where
+  the top-level stream (51 `POKE`s, a `KERNEL`, the `PAIR_CALL`s, `BARRIER`s) passes 64 entries (8 tiles); each reader section's fetch is
+  inside "pair begin". So the chunk loop is not where a replay's time is: one boundary is under 1.3% of chain8 on 8 tiles. The filler
+  `WAIT`s the host pads with are zero in these traces ([trace footprint](#trace-footprint-what-a-trace-costs-a-tile-2026-10-14-ttsim)).
+- **On many tiles the host is the larger part.** Host minus device is 3.7-4.0 us on one tile (the 4.25 us round trip, with the device's own
+  tail) and 18.5-19.7 us on 8: ~2 us a tile for the `CALL` entry's three posted writes and the sync's per-unit polls. A replay of 8
+  tiles is 79 us by the host's clock for a 59 us device span; the device is not what bounds the small ones.
+- **The barrier is 16-20% of an 8-tile replay.** 4,300 cycles an op in the layer (it includes waiting for the slowest tile), ~1,600 in chain8.
+
+Reading with its limits: unit 0 only; spans include waiting for the other tiles at barriers; NC is not stamped, so the pair gap
+and the last-entry gap include the wait for its writes; stamping costs ~12 cycles a stamp (204 stamps, ~2.6% of chain8's span, and
+host minus device agrees with the known round trip, so it is not distorting the shape); the safe image, plain entries, one card.
+
+## Trace footprint: what a trace costs a tile (2026-10-14, ttsim)
+
+`Session::trace_footprint` and `step174_trace_footprint` (ttsim; the counts are host-side and do not depend on the card, so silicon
+reads the same for a given tile count). A trace is bounded by two things per tile, the program cache (`l1::PROGRAM_CACHE`, 240 KiB of
+L1, every program a trace names pinned for its life) and its streams in GDDR. Branch `fast-mode-hardening`, safe image, plain traces.
+
+| Capture | Entries (top level + sections) | Padding | Entry bytes | GDDR allocated | Programs pinned |
+|---|--:|--:|--:|--:|--:|
+| layer forward 64x784x128x10 (matmul, add row, relu, matmul), 1 tile | 124 (57 + 67) | 0 | 3,968 B | 36 KiB | 28, 16 KiB (6.9% of the cache) |
+| the same x2 / x4 in one trace | 195 / 337 | 0 | | 69 / 134 KiB | 28, 16 KiB (unchanged) |
+| the same, 2 tiles (each) | 116 | 0 | 3,712 B | 36 KiB | 26, 9 KiB |
+| two layer shapes in one trace (x2), 1 tile | 221 | 0 | 7,072 B | 69 KiB | 49, 35 KiB (14.9%) |
+| add 2048x2048, 1 tile | 1,668 | 16 (1.0%) | 52 KiB | 77 KiB | 23, 59 KiB (24.6%) |
+
+- **Programs are shared by hash.** The same pass captured again adds entries and pins no program (28, 28, 28), and a pass of another shape
+  does (28 -> 49): the control that shows the count can move. So a trace's pinned set is the number of *distinct* (op, shape) programs,
+  about 4 KiB each for a layer's four ops (roles and streaming bodies), not the number of ops. At that rate ~60 distinct op shapes fill the
+  cache, which is the shape of the model-ladder overflow (roadmap "Trace segmentation"); the per-model count has not been measured.
+- **A pass of four ops is ~71 stream entries (~2.3 KiB) but ~32 KiB of GDDR.** Each `PAIR_CALL` stores its reader and writer sections as
+  allocations of their own, and an allocation is whole tile slots (4,160 B): a 17-entry section takes a slot. GDDR per op is therefore set
+  by the number of allocations (~8 KiB an op here), not by entries. GDDR is not the tight limit (a 2,779-op decode step on one tile at this
+  rate is ~22 MB), but it is the one place a trace's size is 13x what its entries need.
+- **Chunk padding is small where the sections are short.** 0 entries in the layer forward (every section is under one 64-entry chunk) and
+  1.0% in the 2048x2048 add (16 of 1,668 entries), whose sections are long enough to cross chunks. The padding is not a large share of a
+  trace's bytes; its cost is the cycles the mover spends running each filler `WAIT` (139 cycles each, from the read-loop probe), which this
+  does not measure.
+- **The 51 `POKE`s are one per trace, not one per op.** The capture pokes only the descriptor words that changed (`poke_descriptor`), so
+  1, 2 and 4 passes all hold 51. A trace prologue for invariant setup would save nothing in entries; what it could save is the
+  `KERNEL`/`LAUNCH` round trips, which are per op.
+- **Per-op entries are mostly `CB` (credit) records:** 5 a packet in the layer forward, beside a `LAUNCH` and a `KERNEL_WAIT` each and a
+  `GATHER`/`SCATTER` or `READ_RUN`/`WRITE_RUN` pair. The 2048x2048 add is `CB` 456, `READ_RUN` 228, `WRITE_RUN` 114 and `RELEASED` 106
+  (`op::RELEASED`) in 4 packets.
+
+Not measured: footprints of the three models (they do not capture yet), of CNN training, or on more than 2 tiles.
 
 ## Per-tile cost of the movers' records and NC's writes (2026-10-13, cards 0 and 1)
 
