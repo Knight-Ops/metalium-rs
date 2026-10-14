@@ -391,6 +391,18 @@ state: it failed on `--device all` too, and passed on both cards after `tt-smi -
 ([silicon-operating-notes](silicon-operating-notes.md#running-tt-metal-after-this-repos-gates-2026-10-13-card-1)), so it is link state
 and not the movers. Neither build refused a list.
 
+**Traced execution, with the traces left plain (2026-10-14, card 0; the capture-time encoding of a trace's reads was built, measured and
+reverted: `ff39af0`, `2315646`).** Replay time, three runs each, pre-branch commit (`7f18dde`) / this branch's safe build / its fast build: traced
+MNIST inference, batch 64, 1 tile 0.493 / 0.494 / 0.469 ms per batch, all tiles 0.510-0.522 / 0.509-0.524 / 0.513-0.524; traced CNN training, 1
+tile, 146.2 / 145.6 / 146.8 ms per step. So **the branch's safety and speed commits did not slow traced execution** (safe equals the
+pre-branch commit), and **fast mode alone does not speed it up**: a trace holds plain entries, which the card decodes at the safe rate, and the
+fast image's one effect on them is the initiator-1 issue path (`READ_FAST`, on by default there: plain reads 361 -> 334 cycles), worth ~5% on a
+one-tile replay. Encoding a trace's reads needs the trace's reads to be encodable, and nearly all of a streaming op's reads are records
+(a captured layer held 0 plain reads); expanding the records at capture gave -16% (inference, 1 tile) and -17% (CNN training, 1 tile) but grew a
+trace 1.3x to 7x in entries (1.0x in the default build), needing a size budget and an unexpanded fallback, for replays that are mostly compute
+and synchronisation. Not kept. If a traced workload turns out to be read-bound, the size-neutral route is sealed static read records (the
+card validates a record once and issues its tiles at the encoded rate, the record staying three entries), not expansion.
+
 **Containment (plan phase 7, 2026-10-13; both modes, host only).** `DataMover::check_as` now requires every read's or write's L1
 range, top-level, encoded or expanded from a record, to lie in the data arena (`tt_isa::l1::DATA`, `0x2_0000` to the mailbox
 base): a list cannot be aimed at the mover's key, its list ring, its mailbox or its image, which neither mode's card-side
