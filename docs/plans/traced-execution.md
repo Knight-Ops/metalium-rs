@@ -145,9 +145,12 @@ So whichever trace replays, the next reads what it left. The rules:
 The model side is `tt_models::generate`:
 
 - `FixedShapeDecoder` is a decoder's chunk and step over a cache, both functional.
-- `TracedGenerator` captures the step and one chunk per bucket size, feeds a prompt with the smallest
-  bucket that covers it (chunks of the largest past that), then replays the step a token. Token ids go
-  in, and the lookup runs inside the trace.
+- `TracedGenerator` captures one chunk per size and one step per attended length (`Shapes`). It feeds
+  a prompt with the smallest chunk that covers it (chunks of the largest past that), then replays a
+  token at a time the step attending to the fewest positions that include it. Token ids go in, and the
+  lookup runs inside the trace.
+- **Storage:** a trace's streams are one GDDR region a unit: the stream, then each `PAIR_CALL` section from
+  a 64-byte boundary (`Session::store_stream`; see [decode-length-cost.md](../completed-plans/decode-length-cost.md)).
 - `generate_fixed` is the same schedule run eagerly.
 
 The gate is `step187_traced_generation`, run on Llama shapes SmolLM2 does not have and on a GPT-2-style

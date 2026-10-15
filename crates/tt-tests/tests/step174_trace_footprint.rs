@@ -169,6 +169,16 @@ fn footprint_of_passes<T: tt_device::Transport>(
             "unit {u}"
         );
         assert!(fp.gddr_bytes >= fp.stream.entries as u64 * 32, "unit {u}");
+        // The stream and its sections share one region: their entries, each part from a 64-byte
+        // boundary, rounded up to whole slots once (not a slot a section).
+        let packed = fp.stream.entries as u64 * 32 + 64 * (sec.len() as u64 + 1);
+        assert!(
+            fp.gddr_bytes <= packed.next_multiple_of(tt_isa::dm::TILE_SLOT),
+            "unit {u}: {} GDDR bytes for {} entries in {} sections",
+            fp.gddr_bytes,
+            fp.stream.entries,
+            sec.len()
+        );
         assert!(fp.top_level_entries <= fp.stream.entries, "unit {u}");
         assert!(fp.program_bytes <= fp.cache_held_bytes, "unit {u}: {fp:?}");
         assert!(fp.cache_held_bytes <= fp.cache_bytes, "unit {u}: {fp:?}");

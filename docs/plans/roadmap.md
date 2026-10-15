@@ -27,8 +27,9 @@ linking to its evidence and to the detailed plan. Closed work lives in
   models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
   ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
   [replay-fixed-cost.md](replay-fixed-cost.md)). A whole traced generation (ids in, logits out, any
-  fixed-shape decoder) beats burn-flex on prompts of 128 tokens and more, and a decode step costs its cache's
-  length, which is the next fix (Track 2 item 6, step 4).
+  fixed-shape decoder) beats burn-flex at every prompt length measured: 0.60x to 0.90x of its time over a
+  512-position cache, a decode step 26.1-27.3 ms against 26.8-31.6 (Track 2 item 6, step 4,
+  [decode-length-cost.md](../completed-plans/decode-length-cost.md)).
 - **Multi-chip: proof of concept.** Matmul, conv and attention split across two cards over
   Ethernet; every other op runs on chip 0; no all-reduce.
 
@@ -486,9 +487,15 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     - **Result:** 256 tokens take **79 ms** against burn-flex's 1,040, and 32 tokens 40 ms against 175. One tile
       captures only single tokens ([log](../learnings/performance-log.md#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1)).
   - **Where traced generation stands** (card 1, every tile, F32, batch 1, 2026-10-15). End to end, ids in and logits
-    out (`TracedGenerator`, runs `1792072109` and `1792072312`): a 256-token prompt and 64 new tokens take **1,860 ms
-    against burn-flex's 2,996** over a 320-position cache; the first token 5x to 17x sooner, a decode step at or
-    behind burn-flex (step 4 below). The parts, before the driver (embedding lookup excluded; after
+    out (`TracedGenerator`, 512-position cache, run `1792078489`, after step 4), with burn-flex in the same run:
+
+    | Prompt + 64 tokens | Traced | burn-flex | Decode step, traced / burn-flex |
+    |---|--:|--:|---|
+    | 32 | **1,688 ms** | 1,866 | 26.13 / 26.75 ms |
+    | 128 | **1,726** | 2,345 | 26.60 / 29.10 |
+    | 256 | **1,795** | 3,015 | 27.31 / 31.57 |
+
+    The first token comes 5x to 15x sooner. The parts, before the driver (embedding lookup excluded; after
     [replay-fixed-cost.md](replay-fixed-cost.md), runs `1792036613` and `1792036724`):
     - **Decode:** 26.46 ms a token with a 64-position cache (**38 tokens/s**), burn-flex 26.42 in the same run. A
       one-token chunk over a 512-position cache (`step_chunk`, not `step_fixed`) is 32.7 ms.
@@ -533,16 +540,23 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
          (first token 61.7 against 1,020), 128 + 64 1,841 against 2,331, and 32 + 64 1,834 against 1,837.
     3. [x] **The token lookup inside the trace** (2026-10-15, with step 2): the traces take I32 ids and the embedding's
        row select replays with them.
-    4. **Bound the attended range: the next step.** A traced step attends to its whole cache, so a decode step costs
-       the cache's length, not the context: 26.46 ms over 64 positions, 28.49 over 320, 32.28 over 512, against
-       burn-flex's 26.3-31.0, which attends only to what it holds. Decode is the bulk of a generation, so this decides
-       whether traced generation beats the CPU at all. The fix is general to any decoder:
-       - step traces per attended length (a bucket of positions, say 64/128/256/512, chosen from the position), each
-         reading only the cache's first `L` rows (a view of the resident cache, no copy);
-       - check the program cache with `SharedStateTraces::footprint`;
-       - watch the GDDR the streams take, which scales with ops times units.
+    4. [x] **A decode step that costs the context, not the cache** (2026-10-15,
+       [decode-length-cost.md](../completed-plans/decode-length-cost.md)). A step over 512 positions cost 32.29 ms. A
+       per-layer profile at 64 and 512 positions showed `repeat_kv`'s `cat` growing most, then attention's reads; the
+       write-back copy barely grew. Two fixes, both general to decoders:
+       - **Grouped-query attention without `repeat_kv`:** query head groups are folded into rows, attending to the
+         cache's own key/value heads. This saves 5 ms a step.
+       - **Step traces per attended length** (`Shapes`: 64, 128, 256, ... then the cache's length,
+         `FixedCache::step_write_within`): attention reads only the cache's first `L` positions, a view with no copy.
+         This saves a further 1.2 ms on short contexts.
 
-       Then chunks of 512 (the per-token prefill cost had not flattened at 256: 0.29 ms, `1792036724`).
+       Decode is now 26.13 / 26.60 / 27.31 ms at 32, 128 and 256-token prompts (burn-flex 26.75 / 29.10 / 31.57), and a
+       generation 0.60x-0.90x burn-flex's time (run `1792078489`). Gates: `step185` and `step187` (new: steps crossing
+       lengths, and a step attending to too few positions diverging), ttsim and card 0. **Left:**
+       - chunks of 512 (the per-token prefill cost had not flattened at 256: 0.29 ms, `1792036724`) and chunks that also
+         attend only to what they use;
+       - the cache write's `expand` and `mask_where`, still whole-cache (about 1 ms a step at 512 positions; step 6's
+         native row write).
     5. **One tile and `work:64:4`:** prefill chunks and ResNet-18/ViT capture there only once traces are segmented
        ("Trace segmentation" below).
     6. [ ] **What is left of a replay's fixed cost** (each measured in [replay-fixed-cost.md](replay-fixed-cost.md),
@@ -569,7 +583,14 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).
-- [ ] **Trace size in GDDR.** SmolLM2's step and its 64/128/256 prefill chunks hold **3.75 GB** of trace streams
+- [x] **Trace size in GDDR** (2026-10-15, [decode-length-cost.md](../completed-plans/decode-length-cost.md) A0-A1).
+  SmolLM2's step and 64/128/256 chunks held **3.75 GB** of trace streams; now **563 MB**, each trace exactly its
+  entries. Every `PAIR_CALL` section had been an allocation of its own of at least one 4,160-byte slot, holding ~810
+  bytes. A unit's stream and sections are now one region (sections from 64-byte boundaries, which a mover's chunk read
+  needs), written once. The driver's build went from 44.9 s to 18.8 s. Gate `step174` (a bound watched failing on the
+  old allocation); every trace gate on ttsim and silicon. What remains is entries themselves, about 25 a section;
+  fewer ops is the lever. The original entry, kept for the record:
+  SmolLM2's step and its 64/128/256 prefill chunks hold **3.75 GB** of trace streams
   across 120 units (the step 0.45 GB, `Chunk(256)` 1.46 GB; run `1792072109`), about 8 KB an op a participating
   unit.
   - **Likely cause (not yet measured):** each `PAIR_CALL`'s reader and writer sections are allocated separately in
@@ -905,6 +926,7 @@ deferred to later cleanup passes. B1 and B2 stay in Track 1 because models need 
 | [burn-op-coverage.md](burn-op-coverage.md) | Generated operation status |
 | [ttinsn-push-experiment.md](ttinsn-push-experiment.md) | Done, result: go. Experiment record for `.ttinsn` push fusion |
 | [replay-fixed-cost.md](replay-fixed-cost.md) | Track 2 item 6, steps 1 and 6: where a traced replay's time goes, op by op, and the fixes |
+| [decode-length-cost.md](../completed-plans/decode-length-cost.md) | Done: trace size in GDDR, and a decode step that costs the context (GQA fold, step lengths) |
 | [traced-execution.md](traced-execution.md) §3 | Several traces over one state (`SharedStateTraces`) and the generic decoder driver (`tt_models::generate`) |
 | [new-op-definition-of-done.md](new-op-definition-of-done.md) | Standing: what a new op must have before it counts as done |
 | [burn-op-notes.md](burn-op-notes.md) | Standing: per-op notes for the Burn backend |

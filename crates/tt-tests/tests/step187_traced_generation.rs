@@ -35,7 +35,8 @@ use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Int, Tensor};
 use burn_tt::{TtBackend, TtDevice};
 use tt_models::generate::{
-    generate_fixed, FixedShapeCache, FixedShapeDecoder, GenerateError, Generation, TracedGenerator,
+    generate_fixed, FixedShapeCache, FixedShapeDecoder, GenerateError, Generation, Shapes,
+    TracedGenerator,
 };
 use tt_models::kv_cache::FixedCache;
 use tt_models::llama::{Llama, LlamaConfig, Precision, SMOLLM2_135M};
@@ -43,6 +44,11 @@ use tt_tests::burn_device::{assert_native_model, with_device, Config};
 
 const MAX_LEN: usize = 16;
 const BUCKETS: [usize; 2] = [4, 8];
+
+/// Chunks of `BUCKETS` over a cache of `MAX_LEN` positions, decode steps attending to all of them.
+fn shapes() -> Shapes {
+    Shapes::new(MAX_LEN, &BUCKETS)
+}
 /// Prompt lengths: one chunk exactly (4, 8), one padded (1, 3, 5), a chunk of 8 and the rest
 /// through the 4 (9, 12).
 const LENGTHS: [usize; 7] = [1, 3, 4, 5, 8, 9, 12];
@@ -72,11 +78,10 @@ fn assert_same(got: &Generation, want: &Generation, what: &str) {
 /// makes resident are the only transfers outside an op (uploads, nothing read back or staged).
 fn traced<'m, M: FixedShapeDecoder<TtBackend>>(
     model: &'m M,
-    max_len: usize,
-    buckets: &[usize],
+    shapes: &Shapes,
     d: &TtDevice,
 ) -> TracedGenerator<'m, M> {
-    let (g, report) = burn_tt::with_report(|| TracedGenerator::new(model, max_len, buckets, d));
+    let (g, report) = burn_tt::with_report(|| TracedGenerator::new(model, shapes, d));
     let report = burn_tt::Report(
         report
             .0
@@ -151,13 +156,13 @@ fn synthetic_configs() -> Vec<(&'static str, LlamaConfig)> {
 
 /// A Llama `model`'s traced generation of every prompt length against the eager fixed-shape
 /// schedule and the growing cache.
-fn check_llama(model: &Llama<TtBackend>, what: &str, d: &TtDevice) {
+fn check_llama(model: &Llama<TtBackend>, what: &str, lengths: &[usize], d: &TtDevice) {
     let vocab = model.config().vocab;
-    let g = traced(model, MAX_LEN, &BUCKETS, d);
-    for len in LENGTHS {
+    let g = traced(model, &shapes(), d);
+    for &len in lengths {
         let p = prompt(len, vocab);
         let got = generate(&g, &p, STEPS);
-        let fixed = generate_fixed(model, &p, STEPS, MAX_LEN, &BUCKETS, d).unwrap();
+        let fixed = generate_fixed(model, &p, STEPS, &shapes(), d).unwrap();
         assert_same(
             &got,
             &fixed,
@@ -177,7 +182,7 @@ fn synthetic_llamas_generate_as_eagerly() {
     with_device(Config::default(), |d| {
         for (what, config) in synthetic_configs() {
             let model = Llama::<TtBackend>::new(&config, &d);
-            check_llama(&model, what, &d);
+            check_llama(&model, what, &LENGTHS, &d);
         }
     });
 }
@@ -187,7 +192,7 @@ fn one_driver_serves_many_prompts() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[1];
         let model = Llama::<TtBackend>::new(&config, &d);
-        let g = traced(&model, MAX_LEN, &BUCKETS, &d);
+        let g = traced(&model, &shapes(), &d);
         // A generation filling the cache, then shorter ones over what it left.
         for (len, steps) in [(12, 5), (3, 4), (9, 2), (1, MAX_LEN)] {
             let p = prompt(len, config.vocab);
@@ -203,7 +208,7 @@ fn chunks_over_an_unshared_cache_diverge() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[0];
         let model = Llama::<TtBackend>::new(&config, &d);
-        let g = TracedGenerator::with_private_prefill(&model, MAX_LEN, &BUCKETS, &d).unwrap();
+        let g = TracedGenerator::with_private_prefill(&model, &shapes(), &d).unwrap();
         let p = prompt(5, config.vocab);
         let got = g.generate(&p, STEPS).unwrap();
         let want = model.generate(&p, STEPS, Precision::F32, &d);
@@ -228,10 +233,10 @@ fn requests_that_do_not_fit_are_refused_by_name() {
         let (_, config) = synthetic_configs()[0];
         let model = Llama::<TtBackend>::new(&config, &d);
         assert!(matches!(
-            TracedGenerator::new(&model, MAX_LEN, &[4, MAX_LEN + 1], &d),
+            TracedGenerator::new(&model, &Shapes::new(MAX_LEN, &[4, MAX_LEN + 1]), &d),
             Err(GenerateError::Refused(_))
         ));
-        let g = TracedGenerator::new(&model, MAX_LEN, &BUCKETS, &d).unwrap();
+        let g = TracedGenerator::new(&model, &shapes(), &d).unwrap();
         assert!(matches!(
             g.generate(&prompt(12, config.vocab), 6),
             Err(GenerateError::Capacity {
@@ -272,13 +277,15 @@ struct GptBlock<B: Backend> {
 const GPT_HIDDEN: usize = 48;
 const GPT_HEADS: usize = 3;
 const GPT_VOCAB: usize = 90;
+/// Learned positions: as many as the longest cache it runs over.
+const GPT_POSITIONS: usize = LONG;
 
 impl<B: Backend> Gpt<B> {
     fn new(layers: usize, device: &B::Device) -> Self {
         let h = GPT_HIDDEN;
         Self {
             wte: EmbeddingConfig::new(GPT_VOCAB, h).init(device),
-            wpe: EmbeddingConfig::new(MAX_LEN, h).init(device),
+            wpe: EmbeddingConfig::new(GPT_POSITIONS, h).init(device),
             blocks: (0..layers)
                 .map(|_| GptBlock {
                     ln_1: LayerNormConfig::new(h).init(device),
@@ -324,8 +331,8 @@ impl<B: Backend> Gpt<B> {
             let v = write.write(v_cache, part(2));
             let ctx = attention(
                 part(0),
-                k.clone(),
-                v.clone(),
+                write.attended(k.clone()),
+                write.attended(v.clone()),
                 Some(write.later()),
                 None,
                 AttentionModuleOptions {
@@ -363,7 +370,10 @@ impl<B: Backend> FixedShapeDecoder<B> for Gpt<B> {
     type Cache = GptCache<B>;
 
     fn new_cache(&self, max_len: usize, device: &B::Device) -> GptCache<B> {
-        assert!(max_len <= MAX_LEN, "learned positions for {MAX_LEN}");
+        assert!(
+            max_len <= GPT_POSITIONS,
+            "learned positions for {GPT_POSITIONS}"
+        );
         let dtype = self.head.weight.val().dtype();
         GptCache {
             kv: FixedCache::zeros(
@@ -401,9 +411,10 @@ impl<B: Backend> FixedShapeDecoder<B> for Gpt<B> {
         &self,
         token: Tensor<B, 2, Int>,
         position: Tensor<B, 1, Int>,
+        len: usize,
         cache: &GptCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
-        let write = cache.kv.step_write(position.clone());
+        let write = cache.kv.step_write_within(position.clone(), len);
         let (x, state) = self.blocks_fixed(token, position, cache, &write);
         let row = self.ln_f.forward(x).reshape([1, GPT_HIDDEN]);
         (self.head.forward(row), state)
@@ -414,36 +425,114 @@ impl<B: Backend> FixedShapeDecoder<B> for Gpt<B> {
 fn a_decoder_that_is_not_a_llama_generates_as_eagerly() {
     with_device(Config::default(), |d| {
         let model = Gpt::<TtBackend>::new(2, &d);
-        let g = traced(&model, MAX_LEN, &BUCKETS, &d);
+        let g = traced(&model, &shapes(), &d);
         for len in LENGTHS {
             let p = prompt(len, GPT_VOCAB);
             let got = generate(&g, &p, STEPS);
-            let want = generate_fixed(&model, &p, STEPS, MAX_LEN, &BUCKETS, &d).unwrap();
+            let want = generate_fixed(&model, &p, STEPS, &shapes(), &d).unwrap();
             assert_same(&got, &want, &format!("GPT, prompt {len}"));
         }
     });
 }
 
-/// SmolLM2's checkpoint: one layer on the simulator; on silicon all thirty, over every tile.
+/// A cache long enough for decode steps of two lengths: 32 positions, then all 64.
+const LONG: usize = 64;
+
+fn long_shapes() -> Shapes {
+    Shapes::new(LONG, &BUCKETS).with_steps(&[32])
+}
+
+/// Generations whose decode steps cross from the 32-position step to the 64-position one: equal
+/// to the growing cache (a Llama) and to the same schedule attending to the whole cache at every
+/// step (any decoder), so a step that attends to fewer positions changes no bit.
+#[test]
+fn decode_steps_attend_only_to_the_positions_in_use() {
+    with_device(Config::default(), |d| {
+        let whole = Shapes::new(LONG, &BUCKETS).with_steps(&[]);
+        assert_eq!(long_shapes().steps, [32, LONG]);
+        assert_eq!(whole.steps, [LONG]);
+        let (_, config) = synthetic_configs()[1];
+        let llama = Llama::<TtBackend>::new(&config, &d);
+        let g = traced(&llama, &long_shapes(), &d);
+        for (len, steps) in [(28, 10), (31, 3), (33, 2)] {
+            let p = prompt(len, config.vocab);
+            let got = generate(&g, &p, steps);
+            let growing = llama.generate(&p, steps, Precision::F32, &d);
+            assert_same(
+                &got,
+                &growing,
+                &format!("Llama, prompt {len}, growing cache"),
+            );
+            let all = generate_fixed(&llama, &p, steps, &whole, &d).unwrap();
+            assert_same(&got, &all, &format!("Llama, prompt {len}, whole cache"));
+        }
+        let gpt = Gpt::<TtBackend>::new(2, &d);
+        let g = traced(&gpt, &long_shapes(), &d);
+        let p = prompt(28, GPT_VOCAB);
+        let got = generate(&g, &p, 10);
+        let all = generate_fixed(&gpt, &p, 10, &whole, &d).unwrap();
+        assert_same(&got, &all, "GPT, prompt 28, whole cache");
+    });
+}
+
+/// Negative control: the 32-position step replayed at a position past 32 does not see the token
+/// it is given (nor the ones before it past 32), so its logits differ from the step that does.
+#[test]
+fn a_step_attending_to_too_few_positions_diverges() {
+    with_device(Config::default(), |d| {
+        let (_, config) = synthetic_configs()[1];
+        let model = Llama::<TtBackend>::new(&config, &d);
+        let g = TracedGenerator::new(&model, &long_shapes(), &d).unwrap();
+        let p = prompt(36, config.vocab);
+        let _ = g.prefill(&p).unwrap();
+        let short = g.decode_within(5, 36, 32).unwrap();
+        let right = g.decode(5, 36).unwrap();
+        let want = model.forced(&p, &[5], Precision::F32, &d).logits[1].clone();
+        assert_eq!(
+            bits(&right),
+            bits(&want),
+            "the step that attends to position 36"
+        );
+        assert_ne!(
+            bits(&short),
+            bits(&want),
+            "a step attending to 32 positions must diverge"
+        );
+    });
+}
+
+/// SmolLM2's checkpoint: on silicon all thirty layers over every tile, every prompt length (about
+/// 20 s, part of `--smoke`).
+///
+/// On the simulator it is opt-in: one layer, and only a padded chunk (3) and two chunks with a
+/// remainder (9). The synthetic shapes above already cover every way a prompt is fed, and each
+/// step's 49,152-token output projection makes this the slowest test here (about 13 minutes at
+/// all seven lengths). Run it with
+/// `cargo test -p tt-tests --features weights --test step187_traced_generation -- --ignored`.
 #[test]
 #[cfg_attr(
     not(feature = "weights"),
     ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
 )]
+#[cfg_attr(
+    all(feature = "weights", not(feature = "silicon")),
+    ignore = "slow on the simulator (minutes): run explicitly with -- --ignored"
+)]
 fn smollm2_generates_as_eagerly() {
-    let (layers, config) = if cfg!(feature = "silicon") {
+    let (layers, lengths, config) = if cfg!(feature = "silicon") {
         (
             SMOLLM2_135M.layers,
+            &LENGTHS[..],
             Config {
                 tiles: Some(burn_tt::TileChoice::All),
                 ..Config::default()
             },
         )
     } else {
-        (1, Config::default())
+        (1, &[3, 9][..], Config::default())
     };
     with_device(config, |d| {
         let (model, _) = Llama::<TtBackend>::smollm2_135m(layers, Precision::F32, &d).unwrap();
-        check_llama(&model, "SmolLM2", &d);
+        check_llama(&model, "SmolLM2", lengths, &d);
     });
 }

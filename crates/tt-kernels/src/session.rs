@@ -3542,29 +3542,31 @@ impl<T: Transport> Session<T> {
                         seg.what
                     ))
                 })?;
+                // The sections are stored with the stream when the capture ends, so a
+                // trace takes one region a unit (`store_stream`); the offsets are
+                // filled in then.
                 let writer_at = 1 + relative[0][1] as usize;
-                let (reader, reader_storage, reader_mix) =
-                    self.store_region(u, &relative[1..writer_at])?;
-                let (writer, writer_storage, writer_mix) =
-                    self.store_region(u, &relative[writer_at..])?;
-                for (storage, mix) in [
-                    (&reader_storage, &reader_mix),
-                    (&writer_storage, &writer_mix),
-                ] {
-                    out.sections_gddr_bytes += storage.region().map_or(0, |r| r.len());
-                    out.sections_composition.add(mix);
+                let mut counts = [0u32; 2];
+                for (i, part) in [&relative[1..writer_at], &relative[writer_at..]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let words = trace::chunked(part);
+                    out.sections_composition
+                        .add(&trace::Composition::of(part, words.len()));
+                    counts[i] = words.len() as u32;
+                    out.pending_sections.push(words);
                 }
-                out.regions.push(reader_storage);
-                out.regions.push(writer_storage);
-                out.sections.extend([reader[2], writer[2]]);
+                out.sections.extend(counts);
+                out.pair_calls.push(out.stream.len());
                 out.stream.push([
                     op::PAIR_CALL,
-                    reader[0],
-                    reader[1],
-                    reader[2],
-                    writer[0],
-                    writer[1],
-                    writer[2],
+                    0,
+                    0,
+                    counts[0],
+                    0,
+                    0,
+                    counts[1],
                     relative[0][3],
                 ]);
             } else {
@@ -3673,18 +3675,8 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| u.held_programs.clone())
             .collect();
-        let regions: Vec<tensor::Placement> = capture
-            .units
-            .iter()
-            .flat_map(|unit| unit.regions.iter().cloned())
-            .collect();
         let result = self.store_trace(capture);
         if result.is_err() {
-            if let Some(dram) = self.dram.as_mut() {
-                for region in &regions {
-                    dram.alloc.free(region);
-                }
-            }
             for (u, held) in held.iter().enumerate() {
                 for &(generation, at) in held {
                     self.units[u].programs.release_held(generation, at);
@@ -3770,55 +3762,27 @@ impl<T: Transport> Session<T> {
         Ok(TraceId(id))
     }
 
-    /// Unit `u`'s captured stream, laid out for streaming and written to GDDR.
-    fn store_region(
-        &mut self,
-        u: usize,
-        entries: &[[u32; 8]],
-    ) -> Result<([u32; 3], tensor::Placement, trace::Composition), TensorError> {
-        let words = trace::chunked(entries);
-        let composition = trace::Composition::of(entries, words.len());
-        let mut bytes: Vec<u8> = words
-            .iter()
-            .flatten()
-            .flat_map(|word| word.to_le_bytes())
-            .collect();
-        let Session { dev, dram, .. } = self;
-        let dram = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
-        let storage = dram
-            .alloc
-            .alloc_on(u % dram.alloc.channel_count(), bytes.len() as u64)?;
-        let range = storage.region().expect("one channel");
-        bytes.resize(range.len() as usize, 0);
-        if let Err(error) = dev.dram_write(&dram.w4, range, &bytes) {
-            dram.alloc.free(&storage);
-            return Err(error.into());
-        }
-        Ok((
-            [
-                range.channel().index() as u32,
-                range.offset() as u32,
-                words.len() as u32,
-            ],
-            storage,
-            composition,
-        ))
-    }
-
+    /// Unit `u`'s captured stream and its packets' sections, laid out for
+    /// streaming and written to GDDR in one region: the stream first, then each
+    /// section from a 64-byte boundary (what a mover's chunk read needs,
+    /// `tt_isa::dram::ALIGN`), each `PAIR_CALL` given its sections' offsets. One
+    /// allocation and one write a unit, rather than a whole slot and a write for
+    /// each section.
     fn store_stream(
         &mut self,
         u: usize,
         uc: &trace::UnitCapture,
     ) -> Result<trace::UnitTrace, TensorError> {
-        let words = trace::chunked(&uc.stream);
-        let own = trace::Composition::of(&uc.stream, words.len());
-        let bytes: Vec<u8> = words
-            .iter()
-            .flatten()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        use tt_isa::dm::ENTRY_BYTES;
+        debug_assert_eq!(uc.pending_sections.len(), 2 * uc.pair_calls.len());
+        let align = |bytes: u64| bytes.next_multiple_of(tt_isa::dram::ALIGN);
+        let top = trace::chunked(&uc.stream).len();
+        let mut offsets = Vec::with_capacity(uc.pending_sections.len());
+        let mut end = align(top as u64 * ENTRY_BYTES);
+        for section in &uc.pending_sections {
+            offsets.push(end);
+            end = align(end + section.len() as u64 * ENTRY_BYTES);
+        }
         let generations = {
             let r = self.units[u].resident.as_ref().unwrap();
             r.generation().wrapping_sub(uc.generation_base)
@@ -3827,32 +3791,49 @@ impl<T: Transport> Session<T> {
         let d = dram.as_mut().expect("checked at the capture's start");
         // Each unit's on its own channel where there are enough, so the
         // movers' reads of their streams spread out.
-        let stream = d
-            .alloc
-            .alloc_on(u % d.alloc.channel_count(), bytes.len() as u64)?;
-        let range = stream.region().expect("a one-channel placement");
-        // Whole slots, as every GDDR write here is.
-        let mut bytes = bytes;
-        bytes.resize(range.len() as usize, 0);
-        let written = dev.dram_write(&d.w4, range, &bytes);
-        if let Err(e) = written {
-            d.alloc.free(&stream);
+        let region = d.alloc.alloc_on(u % d.alloc.channel_count(), end)?;
+        let range = region.region().expect("a one-channel placement");
+        let (channel, base) = (range.channel().index() as u32, range.offset());
+        let mut stream = uc.stream.clone();
+        for (i, &at) in uc.pair_calls.iter().enumerate() {
+            let entry = &mut stream[at];
+            entry[1] = channel;
+            entry[2] = (base + offsets[2 * i]) as u32;
+            entry[4] = channel;
+            entry[5] = (base + offsets[2 * i + 1]) as u32;
+        }
+        let words = trace::chunked(&stream);
+        debug_assert_eq!(words.len(), top, "the offsets do not move a record");
+        let own = trace::Composition::of(&stream, words.len());
+        // Whole slots, as every GDDR write here is; the gaps are zeros.
+        let mut bytes = vec![0u8; range.len() as usize];
+        let mut put = |at: u64, words: &[[u32; 8]]| {
+            for (i, word) in words.iter().flatten().enumerate() {
+                let at = at as usize + 4 * i;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        };
+        put(0, &words);
+        for (section, &at) in uc.pending_sections.iter().zip(&offsets) {
+            put(at, section);
+        }
+        if let Err(e) = dev.dram_write(&d.w4, range, &bytes) {
+            d.alloc.free(&region);
             return Err(e.into());
         }
         let mut composition = own;
         composition.add(&uc.sections_composition);
         Ok(trace::UnitTrace {
-            regions: uc.regions.clone(),
-            channel: range.channel().index() as u32,
-            offset: range.offset() as u32,
+            channel,
+            offset: base as u32,
             count: words.len() as u32,
             generations,
             held_programs: uc.held_programs.clone(),
             sections: uc.sections.clone(),
             composition,
             top_level_entries: words.len() as u32,
-            gddr_bytes: range.len() + uc.sections_gddr_bytes,
-            stream,
+            gddr_bytes: range.len(),
+            stream: region,
         })
     }
 
@@ -3956,9 +3937,6 @@ impl<T: Transport> Session<T> {
             }
             if let Some(d) = self.dram.as_mut() {
                 d.alloc.free(&ut.stream);
-                for region in &ut.regions {
-                    d.alloc.free(region);
-                }
             }
         }
         for p in t.freed {

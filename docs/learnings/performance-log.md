@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Decode length and trace size](#decode-length-and-trace-size-2026-10-15-cards-0-and-1) | 2026-10-15 | one GDDR region a unit a trace (traces 3,754 -> 563 MB, build 44.9 -> 18.8 s); grouped-query attention without `repeat_kv` and steps attending to 64/128/256/512 positions: decode over a 512-position cache 32.29 -> 26.13-27.31 ms, a generation 0.60x-0.90x burn-flex's time |
 | [Traced generation, end to end](#traced-generation-end-to-end-2026-10-15-cards-0-and-1) | 2026-10-15 | `TracedGenerator`, token ids in and logits out, the step and chunks of 64/128/256 over one cache: the four traces hold 81 KB of the 240 KB program cache together; a decode step costs its cache's length (512 positions 32.3 ms, 320 28.5, 64 26.5); over 320 positions a 256-token prompt plus 64 tokens takes 1,860 ms against burn-flex's 2,996, first token 61.7 against 1,020 |
 | [A traced replay's fixed cost](#a-traced-replays-fixed-cost-2026-10-15-cards-0-and-1) | 2026-10-15 | the 37.2 ms traced SmolLM2 decode step broken down op by op (unit 0's mover stamps): ~84 ops a layer at ~13 us, not the barrier; five fixes (matmul padding off `K`, a kept zero row, a kept transpose, the model's mask and RoPE, thin downloads untilized by the card) bring it to 26.46 ms, burn-flex 26.42 |
 | [SmolLM2 prefill chunk size](#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1) | 2026-10-15 | a traced prefill chunk (`Llama::step_chunk`) costs ~33 ms + 0.18 ms a token on every tile: 256 tokens in 79 ms (burn-flex 1,040), so a prompt wants one chunk that covers it (buckets), not small chunks; one tile captures only single tokens |
@@ -310,6 +311,42 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Decode length and trace size (2026-10-15, cards 0 and 1)
+
+Plan and full tables: [decode-length-cost.md](../completed-plans/decode-length-cost.md). The setup:
+
+- **Benches:** `traced_generation` and `smollm2_replay_profile`, SmolLM2-135M F32 30 layers, card 1, release, every
+  tile, default spread, burn-flex in the same run.
+- **Gates:** card 0, bit for bit against the growing cache.
+
+**Trace size** (`traced_generation`):
+
+- **Before, `1792074320`:** the step and 64/128/256 chunks took 3,754 MB of streams against 545 MB of entries. Each
+  `PAIR_CALL` section had its own slot-rounded region, ~4,360 bytes for ~810 of entries.
+- **After, `1792076190`:** one region a unit, sections 64-byte aligned. 563 MB (1.0x the entries), and the driver's
+  build went from 44.9 s to 18.8 s. Replay times are unchanged.
+
+**Where a step's length cost went** (one layer, unit 0's device time):
+
+- **64 against 512 positions** (`1792076366`, `1792076371`): +223 us. Of that, `repeat_kv`'s `cat` was +79 (and
+  70 us at 64 already), attention's `qk`/`pv`/softmax/mask +77, the `k`/`v` expand +27, the masks +30 (once a
+  step), `mask_where` +8 and the write-back copies +3.
+- **After the grouped-query fold** (`1792078810`, 512 positions): 1,855.6 -> 1,682.3 us. `cat` went 149 -> 19,
+  `qk` 92 -> 69 and `pv` 86 -> 66.
+
+**Generation over a 512-position cache** (prompt + 64 tokens):
+
+| | Decode step, 32 / 128 / 256-token prompt | Total | Run |
+|---|---|---|---|
+| Before | 32.29 / 32.29 / 32.29 ms | 2,077 / 2,087 / 2,111 ms | `1792076190` |
+| Grouped-query fold | 27.32 / 27.31 / 27.32 | 1,761 / 1,770 / 1,795 | `1792078651` |
+| Fold and steps of 64/128/256/512 | **26.13 / 26.60 / 27.31** | **1,688 / 1,726 / 1,795** | `1792078489` |
+| burn-flex | 26.75 / 29.10 / 31.57 | 1,866 / 2,345 / 3,015 | `1792078489` |
+
+With the step lengths: seven traces (4 steps and 3 chunks), 517 MB of streams, 89.3 KB of the 240 KB program cache on
+the fullest unit. The first token is 35.1 / 46.0 / 69.3 ms (was 38.8 / 49.6 / 73.0). What still grows with the
+cache is its write (`expand` and `mask_where`, whole-cache): 1.2 ms a step between 64 and 512 positions.
 
 ## Traced generation, end to end (2026-10-15, cards 0 and 1)
 

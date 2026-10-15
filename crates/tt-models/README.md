@@ -75,8 +75,13 @@ The generation path is written for decoders in general, not for SmolLM2 (a test 
 - **`Llama`** implements the trait for every `LlamaConfig`. SmolLM2-135M is the preset
   `SMOLLM2_135M`, loaded by `Llama::smollm2_135m`; other checkpoints load through
   `Llama::pretrained(config, weights, ..)`.
-- **`TracedGenerator`** captures the step and a chunk of each bucket size as traces over one cache on
-  the card (`burn_tt::SharedStateTraces`), then serves any prompt: token ids in, logits out.
+- **`TracedGenerator`** captures what a `Shapes` names, as traces over one cache on the card
+  (`burn_tt::SharedStateTraces`): a chunk of each size, and a step for each attended length (64,
+  128, 256, ..., then the cache's length). It then serves any prompt: token ids in, logits out, each
+  decode step attending only to the positions in use.
+- **Grouped-query attention reads the cache's own key/value heads** in a fixed step: query head groups
+  are folded into rows instead of repeating the cache (`repeat_kv` stays only in the growing-cache
+  reference).
 - **`generate_fixed`** runs the same schedule eagerly.
 
 `step187_traced_generation` checks it bit for bit against the eager schedule and against the growing

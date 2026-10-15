@@ -231,7 +231,7 @@ impl<B: Backend> Layer<B> {
         let k = rope.apply(heads(project(h.clone(), &a.k_proj), kv_heads));
         let v = heads(project(h, &a.v_proj), kv_heads);
 
-        let (new_k, new_v, keys, values, mask, is_causal) = match write {
+        let (q, new_k, new_v, keys, values, mask, is_causal) = match write {
             Write::At(start) => {
                 let total = start + t;
                 let new_k = cache_k
@@ -253,16 +253,20 @@ impl<B: Backend> Layer<B> {
                     groups,
                 );
                 // A prompt attends causally to itself; one new token attends to everything cached.
-                (new_k, new_v, keys, values, None, t > 1)
+                (q, new_k, new_v, keys, values, None, t > 1)
             }
-            Write::Fixed(w) => {
+            Write::Fixed { write, mask } => {
                 // The new keys and values land where the step writes, every other position kept;
-                // each query attends to every position not later than its own.
-                let new_k = w.write(cache_k.clone(), k);
-                let new_v = w.write(cache_v.clone(), v);
-                let keys = repeat_kv(new_k.clone(), groups);
-                let values = repeat_kv(new_v.clone(), groups);
-                (new_k, new_v, keys, values, Some(w.later()), false)
+                // each query attends to every position not later than its own. Grouped-query
+                // attention reads the cache's own key/value heads: each group of query heads is
+                // folded into the rows (query head `h groups + g` is `repeat_kv`'s order, its row
+                // `i` is row `g t + i`), so nothing repeats the cache, and each score and each sum
+                // is the one `repeat_kv`'s attention computes.
+                let new_k = write.write(cache_k.clone(), k);
+                let new_v = write.write(cache_v.clone(), v);
+                let q = q.reshape([n, kv_heads, groups * t, head_dim]);
+                let (keys, values) = (write.attended(new_k.clone()), write.attended(new_v.clone()));
+                (q, new_k, new_v, keys, values, Some(mask.clone()), false)
             }
         };
         let out = attention(
@@ -277,6 +281,8 @@ impl<B: Backend> Layer<B> {
                 is_causal,
             },
         );
+        // Unfolded (a no-op unless the query heads were folded into rows above).
+        let out = out.reshape([n, cfg.heads, t, head_dim]);
         let context = hook(
             "attn_ctx",
             out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]),
@@ -306,7 +312,12 @@ enum Write<'a, B: Backend> {
     At(usize),
     /// Where a [`FixedCache`] step writes: positions given as tensors, so the step's shapes do not
     /// depend on them.
-    Fixed(&'a FixedWrite<B>),
+    Fixed {
+        write: &'a FixedWrite<B>,
+        /// `write`'s attention mask with each row repeated for the query heads folded into it
+        /// (`[1, 1, groups t, max_len]`): made once a step.
+        mask: Tensor<B, 4, burn::tensor::Bool>,
+    },
 }
 
 /// A [`FixedCache`] and the rotary table its steps select their rows from: what
@@ -573,8 +584,21 @@ impl<B: Backend> Llama<B> {
     /// [`Self::step_fixed`] that returns the new state instead of writing it.
     pub fn fixed_step(
         &self,
+        x: Tensor<B, 3>,
+        position: Tensor<B, 1, Int>,
+        cache: &LlamaCache<B>,
+        dtype: DType,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        self.fixed_step_within(x, position, cache.max_len(), cache, dtype)
+    }
+
+    /// [`Self::fixed_step`] attending only to the cache's first `len` positions (`position` below
+    /// `len`): the same logits, at a cost that follows `len` (`FixedCache::step_write_within`).
+    pub fn fixed_step_within(
+        &self,
         mut x: Tensor<B, 3>,
         position: Tensor<B, 1, Int>,
+        len: usize,
         cache: &LlamaCache<B>,
         dtype: DType,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
@@ -582,7 +606,7 @@ impl<B: Backend> Llama<B> {
         if x.dtype() != dtype {
             x = x.cast(dtype);
         }
-        let write = cache.kv.step_write(position.clone());
+        let write = cache.kv.step_write_within(position.clone(), len);
         let rope = cache.rope.at(position);
         let (x, state) = self.layers_fixed(x, &rope, cache, &write);
         (self.head(x, 1), state)
@@ -648,7 +672,15 @@ impl<B: Backend> Llama<B> {
         cache: &LlamaCache<B>,
         write: &FixedWrite<B>,
     ) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
-        let write = Write::Fixed(write);
+        let groups = self.config.groups();
+        let later = write.later();
+        // A query row of every folded head shares its position's mask row (`Layer::forward`).
+        let mask = if groups == 1 || later.dims()[2] == 1 {
+            later
+        } else {
+            later.repeat_dim(2, groups)
+        };
+        let write = Write::Fixed { write, mask };
         let mut state = Vec::with_capacity(2 * self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let (k, v) = cache.kv.layer(index);
@@ -715,10 +747,11 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         &self,
         token: Tensor<B, 2, Int>,
         position: Tensor<B, 1, Int>,
+        len: usize,
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(token);
-        self.fixed_step(x, position, cache, cache.kv.dtype())
+        self.fixed_step_within(x, position, len, cache, cache.kv.dtype())
     }
 }
 

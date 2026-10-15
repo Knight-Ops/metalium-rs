@@ -9,11 +9,13 @@
 //! assumes nothing about the architecture (rotary or learned positions, grouped-query or multi-head
 //! attention, which norm) beyond a state of rank-4 tensors.
 //!
-//! [`TracedGenerator`] captures the step and one chunk per bucket size once, as traces over one
-//! shared cache on the card (`burn_tt::SharedStateTraces`). It then serves any prompt:
-//! 1. a prompt is fed as chunks: the smallest bucket that covers it, or chunks of the largest
-//!    then the smallest bucket that covers the rest, the last chunk padded;
-//! 2. each later token is a replay of the step.
+//! [`TracedGenerator`] captures, once, as traces over one shared cache on the card
+//! (`burn_tt::SharedStateTraces`), what [`Shapes`] names: a chunk of each size, and a step for
+//! each attended length. It then serves any prompt:
+//! 1. a prompt is fed as chunks: the smallest size that covers it, or chunks of the largest
+//!    then the smallest size that covers the rest, the last chunk padded;
+//! 2. each later token is a replay of the step attending to the fewest positions that include
+//!    it, so a step costs the context so far, not the cache's length.
 //!
 //! Token ids go in and logits come out: the embedding lookup runs inside the trace, the cache
 //! never leaves the card, and the host builds no op after the captures. [`generate_fixed`] runs
@@ -124,11 +126,15 @@ pub trait FixedShapeDecoder<B: Backend> {
         cache: &Self::Cache,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>);
 
-    /// One token (`[1, 1]`) at `position` (`[1]`): its logits `[1, vocab]` and the new state.
+    /// One token (`[1, 1]`) at `position` (`[1]`, below `len`), attending only to the cache's
+    /// first `len` positions: its logits `[1, vocab]` and the new state. A step's cost should
+    /// follow `len`, not the cache's length (`FixedCache::step_write_within`); for a position
+    /// below `len`, the logits must not depend on `len`.
     fn step(
         &self,
         token: Tensor<B, 2, Int>,
         position: Tensor<B, 1, Int>,
+        len: usize,
         cache: &Self::Cache,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>);
 }
@@ -198,20 +204,78 @@ pub fn schedule(len: usize, buckets: &[usize]) -> Vec<Chunk> {
     out
 }
 
-/// Ascending, distinct bucket sizes, each a chunk the cache can take.
-fn check_buckets(buckets: &[usize], max_len: usize) -> Result<Vec<usize>, GenerateError> {
-    let mut b = buckets.to_vec();
-    b.sort_unstable();
-    b.dedup();
-    if b.is_empty() {
-        return Err(GenerateError::Refused("no chunk sizes".into()));
+/// The shapes a generation's steps come in: the cache's length, the chunk sizes a prompt is fed
+/// in ([`schedule`]), and the lengths a decode step attends to (a step at `position` attends to
+/// the smallest length above it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shapes {
+    pub max_len: usize,
+    pub chunks: Vec<usize>,
+    pub steps: Vec<usize>,
+}
+
+impl Shapes {
+    /// Chunks of `chunks` over a cache of `max_len` positions, decode steps attending to 64, 128,
+    /// 256, ... positions below `max_len`, then all of them.
+    pub fn new(max_len: usize, chunks: &[usize]) -> Self {
+        let steps = std::iter::successors(Some(64usize), |l| l.checked_mul(2))
+            .take_while(|&l| l < max_len)
+            .chain([max_len])
+            .collect();
+        Self {
+            max_len,
+            chunks: chunks.to_vec(),
+            steps,
+        }
     }
-    if b[0] == 0 || *b.last().unwrap() > max_len {
-        return Err(GenerateError::Refused(format!(
-            "chunk sizes {b:?} for a cache of {max_len} positions"
-        )));
+
+    /// The same, with decode steps attending to `steps` positions (the cache's length is added).
+    pub fn with_steps(mut self, steps: &[usize]) -> Self {
+        self.steps = steps.to_vec();
+        self.steps.push(self.max_len);
+        self
     }
-    Ok(b)
+
+    /// Sorted and checked: every chunk and step length a shape the cache can take.
+    fn checked(&self) -> Result<Shapes, GenerateError> {
+        let sorted = |v: &[usize]| {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let (chunks, steps) = (sorted(&self.chunks), sorted(&self.steps));
+        let max_len = self.max_len;
+        if chunks.is_empty() {
+            return Err(GenerateError::Refused("no chunk sizes".into()));
+        }
+        let fits = |v: &[usize]| v[0] > 0 && *v.last().unwrap() <= max_len;
+        if !fits(&chunks) {
+            return Err(GenerateError::Refused(format!(
+                "chunk sizes {chunks:?} for a cache of {max_len} positions"
+            )));
+        }
+        if steps.last() != Some(&max_len) || !fits(&steps) {
+            return Err(GenerateError::Refused(format!(
+                "decode steps attending to {steps:?} positions of {max_len}: the last must be the \
+                 cache's length"
+            )));
+        }
+        Ok(Shapes {
+            max_len,
+            chunks,
+            steps,
+        })
+    }
+
+    /// The length a decode step at `position` attends to: the smallest above it.
+    pub fn step_len(&self, position: usize) -> usize {
+        *self
+            .steps
+            .iter()
+            .find(|&&l| l > position)
+            .unwrap_or(&self.max_len)
+    }
 }
 
 /// Positions a generation of `steps` tokens after `prompt` writes: the prompt's, and one for each
@@ -246,23 +310,22 @@ fn padded(prompt: &[i32], chunk: Chunk) -> Vec<i32> {
 }
 
 /// Greedy decoding with `model`'s fixed-shape steps, eagerly: the prompt fed as
-/// [`schedule`] says, then a step a token, over a cache of `max_len` positions. What a
-/// [`TracedGenerator`] with the same buckets computes, op for op.
+/// [`schedule`] says, then a step a token, in `shapes`. What a [`TracedGenerator`] with the same
+/// shapes computes, op for op.
 pub fn generate_fixed<B: Backend, M: FixedShapeDecoder<B>>(
     model: &M,
     prompt: &[i32],
     steps: usize,
-    max_len: usize,
-    buckets: &[usize],
+    shapes: &Shapes,
     device: &B::Device,
 ) -> Result<Generation, GenerateError> {
-    let buckets = check_buckets(buckets, max_len)?;
-    check_request(prompt, steps, max_len)?;
-    let mut cache = model.new_cache(max_len, device);
+    let shapes = shapes.checked()?;
+    check_request(prompt, steps, shapes.max_len)?;
+    let mut cache = model.new_cache(shapes.max_len, device);
     let mut out = Generation::new(steps);
     out.step_with(|| {
         let mut logits = None;
-        for chunk in schedule(prompt.len(), &buckets) {
+        for chunk in schedule(prompt.len(), &shapes.chunks) {
             let (l, state) = model.chunk(
                 ids(&padded(prompt, chunk), device),
                 index(chunk.start, device),
@@ -275,9 +338,11 @@ pub fn generate_fixed<B: Backend, M: FixedShapeDecoder<B>>(
         Ok::<_, GenerateError>(read(logits.expect("a chunk")))
     })?;
     out.decode(steps, |token, step| {
+        let position = prompt.len() + step;
         let (l, state) = model.step(
             ids(&[token], device),
-            index(prompt.len() + step, device),
+            index(position, device),
+            shapes.step_len(position),
             &cache,
         );
         cache.set_state(state);
@@ -289,8 +354,8 @@ pub fn generate_fixed<B: Backend, M: FixedShapeDecoder<B>>(
 /// Which trace of a [`TracedGenerator`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
-    /// The one-token step.
-    Step,
+    /// The one-token step attending to this many positions.
+    Step(usize),
     /// A chunk of this many tokens.
     Chunk(usize),
 }
@@ -314,14 +379,13 @@ fn logits(out: Vec<OutputPayload>) -> Result<Vec<f32>, GenerateError> {
 /// A decoder's step and its prefill chunks, captured once as traces over one cache on the card,
 /// then replayed for any prompt and any number of tokens: see the module documentation.
 ///
-/// Building one captures a trace per chunk size and one for the step; they share the program
+/// Building one captures a trace per chunk size and one per step length; they share the program
 /// cache (`burn_tt::SharedStateTraces`), so the sizes a model can keep together are bounded by it
 /// (`footprint`). A capture runs its step once and writes the cache, which a generation never
 /// relies on: every position it reads was written by its own prompt or steps first.
 pub struct TracedGenerator<'m, M: FixedShapeDecoder<TtBackend>> {
     model: &'m M,
-    max_len: usize,
-    buckets: Vec<usize>,
+    shapes: Shapes,
     /// The caches the traces read and write: one, or two for
     /// [`TracedGenerator::with_private_prefill`].
     caches: Vec<M::Cache>,
@@ -331,16 +395,11 @@ pub struct TracedGenerator<'m, M: FixedShapeDecoder<TtBackend>> {
 }
 
 impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
-    /// Capture `model`'s step and a chunk of each size in `buckets`, over a cache of `max_len`
-    /// positions on `device`. The cache's state must be F32: a packed one would be unpacked by
-    /// each replay's write-back.
-    pub fn new(
-        model: &'m M,
-        max_len: usize,
-        buckets: &[usize],
-        device: &TtDevice,
-    ) -> Result<Self, GenerateError> {
-        Self::build(model, max_len, buckets, device, false)
+    /// Capture `model`'s step at each length and a chunk of each size `shapes` names, over one
+    /// cache on `device`. The cache's state must be F32: a packed one would be unpacked by each
+    /// replay's write-back.
+    pub fn new(model: &'m M, shapes: &Shapes, device: &TtDevice) -> Result<Self, GenerateError> {
+        Self::build(model, shapes, device, false)
     }
 
     /// [`Self::new`] with the chunks capturing over a second cache that the step never reads: a
@@ -348,21 +407,20 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
     #[doc(hidden)]
     pub fn with_private_prefill(
         model: &'m M,
-        max_len: usize,
-        buckets: &[usize],
+        shapes: &Shapes,
         device: &TtDevice,
     ) -> Result<Self, GenerateError> {
-        Self::build(model, max_len, buckets, device, true)
+        Self::build(model, shapes, device, true)
     }
 
     fn build(
         model: &'m M,
-        max_len: usize,
-        buckets: &[usize],
+        shapes: &Shapes,
         device: &TtDevice,
         private: bool,
     ) -> Result<Self, GenerateError> {
-        let buckets = check_buckets(buckets, max_len)?;
+        let shapes = shapes.checked()?;
+        let max_len = shapes.max_len;
         let mut caches = vec![model.new_cache(max_len, device)];
         if private {
             caches.push(model.new_cache(max_len, device));
@@ -374,13 +432,15 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
                     t.dtype()
                 )));
             }
-            // An eager step and chunk of each size first, so what the model keeps between calls
-            // (a weight transposed once for its product, a zero row) is in place before the
-            // captures, which then read it rather than make it.
-            let (l, state) = model.step(ids(&[0], device), index(0, device), cache);
-            cache.set_state(state);
-            let _ = read(l);
-            for &c in &buckets {
+            // An eager step of each length and chunk of each size first, so what the model keeps
+            // between calls (a weight transposed once for its product, a zero row) is in place
+            // before the captures, which then read it rather than make it.
+            for &len in &shapes.steps {
+                let (l, state) = model.step(ids(&[0], device), index(0, device), len, cache);
+                cache.set_state(state);
+                let _ = read(l);
+            }
+            for &c in &shapes.chunks {
                 let (l, state) = model.chunk(
                     ids(&vec![0; c], device),
                     index(0, device),
@@ -398,23 +458,25 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
             )?);
         }
 
-        let token = ids::<TtBackend>(&[0], device);
-        let position = index::<TtBackend>(0, device);
-        let (tp, pp) = (
-            token.clone().into_primitive(),
-            position.clone().into_primitive(),
-        );
-        tp.ensure_resident();
-        pp.ensure_resident();
         let cache = &caches[0];
-        sets[0].capture(Key::Step, &[&tp, &pp], || {
-            let (y, state) = model.step(token, position, cache);
-            (vec![float(y)], state.into_iter().map(float).collect())
-        })?;
+        for &len in &shapes.steps {
+            let token = ids::<TtBackend>(&[0], device);
+            let position = index::<TtBackend>(0, device);
+            let (tp, pp) = (
+                token.clone().into_primitive(),
+                position.clone().into_primitive(),
+            );
+            tp.ensure_resident();
+            pp.ensure_resident();
+            sets[0].capture(Key::Step(len), &[&tp, &pp], || {
+                let (y, state) = model.step(token, position, len, cache);
+                (vec![float(y)], state.into_iter().map(float).collect())
+            })?;
+        }
 
         let prefill = caches.len() - 1;
         let cache = &caches[prefill];
-        for &c in &buckets {
+        for &c in &shapes.chunks {
             let tokens = ids::<TtBackend>(&vec![0; c], device);
             let start = index::<TtBackend>(0, device);
             let last = index::<TtBackend>(0, device);
@@ -433,8 +495,7 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
         }
         Ok(Self {
             model,
-            max_len,
-            buckets,
+            shapes,
             caches,
             sets,
             prefill,
@@ -442,12 +503,12 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
     }
 
     pub fn max_len(&self) -> usize {
-        self.max_len
+        self.shapes.max_len
     }
 
-    /// The chunk sizes captured, ascending.
-    pub fn buckets(&self) -> &[usize] {
-        &self.buckets
+    /// The chunk sizes and step lengths captured, ascending.
+    pub fn shapes(&self) -> &Shapes {
+        &self.shapes
     }
 
     pub fn model(&self) -> &M {
@@ -480,9 +541,9 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
     /// Feed `prompt` from position 0 (as [`schedule`] says) and return the logits after its last
     /// token. Whatever the cache held is overwritten as it is reached.
     pub fn prefill(&self, prompt: &[i32]) -> Result<Vec<f32>, GenerateError> {
-        check_request(prompt, 1, self.max_len)?;
+        check_request(prompt, 1, self.shapes.max_len)?;
         let mut out = None;
-        for chunk in schedule(prompt.len(), &self.buckets) {
+        for chunk in schedule(prompt.len(), &self.shapes.chunks) {
             let trace = self.sets[self.prefill]
                 .get(Key::Chunk(chunk.c))
                 .expect("a trace for every bucket");
@@ -499,15 +560,31 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
         logits(out.expect("a chunk"))
     }
 
-    /// One token at `position` (every earlier position already fed): the logits after it.
+    /// One token at `position` (every earlier position already fed): the logits after it, from
+    /// the step attending to the fewest positions that include it ([`Shapes::step_len`]).
     pub fn decode(&self, token: i32, position: usize) -> Result<Vec<f32>, GenerateError> {
-        if position >= self.max_len {
+        if position >= self.shapes.max_len {
             return Err(GenerateError::Capacity {
                 needed: position + 1,
-                max_len: self.max_len,
+                max_len: self.shapes.max_len,
             });
         }
-        let trace = self.sets[0].get(Key::Step).expect("the step's trace");
+        self.decode_within(token, position, self.shapes.step_len(position))
+    }
+
+    /// [`Self::decode`] by the step attending to `len` positions, whatever the position: for a
+    /// position at or past `len` the token does not see itself, a wrong result by construction
+    /// (the negative control of the step lengths).
+    #[doc(hidden)]
+    pub fn decode_within(
+        &self,
+        token: i32,
+        position: usize,
+        len: usize,
+    ) -> Result<Vec<f32>, GenerateError> {
+        let trace = self.sets[0]
+            .get(Key::Step(len))
+            .ok_or_else(|| GenerateError::Refused(format!("no step attending to {len}")))?;
         logits(trace.run(vec![
             InputPayload::Bits(vec![token as u32]),
             InputPayload::Bits(vec![position as u32]),
@@ -518,7 +595,7 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
     /// sizes computes them (and as the model's growing-cache generation, for a model whose fixed
     /// steps equal it).
     pub fn generate(&self, prompt: &[i32], steps: usize) -> Result<Generation, GenerateError> {
-        check_request(prompt, steps, self.max_len)?;
+        check_request(prompt, steps, self.shapes.max_len)?;
         let mut out = Generation::new(steps);
         out.step_with(|| self.prefill(prompt))?;
         out.decode(steps, |token, step| self.decode(token, prompt.len() + step))?;
@@ -558,13 +635,29 @@ mod tests {
             Err(GenerateError::Refused(_))
         ));
         assert!(matches!(
-            check_buckets(&[], 8),
+            Shapes::new(8, &[]).checked(),
             Err(GenerateError::Refused(_))
         ));
         assert!(matches!(
-            check_buckets(&[4, 16], 8),
+            Shapes::new(8, &[4, 16]).checked(),
             Err(GenerateError::Refused(_))
         ));
-        assert_eq!(check_buckets(&[8, 4, 8], 8).unwrap(), [4, 8]);
+        assert_eq!(Shapes::new(8, &[8, 4, 8]).checked().unwrap().chunks, [4, 8]);
+        let shapes = Shapes::new(512, &[64]);
+        assert_eq!(shapes.steps, [64, 128, 256, 512]);
+        assert_eq!(
+            [0, 63, 64, 300, 511].map(|p| shapes.step_len(p)),
+            [64, 64, 128, 512, 512]
+        );
+        assert_eq!(Shapes::new(16, &[4]).steps, [16]);
+        assert_eq!(Shapes::new(64, &[4]).with_steps(&[32]).steps, [32, 64]);
+        assert!(matches!(
+            Shapes {
+                steps: vec![32],
+                ..Shapes::new(64, &[4])
+            }
+            .checked(),
+            Err(GenerateError::Refused(_))
+        ));
     }
 }

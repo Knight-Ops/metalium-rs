@@ -643,7 +643,12 @@ fn smollm2_replay_profile() {
     use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
     use tt_isa::dm::op;
     use tt_kernels::profile::Event;
-    const MAX_LEN: usize = 64;
+    // The cache's length (`TT_PROFILE_MAX_LEN`, default 64): what a step attends to, so which ops
+    // grow with it shows between two runs.
+    let max_len: usize = std::env::var("TT_PROFILE_MAX_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let layers: usize = std::env::var("TT_PROFILE_LAYERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -677,7 +682,7 @@ fn smollm2_replay_profile() {
         };
         let reps = 5;
         let positions = 2 + reps;
-        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let mut cache = m.fixed_cache(max_len, dtype, &d);
         let eager: Vec<Vec<f32>> = (0..positions)
             .map(|p| {
                 m.step_fixed(x(), at(p), &mut cache, dtype)
@@ -686,7 +691,7 @@ fn smollm2_replay_profile() {
                     .unwrap()
             })
             .collect();
-        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let mut cache = m.fixed_cache(max_len, dtype, &d);
         let _ = m.step_fixed(x(), at(0), &mut cache, dtype).into_data();
         let (xin, pin) = (x(), at(1));
         let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
@@ -1088,7 +1093,7 @@ fn smollm2_decode_with_the_embedding_lookup() {
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn traced_generation() {
-    use tt_models::generate::{generate_fixed, Generation, TracedGenerator};
+    use tt_models::generate::{generate_fixed, Generation, Shapes, TracedGenerator};
     const PROMPTS: [usize; 3] = [32, 128, 256];
     const NEW: usize = 64;
     let max_len: usize = std::env::var("TT_GEN_MAX_LEN")
@@ -1152,7 +1157,18 @@ fn traced_generation() {
         let (m, _) =
             Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         let t0 = Instant::now();
-        let g = match TracedGenerator::new(&m, max_len, &buckets, &d) {
+        // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
+        // for the whole cache at every step).
+        let mut shapes = Shapes::new(max_len, &buckets);
+        if let Ok(v) = std::env::var("TT_GEN_STEPS") {
+            let steps: Vec<usize> = v
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse().unwrap())
+                .collect();
+            shapes = shapes.with_steps(&steps);
+        }
+        let g = match TracedGenerator::new(&m, &shapes, &d) {
             Ok(g) => g,
             Err(e) => {
                 // A capture that does not fit fails the attachment for good: rerun with fewer.
@@ -1160,7 +1176,10 @@ fn traced_generation() {
                 return;
             }
         };
-        let traces = format!("chunks {buckets:?} and the step, {max_len}-position cache");
+        let traces = format!(
+            "chunks {buckets:?}, steps {:?}, {max_len}-position cache",
+            shapes.steps
+        );
         report(
             &format!("smollm2-135m traced generation, build ({traces})"),
             "ms",
@@ -1179,8 +1198,39 @@ fn traced_generation() {
                     .max()
                     .unwrap_or(0);
                 let gddr: u64 = units.iter().flatten().map(|u| u.gddr_bytes).sum();
+                // What the streams hold: every entry is 32 bytes (`chunked`'s padding included), and
+                // each `PAIR_CALL` names a reader and a writer section, each stored on its own.
+                let real: u64 = units
+                    .iter()
+                    .flatten()
+                    .map(|u| u.stream.entries as u64 * 32)
+                    .sum();
+                let sections: u64 = units
+                    .iter()
+                    .flatten()
+                    .map(|u| {
+                        2 * *u.stream.heads.get(&tt_isa::dm::op::PAIR_CALL).unwrap_or(&0) as u64
+                    })
+                    .sum();
+                let unit_traces = units.iter().flatten().count();
                 eprintln!(
-                    "  {key}: at most {most} program bytes a unit, {gddr} stream bytes in all"
+                    "  {key}: at most {most} program bytes a unit, {gddr} stream bytes in all, \
+                     {real} bytes of entries ({:.1}x), {sections} sections over {unit_traces} units \
+                     ({:.0} bytes a section allocated)",
+                    gddr as f64 / real.max(1) as f64,
+                    gddr as f64 / (sections + unit_traces as u64).max(1) as f64,
+                );
+                report(
+                    &format!("smollm2-135m traced generation, {key} entry bytes ({traces})"),
+                    "bytes",
+                    "count",
+                    Stats::of([real as f64]),
+                );
+                report(
+                    &format!("smollm2-135m traced generation, {key} stream bytes ({traces})"),
+                    "bytes",
+                    "count",
+                    Stats::of([gddr as f64]),
                 );
             }
             report(
@@ -1198,7 +1248,7 @@ fn traced_generation() {
         }
         // Validation: the eager schedule on the card, bit for bit.
         let p = prompt(PROMPTS[0]);
-        let want = generate_fixed(&m, &p, 4, max_len, &buckets, &d).unwrap();
+        let want = generate_fixed(&m, &p, 4, &shapes, &d).unwrap();
         let got = g.generate(&p, 4).unwrap();
         assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
         for (i, (a, b)) in got.logits.iter().zip(&want.logits).enumerate() {
@@ -1225,7 +1275,8 @@ fn traced_generation() {
                     total.push(ms(all));
                 }
             }
-            let key = format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens");
+            let key =
+                format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens ({traces})");
             report(
                 &format!("{key}, first token, traced"),
                 "ms",

@@ -183,10 +183,16 @@ pub struct UnitFootprint {
 /// One unit's share of a capture in progress.
 #[derive(Default)]
 pub(crate) struct UnitCapture {
-    /// What the sections stored so far are made of, and their GDDR bytes.
+    /// What the sections so far are made of.
     pub(crate) sections_composition: Composition,
-    pub(crate) sections_gddr_bytes: u64,
-    pub(crate) regions: Vec<Placement>,
+    /// Each packet's reader and writer sections, laid out for streaming
+    /// ([`chunked`]), kept on the host until the capture ends: they are stored
+    /// with the unit's stream, in one region (`Session::store_stream`).
+    pub(crate) pending_sections: Vec<Vec<[u32; 8]>>,
+    /// Where each `PAIR_CALL` sits in `stream`, in order: the `i`th names
+    /// `pending_sections[2 i]` and `[2 i + 1]`, its offsets filled in when they
+    /// are stored.
+    pub(crate) pair_calls: Vec<usize>,
     /// The unit's entries, in order, generations and barrier targets relative.
     pub(crate) stream: Vec<[u32; 8]>,
     /// The resident's last generation when the capture began: the stream's
@@ -273,9 +279,8 @@ pub(crate) struct Capture {
 
 /// One unit's share of a finished trace.
 pub(crate) struct UnitTrace {
-    pub(crate) regions: Vec<Placement>,
-    /// Its stream in GDDR, and where that is: the chip's channel index, the
-    /// offset, the entry count.
+    /// Its stream in GDDR, its sections after it in the same region, and where
+    /// the stream is: the chip's channel index, the offset, the entry count.
     pub(crate) stream: Placement,
     pub(crate) channel: u32,
     pub(crate) offset: u32,

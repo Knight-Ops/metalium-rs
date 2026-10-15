@@ -997,6 +997,20 @@ fails the same congruence for one of the two source parities. The candidates:
    is `Undefined`.
 3. Make room in B: no longer needed -- B's slot grew by 18 KiB (above), so the B-side branch (1) fits.
 
+## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
+
+- **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of
+  `ENTRY_BYTES` (32, `tt_isa::dm` `Entry::decode`).
+- **What the mover does:** it reads a section in chunks of 64 entries through a `READ` descriptor (`call`,
+  `crates/tt-firmware/src/mover.rs`) into L1 chunk addresses that are multiples of 64. A DRAM-to-L1 read needs source
+  and destination congruent mod 64 (`tt_isa::dram::ALIGN`).
+- **So:** a section at an offset of 32 mod 64 passes the entry's decode and fails its first chunk read (`ALIGNMENT`).
+- **Since the change:** `Session::store_stream` packs a unit's stream and its sections into one region, so it starts
+  each section on a 64-byte boundary. Before, every section had a slot-aligned region of its own: at least one
+  `TILE_SLOT`, 4,160 bytes, which made a trace 5x to 7x its entries (SmolLM2's four traces 3.75 GB, now 563 MB;
+  [decode-length-cost.md](../completed-plans/decode-length-cost.md)). Every trace gate passes in both layouts on card
+  0, and `step147` on both cards.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

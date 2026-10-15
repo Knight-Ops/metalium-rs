@@ -34,10 +34,12 @@ pub struct FixedCache<B: Backend> {
 #[derive(Clone, Debug)]
 pub enum FixedWrite<B: Backend> {
     /// One token at the position set in `here` (the cache's shape: made once a step, not once a
-    /// layer); the query attends to every position but those set in `later` (`[1, 1, 1, max_len]`).
+    /// layer); the query attends to the first `len` positions but those set in `later`
+    /// (`[1, 1, 1, len]`).
     Masked {
         here: Tensor<B, 4, Bool>,
         later: Tensor<B, 4, Bool>,
+        len: usize,
     },
     /// A chunk of `c` tokens at the positions set in `here` (the cache's shape, a run from the
     /// chunk's start): cache row `j` of head `h` takes the chunk's row `index[h max_len + j]` of
@@ -111,24 +113,42 @@ impl<B: Backend> FixedCache<B> {
         self.state[0].dims()
     }
 
-    /// The write of one token at `position` (`[1]`, below [`Self::max_len`]).
+    /// The write of one token at `position` (`[1]`, below [`Self::max_len`]), attending to every
+    /// position of the cache.
     pub fn step_write(&self, position: Tensor<B, 1, Int>) -> FixedWrite<B> {
+        self.step_write_within(position, self.max_len)
+    }
+
+    /// The write of one token at `position` (`[1]`, below `len`), attending only to the cache's
+    /// first `len` positions: what a step costs then follows `len`, not [`Self::max_len`]. The
+    /// keys and values are still written into the whole cache; only what attention reads is cut
+    /// ([`FixedWrite::attended`]). A position past `len` is not attended to (wrong by construction:
+    /// choose `len` above the position). With `len` and `max_len` multiples of 32, attention reads
+    /// the cache's prefix in place.
+    pub fn step_write_within(&self, position: Tensor<B, 1, Int>, len: usize) -> FixedWrite<B> {
         let max_len = self.max_len;
-        let at = position.expand([max_len]);
-        FixedWrite::Masked {
-            // Expanded to the cache's shape here, once, rather than in each layer.
-            here: self
-                .positions
+        assert!(
+            (1..=max_len).contains(&len),
+            "attending to {len} of {max_len} positions"
+        );
+        let at = position.clone().expand([max_len]);
+        // Expanded to the cache's shape here, once, rather than in each layer.
+        let here = self
+            .positions
+            .clone()
+            .equal(at.clone())
+            .reshape([1, 1, max_len, 1])
+            .expand(self.shape());
+        let later = if len == max_len {
+            self.positions.clone().greater(at)
+        } else {
+            self.positions
                 .clone()
-                .equal(at.clone())
-                .reshape([1, 1, max_len, 1])
-                .expand(self.shape()),
-            later: self
-                .positions
-                .clone()
-                .greater(at)
-                .reshape([1, 1, 1, max_len]),
+                .narrow(0, 0, len)
+                .greater(position.expand([len]))
         }
+        .reshape([1, 1, 1, len]);
+        FixedWrite::Masked { here, later, len }
     }
 
     /// The write of `c` tokens from `start` (`[1]`) on, and each token's own position (`[c]`,
@@ -188,7 +208,20 @@ impl<B: Backend> FixedWrite<B> {
         }
     }
 
-    /// The positions each query must not attend to: an attention mask.
+    /// The keys or values a query reads from `cache` (`[1, kv_heads, max_len, head_dim]`, as
+    /// [`Self::write`] left it): its first `len` positions for a step that attends to fewer than
+    /// the whole cache (a view: no copy), else all of it.
+    pub fn attended(&self, cache: Tensor<B, 4>) -> Tensor<B, 4> {
+        match self {
+            FixedWrite::Masked { len, .. } if *len < cache.dims()[2] => {
+                let [n, kv, _, d] = cache.dims();
+                cache.slice([0..n, 0..kv, 0..*len, 0..d])
+            }
+            _ => cache,
+        }
+    }
+
+    /// The positions each query must not attend to, of those it reads: an attention mask.
     pub fn later(&self) -> Tensor<B, 4, Bool> {
         match self {
             FixedWrite::Masked { later, .. } | FixedWrite::Chunk { later, .. } => later.clone(),
