@@ -1,4 +1,4 @@
-//! Where attention's device jobs go, and how few there are (`docs/plans/attention-jobs.md`).
+//! Where attention's device jobs go, and how few there are (`docs/completed-plans/attention-jobs.md`).
 //!
 //! `module::attention` charges each stage's jobs to a part of its own (`report::part`):
 //! `attention/qk`, `/scale`, `/mask`, `/softmax`, `/pv`, `/widen` and `/narrow`. This gate runs
@@ -8,7 +8,14 @@
 //! decode call's 64 jobs each). Run with `--nocapture` to see the table.
 //!
 //! Each call's result is bit for bit the same attention run one head at a time: every product is
-//! `matmul_dram`'s on its head's blocks either way (`step184`), and the softmax is per row.
+//! `matmul_dram`'s on its head's blocks either way (`step184`), and the softmax is per row. Where
+//! padding costs at most a quarter more rows (ViT's 197 tokens, not a decode's one query) the
+//! scores stay a head per whole tile rows from `Q K^T` to `P V` (`padded_attention`); a single
+//! head never pads, so the reference took the stacked layout's arithmetic, row for row.
+//!
+//! Watched failing (2026-10-15, ttsim): a causal mask shifted one column (`step83`'s analytic
+//! cases); the kept mask's blocks after the first left unmasked; `P V` reading head `i` from row
+//! `i m` of the padded scores; the padded causal mask laid out at the stacked stride.
 
 use burn::tensor::{module::attention, Tensor, TensorData};
 use burn_tensor::ops::AttentionModuleOptions;
@@ -74,16 +81,20 @@ fn jobs(
         })
         .map(f32::to_bits)
         .collect();
+    let bits = |out: Tensor<TtBackend, 4>| -> Vec<u32> {
+        out.into_data()
+            .to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    };
+    // The first call makes what an attachment keeps (a causal mask); the second is counted.
+    let first = attention(q.clone(), k.clone(), v.clone(), None, None, options());
+    assert_eq!(bits(first), want, "{what}: against one head at a time");
     let (out, report) = burn_tt::with_report(|| attention(q, k, v, None, None, options()));
     assert_native_model(&report);
-    let got: Vec<u32> = out
-        .into_data()
-        .to_vec::<f32>()
-        .unwrap()
-        .into_iter()
-        .map(f32::to_bits)
-        .collect();
-    assert_eq!(got, want, "{what}: against one head at a time");
+    assert_eq!(bits(out), want, "{what}: a second call");
     let mut rows: Vec<_> = PARTS
         .iter()
         .map(|&p| (p, report.op(p).map_or(0, |s| s.jobs)))
@@ -98,6 +109,11 @@ fn jobs(
     assert_eq!(of("attention"), 0, "{what}: every job is charged to a part");
     assert_eq!(of("attention/qk"), 1, "{what}: q k^T is one job");
     assert_eq!(of("attention/pv"), 1, "{what}: p v is one job");
+    assert_eq!(
+        of("attention/mask"),
+        u64::from(causal),
+        "{what}: a kept causal mask is one mask_fill"
+    );
     rows
 }
 
@@ -120,6 +136,15 @@ fn attention_jobs_by_part() {
                 .swap_dims(1, 2)
         };
         jobs("vit [1,3,197,64]", heads(0), heads(1), heads(2), false);
+        // The same heads, causal: the scores stay a head per whole tile rows (`padded_attention`),
+        // so the kept mask is laid out the same way.
+        jobs(
+            "vit-shaped causal [1,3,197,64]",
+            heads(0),
+            heads(1),
+            heads(2),
+            true,
+        );
 
         // SmolLM2 prefill: a causal prompt of five tokens.
         let q = tensor(&d, [1, 9, 5, 64], 13);

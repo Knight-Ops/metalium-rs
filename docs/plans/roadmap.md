@@ -407,7 +407,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   - **After P2 (2026-10-14):** **283.4 ms on every tile** (`1792013104`, 2.7x burn-flex's 106.7) and 663.0 on one tile.
     Its slices and swaps queue nothing, and attention reads the heads in place. Attention is now 187 of 270 ms of
     server time (item 9), then the patch embedding's convolution (44 ms) and the heads' merge (`reshape`, 12 jobs, 10 ms).
-- [ ] **9. Attention (next; decided 2026-10-14, after [decode-host-cost.md](../completed-plans/decode-host-cost.md)).** `module::attention`
+- [x] **9. Attention (closed 2026-10-15; ViT-Tiny 1.18x burn-flex on every tile; [attention-jobs.md](../completed-plans/attention-jobs.md)).** `module::attention`
   (`ops.rs`) composes `matmul(q, k^T)`, a scale, the masks, a softmax (`max_dim`, `clamp_min`, `sub`, `exp`, `sum_dim`,
   `clamp_min`, `div`) and `matmul(p, v)`. On card 0 it is now the largest cost of both transformers:
   - **SmolLM2 decode step, every tile:** 1,920 jobs, **64 a call**, and 72 of the 146 ms of server-thread time after the
@@ -418,7 +418,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   causal mask's upload. P0's counters give the jobs per op inside the call. Then fuse what the numbers favour: one
   batched product per matmul, a softmax over rows in one job or a few (the reduce/norm fuser below), and the mask as
   geometry. The arithmetic order stays Burn's: the existing attention gates must hold bit for bit or within their derived
-  bounds. FlashAttention ("Later") is the end state, not this item. Plan: [attention-jobs.md](attention-jobs.md).
+  bounds. FlashAttention ("Later") is the end state, not this item. Plan: [attention-jobs.md](../completed-plans/attention-jobs.md).
   - **P0 (2026-10-14):** `module::attention` charges its stages to parts (`report::part`). Of a decode call's 64 jobs,
     56 were the two products, each run a head at a time because `m` was not whole tile rows (two repacks and a matmul a
     head). The softmax is 7 and the scale 1; a causal mask adds 3.
@@ -428,11 +428,16 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     - **Jobs a call:** decode 64 -> 10, ViT 28 -> 10, prefill 67 -> 13.
     - **Every tile:** ViT-Tiny **173.5 ms** (was 283.4; burn-flex 107.2) and the decode step **86.5 ms** (was 99.6; burn-flex
       26.5), card 1, runs `1792019882` and `1792019870` ([log](../learnings/performance-log.md#attention-products-in-one-job-2026-10-14-cards-0-and-1)).
-    - **Left:**
-      - ViT's scores are stacked after `qk` and gathered back into tile rows before `pv` (74 of ViT's attention ms):
-        keep them padded through the softmax.
-      - The causal mask as cached geometry (P3).
-      - The softmax's 7 jobs (P4).
+  - **P2b and P3 (2026-10-15, ttsim, cards 0 and 1).** Where padding grows the scores by at most a quarter (ViT, not a
+    decode's single query), they stay a head per whole tile rows from `Q K^T` to `P V` (`padded_attention`). The
+    causal mask is kept per attachment in the scores' layout: a prefill call is 11 jobs, was 13.
+    - **ViT-Tiny:** every tile **129.1 ms** (burn-flex 109.3, run `1792026124`); one tile 368.3.
+    - **The decode step** is unchanged at 86.9 ms.
+  - **Tabled, with their numbers in the plan:**
+    - **The softmax's clamps and a fused softmax (P4):** 2.1 of decode attention's 36 ms of server time on every tile.
+    - **A padded view every op accepts:** only attention was measured to need it.
+  - **What is left in the decode step is not attention:** its single-query products (`qk` 20.6, `pv` 13.4 ms of
+    server time, mostly the operand gathers and zero rows of P1-P2) and the default tile choice.
 - [ ] **5. BF16 lookup (open; the row select does not take it).** `step167` BF16 (six layers) takes 229 s on card 0 (run
   `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
   BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the

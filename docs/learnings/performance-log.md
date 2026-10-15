@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Attention scores kept in tile rows, and a kept causal mask](#attention-scores-kept-in-tile-rows-and-a-kept-causal-mask-2026-10-15-cards-0-and-1) | 2026-10-15 | ViT's scores stay a head per whole tile rows from `Q K^T` to `P V` and the causal mask is kept per attachment: ViT-Tiny 173.5 -> 129.1 ms on every tile (burn-flex 109.3), 481.9 -> 368.3 on one; a prefill call 13 -> 11 jobs |
 | [Attention products in one job](#attention-products-in-one-job-2026-10-14-cards-0-and-1) | 2026-10-14 | a batched matmul takes a ragged `m` and heads stacked by rows (one row gather, not a repack a head): attention 64 -> 10 server jobs a decode call, 28 -> 10 a ViT call; ViT-Tiny 283.4 -> 173.5 ms on every tile (burn-flex 107.2), the SmolLM2 decode step 99.6 -> 86.5 |
 | [Slices and swaps as views](#slices-and-swaps-as-views-2026-10-14-card-0) | 2026-10-14 | a positive-step slice is a view, a swap of a view stays one, a ragged view is a tile copy: ViT-Tiny 401.4 -> 283.4 ms on every tile (burn-flex 106.7), the SmolLM2 decode step 108.5 -> 99.6 |
 | [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
@@ -59,6 +60,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-15 | 1792026124 / 1792026138 | Attention's scores kept a head per whole tile rows (`padded_attention`) and the causal mask kept per attachment: ViT-Tiny 173.5 -> 129.1 ms on every tile at `work:64:4` (burn-flex 109.3), 481.9 -> 368.3 on one tile, card 1; the decode step unchanged (86.9; its single query keeps the stacked path); see "Attention scores kept in tile rows". | ViT rows updated in place. |
 | 2026-10-14 | 1792019870 / 1792019882 / 1792019917 | Attention products in one job (ragged `m`, heads stacked by rows gathered once): ViT-Tiny 283.4 -> 173.5 ms and the SmolLM2 decode step 99.6 -> 86.5 ms on every tile at `work:64:4` (burn-flex 107.2 and 26.5), card 1; one tile ViT 481.9, decode 449.7; see "Attention products in one job". | ViT and decode rows updated in place. |
 | 2026-10-14 | 1792000003 | ResNet-18 forward traced, every tile: 17.6 ms a replay against 205.7 untraced and burn-flex 151.7, card 1, bit for bit the eager forward; one tile does not capture (program cache); see "Chunk-free convolution and max pooling" below. | New scoreboard row. |
 | 2026-10-14 | 1791996580 / 1791996716 / 1791996730 | Chunk-free convolution and max pooling (NHWC tap select, one product, views between layers): ResNet-18 forward 16,288 -> 782.3 ms on one tile, 131.1 ms on every tile at `work:64:4` (burn-flex 151-157 ms), card 1, top-1 validated; see "Chunk-free convolution and max pooling" below. | ResNet-18 rows updated in place. |
@@ -300,9 +302,41 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Attention scores kept in tile rows, and a kept causal mask (2026-10-15, cards 0 and 1)
+
+P2b and P3 of [attention-jobs.md](../completed-plans/attention-jobs.md).
+
+- **ViT's scores.** After P1-P2 they were stacked after `Q K^T` and gathered back into whole tile rows for `P V`.
+  Now `padded_attention` keeps them a head per whole tile rows throughout:
+  - `Session::matmul_dram_batched_with`, `BatchedLayout { stacked: false }`, then `{ lhs_padded: true }`;
+  - the scale, the mask and the softmax run on the padded `[heads·mt·32, sk]` tensor row by row.
+  - It is taken where padding grows the scores by at most a quarter: ViT, not a decode's single query.
+- **The causal mask** is made once an attachment, in the scores' own layout, so a call's mask is one `mask_fill`.
+
+Release, card 1, two warm-ups and nine timed passes, burn-flex in the same run:
+
+| Workload | Before (`1792019882`, `1792019870`) | After | burn-flex |
+|---|--:|--:|--:|
+| ViT-Tiny forward, every tile at `work:64:4` | 173.5 ms | **129.1 ms** (`1792026124`) | 109.3 ms |
+| ViT-Tiny forward, one tile | 481.9 ms | 368.3 ms (`1792026138`) | 109.7 ms |
+| SmolLM2 decode step, every tile | 86.5 ms | 86.9 ms (`1792026124`), unchanged | 26.5 ms |
+
+- **ViT's attention server time, every tile.**
+  - `qk` 26.5 -> **0.9 ms**: the stacking gather is gone.
+  - `pv` 47.2 -> 30.4 ms: the gather back into tile rows is gone. What is left is the product, the scores' column
+    padding fill (`meet`) and the stacking gather.
+  - `softmax` 2.2 -> 4.0 ms, on 672 rows a call instead of 591.
+- **ViT on one tile.** The softmax is 21.4 ms (was 40.9); `pv` is 64.2.
+- **The decode step does not take the padded path.** It would be 288 rows for 9. Its attention is unchanged
+  (`qk` 20.6, `pv` 13.4 ms).
+- **A five-token causal prefill** is 11 jobs a call, was 13 (`step183`, ttsim). There is no prefill bench.
+- **Correctness.**
+  - Card 0 (`1792025224`): `step183`, `step184`, `step83` (single card), `step60`, `step166`, and `step167` in F32.
+  - On ttsim: Burn's conformance has 0 unexpected results, plain (`1792025070`) and `--fusion` (`1792025609`).
+
 ## Attention products in one job (2026-10-14, cards 0 and 1)
 
-P0-P2 of [attention-jobs.md](../plans/attention-jobs.md). Before this, a batched matmul whose `m` was not whole tile rows
+P0-P2 of [attention-jobs.md](../completed-plans/attention-jobs.md). Before this, a batched matmul whose `m` was not whole tile rows
 (decode m = 1, ViT m = 197, a prefill's m = t) ran one head at a time: two element repacks and a matmul a head, then a row
 gather, so 28 of a decode call's 64 attention jobs for each product. Now `Session::matmul_dram_batched`
 does three things, and the whole product is one server job:

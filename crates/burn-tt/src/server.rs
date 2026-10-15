@@ -23,7 +23,7 @@ use tt_kernels::tensor::{Block, BlockMove};
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::matrix_eltwise::{ElementwiseMode, MatrixEltwiseOp, SrcPrecision};
-use tt_kernels::session::{Session, TileChoice};
+use tt_kernels::session::{BatchedLayout, Session, TileChoice};
 
 use crate::error::TtError;
 use crate::{MatmulMode, TtDevice};
@@ -215,6 +215,23 @@ pub trait Engine {
         _b: BufferId,
         _items: &[(Block, Block)],
         _mkn: [usize; 3],
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// Does [`Engine::matmul_dram_batched_layout`] work here? Asked once an
+    /// attachment ([`supports_batched_layout`]).
+    fn supports_batched_layout(&self) -> bool {
+        false
+    }
+    /// [`Engine::matmul_dram_batched`] with the left operand, the output or
+    /// both a product per whole tile rows (`Session::matmul_dram_batched_with`).
+    fn matmul_dram_batched_layout(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+        _items: &[(Block, Block)],
+        _mkn: [usize; 3],
+        _layout: BatchedLayout,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -1026,10 +1043,11 @@ impl DramBuffers {
         route: SrcRoute,
         fidelity: Fidelity,
         budget: u64,
+        layout: BatchedLayout,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
         let c = s
-            .matmul_dram_batched(&ta, &tb, items, mkn, route, fidelity, budget)
+            .matmul_dram_batched_with(&ta, &tb, items, mkn, route, fidelity, budget, layout)
             .map_err(TtError::from)?;
         Ok(self.insert(c))
     }
@@ -1685,6 +1703,8 @@ struct Attached {
     epoch: u32,
     /// Whether the engine keeps tensors on the device, asked once.
     supports_dram: Arc<OnceLock<bool>>,
+    /// Whether the engine takes `Engine::matmul_dram_batched_layout`, asked once.
+    supports_layout: Arc<OnceLock<bool>>,
     /// This attachment's number, unique in the process: what a cache of
     /// device buffers made for it ([`attachment`]) is keyed by, so a later
     /// attachment of the same device never reads them.
@@ -1935,6 +1955,7 @@ where
                     config,
                     epoch,
                     supports_dram: Arc::default(),
+                    supports_layout: Arc::default(),
                     serial: SERIAL.fetch_add(1, Ordering::Relaxed),
                 },
             );
@@ -2195,6 +2216,22 @@ pub(crate) fn supports_dram(device: TtDevice) -> bool {
     })
     .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }));
     *known.get_or_init(|| run(device, |engine, _| engine.supports_dram()))
+}
+
+/// Does `device`'s engine take a batched matmul's layout
+/// ([`matmul_dram_batched_layout`])? Asked once an attachment; `false` for a
+/// mesh, whose batched products are its own.
+pub(crate) fn supports_batched_layout(device: TtDevice) -> bool {
+    if !supports_dram(device) {
+        return false;
+    }
+    let known = with_attached(|a| {
+        a.get(&device)
+            .filter(|d| d.live())
+            .map(|d| d.supports_layout.clone())
+    })
+    .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }));
+    *known.get_or_init(|| run(device, |engine, _| engine.supports_batched_layout()))
 }
 
 /// Can `device` be used for device ops: it has an engine, or the registry
@@ -2585,6 +2622,34 @@ pub(crate) fn matmul_dram(
             }
         }
     })
+}
+
+/// A batched matmul over blocks on the device with `layout`
+/// (`Session::matmul_dram_batched_with`), without waiting. Only where
+/// [`supports_batched_layout`], at the attachment's own fidelity.
+pub(crate) fn matmul_dram_batched_layout(
+    device: TtDevice,
+    a: BufferId,
+    b: BufferId,
+    items: Vec<(Block, Block)>,
+    mkn: [usize; 3],
+    layout: BatchedLayout,
+) -> (BufferId, [usize; 2]) {
+    let [m, _, n] = mkn;
+    let rows = if layout.stacked || items.len() == 1 {
+        items.len() * m
+    } else {
+        items.len() * m.div_ceil(32) * 32
+    };
+    submit(
+        "matmul_dram",
+        device,
+        [rows, n],
+        || "batched matmul".into(),
+        move |engine, ids| {
+            engine.matmul_dram_batched_layout(ids.get(a)?, ids.get(b)?, &items, mkn, layout)
+        },
+    )
 }
 
 /// A batched matmul over blocks on the device, without waiting.
@@ -2993,6 +3058,7 @@ impl Engine for KmdEngine {
             self.route,
             fidelity,
             self.budget,
+            BatchedLayout::STACKED,
         )
     }
     fn eltwise(
@@ -3068,6 +3134,31 @@ impl Engine for KmdEngine {
             self.route,
             self.fidelity,
             self.budget,
+            BatchedLayout::STACKED,
+        )
+    }
+    fn supports_batched_layout(&self) -> bool {
+        self.buffers.is_some()
+    }
+    fn matmul_dram_batched_layout(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        items: &[(Block, Block)],
+        mkn: [usize; 3],
+        layout: BatchedLayout,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul_batched(
+            &mut self.session,
+            a,
+            b,
+            items,
+            mkn,
+            self.route,
+            self.fidelity,
+            self.budget,
+            layout,
         )
     }
     fn copy_blocks(

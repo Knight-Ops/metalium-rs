@@ -1,11 +1,11 @@
 # Attention in fewer jobs
 
 Roadmap Track 2, item 9 ("Attention"). Written 2026-10-14 against `b812e38`.
-Status: **P0, P1 and P2 done on ttsim (2026-10-14); silicon validation and measurement open.**
+Status: **P0-P3 and P2b done; P4 and the general padded view tabled with their numbers (2026-10-15).**
 
 ## Why this item, and what it is not
 
-After [decode-host-cost.md](../completed-plans/decode-host-cost.md), `module::attention` is the largest cost left
+After [decode-host-cost.md](decode-host-cost.md), `module::attention` is the largest cost left
 in both transformers. On card 0, every tile at `work:64:4`:
 
 - **SmolLM2 decode step:** 1,920 jobs (64 a call), 73 of 125 ms of server-thread time. The step takes 99.6 ms
@@ -133,24 +133,89 @@ second layout, for about three jobs a call.
   - **Decode attention's server time:** 73 -> 36 ms (`qk` 20.6, `pv` 13.2, `softmax` 2.1).
   - **ViT's:** `pv` 47.2, `qk` 26.5, `softmax` 2.2.
 - [x] MNIST e2e golden unchanged (ttsim).
-- [ ] **Next, from those numbers:** ViT's `qk` stacks its products' rows, and `pv` gathers the same scores back
-  into whole tile rows. Keeping the scores padded through the scale and softmax would remove both gathers: a padded
-  view that element-wise ops and last-dimension reductions accept.
+- [x] **Next, from those numbers:** ViT's `qk` stacked its products' rows and `pv` gathered the same scores back
+  into whole tile rows. Done attention-local in P2b, below. The general padded view stays tabled.
 
-### P3. Causal mask as cached geometry
+### P2b. Attention's scores kept a head per whole tile rows (done 2026-10-15, ttsim)
 
-- [ ] Cache the `[sq, sk]` mask per attachment.
-- [ ] Apply it as a row broadcast over the padded layout, not the `expanded` copy.
-- [ ] `step83` unchanged.
+Built inside `module::attention` (`padded_attention`, `crates/burn-tt/src/ops.rs`) rather than as a layout every op
+understands. The general version is tabled below.
 
-### P4. Softmax in fewer jobs (decided from P1 to P3's numbers)
+- [x] **The product calls:**
+  - `Session::matmul_dram_batched_with` takes a `BatchedLayout`: `stacked: false` leaves the output a product per
+    whole tile rows, and `lhs_padded: true` reads a left operand already laid out that way, with no gather.
+  - The engine method is `Engine::matmul_dram_batched_layout`. The capability `supports_batched_layout` is asked once
+    an attachment, and is `false` for a mesh.
+- [x] **What attention does with them:**
+  - `Q K^T` leaves the scores as a plain `[heads·mt·32, sk]` tensor.
+  - The scale, the causal mask and the softmax run on it row by row, with the same kinds in the same order.
+  - `P V` reads it in place and stacks once.
+- [x] **When it is taken:**
+  - **Required:** the `Fast` matmul mode, no caller mask or bias, and padding of at most a quarter more rows.
+    ViT's 197 tokens qualify (672 rows against 608). A decode's single query (288 against 32) and a five-token
+    prefill do not.
+  - **The rest** keep the stacked path from P1-P2.
+- [x] **`step183`:**
+  - **Cases:** a causal ViT-shaped case is added. Each call still equals the same attention a head at a time, bit for
+    bit; a single head never pads, so the reference took the stacked layout.
+  - **Mutations:** `P V` reading head `i` from row `i·m`, and the padded causal mask laid out at the stacked stride.
+    Each fails the gate.
 
-- [ ] **First, cheap:** fold the clamps and the scale where the arithmetic is identical.
-- [ ] **Then, if the numbers favour it:** one SFPU row program for max, sub, exp, sum, div, in the same order
-  (B13d's first piece, [kernel-fusion.md](kernel-fusion.md)). It needs the full new-op definition of done.
+### P3. Causal mask as cached geometry (done 2026-10-15, ttsim)
 
-### P5. Close-out
+- [x] **Kept per attachment.** The mask is made once (`nhwc::cached_metadata`, generalized from the convolution's tap
+  index to any I32 or Bool tensor).
+- [x] **In the scores' own layout.** Each `[sq, sk]` block is repeated for every batch and head, or laid a head per
+  whole tile rows for `padded_attention`. So `mask_fill` is one same-shape job: no host bit vector a call, no metadata
+  job, no `expanded` copy.
+- [x] **Large masks.** Past a million elements only one block is kept, and `mask_fill` broadcasts it as before.
+- [x] **Jobs:** prefill `[1,9,5,64]` 13 -> **11** jobs a call; `attention/mask` is 1 on a warm call (`step183`).
+- [x] **`step83` unchanged.** Mutations:
+  - A mask shifted one column fails `step83`'s analytic cases.
+  - The kept mask's blocks after the first left unmasked fails `step183`.
 
-- [ ] Re-measure on card 0, decode, ViT and prefill, on one tile and every tile.
-- [ ] Update the performance log, the scoreboard, roadmap item 9 and `burn-op-notes.md`.
-- [ ] Move this plan to `completed-plans/`.
+### P4. Softmax in fewer jobs: tabled (2026-10-15)
+
+- **Measured, card 1, every tile:**
+  - Decode attention's 36 ms of server time is `qk` 20.6, `pv` 13.2, `softmax` 2.1 (210 jobs at about 10 us) and
+    `scale` 0.3 (`1792019882`).
+  - ViT's softmax is 2.2 of 76 ms.
+  - On one tile the softmax is device time: 40.9 ms of ViT's 473, 84 jobs at 0.49 ms.
+- **Folding the two `clamp_min`s:** saves about 60 jobs a decode step (about 0.6 ms on every tile). It needs new SFPU
+  kinds, a max-and-clamp reduce output and a divide by a clamped sum, each with the new-op definition of done.
+- **A fused softmax row program:** saves up to 6 jobs a call. It is B13d's first piece
+  ([kernel-fusion.md](../plans/kernel-fusion.md), "Reduce-Map"), and must reproduce `EXP`, `DIV` and `sfpu_reduce`'s tree-order
+  sum bit for bit.
+- **Revisit when** the softmax is more than about 30% of attention's time on the configuration that matters: one tile
+  with a fixed tile choice, or a longer context where `sk` grows the softmax's tiles.
+
+### Tabled: a padded view every op accepts
+
+The general form of P2b: a `Strided` view whose batch stride is `mt·32` rows, accepted by `covering_view`/`view_op`
+(element-wise ops), by last-dimension reductions, and by `matrix_blocks` as a fitting operand. Any batched matmul's
+consumer could then skip the stacking gather.
+
+- **Why not now:**
+  - Every op on such a view must agree that the per-block tail rows are not elements. That is a second layout for
+    element-wise ops, reductions, `expanded` broadcasts, `tile_moves` and reshapes, and padding claims (`Pad`) that
+    hold inside a buffer.
+  - The one consumer measured to pay, attention's softmax, is covered attention-locally by P2b.
+- **Revisit if** another composition between two batched products shows the stacking and padding gathers in its
+  server time (a cross-attention, a batched LoRA product).
+
+### P5. Close-out (done 2026-10-15)
+
+- [x] **Re-measured on card 1**, release, every tile and one tile (`1792026124`, `1792026138`):
+  - **ViT-Tiny:** 129.1 ms on every tile (burn-flex 109.3) and 368.3 on one tile.
+  - **Decode step:** 86.9 ms, unchanged.
+  - **Prefill:** counted on ttsim only (`step183`); there is no prefill bench.
+- [x] **Silicon, card 0** (`1792025224`): `step183`, `step184`, `step83`, `step60`, `step166`, and `step167` in F32.
+- [x] **Conformance on ttsim:** 0 unexpected, plain (`1792025070`) and `--fusion` (`1792025609`).
+- [x] **Docs:** the performance log, the scoreboard, roadmap item 9 and `burn-op-notes.md` are updated.
+- [x] **Moved** to `completed-plans/`.
+
+**Hand-off.** The decode step's attention is now its two single-query products. Each is one job, but inside it the
+operand gathers and zero rows take 0.4-0.7 ms of server time. Cheaper candidates, in order:
+- keep the zero row per attachment (`cached_metadata`);
+- read `q` (one row a head) without a gather, as a whole-row block of a `[heads, 64]` buffer whose `m` is 1;
+- after that, the default tile choice (roadmap, "Per-workload tile choice") on one tile.

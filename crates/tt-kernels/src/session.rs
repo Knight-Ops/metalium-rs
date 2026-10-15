@@ -391,6 +391,29 @@ pub struct DataflowProgress {
     pub waits: [u32; 5],
 }
 
+/// How [`Session::matmul_dram_batched_with`] lays out its left operand and
+/// output when a product's `m` is not whole tiles.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BatchedLayout {
+    /// `a` holds a block per whole tile rows already (a previous product's
+    /// output left unstacked): each left block starts on a tile row and the
+    /// rows to the next block are its own, whatever they hold -- they are `M`,
+    /// so they only make output rows that are not read. Never gathered.
+    pub lhs_padded: bool,
+    /// The output is the stacked `[batch m, n]`; otherwise `[batch mt 32, n]`,
+    /// product `i` from tile row `i mt`, its tail rows the products of the left
+    /// block's tail rows.
+    pub stacked: bool,
+}
+
+impl BatchedLayout {
+    /// The products stacked, every operand gathered as it needs.
+    pub const STACKED: BatchedLayout = BatchedLayout {
+        lhs_padded: false,
+        stacked: true,
+    };
+}
+
 /// A chip opened for compute on one or more Tensix tiles, in the order the
 /// module documentation gives.
 pub struct Session<T: Transport> {
@@ -4939,6 +4962,35 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
+        self.matmul_dram_batched_with(
+            a,
+            b,
+            items,
+            mkn,
+            route,
+            fidelity,
+            budget,
+            BatchedLayout::STACKED,
+        )
+    }
+
+    /// [`Session::matmul_dram_batched`] with the left operand, the output, or
+    /// both laid out a product per whole tile rows ([`BatchedLayout`]): a
+    /// composition that keeps its products' rows apart between two batched
+    /// products (attention's scores, from `Q K^T` to `P V`) skips the stacking
+    /// gather after the first and the operand gather before the second.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dram_batched_with(
+        &mut self,
+        a: &DramTensor,
+        b: &DramTensor,
+        items: &[(tensor::Block, tensor::Block)],
+        mkn: [usize; 3],
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        layout: BatchedLayout,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         a.expect("a matmul", tensor::Elem::F32)?;
         b.expect("a matmul", tensor::Elem::F32)?;
@@ -4969,7 +5021,12 @@ impl<T: Transport> Session<T> {
             let mut items = items.to_vec();
             let mut padded = [false; 2];
             let mut operands = [a, b];
-            for side in 0..2 {
+            if layout.lhs_padded {
+                // Each block starts on a tile row of `a` and owns the rows to the next
+                // block: its tail rows only make output rows nobody reads.
+                padded[0] = true;
+            }
+            for side in usize::from(layout.lhs_padded)..2 {
                 let t = &operands[side];
                 let extent = |block: &tensor::Block| {
                     if side == 0 {
@@ -5029,7 +5086,7 @@ impl<T: Transport> Session<T> {
                 })
                 .and_then(|work| self.execute_on(work, units, budget))?;
             out.set_pad(need.produces(&[&a, &b]));
-            if items.len() == 1 || m % 32 == 0 {
+            if !layout.stacked || items.len() == 1 || m % 32 == 0 {
                 return Ok(out);
             }
             // Each product's rows from its own tile row: stack them.

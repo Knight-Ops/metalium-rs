@@ -1,5 +1,5 @@
 //! A batched matmul whose products are not whole tile rows, over blocks that are not either
-//! (`docs/plans/attention-jobs.md`, P1 and P2).
+//! (`docs/completed-plans/attention-jobs.md`, P1 and P2).
 //!
 //! `Session::matmul_dram_batched` refused a batch whose `m` was not whole tiles, and burn-tt then
 //! ran attention's products one head at a time (two element repacks and a matmul a head, then a row

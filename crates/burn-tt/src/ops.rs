@@ -2206,6 +2206,33 @@ pub mod float {
     /// buffer, or its blocks are neither whole tiles nor whole rows of it
     /// (`Strided::matrix_blocks`).
     fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+        let plan = batched_plan(lhs, rhs)?;
+        let (id, dims) =
+            crate::server::matmul_dram_batched(lhs.device, plan.a, plan.b, plan.items, plan.mkn);
+        let mut shape = plan.batch;
+        shape.extend([plan.mkn[0], plan.mkn[2]]);
+        Some(device_result_shaped(
+            lhs.device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        ))
+    }
+
+    /// What [`batched_matmul`] submits: the operands' buffers, a pair of
+    /// blocks a product, `[m, k, n]`, and the broadcast batch dimensions.
+    pub(crate) struct BatchedPlan {
+        pub(crate) a: crate::BufferId,
+        pub(crate) b: crate::BufferId,
+        pub(crate) items: Vec<(crate::Block, crate::Block)>,
+        pub(crate) mkn: [usize; 3],
+        pub(crate) batch: Vec<usize>,
+    }
+
+    /// [`batched_matmul`]'s plan for `lhs @ rhs`, or `None` where it takes
+    /// another path.
+    pub(crate) fn batched_plan(lhs: &TtTensor, rhs: &TtTensor) -> Option<BatchedPlan> {
         let device = lhs.device;
         let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
         let rank = ls.len().max(rs.len());
@@ -2230,32 +2257,29 @@ pub mod float {
             .zip(&lb)
             .map(|(&a, &b)| (a == b || a == 1 || b == 1).then_some(a.max(b)))
             .collect::<Option<_>>()?;
-        let view = |t: &TtTensor| {
-            t.as_strided().or_else(|| {
-                t.to_dram();
-                t.as_strided()
-            })
-        };
-        let (va, vb) = (view(lhs)?, view(rhs)?);
-        let ba = va.matrix_blocks(&ls, &batch)?;
-        let bb = vb.matrix_blocks(&rs, &batch)?;
-        let items: Vec<_> = ba.into_iter().zip(bb).collect();
-        let (id, dims) = crate::server::matmul_dram_batched(
-            device,
-            va.src.buffer.id,
-            vb.src.buffer.id,
-            items,
-            [m, k, n],
-        );
-        let mut shape = batch;
-        shape.extend([m, n]);
-        Some(device_result_shaped(
-            device,
-            id,
-            dims,
-            burn_backend::Shape::from(shape),
-            DType::F32,
-        ))
+        let (a, ba) = operand_blocks(lhs, &batch)?;
+        let (b, bb) = operand_blocks(rhs, &batch)?;
+        Some(BatchedPlan {
+            a,
+            b,
+            items: ba.into_iter().zip(bb).collect(),
+            mkn: [m, k, n],
+            batch,
+        })
+    }
+
+    /// The buffer a batched matmul reads `t` from, and `t`'s block for each
+    /// index of `batch` (`Strided::matrix_blocks`).
+    pub(crate) fn operand_blocks(
+        t: &TtTensor,
+        batch: &[usize],
+    ) -> Option<(crate::BufferId, Vec<crate::Block>)> {
+        let v = t.as_strided().or_else(|| {
+            t.to_dram();
+            t.as_strided()
+        })?;
+        let blocks = v.matrix_blocks(&t.shape().to_vec(), batch)?;
+        Some((v.src.buffer.id, blocks))
     }
 
     /// `tensor` with dimensions `dim1` and `dim2` swapped, as a view of its
@@ -3510,6 +3534,12 @@ pub mod module {
                 float_compute_input(value),
             )
         };
+        if mask.is_none() && attn_bias.is_none() {
+            if let Some(out) = padded_attention(&query, &key, &value, &options, scale) {
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
+            }
+        }
         let scores = {
             let _part = part("attention/qk");
             float::float_matmul(query, float::float_transpose(key))
@@ -3531,21 +3561,11 @@ pub mod module {
             scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
         }
         if options.is_causal {
-            let [sq, sk] = [qs[2], ks[2]];
-            let offset = sk as i128 - sq as i128;
-            let bits = (0..sq)
-                .flat_map(|r| (0..sk).map(move |c| u32::from(c as i128 > r as i128 + offset)))
-                .collect();
-            let id = crate::server::metadata(device, bits, [sq, sk], Elem::Bool);
-            let bool_dtype = burn_backend::get_device_settings::<TtBackend>(&device).bool_dtype;
-            let mask = device_result_shaped(
-                device,
-                id,
-                [sq, sk],
-                [1, 1, sq, sk].into(),
-                bool_dtype.into(),
+            scores = float::float_mask_fill(
+                scores,
+                causal_mask(device, &qs, &ks),
+                f32::NEG_INFINITY.into(),
             );
-            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
         }
         if let Some(bias) = attn_bias {
             assert_eq!(device, bias.device, "attention bias device differs");
@@ -3570,6 +3590,182 @@ pub mod module {
         };
         let _part = part("attention/narrow");
         cast_native(out, dtype)
+    }
+
+    /// The bottom-right causal mask of `[b, h, sq, _]` queries over
+    /// `[_, _, sk, _]` keys (`true` where a key is later than the query's
+    /// position, offset by `sk - sq`), laid out as the scores are -- each
+    /// `[sq, sk]` block repeated for every batch and head, so `mask_fill` needs
+    /// no broadcast copy -- and kept for the attachment
+    /// (`nhwc::cached_metadata`): a decode loop's prefill, and every layer of
+    /// it, makes it once. Past a million elements only one block is kept and
+    /// `mask_fill` broadcasts it.
+    fn causal_mask(device: TtDevice, qs: &[usize], ks: &[usize]) -> TtTensor {
+        const WHOLE: usize = 1 << 20;
+        let [sq, sk] = [qs[2], ks[2]];
+        let count = if qs[0] * qs[1] * sq * sk <= WHOLE {
+            qs[0] * qs[1]
+        } else {
+            1
+        };
+        let shape = if count == 1 {
+            [1, 1, sq, sk]
+        } else {
+            [qs[0], qs[1], sq, sk]
+        };
+        causal_blocks(device, count, [sq, sk], sq, shape.into())
+    }
+
+    /// `count` causal `[sq, sk]` blocks, each from a row `stride` past the
+    /// last (rows past `sq` in a block unmasked), as a tensor of `shape`, kept
+    /// for the attachment.
+    fn causal_blocks(
+        device: TtDevice,
+        count: usize,
+        [sq, sk]: [usize; 2],
+        stride: usize,
+        shape: Shape,
+    ) -> TtTensor {
+        let offset = sk as i128 - sq as i128;
+        let block = move || {
+            (0..stride).flat_map(move |r| {
+                (0..sk).map(move |c| u32::from(r < sq && c as i128 > r as i128 + offset))
+            })
+        };
+        let bool_dtype = burn_backend::get_device_settings::<TtBackend>(&device).bool_dtype;
+        nhwc::cached_metadata(
+            device,
+            "attention causal mask",
+            vec![count, sq, sk, stride],
+            [count * stride, sk],
+            shape,
+            bool_dtype.into(),
+            || (0..count).flat_map(|_| block()).collect(),
+        )
+    }
+
+    /// Attention whose scores never leave the products' own tile rows: `Q K^T`
+    /// leaves each head's `[m, sk]` block from a tile row of its own (a plain
+    /// `[heads mt 32, sk]` tensor, the rows past `m` in each block those of `Q`'s
+    /// zero padding), the scale, causal mask and softmax run on that tensor
+    /// row by row, and `P V` reads it in place and stacks the heads' rows once
+    /// (`Session::matmul_dram_batched_with`). Each row's arithmetic is the
+    /// composition's, in its order, so the result is the same bits; what is
+    /// saved is the gather that stacks the scores and the one that pads them
+    /// again for `P V`. `None` (the composition) for a mesh, a matmul mode
+    /// other than `Fast`, a mask or bias (the caller's), a causal mask past a
+    /// million elements, or where padding would grow the scores by more than a
+    /// quarter (one query a head: 32 rows for 1).
+    fn padded_attention(
+        query: &TtTensor,
+        key: &TtTensor,
+        value: &TtTensor,
+        options: &burn_backend::ops::AttentionModuleOptions,
+        scale: f64,
+    ) -> Option<TtTensor> {
+        use tt_kernels::session::BatchedLayout;
+        let device = query.device;
+        if crate::matmul_mode::effective(device) != crate::MatmulMode::Fast
+            || crate::matmul_mode::fidelity_override().is_some()
+            || !crate::server::supports_batched_layout(device)
+        {
+            return None;
+        }
+        let part = crate::report::part;
+        let key_t = float::float_transpose(key.clone());
+        let qk = float::batched_plan(query, &key_t)?;
+        let [m, _, sk] = qk.mkn;
+        let count = qk.items.len();
+        // One product is never padded (`matmul_dram_batched_with`).
+        let stride = if count == 1 { m } else { m.div_ceil(32) * 32 };
+        if 4 * count * stride > 5 * (count * m).div_ceil(32) * 32 {
+            return None;
+        }
+        let (vb, value_blocks) = float::operand_blocks(value, &qk.batch)?;
+        let dv = value.shape()[3];
+        if value.shape()[2] != sk || value_blocks.len() != count {
+            return None;
+        }
+        let rows = count * stride;
+        if options.is_causal && count * stride * sk > 1 << 20 {
+            return None;
+        }
+        let scores = {
+            let _part = part("attention/qk");
+            let (id, dims) = crate::server::matmul_dram_batched_layout(
+                device,
+                qk.a,
+                qk.b,
+                qk.items,
+                qk.mkn,
+                BatchedLayout {
+                    lhs_padded: false,
+                    stacked: false,
+                },
+            );
+            device_result_shaped(device, id, dims, Shape::new([rows, sk]), DType::F32)
+        };
+        let mut scores = {
+            let _part = part("attention/scale");
+            let mut scores = float::float_mul_scalar(scores, scale.into());
+            if let Some(cap) = options.softcap {
+                scores = float::float_mul_scalar(
+                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                    cap.into(),
+                );
+            }
+            scores
+        };
+        if options.is_causal {
+            let _part = part("attention/mask");
+            let mask = causal_blocks(device, count, [m, sk], stride, Shape::new([rows, sk]));
+            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
+        }
+        let probabilities = {
+            let _part = part("attention/softmax");
+            let max =
+                float::float_clamp_min(float::float_max_dim(scores.clone(), 1), (-f32::MAX).into());
+            let exp = float::float_exp(float::float_sub(scores, max));
+            let sum = float::float_clamp_min(
+                float::float_sum_dim(exp.clone(), 1),
+                f32::MIN_POSITIVE.into(),
+            );
+            float::float_div(exp, sum)
+        };
+        let _part = part("attention/pv");
+        let p = probabilities.to_dram();
+        if p.transposed || [p.buffer.rows, p.buffer.cols] != [rows, sk] {
+            return None;
+        }
+        let items = value_blocks
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    crate::Block {
+                        at: [i * stride, 0],
+                        transposed: false,
+                    },
+                    v,
+                )
+            })
+            .collect();
+        let (id, dims) = crate::server::matmul_dram_batched_layout(
+            device,
+            p.buffer.id,
+            vb,
+            items,
+            [m, sk, dv],
+            BatchedLayout {
+                lhs_padded: true,
+                stacked: true,
+            },
+        );
+        let mut shape = qk.batch;
+        shape.extend([m, dv]);
+        let out = device_result_shaped(device, id, dims, Shape::from(shape), DType::F32);
+        drop(probabilities);
+        Some(out)
     }
 
     /// Burn's own composition (`ModuleOps::embedding`'s default: a
