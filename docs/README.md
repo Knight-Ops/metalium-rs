@@ -45,6 +45,14 @@ flowchart TD
 
 ---
 
+**Decisions that bind future work** are recorded beside the tiers as Architectural Decision Records in
+[`docs/adr/`](adr/), one numbered file each, with the code paths they govern. Record one with
+`scryer record-adr` (which also indexes it, so `query_adrs` and `inspect_symbol` surface it on those paths), and
+search them with `scryer query-adrs`. So far:
+[0001](adr/0001-llm-support-is-generic-across-architectures-not-model-specific.md), LLM support is generic across
+architectures; [0002](adr/0002-profiling-is-one-switchable-mode-and-costs-nothing-unless-built-in.md), profiling is
+one switchable mode and costs nothing unless built in.
+
 ## The Three Tiers
 
 ### 1. `docs/learnings/` — Living Background & Empirical Source of Truth
