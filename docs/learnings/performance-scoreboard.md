@@ -88,6 +88,7 @@ row in place when its fix lands, add the run ID, and keep the old row in the log
 | SmolLM2-135M decode step from a token id, lookup included (card 0) | 26.4 ms | 623 ms (`1791852097`) | 23.6x | at or below burn-flex | 3 |
 | SmolLM2-135M BF16 decoded token, six layers, lookup included (card 0) | not measured | 37.5 s (`1791848957`) | n/a | no slower than F32 | 5 |
 | ViT-Tiny forward, 224x224 (card 1), every tile (`TT_TILES=all`), traced replay | 107.6 ms | 12.6 ms (`1792026627`; `work:64:4` 61.9, `1792026634`; one tile does not capture) | 0.12x | at or below burn-flex: **met** (one tile: "Trace segmentation") | 6 |
+| SmolLM2-135M decode step, lookup excluded (card 1), every tile (`TT_TILES=all`), fixed shapes, traced replay | 26.6 ms | 37.1 ms (`1792029144`; `work:64:4` 83.5, `1792029158`; one tile 478.3, `1792029169`) | 1.4x | at or below burn-flex | 6 |
 | ResNet-18 forward, 224x224 (card 1), every tile (`TT_TILES=all`), traced replay | 151.7 ms | 17.6 ms (`1792000003`; untraced, same settings, 205.7 ms) | 0.12x | at or below burn-flex: **met** (one tile does not capture: program cache, item "Trace segmentation") | 6 |
 | Traced rows for ViT-Tiny and SmolLM2 | n/a | not measured | n/a | measure once segmentation lands | 6 |
 

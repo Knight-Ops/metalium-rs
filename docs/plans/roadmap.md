@@ -454,10 +454,18 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     spread, against burn-flex's 107.6 (run `1792026627`), and bit for bit the eager forward. At `work:64:4` it is 61.9 ms
     (`1792026634`), where it now captures. One tile does not capture
     ([log](../learnings/performance-log.md#vit-tiny-traced-2026-10-15-card-1)).
-  - **A decode step cannot be traced as written.** Each step's cache position and attention length change, so a fixed
-    shape (the whole `max_len` cache with a length mask, a cache write at a position read from a tensor) is needed
-    first. That is a model-side or Burn-API change.
-  - **Left:** a fixed-shape decode step, and ResNet-18 and ViT on fewer tiles once segmentation lands.
+  - **SmolLM2 decode step** (2026-10-15, card 1, `smollm2_decode_traced`, gate `step185_fixed_decode`).
+    - **How it traces:** `Llama::step_fixed` gives the step fixed shapes. The position is a tensor; the rotary rows
+      are a row select; the cache is written by `mask_where` and attention masks the later positions.
+      `TracedInference::capture_with_state` writes the cache back on the card after each replay.
+    - **Result:** a replayed token is **37.1 ms** on every tile, against burn-flex's 26.6 (run `1792029144`), and bit
+      for bit the eager fixed step. That is 83.5 ms at `work:64:4` and 478.3 on one tile, where it also captures
+      ([log](../learnings/performance-log.md#smollm2-decode-step-traced-2026-10-15-cards-0-and-1)).
+    - **Open:** where its device time goes.
+  - **Left:**
+    - the decode replay's device profile, then what it shows (the m = 1 products, `mask_where`'s cache copies);
+    - a traced prefill;
+    - ResNet-18 and ViT on fewer tiles once segmentation lands.
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),

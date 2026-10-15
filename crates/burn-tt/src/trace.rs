@@ -206,6 +206,20 @@ impl TracedInference {
         inputs: &[&TtTensor],
         f: impl FnOnce() -> Vec<TtTensor>,
     ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
+        Self::capture_with_state(inputs, || (f(), Vec::new()))
+    }
+
+    /// [`TracedInference::capture`] of a step that carries state from one run
+    /// to the next -- a decoder's key/value cache. `f` returns the outputs and
+    /// `(new, state)` pairs: an on-device `copy_into` of each `new` over its
+    /// `state` is recorded before the capture ends, so every replay leaves the
+    /// state as the step computed it, read by the next replay, with no host
+    /// copy. Each `state` must be a tensor the step reads (not one it makes):
+    /// it is kept alive by the trace.
+    pub fn capture_with_state(
+        inputs: &[&TtTensor],
+        f: impl FnOnce() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
+    ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
         let Some(first_in) = inputs.first() else {
             return Err(TtError::Device(
                 "a trace needs at least one input tensor".into(),
@@ -237,7 +251,7 @@ impl TracedInference {
 
         server::run(device, |e, _| e.begin_trace())?;
         let mut guard = Capturing::new(device, false);
-        let outs = f();
+        let (outs, updates) = f();
         let mut out_info = Vec::with_capacity(outs.len());
         for out in &outs {
             if out.device != device {
@@ -259,6 +273,24 @@ impl TracedInference {
                 server::OutputKind::Bits
             };
             out_info.push((d.buffer.id, kind, [d.buffer.rows, d.buffer.cols]));
+        }
+        // The state written back in place, last, as `TracedTrainingStep` writes its parameters.
+        let mut held_state = Vec::with_capacity(updates.len() * 2);
+        for (new, state) in updates {
+            if new.device != device || state.device != device {
+                return Err(TtError::Device(
+                    "state tensors must belong to the trace device".into(),
+                ));
+            }
+            let (new_d, state_d) = (new.to_dram(), state.to_dram());
+            if new_d.transposed || state_d.transposed || state_d.buffer.parent.is_some() {
+                return Err(TtError::Device(
+                    "state must own its buffer, and neither side be a transposed view".into(),
+                ));
+            }
+            server::copy_into(device, new_d.buffer.id, state_d.buffer.id)?;
+            held_state.push(new);
+            held_state.push(state);
         }
         guard.open = false;
         let id = server::run(device, |e, _| e.end_trace())?;
@@ -283,6 +315,7 @@ impl TracedInference {
             held.push((*inp).clone());
         }
         held.extend(outs);
+        held.extend(held_state);
 
         Ok((
             TracedInference {

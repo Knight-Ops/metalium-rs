@@ -110,6 +110,33 @@ impl<B: Backend> Rope<B> {
         }
     }
 
+    /// The tables for every position below `max_len`, `[max_len, HEAD_DIM]` each: what
+    /// [`Rope::at`] selects a position's row from. Each row is [`Rope::new`]'s for that position,
+    /// the same products in the same order.
+    fn table(max_len: usize, dtype: DType, device: &B::Device) -> Self {
+        let r = Self::new(0, max_len, dtype, device);
+        Self {
+            cos: r.cos.reshape([1, 1, max_len, HEAD_DIM]),
+            sin: r.sin.reshape([1, 1, max_len, HEAD_DIM]),
+        }
+    }
+
+    /// The row of a [`Rope::table`] at `position` (`[1]`, on the device): a row select, so a
+    /// traced step replays it with a new position.
+    fn at(&self, position: Tensor<B, 1, Int>) -> Self {
+        let [_, _, max_len, d] = self.cos.dims();
+        let row = |t: &Tensor<B, 4>| {
+            t.clone()
+                .reshape([max_len, d])
+                .select(0, position.clone())
+                .reshape([1, 1, 1, d])
+        };
+        Self {
+            cos: row(&self.cos),
+            sin: row(&self.sin),
+        }
+    }
+
     fn apply(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let [n, h, t, d] = x.dims();
         let half = d / 2;
@@ -172,7 +199,7 @@ impl<B: Backend> Layer<B> {
         x: Tensor<B, 3>,
         rope: &Rope<B>,
         cache: &mut LayerCache<B>,
-        start: usize,
+        write: &Write<B>,
         index: usize,
         act: Option<&ActFn<B>>,
     ) -> Tensor<B, 3> {
@@ -189,39 +216,58 @@ impl<B: Backend> Layer<B> {
         let k = rope.apply(heads(project(h.clone(), &a.k_proj), KV_HEADS));
         let v = heads(project(h, &a.v_proj), KV_HEADS);
 
-        let total = start + t;
-        cache.k = cache
-            .k
-            .clone()
-            .slice_assign([0..n, 0..KV_HEADS, start..total, 0..HEAD_DIM], k);
-        cache.v = cache
-            .v
-            .clone()
-            .slice_assign([0..n, 0..KV_HEADS, start..total, 0..HEAD_DIM], v);
-        let keys = repeat_kv(
-            cache
-                .k
-                .clone()
-                .slice([0..n, 0..KV_HEADS, 0..total, 0..HEAD_DIM]),
-        );
-        let values = repeat_kv(
-            cache
-                .v
-                .clone()
-                .slice([0..n, 0..KV_HEADS, 0..total, 0..HEAD_DIM]),
-        );
-
-        // A prompt attends causally to itself; one new token attends to everything cached.
+        let (keys, values, mask, is_causal) =
+            match write {
+                Write::At(start) => {
+                    let total = start + t;
+                    cache.k = cache
+                        .k
+                        .clone()
+                        .slice_assign([0..n, 0..KV_HEADS, *start..total, 0..HEAD_DIM], k);
+                    cache.v = cache
+                        .v
+                        .clone()
+                        .slice_assign([0..n, 0..KV_HEADS, *start..total, 0..HEAD_DIM], v);
+                    let keys = repeat_kv(cache.k.clone().slice([
+                        0..n,
+                        0..KV_HEADS,
+                        0..total,
+                        0..HEAD_DIM,
+                    ]));
+                    let values = repeat_kv(cache.v.clone().slice([
+                        0..n,
+                        0..KV_HEADS,
+                        0..total,
+                        0..HEAD_DIM,
+                    ]));
+                    // A prompt attends causally to itself; one new token attends to everything cached.
+                    (keys, values, None, t > 1)
+                }
+                Write::Masked { here, later } => {
+                    // The new key and value land where `here` is set, every other position kept;
+                    // the query attends to every position not `later` than its own.
+                    let shape = cache.k.dims();
+                    let here = here.clone().expand(shape);
+                    cache.k = cache.k.clone().mask_where(here.clone(), k.expand(shape));
+                    cache.v = cache.v.clone().mask_where(here, v.expand(shape));
+                    (
+                        repeat_kv(cache.k.clone()),
+                        repeat_kv(cache.v.clone()),
+                        Some(later.clone()),
+                        false,
+                    )
+                }
+            };
         let out = attention(
             q,
             keys,
             values,
-            None,
+            mask,
             None,
             AttentionModuleOptions {
                 scale: None,
                 softcap: None,
-                is_causal: t > 1,
+                is_causal,
             },
         );
         let context = hook(
@@ -244,6 +290,46 @@ impl<B: Backend> Layer<B> {
 struct LayerCache<B: Backend> {
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
+}
+
+/// How a step puts its keys and values into a layer's cache, and which of them it attends to.
+enum Write<B: Backend> {
+    /// At positions `start..start + t`, known on the host; the query attends to positions
+    /// `..start + t` (causally within the new ones).
+    At(usize),
+    /// At the one position set in `here` (`[1, 1, max_len, 1]`); the query attends to every
+    /// position but those set in `later` (`[1, 1, 1, max_len]`). Both are tensors, so the step's
+    /// shapes do not depend on the position ([`FixedCache`]).
+    Masked {
+        here: Tensor<B, 4, burn::tensor::Bool>,
+        later: Tensor<B, 4, burn::tensor::Bool>,
+    },
+}
+
+/// A key/value cache whose step has the same shapes at every position, so it can be traced: one
+/// token a step, its position a tensor, attention over all `max_len` positions with the ones not
+/// yet written masked. [`Llama::step_fixed`] is [`Llama::forward_embedded`]'s decode step with
+/// the same arithmetic on every position it attends to.
+pub struct FixedCache<B: Backend> {
+    layers: Vec<LayerCache<B>>,
+    max_len: usize,
+    rope: Rope<B>,
+    /// `0..max_len`, to compare a position with.
+    positions: Tensor<B, 1, Int>,
+}
+
+impl<B: Backend> FixedCache<B> {
+    pub fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    /// Every layer's keys and values, in layer order: the state a traced step writes back.
+    pub fn state(&self) -> Vec<Tensor<B, 4>> {
+        self.layers
+            .iter()
+            .flat_map(|c| [c.k.clone(), c.v.clone()])
+            .collect()
+    }
 }
 
 /// The keys and values of every position a model has seen.
@@ -393,11 +479,71 @@ impl<B: Backend> Llama<B> {
         }
         let rope = Rope::new(start, t, dtype, &device);
         let act = cache.act.clone();
+        let write = Write::At(start);
         for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            x = layer.forward(x, &rope, c, start, index, act.as_ref());
+            x = layer.forward(x, &rope, c, &write, index, act.as_ref());
         }
         cache.len += t;
+        self.head(x, t)
+    }
 
+    /// An empty [`FixedCache`] for `max_len` positions.
+    pub fn fixed_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> FixedCache<B> {
+        let shape = [1, KV_HEADS, max_len, HEAD_DIM];
+        FixedCache {
+            layers: self
+                .layers
+                .iter()
+                .map(|_| LayerCache {
+                    k: Tensor::zeros(shape, (device, dtype)),
+                    v: Tensor::zeros(shape, (device, dtype)),
+                })
+                .collect(),
+            max_len,
+            rope: Rope::table(max_len, dtype, device),
+            positions: Tensor::arange(0..max_len as i64, device),
+        }
+    }
+
+    /// One decode step whose shapes do not depend on its position: the embedded token `x`
+    /// (`[1, 1, HIDDEN]`) at `position` (`[1]`, below `cache.max_len()`), its keys and values
+    /// written into `cache` there, the logits `[1, VOCAB]` returned. The position is a tensor,
+    /// so the step can be captured once and replayed at every position
+    /// (`burn_tt::TracedInference::capture_with_state`, with [`FixedCache::state`]).
+    pub fn step_fixed(
+        &self,
+        mut x: Tensor<B, 3>,
+        position: Tensor<B, 1, Int>,
+        cache: &mut FixedCache<B>,
+        dtype: DType,
+    ) -> Tensor<B, 2> {
+        assert_eq!(x.dims(), [1, 1, HIDDEN], "one token a step");
+        if x.dtype() != dtype {
+            x = x.cast(dtype);
+        }
+        let max_len = cache.max_len;
+        let at = position.clone().expand([max_len]);
+        let write = Write::Masked {
+            here: cache
+                .positions
+                .clone()
+                .equal(at.clone())
+                .reshape([1, 1, max_len, 1]),
+            later: cache
+                .positions
+                .clone()
+                .greater(at)
+                .reshape([1, 1, 1, max_len]),
+        };
+        let rope = cache.rope.at(position);
+        for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            x = layer.forward(x, &rope, c, &write, index, None);
+        }
+        self.head(x, 1)
+    }
+
+    /// The logits `[1, VOCAB]` of the last of `t` positions of `x`.
+    fn head(&self, x: Tensor<B, 3>, t: usize) -> Tensor<B, 2> {
         let last = self
             .norm
             .forward(x)

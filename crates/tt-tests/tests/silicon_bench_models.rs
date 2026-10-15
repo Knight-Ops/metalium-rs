@@ -379,6 +379,138 @@ fn smollm2_decode_without_the_embedding_lookup() {
     });
 }
 
+/// `smollm2_decode_without_the_embedding_lookup` with fixed shapes (`Llama::step_fixed`: the position
+/// a tensor, attention over a 64-position cache with the later positions masked), first eagerly,
+/// then as a trace: one step captured at position 1 with the cache as state written back in place
+/// (`TracedInference::capture_with_state`), each timed pass a replay that writes the next
+/// position's embedding and position and reads the logits back, with no op submitted by the host.
+/// Every replay's logits equal the eager fixed step's at that position bit for bit. Skipped, with
+/// the reason, where the step's programs do not fit the program cache.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_decode_traced() {
+    use burn::tensor::{Int, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
+    const MAX_LEN: usize = 64;
+    let row: Vec<f32> = {
+        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![7042i32], [1, 1]),
+            &FlexDevice,
+        );
+        m.embed(ids).into_data().to_vec::<f32>().unwrap()
+    };
+    {
+        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let mut cache = m.cache(MAX_LEN, DType::F32, &FlexDevice);
+        baseline("smollm2-135m decode step, traced", || {
+            let x = Tensor::<Flex, 3>::from_data(
+                TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                &FlexDevice,
+            );
+            m.forward_embedded(x, &mut cache, DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        });
+    }
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let dtype = DType::F32;
+        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let x =
+            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let at = |p: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
+        };
+        let positions = 2 + WARMUPS + SAMPLES;
+        // Eager fixed steps: the reference logits at every position, and their cost.
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let mut eager = Vec::new();
+        let mut ms = Vec::new();
+        for p in 0..positions {
+            let t0 = Instant::now();
+            eager.push(
+                m.step_fixed(x(), at(p), &mut cache, dtype)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap(),
+            );
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        report(
+            "smollm2-135m decode step, fixed shapes, eager",
+            "ms",
+            "host",
+            Stats::of(ms[2 + WARMUPS..].to_vec()),
+        );
+        // The trace: an eager step at 0 makes the cache resident, the step at 1 is captured.
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let _ = m.step_fixed(x(), at(0), &mut cache, dtype).into_data();
+        let (xin, pin) = (x(), at(1));
+        let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
+            unreachable!()
+        };
+        xp.ensure_resident();
+        let pp = pin.clone().into_primitive();
+        pp.ensure_resident();
+        let float = |t: Tensor<TtBackend, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!(),
+        };
+        let old: Vec<TtTensor> = cache.state().into_iter().map(float).collect();
+        let captured = TracedInference::capture_with_state(&[&xp, &pp], || {
+            let TensorPrimitive::Float(y) = m
+                .step_fixed(xin.clone(), pin.clone(), &mut cache, dtype)
+                .into_primitive()
+            else {
+                unreachable!()
+            };
+            let new = cache.state().into_iter().map(float);
+            (vec![y], new.zip(old.iter().cloned()).collect())
+        });
+        let (trace, first) = match captured {
+            Ok(t) => t,
+            Err(e) => {
+                let cause = format!(
+                    "{:?}",
+                    <TtBackend as burn::tensor::backend::Backend>::sync(&d)
+                );
+                assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+                eprintln!(
+                    "SKIP smollm2-135m decode step, traced: the step's programs do not fit one \
+                     tile's program cache (run with TT_TILES=all until traces are segmented): {cause}"
+                );
+                return;
+            }
+        };
+        let logits = |o: &[OutputPayload]| match &o[0] {
+            OutputPayload::F32(v) => v.clone(),
+            other => panic!("logits as {other:?}"),
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&logits(&first)), bits(&eager[1]), "the capture's run");
+        let mut ms = Vec::new();
+        for (p, want) in eager.iter().enumerate().skip(2) {
+            let t0 = Instant::now();
+            let got = trace
+                .run(vec![
+                    InputPayload::F32(row.clone()),
+                    InputPayload::Bits(vec![p as u32]),
+                ])
+                .unwrap();
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(bits(&logits(&got)), bits(want), "replay at position {p}");
+        }
+        report(
+            "smollm2-135m decode step, traced",
+            "ms",
+            "host",
+            Stats::of(ms[WARMUPS..].to_vec()),
+        );
+    });
+}
+
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn smollm2_decode_with_the_embedding_lookup() {
