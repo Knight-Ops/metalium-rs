@@ -569,6 +569,14 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).
+- [ ] **Trace size in GDDR.** SmolLM2's step and its 64/128/256 prefill chunks hold **3.75 GB** of trace streams
+  across 120 units (the step 0.45 GB, `Chunk(256)` 1.46 GB; run `1792072109`), about 8 KB an op a participating
+  unit.
+  - **Likely cause (not yet measured):** each `PAIR_CALL`'s reader and writer sections are allocated separately in
+    whole GDDR slots (`Session::store_region`, at least `TILE_SLOT`, 4,160 bytes, each) while holding a few entries.
+  - **Measure first:** the entries `UnitFootprint::stream` counts, times 32 bytes, against `gddr_bytes`.
+  - **The fix if so:** one contiguous arena per unit per trace, its sections packed at entry alignment.
+  - **When:** before the 1B-parameter model (Track 1), whose F32 weights alone take 4-5 GB of a card's 32.
 - [ ] **B13b** general SFPU micro-op chain fuser (today one fuser, `ADD_RELU`).
   [kernel-fusion.md](kernel-fusion.md) lines 195–197.
 - [ ] **B13c** matmul + bias + activation epilogue (kernel-fusion.md lines 200–204).
