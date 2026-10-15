@@ -2203,8 +2203,8 @@ pub mod float {
     /// still on the host are uploaded, as the 2-D path does. `None` -- the
     /// host-staged path -- when a batch dimension broadcasts other than
     /// from 1, the last two dimensions of an operand are not a block of its
-    /// buffer, a block is not whole tiles, or the products are not whole
-    /// tile rows each.
+    /// buffer, or its blocks are neither whole tiles nor whole rows of it
+    /// (`Strided::matrix_blocks`).
     fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         let device = lhs.device;
         let (ls, rs) = (lhs.shape().to_vec(), rhs.shape().to_vec());
@@ -2230,10 +2230,6 @@ pub mod float {
             .zip(&lb)
             .map(|(&a, &b)| (a == b || a == 1 || b == 1).then_some(a.max(b)))
             .collect::<Option<_>>()?;
-        let count: usize = batch.iter().product();
-        if count > 1 && m % 32 != 0 {
-            return None;
-        }
         let view = |t: &TtTensor| {
             t.as_strided().or_else(|| {
                 t.to_dram();
@@ -3503,19 +3499,33 @@ pub mod module {
         }
         let device = query.device;
         let scale = options.scale.unwrap_or_else(|| 1.0 / (qs[3] as f64).sqrt());
-        let query = float_compute_input(query);
-        let key = float_compute_input(key);
-        let value = float_compute_input(value);
-        let mut scores = float::float_mul_scalar(
-            float::float_matmul(query, float::float_transpose(key)),
-            scale.into(),
-        );
-        if let Some(cap) = options.softcap {
-            scores = float::float_mul_scalar(
-                float::float_tanh(float::float_div_scalar(scores, cap.into())),
-                cap.into(),
-            );
-        }
+        // Each stage's jobs are charged to a part of `attention` of its own
+        // (`report::part`), so a report says which of them the cost is.
+        let part = crate::report::part;
+        let (query, key, value) = {
+            let _part = part("attention/widen");
+            (
+                float_compute_input(query),
+                float_compute_input(key),
+                float_compute_input(value),
+            )
+        };
+        let scores = {
+            let _part = part("attention/qk");
+            float::float_matmul(query, float::float_transpose(key))
+        };
+        let mut scores = {
+            let _part = part("attention/scale");
+            let mut scores = float::float_mul_scalar(scores, scale.into());
+            if let Some(cap) = options.softcap {
+                scores = float::float_mul_scalar(
+                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                    cap.into(),
+                );
+            }
+            scores
+        };
+        let _part = part("attention/mask");
         if let Some(mask) = mask {
             assert_eq!(device, mask.device, "attention mask device differs");
             scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
@@ -3542,17 +3552,24 @@ pub mod module {
             assert_eq!(dtype, bias.dtype(), "attention bias dtype differs");
             scores = float::float_add(scores, float_compute_input(bias));
         }
-        let max =
-            float::float_clamp_min(float::float_max_dim(scores.clone(), 3), (-f32::MAX).into());
-        let exp = float::float_exp(float::float_sub(scores, max));
-        let sum = float::float_clamp_min(
-            float::float_sum_dim(exp.clone(), 3),
-            f32::MIN_POSITIVE.into(),
-        );
-        cast_native(
-            float::float_matmul(float::float_div(exp, sum), value),
-            dtype,
-        )
+        drop(_part);
+        let probabilities = {
+            let _part = part("attention/softmax");
+            let max =
+                float::float_clamp_min(float::float_max_dim(scores.clone(), 3), (-f32::MAX).into());
+            let exp = float::float_exp(float::float_sub(scores, max));
+            let sum = float::float_clamp_min(
+                float::float_sum_dim(exp.clone(), 3),
+                f32::MIN_POSITIVE.into(),
+            );
+            float::float_div(exp, sum)
+        };
+        let out = {
+            let _part = part("attention/pv");
+            float::float_matmul(probabilities, value)
+        };
+        let _part = part("attention/narrow");
+        cast_native(out, dtype)
     }
 
     /// Burn's own composition (`ModuleOps::embedding`'s default: a

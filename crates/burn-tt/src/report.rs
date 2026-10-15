@@ -146,6 +146,9 @@ static GLOBAL: Mutex<Option<HashMap<&'static str, OpStat>>> = Mutex::new(None);
 
 struct Frame {
     op: &'static str,
+    /// The part of `op` now running ([`part`]): jobs are charged to it
+    /// instead of `op`.
+    part: Option<&'static str>,
     /// Where the last tensor made inside this op (not inside a nested one)
     /// was made: `Some(true)` on the device. The last one is the result.
     made_on_device: Option<bool>,
@@ -207,6 +210,7 @@ pub fn enter(op: &'static str, hand_written: bool) -> OpGuard {
     STACK.with(|s| {
         s.borrow_mut().push(Frame {
             op,
+            part: None,
             made_on_device: None,
         })
     });
@@ -265,13 +269,46 @@ fn is_readback(op: &str) -> bool {
     op.ends_with("_into_data") || op == "tr_execute"
 }
 
+/// Charges the jobs the innermost op queues to `name`, one part of a composed
+/// op (`"attention/qk"`), until dropped: the jobs and their server time get a
+/// row of their own instead of the op's, so the parts sum to what the op alone
+/// counted. Calls and where the result was made stay the op's.
+pub(crate) fn part(name: &'static str) -> PartGuard {
+    let previous = STACK.with(|s| s.borrow_mut().last_mut().map(|f| f.part.replace(name)));
+    PartGuard { previous }
+}
+
+/// Restores the enclosing part ([`part`]) when dropped.
+#[must_use]
+pub(crate) struct PartGuard {
+    previous: Option<Option<&'static str>>,
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            STACK.with(|s| {
+                if let Some(f) = s.borrow_mut().last_mut() {
+                    f.part = previous;
+                }
+            });
+        }
+    }
+}
+
 /// A job is being queued on a server thread: charge it to the innermost op
-/// on this thread, and return that op's name for [`served`]. A job queued
-/// outside every op (a trace's capture, a caller's own `burn-tt` API) is
-/// timed under [`OUTSIDE`] and counted in no op's row.
+/// on this thread (or the part of it running, [`part`]), and return that name
+/// for [`served`]. A job queued outside every op (a trace's capture, a
+/// caller's own `burn-tt` API) is timed under [`OUTSIDE`] and counted in no
+/// op's row.
 pub(crate) fn queued() -> &'static str {
-    match current() {
-        Some(op) => {
+    let charged = STACK.with(|s| s.borrow().last().map(|f| (f.part, f.op)));
+    match charged {
+        Some((Some(part), _)) => {
+            bump(part, Some(true), |s| s.jobs += 1);
+            part
+        }
+        Some((None, op)) => {
             bump(op, None, |s| s.jobs += 1);
             op
         }

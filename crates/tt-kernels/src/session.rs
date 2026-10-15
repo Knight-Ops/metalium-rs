@@ -4917,8 +4917,17 @@ impl<T: Transport> Session<T> {
     /// `op(A_i) @ op(B_i)` for each pair of blocks in `items`, every product
     /// `[m, k] @ [k, n]`, into one `[items.len() m, n]` tensor in GDDR
     /// ([`tensor::matmul_dram_batched`]): a batched matmul whose operands are
-    /// resident tensors or tile-aligned blocks of them, gathered where they
-    /// lie.
+    /// resident tensors or blocks of them, each product [`Session::matmul_dram`]'s
+    /// bit for bit.
+    ///
+    /// A block is read where it lies when it starts on a tile and ends on one
+    /// or at its tensor's edge ([`tensor::block_fits`]). An operand with a block
+    /// that does not, but whose blocks are each whole rows of it (attention's
+    /// heads stacked in a `[heads s, d]` buffer, `s` not whole tiles), is first
+    /// gathered by rows into a block per whole tile rows with zero tail rows --
+    /// one row gather, not a copy a block. When `m` is not whole tiles each
+    /// product's output starts on a tile row of its own, and one row gather
+    /// stacks the products' rows.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_dram_batched(
         &mut self,
@@ -4936,44 +4945,153 @@ impl<T: Transport> Session<T> {
         // A block that reaches its tensor's ragged edge reads the tensor's
         // padding as `K`'s: the same fill `matmul_dram` asks for.
         let need = tensor::MatmulPadding;
-        let ca = self.meet(a, need.requires(0))?;
-        let cb = match self.meet(b, need.requires(1)) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(c) = ca {
-                    let _ = self.free(c);
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let ca = self.meet(a, need.requires(0))?;
+            let a = match ca {
+                Some(c) => {
+                    temporary.push(c);
+                    temporary.last().unwrap().clone()
                 }
-                return Err(e);
+                None => a.clone(),
+            };
+            let cb = self.meet(b, need.requires(1))?;
+            let b = match cb {
+                Some(c) => {
+                    temporary.push(c);
+                    temporary.last().unwrap().clone()
+                }
+                None => b.clone(),
+            };
+            let [m, k, n] = mkn;
+            let extent_a = |t: bool| if t { [k, m] } else { [m, k] };
+            let extent_b = |t: bool| if t { [n, k] } else { [k, n] };
+            let mut items = items.to_vec();
+            let mut padded = [false; 2];
+            let mut operands = [a, b];
+            for side in 0..2 {
+                let t = &operands[side];
+                let extent = |block: &tensor::Block| {
+                    if side == 0 {
+                        extent_a(block.transposed)
+                    } else {
+                        extent_b(block.transposed)
+                    }
+                };
+                let pick = |item: &(tensor::Block, tensor::Block)| {
+                    if side == 0 {
+                        item.0
+                    } else {
+                        item.1
+                    }
+                };
+                if items
+                    .iter()
+                    .all(|i| tensor::block_fits(t, pick(i).at, extent(&pick(i))))
+                {
+                    continue;
+                }
+                let Some((p, blocks)) =
+                    self.rows_padded(t, &items.iter().map(pick).collect::<Vec<_>>(), extent)?
+                else {
+                    // Not whole rows: the product refuses the block by name.
+                    continue;
+                };
+                for (item, block) in items.iter_mut().zip(blocks) {
+                    *(if side == 0 { &mut item.0 } else { &mut item.1 }) = block;
+                }
+                temporary.push(p.clone());
+                operands[side] = p;
+                padded[side] = true;
             }
-        };
-        let [m, k, n] = mkn;
-        let units = self.spread_for(items.len() * m.div_ceil(32) * n.div_ceil(32) * k.div_ceil(32));
-        let pipeline = self.pipeline;
-        let max_k_tiles = self.matmul_k_block_limit;
-        let out = self
-            .dram_state()
-            .and_then(|d| {
-                tensor::matmul_dram_batched_limited(
-                    &mut d.alloc,
-                    ca.as_ref().unwrap_or(a),
-                    cb.as_ref().unwrap_or(b),
-                    items,
-                    mkn,
-                    route,
-                    fidelity,
-                    units,
-                    false,
-                    pipeline,
-                    max_k_tiles,
-                )
-            })
-            .and_then(|work| self.execute_on(work, units, budget));
-        for c in [ca, cb].into_iter().flatten() {
-            self.free(c)?;
+            let [a, b] = operands;
+            let units =
+                self.spread_for(items.len() * m.div_ceil(32) * n.div_ceil(32) * k.div_ceil(32));
+            let pipeline = self.pipeline;
+            let max_k_tiles = self.matmul_k_block_limit;
+            let out = self
+                .dram_state()
+                .and_then(|d| {
+                    tensor::matmul_dram_batched_limited(
+                        &mut d.alloc,
+                        &a,
+                        &b,
+                        &items,
+                        mkn,
+                        route,
+                        fidelity,
+                        units,
+                        false,
+                        pipeline,
+                        max_k_tiles,
+                        padded,
+                    )
+                })
+                .and_then(|work| self.execute_on(work, units, budget))?;
+            out.set_pad(need.produces(&[&a, &b]));
+            if items.len() == 1 || m % 32 == 0 {
+                return Ok(out);
+            }
+            // Each product's rows from its own tile row: stack them.
+            let stride = m.div_ceil(32) * 32;
+            let rows: Vec<_> = (0..items.len())
+                .flat_map(|i| (0..m).map(move |r| (0, i * stride + r)))
+                .collect();
+            let stacked = self.gather_rows(&[&out], &rows, n);
+            temporary.push(out);
+            stacked
+        })();
+        for t in temporary {
+            self.free(t)?;
         }
-        let out = out?;
-        out.set_pad(need.produces(&[a, b]));
-        Ok(out)
+        result
+    }
+
+    /// The blocks of `t` gathered by rows into a new tensor, a block per whole
+    /// tile rows with zero tail rows, and the blocks' places in it -- if each
+    /// block (of `extent(block)` elements, read transposed or not) is whole rows
+    /// of `t`. Blocks at the same place share theirs. `None` otherwise.
+    fn rows_padded(
+        &mut self,
+        t: &DramTensor,
+        blocks: &[tensor::Block],
+        extent: impl Fn(&tensor::Block) -> [usize; 2],
+    ) -> Result<Option<(DramTensor, Vec<tensor::Block>)>, TensorError> {
+        let whole_rows = blocks.iter().all(|b| {
+            let [r, c] = extent(b);
+            b.at[1] == 0 && c == t.cols && b.at[0] + r <= t.rows
+        });
+        if !whole_rows || blocks.is_empty() {
+            return Ok(None);
+        }
+        // `(first row, rows, place)` of each distinct block.
+        let mut places: Vec<(usize, usize, usize)> = Vec::new();
+        let mut at = Vec::with_capacity(blocks.len());
+        let mut rows = Vec::new();
+        for b in blocks {
+            let r = extent(b)[0];
+            let first = match places.iter().find(|p| (p.0, p.1) == (b.at[0], r)) {
+                Some(p) => p.2,
+                None => {
+                    let first = rows.len();
+                    places.push((b.at[0], r, first));
+                    let padded = r.div_ceil(32) * 32;
+                    rows.extend((0..padded).map(|i| if i < r { (0, b.at[0] + i) } else { (1, 0) }));
+                    first
+                }
+            };
+            at.push(tensor::Block {
+                at: [first, 0],
+                transposed: b.transposed,
+            });
+        }
+        // A zero row (with zero padding: `metadata` fills each tile before
+        // writing it), which every tail row reads; works on ttsim, unlike the
+        // XMOV zero fill.
+        let zero = self.metadata(&vec![0; t.cols], [1, t.cols], t.elem)?;
+        let gathered = self.gather_rows(&[t, &zero], &rows, t.cols);
+        self.free(zero)?;
+        Ok(Some((gathered?, at)))
     }
 
     /// Run an op's jobs over the units (see the module documentation) and

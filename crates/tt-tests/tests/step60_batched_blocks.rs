@@ -191,8 +191,8 @@ fn a_batched_matmul_over_head_blocks_is_each_heads_product() {
 }
 
 /// One product of a block that ends at its tensor's ragged edge reads the
-/// tensor's own zero padding; a ragged block inside a tensor, or a batch
-/// whose products do not start on tile rows, is refused.
+/// tensor's own zero padding; a ragged block inside a tensor that is not whole
+/// rows of it is refused (whole rows are gathered: `step184`).
 #[test]
 fn ragged_blocks_only_at_the_edge() {
     with_session(|s| {
@@ -230,12 +230,12 @@ fn ragged_blocks_only_at_the_edge() {
                 .unwrap_err();
             assert!(e.to_string().contains("not whole tiles"), "{e}");
         }
-        // Two `[35, 32]` products would share a tile row of the output.
+        // Two `[35, 32]` blocks end inside A and are not whole rows of it.
         let two = [item(0)[0], item(0)[0]];
         let e = s
             .matmul_dram_batched(&da, &db, &two, [35, 32, 50], ROUTE, Fidelity::HiFi4, BUDGET)
             .unwrap_err();
-        assert!(e.to_string().contains("whole tile rows"), "{e}");
+        assert!(e.to_string().contains("not whole tiles"), "{e}");
 
         // `[70, 64] @ [64, 50]`: A's last 64 columns (ragged rows at the
         // edge), B a `[64, 50]` tensor (ragged columns at its edge).
