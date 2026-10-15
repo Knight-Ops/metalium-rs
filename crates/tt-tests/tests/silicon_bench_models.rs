@@ -26,7 +26,7 @@ use burn::tensor::{DType, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::TtBackend;
 use tt_models::image_input::{load_chw, HALF_MEAN, HALF_STD, IMAGENET_MEAN, IMAGENET_STD};
-use tt_models::llama::{Llama, Precision, FULL_LAYERS, HIDDEN};
+use tt_models::llama::{Llama, Precision, SMOLLM2_135M};
 use tt_models::resnet::ResNet18;
 use tt_models::vit::{VitTiny, FULL_DEPTH};
 use tt_tests::bench::{git_sha, report, Stats};
@@ -418,24 +418,25 @@ fn vit_tiny_forward() {
 fn smollm2_decode_without_the_embedding_lookup() {
     // The embedding of " Paris" (token 7042), read from the host model: the input of a decode step.
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
         );
         m.embed(ids).into_data().to_vec::<f32>().unwrap()
     };
-    assert_eq!(row.len(), HIDDEN);
+    assert_eq!(row.len(), SMOLLM2_135M.hidden);
     // The host, doing the same decode steps (a fresh cache after sixty, as below).
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(64, DType::F32, &FlexDevice);
         let mut step = 0usize;
         baseline(
             "smollm2-135m decode step without the embedding lookup",
             || {
                 let x = Tensor::<Flex, 3>::from_data(
-                    TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                    TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                     &FlexDevice,
                 );
                 step += 1;
@@ -452,7 +453,8 @@ fn smollm2_decode_without_the_embedding_lookup() {
     }
     with_device(Config::default(), |d| {
         conditions(card());
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         // A cache holding a five-token prompt's worth of positions would need the prompt run; a
         // decode step at position 0 has the same operations, with a one-position attention.
         let mut cache = m.cache(64, DType::F32, &d);
@@ -461,7 +463,7 @@ fn smollm2_decode_without_the_embedding_lookup() {
             "smollm2-135m decode step without the embedding lookup",
             || {
                 let x = Tensor::<TtBackend, 3>::from_data(
-                    TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                    TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                     &d,
                 );
                 step += 1;
@@ -493,7 +495,7 @@ fn smollm2_decode_traced() {
     use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
     const MAX_LEN: usize = 64;
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
@@ -501,11 +503,12 @@ fn smollm2_decode_traced() {
         m.embed(ids).into_data().to_vec::<f32>().unwrap()
     };
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(MAX_LEN, DType::F32, &FlexDevice);
         baseline("smollm2-135m decode step, traced", || {
             let x = Tensor::<Flex, 3>::from_data(
-                TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                 &FlexDevice,
             );
             m.forward_embedded(x, &mut cache, DType::F32)
@@ -517,9 +520,14 @@ fn smollm2_decode_traced() {
     with_device(Config::default(), |d| {
         conditions(card());
         let dtype = DType::F32;
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
-        let x =
-            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
+        let x = || {
+            Tensor::<TtBackend, 3>::from_data(
+                TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
+                &d,
+            )
+        };
         let at = |p: usize| {
             Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
         };
@@ -641,7 +649,7 @@ fn smollm2_replay_profile() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
@@ -657,9 +665,13 @@ fn smollm2_replay_profile() {
             .unwrap_or(128);
         burn_tt::set_profile_buffer(d, Some(kib * 1024)).unwrap();
         let dtype = DType::F32;
-        let (m, _) = Llama::<TtBackend>::pretrained(layers, Precision::F32, &d).unwrap();
-        let x =
-            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let (m, _) = Llama::<TtBackend>::smollm2_135m(layers, Precision::F32, &d).unwrap();
+        let x = || {
+            Tensor::<TtBackend, 3>::from_data(
+                TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
+                &d,
+            )
+        };
         let at = |p: usize| {
             Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
         };
@@ -853,7 +865,7 @@ fn smollm2_prefill_chunk_sweep() {
     const MAX_LEN: usize = 512;
     const PREFILL_CHUNKS: [usize; 5] = [1, 32, 64, 128, 256];
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
@@ -862,13 +874,14 @@ fn smollm2_prefill_chunk_sweep() {
     };
     // burn-flex's whole prefill of a prompt of each length, for the cost a token.
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         for len in [32, 128, 256] {
             let values: Vec<f32> = (0..len).flat_map(|_| row.iter().copied()).collect();
             baseline(&format!("smollm2-135m prefill of {len} tokens"), || {
                 let mut cache = m.cache(len, DType::F32, &FlexDevice);
                 let x = Tensor::<Flex, 3>::from_data(
-                    TensorData::new(values.clone(), [1, len, HIDDEN]),
+                    TensorData::new(values.clone(), [1, len, SMOLLM2_135M.hidden]),
                     &FlexDevice,
                 );
                 m.forward_embedded(x, &mut cache, DType::F32)
@@ -881,7 +894,8 @@ fn smollm2_prefill_chunk_sweep() {
     with_device(Config::default(), |d| {
         conditions(card());
         let dtype = DType::F32;
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         let at = |p: usize| {
             Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
         };
@@ -898,7 +912,7 @@ fn smollm2_prefill_chunk_sweep() {
             let values: Vec<f32> = (0..c).flat_map(|_| row.iter().copied()).collect();
             let x = || {
                 Tensor::<TtBackend, 3>::from_data(
-                    TensorData::new(values.clone(), [1, c, HIDDEN]),
+                    TensorData::new(values.clone(), [1, c, SMOLLM2_135M.hidden]),
                     &d,
                 )
             };
@@ -1009,7 +1023,8 @@ fn smollm2_decode_with_the_embedding_lookup() {
     // A whole decode step from a token id: the lookup, the thirty layers and the output head.
     let ids = |data: Vec<i32>| TensorData::new(data, [1, 1]);
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(64, DType::F32, &FlexDevice);
         let mut step = 0usize;
         baseline("smollm2-135m decode step from a token id", || {
@@ -1027,7 +1042,8 @@ fn smollm2_decode_with_the_embedding_lookup() {
     }
     with_device(Config::default(), |d| {
         conditions(card());
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         let mut cache = m.cache(64, DType::F32, &d);
         let mut step = 0usize;
         let got = measure("smollm2-135m decode step from a token id", || {
@@ -1043,5 +1059,191 @@ fn smollm2_decode_with_the_embedding_lookup() {
                 .unwrap()
         });
         assert!(got.iter().all(|v| v.is_finite()));
+    });
+}
+
+/// Traced generation end to end (`tt_models::generate::TracedGenerator`, gate
+/// `step187_traced_generation`): SmolLM2, 30 layers, a 512-position cache. Token ids go in and
+/// logits come out; the lookup runs inside the trace and the cache stays on the card.
+///
+/// Two things are measured:
+/// 1. **What the traces cost together:** the step and the chunks (`TT_GEN_BUCKETS`, default
+///    `64,128,256`) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
+///    attachment. The report gives the program-cache bytes held on the fullest unit and the trace
+///    streams' GDDR bytes. A capture that does not fit fails its attachment for good, so the bench
+///    then stops and names the sizes.
+/// 2. **A generation's time:** prompts of 32, 128 and 256 tokens, each followed by `NEW` tokens.
+///    Reported are:
+///    - the driver's build time (the eager warm-up and the captures);
+///    - the time to the first token (the prefill and its logits read);
+///    - the median decode step;
+///    - the whole generation.
+///
+///    burn-flex's eager growing-cache generation of the same prompts is timed in the same run.
+///
+/// Validated outside the timing:
+/// - a 32-token prompt's first 4 tokens, bit for bit against the eager fixed-shape schedule on
+///   the card (`generate_fixed`);
+/// - every timed run produces the same tokens.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn traced_generation() {
+    use tt_models::generate::{generate_fixed, Generation, TracedGenerator};
+    const PROMPTS: [usize; 3] = [32, 128, 256];
+    const NEW: usize = 64;
+    let max_len: usize = std::env::var("TT_GEN_MAX_LEN")
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(512);
+    let vocab = SMOLLM2_135M.vocab;
+    let prompt = |len: usize| -> Vec<i32> {
+        (0..len)
+            .map(|i| ((7 + 7919 * i + 104_729 * i * i) % vocab) as i32)
+            .collect()
+    };
+    let decode_ms = |g: &Generation| -> f64 {
+        let mut d: Vec<f64> = g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
+        d.sort_by(f64::total_cmp);
+        d[d.len() / 2]
+    };
+    let ms = |t: std::time::Duration| t.as_secs_f64() * 1e3;
+    // burn-flex, eager, growing cache.
+    {
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
+        for len in PROMPTS {
+            let p = prompt(len);
+            let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..WARMUPS + SAMPLES {
+                let t0 = Instant::now();
+                let g = m.generate(&p, NEW, Precision::F32, &FlexDevice);
+                let all = t0.elapsed();
+                if i >= WARMUPS {
+                    first.push(ms(g.times[0]));
+                    step.push(decode_ms(&g));
+                    total.push(ms(all));
+                }
+            }
+            let key = format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens");
+            report(
+                &format!("{key}, first token (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, total (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(total),
+            );
+        }
+    }
+    let buckets: Vec<usize> = std::env::var("TT_GEN_BUCKETS")
+        .map(|v| v.split(',').map(|b| b.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![64, 128, 256]);
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
+        let t0 = Instant::now();
+        let g = match TracedGenerator::new(&m, max_len, &buckets, &d) {
+            Ok(g) => g,
+            Err(e) => {
+                // A capture that does not fit fails the attachment for good: rerun with fewer.
+                eprintln!("SKIP chunks {buckets:?} and the step do not capture together: {e} (set TT_GEN_BUCKETS)");
+                return;
+            }
+        };
+        let traces = format!("chunks {buckets:?} and the step, {max_len}-position cache");
+        report(
+            &format!("smollm2-135m traced generation, build ({traces})"),
+            "ms",
+            "host",
+            Stats::of([ms(t0.elapsed())]),
+        );
+        // What the traces hold together: the program cache bounds which chunk sizes fit.
+        for set in g.footprint().unwrap() {
+            let (held, size) = set.cache_held_bytes();
+            eprintln!("{traces}: program cache {held} of {size} bytes on the fullest unit");
+            for (key, units) in &set.traces {
+                let most = units
+                    .iter()
+                    .flatten()
+                    .map(|u| u.program_bytes)
+                    .max()
+                    .unwrap_or(0);
+                let gddr: u64 = units.iter().flatten().map(|u| u.gddr_bytes).sum();
+                eprintln!(
+                    "  {key}: at most {most} program bytes a unit, {gddr} stream bytes in all"
+                );
+            }
+            report(
+                &format!("smollm2-135m traced generation, program cache held ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([held as f64]),
+            );
+            report(
+                &format!("smollm2-135m traced generation, trace streams ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([set.gddr_bytes() as f64]),
+            );
+        }
+        // Validation: the eager schedule on the card, bit for bit.
+        let p = prompt(PROMPTS[0]);
+        let want = generate_fixed(&m, &p, 4, max_len, &buckets, &d).unwrap();
+        let got = g.generate(&p, 4).unwrap();
+        assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
+        for (i, (a, b)) in got.logits.iter().zip(&want.logits).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "logits {i} against the eager schedule"
+            );
+        }
+        for len in PROMPTS {
+            let p = prompt(len);
+            let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
+            let mut tokens = None;
+            for i in 0..WARMUPS + SAMPLES {
+                let t0 = Instant::now();
+                let out = g.generate(&p, NEW).unwrap();
+                let all = t0.elapsed();
+                match &tokens {
+                    None => tokens = Some(out.tokens.clone()),
+                    Some(t) => assert_eq!(&out.tokens, t, "a run's tokens"),
+                }
+                if i >= WARMUPS {
+                    first.push(ms(out.times[0]));
+                    step.push(decode_ms(&out));
+                    total.push(ms(all));
+                }
+            }
+            let key = format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens");
+            report(
+                &format!("{key}, first token, traced"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step, traced"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, total, traced"),
+                "ms",
+                "host",
+                Stats::of(total),
+            );
+        }
     });
 }

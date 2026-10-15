@@ -621,6 +621,12 @@ fn sim_factory(
         fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
             self.buffers.trace_ops(&self.session, trace)
         }
+        fn trace_footprint(
+            &mut self,
+            trace: u64,
+        ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+            self.buffers.trace_footprint(&self.session, trace)
+        }
         fn copy_into(
             &mut self,
             src: burn_tt::BufferId,

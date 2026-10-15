@@ -62,6 +62,28 @@ under `assert_native_model` (no staged compute, no host arithmetic, no downloade
   model, continue, and end bit-identical to an uninterrupted run (and not to a model that was not
   loaded).
 
+## Traced generation (`generate.rs`, `kv_cache.rs`, `rope.rs`)
+
+The generation path is written for decoders in general, not for SmolLM2 (a test vehicle):
+
+- **`FixedShapeDecoder`** is any decoder whose steps have shapes that depend only on how many tokens
+  they take. It has a chunk (`c` prompt tokens from a start position) and a one-token step. Both read
+  a cache and return its new state, and both take positions as tensors.
+- **`FixedCache`** (`kv_cache.rs`) is the architecture-neutral key/value cache those steps use:
+  masked writes at a position or a run, and the attention mask of the later positions. **`Rope`**
+  (`rope.rs`) is a rotary table any RoPE model can select rows from.
+- **`Llama`** implements the trait for every `LlamaConfig`. SmolLM2-135M is the preset
+  `SMOLLM2_135M`, loaded by `Llama::smollm2_135m`; other checkpoints load through
+  `Llama::pretrained(config, weights, ..)`.
+- **`TracedGenerator`** captures the step and a chunk of each bucket size as traces over one cache on
+  the card (`burn_tt::SharedStateTraces`), then serves any prompt: token ids in, logits out.
+- **`generate_fixed`** runs the same schedule eagerly.
+
+`step187_traced_generation` checks it bit for bit against the eager schedule and against the growing
+cache. It runs on Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, head widths 32 and 128,
+untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added under
+`--features weights`.
+
 ## Mixed precision (`quant.rs`)
 
 F32, BF16 and F16 (logical dtypes: the matrix is computed in that dtype) and BFP8, BFP4 and BFP2
@@ -77,7 +99,11 @@ quantised values.
 
 ## Where it stands
 
-See the roadmap entry for the numbers. The short version: all three models run natively on card 0 and
-agree with Flex, and the profile is what the performance work needed: one embedding lookup of a real
-vocabulary costs 15 s (`gather_native` stages `32 x rows` host addresses per chunk), a ResNet-18
-forward costs seconds, and a decoded token costs about 3,000 device operations.
+See the roadmap (Track 1, "Model ladder", and Track 2, items 1 to 9) for the numbers. All three models
+run natively and agree with Flex. Since the ladder's first profile:
+
+- an F32 embedding lookup is a row select (260 us, was 15 s);
+- convolution is chunk-free;
+- traced, the three models match or beat burn-flex.
+
+For SmolLM2 traced generation (`TracedGenerator`), see the roadmap's Track 2 item 6.

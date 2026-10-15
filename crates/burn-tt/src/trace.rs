@@ -16,6 +16,8 @@
 //! The input and output are the capture's, kept alive by the trace; dropping
 //! the trace releases it on the device.
 
+use burn_backend::TensorMetadata;
+
 use crate::error::TtError;
 use crate::server::{self, BufferId};
 use crate::tensor::TtTensor;
@@ -342,6 +344,15 @@ impl TracedInference {
         server::run(self.device, move |e, _| e.trace_ops(id))
     }
 
+    /// What the trace costs each unit (`None` for a unit it does not use): its stream's GDDR
+    /// bytes and the program-cache bytes it holds, beside what every trace on the unit holds
+    /// and the cache's size (`Session::trace_footprint`). The program cache is what bounds how
+    /// many traces live together.
+    pub fn footprint(&self) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        let id = self.id;
+        server::run(self.device, move |e, _| e.trace_footprint(id))
+    }
+
     /// Replay the trace with new input values.
     pub fn run(
         &self,
@@ -404,6 +415,173 @@ impl Drop for TracedInference {
         // A drop never opens a card, and never panics: a detached device has
         // nothing left to release.
         server::run_if_attached(self.device, move |e, _| e.release_trace(id));
+    }
+}
+
+/// Traces of one step at several shapes that carry the same state: a decoder's
+/// prefill chunks of several sizes and its one-token step, all reading and writing
+/// one key/value cache. Each trace has a key (a chunk length, say) of the caller's
+/// type `K`.
+///
+/// Every capture is handed the same state tensors and returns the state it computed
+/// from them, which its replays copy back over them on the card
+/// ([`TracedInference::capture_with_state`]): so whichever trace runs, the next one
+/// reads what it left, and the order in which they were captured does not matter. A
+/// step must read the state it is given and nothing another capture made (a
+/// tensor that held one capture's result is that trace's scratch, rewritten by its
+/// replays and by no other trace's).
+///
+/// Two things to know:
+/// - A capture runs its step once, so it writes the state. A model whose state is a
+///   cache must not rely on what the cache held before a capture.
+/// - The traces share the program cache (240 KiB of L1 a unit), and a capture that
+///   does not fit fails the attachment for good (its error is sticky). Measure the
+///   set with [`SharedStateTraces::footprint`] and reattach to retry with fewer.
+#[derive(Debug)]
+pub struct SharedStateTraces<K: Ord + Copy + std::fmt::Debug = usize> {
+    device: TtDevice,
+    state: Vec<TtTensor>,
+    traces: std::collections::BTreeMap<K, TracedInference>,
+}
+
+impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
+    /// A set over `state`: tensors on one device, each holding its own buffer (not a
+    /// view), resident there.
+    pub fn new(state: Vec<TtTensor>) -> Result<Self, TtError> {
+        let Some(first) = state.first() else {
+            return Err(TtError::Device(
+                "shared-state traces need at least one state tensor".into(),
+            ));
+        };
+        let device = first.device;
+        for t in &state {
+            if t.device != device {
+                return Err(TtError::Device(
+                    "shared state must belong to one device".into(),
+                ));
+            }
+            if !t.is_storable() || t.storage_format() != crate::storage::StorageFormat::F32 {
+                return Err(TtError::Device(
+                    "shared state must be storable, unpacked tensors".into(),
+                ));
+            }
+            t.ensure_resident();
+            let d = t.to_dram();
+            if d.transposed || d.buffer.parent.is_some() {
+                return Err(TtError::Device(
+                    "shared state must own its buffers: not a transposed or row view".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            device,
+            state,
+            traces: Default::default(),
+        })
+    }
+
+    /// The state every trace reads and writes back, in the order given to [`Self::new`].
+    pub fn state(&self) -> &[TtTensor] {
+        &self.state
+    }
+
+    /// Capture the step keyed `key` over `inputs`: `f` reads [`Self::state`] and returns
+    /// the outputs and the new state, one tensor for each state tensor in its order and of
+    /// its shape and dtype. Returns the capture's own outputs (its first run).
+    pub fn capture(
+        &mut self,
+        key: K,
+        inputs: &[&TtTensor],
+        f: impl FnOnce() -> (Vec<TtTensor>, Vec<TtTensor>),
+    ) -> Result<Vec<server::OutputPayload>, TtError> {
+        if self.traces.contains_key(&key) {
+            return Err(TtError::Device(format!(
+                "a trace keyed {key:?} is already in the set"
+            )));
+        }
+        let state = self.state.clone();
+        let mut mismatch = None;
+        let (trace, first) = TracedInference::capture_with_state(inputs, || {
+            let (outs, new) = f();
+            if new.len() != state.len() {
+                mismatch = Some(format!(
+                    "the step returned {} state tensors for {}",
+                    new.len(),
+                    state.len()
+                ));
+            } else if let Some(i) = (0..new.len())
+                .find(|&i| new[i].shape() != state[i].shape() || new[i].dtype() != state[i].dtype())
+            {
+                mismatch = Some(format!(
+                    "new state {i} is {:?} {:?}, the state {:?} {:?}",
+                    new[i].shape(),
+                    new[i].dtype(),
+                    state[i].shape(),
+                    state[i].dtype()
+                ));
+            }
+            if mismatch.is_some() {
+                // Nothing written back: the trace is dropped below.
+                return (outs, Vec::new());
+            }
+            (outs, new.into_iter().zip(state.iter().cloned()).collect())
+        })?;
+        if let Some(why) = mismatch {
+            drop(trace);
+            return Err(TtError::Device(why));
+        }
+        self.traces.insert(key, trace);
+        Ok(first)
+    }
+
+    /// The trace keyed `key`.
+    pub fn get(&self, key: K) -> Option<&TracedInference> {
+        self.traces.get(&key)
+    }
+
+    /// The keys captured, ascending.
+    pub fn keys(&self) -> Vec<K> {
+        self.traces.keys().copied().collect()
+    }
+
+    /// What the set costs each unit ([`TracedInference::footprint`], per trace).
+    pub fn footprint(&self) -> Result<SetFootprint<K>, TtError> {
+        let mut traces = Vec::with_capacity(self.traces.len());
+        for (&key, t) in &self.traces {
+            traces.push((key, t.footprint()?));
+        }
+        Ok(SetFootprint { traces })
+    }
+
+    /// The device the set runs on.
+    pub fn device(&self) -> TtDevice {
+        self.device
+    }
+}
+
+/// What a [`SharedStateTraces`] costs: each trace's per-unit footprint, by key.
+#[derive(Clone, Debug)]
+pub struct SetFootprint<K = usize> {
+    pub traces: Vec<(K, Vec<Option<tt_kernels::trace::UnitFootprint>>)>,
+}
+
+impl<K> SetFootprint<K> {
+    /// The most program-cache bytes every live trace holds on any one unit, and that
+    /// cache's size: the bound on how many traces fit together.
+    pub fn cache_held_bytes(&self) -> (u64, u64) {
+        self.units()
+            .map(|u| (u.cache_held_bytes, u.cache_bytes))
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// The GDDR bytes of every trace's streams and sections, on every unit.
+    pub fn gddr_bytes(&self) -> u64 {
+        self.units().map(|u| u.gddr_bytes).sum()
+    }
+
+    fn units(&self) -> impl Iterator<Item = &tt_kernels::trace::UnitFootprint> {
+        self.traces.iter().flat_map(|(_, u)| u.iter().flatten())
     }
 }
 

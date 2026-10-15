@@ -70,7 +70,9 @@ pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
 #[doc(hidden)]
 pub use trace::set_profile_buffer;
-pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};
+pub use trace::{
+    SetFootprint, SharedStateTraces, StepTiming, Trace, TracedInference, TracedTrainingStep,
+};
 
 #[cfg(feature = "fusion")]
 pub type Tt = burn_fusion::Fusion<TtBackend>;

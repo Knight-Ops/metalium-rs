@@ -23,7 +23,7 @@
 
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::TtBackend;
-use tt_models::llama::{Generation, Llama, Precision, FULL_LAYERS};
+use tt_models::llama::{Generation, Llama, Precision, SMOLLM2_135M};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
 
 /// "The capital of France is", tokenised with the model's own tokenizer.
@@ -33,7 +33,7 @@ const SMALL_LAYERS: usize = 1;
 
 fn layers() -> usize {
     if cfg!(feature = "silicon") {
-        FULL_LAYERS
+        SMOLLM2_135M.layers
     } else {
         SMALL_LAYERS
     }
@@ -86,14 +86,14 @@ fn compare(label: &str, host: &Generation, device: &Generation) {
 }
 
 fn run(precision: Precision, layers: usize, steps: usize) {
-    let host_model = Llama::<Flex>::pretrained(layers, precision, &FlexDevice)
+    let host_model = Llama::<Flex>::smollm2_135m(layers, precision, &FlexDevice)
         .unwrap()
         .0;
     let free_host = host_model.generate(&PROMPT, steps, precision, &FlexDevice);
     let forced_host = host_model.forced(&PROMPT, &free_host.tokens, precision, &FlexDevice);
 
     with_device(Config::default(), |d| {
-        let (model, loaded) = Llama::<TtBackend>::pretrained(layers, precision, &d).unwrap();
+        let (model, loaded) = Llama::<TtBackend>::smollm2_135m(layers, precision, &d).unwrap();
         eprintln!(
             "loaded {} tensors, {} layers, {precision:?}",
             loaded.applied, layers

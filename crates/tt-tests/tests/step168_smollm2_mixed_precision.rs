@@ -43,7 +43,7 @@ const CONTINUATION: [i32; 3] = [260, 3575, 282];
 const LAYERS: usize = 6;
 
 fn flex_run(plan: &Plan, acts: &Plan) -> Generation {
-    let (model, _) = Llama::<Flex>::pretrained(LAYERS, Precision::F32, &FlexDevice).unwrap();
+    let (model, _) = Llama::<Flex>::smollm2_135m(LAYERS, Precision::F32, &FlexDevice).unwrap();
     let model = apply(model, plan, &Emulated);
     let acts = acts.clone();
     let hook: ActFn<Flex> = Arc::new(move |name, t| Emulated.activation(acts.format(name), t));
@@ -80,7 +80,7 @@ fn check(name: &str, plan: Plan, acts: Plan, quantises: bool) {
     let reference = flex_run(&plan, &acts);
     let unquantised = flex_run(&Plan::new(), &Plan::new());
     with_device(Config::default(), |d| {
-        let (model, _) = Llama::<TtBackend>::pretrained(LAYERS, Precision::F32, &d).unwrap();
+        let (model, _) = Llama::<TtBackend>::smollm2_135m(LAYERS, Precision::F32, &d).unwrap();
         let model = apply(model, &plan, &Native);
         let acts = acts.clone();
         let hook: ActFn<TtBackend> = Arc::new(move |n, t| Native.activation(acts.format(n), t));

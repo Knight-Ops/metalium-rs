@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Traced generation, end to end](#traced-generation-end-to-end-2026-10-15-cards-0-and-1) | 2026-10-15 | `TracedGenerator`, token ids in and logits out, the step and chunks of 64/128/256 over one cache: the four traces hold 81 KB of the 240 KB program cache together; a decode step costs its cache's length (512 positions 32.3 ms, 320 28.5, 64 26.5); over 320 positions a 256-token prompt plus 64 tokens takes 1,860 ms against burn-flex's 2,996, first token 61.7 against 1,020 |
 | [A traced replay's fixed cost](#a-traced-replays-fixed-cost-2026-10-15-cards-0-and-1) | 2026-10-15 | the 37.2 ms traced SmolLM2 decode step broken down op by op (unit 0's mover stamps): ~84 ops a layer at ~13 us, not the barrier; five fixes (matmul padding off `K`, a kept zero row, a kept transpose, the model's mask and RoPE, thin downloads untilized by the card) bring it to 26.46 ms, burn-flex 26.42 |
 | [SmolLM2 prefill chunk size](#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1) | 2026-10-15 | a traced prefill chunk (`Llama::step_chunk`) costs ~33 ms + 0.18 ms a token on every tile: 256 tokens in 79 ms (burn-flex 1,040), so a prompt wants one chunk that covers it (buckets), not small chunks; one tile captures only single tokens |
 | [SmolLM2 decode step traced](#smollm2-decode-step-traced-2026-10-15-cards-0-and-1) | 2026-10-15 | a fixed-shape decode step (`Llama::step_fixed`) captured once and replayed at every position, the cache written back on the card: 37.1 ms a token on every tile (burn-flex 26.6; eager 86.9 at best) |
@@ -309,6 +310,50 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Traced generation, end to end (2026-10-15, cards 0 and 1)
+
+Roadmap Track 2 item 6, next steps 2 and 3. The setup:
+
+- **What runs:** `tt_models::generate::TracedGenerator` on SmolLM2-135M (F32, 30 layers): the step and
+  chunks of 64, 128 and 256 captured as traces over one cache (`burn_tt::SharedStateTraces`). Token ids
+  go in (the lookup runs inside the trace) and logits come out.
+- **Bench:** `silicon_bench_models::traced_generation`, card 1, release, every tile (`TT_TILES=all`),
+  default spread, 2 warm-ups and 9 samples. burn-flex's eager growing-cache `Llama::generate` ran in the
+  same run.
+- **Validation:** a 32-token prompt's first 4 tokens bit for bit against the eager schedule on the card
+  (`generate_fixed`), and every timed run's tokens equal. Gate `step187_traced_generation` on card 0
+  (run `1792071747`): SmolLM2 at 30 layers, synthetic Llama shapes and a GPT-2-style decoder, bit for bit.
+
+**The four traces fit together.** Program cache held on the fullest unit, of 245,760 bytes:
+
+- **80,980 bytes** at 512 positions (`1792072109`);
+- **63,980** at 320 (`1792072312`).
+
+Per trace, the most on one unit at 512: the step 35,764, `Chunk(64)` 40,680, `Chunk(128)` 45,572,
+`Chunk(256)` 59,344 (programs shared between traces are held once). **The streams are large:** 3.75 GB
+of GDDR across 120 units at 512 (the step 0.45 GB, `Chunk(256)` 1.46 GB); 3.42 GB at 320. That scales
+with ops times units, so it is the cost to watch for a larger model. The build (eager warm-up and four
+captures) took 44.6 s at 512 and 40.1 s at 320.
+
+| Cache | Prompt + 64 tokens | First token | Decode step | Total | burn-flex first / step / total | Run |
+|---|---|--:|--:|--:|---|---|
+| 512 | 32 | 38.7 ms | 32.28 ms | 2,075 ms | 180.1 / 26.57 / 1,856 | `1792072109` |
+| 512 | 128 | 49.6 | 32.28 | 2,086 | 513.0 / 28.63 / 2,322 | `1792072109` |
+| 512 | 256 | 72.9 | 32.28 | 2,110 | 1,028.1 / 30.82 / 2,985 | `1792072109` |
+| 320 | 32 | 35.0 | 28.49 | 1,834 | 175.1 / 26.34 / 1,837 | `1792072312` |
+| 320 | 128 | 42.7 | 28.49 | 1,841 | 506.5 / 28.93 / 2,331 | `1792072312` |
+| 320 | 256 | 61.7 | 28.49 | 1,860 | 1,019.6 / 30.99 / 2,996 | `1792072312` |
+
+(The first run, `1792071816`, timed with chunks of 64 and 256 only; a 128-token prompt then took the 256
+chunk, 73.0 ms.)
+
+**What it says.** A traced step attends to every position of its cache, so it costs the cache's length,
+not the context: 26.46 ms over 64 positions (`1792036613`), 28.49 over 320, 32.28 over 512, against
+burn-flex's 26.3 to 31.0, whose growing cache attends only to what it holds. The prefill is where the
+traces win (5x to 17x on the first token). Decode is at parity at best, and behind once the cache is
+longer than the context. Bounding the attended range by the position (step traces per attended
+length) is the next step for any LLM, not only this one.
 
 ## A traced replay's fixed cost (2026-10-15, cards 0 and 1)
 

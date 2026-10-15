@@ -116,6 +116,43 @@ Bool), never as tensors, because the output buffer is rewritten by every replay.
    - Enqueue a single `CALL` entry per tile (`Session::replay`).
    - Download the $M$ output buffers back to host memory.
 
+### Several traces over one state (`SharedStateTraces`, 2026-10-15)
+
+A decoder needs more than one trace over the same key/value cache: its one-token step, and prefill
+chunks of a few sizes. `SharedStateTraces<K>` (`crates/burn-tt/src/trace.rs`) holds them, keyed by
+the caller's `K`. Each capture works like this:
+
+- it receives the same state tensors;
+- it returns the new state, one tensor for each state tensor, of the same shape and dtype;
+- `capture_with_state` records the on-card `copy_into(new → state)`.
+
+So whichever trace replays, the next reads what it left. The rules:
+
+- **The step is functional.** It reads the state it was given and returns the new state. It must not
+  read a tensor that an earlier capture produced, because that tensor is the earlier trace's
+  scratch: its own replays rewrite it, and no other trace's do. A model whose step mutated its cache
+  object in place would capture the second trace over the first one's scratch. Under this rule, the
+  order of capture does not matter.
+- **A capture runs its step once, so it writes the state.** Nothing may rely on what the state held
+  before a capture. A cache read only at positions the generation itself has written meets this
+  rule.
+- **Several traces fit only together, or fail.** They share the program cache (240 KiB of L1 a unit;
+  programs are refcounted, so a program shared by two traces is held once). A capture that does not
+  fit fails the attachment for good (the error is sticky), so reattach before retrying with fewer
+  traces. `SharedStateTraces::footprint` and `TracedInference::footprint` (`Session::trace_footprint`)
+  report what each unit holds.
+
+The model side is `tt_models::generate`:
+
+- `FixedShapeDecoder` is a decoder's chunk and step over a cache, both functional.
+- `TracedGenerator` captures the step and one chunk per bucket size, feeds a prompt with the smallest
+  bucket that covers it (chunks of the largest past that), then replays the step a token. Token ids go
+  in, and the lookup runs inside the trace.
+- `generate_fixed` is the same schedule run eagerly.
+
+The gate is `step187_traced_generation`, run on Llama shapes SmolLM2 does not have and on a GPT-2-style
+decoder: bit for bit against the eager schedule and the growing cache.
+
 ---
 
 ## 4. Traced Training (`TracedTrainingStep`, as built)

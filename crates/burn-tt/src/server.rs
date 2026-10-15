@@ -427,6 +427,14 @@ pub trait Engine {
     fn trace_ops(&mut self, _trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
         Err(no_traces())
     }
+    /// What `trace` costs each unit: its stream's GDDR bytes and the program-cache bytes it
+    /// holds, beside what every trace on the unit holds (`Session::trace_footprint`).
+    fn trace_footprint(
+        &mut self,
+        _trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        Err(no_traces())
+    }
     /// [`Engine::run_generic_trace`] with the timestamper on around the replay alone
     /// (`Session::profile_start`): every unit's data mover stamps its entries. The roles
     /// stamp only if the capture was made while profiling, which a capture through
@@ -838,6 +846,18 @@ impl DramBuffers {
             .get(&trace)
             .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
         Ok(s.trace_ops(id).map_err(TtError::from)?.to_vec())
+    }
+
+    pub fn trace_footprint<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        s.trace_footprint(id).map_err(TtError::from)
     }
 
     pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
@@ -3366,6 +3386,13 @@ impl Engine for KmdEngine {
     fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
         let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
         bufs.trace_ops(&self.session, trace)
+    }
+    fn trace_footprint(
+        &mut self,
+        trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
+        bufs.trace_footprint(&self.session, trace)
     }
     fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TtError> {
         self.session

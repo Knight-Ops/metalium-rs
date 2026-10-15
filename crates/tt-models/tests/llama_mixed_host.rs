@@ -7,13 +7,14 @@
 //! Needs `cargo xtask fetch-weights`.
 
 use burn_flex::{Flex, FlexDevice};
-use tt_models::llama::{Llama, Precision, FULL_LAYERS};
+use tt_models::llama::{Llama, Precision, SMOLLM2_135M};
 use tt_models::quant::{apply, Emulated, Format, Plan};
 
 const PROMPT: [i32; 5] = [504, 3575, 282, 4649, 314];
 
 fn logits(plan: &Plan) -> Vec<f32> {
-    let (model, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+    let (model, _) =
+        Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
     let model = apply(model, plan, &Emulated);
     model
         .generate(&PROMPT, 1, Precision::F32, &FlexDevice)

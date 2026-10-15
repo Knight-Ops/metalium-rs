@@ -3,7 +3,7 @@
 **Start here.** This is the single list of open work. It holds only open items, each
 linking to its evidence and to the detailed plan. Closed work lives in
 [`completed-plans/`](../completed-plans/) and the archived phase docs below; permanent facts live in
-[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-12.
+[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-15.
 
 ## Where the project stands
 
@@ -26,7 +26,9 @@ linking to its evidence and to the detailed plan. Closed work lives in
   submission, not the device. Traced MNIST inference already beats the CPU, and traced, the three
   models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
   ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
-  [replay-fixed-cost.md](replay-fixed-cost.md)).
+  [replay-fixed-cost.md](replay-fixed-cost.md)). A whole traced generation (ids in, logits out, any
+  fixed-shape decoder) beats burn-flex on prompts of 128 tokens and more, and a decode step costs its cache's
+  length, which is the next fix (Track 2 item 6, step 4).
 - **Multi-chip: proof of concept.** Matmul, conv and attention split across two cards over
   Ethernet; every other op runs on chip 0; no all-reduce.
 
@@ -321,6 +323,16 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   nothing more for them. What the formats cost the model (host, 30 layers, one position): F16 0.017, BF16 0.26,
   BFP8 1.4, BFP4 19.8, BFP2 23.0 (top-1 holds through BFP8). Left: the full 30 layers per plan (the lookup makes each
   plan two minutes), the half formats against a per-matmul reference, and BFP in a trace or under autodiff.
+- [ ] **A real LLM of 1B parameters or more** (decided 2026-10-15). SmolLM2-135M is a test vehicle, not a model
+  worth running, so performance work should be measured on one that is. Candidates are Llama-3.2-1B and
+  Qwen2.5-0.5B/1.5B. What it takes:
+  - pin the checkpoint in `PINS.toml`;
+  - add what its architecture adds over `LlamaConfig`: RoPE scaling (Llama 3) and QKV biases (Qwen2);
+  - a host reference against `transformers`, as `llama_host.rs` does;
+  - the ladder's device-vs-Flex gate;
+  - `TracedGenerator` on it.
+
+  Everything generation-side is already generic (`FixedShapeDecoder`, `step187`).
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL
@@ -473,7 +485,10 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
       that covers it: buckets of 64 and 256, plus 128 if its trace fits.
     - **Result:** 256 tokens take **79 ms** against burn-flex's 1,040, and 32 tokens 40 ms against 175. One tile
       captures only single tokens ([log](../learnings/performance-log.md#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1)).
-  - **Where traced SmolLM2 stands** (card 1, every tile, F32, batch 1, embedding lookup excluded; 2026-10-15, after
+  - **Where traced generation stands** (card 1, every tile, F32, batch 1, 2026-10-15). End to end, ids in and logits
+    out (`TracedGenerator`, runs `1792072109` and `1792072312`): a 256-token prompt and 64 new tokens take **1,860 ms
+    against burn-flex's 2,996** over a 320-position cache; the first token 5x to 17x sooner, a decode step at or
+    behind burn-flex (step 4 below). The parts, before the driver (embedding lookup excluded; after
     [replay-fixed-cost.md](replay-fixed-cost.md), runs `1792036613` and `1792036724`):
     - **Decode:** 26.46 ms a token with a 64-position cache (**38 tokens/s**), burn-flex 26.42 in the same run. A
       one-token chunk over a 512-position cache (`step_chunk`, not `step_fixed`) is 32.7 ms.
@@ -494,17 +509,40 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
        37.2 -> 26.46 ms (burn-flex 26.42); prefill 256 tokens 79.0 -> 73.1. Left in the plan: the cache write's
        expands (~2 ms a step; a native row assign at a resident index), the RMSNorm's broadcast `div`, the replay's
        start, each op's ~3.5 us of control (step 6).
-    2. **A prefill-and-decode driver** in `tt-models`:
-       - keep the bucket traces (64 and 256; 128 if the program cache holds three) and one decode trace;
-       - for a prompt, replay the smallest bucket that covers it (chunks of 256 past that), then decode replays;
-       - the cache stays on the card throughout.
+    2. [x] **A prefill-and-decode driver, generic over decoders** (2026-10-15).
+       - **The pieces:**
+         - `tt_models::generate::TracedGenerator` over any `FixedShapeDecoder`: a chunk and a one-token step, both
+           functional over a cache;
+         - `burn_tt::SharedStateTraces`, several traces over one state;
+         - `tt_models::kv_cache::FixedCache` and `rope::Rope`, architecture-neutral;
+         - `Llama` driven by `LlamaConfig`, with SmolLM2 its preset `SMOLLM2_135M`.
+       - **How it runs:** the step and chunks of 64, 128 and 256 are captured once. A prompt replays the smallest
+         chunk that covers it (chunks of the largest past that), then the step a token. The cache stays on the card.
+       - **All four traces fit together:** 81 KB of the 240 KB program cache on the fullest unit, though 3.75 GB of
+         trace streams in GDDR.
+       - **Gate `step187_traced_generation`** (ttsim; card 0, run `1792071747`): bit for bit, token for token, against
+         the eager schedule (`generate_fixed`) and against the growing cache. It covers:
+         - SmolLM2 at 30 layers;
+         - Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, head widths 32 and 128, untied heads, ragged
+           widths);
+         - a GPT-2-style decoder;
+         - one driver serving many prompts;
+         - a negative control (chunks over an unshared cache diverge).
+       - **Measured** ([log](../learnings/performance-log.md#traced-generation-end-to-end-2026-10-15-cards-0-and-1)):
+         over a 320-position cache, a 256-token prompt plus 64 tokens takes **1,860 ms against burn-flex's 2,996**
+         (first token 61.7 against 1,020), 128 + 64 1,841 against 2,331, and 32 + 64 1,834 against 1,837.
+    3. [x] **The token lookup inside the trace** (2026-10-15, with step 2): the traces take I32 ids and the embedding's
+       row select replays with them.
+    4. **Bound the attended range: the next step.** A traced step attends to its whole cache, so a decode step costs
+       the cache's length, not the context: 26.46 ms over 64 positions, 28.49 over 320, 32.28 over 512, against
+       burn-flex's 26.3-31.0, which attends only to what it holds. Decode is the bulk of a generation, so this decides
+       whether traced generation beats the CPU at all. The fix is general to any decoder:
+       - step traces per attended length (a bucket of positions, say 64/128/256/512, chosen from the position), each
+         reading only the cache's first `L` rows (a view of the resident cache, no copy);
+       - check the program cache with `SharedStateTraces::footprint`;
+       - watch the GDDR the streams take, which scales with ops times units.
 
-       Gate: a whole generation equal to the eager growing-cache generation, token for token and logit for logit.
-    3. **The token lookup inside the trace.** Pass the token id as an I32 input and `select` the embedding row on the
-       card (the row select replays with new indices, `step171`). Then a step takes a token in and gives logits out.
-    4. **Chunks of 512, and longer caches.** The per-token cost had not flattened at 256 (0.29 ms, `1792036724`). A
-       replay slows with cache length (the decode step 26.46 ms over 64 positions; a one-token `step_chunk` over 512,
-       32.7 ms), since attention reads the whole cache; if long contexts matter, bound the attended range.
+       Then chunks of 512 (the per-token prefill cost had not flattened at 256: 0.29 ms, `1792036724`).
     5. **One tile and `work:64:4`:** prefill chunks and ResNet-18/ViT capture there only once traces are segmented
        ("Trace segmentation" below).
     6. [ ] **What is left of a replay's fixed cost** (each measured in [replay-fixed-cost.md](replay-fixed-cost.md),
@@ -859,6 +897,7 @@ deferred to later cleanup passes. B1 and B2 stay in Track 1 because models need 
 | [burn-op-coverage.md](burn-op-coverage.md) | Generated operation status |
 | [ttinsn-push-experiment.md](ttinsn-push-experiment.md) | Done, result: go. Experiment record for `.ttinsn` push fusion |
 | [replay-fixed-cost.md](replay-fixed-cost.md) | Track 2 item 6, steps 1 and 6: where a traced replay's time goes, op by op, and the fixes |
+| [traced-execution.md](traced-execution.md) §3 | Several traces over one state (`SharedStateTraces`) and the generic decoder driver (`tt_models::generate`) |
 | [new-op-definition-of-done.md](new-op-definition-of-done.md) | Standing: what a new op must have before it counts as done |
 | [burn-op-notes.md](burn-op-notes.md) | Standing: per-op notes for the Burn backend |
 | [phases-0-10-roadmap.md](../completed-plans/phases-0-10-roadmap.md) | Archived: architecture and phase rationale (historical design) |
