@@ -218,6 +218,9 @@ pub const SMOKE: &[&str] = &[
     // (roadmap Track 2 item 9, `attention-jobs.md` P1-P2).
     "step183_attention_jobs::",
     "step184_ragged_batched_matmul::",
+    // SmolLM2's decode step with fixed shapes, traced and replayed at every position (roadmap
+    // Track 2 item 6).
+    "step185_fixed_decode::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

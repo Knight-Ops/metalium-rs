@@ -395,6 +395,7 @@ fn sim_factory(
                 c.route,
                 fidelity,
                 c.budget,
+                tt_kernels::session::BatchedLayout::STACKED,
             )
         }
         fn eltwise(
@@ -475,6 +476,31 @@ fn sim_factory(
                 c.route,
                 c.fidelity,
                 c.budget,
+                tt_kernels::session::BatchedLayout::STACKED,
+            )
+        }
+        fn supports_batched_layout(&self) -> bool {
+            true
+        }
+        fn matmul_dram_batched_layout(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            items: &[(burn_tt::Block, burn_tt::Block)],
+            mkn: [usize; 3],
+            layout: tt_kernels::session::BatchedLayout,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.matmul_batched(
+                &mut self.session,
+                a,
+                b,
+                items,
+                mkn,
+                c.route,
+                c.fidelity,
+                c.budget,
+                layout,
             )
         }
         fn repack(

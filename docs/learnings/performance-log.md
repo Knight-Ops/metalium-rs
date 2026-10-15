@@ -12,6 +12,10 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [SmolLM2 prefill chunk size](#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1) | 2026-10-15 | a traced prefill chunk (`Llama::step_chunk`) costs ~33 ms + 0.18 ms a token on every tile: 256 tokens in 79 ms (burn-flex 1,040), so a prompt wants one chunk that covers it (buckets), not small chunks; one tile captures only single tokens |
+| [SmolLM2 decode step traced](#smollm2-decode-step-traced-2026-10-15-cards-0-and-1) | 2026-10-15 | a fixed-shape decode step (`Llama::step_fixed`) captured once and replayed at every position, the cache written back on the card: 37.1 ms a token on every tile (burn-flex 26.6; eager 86.9 at best) |
+| [ViT-Tiny traced](#vit-tiny-traced-2026-10-15-card-1) | 2026-10-15 | a replayed ViT-Tiny forward: 12.6 ms on every tile with the default spread (burn-flex 107.6, 8.5x faster), 61.9 at `work:64:4`; one tile does not capture; a decode step cannot be traced yet (its shapes grow a position a step) |
+| [Attention scores kept in tile rows, and a kept causal mask](#attention-scores-kept-in-tile-rows-and-a-kept-causal-mask-2026-10-15-cards-0-and-1) | 2026-10-15 | ViT's scores stay a head per whole tile rows from `Q K^T` to `P V` and the causal mask is kept per attachment: ViT-Tiny 173.5 -> 129.1 ms on every tile (burn-flex 109.3), 481.9 -> 368.3 on one; a prefill call 13 -> 11 jobs |
 | [Attention products in one job](#attention-products-in-one-job-2026-10-14-cards-0-and-1) | 2026-10-14 | a batched matmul takes a ragged `m` and heads stacked by rows (one row gather, not a repack a head): attention 64 -> 10 server jobs a decode call, 28 -> 10 a ViT call; ViT-Tiny 283.4 -> 173.5 ms on every tile (burn-flex 107.2), the SmolLM2 decode step 99.6 -> 86.5 |
 | [Slices and swaps as views](#slices-and-swaps-as-views-2026-10-14-card-0) | 2026-10-14 | a positive-step slice is a view, a swap of a view stays one, a ragged view is a tile copy: ViT-Tiny 401.4 -> 283.4 ms on every tile (burn-flex 106.7), the SmolLM2 decode step 108.5 -> 99.6 |
 | [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
@@ -59,6 +63,10 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-15 | 1792031467 / 1792032275 / 1792032323 | SmolLM2 prefill chunk sweep (`smollm2_prefill_chunk_sweep`, traced `Llama::step_chunk`, 512-position cache): every tile 1 / 32 / 64 / 128 / 256 tokens a replay in 43.8 / 40.2 / 44.3 / 55.2 / 79.0 ms (burn-flex prefill of 32 / 128 / 256 tokens 175 / 514 / 1,040 ms), card 1; one tile does not capture 32 and up; `work:64:4` 228-418 ms. | New scoreboard row. |
+| 2026-10-15 | 1792029144 / 1792029158 / 1792029169 | SmolLM2 decode step traced (`smollm2_decode_traced`, fixed shapes, cache as written-back state): 37.1 ms a replay on every tile with the default spread, 83.5 at `work:64:4`, 478.3 on one tile (burn-flex 25.5-26.6), card 1, bit for bit the eager fixed step. | New scoreboard row. |
+| 2026-10-15 | 1792026627 / 1792026634 / 1792026639 | ViT-Tiny forward traced (`vit_tiny_forward_traced`): 12.6 ms a replay on every tile with the default spread, 61.9 at `work:64:4` (burn-flex 107.6), card 1, bit for bit the eager forward; one tile does not capture (program cache). | New scoreboard row. |
+| 2026-10-15 | 1792026124 / 1792026138 | Attention's scores kept a head per whole tile rows (`padded_attention`) and the causal mask kept per attachment: ViT-Tiny 173.5 -> 129.1 ms on every tile at `work:64:4` (burn-flex 109.3), 481.9 -> 368.3 on one tile, card 1; the decode step unchanged (86.9; its single query keeps the stacked path); see "Attention scores kept in tile rows". | ViT rows updated in place. |
 | 2026-10-14 | 1792019870 / 1792019882 / 1792019917 | Attention products in one job (ragged `m`, heads stacked by rows gathered once): ViT-Tiny 283.4 -> 173.5 ms and the SmolLM2 decode step 99.6 -> 86.5 ms on every tile at `work:64:4` (burn-flex 107.2 and 26.5), card 1; one tile ViT 481.9, decode 449.7; see "Attention products in one job". | ViT and decode rows updated in place. |
 | 2026-10-14 | 1792000003 | ResNet-18 forward traced, every tile: 17.6 ms a replay against 205.7 untraced and burn-flex 151.7, card 1, bit for bit the eager forward; one tile does not capture (program cache); see "Chunk-free convolution and max pooling" below. | New scoreboard row. |
 | 2026-10-14 | 1791996580 / 1791996716 / 1791996730 | Chunk-free convolution and max pooling (NHWC tap select, one product, views between layers): ResNet-18 forward 16,288 -> 782.3 ms on one tile, 131.1 ms on every tile at `work:64:4` (burn-flex 151-157 ms), card 1, top-1 validated; see "Chunk-free convolution and max pooling" below. | ResNet-18 rows updated in place. |
@@ -300,9 +308,155 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## SmolLM2 prefill chunk size (2026-10-15, cards 0 and 1)
+
+`Llama::step_chunk` (`crates/tt-models/src/llama.rs`) generalises the fixed-shape decode step to `c` prompt tokens from a
+start position, both tensors:
+- **cache write:** the chunk's keys and values are laid over the cache by a row gather (a one-hot matmul would
+  truncate to TF32), then `mask_where` keeps positions `start..start + c`;
+- **attention:** each query masks the positions after its own;
+- **rotary rows:** selected per token, clamped for padding tokens past the cache;
+- **logits:** taken at a `last` row index tensor.
+
+A prompt is its chunks in order, the last padded. A padding token's cache row is overwritten by the decode step at that
+position before anything reads it.
+
+Gate `step185_fixed_decode` (ttsim at one layer; card 0 at 30, `1792032276`):
+- the chunked prefill's logits, and the decode step's after it, equal the eager prefill's bit for bit, at prompt
+  lengths 1, 3, 4, 5 with chunks of 4, and 5 with a chunk of 8;
+- one captured chunk replays at the next start bit for bit;
+- shifting every token's position by one, watched failing, breaks it.
+
+`smollm2_prefill_chunk_sweep`: card 1, release, the 512-position cache, each chunk captured once with the cache as
+written-back state, one replay checked bit for bit against the eager chunk, two warm-up and nine timed replays.
+burn-flex's eager prefill was timed in the same run.
+
+| Chunk `c` | every tile, default spread (`1792031467`) | a token | one tile (`1792032275`) | `work:64:4` (`1792032323`) |
+|--:|--:|--:|--:|--:|
+| 1 | 43.8 ms | 43.8 ms | 1,134.8 ms | 227.8 ms |
+| 32 | 40.2 ms | 1.26 ms | does not capture | 248.6 ms |
+| 64 | 44.3 ms | 0.69 ms | does not capture | 298.2 ms |
+| 128 | 55.2 ms | 0.43 ms | does not capture | 348.8 ms |
+| 256 | 79.0 ms | 0.31 ms | does not capture | 418.0 ms |
+
+burn-flex's prefill takes 175 ms for 32 tokens, 514 for 128 and 1,040 for 256, about 4 ms a token.
+
+- **The cost model.** A replay on every tile costs about **33 ms + 0.18 ms a token** (0.13 between 32 and 64). The
+  fixed part is the 30 layers' per-op cost, the same as a decode step's. Two consequences:
+  - **Small chunks lose.** A token of padding costs about 0.18 ms and one more replay about 33 ms, so a chunk up to
+    about 180 tokens larger than the prompt still beats two replays.
+  - **The most efficient prefill is one replay of the smallest captured chunk that covers the prompt**, and chunks of
+    the largest only past it: buckets, not small chunks.
+- **Which buckets.**
+  - **64 and 256** cover up to 64 tokens in 44 ms and up to 256 in 79 ms. Past 256, each further 256 is one more
+    replay.
+  - **Adding 128** saves 24 ms for prompts of 65-128 tokens, at the cost of a third trace's program-cache footprint.
+  - The per-token cost had not flattened at 256 (0.31 ms), so 512 is worth measuring with a longer cache.
+- **Against burn-flex.** A 256-token prompt in one replay is **13x faster** (79 against 1,040 ms); 32 tokens 4.4x (40
+  against 175).
+- **One tile captures only single-token steps.** Its cost is attention over all 512 positions (1.13 s a token, against
+  478 ms with a 64-position cache). Chunks wait for trace segmentation.
+- **`work:64:4` is 5x slower when traced** than the default spread, as for the other traces.
+
+## SmolLM2 decode step traced (2026-10-15, cards 0 and 1)
+
+Roadmap Track 2 item 6. `Llama::forward_embedded` grows its attention by a position a step and writes its cache with
+`slice_assign` at a host range, so no two steps have the same shapes. `Llama::step_fixed` (`crates/tt-models/src/llama.rs`)
+takes the position as a tensor:
+- the rotary rows are a row select from a `max_len` table;
+- the key and value land by `mask_where` on a one-hot of the position;
+- attention reads the whole cache with the later positions masked.
+
+`burn_tt::TracedInference::capture_with_state` records a `copy_into` of each new cache tensor over the old one, so every
+replay leaves the cache as the step computed it, on the card. Gate `step185_fixed_decode` (ttsim at one layer; card 0
+at 30, `1792029209`):
+- every fixed step's logits equal the growing cache's bit for bit;
+- one captured step replays each later position bit for bit;
+- without the write-back the replays diverge (negative control);
+- masking the query's own position, watched failing, breaks the first claim.
+
+Release, card 1, the 64-position cache, two warm-up and nine timed replays at positions 4-12, each checked bit for bit
+against the eager fixed step, burn-flex in the same run (`smollm2_decode_traced`):
+
+| Setting | Traced replay | Eager, fixed shape | Eager, growing cache | burn-flex |
+|---|--:|--:|--:|--:|
+| every tile, default spread (`TT_TILES=all`) | **37.1 ms** (`1792029144`) | 194.6 ms | not measured | 26.6 ms |
+| every tile, `work:64:4` | 83.5 ms (`1792029158`) | 118.7 ms | 86.9 ms (`1792026124`) | 25.9 ms |
+| one tile | 478.3 ms (`1792029169`) | 528.9 ms | 449.7 ms (`1792019917`) | 25.5 ms |
+
+- **The replay is 1.4x burn-flex** on every tile, and 2.3x faster than the best eager step.
+  - **Eager, the fixed step costs more than the growing one:** attention over all 64 positions, and a `mask_where` copy
+    of each layer's cache.
+  - **Traced, that host cost is gone.** What is left is device work.
+  - **Next:** where the 37 ms of device work goes is not broken down yet; the replay profile
+    (`Session::host_times`, the trace replay breakdown) would say.
+- **The decode step captures even on one tile**, where ViT and ResNet-18 overflow the program cache. There it is
+  device-bound on its m = 1 matmuls, as the eager step is.
+- **The default spread wins traced** (37.1 against 83.5 ms) and `work:64:4` wins eager, as for ViT.
+- **Regression.**
+  - `forward_embedded` shares the layer code (`Write::At`). `step167` F32 and the seven `step168` plans pass on card 0
+    (`1792029254`).
+  - `tt-models`' host tests (against HuggingFace) pass.
+
+## ViT-Tiny traced (2026-10-15, card 1)
+
+Roadmap Track 2 item 6, after [attention-jobs.md](../completed-plans/attention-jobs.md) cut ViT's attention to 10 jobs
+a call. `vit_tiny_forward_traced` makes one eager forward, captures one, then times replays: each writes the image
+and reads the logits back with no op submitted by the host. It shares `traced_image_forward` with
+`resnet18_forward_traced`. Release, card 1, two warm-ups and nine timed replays, burn-flex in the same run:
+
+| Setting | Traced replay | Eager | burn-flex |
+|---|--:|--:|--:|
+| every tile, default spread (`TT_TILES=all`) | **12.6 ms** (`1792026627`) | not measured in this setting | 107.6 ms |
+| every tile, `TT_SPREAD=work:64:4` | 61.9 ms (`1792026634`) | 129.1 ms (`1792026124`) | 107.6 ms |
+| one tile | does not capture (`1792026639`) | 368.3 ms (`1792026138`) | 107.0 ms |
+
+- **The replay's logits equal the eager forward's bit for bit**, and its top-1 equals burn-flex's.
+- **ResNet-18 through the shared helper** is unchanged: 17.6 ms traced on every tile (`1792026644`; 17.6 in
+  `1792000003`).
+- **Capture at `work:64:4`.** ViT's capture fits the program cache at `work:64:4`, where ResNet-18's did not
+  (`1792000003`). It still overflows on one tile, which is trace segmentation's case.
+- **The default spread is faster when replayed, `work:64:4` when eager.** A replay has no host cost to amortise,
+  so spreading every op over every tile wins: 12.6 against 61.9 ms. Eager, the per-unit cost made `work:64:4` the
+  better setting. A traced deployment and an eager one want different spreads.
+- **A decode step could not be traced as written** (its shapes grow a position a step). The fixed-shape step in the
+  section above does it.
+
+## Attention scores kept in tile rows, and a kept causal mask (2026-10-15, cards 0 and 1)
+
+P2b and P3 of [attention-jobs.md](../completed-plans/attention-jobs.md).
+
+- **ViT's scores.** After P1-P2 they were stacked after `Q K^T` and gathered back into whole tile rows for `P V`.
+  Now `padded_attention` keeps them a head per whole tile rows throughout:
+  - `Session::matmul_dram_batched_with`, `BatchedLayout { stacked: false }`, then `{ lhs_padded: true }`;
+  - the scale, the mask and the softmax run on the padded `[heads·mt·32, sk]` tensor row by row.
+  - It is taken where padding grows the scores by at most a quarter: ViT, not a decode's single query.
+- **The causal mask** is made once an attachment, in the scores' own layout, so a call's mask is one `mask_fill`.
+
+Release, card 1, two warm-ups and nine timed passes, burn-flex in the same run:
+
+| Workload | Before (`1792019882`, `1792019870`) | After | burn-flex |
+|---|--:|--:|--:|
+| ViT-Tiny forward, every tile at `work:64:4` | 173.5 ms | **129.1 ms** (`1792026124`) | 109.3 ms |
+| ViT-Tiny forward, one tile | 481.9 ms | 368.3 ms (`1792026138`) | 109.7 ms |
+| SmolLM2 decode step, every tile | 86.5 ms | 86.9 ms (`1792026124`), unchanged | 26.5 ms |
+
+- **ViT's attention server time, every tile.**
+  - `qk` 26.5 -> **0.9 ms**: the stacking gather is gone.
+  - `pv` 47.2 -> 30.4 ms: the gather back into tile rows is gone. What is left is the product, the scores' column
+    padding fill (`meet`) and the stacking gather.
+  - `softmax` 2.2 -> 4.0 ms, on 672 rows a call instead of 591.
+- **ViT on one tile.** The softmax is 21.4 ms (was 40.9); `pv` is 64.2.
+- **The decode step does not take the padded path.** It would be 288 rows for 9. Its attention is unchanged
+  (`qk` 20.6, `pv` 13.4 ms).
+- **A five-token causal prefill** is 11 jobs a call, was 13 (`step183`, ttsim). There is no prefill bench.
+- **Correctness.**
+  - Card 0 (`1792025224`): `step183`, `step184`, `step83` (single card), `step60`, `step166`, and `step167` in F32.
+  - On ttsim: Burn's conformance has 0 unexpected results, plain (`1792025070`) and `--fusion` (`1792025609`).
+
 ## Attention products in one job (2026-10-14, cards 0 and 1)
 
-P0-P2 of [attention-jobs.md](../plans/attention-jobs.md). Before this, a batched matmul whose `m` was not whole tile rows
+P0-P2 of [attention-jobs.md](../completed-plans/attention-jobs.md). Before this, a batched matmul whose `m` was not whole tile rows
 (decode m = 1, ViT m = 197, a prefill's m = t) ran one head at a time: two element repacks and a matmul a head, then a row
 gather, so 28 of a decode call's 64 attention jobs for each product. Now `Session::matmul_dram_batched`
 does three things, and the whole product is one server job:

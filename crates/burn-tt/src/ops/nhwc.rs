@@ -92,6 +92,31 @@ fn geometry(
     dims: [usize; 2],
     values: impl FnOnce() -> Vec<u32>,
 ) -> TtTensor {
+    cached_metadata(
+        device,
+        what,
+        key,
+        dims,
+        burn_backend::Shape::new(dims),
+        DType::I32,
+        values,
+    )
+}
+
+/// The tensor of `shape` (stored `dims`, of `dtype`: I32 or Bool) that `values`
+/// makes, which depends on the shapes in `key` alone: made once on the card
+/// (descriptor immediates, `server::metadata`, which a trace replays without
+/// an upload) and kept for the device's attachment -- a convolution's tap
+/// index, attention's causal mask.
+pub(crate) fn cached_metadata(
+    device: TtDevice,
+    what: &'static str,
+    key: Vec<usize>,
+    dims: [usize; 2],
+    shape: burn_backend::Shape,
+    dtype: DType,
+    values: impl FnOnce() -> Vec<u32>,
+) -> TtTensor {
     let serial = crate::server::attachment(device);
     let key = (device, what, key);
     let mut stale = Vec::new();
@@ -112,8 +137,13 @@ fn geometry(
     }
     // Outside the lock: a dropped buffer is freed through the server.
     drop(stale);
-    let id = crate::server::metadata(device, values(), dims, Elem::I32);
-    let t = device_result_shaped(device, id, dims, burn_backend::Shape::new(dims), DType::I32);
+    let elem = if matches!(dtype, DType::Bool(_)) {
+        Elem::Bool
+    } else {
+        Elem::I32
+    };
+    let id = crate::server::metadata(device, values(), dims, elem);
+    let t = device_result_shaped(device, id, dims, shape, dtype);
     if let Some(serial) = serial {
         GEOMETRY
             .lock()

@@ -172,16 +172,69 @@ fn resnet18_forward() {
     });
 }
 
-/// `resnet18_forward` as a trace (`burn_tt::Trace`): one eager forward first (the relaid weights
-/// and tap indices are made and kept then), one captured, then each timed pass a replay that writes
-/// the image and reads the logits back, with no op submitted by the host. Its logits equal the eager
-/// forward's bit for bit (the same ops), and its top-1 burn-flex's. Until traces are segmented the
-/// capture fits only with the programs spread over many tiles (`TT_TILES=all`); on fewer it is
-/// skipped with the reason printed.
+/// `forward` on a `[1, 3, 224, 224]` image as a trace (`burn_tt::Trace`): one eager forward first (what
+/// a model makes and keeps on first use -- relaid weights, tap indices, a causal mask -- is made
+/// then), one captured, then each timed pass a replay that writes the image and reads the logits
+/// back, with no op submitted by the host. Its logits equal the eager forward's bit for bit (the same
+/// ops), and its top-1 burn-flex's (`host`). Until traces are segmented the capture fits only where
+/// the programs are spread over enough tiles; otherwise it is skipped with the reason printed.
+fn traced_image_forward(
+    key: &str,
+    d: &burn_tt::TtDevice,
+    x: &[f32],
+    host: &[f32],
+    forward: impl Fn(Tensor<TtBackend, 4>) -> Tensor<TtBackend, 2>,
+) {
+    use burn::tensor::TensorPrimitive;
+    let input = Tensor::<TtBackend, 4>::from_data(TensorData::new(x.to_vec(), [1, 3, 224, 224]), d);
+    let eager = forward(input.clone()).into_data().to_vec::<f32>().unwrap();
+    let TensorPrimitive::Float(image) = input.clone().into_primitive() else {
+        unreachable!()
+    };
+    let captured = burn_tt::Trace::capture(&image, || {
+        let TensorPrimitive::Float(y) = forward(input.clone()).into_primitive() else {
+            unreachable!()
+        };
+        y
+    });
+    let (trace, first) = match captured {
+        Ok(t) => t,
+        Err(e) => {
+            // A forward's programs fit the program cache only when spread over enough tiles
+            // (every tile with the default spread does; one tile does not) until traces are
+            // segmented (roadmap Track 2, "Trace segmentation"): that is reported, not timed.
+            let cause = format!(
+                "{:?}",
+                <TtBackend as burn::tensor::backend::Backend>::sync(d)
+            );
+            assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+            eprintln!(
+                "SKIP {key}: the forward's programs do not fit one tile's program cache (run \
+                 with TT_TILES=all until traces are segmented): {cause}"
+            );
+            return;
+        }
+    };
+    assert_eq!(first, eager, "the capture's run is the eager forward");
+    for _ in 0..WARMUPS {
+        trace.run(x.to_vec()).unwrap();
+    }
+    let mut ms = Vec::new();
+    let mut got = Vec::new();
+    for _ in 0..SAMPLES {
+        let t0 = Instant::now();
+        got = trace.run(x.to_vec()).unwrap();
+        ms.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    report(key, "ms", "host", Stats::of(ms));
+    assert_eq!(got, eager, "a replay is the eager forward");
+    assert_eq!(argmax(&got), argmax(host));
+}
+
+/// `resnet18_forward` as a trace ([`traced_image_forward`]).
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn resnet18_forward_traced() {
-    use burn::tensor::TensorPrimitive;
     let x = load_chw("cats.jpg", 224, IMAGENET_MEAN, IMAGENET_STD).unwrap();
     let host = {
         let (m, _) = ResNet18::<Flex>::pretrained(&FlexDevice).unwrap();
@@ -196,59 +249,41 @@ fn resnet18_forward_traced() {
     with_device(Config::default(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
-        let input =
-            Tensor::<TtBackend, 4>::from_data(TensorData::new(x.clone(), [1, 3, 224, 224]), &d);
-        let eager = m
-            .forward(input.clone())
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let TensorPrimitive::Float(image) = input.clone().into_primitive() else {
-            unreachable!()
-        };
-        let captured = burn_tt::Trace::capture(&image, || {
-            let TensorPrimitive::Float(y) = m.forward(input.clone()).into_primitive() else {
-                unreachable!()
-            };
-            y
-        });
-        let (trace, first) = match captured {
-            Ok(t) => t,
-            Err(e) => {
-                // A forward's programs fit the program cache only when spread over enough tiles
-                // (every tile with the default spread does; one tile does not) until traces are
-                // segmented (roadmap Track 2, "Trace segmentation"): that is reported, not timed.
-                let cause = format!(
-                    "{:?}",
-                    <TtBackend as burn::tensor::backend::Backend>::sync(&d)
-                );
-                assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
-                eprintln!(
-                    "SKIP resnet18 traced: the forward's programs do not fit one tile's program \
-                     cache (run with TT_TILES=all until traces are segmented): {cause}"
-                );
-                return;
-            }
-        };
-        assert_eq!(first, eager, "the capture's run is the eager forward");
-        for _ in 0..WARMUPS {
-            trace.run(x.clone()).unwrap();
-        }
-        let mut ms = Vec::new();
-        let mut got = Vec::new();
-        for _ in 0..SAMPLES {
-            let t0 = Instant::now();
-            got = trace.run(x.clone()).unwrap();
-            ms.push(t0.elapsed().as_secs_f64() * 1e3);
-        }
-        report(
+        traced_image_forward(
             "resnet18 224x224 batch 1 forward, traced",
-            "ms",
-            "host",
-            Stats::of(ms),
+            &d,
+            &x,
+            &host,
+            |t| m.forward(t),
         );
-        assert_eq!(got, eager, "a replay is the eager forward");
-        assert_eq!(argmax(&got), argmax(&host));
+    });
+}
+
+/// `vit_tiny_forward` as a trace ([`traced_image_forward`]).
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn vit_tiny_forward_traced() {
+    let x = load_chw("cats.jpg", 224, HALF_MEAN, HALF_STD).unwrap();
+    let host = {
+        let (m, _) = VitTiny::<Flex>::pretrained(FULL_DEPTH, &FlexDevice).unwrap();
+        baseline("vit-tiny 224x224 batch 1 forward, traced", || {
+            let t = Tensor::<Flex, 4>::from_data(
+                TensorData::new(x.clone(), [1, 3, 224, 224]),
+                &FlexDevice,
+            );
+            m.forward(t).into_data().to_vec::<f32>().unwrap()
+        })
+    };
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
+        traced_image_forward(
+            "vit-tiny 224x224 batch 1 forward, traced",
+            &d,
+            &x,
+            &host,
+            |t| m.forward(t),
+        );
     });
 }
 
@@ -341,6 +376,292 @@ fn smollm2_decode_without_the_embedding_lookup() {
             },
         );
         assert!(got.iter().all(|v| v.is_finite()));
+    });
+}
+
+/// `smollm2_decode_without_the_embedding_lookup` with fixed shapes (`Llama::step_fixed`: the position
+/// a tensor, attention over a 64-position cache with the later positions masked), first eagerly,
+/// then as a trace: one step captured at position 1 with the cache as state written back in place
+/// (`TracedInference::capture_with_state`), each timed pass a replay that writes the next
+/// position's embedding and position and reads the logits back, with no op submitted by the host.
+/// Every replay's logits equal the eager fixed step's at that position bit for bit. Skipped, with
+/// the reason, where the step's programs do not fit the program cache.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_decode_traced() {
+    use burn::tensor::{Int, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
+    const MAX_LEN: usize = 64;
+    let row: Vec<f32> = {
+        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![7042i32], [1, 1]),
+            &FlexDevice,
+        );
+        m.embed(ids).into_data().to_vec::<f32>().unwrap()
+    };
+    {
+        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let mut cache = m.cache(MAX_LEN, DType::F32, &FlexDevice);
+        baseline("smollm2-135m decode step, traced", || {
+            let x = Tensor::<Flex, 3>::from_data(
+                TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                &FlexDevice,
+            );
+            m.forward_embedded(x, &mut cache, DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        });
+    }
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let dtype = DType::F32;
+        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let x =
+            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let at = |p: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
+        };
+        let positions = 2 + WARMUPS + SAMPLES;
+        // Eager fixed steps: the reference logits at every position, and their cost.
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let mut eager = Vec::new();
+        let mut ms = Vec::new();
+        for p in 0..positions {
+            let t0 = Instant::now();
+            eager.push(
+                m.step_fixed(x(), at(p), &mut cache, dtype)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap(),
+            );
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        report(
+            "smollm2-135m decode step, fixed shapes, eager",
+            "ms",
+            "host",
+            Stats::of(ms[2 + WARMUPS..].to_vec()),
+        );
+        // The trace: an eager step at 0 makes the cache resident, the step at 1 is captured.
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let _ = m.step_fixed(x(), at(0), &mut cache, dtype).into_data();
+        let (xin, pin) = (x(), at(1));
+        let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
+            unreachable!()
+        };
+        xp.ensure_resident();
+        let pp = pin.clone().into_primitive();
+        pp.ensure_resident();
+        let float = |t: Tensor<TtBackend, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!(),
+        };
+        let old: Vec<TtTensor> = cache.state().into_iter().map(float).collect();
+        let captured = TracedInference::capture_with_state(&[&xp, &pp], || {
+            let TensorPrimitive::Float(y) = m
+                .step_fixed(xin.clone(), pin.clone(), &mut cache, dtype)
+                .into_primitive()
+            else {
+                unreachable!()
+            };
+            let new = cache.state().into_iter().map(float);
+            (vec![y], new.zip(old.iter().cloned()).collect())
+        });
+        let (trace, first) = match captured {
+            Ok(t) => t,
+            Err(e) => {
+                let cause = format!(
+                    "{:?}",
+                    <TtBackend as burn::tensor::backend::Backend>::sync(&d)
+                );
+                assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+                eprintln!(
+                    "SKIP smollm2-135m decode step, traced: the step's programs do not fit one \
+                     tile's program cache (run with TT_TILES=all until traces are segmented): {cause}"
+                );
+                return;
+            }
+        };
+        let logits = |o: &[OutputPayload]| match &o[0] {
+            OutputPayload::F32(v) => v.clone(),
+            other => panic!("logits as {other:?}"),
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&logits(&first)), bits(&eager[1]), "the capture's run");
+        let mut ms = Vec::new();
+        for (p, want) in eager.iter().enumerate().skip(2) {
+            let t0 = Instant::now();
+            let got = trace
+                .run(vec![
+                    InputPayload::F32(row.clone()),
+                    InputPayload::Bits(vec![p as u32]),
+                ])
+                .unwrap();
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(bits(&logits(&got)), bits(want), "replay at position {p}");
+        }
+        report(
+            "smollm2-135m decode step, traced",
+            "ms",
+            "host",
+            Stats::of(ms[WARMUPS..].to_vec()),
+        );
+    });
+}
+
+/// The chunk size of a traced prefill (`Llama::step_chunk`: `c` prompt tokens from a start position,
+/// both tensors): for each `c` of `PREFILL_CHUNKS`, one chunk captured on a fresh 512-position cache
+/// with the cache as state, then replays timed. A prompt of `len` tokens costs `ceil(len / c)`
+/// replays, so the replay's time and its time a token decide the chunk. One replay at the second
+/// chunk's start is checked bit for bit against the eager chunk there. A chunk whose programs do not
+/// fit the program cache is reported and skipped.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_prefill_chunk_sweep() {
+    use burn::tensor::{Int, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
+    const MAX_LEN: usize = 512;
+    const PREFILL_CHUNKS: [usize; 5] = [1, 32, 64, 128, 256];
+    let row: Vec<f32> = {
+        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![7042i32], [1, 1]),
+            &FlexDevice,
+        );
+        m.embed(ids).into_data().to_vec::<f32>().unwrap()
+    };
+    // burn-flex's whole prefill of a prompt of each length, for the cost a token.
+    {
+        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        for len in [32, 128, 256] {
+            let values: Vec<f32> = (0..len).flat_map(|_| row.iter().copied()).collect();
+            baseline(&format!("smollm2-135m prefill of {len} tokens"), || {
+                let mut cache = m.cache(len, DType::F32, &FlexDevice);
+                let x = Tensor::<Flex, 3>::from_data(
+                    TensorData::new(values.clone(), [1, len, HIDDEN]),
+                    &FlexDevice,
+                );
+                m.forward_embedded(x, &mut cache, DType::F32)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            });
+        }
+    }
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let dtype = DType::F32;
+        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let at = |p: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
+        };
+        let float = |t: Tensor<TtBackend, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!(),
+        };
+        let logits = |o: &[OutputPayload]| match &o[0] {
+            OutputPayload::F32(v) => v.clone(),
+            other => panic!("logits as {other:?}"),
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for c in PREFILL_CHUNKS {
+            let values: Vec<f32> = (0..c).flat_map(|_| row.iter().copied()).collect();
+            let x = || {
+                Tensor::<TtBackend, 3>::from_data(
+                    TensorData::new(values.clone(), [1, c, HIDDEN]),
+                    &d,
+                )
+            };
+            // The eager chunks at 0 and `c`: the reference for the replay at `c`.
+            let want = {
+                let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+                let _ = m
+                    .step_chunk(x(), at(0), at(c - 1), &mut cache, dtype)
+                    .into_data();
+                m.step_chunk(x(), at(c), at(c - 1), &mut cache, dtype)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            };
+            let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+            for t in cache.state() {
+                float(t).ensure_resident();
+            }
+            let (xin, sin, lin) = (x(), at(0), at(c - 1));
+            let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
+                unreachable!()
+            };
+            xp.ensure_resident();
+            let (sp, lp) = (sin.clone().into_primitive(), lin.clone().into_primitive());
+            sp.ensure_resident();
+            lp.ensure_resident();
+            let old: Vec<TtTensor> = cache.state().into_iter().map(float).collect();
+            let captured = TracedInference::capture_with_state(&[&xp, &sp, &lp], || {
+                let TensorPrimitive::Float(y) = m
+                    .step_chunk(xin.clone(), sin.clone(), lin.clone(), &mut cache, dtype)
+                    .into_primitive()
+                else {
+                    unreachable!()
+                };
+                let new = cache.state().into_iter().map(float);
+                (vec![y], new.zip(old.iter().cloned()).collect())
+            });
+            let (trace, _) = match captured {
+                Ok(t) => t,
+                Err(e) => {
+                    let cause = format!(
+                        "{:?}",
+                        <TtBackend as burn::tensor::backend::Backend>::sync(&d)
+                    );
+                    assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+                    // The attachment's error is sticky, and a larger chunk has more programs.
+                    eprintln!(
+                        "SKIP smollm2 prefill chunks of {c} and up: do not fit the program \
+                         cache: {cause}"
+                    );
+                    break;
+                }
+            };
+            let run = |start: usize| {
+                trace
+                    .run(vec![
+                        InputPayload::F32(values.clone()),
+                        InputPayload::Bits(vec![start as u32]),
+                        InputPayload::Bits(vec![c as u32 - 1]),
+                    ])
+                    .unwrap()
+            };
+            assert_eq!(
+                bits(&logits(&run(c))),
+                bits(&want),
+                "chunk {c}: the replay at {c}"
+            );
+            for _ in 0..WARMUPS {
+                run(0);
+            }
+            let mut ms = Vec::new();
+            for _ in 0..SAMPLES {
+                let t0 = Instant::now();
+                run(0);
+                ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let per_token: Vec<f64> = ms.iter().map(|t| t / c as f64).collect();
+            report(
+                &format!("smollm2-135m prefill chunk of {c}, traced replay"),
+                "ms",
+                "host",
+                Stats::of(ms),
+            );
+            report(
+                &format!("smollm2-135m prefill chunk of {c}, traced, a token"),
+                "ms",
+                "host",
+                Stats::of(per_token),
+            );
+            drop(trace);
+        }
     });
 }
 
