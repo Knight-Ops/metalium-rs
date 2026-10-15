@@ -469,11 +469,35 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
       that covers it: buckets of 64 and 256, plus 128 if its trace fits.
     - **Result:** 256 tokens take **79 ms** against burn-flex's 1,040, and 32 tokens 40 ms against 175. One tile
       captures only single tokens ([log](../learnings/performance-log.md#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1)).
-  - **Left:**
-    - **The fixed ~33 ms a replay**, shared by decode and every chunk: its device profile first, then what it shows (the
-      m = 1 products, `mask_where`'s cache copies).
-    - A bucketed prefill-and-decode driver, the token lookup inside the trace, and chunks of 512.
-    - ResNet-18, ViT and prefill chunks on fewer tiles once segmentation lands.
+  - **Where traced SmolLM2 stands** (card 1, every tile, F32, batch 1, embedding lookup excluded, from the runs above):
+    - **Decode:** 37.1 ms a token with a 64-position cache (**27 tokens/s**), and 43.8 ms with a 512-position one
+      (23 tokens/s). burn-flex is 26.6 ms (38 tokens/s).
+    - **Prefill, one replay a bucket:**
+      - 32 tokens in 40.2 ms (about 800 tokens/s);
+      - 64 in 44.3 ms (1,450 tokens/s);
+      - 128 in 55.2 ms (2,300 tokens/s);
+      - 256 in 79.0 ms (**3,240 tokens/s**).
+
+      burn-flex reaches about 180-250 tokens/s.
+  - **Next steps, in order** (each measured as before: release, card 1, every tile with the default spread, burn-flex in
+    the same run; correctness bit for bit against the eager path, as in `step185`):
+    1. **Profile the fixed ~33 ms a replay.** It is shared by the decode step and every prefill chunk, and it is what
+       keeps decode behind burn-flex. Break the replay's device time down by op and layer (the trace replay breakdown,
+       `Session::host_times`, `dataflow_stats`); suspects are the m = 1 products and `mask_where`'s whole-cache copies.
+       Then fix what it shows. Targets: decode at or below burn-flex's 26.6 ms, and the chunk curve's intercept.
+    2. **A prefill-and-decode driver** in `tt-models`:
+       - keep the bucket traces (64 and 256; 128 if the program cache holds three) and one decode trace;
+       - for a prompt, replay the smallest bucket that covers it (chunks of 256 past that), then decode replays;
+       - the cache stays on the card throughout.
+
+       Gate: a whole generation equal to the eager growing-cache generation, token for token and logit for logit.
+    3. **The token lookup inside the trace.** Pass the token id as an I32 input and `select` the embedding row on the
+       card (the row select replays with new indices, `step171`). Then a step takes a token in and gives logits out.
+    4. **Chunks of 512, and longer caches.** The per-token cost had not flattened at 256 (0.31 ms). Decode slows with
+       cache length (37.1 ms at 64 positions, 43.8 at 512), since attention reads the whole cache; if long contexts
+       matter, bound the attended range.
+    5. **One tile and `work:64:4`:** prefill chunks and ResNet-18/ViT capture there only once traces are segmented
+       ("Trace segmentation" below).
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),
