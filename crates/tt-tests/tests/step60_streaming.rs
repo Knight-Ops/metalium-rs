@@ -1052,7 +1052,7 @@ fn streaming_gddr_throughput() {
     }
 }
 
-#[cfg(feature = "silicon")]
+#[cfg(all(feature = "silicon", feature = "profile"))]
 #[test]
 fn streaming_collects_profile_events_without_affecting_results() {
     for roles in [false, true] {

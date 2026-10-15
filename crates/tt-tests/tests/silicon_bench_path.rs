@@ -19,6 +19,8 @@
 //! movement, hand-offs and the roles' programs.
 
 #![cfg(feature = "silicon")]
+// The profiling helpers serve only the benches that need the `profile` feature.
+#![cfg_attr(not(feature = "profile"), allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -369,6 +371,8 @@ fn split(p: &DeviceProfile) -> Split {
 /// movement the roles waited on).
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn workflow_ops() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     use tt_kernels::sfpu::ops::kind_sfpu;
@@ -517,6 +521,8 @@ fn workflow_ops() {
 /// hides of the per-op path, and what it does not.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn queue_steady_state() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let card = device_index();
@@ -617,6 +623,8 @@ fn sweep_arm(s: &mut Session<tt_kmd::Kmd>, on: bool) {
 /// would show. `SWEEP_TILES` picks the tile counts.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn matmul_pipeline_sweep() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let card = device_index();
@@ -765,6 +773,8 @@ fn matmul_pipeline_sweep() {
 /// from.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn sfpu_pipeline_sweep() {
     use tt_kernels::kind;
     use tt_kernels::sfpu::ops::kind_sfpu;

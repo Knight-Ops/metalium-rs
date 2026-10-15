@@ -20,6 +20,8 @@ ttinsn-experiment = []
 # Off by default (the "safe" image). `encoded-guard` adds the semantic guard.
 fast-reads = []
 encoded-guard = ["fast-reads"]
+# Images that can stamp their work for the profile mode (`tt-firmware`'s `profile`).
+profile = []
 
 [dependencies]
 tt-isa.workspace = true

@@ -22,6 +22,10 @@ pub struct TraceEvent {
     pub cycles: u64,
 }
 
+/// The reason [`Device::read_trace`] gives when the stream outran its buffer: the events since it was
+/// configured are lost, and the buffer must be configured again.
+pub const OVERFLOWED: &str = "the timestamper buffer overflowed; events were dropped";
+
 impl<T: Transport> Device<T> {
     /// Point the tile's timestamper stream at `bytes` of L1 from `buffer`, and
     /// start it empty.
@@ -71,7 +75,7 @@ impl<T: Transport> Device<T> {
         if ts::buf0_overflowed(status) {
             return Err(TransportError::Hazard {
                 address: buffer,
-                reason: "the timestamper buffer overflowed; events were dropped",
+                reason: OVERFLOWED,
             });
         }
         let n = ts::buf0_position(status) as usize;

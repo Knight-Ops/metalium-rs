@@ -38,6 +38,8 @@ struct Opts {
     /// Extra `tt-tests` features for the build, beyond `silicon`.
     features: Vec<String>,
     timeout: Duration,
+    /// Run each test in burn-tt's profile mode (`TT_PROFILE`), each into a directory of its own.
+    profile: bool,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
@@ -50,6 +52,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         release: false,
         features: Vec::new(),
         timeout: Duration::from_secs(120),
+        profile: false,
     };
     let mut smoke = false;
     let mut args = args.peekable();
@@ -83,6 +86,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             "--keep-going" => o.keep_going = true,
             "--list" => o.list_only = true,
             "--release" => o.release = true,
+            "--profile" => {
+                // The profile mode needs firmware that can stamp (`tt-tests`'s `profile`).
+                o.profile = true;
+                o.features.push("profile".to_string());
+            }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
@@ -387,6 +395,9 @@ usage: cargo xtask silicon [options]
                         guard); the default is the safe mode
   --release             build the suite optimised; every timing worth quoting
                         comes from this, since the dev build is not a baseline
+  --profile             run each test in burn-tt's profile mode (`TT_PROFILE`): where the
+                        device's and the host's time goes, by Burn op, eager and traced,
+                        written to target/silicon/profile/<stamp>/<test>/chip<N>/
   --list                print the selection and exit without touching a card";
 
 /// Every card the driver has enumerated.
@@ -601,7 +612,15 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
                 .join(format!("{stamp}-dev{dev}-{}.txt", full.replace("::", "__")));
             let started = Instant::now();
             // `cargo test` runs a package's tests from its own directory.
-            let env = [("TT_SILICON_DEVICE", dev.to_string())];
+            let mut env = vec![("TT_SILICON_DEVICE", dev.to_string())];
+            if o.profile {
+                let at = dir
+                    .join("profile")
+                    .join(stamp.to_string())
+                    .join(full.replace("::", "__"));
+                println!("dev{dev} profile {}", at.display());
+                env.push(("TT_PROFILE", at.display().to_string()));
+            }
             let verdict = run_one(&bin.exe, test, &bin.dir, &env, o.timeout, &out_path)?;
             let secs = started.elapsed().as_secs_f64();
             log.line(&format!(

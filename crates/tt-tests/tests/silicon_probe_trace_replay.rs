@@ -16,6 +16,8 @@
 //! perturbation shows.
 
 #![cfg(feature = "silicon")]
+// The profiling helpers serve only the tests that need the `profile` feature.
+#![cfg_attr(not(feature = "profile"), allow(dead_code, unused_imports))]
 
 use std::time::Instant;
 
@@ -148,6 +150,8 @@ fn dump(profile: &DeviceProfile, unit: usize) {
     }
 }
 
+// Profiles its replays: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 #[test]
 #[ignore = "benchmark"]
 fn replay_dump() {
@@ -410,6 +414,8 @@ fn breakdown(s: &mut Card, name: &str, tiles: usize, trace: TraceId, reps: usize
     }
 }
 
+// Profiles its replays: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 #[test]
 #[ignore = "benchmark"]
 fn replay_breakdown() {

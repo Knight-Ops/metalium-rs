@@ -281,7 +281,8 @@ unparsable value as `0`.
 | `TT_BATCH` | `1`, `0` | Ops are queued on the tiles' movers and synced only when the host needs a result (`Session::set_batching`); `0` waits for every op. |
 | `TT_EXACT` | must be unset | Retired with the Flex cutover. Native numerical bounds apply; unset this variable. (Not the same as `TT_EXACT_MATMUL`.) |
 | `TT_EXACT_MATMUL` | unset, `0`, `1` | `1`: matmuls accumulate in exact F32 in `k` order on the SFPU (`MatmulMode::Exact`, `TtConfig::from_env`) instead of on the Matrix Unit; any other value is refused. The `tt-tests` harness's `Config::default()` reads it too. |
-| `TT_PROFILE` | unset, a path | Records a device-side profile of everything an attachment runs and writes it as Chrome trace JSON on detach (`{chip}` in the path becomes the card). Silicon only. |
+| `TT_PROFILE` | unset, a directory, a `.json` path | A directory: the **profile mode** (`burn_tt::profile`). Every eager op's device time by Burn op (timed alone), every trace's captured ops by name (a replay stamps a window of its ops, the next replay the next window, so a trace of any length is covered without replaying it twice), each replay's write/replay/read split, and the host's server-thread time, calls and session counters. Written on detach to `<dir>/chip<N>/summary.md`, `ops.tsv` and `trace.json` (Perfetto). `cargo xtask bench --profile` sets it per test. A path ending in `.json`: the raw timestamp trace of every entry, as Chrome trace JSON. `{chip}` becomes the card. Silicon only. |
+| `TT_PROFILE_DETAIL` | unset, `full` | With `TT_PROFILE=<dir>`: `full` also times every data entry (fewer ops a replay window). Unset, only the entries that bound an op's phases are stamped; data time is the remainder. |
 | `TT_REPORT` | unset, `1` | `1`: print the per-op report at exit (`burn_tt::report`): for every op, calls, results made on the device and on the host, bytes downloaded, uploaded and host-staged, and whether `burn-tt` implements it (`tt`) or the method is unsupported (`unsupported`). The worklist for a new model. |
 | `TT_STRICT` | unset, `1` | `1`: a download a host op causes, or a host-staged matmul, panics with the op's name (`burn_tt::set_strict`; one thread's block: `burn_tt::strictly`). Reading results back (`into_data`) is never one; `burn_tt::host_ok(..)` marks intended host work. |
 | `TT_TRACE_FALLBACK` | unset, any | Prints a backtrace whenever a device tensor is downloaded for a host op: the way to find what still crosses PCIe. |
@@ -329,9 +330,13 @@ unparsable value as `0`.
   `TtError::ServerPanicked` with the message. Ops with no `Result` to return (a
   host-staged matmul or full reduction) and an op on an unattached device panic at
   once. Nothing silently falls back.
-- `TT_PROFILE` records each tile's mover lists, entries and records, and its role
-  runs, by the tile's own cycle counter (Perfetto, `chrome://tracing`). Silicon
-  only: ttsim does not model the timestamper's event stream.
+- `TT_PROFILE=<dir>` (the profile mode) times ops on unit 0's data mover, by the
+  tile's own cycle counter: an op's span runs from the previous op's barrier to its
+  own, so it is the op's critical path, not each unit's work. Eager ops are synced and
+  timed one at a time, without overlap. A path ending in `.json` records every tile's
+  mover lists, entries and records, and its role runs (Perfetto, `chrome://tracing`).
+  Silicon only: ttsim does not model the timestamper's event stream. Not on
+  `Topology::Cards` (refused by name).
 - `Topology::Cards` uses resident buffers (retained in chip 0's GDDR, per-chip
   sessions for the matmul partitions) and one compute tile per card; `on_tiles`
   refuses more. Non-matmul primitives execute on chip 0 and chips are not yet

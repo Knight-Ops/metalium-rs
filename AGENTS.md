@@ -98,6 +98,13 @@ cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings
 ```
 
+**Profiling is a mode, and a build feature.** `TT_PROFILE=<dir>` (or `cargo xtask bench|silicon --profile`) records
+every eager op's and every traced op's device time by Burn op, with the host's side, into one directory
+(`burn_tt::profile`, `tt_kernels::profile_mode`). Stamping is compiled into the firmware only with the `profile`
+feature (`tt-tests/profile`, `burn-tt/profile`; `--profile` adds it): without it a run pays nothing for it (0.46 ms a
+SmolLM2-135M decode step when compiled in), and profiling is refused by name. Do not write per-benchmark profiling;
+extend the mode. A firmware change is linted with and without `--features profile`.
+
 The mover has two read modes (`fast-reads`, see below); a change to `mover.rs` or `tt_isa::dm::encoded`
 is run through the encoded-read gate and the differential gate in both: `cargo test -p tt-tests --test
 step172_encoded_reads --test step173_mover_differential` and the same with `--features tt-tests/fast-reads` (and

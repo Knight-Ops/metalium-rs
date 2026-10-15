@@ -83,6 +83,25 @@ pub mod trace_mode {
     /// The list's own begin and end and every entry but a plain or encoded read (a barrier's release, a
     /// kernel, a wait): what a benchmark that times lists needs, with the reads running as they do untraced.
     pub const LISTS: u32 = 2;
+    /// The outermost list's begin and end and only the entries that bound an op's phases: its control
+    /// (`LAUNCH`, `KERNEL`, `CB`, `POKE`), its kernels' wait (`KERNEL_WAIT`) and its barrier (`BARRIER`).
+    /// Data entries are not stamped (the span less the rest is their time), so an op costs ~8 events, not
+    /// ~25, and reads keep their untraced fast path: the profile mode's default
+    /// (`tt_kernels::profile`).
+    pub const OPS: u32 = 3;
+
+    /// Is an entry headed by `op` stamped in `OPS` mode?
+    pub const fn ops_stamped(op: u32) -> bool {
+        matches!(
+            op,
+            super::op::BARRIER
+                | super::op::KERNEL_WAIT
+                | super::op::LAUNCH
+                | super::op::KERNEL
+                | super::op::CB
+                | super::op::POKE
+        )
+    }
 }
 /// Mover -> host: how many of the mover's NoC requests had to wait for room
 /// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
@@ -174,7 +193,14 @@ const _: () = assert!(READ_FAST + 4 <= CAPS);
 /// made for another mover, fails the card's check. Ignored by an image without `fast-reads`.
 pub const ENCODE_KEY: u64 = MAILBOX_BASE + 0xF0;
 const _: () = assert!(CAPS + 4 <= ENCODE_KEY);
-const _: () = assert!(ENCODE_KEY + 4 <= MAILBOX_BASE + 0x100);
+/// Host -> mover: which ops of a list are stamped while [`TRACE`] is on, `lo | hi << 16`: only the entries
+/// run while `lo <= barriers < hi`, `barriers` counting the `BARRIER` entries the outermost list has run
+/// so far (each op of a multi-unit list ends in one, so it is the op's index). `hi == 0` stamps every
+/// entry. A replay too long for the stamp buffer is profiled a window at a time over successive replays
+/// (`tt_kernels::profile`). Read at the start of each outermost list.
+pub const TRACE_WINDOW: u64 = MAILBOX_BASE + 0xF4;
+const _: () = assert!(ENCODE_KEY + 4 <= TRACE_WINDOW);
+const _: () = assert!(TRACE_WINDOW + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`CAPS`]'s bits.
 pub mod caps {
@@ -187,6 +213,10 @@ pub mod caps {
     /// With `FAST_READS`, the image also runs [`super::encoded::guard`] on each
     /// encoded read (the `encoded-guard` feature), not only its checksum.
     pub const GUARD: u32 = 1 << 1;
+    /// The image stamps its work through the tile's timestamper when [`super::TRACE`] asks (the
+    /// `profile` feature). Without it the stamping code is not in the image at all, so a run that
+    /// does not profile pays nothing for it, and the host refuses to profile.
+    pub const STAMPS: u32 = 1 << 2;
 }
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].

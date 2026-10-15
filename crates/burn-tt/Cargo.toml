@@ -29,3 +29,7 @@ libc.workspace = true
 default = ["std", "fusion"]
 std = []
 fusion = ["dep:burn-std", "dep:burn-ir", "dep:burn-fusion", "dep:serde"]
+# Firmware that can stamp its work, for the profile mode (`TT_PROFILE`, `burn_tt::profile`). Off by
+# default: the stamping code is not in the images, so a run pays nothing for it, and `TT_PROFILE`
+# is refused by name.
+profile = ["tt-firmware-images/profile"]

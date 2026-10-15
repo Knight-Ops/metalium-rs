@@ -331,6 +331,16 @@ impl TracedInference {
         ))
     }
 
+    /// Name the trace in the profile mode's report (`crate::profile`); it is otherwise reported by
+    /// number.
+    pub fn set_name(&self, name: impl Into<String>) {
+        let (id, name) = (self.id, name.into());
+        let _ = server::run(self.device, move |e, _| {
+            e.set_trace_name(id, name);
+            Ok::<_, TtError>(())
+        });
+    }
+
     /// The number and shapes of output tensors, `[rows, cols]`.
     pub fn output_shapes(&self) -> Vec<[usize; 2]> {
         self.outputs.iter().map(|&(_, _, dims)| dims).collect()
@@ -530,6 +540,7 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
             drop(trace);
             return Err(TtError::Device(why));
         }
+        trace.set_name(format!("{key:?}"));
         self.traces.insert(key, trace);
         Ok(first)
     }

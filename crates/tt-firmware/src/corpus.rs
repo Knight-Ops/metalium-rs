@@ -94,7 +94,8 @@ fn fail_in(mb: Mailbox, code: u32) -> ! {
 /// whether ttsim models the timestamper is a question with its own probe, and
 /// a register it does not model is fatal there.
 fn trace(on: bool, thread: u32, event: u32) {
-    if on {
+    // Compiled out without the `profile` feature (`tt_isa::dm::caps::STAMPS`).
+    if cfg!(feature = "profile") && on {
         // SAFETY: a documented, aligned timestamper register; a store has no
         // effect beyond appending the event.
         unsafe {
@@ -446,7 +447,7 @@ where
         // generation, and the poll goes through a fence, since nothing the NoC
         // writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
         // SAFETY: fixed aligned mailbox locations inside L1.
-        let tracing = || unsafe { l1_read32(mb.trace()) } != 0;
+        let tracing = || cfg!(feature = "profile") && unsafe { l1_read32(mb.trace()) } != 0;
         trace(tracing(), Thread::INDEX, mailbox::trace::ACKED);
         // SAFETY: fixed aligned mailbox locations inside L1.
         unsafe {
@@ -489,7 +490,7 @@ where
     let program_len = program_len_word & tt_isa::dataflow::LENGTH_MASK;
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
-    let tracing = unsafe { l1_read32(mb.trace()) } != 0;
+    let tracing = cfg!(feature = "profile") && unsafe { l1_read32(mb.trace()) } != 0;
     let mut push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
     // SAFETY: as above.

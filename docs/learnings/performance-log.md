@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Where a SmolLM2-1.7B step goes: the profile mode](#where-a-smollm2-17b-step-goes-the-profile-mode-2026-10-15-cards-0-and-1) | 2026-10-15 | the first profile from the profile mode (`cargo xtask bench --profile`): a 1.7B decode step is 46% matmuls (~200 GB/s), **24% the cache write's `expand`** (32 key/value heads), ~30% small ops; stamping compiled in costs 0.46 ms a 135M step, so it is now a build feature |
 | [SmolLM2-1.7B-Instruct on the card](#smollm2-17b-instruct-on-the-card-2026-10-15-card-1) | 2026-10-15 | the first model past 1B parameters, traced, F32, every tile: decode 13.6-12.6 tokens/s (burn-flex 3.4-3.0), prefill 267-771 tokens/s (burn-flex 7.6-24.7); decode reads its weights at 86-93 GB/s, 17-18% of GDDR's 512 |
 | [Decode length and trace size](#decode-length-and-trace-size-2026-10-15-cards-0-and-1) | 2026-10-15 | one GDDR region a unit a trace (traces 3,754 -> 563 MB, build 44.9 -> 18.8 s); grouped-query attention without `repeat_kv` and steps attending to 64/128/256/512 positions: decode over a 512-position cache 32.29 -> 26.13-27.31 ms, a generation 0.60x-0.90x burn-flex's time |
 | [Traced generation, end to end](#traced-generation-end-to-end-2026-10-15-cards-0-and-1) | 2026-10-15 | `TracedGenerator`, token ids in and logits out, the step and chunks of 64/128/256 over one cache: the four traces hold 81 KB of the 240 KB program cache together; a decode step costs its cache's length (512 positions 32.3 ms, 320 28.5, 64 26.5); over 320 positions a 256-token prompt plus 64 tokens takes 1,860 ms against burn-flex's 2,996, first token 61.7 against 1,020 |
@@ -312,6 +313,58 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Where a SmolLM2-1.7B step goes: the profile mode (2026-10-15, cards 0 and 1)
+
+The first profile from the profile mode (`TT_PROFILE`, `cargo xtask bench --profile`; `burn_tt::profile`,
+`tt_kernels::profile_mode`, gate `silicon_profile_mode`).
+
+**The run:** `TT_TILES=all TT_GEN_MODEL=smollm2-1.7b-instruct TT_GEN_FLEX_SAMPLES=1 cargo xtask bench --profile
+--device 1 --filter silicon_bench_models::traced_generation`, run `1792091115`. The profile is in
+`target/silicon/profile/1792091115/`.
+
+**Coverage:**
+
+- Every decode step trace is fully covered (1,438-1,443 ops each, 341-693 replays, none overflowed).
+- **Their per-op medians sum to 73.5 / 74.5 / 76.0 / 79.3 ms a replay**, against 73.7-79.3 ms for the unprofiled
+  decode step (`1792082994`): the attribution accounts for the whole step.
+- Prefill chunks get 11-12 replays each, so 32-46% of their ~1,500 ops are covered. The 24 layers are alike, so the
+  covered stretch stands for the rest by label.
+- Profiled replays are host-timed at ~208 ms against 74: the mode's per-replay window writes and syncs, not the device.
+
+**A decode step (`Step(64)`, 73.5 ms):**
+
+| Label | Ops | ms | Share |
+|---|--:|--:|--:|
+| `float_matmul` | 169 | 33.7 | 46% |
+| `float_expand` | 72 | **17.9** | **24%** |
+| `float_mul` | 241 | 3.6 | 5% |
+| `float_mask_where` | 48 | 2.2 | 3% |
+| `attention/softmax` | 168 | 2.0 | 3% |
+| `float_cat` | 48 | 1.8 | 2% |
+| `attention/qk` + `/pv` | 144 | 3.1 | 4% |
+| the rest (norms, SiLU, adds, masks) | ~550 | ~9 | ~13% |
+
+- **The cache write is a quarter of a decode step.** `FixedCache`'s masked write expands the new key and value to
+  the cache's whole shape: a 120-unit row gather of ~355 us, twice a layer, since this model keeps all 32
+  key/value heads. SmolLM2-135M has 3, so it never showed. A row write at a device-held position (the deferred B3
+  of `decode-length-cost.md`) would replace both the expand and the `mask_where`.
+- **The matmuls read the 6.85 GB of weights at ~200 GB/s**, 40% of the 512 peak. The tied output head (402 MB) takes
+  1.44 ms, 279 GB/s.
+- **The rest is ~1,200 small ops at 6-50 us each:** per-op cost and fusion territory.
+
+**A 256-token prefill chunk** (32% covered): matmuls 62%, the softmax 10%, attention's mask 6.5%, `float_mul` 5%,
+`float_select` 5%.
+
+**The cost of stamping** (card 1, the 135M bench; runs `1792088908` and `1792089070`):
+
+| | Decode step, 32 / 128 / 256-token prompt |
+|---|---|
+| Stamping compiled in, profiling off | 26.28 / 26.74 / 27.45 ms |
+| Stamping compiled out (now the default) | **25.81 / 26.28 / 26.99 ms** |
+
+About 0.46 ms a step, 1.8%. So stamping is now the firmware's `profile` feature: the default images carry none of
+it, and profiling without it is refused by name.
 
 ## SmolLM2-1.7B-Instruct on the card (2026-10-15, card 1)
 

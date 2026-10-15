@@ -74,6 +74,10 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_ENCODED_GUARD").is_some() {
         features.push("encoded-guard");
     }
+    // Stamping is compiled in only for profiling (`tt-firmware`'s `profile`).
+    if std::env::var_os("CARGO_FEATURE_PROFILE").is_some() {
+        features.push("profile");
+    }
     if !features.is_empty() {
         cmd.args(["--features", &features.join(",")]);
     }

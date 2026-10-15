@@ -354,8 +354,18 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     against 74-79 ms measured, so decode is far from bound by memory: the next performance target. The traces hold
     155 KB of the 240 KB program cache and 1.5 GB of streams.
 
-  **Next:** Llama-3.2-1B or Qwen2.5-1.5B for the architecture features this one lacks (grouped-query attention, RoPE
-  scaling, QKV biases), and BF16 weights for this one (half the bytes a token).
+  **Profiled** (2026-10-15, the profile mode, run `1792091115`,
+  [log](../learnings/performance-log.md#where-a-smollm2-17b-step-goes-the-profile-mode-2026-10-15-cards-0-and-1)). A
+  decode step is:
+  - matmuls 46% (~200 GB/s);
+  - **the cache write's `expand` 24%** (all 32 key/value heads expanded to the cache's shape twice a layer);
+  - ~30% in ~1,200 small ops.
+
+  **Next, by that profile:**
+  - a row write at a device-held position for the cache (decode-length-cost B3, now ~18 ms a 1.7B token);
+  - the matmuls' bandwidth;
+  - BF16 weights (half the bytes a token);
+  - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL
@@ -531,7 +541,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   - **Next steps, in order** (each measured as before: release, card 1, every tile with the default spread, burn-flex in
     the same run; correctness bit for bit against the eager path, as in `step185`):
     1. [x] **Profile the fixed ~33 ms a replay** (done 2026-10-15, [replay-fixed-cost.md](replay-fixed-cost.md)). Unit 0's
-       mover stamps, op by op (`smollm2_replay_profile`, `TracedInference::ops`/`run_profiled`): ~84 ops a layer at
+       mover stamps, op by op (`smollm2_replay_profile`, since replaced by the profile mode, `cargo xtask bench --profile`): ~84 ops a layer at
        ~13 us, not the barrier (0.6 us an op) and not the m = 1 products' arithmetic. Fixed: a matmul refills padding only
        along `K`; one zero row per width kept; a buffer read transposed as `B` transposed once (the tied head, 2.3 ms);
        the model's mask expanded once a step and RoPE's sign in its table; thin downloads untilized by the card. Decode
@@ -602,6 +612,23 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   benches); `s`/`z` slow the mover 1.6x and the roles' push loop 7x. **Left:** an end-to-end check of `opt-level` 2, then adopt
   it; the loadable-kernel prototype (only if mover per-entry cost becomes the bottleneck: it is not today); live tt-metal
   timings once a ttnn whose SFPI matches the machine's is available (`crates/tt-tests/bench/ttnn_reference.py`).
+- [x] **The profile mode** (2026-10-15). One switch for where the time goes, eager and traced:
+  - **How:** `TT_PROFILE=<dir>` or `cargo xtask bench|silicon --profile`, from `burn_tt::profile` and
+    `tt_kernels::profile_mode`.
+  - **What it records:**
+    - each Burn op's (and op part's) device time, split into barrier, kernels, control and data;
+    - each trace's ops by name: a replay stamps a window of its ops (`dm::TRACE_WINDOW`), the next replay the next,
+      so a trace of any length is covered without a replay being repeated or extended;
+    - replay splits, and the host's server time and counters.
+  - **Output:** `summary.md`, `ops.tsv` and `trace.json`.
+  - **Overflow:** a stamp overflow is reported, never a failed run.
+  - **The firmware's `profile` feature:** stamping compiled in cost 0.46 ms a 135M decode step, so the default images
+    carry none of it.
+  - **Gates:** `silicon_profile_mode` (eager attribution, a 600-op trace covered window by window, windows stitched
+    against whole profiles, the window's negative control) and `step23` (refused without the feature).
+  - **Retired:** the custom `smollm2_replay_profile`.
+  - **Left:** prefill chunks replay too few times in the bench to be covered whole (32-46%); mesh engines refuse
+    the mode.
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8).

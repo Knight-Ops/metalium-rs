@@ -302,7 +302,7 @@ fn launch(generation: u32, programs: [(u32, u32); 3]) {
     }
     publish();
     *launched() = generation;
-    let traced = rd(M.at(dm::TRACE)) != 0;
+    let traced = trace_mode() != 0 && in_window();
     trace(traced, tt_isa::mailbox::trace::KICK, generation);
 }
 
@@ -331,7 +331,7 @@ fn await_roles(generation: u32) -> Result<(), u32> {
             }
         }
     }
-    let traced = rd(M.at(dm::TRACE)) != 0;
+    let traced = trace_mode() != 0 && in_window();
     trace(traced, tt_isa::mailbox::trace::ROLES_DONE, generation);
     Ok(())
 }
@@ -342,7 +342,7 @@ fn await_roles(generation: u32) -> Result<(), u32> {
 fn trace(on: bool, event: u32, detail: u32) {
     use tt_isa::mailbox::trace as ev;
     use tt_isa::tensix::timestamper as ts;
-    if on {
+    if STAMPS && on {
         wr(
             ts::TIMESTAMP,
             ts::event_128(ev::token_with(ev::MOVER, event, detail)),
@@ -415,10 +415,24 @@ const FAST_READS: bool = cfg!(feature = "fast-reads") && !IS_NC;
 /// the `encoded-guard` feature (about 50 cycles an entry).
 const ENCODED_GUARD: bool = FAST_READS && cfg!(feature = "encoded-guard");
 
+/// Whether this image can stamp its work at all (the `profile` feature): without it every stamp,
+/// and every read of [`dm::TRACE`], is compiled out.
+const STAMPS: bool = cfg!(feature = "profile");
+
+/// [`dm::TRACE`], or 0 in an image that cannot stamp (no read).
+fn trace_mode() -> u32 {
+    if STAMPS {
+        rd(M.at(dm::TRACE))
+    } else {
+        0
+    }
+}
+
 /// What this image tells the host it can do ([`dm::CAPS`]).
 const CAPS: u32 = dm::caps::VALID
     | if FAST_READS { dm::caps::FAST_READS } else { 0 }
-    | if ENCODED_GUARD { dm::caps::GUARD } else { 0 };
+    | if ENCODED_GUARD { dm::caps::GUARD } else { 0 }
+    | if STAMPS { dm::caps::STAMPS } else { 0 };
 
 /// `op::READ_ENCODED`: one GDDR read the host validated and encoded
 /// (`tt_isa::dm::encoded`). The card verifies the entry's checksum -- damage in
@@ -875,6 +889,30 @@ fn flip_trace_domain() {
 }
 static mut PAIR_ACTIVE: bool = false;
 static mut TRACE_DEPTH: u32 = 0;
+/// `BARRIER` entries the outermost traced list has run (`dm::TRACE_WINDOW`), and that list's window.
+static mut TRACE_BARRIERS: u32 = 0;
+static mut TRACE_WINDOW: (u32, u32) = (0, 0);
+/// A replay ([`call`]) is running: its chunks are lists of one stamped scope, not each its own.
+static mut IN_CALL: bool = false;
+
+/// Whether stamps now fall inside the scope's window (`dm::TRACE_WINDOW`): every stamp the mover
+/// makes inside a scope (entries, a launch's `KICK`, a wait's `ROLES_DONE`, `THROTTLE`) obeys it, or a
+/// long replay's launches alone would outrun the buffer.
+fn in_window() -> bool {
+    let (lo, hi) = unsafe { TRACE_WINDOW };
+    let b = unsafe { TRACE_BARRIERS };
+    hi == 0 || (lo <= b && b < hi)
+}
+
+/// Start a stamped scope (an outermost list, or a whole replay): its window read, its barriers
+/// counted from zero.
+fn begin_trace_scope() {
+    let w = rd(M.at(dm::TRACE_WINDOW));
+    unsafe {
+        TRACE_BARRIERS = 0;
+        TRACE_WINDOW = (w & 0xFFFF, w >> 16);
+    }
+}
 
 fn begin_pair() -> Result<u32, u32> {
     if unsafe { PAIR_ACTIVE }
@@ -978,9 +1016,13 @@ fn pair_call(
 #[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
-    let mode = rd(M.at(dm::TRACE));
+    let mode = trace_mode();
     let traced = mode != 0;
-    let outer = traced && unsafe { TRACE_DEPTH == 0 };
+    // A replay's chunks are not outermost: the replay is ([`call`]).
+    let outer = traced && unsafe { TRACE_DEPTH == 0 && !IN_CALL };
+    if outer {
+        begin_trace_scope();
+    }
     if traced {
         unsafe {
             TRACE_DEPTH += 1;
@@ -993,10 +1035,14 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
         while i < count as u64 {
             let head = at(i);
             let n = record::len(head[0]) as u64;
-            // `trace_mode::LISTS` leaves the reads out, so they keep the untraced paths.
+            // `trace_mode::LISTS` leaves the reads out, so they keep the untraced paths;
+            // `trace_mode::OPS` stamps only what bounds an op's phases; a window
+            // (`dm::TRACE_WINDOW`) only the ops within it.
             let entry_traced = traced
                 && head[0] != op::PAIR_CALL
-                && !(mode == dm::trace_mode::LISTS && (head[0] == op::READ || head[0] == op::READ_ENCODED));
+                && !(mode == dm::trace_mode::LISTS && (head[0] == op::READ || head[0] == op::READ_ENCODED))
+                && (mode != dm::trace_mode::OPS || dm::trace_mode::ops_stamped(head[0]))
+                && in_window();
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
             if n == 1 {
                 // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
@@ -1031,6 +1077,11 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
                 }
             }
             trace(entry_traced, ev::ENTRY_END, head[0]);
+            if traced && head[0] == op::BARRIER {
+                unsafe {
+                    TRACE_BARRIERS += 1;
+                }
+            }
             i += n;
         }
         noc::wait(TXN);
@@ -1151,6 +1202,39 @@ fn call(
     generation_base: u32,
     barrier_base: u32,
 ) -> Result<(), u32> {
+    use tt_isa::mailbox::trace as ev;
+    // The outermost call is one stamped scope, its own list begin and end around all its chunks
+    // (a `PAIR_CALL`'s reader section runs as a call inside it).
+    let scope = trace_mode() != 0 && unsafe { !IN_CALL && TRACE_DEPTH == 0 };
+    if scope {
+        begin_trace_scope();
+        trace(true, ev::LIST_BEGIN, count);
+        unsafe {
+            IN_CALL = true;
+        }
+    }
+    let result = call_chunks(me, usable, channel, offset, count, generation_base, barrier_base);
+    if scope {
+        unsafe {
+            IN_CALL = false;
+        }
+        if result.is_ok() {
+            trace(true, ev::LIST_END, count);
+        }
+    }
+    result
+}
+
+/// [`call`]'s chunks, in order.
+fn call_chunks(
+    me: (u8, u8),
+    usable: u32,
+    channel: u32,
+    offset: u32,
+    count: u32,
+    generation_base: u32,
+    barrier_base: u32,
+) -> Result<(), u32> {
     let mut done = 0u32;
     let chunk = if M == dm::Mover::B && !unsafe { PAIR_ACTIVE } {
         tt_isa::dataflow::OUTER_CHUNK
@@ -1260,7 +1344,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             list_settings();
             let slot = rd(M.at(dm::QUEUE_SLOTS) + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
-            publish_stalls(&mut stalls, rd(M.at(dm::TRACE)) != 0);
+            publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
             // Everything the list moved has landed before it is reported.
             publish();
             match result {
@@ -1316,7 +1400,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             )
             .and_then(|d| run(me, d))
         };
-        publish_stalls(&mut stalls, rd(M.at(dm::TRACE)) != 0);
+        publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
         if let Err(code) = result {
             if matches!(rd(M.at(dm::OP)), op::SHARED | op::CALL) {
                 tt_firmware::dataflow::abort_with(code);

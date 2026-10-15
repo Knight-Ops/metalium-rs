@@ -55,7 +55,7 @@ gain is therefore ~6.6x, not 30-60x.
 
 ### B0. Where a step's length cost goes (done)
 
-`smollm2_replay_profile` with `TT_PROFILE_MAX_LEN` (new), one layer, card 1, runs `1792076366` (64 positions) and
+`smollm2_replay_profile` (since retired for the profile mode, `TT_PROFILE`/`cargo xtask bench --profile`) with `TT_PROFILE_MAX_LEN`, one layer, card 1, runs `1792076366` (64 positions) and
 `1792076371` (512). This is unit 0's device time by Burn op, in microseconds, for one layer plus the head and the
 step's prologue:
 

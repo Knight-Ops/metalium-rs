@@ -429,6 +429,23 @@ pub trait Engine {
     }
     /// What `trace` costs each unit: its stream's GDDR bytes and the program-cache bytes it
     /// holds, beside what every trace on the unit holds (`Session::trace_footprint`).
+    /// Name `trace` for the profile mode's report.
+    fn set_trace_name(&mut self, _trace: u64, _name: String) {}
+    /// Turn the profile mode on (`Some`) or off (`None`, returning what it recorded):
+    /// `Session::profile_mode`.
+    fn profile_mode(
+        &mut self,
+        _options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        Err(TtError::Device(
+            "this engine has no profile mode (`TT_PROFILE` is for a single card's KMD engine)"
+                .into(),
+        ))
+    }
+    /// What the profile mode has recorded so far.
+    fn profile_report(&mut self) -> Result<Option<crate::profile::Profile>, TtError> {
+        Ok(None)
+    }
     fn trace_footprint(
         &mut self,
         _trace: u64,
@@ -588,6 +605,12 @@ pub struct DramBuffers {
     bfp: HashMap<BufferId, tt_kernels::bfp::BfpTensor>,
     next_trace: u64,
     traces: HashMap<u64, tt_kernels::trace::TraceId>,
+    /// The profile mode's names for traces, by the session's trace number
+    /// ([`DramBuffers::set_trace_name`]), kept after a trace is released.
+    trace_names: std::collections::BTreeMap<u64, String>,
+    /// While the profile mode is on: each replay's input write, replay and output read, by the
+    /// session's trace number.
+    replay_times: Option<std::collections::BTreeMap<u64, Vec<[std::time::Duration; 3]>>>,
 }
 
 impl DramBuffers {
@@ -917,12 +940,62 @@ impl DramBuffers {
         s.sync().map_err(TtError::from)?;
         let t2 = Instant::now();
         let out_data = self.read_trace_outputs(s, outputs)?;
-        Ok(GenericTraceRun {
+        let run = GenericTraceRun {
             outputs: out_data,
             write: t1 - t0,
             replay: t2 - t1,
             read: t2.elapsed(),
-        })
+        };
+        if let Some(times) = self.replay_times.as_mut() {
+            times
+                .entry(id.raw())
+                .or_default()
+                .push([run.write, run.replay, run.read]);
+        }
+        Ok(run)
+    }
+
+    /// Name trace `trace` for the profile mode's report.
+    pub fn set_trace_name(&mut self, trace: u64, name: String) {
+        if let Some(id) = self.traces.get(&trace) {
+            self.trace_names.insert(id.raw(), name);
+        }
+    }
+
+    /// Turn the profile mode on or off (`Session::profile_mode`), keeping each replay's timing
+    /// while it is on; off, what it recorded, with the traces' names.
+    pub fn profile_mode<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let on = options.is_some();
+        let device = s.profile_mode(options).map_err(TtError::from)?;
+        let profile = device.map(|device| self.profile(s, device));
+        self.replay_times = on.then(Default::default);
+        Ok(profile)
+    }
+
+    /// What the profile mode has recorded so far.
+    pub fn profile_report<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let device = s.profile_report().map_err(TtError::from)?;
+        Ok(device.map(|device| self.profile(s, device)))
+    }
+
+    fn profile<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        device: tt_kernels::profile_mode::ProfileReport,
+    ) -> crate::profile::Profile {
+        crate::profile::Profile {
+            device,
+            names: self.trace_names.clone(),
+            replays: self.replay_times.clone().unwrap_or_default(),
+            host: crate::profile::session_text(s),
+        }
     }
 
     pub fn profile_generic_trace<T: tt_device::Transport>(
@@ -3394,6 +3467,22 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
         bufs.trace_footprint(&self.session, trace)
     }
+    fn set_trace_name(&mut self, trace: u64, name: String) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.set_trace_name(trace, name);
+        }
+    }
+    fn profile_mode(
+        &mut self,
+        options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_mode(&mut self.session, options)
+    }
+    fn profile_report(&mut self) -> Result<Option<crate::profile::Profile>, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_report(&mut self.session)
+    }
     fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TtError> {
         self.session
             .set_profile_buffer(bytes)
@@ -3627,10 +3716,19 @@ pub(crate) fn kmd_engine_with_elementwise(
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.
+        //
+        // `TT_PROFILE=<dir>`: the profile mode (`crate::profile`): every op's device time,
+        // eager and traced, by Burn op, written to `<dir>/chip<N>/` when it detaches.
+        // `TT_PROFILE_DETAIL=full` times data entries one by one.
         let profile_to = std::env::var("TT_PROFILE")
             .ok()
             .map(|p| p.replace("{chip}", &device.chip.to_string()));
-        if profile_to.is_some() {
+        let (raw_profile, profile_dir) = match profile_to {
+            Some(p) if p.ends_with(".json") => (Some(p), None),
+            Some(p) => (None, Some(std::path::PathBuf::from(p))),
+            None => (None, None),
+        };
+        if raw_profile.is_some() {
             session
                 .profile_start()
                 .map_err(|e| TtError::Device(format!("TT_PROFILE: {e}")))?;
@@ -3644,6 +3742,11 @@ pub(crate) fn kmd_engine_with_elementwise(
             matmul,
         }
         .with_elementwise_mode(elementwise)?;
+        if profile_dir.is_some() {
+            engine
+                .profile_mode(Some(crate::profile::options_from_env()))
+                .map_err(|e| TtError::Device(format!("TT_PROFILE: {e}")))?;
+        }
         let served = std::time::Instant::now();
         serve.serve(&mut engine);
         // `TT_HOST_TIMES=1`: where the server thread's time went queueing ops
@@ -3676,7 +3779,18 @@ pub(crate) fn kmd_engine_with_elementwise(
                 lists.iter().max().copied().unwrap_or(0)
             );
         }
-        if let Some(path) = profile_to {
+        if let Some(dir) = profile_dir {
+            let dir = dir.join(format!("chip{}", device.chip));
+            match engine.profile_mode(None) {
+                Ok(Some(profile)) => match profile.write(&dir) {
+                    Ok(()) => eprintln!("burn-tt: profile written to {}", dir.display()),
+                    Err(e) => eprintln!("burn-tt: TT_PROFILE: {e}"),
+                },
+                Ok(None) => {}
+                Err(e) => eprintln!("burn-tt: TT_PROFILE: {e}"),
+            }
+        }
+        if let Some(path) = raw_profile {
             let written = engine
                 .session
                 .profile_stop()

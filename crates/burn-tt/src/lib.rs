@@ -39,6 +39,7 @@ mod generated;
 mod host;
 mod matmul_mode;
 mod ops;
+pub mod profile;
 mod random;
 mod registry;
 mod report;

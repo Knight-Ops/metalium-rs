@@ -106,6 +106,13 @@ impl core::fmt::Display for TraceError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TraceId(pub(crate) u64);
 
+impl TraceId {
+    /// The number, as the profile mode reports traces by it (`crate::profile_mode`).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// What one captured op was: the graph a later pass can optimize over.
 #[derive(Clone, Debug)]
 pub struct OpRecord {
@@ -120,6 +127,9 @@ pub struct OpRecord {
     pub entries: Vec<core::ops::Range<usize>>,
     /// Whether a barrier followed it on every unit.
     pub barrier: bool,
+    /// The events it could stamp in the profile mode on its busiest unit, at most:
+    /// `[Detail::Ops, Detail::Full]` (`crate::profile_mode`). Set when the trace is stored.
+    pub stamps: [u32; 2],
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those

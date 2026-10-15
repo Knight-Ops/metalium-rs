@@ -107,7 +107,7 @@ of 16 and 64 ops, replay time over op count:
 An op on one unit of 120 costs 0.6 us more than on a one-tile session: the barrier with 119 idle units arriving.
 P1 (barriers on the units an op ran on) would save at most about that a op, ~1.5 ms a step, so it waits.
 
-**Op by op** (`smollm2_replay_profile`, one layer, run `1792034647`: unit 0's mover stamps in a 128 KiB buffer at the top of
+**Op by op** (`smollm2_replay_profile`, since replaced by the profile mode (`TT_PROFILE`, `cargo xtask bench --profile`), one layer, run `1792034647`: unit 0's mover stamps in a 128 KiB buffer at the top of
 the program cache, `Session::set_profile_buffer`; each op's span runs from one of unit 0's `BARRIER` ends to the next).
 The spans sum to 3,846 us: **1,123 us a layer**, the output head 2,329 us, the replay's start 174 us (the first op's barrier
 waiting for the 120 `CALL`s to be enqueued), the final norm 98 us. 30 layers of that is 36.4 ms against the 36.0 ms

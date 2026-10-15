@@ -27,6 +27,11 @@ fast-reads = []
 # each encoded read: ~50 cycles more an entry, protecting against a bug in the
 # host's encoder as well as damage.
 encoded-guard = ["fast-reads"]
+# Timestamping (`tt_isa::dm::TRACE`, the profile mode `tt_kernels::profile_mode`): the movers and the
+# role runners stamp their lists, entries and kernels when the host asks. Off by default: without it
+# the stamping code, and every check of whether to stamp, is compiled out, so ordinary runs pay
+# nothing. The mover reports it (`dm::caps::STAMPS`), and the host refuses to profile without it.
+profile = []
 
 [[bin]]
 name = "ttinsn_t1"

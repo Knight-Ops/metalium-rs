@@ -11,6 +11,13 @@
 //! ttsim does not model the event stream (divergence row 54): there the claim
 //! is that profiling is refused with a reason, and that the refusal leaves the
 //! session usable.
+//!
+//! The silicon claims need firmware that can stamp (`--features tt-tests/profile`); without it the
+//! stamping code is compiled out, and these tests are too.
+#![cfg_attr(
+    all(feature = "silicon", not(feature = "profile")),
+    allow(dead_code, unused_imports)
+)]
 
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::tensor::Eltwise;
@@ -81,7 +88,21 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
     }
 }
 
-#[cfg(feature = "silicon")]
+/// Without the `profile` feature the firmware cannot stamp (its stamping code is compiled out, so
+/// ordinary runs pay nothing for it): profiling is refused by name, and the session carries on.
+#[cfg(all(feature = "silicon", not(feature = "profile")))]
+#[test]
+fn without_the_profile_feature_profiling_is_refused_by_name() {
+    with_tiles(1, |s| {
+        let err = s.profile_start().expect_err("this firmware cannot stamp");
+        assert!(err.to_string().contains("`profile` feature"), "{err}");
+        let v = floats(1, 64 * 64);
+        let a = s.upload(&v, 64, 64).unwrap();
+        assert_eq!(s.download(&a).unwrap(), v);
+    });
+}
+
+#[cfg(all(feature = "silicon", feature = "profile"))]
 #[test]
 fn a_profile_brackets_every_entry_and_accounts_for_streaming_roles() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
@@ -185,7 +206,7 @@ fn a_profile_brackets_every_entry_and_accounts_for_streaming_roles() {
     });
 }
 
-#[cfg(feature = "silicon")]
+#[cfg(all(feature = "silicon", feature = "profile"))]
 #[test]
 fn a_profile_outlives_the_event_buffer() {
     with_tiles(1, |s| {

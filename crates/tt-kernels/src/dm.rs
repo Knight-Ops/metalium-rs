@@ -389,6 +389,12 @@ impl<N: NocId> DataMover<N> {
         Ok(())
     }
 
+    /// Whether this mover's image can stamp its work (`dm::caps::STAMPS`, the firmware's `profile`
+    /// feature): what profiling needs.
+    pub fn stamps(&self) -> bool {
+        self.caps & dm::caps::STAMPS != 0
+    }
+
     /// Whether this mover's image runs host-encoded reads (`dm::caps::FAST_READS`): the
     /// firmware was built with `fast-reads`. Only B's can.
     pub fn fast_reads(&self) -> bool {

@@ -35,6 +35,7 @@ pub mod matrix_eltwise;
 pub mod mesh_trace;
 pub mod prng;
 pub mod profile;
+pub mod profile_mode;
 pub mod program_cache;
 pub mod runtime;
 pub mod session;

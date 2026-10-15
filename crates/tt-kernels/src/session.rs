@@ -461,6 +461,10 @@ pub struct Session<T: Transport> {
     /// Each unit's timestamper stream so far, between
     /// [`Session::profile_start`] and [`Session::profile_stop`].
     profiling: Option<Vec<crate::profile::UnitProfile>>,
+    /// The profile mode ([`Session::profile_mode`]): what the stamps are attributed to, and each
+    /// unit's stamps since the last attribution.
+    profiler: Option<crate::profile_mode::Profiler>,
+    profile_drained: Vec<Vec<tt_device::trace::TraceEvent>>,
     /// Where each unit's timestamper stream goes, and its bytes
     /// ([`Session::set_profile_buffer`]): the fixed trace buffer unless moved.
     profile_buffer: (u64, u64),
@@ -1707,6 +1711,44 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
     items
 }
 
+/// The events unit stream `uc`'s entries `range` could stamp in the profile mode, at most, in
+/// [`crate::profile_mode::Detail::Ops`] and in `Full`: three a stamped entry (its begin and end and a
+/// `KICK` or `ROLES_DONE` inside), and for a `PAIR_CALL`, its reader section's entries (B runs them;
+/// NC, which runs the writer's, does not stamp).
+fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2] {
+    use crate::profile_mode::{Detail, ProfileOptions};
+    let options = |detail| ProfileOptions {
+        detail,
+        ..ProfileOptions::default()
+    };
+    let (ops, full) = (options(Detail::Ops), options(Detail::Full));
+    let mut count = [0u32; 2];
+    let mut add = |entries: &[[u32; 8]]| {
+        let mut i = 0;
+        while i < entries.len() {
+            let head = entries[i][0];
+            count[0] += ops.stamps(head);
+            count[1] += full.stamps(head);
+            i += (tt_isa::dm::record::len(head) as usize).max(1);
+        }
+    };
+    let mut i = range.start;
+    while i < range.end.min(uc.stream.len()) {
+        let head = uc.stream[i][0];
+        if head == tt_isa::dm::op::PAIR_CALL {
+            if let Some(k) = uc.pair_calls.iter().position(|&at| at == i) {
+                if let Some(reader) = uc.pending_sections.get(2 * k) {
+                    add(reader);
+                }
+            }
+        } else {
+            add(&uc.stream[i..i + 1]);
+        }
+        i += (tt_isa::dm::record::len(head) as usize).max(1);
+    }
+    count
+}
+
 impl<T: Transport> Session<T> {
     /// Bring `dev` up for compute on the tiles `choice` names.
     ///
@@ -1784,6 +1826,8 @@ impl<T: Transport> Session<T> {
             drains: 0,
             dram: None,
             profiling: None,
+            profiler: None,
+            profile_drained: Vec::new(),
             profile_buffer: (
                 tt_isa::mailbox::TRACE_BUFFER,
                 tt_isa::mailbox::TRACE_BUFFER_BYTES,
@@ -1893,12 +1937,9 @@ impl<T: Transport> Session<T> {
             // that failed; the profile goes on from an empty one.
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
-            dev.configure_trace(
-                r.window(),
-                unit.tile,
-                tt_isa::mailbox::TRACE_BUFFER,
-                tt_isa::mailbox::TRACE_BUFFER_BYTES,
-            )?;
+            // The buffer the profile reads (`set_profile_buffer` may have moved it).
+            let (buffer, bytes) = self.profile_buffer;
+            dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
         }
         unit.resident = Some(r);
         Ok(())
@@ -1922,8 +1963,32 @@ impl<T: Transport> Session<T> {
         if self.profiling.is_some() {
             return Ok(());
         }
+        // Stamping is compiled into the firmware only with its `profile` feature; without it there
+        // is nothing to record. Checked on unit 0's mover, once it has started.
+        if self.units.first().is_some_and(|u| u.resident.is_none()) {
+            self.prepare_unit(0)?;
+        }
+        if self.dram.is_some() && self.units[0].mover.is_none() {
+            // Movers start with their first list; this one is needed now, to ask it.
+            self.ensure_unit(0).map_err(|e| match e {
+                TensorError::Run(r) => r,
+                TensorError::Transport(t) => RunError::Transport(t),
+                _ => RunError::Transport(TransportError::Hazard {
+                    address: tt_isa::dm::CAPS,
+                    reason: "unit 0's data mover did not start, so whether it can stamp is unknown",
+                }),
+            })?;
+        }
+        if self.units[0].mover.as_ref().is_some_and(|m| !m.stamps()) {
+            return Err(RunError::Transport(TransportError::Hazard {
+                address: tt_isa::dm::CAPS,
+                reason: "this firmware cannot stamp its work: build with the `profile` feature \
+                         (`burn-tt/profile`, `tt-tests/profile`; `cargo xtask silicon --profile`)",
+            }));
+        }
         self.profiling = Some(Vec::new());
         let (buffer, bytes) = self.profile_buffer;
+        let trace_word = self.trace_word();
         let mut units = Vec::with_capacity(self.units.len());
         for u in 0..self.units.len() {
             if self.units[u].resident.is_none() {
@@ -1937,7 +2002,8 @@ impl<T: Transport> Session<T> {
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
             if unit.mover.is_some() {
-                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
             }
             let counter_at_start = dev.wall_clock(r.window(), unit.tile)?;
             units.push(crate::profile::UnitProfile {
@@ -1987,6 +2053,96 @@ impl<T: Transport> Session<T> {
         })
     }
 
+    /// The mover's `tt_isa::dm::TRACE` word while profiling: the profile mode's detail, or every
+    /// entry for a bare [`Session::profile_start`].
+    fn trace_word(&self) -> u32 {
+        self.profiler
+            .as_ref()
+            .map_or(tt_isa::dm::trace_mode::FULL, |p| p.options.trace_mode())
+    }
+
+    /// Turn the profile mode on (`Some`) or off (`None`, returning what it recorded): where the
+    /// device's time goes, op by op, for whatever runs, eager or traced (`crate::profile_mode`).
+    /// While it is on, every op is synced and timed alone, and every replay stamps the next window
+    /// of its ops. Refused on the simulator, which does not model the stamp stream.
+    pub fn profile_mode(
+        &mut self,
+        options: Option<crate::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile_mode::ProfileReport>, RunError> {
+        match options {
+            Some(options) => {
+                if self.profiler.is_some() || self.profiling.is_some() {
+                    return Err(RunError::Transport(TransportError::Hazard {
+                        address: 0,
+                        reason: "the profile mode is already on, or a bare profile is running",
+                    }));
+                }
+                self.profile_roles = options.roles;
+                self.profiler = Some(crate::profile_mode::Profiler::new(options, 0));
+                if let Err(e) = self.profile_start() {
+                    self.profiler = None;
+                    return Err(e);
+                }
+                let counter = self.unit0_clock()?;
+                self.profiler = Some(crate::profile_mode::Profiler::new(options, counter));
+                Ok(None)
+            }
+            None => {
+                let report = self.profile_report()?;
+                self.profiler = None;
+                self.profile_drained.clear();
+                if self.profiling.is_some() {
+                    self.profile_stop()?;
+                }
+                Ok(report)
+            }
+        }
+    }
+
+    /// What the profile mode has recorded so far, if it is on.
+    pub fn profile_report(
+        &mut self,
+    ) -> Result<Option<crate::profile_mode::ProfileReport>, RunError> {
+        if self.profiler.is_none() {
+            return Ok(None);
+        }
+        self.sync_run()?;
+        self.profile_collect();
+        let counter = self.unit0_clock()?;
+        Ok(self.profiler.as_ref().map(|p| p.report(counter)))
+    }
+
+    fn unit0_clock(&mut self) -> Result<u64, RunError> {
+        let Session { dev, units, .. } = self;
+        match units
+            .first()
+            .and_then(|u| u.resident.as_ref().map(|r| (r, u.tile)))
+        {
+            Some((r, tile)) => Ok(dev.wall_clock(r.window(), tile)?),
+            None => Ok(0),
+        }
+    }
+
+    /// Hand the stamps drained since the last call to the profile mode, for what it was waiting
+    /// to attribute (an eager op, or a replay).
+    fn profile_collect(&mut self) {
+        let Some(p) = self.profiler.as_mut() else {
+            return;
+        };
+        let drained = std::mem::take(&mut self.profile_drained);
+        let was_replay = p.expecting_replay();
+        p.drained(&drained);
+        if was_replay {
+            // The next list is no replay: it stamps every entry again.
+            let Session { dev, units, .. } = self;
+            for unit in units.iter() {
+                if let (Some(r), Some(_)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                    let _ = dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0);
+                }
+            }
+        }
+    }
+
     /// Move unit `u`'s events into the profile and start its stream empty
     /// again, so the 1024-event buffer bounds one operation, not a whole profile.
     fn drain(&mut self, u: usize) -> Result<(), TransportError> {
@@ -1994,6 +2150,8 @@ impl<T: Transport> Session<T> {
             dev,
             units,
             profiling,
+            profiler,
+            profile_drained,
             profile_buffer: (buffer, bytes),
             ..
         } = self;
@@ -2001,8 +2159,30 @@ impl<T: Transport> Session<T> {
             return Ok(());
         };
         let tile = units[u].tile;
-        let events = dev.read_trace(r.window(), tile, *buffer)?;
-        p[u].events.extend(events);
+        let events = match (dev.read_trace(r.window(), tile, *buffer), profiler.as_mut()) {
+            // The profile mode never fails a run: an op whose stamps outran the buffer is reported as
+            // such, and the buffer starts again.
+            (
+                Err(TransportError::Hazard {
+                    reason: tt_device::trace::OVERFLOWED,
+                    ..
+                }),
+                Some(pr),
+            ) => {
+                pr.overflowed();
+                Vec::new()
+            }
+            (events, _) => events?,
+        };
+        if profiler.is_some() {
+            // The profile mode attributes them ([`Session::profile_collect`]) and keeps no raw stream.
+            if profile_drained.len() <= u {
+                profile_drained.resize(u + 1, Vec::new());
+            }
+            profile_drained[u].extend(events);
+        } else {
+            p[u].events.extend(events);
+        }
         dev.configure_trace(r.window(), tile, *buffer, *bytes)
     }
 
@@ -2976,6 +3156,7 @@ impl<T: Transport> Session<T> {
         if self.units[u].resident.is_none() {
             self.prepare_unit(u)?;
         }
+        let trace_word = self.trace_word();
         let Session {
             dev,
             units,
@@ -3020,7 +3201,8 @@ impl<T: Transport> Session<T> {
             nc.set_write_noc(dev, r.window(), crate::dm::WriteNoc::Noc1)?;
             unit.nc = Some(nc);
             if profiling.is_some() {
-                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 1)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
             }
             // Unit 0's tile holds the barrier counter, and L1 keeps whatever
             // an earlier session left there: a count already past every
@@ -3073,6 +3255,7 @@ impl<T: Transport> Session<T> {
                     .map(|(u, s)| s..u.stream.len())
                     .collect(),
                 barrier: self.units.len() > 1,
+                stamps: [0; 2],
             });
         }
         result
@@ -3693,10 +3876,20 @@ impl<T: Transport> Session<T> {
             barriers,
             units,
             freed,
-            ops,
+            mut ops,
             failed,
             ..
         } = capture;
+        // What each op could stamp in each detail of the profile mode, on its busiest unit: what
+        // sizes a profiled replay's window (`profile_mode`).
+        for op in &mut ops {
+            let mut most = [0u32; 2];
+            for (uc, range) in units.iter().zip(&op.entries) {
+                let s = op_stamps(uc, range.clone());
+                most = [most[0].max(s[0]), most[1].max(s[1])];
+            }
+            op.stamps = most;
+        }
         // What the capture deferred is the session's to give back now.
         let give_back = |s: &mut Self, freed: Vec<tensor::Placement>| {
             for p in freed {
@@ -3875,9 +4068,21 @@ impl<T: Transport> Session<T> {
                 self.catch_up(u)?;
             }
         }
+        // The profile mode stamps a window of the trace's ops on every unit.
+        let window = match self.profiler.is_some() {
+            true => Some(self.profile_window(id)),
+            false => None,
+        };
         let barrier_base = self.barriers;
         let ran: Vec<bool> = calls.iter().map(Option::is_some).collect();
         let Session { dev, units, .. } = self;
+        if let Some(w) = window {
+            for unit in units.iter() {
+                if let (Some(r), Some(_)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                    dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, w)?;
+                }
+            }
+        }
         for (unit, call) in units.iter_mut().zip(calls) {
             let Some([channel, offset, count, generations]) = call else {
                 continue;
@@ -3917,7 +4122,43 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+        if window.is_some() {
+            // Profiled, a replay is timed alone, as an eager op is.
+            self.sync()?;
+            self.profile_collect();
+        }
         Ok(())
+    }
+
+    /// The window of trace `id`'s ops its next replay stamps (`tt_isa::dm::TRACE_WINDOW`), its ops
+    /// made known to the profile mode on its first replay.
+    fn profile_window(&mut self, id: TraceId) -> u32 {
+        let detail = match self.profiler.as_ref().map(|p| p.options.detail) {
+            Some(crate::profile_mode::Detail::Full) => 1,
+            _ => 0,
+        };
+        let ops = self.traces.get(&id.0).map(|t| &t.ops[..]).unwrap_or(&[]);
+        let Some(p) = self.profiler.as_mut() else {
+            return 0;
+        };
+        p.know_trace(id.0, || {
+            let info = ops
+                .iter()
+                .map(|o| crate::profile_mode::OpInfo {
+                    label: o.label,
+                    what: o.what,
+                    units: o
+                        .entries
+                        .iter()
+                        .filter(|r| r.len() > o.barrier as usize)
+                        .count(),
+                })
+                .collect();
+            let stamps = ops.iter().map(|o| o.stamps[detail]).collect();
+            let segmented = !ops.is_empty() && ops.iter().all(|o| o.barrier);
+            (info, stamps, segmented)
+        });
+        p.next_window(id.0)
     }
 
     /// Give trace `id` back: once nothing queued runs it, its programs may be
@@ -5229,6 +5470,25 @@ impl<T: Transport> Session<T> {
         units: usize,
         budget: u64,
     ) -> Result<(), TensorError> {
+        if self.profiler.is_some() {
+            // The profile mode times this submission alone, under its label.
+            self.profile_collect();
+            let what = jobs
+                .iter()
+                .flatten()
+                .find_map(|step| match step {
+                    Step::List { what, .. } | Step::Transfer { what, .. } => Some(*what),
+                    Step::Kernel { .. } => None,
+                })
+                .unwrap_or("control kernel");
+            let label = self.op_label;
+            if let Some(p) = self.profiler.as_mut() {
+                p.expect_eager(label, what);
+            }
+            let result = self.submit_jobs_inner(jobs, units, budget);
+            self.profile_collect();
+            return result;
+        }
         if self.batching {
             return self.submit_jobs_inner(jobs, units, budget);
         }

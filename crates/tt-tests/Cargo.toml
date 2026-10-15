@@ -61,6 +61,9 @@ ttinsn-experiment = ["tt-firmware-images/ttinsn-experiment"]
 # holds that the card refuses an encoded read.
 fast-reads = ["tt-firmware-images/fast-reads"]
 encoded-guard = ["fast-reads", "tt-firmware-images/encoded-guard"]
+# Firmware that can stamp its work: the profile mode and the profiling probes need it
+# (`cargo xtask silicon --profile` turns it on). Off, stamping is compiled out.
+profile = ["tt-firmware-images/profile", "burn-tt/profile"]
 
 # Real dependencies, not dev-dependencies: `src/harness.rs` uses them. This crate
 # is classified DEV_ONLY in `xtask/src/ship.rs`, so the simulator binding still
