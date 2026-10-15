@@ -462,10 +462,18 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
       for bit the eager fixed step. That is 83.5 ms at `work:64:4` and 478.3 on one tile, where it also captures
       ([log](../learnings/performance-log.md#smollm2-decode-step-traced-2026-10-15-cards-0-and-1)).
     - **Open:** where its device time goes.
+  - **SmolLM2 prefill** (2026-10-15, card 1, `smollm2_prefill_chunk_sweep`, gate `step185`).
+    - **How:** `Llama::step_chunk` feeds the prompt `c` tokens a replay, the start a tensor. It is bit for bit the
+      eager prefill, and the decode step after it matches too.
+    - **Cost model:** a replay on every tile costs about **33 ms + 0.18 ms a token**, so a prompt wants one chunk
+      that covers it: buckets of 64 and 256, plus 128 if its trace fits.
+    - **Result:** 256 tokens take **79 ms** against burn-flex's 1,040, and 32 tokens 40 ms against 175. One tile
+      captures only single tokens ([log](../learnings/performance-log.md#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1)).
   - **Left:**
-    - the decode replay's device profile, then what it shows (the m = 1 products, `mask_where`'s cache copies);
-    - a traced prefill;
-    - ResNet-18 and ViT on fewer tiles once segmentation lands.
+    - **The fixed ~33 ms a replay**, shared by decode and every chunk: its device profile first, then what it shows (the
+      m = 1 products, `mask_where`'s cache copies).
+    - A bucketed prefill-and-decode driver, the token lookup inside the trace, and chunks of 512.
+    - ResNet-18, ViT and prefill chunks on fewer tiles once segmentation lands.
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),

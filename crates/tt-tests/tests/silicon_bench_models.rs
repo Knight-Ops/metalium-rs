@@ -511,6 +511,160 @@ fn smollm2_decode_traced() {
     });
 }
 
+/// The chunk size of a traced prefill (`Llama::step_chunk`: `c` prompt tokens from a start position,
+/// both tensors): for each `c` of `PREFILL_CHUNKS`, one chunk captured on a fresh 512-position cache
+/// with the cache as state, then replays timed. A prompt of `len` tokens costs `ceil(len / c)`
+/// replays, so the replay's time and its time a token decide the chunk. One replay at the second
+/// chunk's start is checked bit for bit against the eager chunk there. A chunk whose programs do not
+/// fit the program cache is reported and skipped.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_prefill_chunk_sweep() {
+    use burn::tensor::{Int, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
+    const MAX_LEN: usize = 512;
+    const PREFILL_CHUNKS: [usize; 5] = [1, 32, 64, 128, 256];
+    let row: Vec<f32> = {
+        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![7042i32], [1, 1]),
+            &FlexDevice,
+        );
+        m.embed(ids).into_data().to_vec::<f32>().unwrap()
+    };
+    // burn-flex's whole prefill of a prompt of each length, for the cost a token.
+    {
+        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        for len in [32, 128, 256] {
+            let values: Vec<f32> = (0..len).flat_map(|_| row.iter().copied()).collect();
+            baseline(&format!("smollm2-135m prefill of {len} tokens"), || {
+                let mut cache = m.cache(len, DType::F32, &FlexDevice);
+                let x = Tensor::<Flex, 3>::from_data(
+                    TensorData::new(values.clone(), [1, len, HIDDEN]),
+                    &FlexDevice,
+                );
+                m.forward_embedded(x, &mut cache, DType::F32)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            });
+        }
+    }
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let dtype = DType::F32;
+        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let at = |p: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
+        };
+        let float = |t: Tensor<TtBackend, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!(),
+        };
+        let logits = |o: &[OutputPayload]| match &o[0] {
+            OutputPayload::F32(v) => v.clone(),
+            other => panic!("logits as {other:?}"),
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for c in PREFILL_CHUNKS {
+            let values: Vec<f32> = (0..c).flat_map(|_| row.iter().copied()).collect();
+            let x = || {
+                Tensor::<TtBackend, 3>::from_data(
+                    TensorData::new(values.clone(), [1, c, HIDDEN]),
+                    &d,
+                )
+            };
+            // The eager chunks at 0 and `c`: the reference for the replay at `c`.
+            let want = {
+                let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+                let _ = m
+                    .step_chunk(x(), at(0), at(c - 1), &mut cache, dtype)
+                    .into_data();
+                m.step_chunk(x(), at(c), at(c - 1), &mut cache, dtype)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            };
+            let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+            for t in cache.state() {
+                float(t).ensure_resident();
+            }
+            let (xin, sin, lin) = (x(), at(0), at(c - 1));
+            let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
+                unreachable!()
+            };
+            xp.ensure_resident();
+            let (sp, lp) = (sin.clone().into_primitive(), lin.clone().into_primitive());
+            sp.ensure_resident();
+            lp.ensure_resident();
+            let old: Vec<TtTensor> = cache.state().into_iter().map(float).collect();
+            let captured = TracedInference::capture_with_state(&[&xp, &sp, &lp], || {
+                let TensorPrimitive::Float(y) = m
+                    .step_chunk(xin.clone(), sin.clone(), lin.clone(), &mut cache, dtype)
+                    .into_primitive()
+                else {
+                    unreachable!()
+                };
+                let new = cache.state().into_iter().map(float);
+                (vec![y], new.zip(old.iter().cloned()).collect())
+            });
+            let (trace, _) = match captured {
+                Ok(t) => t,
+                Err(e) => {
+                    let cause = format!(
+                        "{:?}",
+                        <TtBackend as burn::tensor::backend::Backend>::sync(&d)
+                    );
+                    assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+                    // The attachment's error is sticky, and a larger chunk has more programs.
+                    eprintln!(
+                        "SKIP smollm2 prefill chunks of {c} and up: do not fit the program \
+                         cache: {cause}"
+                    );
+                    break;
+                }
+            };
+            let run = |start: usize| {
+                trace
+                    .run(vec![
+                        InputPayload::F32(values.clone()),
+                        InputPayload::Bits(vec![start as u32]),
+                        InputPayload::Bits(vec![c as u32 - 1]),
+                    ])
+                    .unwrap()
+            };
+            assert_eq!(
+                bits(&logits(&run(c))),
+                bits(&want),
+                "chunk {c}: the replay at {c}"
+            );
+            for _ in 0..WARMUPS {
+                run(0);
+            }
+            let mut ms = Vec::new();
+            for _ in 0..SAMPLES {
+                let t0 = Instant::now();
+                run(0);
+                ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let per_token: Vec<f64> = ms.iter().map(|t| t / c as f64).collect();
+            report(
+                &format!("smollm2-135m prefill chunk of {c}, traced replay"),
+                "ms",
+                "host",
+                Stats::of(ms),
+            );
+            report(
+                &format!("smollm2-135m prefill chunk of {c}, traced, a token"),
+                "ms",
+                "host",
+                Stats::of(per_token),
+            );
+            drop(trace);
+        }
+    });
+}
+
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn smollm2_decode_with_the_embedding_lookup() {
