@@ -73,6 +73,7 @@ impl TtTensor {
                 cols,
                 parent: None,
                 storage: format,
+                plain: Default::default(),
             }),
             transposed: src.transposed,
         };

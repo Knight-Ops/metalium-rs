@@ -85,7 +85,8 @@ pub struct Layer<B: Backend> {
     mlp: Mlp<B>,
 }
 
-/// Rotary tables for a run of positions: `[1, 1, t, HEAD_DIM]` each.
+/// Rotary tables for a run of positions: `[1, 1, t, HEAD_DIM]` each. `sin` holds its first half
+/// negated, the sign `rotate_half` would put on `x`'s second half ([`Rope::apply`]).
 struct Rope<B: Backend> {
     cos: Tensor<B, 4>,
     sin: Tensor<B, 4>,
@@ -93,8 +94,9 @@ struct Rope<B: Backend> {
 
 impl<B: Backend> Rope<B> {
     /// `angle = position * theta^(-2i / HEAD_DIM)`, the first half of the row repeated as the
-    /// second (the rotate-half layout). The positions and the frequencies are host data that
-    /// the shapes fix; the products and the `sin` and `cos` run on the device.
+    /// second (the rotate-half layout), `sin`'s first half negated. The positions and the
+    /// frequencies are host data that the shapes fix; the products and the `sin` and `cos` run on
+    /// the device.
     fn new(start: usize, t: usize, dtype: DType, device: &B::Device) -> Self {
         let positions: Vec<f32> = (start..start + t).map(|p| p as f32).collect();
         let freqs: Vec<f32> = (0..HEAD_DIM / 2)
@@ -103,10 +105,12 @@ impl<B: Backend> Rope<B> {
         let pos = Tensor::<B, 2>::from_data(TensorData::new(positions, [t, 1]), device);
         let freq = Tensor::<B, 2>::from_data(TensorData::new(freqs, [1, HEAD_DIM / 2]), device);
         let angles = pos * freq;
+        let sin = angles.clone().sin();
+        let sin = Tensor::cat(vec![sin.clone().neg(), sin], 1).reshape([1, 1, t, HEAD_DIM]);
         let angles = Tensor::cat(vec![angles.clone(), angles], 1).reshape([1, 1, t, HEAD_DIM]);
         Self {
-            cos: angles.clone().cos().cast(dtype),
-            sin: angles.sin().cast(dtype),
+            cos: angles.cos().cast(dtype),
+            sin: sin.cast(dtype),
         }
     }
 
@@ -143,8 +147,11 @@ impl<B: Backend> Rope<B> {
         let half = d / 2;
         let x1 = x.clone().slice([0..n, 0..h, 0..t, 0..half]);
         let x2 = x.clone().slice([0..n, 0..h, 0..t, half..d]);
-        let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
-        x * self.cos.clone() + rotated * self.sin.clone()
+        // `rotate_half(x) * sin`, `cat(-x2, x1) * [s, s]`, as `cat(x2, x1) * [-s, s]`: the same bits
+        // (a product's sign is its operands' product, its magnitude theirs), without the
+        // negation an application.
+        let swapped = Tensor::cat(vec![x2, x1], 3);
+        x * self.cos.clone() + swapped * self.sin.clone()
     }
 }
 
@@ -248,9 +255,8 @@ impl<B: Backend> Layer<B> {
                     // The new key and value land where `here` is set, every other position kept;
                     // the query attends to every position not `later` than its own.
                     let shape = cache.k.dims();
-                    let here = here.clone().expand(shape);
                     cache.k = cache.k.clone().mask_where(here.clone(), k.expand(shape));
-                    cache.v = cache.v.clone().mask_where(here, v.expand(shape));
+                    cache.v = cache.v.clone().mask_where(here.clone(), v.expand(shape));
                     (
                         repeat_kv(cache.k.clone()),
                         repeat_kv(cache.v.clone()),
@@ -270,9 +276,8 @@ impl<B: Backend> Layer<B> {
                             .select(0, index.clone())
                             .reshape(shape)
                     };
-                    let here = here.clone().expand(shape);
                     cache.k = cache.k.clone().mask_where(here.clone(), place(k));
-                    cache.v = cache.v.clone().mask_where(here, place(v));
+                    cache.v = cache.v.clone().mask_where(here.clone(), place(v));
                     (
                         repeat_kv(cache.k.clone()),
                         repeat_kv(cache.v.clone()),
@@ -320,14 +325,15 @@ enum Write<B: Backend> {
     /// At positions `start..start + t`, known on the host; the query attends to positions
     /// `..start + t` (causally within the new ones).
     At(usize),
-    /// At the one position set in `here` (`[1, 1, max_len, 1]`); the query attends to every
-    /// position but those set in `later` (`[1, 1, 1, max_len]`). Both are tensors, so the step's
-    /// shapes do not depend on the position ([`FixedCache`]).
+    /// At the one position set in `here` (the cache's shape, `[1, KV_HEADS, max_len, HEAD_DIM]`:
+    /// made once a step, not once a layer); the query attends to every position but those set in
+    /// `later` (`[1, 1, 1, max_len]`). Both are tensors, so the step's shapes do not depend on the
+    /// position ([`FixedCache`]).
     Masked {
         here: Tensor<B, 4, burn::tensor::Bool>,
         later: Tensor<B, 4, burn::tensor::Bool>,
     },
-    /// A chunk of `c` tokens at the positions set in `here` (`[1, 1, max_len, 1]`, a run from the
+    /// A chunk of `c` tokens at the positions set in `here` (the cache's shape, a run from the
     /// chunk's start): cache row `j` of head `h` takes the chunk's row `index[h max_len + j]` of
     /// its `[KV_HEADS c, HEAD_DIM]` keys and values; query `i` attends to every position but those
     /// set in row `i` of `later` (`[1, 1, c, max_len]`).
@@ -556,11 +562,13 @@ impl<B: Backend> Llama<B> {
         let max_len = cache.max_len;
         let at = position.clone().expand([max_len]);
         let write = Write::Masked {
+            // Expanded to the cache's shape here, once, rather than in each layer.
             here: cache
                 .positions
                 .clone()
                 .equal(at.clone())
-                .reshape([1, 1, max_len, 1]),
+                .reshape([1, 1, max_len, 1])
+                .expand([1, KV_HEADS, max_len, HEAD_DIM]),
             later: cache
                 .positions
                 .clone()
@@ -605,7 +613,8 @@ impl<B: Backend> Llama<B> {
             .clone()
             .greater_equal(from.clone())
             .bool_and(positions.clone().lower(from.clone().add_scalar(c as i64)))
-            .reshape([1, 1, max_len, 1]);
+            .reshape([1, 1, max_len, 1])
+            .expand([1, KV_HEADS, max_len, HEAD_DIM]);
         // Each token's own position.
         let own = start.expand([c]) + positions.clone().narrow(0, 0, c);
         let later = positions

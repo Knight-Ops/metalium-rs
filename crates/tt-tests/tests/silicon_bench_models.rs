@@ -120,6 +120,106 @@ fn measure(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
     last
 }
 
+/// What a captured trace is made of (`docs/plans/replay-fixed-cost.md`, P0): its ops, the
+/// barriers among them, how many units each op ran on (a unit whose share of the op is only the
+/// barrier entry sat it out), and by the Burn op that queued each (`OpRecord::label`). Reported as
+/// `BENCH` counts under `key`; the table goes to stderr, and the whole list, one op a line, to the
+/// file `TT_TRACE_OPS` names if set.
+fn trace_shape(key: &str, trace: &burn_tt::TracedInference) {
+    let ops = trace.ops().unwrap();
+    let ran = |o: &tt_kernels::trace::OpRecord| {
+        let fixed = o.barrier as usize;
+        o.entries.iter().filter(|r| r.len() > fixed).count()
+    };
+    let barriers = ops.iter().filter(|o| o.barrier).count();
+    let units = ops.first().map_or(0, |o| o.entries.len());
+    let entries: Vec<usize> = (0..units)
+        .map(|u| ops.iter().map(|o| o.entries[u].len()).sum())
+        .collect();
+    report(
+        &format!("{key} trace ops"),
+        "ops",
+        "count",
+        Stats::of([ops.len() as f64]),
+    );
+    report(
+        &format!("{key} trace barriers"),
+        "barriers",
+        "count",
+        Stats::of([barriers as f64]),
+    );
+    report(
+        &format!("{key} trace units an op ran on"),
+        "units",
+        "count",
+        Stats::of(ops.iter().map(|o| ran(o) as f64).collect::<Vec<_>>()),
+    );
+    eprintln!(
+        "trace: {} ops, {barriers} barriers, {units} units; stream entries on unit 0 {}, most {}",
+        ops.len(),
+        entries.first().copied().unwrap_or(0),
+        entries.iter().max().copied().unwrap_or(0)
+    );
+    // By label: ops, the units they ran on, and their entries summed over every unit.
+    let mut by: std::collections::BTreeMap<&str, (usize, usize, usize)> = Default::default();
+    for o in &ops {
+        let r = by.entry(o.label).or_default();
+        r.0 += 1;
+        r.1 += ran(o);
+        r.2 += o.entries.iter().map(|e| e.len()).sum::<usize>();
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by_key(|&(label, (n, _, _))| (std::cmp::Reverse(n), label));
+    eprintln!(
+        "{:<34} {:>6} {:>10} {:>10}",
+        "label", "ops", "units/op", "entries"
+    );
+    for (label, (n, units, entries)) in rows {
+        eprintln!(
+            "{:<34} {:>6} {:>10.1} {:>10}",
+            label,
+            n,
+            units as f64 / n as f64,
+            entries
+        );
+    }
+    if let Ok(path) = std::env::var("TT_TRACE_OPS") {
+        let mut out = String::from("index\tlabel\twhat\tunits_ran\tunit0_entries\tbarrier\n");
+        for (i, o) in ops.iter().enumerate() {
+            out += &format!(
+                "{i}\t{}\t{}\t{}\t{}\t{}\n",
+                o.label,
+                o.what,
+                ran(o),
+                o.entries[0].len(),
+                o.barrier
+            );
+        }
+        std::fs::write(&path, out).unwrap();
+        eprintln!("trace ops written to {path}");
+    }
+}
+
+/// Medians of a trace's replays split as `run_timed` measures them (`GenericTraceRun`): the input
+/// write, the replay to its end, the output read.
+fn report_split(key: &str, runs: &[burn_tt::GenericTraceRun]) {
+    let ms = |f: fn(&burn_tt::GenericTraceRun) -> std::time::Duration| {
+        Stats::of(
+            runs.iter()
+                .map(|r| f(r).as_secs_f64() * 1e3)
+                .collect::<Vec<_>>(),
+        )
+    };
+    report(
+        &format!("{key}, input write"),
+        "ms",
+        "host",
+        ms(|r| r.write),
+    );
+    report(&format!("{key}, replay"), "ms", "host", ms(|r| r.replay));
+    report(&format!("{key}, output read"), "ms", "host", ms(|r| r.read));
+}
+
 /// The same forward pass on burn-flex (the host), timed the same way: the baseline a device number
 /// is held against.
 fn baseline(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
@@ -490,17 +590,24 @@ fn smollm2_decode_traced() {
         };
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&logits(&first)), bits(&eager[1]), "the capture's run");
+        trace_shape("smollm2-135m decode step, traced", &trace);
         let mut ms = Vec::new();
+        let mut split = Vec::new();
         for (p, want) in eager.iter().enumerate().skip(2) {
             let t0 = Instant::now();
             let got = trace
-                .run(vec![
+                .run_timed(vec![
                     InputPayload::F32(row.clone()),
                     InputPayload::Bits(vec![p as u32]),
                 ])
                 .unwrap();
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
-            assert_eq!(bits(&logits(&got)), bits(want), "replay at position {p}");
+            assert_eq!(
+                bits(&logits(&got.outputs)),
+                bits(want),
+                "replay at position {p}"
+            );
+            split.push(got);
         }
         report(
             "smollm2-135m decode step, traced",
@@ -508,6 +615,227 @@ fn smollm2_decode_traced() {
             "host",
             Stats::of(ms[WARMUPS..].to_vec()),
         );
+        report_split("smollm2-135m decode step, traced", &split[WARMUPS..]);
+    });
+}
+
+/// Where a replayed decode step's device time goes, op by op (`docs/plans/replay-fixed-cost.md`,
+/// P0): SmolLM2 with `TT_PROFILE_LAYERS` layers (default 1: the 30 are identical, and each unit's
+/// stamp buffer holds 1,024 events), its fixed step captured as in `smollm2_decode_traced`, then
+/// replays with unit 0's data mover stamping every entry (`TracedInference::run_profiled`). Every
+/// captured op ends in a `BARRIER` every unit reaches and unit 0 runs a share of every op, so the
+/// time from one of unit 0's `BARRIER` ends to the next is that op's span on the card: its own work
+/// on unit 0, and in the `BARRIER` the wait for the slowest unit. The spans are charged to the ops'
+/// labels (`OpRecord::label`) and their stamps checked to tile the replay. The replay is checked bit
+/// for bit against the eager fixed step.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn smollm2_replay_profile() {
+    use burn::tensor::{Int, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
+    use tt_isa::dm::op;
+    use tt_kernels::profile::Event;
+    const MAX_LEN: usize = 64;
+    let layers: usize = std::env::var("TT_PROFILE_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let row: Vec<f32> = {
+        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![7042i32], [1, 1]),
+            &FlexDevice,
+        );
+        m.embed(ids).into_data().to_vec::<f32>().unwrap()
+    };
+    with_device(Config::default(), |d| {
+        conditions(card());
+        // The stamps of a layer's replay overflow the fixed 1,024-event buffer.
+        let kib: u64 = std::env::var("TT_PROFILE_BUFFER_KIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        burn_tt::set_profile_buffer(d, Some(kib * 1024)).unwrap();
+        let dtype = DType::F32;
+        let (m, _) = Llama::<TtBackend>::pretrained(layers, Precision::F32, &d).unwrap();
+        let x =
+            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let at = |p: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
+        };
+        let reps = 5;
+        let positions = 2 + reps;
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let eager: Vec<Vec<f32>> = (0..positions)
+            .map(|p| {
+                m.step_fixed(x(), at(p), &mut cache, dtype)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            })
+            .collect();
+        let mut cache = m.fixed_cache(MAX_LEN, dtype, &d);
+        let _ = m.step_fixed(x(), at(0), &mut cache, dtype).into_data();
+        let (xin, pin) = (x(), at(1));
+        let TensorPrimitive::Float(xp) = xin.clone().into_primitive() else {
+            unreachable!()
+        };
+        xp.ensure_resident();
+        let pp = pin.clone().into_primitive();
+        pp.ensure_resident();
+        let float = |t: Tensor<TtBackend, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!(),
+        };
+        let old: Vec<TtTensor> = cache.state().into_iter().map(float).collect();
+        let (trace, _) = TracedInference::capture_with_state(&[&xp, &pp], || {
+            let TensorPrimitive::Float(y) = m
+                .step_fixed(xin.clone(), pin.clone(), &mut cache, dtype)
+                .into_primitive()
+            else {
+                unreachable!()
+            };
+            let new = cache.state().into_iter().map(float);
+            (vec![y], new.zip(old.iter().cloned()).collect())
+        })
+        .unwrap();
+        let key = format!("smollm2-135m decode step of {layers} layers, traced");
+        trace_shape(&key, &trace);
+        let ops = trace.ops().unwrap();
+        assert!(
+            ops.iter().all(|o| o.barrier),
+            "every captured op ends in a barrier"
+        );
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let logits = |o: &[OutputPayload]| match &o[0] {
+            OutputPayload::F32(v) => v.clone(),
+            other => panic!("logits as {other:?}"),
+        };
+        // Per op: span, its BARRIER's span on unit 0, its KERNEL_WAITs', its data entries'.
+        let mut spans: Vec<Vec<[u64; 4]>> = Vec::new();
+        let mut ticks = 0.0;
+        for (p, want) in eager.iter().enumerate().skip(2) {
+            let (run, profile) = trace
+                .run_profiled(vec![
+                    InputPayload::F32(row.clone()),
+                    InputPayload::Bits(vec![p as u32]),
+                ])
+                .unwrap();
+            assert_eq!(
+                bits(&logits(&run.outputs)),
+                bits(want),
+                "replay at position {p}"
+            );
+            ticks = profile.ticks_per_us;
+            let ev: Vec<(Event, u64)> = profile.units[0]
+                .events
+                .iter()
+                .map(|e| (Event::decode(e.token), e.cycles))
+                .collect();
+            let first = ev.first().map(|e| e.1).unwrap();
+            let mut per_op = Vec::with_capacity(ops.len());
+            let (mut since, mut open) = (first, None);
+            let mut acc = [0u64; 4];
+            for &(e, t) in &ev {
+                match e {
+                    Event::Entry { begin: true, op: y } => open = Some((y, t)),
+                    Event::Entry {
+                        begin: false,
+                        op: y,
+                    } => {
+                        let Some((_, t0)) = open.take() else { continue };
+                        match y {
+                            op::BARRIER => {
+                                acc[1] += t - t0;
+                                acc[0] = t - since;
+                                per_op.push(acc);
+                                acc = [0; 4];
+                                since = t;
+                            }
+                            op::KERNEL_WAIT => acc[2] += t - t0,
+                            op::LAUNCH | op::CB | op::POKE | op::KERNEL => {}
+                            _ => acc[3] += t - t0,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                per_op.len(),
+                ops.len(),
+                "one BARRIER on unit 0 an op ({} stamps)",
+                ev.len()
+            );
+            let tail = ev.last().unwrap().1 - since;
+            eprintln!(
+                "position {p}: unit 0 stamped {} events over {:.1} us; after the last barrier {:.1} us",
+                ev.len(),
+                (ev.last().unwrap().1 - first) as f64 / ticks,
+                tail as f64 / ticks
+            );
+            spans.push(per_op);
+        }
+        let us = |c: u64| c as f64 / ticks;
+        let median = |k: usize, f: usize| {
+            let mut v: Vec<u64> = spans.iter().map(|s| s[k][f]).collect();
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let total: u64 = (0..ops.len()).map(|k| median(k, 0)).sum();
+        report(
+            &format!("{key}, unit 0 op spans summed"),
+            "us",
+            "device",
+            Stats::of([us(total)]),
+        );
+        // By label: ops, span, the part of it waiting in the barrier, kernels, data.
+        let mut by: std::collections::BTreeMap<&str, (usize, [u64; 4])> = Default::default();
+        for (k, o) in ops.iter().enumerate() {
+            let r = by.entry(o.label).or_default();
+            r.0 += 1;
+            for f in 0..4 {
+                r.1[f] += median(k, f);
+            }
+        }
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by_key(|&(label, (_, a))| (std::cmp::Reverse(a[0]), label));
+        eprintln!(
+            "{:<26} {:>5} {:>9} {:>7} {:>9} {:>9} {:>9} {:>9}",
+            "label", "ops", "span us", "%", "us/op", "barrier", "kernels", "data"
+        );
+        for (label, (n, a)) in rows {
+            eprintln!(
+                "{:<26} {:>5} {:>9.1} {:>6.1}% {:>9.2} {:>9.1} {:>9.1} {:>9.1}",
+                label,
+                n,
+                us(a[0]),
+                100.0 * a[0] as f64 / total as f64,
+                us(a[0]) / n as f64,
+                us(a[1]),
+                us(a[2]),
+                us(a[3])
+            );
+        }
+        eprintln!("op-by-op (median of {} replays):", spans.len());
+        eprintln!(
+            "{:>4} {:<26} {:<28} {:>5} {:>8} {:>8} {:>8} {:>8}",
+            "i", "label", "what", "units", "span", "barrier", "kernels", "data"
+        );
+        for (k, o) in ops.iter().enumerate() {
+            let fixed = o.barrier as usize;
+            let ran = o.entries.iter().filter(|r| r.len() > fixed).count();
+            eprintln!(
+                "{:>4} {:<26} {:<28} {:>5} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+                k,
+                o.label,
+                o.what,
+                ran,
+                us(median(k, 0)),
+                us(median(k, 1)),
+                us(median(k, 2)),
+                us(median(k, 3))
+            );
+        }
     });
 }
 
@@ -626,7 +954,7 @@ fn smollm2_prefill_chunk_sweep() {
             };
             let run = |start: usize| {
                 trace
-                    .run(vec![
+                    .run_timed(vec![
                         InputPayload::F32(values.clone()),
                         InputPayload::Bits(vec![start as u32]),
                         InputPayload::Bits(vec![c as u32 - 1]),
@@ -634,19 +962,28 @@ fn smollm2_prefill_chunk_sweep() {
                     .unwrap()
             };
             assert_eq!(
-                bits(&logits(&run(c))),
+                bits(&logits(&run(c).outputs)),
                 bits(&want),
                 "chunk {c}: the replay at {c}"
+            );
+            trace_shape(
+                &format!("smollm2-135m prefill chunk of {c}, traced"),
+                &trace,
             );
             for _ in 0..WARMUPS {
                 run(0);
             }
             let mut ms = Vec::new();
+            let mut split = Vec::new();
             for _ in 0..SAMPLES {
                 let t0 = Instant::now();
-                run(0);
+                split.push(run(0));
                 ms.push(t0.elapsed().as_secs_f64() * 1e3);
             }
+            report_split(
+                &format!("smollm2-135m prefill chunk of {c}, traced"),
+                &split,
+            );
             let per_token: Vec<f64> = ms.iter().map(|t| t / c as f64).collect();
             report(
                 &format!("smollm2-135m prefill chunk of {c}, traced replay"),

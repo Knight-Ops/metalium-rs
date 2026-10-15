@@ -334,6 +334,14 @@ impl TracedInference {
         self.outputs.iter().map(|&(_, _, dims)| dims).collect()
     }
 
+    /// The ops the capture recorded, in order: each one's Burn op (or part) as
+    /// `label`, and its range of every unit's stream. What a replay runs, op by
+    /// op; for profiling a replay (`docs/plans/replay-fixed-cost.md`).
+    pub fn ops(&self) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        let id = self.id;
+        server::run(self.device, move |e, _| e.trace_ops(id))
+    }
+
     /// Replay the trace with new input values.
     pub fn run(
         &self,
@@ -363,6 +371,31 @@ impl TracedInference {
             .collect();
         server::run_generic_trace(self.device, self.id, in_pairs, out_pairs)
     }
+
+    /// [`TracedInference::run_timed`] with every unit's data mover stamping the replay's
+    /// entries (`tt_kernels::profile`): where a replay's device time goes, op by op when
+    /// read beside [`TracedInference::ops`]. Each unit's buffer holds 1,024 events, so
+    /// only a small trace fits (a model of one layer). Silicon only; dev-facing.
+    #[doc(hidden)]
+    pub fn run_profiled(
+        &self,
+        inputs: Vec<server::InputPayload>,
+    ) -> Result<(server::GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        if inputs.len() != self.inputs.len() {
+            return Err(TtError::Device(format!(
+                "expected {} inputs, got {}",
+                self.inputs.len(),
+                inputs.len()
+            )));
+        }
+        let in_pairs = self.inputs.iter().copied().zip(inputs).collect();
+        let out_pairs = self
+            .outputs
+            .iter()
+            .map(|&(id, kind, _)| (id, kind))
+            .collect();
+        server::profile_generic_trace(self.device, self.id, in_pairs, out_pairs)
+    }
 }
 
 impl Drop for TracedInference {
@@ -372,6 +405,15 @@ impl Drop for TracedInference {
         // nothing left to release.
         server::run_if_attached(self.device, move |e, _| e.release_trace(id));
     }
+}
+
+/// Give `device`'s timestamper `bytes` of L1 per tile, taken from the top of the program
+/// cache (`Session::set_profile_buffer`; `None` restores the fixed 1,024-event buffer), so
+/// [`TracedInference::run_profiled`] can stamp a larger replay. Call it before the capture:
+/// it empties the program cache, and it is refused while a trace lives. Dev-facing.
+#[doc(hidden)]
+pub fn set_profile_buffer(device: TtDevice, bytes: Option<u64>) -> Result<(), TtError> {
+    server::run(device, move |e, _| e.set_profile_buffer(bytes))
 }
 
 /// Detailed timing breakdown of a traced training step.

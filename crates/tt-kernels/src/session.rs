@@ -440,6 +440,9 @@ pub struct Session<T: Transport> {
     /// While set, queued work takes no barrier: a host DMA transfer, which
     /// the session syncs on at once, so nothing can run past it.
     unbarriered: bool,
+    /// The caller's name for the ops it queues now ([`Session::set_op_label`]),
+    /// kept in a capture's [`trace::OpRecord`]s.
+    op_label: &'static str,
     /// Where tensors take and lose the tile layout ([`Session::set_tilize`]).
     tilize: Tilize,
     /// The next free byte of `staging`, used as a ring by queued uploads;
@@ -458,6 +461,9 @@ pub struct Session<T: Transport> {
     /// Each unit's timestamper stream so far, between
     /// [`Session::profile_start`] and [`Session::profile_stop`].
     profiling: Option<Vec<crate::profile::UnitProfile>>,
+    /// Where each unit's timestamper stream goes, and its bytes
+    /// ([`Session::set_profile_buffer`]): the fixed trace buffer unless moved.
+    profile_buffer: (u64, u64),
     /// Queue ops on the movers and wait only at a sync point
     /// ([`Session::sync`]), rather than one host round trip per op.
     batching: bool,
@@ -742,6 +748,9 @@ struct DramState {
     image: &'static [u8],
     nc_image: &'static [u8],
     w4: tt_device::Window,
+    /// The zero rows a row gather's padding reads ([`Session::zero_row`]), one per
+    /// width and datum kind, kept for as long as GDDR is.
+    zero_rows: Vec<(usize, tensor::Elem, DramTensor)>,
 }
 
 /// One mover list for one unit: list entries, the `KERNEL` entries among
@@ -1766,6 +1775,7 @@ impl<T: Transport> Session<T> {
             staging: None,
             host_dma: true,
             unbarriered: false,
+            op_label: "",
             staging_at: 0,
             staging_busy: false,
             tilize: Tilize::Host,
@@ -1774,6 +1784,10 @@ impl<T: Transport> Session<T> {
             drains: 0,
             dram: None,
             profiling: None,
+            profile_buffer: (
+                tt_isa::mailbox::TRACE_BUFFER,
+                tt_isa::mailbox::TRACE_BUFFER_BYTES,
+            ),
             batching: std::env::var("TT_BATCH").map_or(true, |v| v != "0"),
             math,
             barriers: 0,
@@ -1909,6 +1923,7 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         self.profiling = Some(Vec::new());
+        let (buffer, bytes) = self.profile_buffer;
         let mut units = Vec::with_capacity(self.units.len());
         for u in 0..self.units.len() {
             if self.units[u].resident.is_none() {
@@ -1918,12 +1933,7 @@ impl<T: Transport> Session<T> {
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let r = unit.resident.as_mut().expect("prepared above");
-            dev.configure_trace(
-                r.window(),
-                unit.tile,
-                tt_isa::mailbox::TRACE_BUFFER,
-                tt_isa::mailbox::TRACE_BUFFER_BYTES,
-            )?;
+            dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
             if unit.mover.is_some() {
@@ -1952,17 +1962,15 @@ impl<T: Transport> Session<T> {
             }));
         };
         let mut ticks_per_us = 0.0;
+        let (buffer, _) = self.profile_buffer;
         for (u, p) in units.iter_mut().enumerate() {
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let Some(r) = unit.resident.as_mut() else {
                 continue;
             };
-            p.events.extend(dev.read_trace(
-                r.window(),
-                unit.tile,
-                tt_isa::mailbox::TRACE_BUFFER,
-            )?);
+            p.events
+                .extend(dev.read_trace(r.window(), unit.tile, buffer)?);
             r.set_profiling(false);
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 0)?;
@@ -1986,20 +1994,16 @@ impl<T: Transport> Session<T> {
             dev,
             units,
             profiling,
+            profile_buffer: (buffer, bytes),
             ..
         } = self;
         let (Some(p), Some(r)) = (profiling.as_mut(), units[u].resident.as_ref()) else {
             return Ok(());
         };
         let tile = units[u].tile;
-        let events = dev.read_trace(r.window(), tile, tt_isa::mailbox::TRACE_BUFFER)?;
+        let events = dev.read_trace(r.window(), tile, *buffer)?;
         p[u].events.extend(events);
-        dev.configure_trace(
-            r.window(),
-            tile,
-            tt_isa::mailbox::TRACE_BUFFER,
-            tt_isa::mailbox::TRACE_BUFFER_BYTES,
-        )
+        dev.configure_trace(r.window(), tile, *buffer, *bytes)
     }
 
     /// Enable GDDR with fixed resident B-reader / NC-writer compute ownership.
@@ -2057,6 +2061,7 @@ impl<T: Transport> Session<T> {
             image: b_image,
             nc_image,
             w4,
+            zero_rows: Vec::new(),
         });
         Ok(())
     }
@@ -2699,10 +2704,19 @@ impl<T: Transport> Session<T> {
         let tiles = rt * ct;
         let mut out = huge_zeroed(t.rows * t.cols);
         let stride = tensor::row_major_stride(t.cols);
-        if self.tilize == Tilize::Card && t.rows * stride <= HOST_DMA_STAGING {
-            // The card untilizes; the rows come back as they are.
+        // Rows that fill at most a quarter of their tile rows come back untilized by
+        // the card whatever the setting: the tiles would carry four times the data
+        // or more across PCIe (a `[1, 49152]` row of logits: 6.3 MB of tiles for its
+        // 192 KiB, about 1 ms on card 1), against ~2.6 us of mover time a tile spread
+        // over the units (`docs/plans/replay-fixed-cost.md`).
+        let mostly_padding = 4 * t.rows <= 32 * rt;
+        if (self.tilize == Tilize::Card || mostly_padding) && t.rows * stride <= HOST_DMA_STAGING {
+            // The card untilizes; the rows come back as they are. A unit for every 96
+            // tiles: each unit is a list and a drain for the host, so past that more of
+            // them cost more than their untilizing saves (the `[1, 49152]` logits on card
+            // 1: 0.95 ms on 120 units, 0.46 on 16, 0.55 on 8; `replay-fixed-cost.md`).
             let base = self.staging().expect("checked above").noc_address();
-            let units = self.spread_for(tiles);
+            let units = self.spread_for(tiles).min(tiles.div_ceil(96));
             let jobs =
                 tensor::row_major_dma_jobs(t.tensor_ref(), [t.rows, t.cols], false, base, units);
             self.submit_dma(jobs, units)?;
@@ -3051,6 +3065,7 @@ impl<T: Transport> Session<T> {
             c.failed |= result.is_err();
             c.ops.push(trace::OpRecord {
                 what,
+                label: self.op_label,
                 entries: c
                     .units
                     .iter()
@@ -3951,6 +3966,14 @@ impl<T: Transport> Session<T> {
             self.free_placement(p)?;
         }
         Ok(())
+    }
+
+    /// Name the ops queued from here on, for a capture's records
+    /// ([`trace::OpRecord::label`]): a caller's own name for what it is running
+    /// (burn-tt sets the Burn op whose job it is), so a replay's device time can be
+    /// charged back to it. Nothing else reads it.
+    pub fn set_op_label(&mut self, label: &'static str) {
+        self.op_label = label;
     }
 
     /// The ops trace `id` captured, in order (`crate::trace::OpRecord`).
@@ -4888,8 +4911,19 @@ impl<T: Transport> Session<T> {
             return result;
         }
         let need = tensor::MatmulPadding;
-        let ca = self.meet(a, need.requires(0))?;
-        let cb = match self.meet(b, need.requires(1)) {
+        // Only padding along `K` reaches a real datum: an output row reads its row
+        // of `op(A)` alone, an output column its column of `op(B)`. An operand
+        // whose `K` is whole tiles has no padding there, so it is used as it is
+        // (no refill: SmolLM2's projections refilled a `[1, 576]` input's 31
+        // padding rows every time), and what it holds past `M` or `N` lands in
+        // the output's padding ([`tensor::matmul_padding_off_k`]).
+        let off_k = tensor::matmul_padding_off_k(a, a_transposed, b, b_transposed);
+        let needs = |i: usize| match off_k[i] {
+            true => tensor::PadNeed::Any,
+            false => need.requires(i),
+        };
+        let ca = self.meet(a, needs(0))?;
+        let cb = match self.meet(b, needs(1)) {
             Ok(c) => c,
             Err(e) => {
                 if let Some(c) = ca {
@@ -4933,7 +4967,14 @@ impl<T: Transport> Session<T> {
             self.free(c)?;
         }
         let out = out?;
-        out.set_pad(need.produces(&[a, b]));
+        // An operand used with its padding off `K` as it was leaves that padding's
+        // image in the output's.
+        let dirty = (off_k[0] && a.pad() != tensor::Pad::Zero)
+            || (off_k[1] && b.pad() != tensor::Pad::Zero);
+        out.set_pad(match dirty {
+            true => tensor::Pad::Undefined,
+            false => need.produces(&[a, b]),
+        });
         Ok(out)
     }
 
@@ -5142,13 +5183,25 @@ impl<T: Transport> Session<T> {
                 transposed: b.transposed,
             });
         }
-        // A zero row (with zero padding: `metadata` fills each tile before
-        // writing it), which every tail row reads; works on ttsim, unlike the
-        // XMOV zero fill.
-        let zero = self.metadata(&vec![0; t.cols], [1, t.cols], t.elem)?;
-        let gathered = self.gather_rows(&[t, &zero], &rows, t.cols);
-        self.free(zero)?;
-        Ok(Some((gathered?, at)))
+        let zero = self.zero_row(t.cols, t.elem)?;
+        let gathered = self.gather_rows(&[t, &zero], &rows, t.cols)?;
+        Ok(Some((gathered, at)))
+    }
+
+    /// A `[1, cols]` row of zero `elem` datums, with zero padding (`metadata` fills each
+    /// tile before writing it), for a row gather's tail rows to read; works on ttsim,
+    /// unlike the XMOV zero fill. Made once per width and datum kind and kept as long as
+    /// GDDR is: nothing writes it, and each one made per use was a `metadata` write an op
+    /// (34 us of every replayed SmolLM2 layer's attention, twice:
+    /// `docs/plans/replay-fixed-cost.md`). The caller must not free it.
+    fn zero_row(&mut self, cols: usize, elem: tensor::Elem) -> Result<DramTensor, TensorError> {
+        let kept = &self.dram_state()?.zero_rows;
+        if let Some((_, _, z)) = kept.iter().find(|(c, e, _)| (*c, *e) == (cols, elem)) {
+            return Ok(z.clone());
+        }
+        let z = self.metadata(&vec![0; cols], [1, cols], elem)?;
+        self.dram_state()?.zero_rows.push((cols, elem, z.clone()));
+        Ok(z)
     }
 
     /// Run an op's jobs over the units (see the module documentation) and
@@ -5424,6 +5477,38 @@ impl<T: Transport> Session<T> {
                 ..full
             });
         }
+        Ok(())
+    }
+
+    /// Give the timestamper `bytes` of L1 at the top of the program cache instead of the
+    /// fixed 1,024-event buffer, the cache shrunk to what is left below them and emptied
+    /// ([`Session::limit_program_cache`]); `None` puts both back. For profiling a stretch
+    /// of ops the fixed buffer cannot hold, one stream to a [`Session::sync`] -- a trace
+    /// replay above all, which runs to its end with no sync inside
+    /// (`docs/plans/replay-fixed-cost.md`). Refused while a capture is open, a trace
+    /// lives (it holds programs in the cache) or a profile runs.
+    #[doc(hidden)]
+    pub fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TensorError> {
+        let full = tt_isa::l1::PROGRAM_CACHE;
+        let refuse = |why: &str| Err(TensorError::Shape(format!("set_profile_buffer: {why}")));
+        if self.capture.is_some() || !self.traces.is_empty() || self.profiling.is_some() {
+            return refuse("a capture, a trace or a profile is live");
+        }
+        let (buffer, cache) = match bytes {
+            None => (
+                (
+                    tt_isa::mailbox::TRACE_BUFFER,
+                    tt_isa::mailbox::TRACE_BUFFER_BYTES,
+                ),
+                full.len(),
+            ),
+            Some(b) if b % tt_isa::tensix::timestamper::EVENT_BYTES == 0 && b < full.len() => {
+                ((full.end - b, b), full.len() - b)
+            }
+            Some(_) => return refuse("whole 16-byte events, less than the program cache"),
+        };
+        self.limit_program_cache(cache)?;
+        self.profile_buffer = buffer;
         Ok(())
     }
 

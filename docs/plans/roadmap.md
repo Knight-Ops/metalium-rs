@@ -23,7 +23,10 @@ linking to its evidence and to the detailed plan. Closed work lives in
   The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
 - **Performance: behind the CPU unless traced.** Untraced training is 2–3× slower than
   burn-flex ([scoreboard](../learnings/performance-scoreboard.md)); the cost is host-side
-  submission, not the device. Traced MNIST inference already beats the CPU.
+  submission, not the device. Traced MNIST inference already beats the CPU, and traced, the three
+  models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
+  ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
+  [replay-fixed-cost.md](replay-fixed-cost.md)).
 - **Multi-chip: proof of concept.** Matmul, conv and attention split across two cards over
   Ethernet; every other op runs on chip 0; no all-reduce.
 
@@ -461,7 +464,8 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     - **Result:** a replayed token is **37.1 ms** on every tile, against burn-flex's 26.6 (run `1792029144`), and bit
       for bit the eager fixed step. That is 83.5 ms at `work:64:4` and 478.3 on one tile, where it also captures
       ([log](../learnings/performance-log.md#smollm2-decode-step-traced-2026-10-15-cards-0-and-1)).
-    - **Open:** where its device time goes.
+    - **Since (2026-10-15, [replay-fixed-cost.md](replay-fixed-cost.md)):** **26.46 ms a token against burn-flex's 26.42** in
+      the same run (`1792036613`), from the profile and five fixes below (next step 1).
   - **SmolLM2 prefill** (2026-10-15, card 1, `smollm2_prefill_chunk_sweep`, gate `step185`).
     - **How:** `Llama::step_chunk` feeds the prompt `c` tokens a replay, the start a tensor. It is bit for bit the
       eager prefill, and the decode step after it matches too.
@@ -469,22 +473,27 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
       that covers it: buckets of 64 and 256, plus 128 if its trace fits.
     - **Result:** 256 tokens take **79 ms** against burn-flex's 1,040, and 32 tokens 40 ms against 175. One tile
       captures only single tokens ([log](../learnings/performance-log.md#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1)).
-  - **Where traced SmolLM2 stands** (card 1, every tile, F32, batch 1, embedding lookup excluded, from the runs above):
-    - **Decode:** 37.1 ms a token with a 64-position cache (**27 tokens/s**), and 43.8 ms with a 512-position one
-      (23 tokens/s). burn-flex is 26.6 ms (38 tokens/s).
+  - **Where traced SmolLM2 stands** (card 1, every tile, F32, batch 1, embedding lookup excluded; 2026-10-15, after
+    [replay-fixed-cost.md](replay-fixed-cost.md), runs `1792036613` and `1792036724`):
+    - **Decode:** 26.46 ms a token with a 64-position cache (**38 tokens/s**), burn-flex 26.42 in the same run. A
+      one-token chunk over a 512-position cache (`step_chunk`, not `step_fixed`) is 32.7 ms.
     - **Prefill, one replay a bucket:**
-      - 32 tokens in 40.2 ms (about 800 tokens/s);
-      - 64 in 44.3 ms (1,450 tokens/s);
-      - 128 in 55.2 ms (2,300 tokens/s);
-      - 256 in 79.0 ms (**3,240 tokens/s**).
+      - 32 tokens in 34.8 ms (about 920 tokens/s);
+      - 64 in 38.7 ms (1,650 tokens/s);
+      - 128 in 49.7 ms (2,580 tokens/s);
+      - 256 in 73.1 ms (**3,500 tokens/s**).
 
-      burn-flex reaches about 180-250 tokens/s.
+      burn-flex reaches about 175-240 tokens/s.
   - **Next steps, in order** (each measured as before: release, card 1, every tile with the default spread, burn-flex in
     the same run; correctness bit for bit against the eager path, as in `step185`):
-    1. **Profile the fixed ~33 ms a replay.** It is shared by the decode step and every prefill chunk, and it is what
-       keeps decode behind burn-flex. Break the replay's device time down by op and layer (the trace replay breakdown,
-       `Session::host_times`, `dataflow_stats`); suspects are the m = 1 products and `mask_where`'s whole-cache copies.
-       Then fix what it shows. Targets: decode at or below burn-flex's 26.6 ms, and the chunk curve's intercept.
+    1. [x] **Profile the fixed ~33 ms a replay** (done 2026-10-15, [replay-fixed-cost.md](replay-fixed-cost.md)). Unit 0's
+       mover stamps, op by op (`smollm2_replay_profile`, `TracedInference::ops`/`run_profiled`): ~84 ops a layer at
+       ~13 us, not the barrier (0.6 us an op) and not the m = 1 products' arithmetic. Fixed: a matmul refills padding only
+       along `K`; one zero row per width kept; a buffer read transposed as `B` transposed once (the tied head, 2.3 ms);
+       the model's mask expanded once a step and RoPE's sign in its table; thin downloads untilized by the card. Decode
+       37.2 -> 26.46 ms (burn-flex 26.42); prefill 256 tokens 79.0 -> 73.1. Left in the plan: the cache write's
+       expands (~2 ms a step; a native row assign at a resident index), the RMSNorm's broadcast `div`, the replay's
+       start, each op's ~3.5 us of control (step 6).
     2. **A prefill-and-decode driver** in `tt-models`:
        - keep the bucket traces (64 and 256; 128 if the program cache holds three) and one decode trace;
        - for a prompt, replay the smallest bucket that covers it (chunks of 256 past that), then decode replays;
@@ -493,11 +502,23 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
        Gate: a whole generation equal to the eager growing-cache generation, token for token and logit for logit.
     3. **The token lookup inside the trace.** Pass the token id as an I32 input and `select` the embedding row on the
        card (the row select replays with new indices, `step171`). Then a step takes a token in and gives logits out.
-    4. **Chunks of 512, and longer caches.** The per-token cost had not flattened at 256 (0.31 ms). Decode slows with
-       cache length (37.1 ms at 64 positions, 43.8 at 512), since attention reads the whole cache; if long contexts
-       matter, bound the attended range.
+    4. **Chunks of 512, and longer caches.** The per-token cost had not flattened at 256 (0.29 ms, `1792036724`). A
+       replay slows with cache length (the decode step 26.46 ms over 64 positions; a one-token `step_chunk` over 512,
+       32.7 ms), since attention reads the whole cache; if long contexts matter, bound the attended range.
     5. **One tile and `work:64:4`:** prefill chunks and ResNet-18/ViT capture there only once traces are segmented
        ("Trace segmentation" below).
+    6. [ ] **What is left of a replay's fixed cost** (each measured in [replay-fixed-cost.md](replay-fixed-cost.md),
+       P0 and P2; decode is at burn-flex, not below it). In order of share:
+       - **The cache write's operands** (~70 us a layer, ~2 ms a step): `k` and `v` expanded to the cache's shape by
+         device copies (`expanded`), then two whole-cache `mask_where`s. A native row assign at a resident index
+         (Burn's `select_assign` with `IndexingUpdateOp::Assign`; `burn-tt` has only `select_add` natively) would write
+         the one row instead: a new op, so its definition of done applies.
+       - **The RMSNorm's broadcast `div`** (27 us, twice a layer): the mover broadcasts the `[1, 1]` column in software
+         (`READ_BROADCAST_COL`), and the SFPU divides.
+       - **The replay's start** (~170 us): every unit's catch-up and its `CALL` are two enqueues, since the mover takes
+         a `CALL` only as a list of its own (a firmware change).
+       - **P1, barriers on the units an op ran on** (~0.6 us an op, ~1.5 ms a step), and each op's ~3.5 us of control
+         (descriptor pokes, the `PAIR_CALL`'s launch and credits).
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),
@@ -837,6 +858,7 @@ deferred to later cleanup passes. B1 and B2 stay in Track 1 because models need 
 | [kernel-fusion.md](kernel-fusion.md), [traced-execution.md](traced-execution.md), [mixed-bfp-storage.md](mixed-bfp-storage.md) | Feature specs |
 | [burn-op-coverage.md](burn-op-coverage.md) | Generated operation status |
 | [ttinsn-push-experiment.md](ttinsn-push-experiment.md) | Done, result: go. Experiment record for `.ttinsn` push fusion |
+| [replay-fixed-cost.md](replay-fixed-cost.md) | Track 2 item 6, steps 1 and 6: where a traced replay's time goes, op by op, and the fixes |
 | [new-op-definition-of-done.md](new-op-definition-of-done.md) | Standing: what a new op must have before it counts as done |
 | [burn-op-notes.md](burn-op-notes.md) | Standing: per-op notes for the Burn backend |
 | [phases-0-10-roadmap.md](../completed-plans/phases-0-10-roadmap.md) | Archived: architecture and phase rationale (historical design) |

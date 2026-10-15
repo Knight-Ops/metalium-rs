@@ -111,6 +111,11 @@ pub struct TraceId(pub(crate) u64);
 pub struct OpRecord {
     /// Its first list's name (`tensor::stats`).
     pub what: &'static str,
+    /// The caller's name for it when it was queued ([`Session::set_op_label`]);
+    /// empty if none was set.
+    ///
+    /// [`Session::set_op_label`]: crate::session::Session::set_op_label
+    pub label: &'static str,
     /// Per unit, the range of that unit's stream its lists took.
     pub entries: Vec<core::ops::Range<usize>>,
     /// Whether a barrier followed it on every unit.

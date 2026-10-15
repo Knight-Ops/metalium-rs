@@ -1254,6 +1254,7 @@ fn device_view(
         storage: parent
             .as_ref()
             .map_or(crate::storage::StorageFormat::F32, |p| p.storage),
+        plain: Default::default(),
         parent,
     });
     TtTensor::on_device(
@@ -2086,7 +2087,8 @@ pub mod float {
         // stay there -- operands uploaded once, the result never downloaded
         // unless a host op asks for it (`tensor.rs`).
         if lhs.is_matrix_f32() && rhs.is_matrix_f32() && crate::server::supports_dram(device) {
-            let (a, b) = (lhs.to_dram().clone(), rhs.to_dram().clone());
+            let a = lhs.to_dram().clone();
+            let b = rhs.to_dram().plain_for_matmul(|| plain_dram(&rhs));
             let (id, [m, n]) = crate::server::matmul_dram(
                 device,
                 a.buffer.id,

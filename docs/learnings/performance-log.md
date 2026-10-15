@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A traced replay's fixed cost](#a-traced-replays-fixed-cost-2026-10-15-cards-0-and-1) | 2026-10-15 | the 37.2 ms traced SmolLM2 decode step broken down op by op (unit 0's mover stamps): ~84 ops a layer at ~13 us, not the barrier; five fixes (matmul padding off `K`, a kept zero row, a kept transpose, the model's mask and RoPE, thin downloads untilized by the card) bring it to 26.46 ms, burn-flex 26.42 |
 | [SmolLM2 prefill chunk size](#smollm2-prefill-chunk-size-2026-10-15-cards-0-and-1) | 2026-10-15 | a traced prefill chunk (`Llama::step_chunk`) costs ~33 ms + 0.18 ms a token on every tile: 256 tokens in 79 ms (burn-flex 1,040), so a prompt wants one chunk that covers it (buckets), not small chunks; one tile captures only single tokens |
 | [SmolLM2 decode step traced](#smollm2-decode-step-traced-2026-10-15-cards-0-and-1) | 2026-10-15 | a fixed-shape decode step (`Llama::step_fixed`) captured once and replayed at every position, the cache written back on the card: 37.1 ms a token on every tile (burn-flex 26.6; eager 86.9 at best) |
 | [ViT-Tiny traced](#vit-tiny-traced-2026-10-15-card-1) | 2026-10-15 | a replayed ViT-Tiny forward: 12.6 ms on every tile with the default spread (burn-flex 107.6, 8.5x faster), 61.9 at `work:64:4`; one tile does not capture; a decode step cannot be traced yet (its shapes grow a position a step) |
@@ -63,6 +64,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-15 | 1792034179 / 1792034180 / 1792034647 / 1792035075 / 1792035466 / 1792035579 / 1792036613 / 1792036724 / 1792036850 / 1792036818 | A traced replay's fixed cost (`replay-fixed-cost.md`): P0 profile (2,418 ops, replay 36.0 ms; per op ~13 us; the barrier 0.6 us of it), then matmul padding off `K`, a kept zero row, a kept transpose for `B`, the model's mask expanded once a step and RoPE's sign in its table, thin downloads untilized by the card. SmolLM2 decode traced 37.2 -> **26.46 ms** (burn-flex 26.42), prefill 256 tokens 79.0 -> 73.1 ms, ViT-Tiny traced 12.6 -> 11.6, ResNet-18 traced 17.6 -> 17.2; card 1, every tile. | Rows updated. |
 | 2026-10-15 | 1792031467 / 1792032275 / 1792032323 | SmolLM2 prefill chunk sweep (`smollm2_prefill_chunk_sweep`, traced `Llama::step_chunk`, 512-position cache): every tile 1 / 32 / 64 / 128 / 256 tokens a replay in 43.8 / 40.2 / 44.3 / 55.2 / 79.0 ms (burn-flex prefill of 32 / 128 / 256 tokens 175 / 514 / 1,040 ms), card 1; one tile does not capture 32 and up; `work:64:4` 228-418 ms. | New scoreboard row. |
 | 2026-10-15 | 1792029144 / 1792029158 / 1792029169 | SmolLM2 decode step traced (`smollm2_decode_traced`, fixed shapes, cache as written-back state): 37.1 ms a replay on every tile with the default spread, 83.5 at `work:64:4`, 478.3 on one tile (burn-flex 25.5-26.6), card 1, bit for bit the eager fixed step. | New scoreboard row. |
 | 2026-10-15 | 1792026627 / 1792026634 / 1792026639 | ViT-Tiny forward traced (`vit_tiny_forward_traced`): 12.6 ms a replay on every tile with the default spread, 61.9 at `work:64:4` (burn-flex 107.6), card 1, bit for bit the eager forward; one tile does not capture (program cache). | New scoreboard row. |
@@ -307,6 +309,44 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A traced replay's fixed cost (2026-10-15, cards 0 and 1)
+
+Roadmap Track 2 item 6, next step 1; plan and full tables: [replay-fixed-cost.md](../plans/replay-fixed-cost.md).
+Release, every tile (`TT_TILES=all`), default spread, burn-flex in the same run; every replay checked bit for bit against
+the eager step by the bench.
+
+**What a replay was** (`smollm2_decode_traced`, card 1, `1792034179`): input write 0.07 ms, replay 36.0, logits read 1.0;
+2,418 captured ops, each ending in a barrier all 120 units reach, a median op on 6 units.
+
+**Not the barrier** (`silicon_probe_trace_replay::replay_per_op_cost`, card 0, `1792034180`): a captured chain's cost an op
+is 6.2 us on one tile and 6.8 us on 120 for an op on one unit; a `[1, 576] @ [576, 576]` is 21.0 us on 120 tiles.
+
+**Op by op** (`smollm2_replay_profile`, one layer, card 1, `1792034647`; unit 0's mover stamps in 128 KiB at the top of the
+program cache, `Session::set_profile_buffer`, an op's span from one of unit 0's `BARRIER` ends to the next, the spans
+checked to account for 36.4 of the 36.0 ms): 1,123 us a layer, the head 2,329 us, the start 174 us. A tiny op is 5.7 us on
+unit 0, 3.5 of it control. What the layer spent most on: a 16 us `fill-pad` before each of its 7 projections (an m = 1
+input's padding rows), two 34 us zero-row `metadata` writes in attention, 8 ops to expand the cache write's operands,
+RoPE's `neg` of a slice; the head read its `B` through `READ_TRANSPOSED` (about 10 us a tile, the transpose in software).
+
+| Change (each adds to the one before) | Ops | Replay | Read | Step | burn-flex | Run |
+|---|--:|--:|--:|--:|--:|---|
+| baseline | 2,418 | 36.0 ms | 1.00 | 37.2 ms | 26.6 | `1792034179` |
+| a matmul refills padding only along `K` | 2,207 | 32.6 | 0.96 | 33.8 | 25.9 | `1792035075` |
+| one zero row per width kept; a buffer read transposed as `B` transposed once and kept | 2,147 | 28.7 | 1.19 | 30.0 | 26.4 | `1792035466` |
+| the model's position mask expanded once a step; RoPE's sign in its `sin` table | 1,911 | 25.8 | 0.99 | 27.0 | 26.3 | `1792035579` |
+| a tensor mostly of padding downloads untilized by the card, a unit per 96 tiles | 1,911 | 25.8 | 0.47 | **26.46** | 26.42 | `1792036613` |
+
+- **The download's unit count** (the logits, `[1, 49152]`): untilized by the card on 4 / 8 / 16 / 24 / 32 / 48 / 120 units
+  0.66 / 0.55 / 0.46 / 0.49 / 0.51 / 0.60 / 0.95 ms; as tiles detilized by the host on 4 / 16 / 120 units 0.68 / 0.77 / 0.99
+  (`1792036386`-`1792036493`). Each unit is a list and a drain for the host.
+- **The other traces** (card 1): prefill chunks of 1 / 32 / 64 / 128 / 256 tokens 32.7 / 34.8 / 38.7 / 49.7 / 73.1 ms
+  (were 43.8 / 40.2 / 44.3 / 55.2 / 79.0; `1792036724`; burn-flex 184 / 540 / 1,098 ms for 32 / 128 / 256 tokens); ViT-Tiny
+  11.6 ms (was 12.6; `1792036850`, burn-flex 112); ResNet-18 17.2 ms (was 17.6; `1792036818`, burn-flex 164). A first
+  ViT run at 15.2 ms (`1792036810`) was taken with the conformance suite loading the host; two reruns gave 11.6.
+- **Left** (by share): the cache write's `k`/`v` expands and `mask_where`s, ~70 us a layer; the RMSNorm's broadcast `div`,
+  27 us twice a layer; the replay's start, ~170 us (a `CALL` must be a list of its own, so a unit's catch-up is a second
+  enqueue); ~3.5 us of control an op.
 
 ## SmolLM2 prefill chunk size (2026-10-15, cards 0 and 1)
 

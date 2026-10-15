@@ -221,6 +221,8 @@ pub const SMOKE: &[&str] = &[
     // SmolLM2's decode step with fixed shapes, traced and replayed at every position (roadmap
     // Track 2 item 6).
     "step185_fixed_decode::",
+    // A buffer read transposed as a matmul's `B` is transposed once (`replay-fixed-cost.md` P2).
+    "step186_kept_transpose::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

@@ -615,6 +615,12 @@ fn sim_factory(
         fn release_trace(&mut self, trace: u64) {
             self.buffers.release_trace(&mut self.session, trace)
         }
+        fn set_op_label(&mut self, label: &'static str) {
+            self.session.set_op_label(label);
+        }
+        fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+            self.buffers.trace_ops(&self.session, trace)
+        }
         fn copy_into(
             &mut self,
             src: burn_tt::BufferId,

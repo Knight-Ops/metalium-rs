@@ -419,6 +419,32 @@ pub trait Engine {
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
+    /// Name the device work queued from here on: the Burn op (or part) whose job
+    /// runs next, kept in a capture's records (`Session::set_op_label`).
+    fn set_op_label(&mut self, _label: &'static str) {}
+    /// The ops `trace` captured, in order, each with its label and its share of
+    /// every unit's stream (`tt_kernels::trace::OpRecord`).
+    fn trace_ops(&mut self, _trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        Err(no_traces())
+    }
+    /// [`Engine::run_generic_trace`] with the timestamper on around the replay alone
+    /// (`Session::profile_start`): every unit's data mover stamps its entries. The roles
+    /// stamp only if the capture was made while profiling, which a capture through
+    /// burn-tt never is. Each unit's buffer holds 1,024 events, so this is for small
+    /// traces (a model of one layer); a larger one fails its sync. Silicon only.
+    #[doc(hidden)]
+    fn set_profile_buffer(&mut self, _bytes: Option<u64>) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    #[doc(hidden)]
+    fn profile_generic_trace(
+        &mut self,
+        _trace: u64,
+        _inputs: &[(BufferId, InputPayload)],
+        _outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        Err(no_traces())
+    }
     /// Copy `src` into `dst` on the device without allocating a new buffer.
     fn copy_into(&mut self, _src: BufferId, _dst: BufferId) -> Result<(), TtError> {
         Err(unsupported())
@@ -802,6 +828,18 @@ impl DramBuffers {
         })
     }
 
+    pub fn trace_ops<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        trace: u64,
+    ) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        Ok(s.trace_ops(id).map_err(TtError::from)?.to_vec())
+    }
+
     pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
         if let Some(id) = self.traces.remove(&trace) {
             let _ = s.release_trace(id);
@@ -865,6 +903,41 @@ impl DramBuffers {
             replay: t2 - t1,
             read: t2.elapsed(),
         })
+    }
+
+    pub fn profile_generic_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        use std::time::Instant;
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        s.sync().map_err(TtError::from)?;
+        let t0 = Instant::now();
+        self.write_trace_inputs(s, inputs)?;
+        // The inputs' writes land first, so the stamps hold the replay alone.
+        s.sync().map_err(TtError::from)?;
+        s.profile_start().map_err(TtError::from)?;
+        let t1 = Instant::now();
+        s.replay(id).map_err(TtError::from)?;
+        s.sync().map_err(TtError::from)?;
+        let t2 = Instant::now();
+        let profile = s.profile_stop().map_err(TtError::from)?;
+        let out_data = self.read_trace_outputs(s, outputs)?;
+        Ok((
+            GenericTraceRun {
+                outputs: out_data,
+                write: t1 - t0,
+                replay: t2 - t1,
+                read: t2.elapsed(),
+            },
+            profile,
+        ))
     }
 
     /// Write each of a generic trace's inputs into its buffer.
@@ -1555,6 +1628,7 @@ type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 /// (`report::server_report`).
 fn timed_job(op: &'static str, job: Job) -> Job {
     Box::new(move |engine, ids| {
+        engine.set_op_label(op);
         let t0 = std::time::Instant::now();
         job(engine, ids);
         crate::report::served(op, t0.elapsed());
@@ -3286,6 +3360,27 @@ impl Engine for KmdEngine {
             b.release_trace(&mut self.session, trace);
         }
     }
+    fn set_op_label(&mut self, label: &'static str) {
+        self.session.set_op_label(label);
+    }
+    fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
+        bufs.trace_ops(&self.session, trace)
+    }
+    fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TtError> {
+        self.session
+            .set_profile_buffer(bytes)
+            .map_err(TtError::from)
+    }
+    fn profile_generic_trace(
+        &mut self,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_generic_trace(&mut self.session, trace, inputs, outputs)
+    }
     fn copy_into(&mut self, src: BufferId, dst: BufferId) -> Result<(), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.copy_into(&mut self.session, src, dst)
@@ -3352,6 +3447,27 @@ pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), T
     run(device, move |engine, ids| {
         ids.healthy()?;
         engine.copy_into(ids.get(src)?, ids.get(dst)?)
+    })
+}
+
+/// [`run_generic_trace`] with the replay stamped ([`Engine::profile_generic_trace`]).
+pub(crate) fn profile_generic_trace(
+    device: TtDevice,
+    trace: u64,
+    inputs: Vec<(BufferId, InputPayload)>,
+    outputs: Vec<(BufferId, OutputKind)>,
+) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        let inputs = inputs
+            .into_iter()
+            .map(|(buf, p)| ids.get(buf).map(|b| (b, p)))
+            .collect::<Result<Vec<_>, TtError>>()?;
+        let outputs = outputs
+            .into_iter()
+            .map(|(buf, k)| ids.get(buf).map(|b| (b, k)))
+            .collect::<Result<Vec<_>, TtError>>()?;
+        engine.profile_generic_trace(trace, &inputs, &outputs)
     })
 }
 

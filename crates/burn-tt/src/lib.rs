@@ -68,6 +68,8 @@ pub use server::{
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
+#[doc(hidden)]
+pub use trace::set_profile_buffer;
 pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};
 
 #[cfg(feature = "fusion")]

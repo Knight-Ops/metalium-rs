@@ -90,6 +90,51 @@ pub(crate) struct Buffer {
     #[allow(dead_code)]
     pub(crate) parent: Option<Arc<Buffer>>,
     pub(crate) storage: crate::storage::StorageFormat,
+    /// This buffer as a plain matrix of its transpose, for a matmul that reads it
+    /// transposed as `B` ([`DramRef::plain_for_matmul`]).
+    pub(crate) plain: std::sync::Mutex<PlainTranspose>,
+}
+
+/// A buffer's transpose, kept once it has been read transposed as a matmul's `B`
+/// twice: the mover transposes a tile it reads transposed one datum at a time
+/// (`READ_TRANSPOSED`, about 10 us a tile on silicon), so a weight used as `x @ W^T`
+/// every step -- a tied output head -- is transposed once instead of every step.
+#[derive(Debug, Default)]
+pub(crate) struct PlainTranspose {
+    uses: u32,
+    copy: Option<DramRef>,
+}
+
+impl DramRef {
+    /// What a matmul reads as `B`: this, or for a transposed view of a buffer that
+    /// another use has already read this way, that buffer's transpose as a plain
+    /// matrix, made by `transpose` (a block copy) and kept beside the buffer while
+    /// it lives. Never kept for a buffer written after it was made (a trace's input,
+    /// a `copy_into` target) or while a training step is captured (whose replays
+    /// write the parameters), as `TtTensor::derived` decides.
+    pub(crate) fn plain_for_matmul(&self, transpose: impl FnOnce() -> DramRef) -> DramRef {
+        let b = &self.buffer;
+        if !self.transposed || b.parent.is_some() || b.storage != crate::storage::StorageFormat::F32
+        {
+            return self.clone();
+        }
+        let mut plain = b.plain.lock().unwrap_or_else(|p| p.into_inner());
+        if server::is_written_in_place(b.id) || crate::trace::capturing_training(b.device) {
+            *plain = PlainTranspose::default();
+            return self.clone();
+        }
+        if let Some(copy) = &plain.copy {
+            return copy.clone();
+        }
+        plain.uses += 1;
+        if plain.uses < 2 {
+            // Read once, transposed as it lies: a copy first would read it twice.
+            return self.clone();
+        }
+        let copy = transpose();
+        plain.copy = Some(copy.clone());
+        copy
+    }
 }
 
 impl Drop for Buffer {
@@ -504,6 +549,7 @@ impl TtTensor {
                             cols: dims[1],
                             parent: None,
                             storage: crate::storage::StorageFormat::F32,
+                            plain: Default::default(),
                         }),
                         transposed: false,
                     };
@@ -521,6 +567,7 @@ impl TtTensor {
                         cols: dims[1],
                         parent: None,
                         storage: crate::storage::StorageFormat::F32,
+                        plain: Default::default(),
                     }),
                     transposed: false,
                 };
@@ -568,6 +615,7 @@ impl TtTensor {
                     cols,
                     parent: None,
                     storage: crate::storage::StorageFormat::F32,
+                    plain: Default::default(),
                 }),
                 transposed: false,
             }

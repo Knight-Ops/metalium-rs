@@ -3102,6 +3102,33 @@ impl OpPadding for MatmulPadding {
     }
 }
 
+/// For `op(A) @ op(B)`, per operand: is its `K` whole tiles while it has padding
+/// elsewhere? Then its padding is all off `K` -- `op(A)`'s past `M`, `op(B)`'s past
+/// `N` -- where it reaches only the output's padding rows (columns), never a real
+/// datum, so the operand needs no refill whatever it holds there; the output's
+/// padding is then undefined unless the operand's was zero. `false` for an
+/// operand with no padding at all, or with padding along `K`, which the matmul
+/// needs zero ([`MatmulPadding`]).
+pub fn matmul_padding_off_k(
+    a: &DramTensor,
+    a_transposed: bool,
+    b: &DramTensor,
+    b_transposed: bool,
+) -> [bool; 2] {
+    // `(K, the other)` of each operand as stored.
+    let (ak, am) = if a_transposed {
+        (a.rows, a.cols)
+    } else {
+        (a.cols, a.rows)
+    };
+    let (bk, bn) = if b_transposed {
+        (b.cols, b.rows)
+    } else {
+        (b.rows, b.cols)
+    };
+    [ak % 32 == 0 && am % 32 != 0, bk % 32 == 0 && bn % 32 != 0]
+}
+
 impl Eltwise {
     /// For the S2 kinds (10.2c): does a zero `a` -- with `b`, `c` zero where
     /// `b_zero`, `c_zero` say -- give a zero (of either sign)? From each op's

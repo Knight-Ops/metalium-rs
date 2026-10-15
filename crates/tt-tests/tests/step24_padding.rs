@@ -314,3 +314,120 @@ fn a_view_is_filled_through_a_copy() {
         }
     });
 }
+
+/// Padding off `K` reaches only the output's padding: an output row reads its row of `op(A)`
+/// alone, an output column its column of `op(B)`. So an operand whose `K` is whole tiles is used
+/// as it is, however dirty its other padding (`tensor::matmul_padding_off_k`): no refill is
+/// queued, the real result is Flex's, and the output's padding is declared undefined -- which a
+/// consumer that needs it zero (a matmul over it as `K`) then refills. Dirt along `K` is still
+/// refilled (`dirty_padding_never_reaches_an_accumulation`).
+#[test]
+fn padding_off_k_is_used_as_it_is() {
+    with_session(|s| {
+        // `M` = 37 and `N` = 24 ragged, `K` = 64 whole tiles. Values in -1..=1, so a product's
+        // entries (at most 256 in magnitude) are exact TF32 operands for the matmul after it.
+        let (m, k, n) = (37, 64, 24);
+        let small = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i * 7 + seed) % 3) as f32 - 1.0).collect()
+        };
+        let (xv, bv, wv, vv, ev) = (
+            small(1, m * k),
+            small(2, k),
+            small(3, k * n),
+            small(4, n * k),
+            small(5, k),
+        );
+        let x = s.upload(&xv, m, k).unwrap();
+        let b = s.upload(&bv, 1, k).unwrap();
+        let w = s.upload(&wv, k, n).unwrap();
+        let v = s.upload(&vv, n, k).unwrap();
+        let e = s.upload(&ev, 1, k).unwrap();
+        let yv = small(6, m * n);
+        let y = s.upload(&yv, m, n).unwrap();
+        let fy = flex(&yv, m, n);
+        let add_row = Eltwise {
+            scalar2: 0.0,
+            kind: kind::ADD_ROW,
+            scalar: 0.0,
+        };
+        // The bias lands in the padding rows: `x + b` is dirty past `M`, and `v + e`, used
+        // transposed as `B`, past `N`.
+        let xb = s.eltwise(add_row, &x, Some(&b)).unwrap();
+        let ve = s.eltwise(add_row, &v, Some(&e)).unwrap();
+        for (t, what) in [(&xb, "x + b"), (&ve, "v + e")] {
+            assert_eq!(t.pad(), Pad::Undefined, "{what}: dirty padding");
+            assert!(
+                padding(s, t).iter().any(|&(_, _, p)| p != 0.0),
+                "{what}: the bias is in the padding rows"
+            );
+        }
+        let (fx, fb, fw) = (flex(&xv, m, k), flex(&bv, 1, k), flex(&wv, k, n));
+        let fxb = fx.clone() + fb;
+        let fve = flex(&vv, n, k) + flex(&ev, 1, k);
+        // Ops a product queues: a clean pair's is the matmul's own.
+        let queued = |s: &mut Session<_>, a: &DramTensor, ta, bb: &DramTensor, tb| {
+            let before = s.host_times().ops;
+            let p = mm(s, a, ta, bb, tb);
+            (p, s.host_times().ops - before)
+        };
+        let (clean, alone) = queued(s, &x, false, &w, false);
+        assert_same(
+            &s.download(&clean).unwrap(),
+            &values(fx.clone().matmul(fw.clone())),
+            "x @ w",
+        );
+        assert_eq!(clean.pad(), Pad::Zero, "clean operands, clean output");
+        s.free(clean).unwrap();
+        let cases = [
+            (
+                &xb,
+                &w,
+                false,
+                fxb.clone().matmul(fw.clone()),
+                "(x + b) @ w",
+            ),
+            (
+                &x,
+                &ve,
+                true,
+                fx.clone().matmul(fve.clone().transpose()),
+                "x @ (v + e)^T",
+            ),
+            (
+                &xb,
+                &ve,
+                true,
+                fxb.clone().matmul(fve.clone().transpose()),
+                "(x + b) @ (v + e)^T",
+            ),
+        ];
+        for (a, bb, tb, want, what) in cases {
+            let (p, ops) = queued(s, a, false, bb, tb);
+            assert_eq!(ops, alone, "{what}: no refill queued");
+            assert_same(&s.download(&p).unwrap(), &values(want.clone()), what);
+            assert_eq!(
+                p.pad(),
+                Pad::Undefined,
+                "{what}: the operand's padding is the output's"
+            );
+            // A consumer that accumulates over the output's padding rows (`K` = `M`, ragged)
+            // refills them.
+            let pt = mm(s, &p, true, &y, false);
+            assert_same(
+                &s.download(&pt).unwrap(),
+                &values(want.transpose().matmul(fy.clone())),
+                &format!("({what})^T @ y"),
+            );
+            pad_is_honest(s, &pt, what);
+            for t in [p, pt] {
+                s.free(t).unwrap();
+            }
+        }
+        // Used as they were: neither operand was refilled.
+        assert_eq!(xb.pad(), Pad::Undefined);
+        assert_eq!(ve.pad(), Pad::Undefined);
+        for t in [x, b, w, v, e, y, xb, ve] {
+            s.free(t).unwrap();
+        }
+    });
+}

@@ -433,3 +433,112 @@ fn replay_breakdown() {
         .unwrap_or_else(|e| panic!("{e}"));
     }
 }
+
+/// A captured chain of `n` ops, each reading the last one's result: `relu`s of a `[32, cols]`
+/// tensor, or (`matmul`) `x @ w` with `x` of `[1, 576]` and `w` of `[576, 576]`, SmolLM2's q
+/// projection at decode.
+fn chain_of(s: &mut Card, n: usize, cols: usize, matmul: bool) -> TraceId {
+    if matmul {
+        let x = s.upload(&vec![0.01; 576], 1, 576).unwrap();
+        let w = s.upload(&vec![0.001; 576 * 576], 576, 576).unwrap();
+        s.begin_trace().unwrap();
+        let mut t = x;
+        for _ in 0..n {
+            t = s
+                .matmul_dram(
+                    &t,
+                    false,
+                    &w,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    BUDGET,
+                )
+                .unwrap();
+        }
+        return s.end_trace().unwrap();
+    }
+    let x = s.upload(&vec![0.5; 32 * cols], 32, cols).unwrap();
+    s.begin_trace().unwrap();
+    let mut t = x;
+    for _ in 0..n {
+        t = s
+            .eltwise(
+                Eltwise {
+                    scalar2: 0.0,
+                    kind: kind::RELU,
+                    scalar: 0.0,
+                },
+                &t,
+                None,
+            )
+            .unwrap();
+    }
+    s.end_trace().unwrap()
+}
+
+/// What one more op costs a replay, against how many tiles the session has open and how many of
+/// them the op runs on (`docs/plans/replay-fixed-cost.md`, P0): host-timed replays of captured
+/// chains of 16 and 64 ops, unstamped, the slope between them the cost an op. Each captured op
+/// ends in a barrier every open unit reaches, so an op on one unit of many shows what the barrier
+/// alone costs. `SWEEP_TILES` (default `1,8,32,all`) picks the session sizes.
+///
+/// `cargo xtask bench --device 0 --filter silicon_probe_trace_replay::replay_per_op_cost`
+#[test]
+#[ignore = "benchmark"]
+fn replay_per_op_cost() {
+    use tt_kernels::session::Spread;
+    let card = device_index();
+    let sizes: Vec<String> = std::env::var("SWEEP_TILES")
+        .unwrap_or_else(|_| "1,8,32,all".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    for size in sizes {
+        fork_scope(|| {
+            let choice = match size.as_str() {
+                "all" => TileChoice::All,
+                n => TileChoice::Count(n.parse().unwrap()),
+            };
+            let mut s = Session::open_card(card, tt_firmware_images::ROLES, choice)
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+                .unwrap();
+            let tiles = s.tiles().len();
+            // (name, spread, columns of the relu's tensor, matmul)
+            let cases = [
+                ("relu [32,64] on 1 unit", Spread::Fixed(1), 64, false),
+                ("relu a tile a unit", Spread::All, 32 * tiles, false),
+                ("m=1 matmul [1,576]@[576,576]", Spread::All, 0, true),
+            ];
+            for (name, spread, cols, matmul) in cases {
+                s.set_spread(spread);
+                let mut us = Vec::new();
+                for n in [16usize, 64] {
+                    let t = chain_of(&mut s, n, cols, matmul);
+                    for _ in 0..3 {
+                        s.replay(t).unwrap();
+                        s.sync().unwrap();
+                    }
+                    us.push(host_replay_us(&mut s, t, 15));
+                    s.release_trace(t).unwrap();
+                }
+                let per_op = (us[1] - us[0]) / 48.0;
+                println!(
+                    "MEASURE replay-per-op {name} on {tiles} tiles: 16 ops {:.1} us, 64 ops {:.1} us, \
+                     {per_op:.2} us an op, intercept {:.1} us",
+                    us[0],
+                    us[1],
+                    us[0] - 16.0 * per_op
+                );
+                tt_tests::bench::report(
+                    &format!("replay per op, {name}, {tiles} tiles"),
+                    "us",
+                    "host",
+                    tt_tests::bench::Stats::of([per_op]),
+                );
+            }
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
