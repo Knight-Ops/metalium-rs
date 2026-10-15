@@ -172,16 +172,69 @@ fn resnet18_forward() {
     });
 }
 
-/// `resnet18_forward` as a trace (`burn_tt::Trace`): one eager forward first (the relaid weights
-/// and tap indices are made and kept then), one captured, then each timed pass a replay that writes
-/// the image and reads the logits back, with no op submitted by the host. Its logits equal the eager
-/// forward's bit for bit (the same ops), and its top-1 burn-flex's. Until traces are segmented the
-/// capture fits only with the programs spread over many tiles (`TT_TILES=all`); on fewer it is
-/// skipped with the reason printed.
+/// `forward` on a `[1, 3, 224, 224]` image as a trace (`burn_tt::Trace`): one eager forward first (what
+/// a model makes and keeps on first use -- relaid weights, tap indices, a causal mask -- is made
+/// then), one captured, then each timed pass a replay that writes the image and reads the logits
+/// back, with no op submitted by the host. Its logits equal the eager forward's bit for bit (the same
+/// ops), and its top-1 burn-flex's (`host`). Until traces are segmented the capture fits only where
+/// the programs are spread over enough tiles; otherwise it is skipped with the reason printed.
+fn traced_image_forward(
+    key: &str,
+    d: &burn_tt::TtDevice,
+    x: &[f32],
+    host: &[f32],
+    forward: impl Fn(Tensor<TtBackend, 4>) -> Tensor<TtBackend, 2>,
+) {
+    use burn::tensor::TensorPrimitive;
+    let input = Tensor::<TtBackend, 4>::from_data(TensorData::new(x.to_vec(), [1, 3, 224, 224]), d);
+    let eager = forward(input.clone()).into_data().to_vec::<f32>().unwrap();
+    let TensorPrimitive::Float(image) = input.clone().into_primitive() else {
+        unreachable!()
+    };
+    let captured = burn_tt::Trace::capture(&image, || {
+        let TensorPrimitive::Float(y) = forward(input.clone()).into_primitive() else {
+            unreachable!()
+        };
+        y
+    });
+    let (trace, first) = match captured {
+        Ok(t) => t,
+        Err(e) => {
+            // A forward's programs fit the program cache only when spread over enough tiles
+            // (every tile with the default spread does; one tile does not) until traces are
+            // segmented (roadmap Track 2, "Trace segmentation"): that is reported, not timed.
+            let cause = format!(
+                "{:?}",
+                <TtBackend as burn::tensor::backend::Backend>::sync(d)
+            );
+            assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
+            eprintln!(
+                "SKIP {key}: the forward's programs do not fit one tile's program cache (run \
+                 with TT_TILES=all until traces are segmented): {cause}"
+            );
+            return;
+        }
+    };
+    assert_eq!(first, eager, "the capture's run is the eager forward");
+    for _ in 0..WARMUPS {
+        trace.run(x.to_vec()).unwrap();
+    }
+    let mut ms = Vec::new();
+    let mut got = Vec::new();
+    for _ in 0..SAMPLES {
+        let t0 = Instant::now();
+        got = trace.run(x.to_vec()).unwrap();
+        ms.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    report(key, "ms", "host", Stats::of(ms));
+    assert_eq!(got, eager, "a replay is the eager forward");
+    assert_eq!(argmax(&got), argmax(host));
+}
+
+/// `resnet18_forward` as a trace ([`traced_image_forward`]).
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn resnet18_forward_traced() {
-    use burn::tensor::TensorPrimitive;
     let x = load_chw("cats.jpg", 224, IMAGENET_MEAN, IMAGENET_STD).unwrap();
     let host = {
         let (m, _) = ResNet18::<Flex>::pretrained(&FlexDevice).unwrap();
@@ -196,59 +249,41 @@ fn resnet18_forward_traced() {
     with_device(Config::default(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
-        let input =
-            Tensor::<TtBackend, 4>::from_data(TensorData::new(x.clone(), [1, 3, 224, 224]), &d);
-        let eager = m
-            .forward(input.clone())
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let TensorPrimitive::Float(image) = input.clone().into_primitive() else {
-            unreachable!()
-        };
-        let captured = burn_tt::Trace::capture(&image, || {
-            let TensorPrimitive::Float(y) = m.forward(input.clone()).into_primitive() else {
-                unreachable!()
-            };
-            y
-        });
-        let (trace, first) = match captured {
-            Ok(t) => t,
-            Err(e) => {
-                // A forward's programs fit the program cache only when spread over enough tiles
-                // (every tile with the default spread does; one tile does not) until traces are
-                // segmented (roadmap Track 2, "Trace segmentation"): that is reported, not timed.
-                let cause = format!(
-                    "{:?}",
-                    <TtBackend as burn::tensor::backend::Backend>::sync(&d)
-                );
-                assert!(cause.contains("do not fit"), "capture failed: {e}; {cause}");
-                eprintln!(
-                    "SKIP resnet18 traced: the forward's programs do not fit one tile's program \
-                     cache (run with TT_TILES=all until traces are segmented): {cause}"
-                );
-                return;
-            }
-        };
-        assert_eq!(first, eager, "the capture's run is the eager forward");
-        for _ in 0..WARMUPS {
-            trace.run(x.clone()).unwrap();
-        }
-        let mut ms = Vec::new();
-        let mut got = Vec::new();
-        for _ in 0..SAMPLES {
-            let t0 = Instant::now();
-            got = trace.run(x.clone()).unwrap();
-            ms.push(t0.elapsed().as_secs_f64() * 1e3);
-        }
-        report(
+        traced_image_forward(
             "resnet18 224x224 batch 1 forward, traced",
-            "ms",
-            "host",
-            Stats::of(ms),
+            &d,
+            &x,
+            &host,
+            |t| m.forward(t),
         );
-        assert_eq!(got, eager, "a replay is the eager forward");
-        assert_eq!(argmax(&got), argmax(&host));
+    });
+}
+
+/// `vit_tiny_forward` as a trace ([`traced_image_forward`]).
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn vit_tiny_forward_traced() {
+    let x = load_chw("cats.jpg", 224, HALF_MEAN, HALF_STD).unwrap();
+    let host = {
+        let (m, _) = VitTiny::<Flex>::pretrained(FULL_DEPTH, &FlexDevice).unwrap();
+        baseline("vit-tiny 224x224 batch 1 forward, traced", || {
+            let t = Tensor::<Flex, 4>::from_data(
+                TensorData::new(x.clone(), [1, 3, 224, 224]),
+                &FlexDevice,
+            );
+            m.forward(t).into_data().to_vec::<f32>().unwrap()
+        })
+    };
+    with_device(Config::default(), |d| {
+        conditions(card());
+        let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
+        traced_image_forward(
+            "vit-tiny 224x224 batch 1 forward, traced",
+            &d,
+            &x,
+            &host,
+            |t| m.forward(t),
+        );
     });
 }
 

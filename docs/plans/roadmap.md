@@ -449,8 +449,15 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   eager forward's bit for bit. It captures only when the programs are spread over many tiles: on one tile, or at
   `TT_SPREAD=work:64:4`, a list's programs do not fit the 240 KB program cache (the bench says so and skips), which is trace
   segmentation (next item). An inference capture reads the relaid weights an eager forward kept (a training capture remakes
-  them: its replays write the parameters in place; `step179`'s trace test, watched failing). **Left:** ViT-Tiny and a decode
-  step, and ResNet-18 on fewer tiles once segmentation lands.
+  them: its replays write the parameters in place; `step179`'s trace test, watched failing).
+  - **ViT-Tiny** (2026-10-15, card 1, `vit_tiny_forward_traced`): a replay is **12.6 ms** on every tile with the default
+    spread, against burn-flex's 107.6 (run `1792026627`), and bit for bit the eager forward. At `work:64:4` it is 61.9 ms
+    (`1792026634`), where it now captures. One tile does not capture
+    ([log](../learnings/performance-log.md#vit-tiny-traced-2026-10-15-card-1)).
+  - **A decode step cannot be traced as written.** Each step's cache position and attention length change, so a fixed
+    shape (the whole `max_len` cache with a length mask, a cache write at a position read from a tensor) is needed
+    first. That is a model-side or Burn-API change.
+  - **Left:** a fixed-shape decode step, and ResNet-18 and ViT on fewer tiles once segmentation lands.
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),
