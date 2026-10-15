@@ -414,14 +414,14 @@ pub fn fetch_weights(only: Option<&str>, force: bool) -> Result<(), String> {
             f.revision,
             f.file
         );
-        // Ten minutes: the largest pinned file is 269 MB.
+        // Ten minutes, or as long as the file takes at 4 MB/s (SmolLM2-1.7B's 3.4 GB: 14 minutes).
         fetch_pinned(
             &url,
             &root.join(f.model).join(f.file),
             f.bytes,
             f.sha256,
             force,
-            600,
+            600.max(u32::try_from(f.bytes / 4_000_000).unwrap_or(u32::MAX)),
         )?;
     }
     if only.is_none_or(|name| name == "images") {

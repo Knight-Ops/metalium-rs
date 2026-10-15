@@ -10,7 +10,7 @@ Dev-only (`xtask/src/ship.rs`): `burn-flex` is the host reference. Nothing here 
 ## Fetching what it runs on
 
 ```bash
-cargo xtask fetch-weights                 # everything below, 340 MB
+cargo xtask fetch-weights                 # everything below, 3.8 GB (SmolLM2-1.7B is 3.4 of it)
 cargo xtask fetch-weights --model resnet18
 ```
 
@@ -24,6 +24,7 @@ read it are ignored unless `--features weights` (silicon implies it), so a plain
 | 1 | ResNet-18 | `timm/resnet18.a1_in1k` | conv2d, batch norm (inference), max pool, adaptive average pool, linear |
 | 2 | ViT-Tiny/16, 224 | `timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k` | patch convolution, layer norm, GELU, `attention`, class token, position embedding |
 | 3 | SmolLM2-135M (Llama architecture) | `HuggingFaceTB/SmolLM2-135M` (BF16) | RMSNorm, SiLU, RoPE (`sin`/`cos` on the device), grouped-query attention, `slice_assign` KV cache, embedding of a 49,152-token vocabulary, tied output head |
+| 4 | SmolLM2-1.7B-Instruct (Llama architecture, 3.4 GB) | `HuggingFaceTB/SmolLM2-1.7B-Instruct` (BF16) | the same at 24 layers of width 2048 and 32 heads: the first model past 1B parameters, and the one performance is measured on |
 
 The test photographs (`vendor/weights/images/`) are five natural images, so a top-1 comparison is
 between real classes and not near-tied logits of noise.
@@ -56,7 +57,10 @@ under `assert_native_model` (no staged compute, no host arithmetic, no downloade
 * `step167_smollm2`: teacher-forced top-1 agreement at every position (both backends are fed the
   same tokens), and the free-running greedy decode is printed with the position of the first
   divergence. The host model reproduces HuggingFace `transformers` (`tests/llama_host.rs`: the same
-  top-10 next tokens on two prompts, logits to 5e-5).
+  top-10 next tokens on two prompts, logits within 3e-5 as measured, guarded at 1e-3).
+* `step188_smollm2_1_7b`: the same for SmolLM2-1.7B-Instruct (its host reference is
+  `tests/llama_1_7b_host.rs`), plus its traced generation bit for bit against the eager one
+  (silicon only).
 * `step168_smollm2_mixed_precision`: a different number format per matrix. See below.
 * `step170_checkpoint_round_trip`: train, save with Burn's `BinFileRecorder`, load into a fresh
   model, continue, and end bit-identical to an uninterrupted run (and not to a model that was not
@@ -88,6 +92,14 @@ The generation path is written for decoders in general, not for SmolLM2 (a test 
 cache. It runs on Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, head widths 32 and 128,
 untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added under
 `--features weights`.
+
+## The `transformers` reference (`reference/llama_reference.py`)
+
+Device against burn-flex checks the backend: both run this crate's `Llama`. Whether that `Llama` *is* the model is
+checked against HuggingFace `transformers`. `reference/llama_reference.py` is a uv script (dev-only) whose header pins
+`transformers` and torch (CPU). It runs a pinned checkpoint from the verified local file and prints, as Rust, its
+`config.json` as a `LlamaConfig` (to compare with the preset), the token ids and top-10 logits of each prompt (raw or
+chat-templated), and a greedy continuation. `tests/llama_1_7b_host.rs` holds the values it printed and the command.
 
 ## Mixed precision (`quant.rs`)
 

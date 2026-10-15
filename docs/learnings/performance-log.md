@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [SmolLM2-1.7B-Instruct on the card](#smollm2-17b-instruct-on-the-card-2026-10-15-card-1) | 2026-10-15 | the first model past 1B parameters, traced, F32, every tile: decode 13.6-12.6 tokens/s (burn-flex 3.4-3.0), prefill 267-771 tokens/s (burn-flex 7.6-24.7); decode reads its weights at 86-93 GB/s, 17-18% of GDDR's 512 |
 | [Decode length and trace size](#decode-length-and-trace-size-2026-10-15-cards-0-and-1) | 2026-10-15 | one GDDR region a unit a trace (traces 3,754 -> 563 MB, build 44.9 -> 18.8 s); grouped-query attention without `repeat_kv` and steps attending to 64/128/256/512 positions: decode over a 512-position cache 32.29 -> 26.13-27.31 ms, a generation 0.60x-0.90x burn-flex's time |
 | [Traced generation, end to end](#traced-generation-end-to-end-2026-10-15-cards-0-and-1) | 2026-10-15 | `TracedGenerator`, token ids in and logits out, the step and chunks of 64/128/256 over one cache: the four traces hold 81 KB of the 240 KB program cache together; a decode step costs its cache's length (512 positions 32.3 ms, 320 28.5, 64 26.5); over 320 positions a 256-token prompt plus 64 tokens takes 1,860 ms against burn-flex's 2,996, first token 61.7 against 1,020 |
 | [A traced replay's fixed cost](#a-traced-replays-fixed-cost-2026-10-15-cards-0-and-1) | 2026-10-15 | the 37.2 ms traced SmolLM2 decode step broken down op by op (unit 0's mover stamps): ~84 ops a layer at ~13 us, not the barrier; five fixes (matmul padding off `K`, a kept zero row, a kept transpose, the model's mask and RoPE, thin downloads untilized by the card) bring it to 26.46 ms, burn-flex 26.42 |
@@ -311,6 +312,40 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## SmolLM2-1.7B-Instruct on the card (2026-10-15, card 1)
+
+The first model past 1B parameters (Track 1; `tt_models::llama::SMOLLM2_1_7B_INSTRUCT`). Setup:
+
+- **Model:** 24 layers, width 2048, 32 heads, F32 (6.85 GB of weights).
+- **Bench:** `silicon_bench_models::traced_generation` with `TT_GEN_MODEL=smollm2-1.7b-instruct`, card 1, release,
+  every tile, default spread, run `1792082994`.
+- **Shapes:** chunks of 64/128/256, step lengths 64/128/256/512, a 512-position cache.
+- **burn-flex:** the eager growing cache in the same run, 3 samples (`TT_GEN_FLEX_SAMPLES=3`), as a sample takes 23
+  to 31 s.
+- **Validated:** the traced 32-token prompt bit for bit against the eager schedule on the card. Gate
+  `step188_smollm2_1_7b` on card 0 (`1792080640`) agrees with Flex and with the eager generation.
+
+| Prompt + 64 tokens | Prefill (first token) | Decode step | Total | burn-flex: prefill / step / total |
+|---|---|---|---|---|
+| 32 | **267 tokens/s** (120.0 ms) | **73.65 ms, 13.6 tokens/s** | 4,789 ms | 7.6 tokens/s / 293.4 ms / 22,722 ms |
+| 128 | **657** (194.9) | **76.08, 13.1** | 4,992 | 23.0 / 312.0 / 25,260 |
+| 256 | **771** (331.9) | **79.30, 12.6** | 5,332 | 24.7 / 332.6 / 31,304 |
+
+- **Traced against burn-flex:** decode 4.0-4.2x faster, prefill 29-35x, a whole generation 4.7-5.9x.
+- **Decode is not memory-bound yet.**
+  - A step reads every F32 weight once, 6.85 GB. Done in 73.7-79.3 ms, that is **86-93 GB/s, 17-18% of the card's
+    512 GB/s** (469 measured for reads across 120 tiles).
+  - The floor at that bandwidth is ~14.6 ms a token, so decode is about 5x from it. Its m = 1 matmuls (one job an
+    output tile, the `K` tiles a serial chain on one unit) are the first suspect; profile before choosing.
+- **Footprint:**
+  - the seven traces hold 155 KB of the 240 KB program cache on the fullest unit (SmolLM2-135M: 89 KB) and 1.54 GB
+    of streams;
+  - the driver's build is 76.2 s.
+- **Untraced** (gate run `1792080640`, card 0, every tile): a decoded token is about 530 ms; the first prompt pass is
+  36.5 s, cold (the weights are uploaded on first use).
+- **The simulator** (one tile) cannot capture a 2048-wide step: "a list's programs do not fit an empty program cache"
+  on an element-wise op. The traced gate is silicon only until traces are segmented.
 
 ## Decode length and trace size (2026-10-15, cards 0 and 1)
 

@@ -26,7 +26,7 @@ use burn::tensor::{DType, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::TtBackend;
 use tt_models::image_input::{load_chw, HALF_MEAN, HALF_STD, IMAGENET_MEAN, IMAGENET_STD};
-use tt_models::llama::{Llama, Precision, SMOLLM2_135M};
+use tt_models::llama::{Llama, Precision, SMOLLM2_135M, SMOLLM2_1_7B_INSTRUCT};
 use tt_models::resnet::ResNet18;
 use tt_models::vit::{VitTiny, FULL_DEPTH};
 use tt_tests::bench::{git_sha, report, Stats};
@@ -1095,11 +1095,33 @@ fn smollm2_decode_with_the_embedding_lookup() {
 fn traced_generation() {
     use tt_models::generate::{generate_fixed, Generation, Shapes, TracedGenerator};
     const PROMPTS: [usize; 3] = [32, 128, 256];
-    const NEW: usize = 64;
     let max_len: usize = std::env::var("TT_GEN_MAX_LEN")
         .map(|v| v.parse().unwrap())
         .unwrap_or(512);
-    let vocab = SMOLLM2_135M.vocab;
+    // The model (`TT_GEN_MODEL`): its preset and the weights `cargo xtask fetch-weights` puts in
+    // place. burn-flex's baseline takes `TT_GEN_FLEX_SAMPLES` samples (SmolLM2-1.7B on the host
+    // takes about a minute a sample), and each generation `TT_GEN_NEW` tokens.
+    let name = std::env::var("TT_GEN_MODEL").unwrap_or_else(|_| "smollm2-135m".into());
+    let config = match name.as_str() {
+        "smollm2-135m" => SMOLLM2_135M,
+        "smollm2-1.7b-instruct" => SMOLLM2_1_7B_INSTRUCT,
+        other => panic!("TT_GEN_MODEL={other}: smollm2-135m or smollm2-1.7b-instruct"),
+    };
+    let env = |key: &str, default: usize| -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let flex_samples = env("TT_GEN_FLEX_SAMPLES", SAMPLES);
+    let new = env("TT_GEN_NEW", 64);
+    let vocab = config.vocab;
+    // Tokens a second, from a median time.
+    let median = |v: &[f64]| {
+        let mut v = v.to_vec();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
     let prompt = |len: usize| -> Vec<i32> {
         (0..len)
             .map(|i| ((7 + 7919 * i + 104_729 * i * i) % vocab) as i32)
@@ -1114,21 +1136,33 @@ fn traced_generation() {
     // burn-flex, eager, growing cache.
     {
         let (m, _) =
-            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
+            Llama::<Flex>::pretrained(&config, &name, Precision::F32, &FlexDevice).unwrap();
         for len in PROMPTS {
             let p = prompt(len);
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
-            for i in 0..WARMUPS + SAMPLES {
+            for i in 0..WARMUPS.min(flex_samples) + flex_samples {
                 let t0 = Instant::now();
-                let g = m.generate(&p, NEW, Precision::F32, &FlexDevice);
+                let g = m.generate(&p, new, Precision::F32, &FlexDevice);
                 let all = t0.elapsed();
-                if i >= WARMUPS {
+                if i >= WARMUPS.min(flex_samples) {
                     first.push(ms(g.times[0]));
                     step.push(decode_ms(&g));
                     total.push(ms(all));
                 }
             }
-            let key = format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens");
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens");
+            report(
+                &format!("{key}, prefill (burn-flex, host)"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&first)]),
+            );
+            report(
+                &format!("{key}, decode (burn-flex, host)"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / median(&step)]),
+            );
             report(
                 &format!("{key}, first token (burn-flex, host)"),
                 "ms",
@@ -1154,8 +1188,9 @@ fn traced_generation() {
         .unwrap_or_else(|_| vec![64, 128, 256]);
     with_device(Config::default(), |d| {
         conditions(card());
-        let (m, _) =
-            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
+        let (m, _) = Llama::<TtBackend>::pretrained(&config, &name, Precision::F32, &d).unwrap();
+        // What a decode step reads at least: every F32 parameter once.
+        let weight_bytes = burn::module::Module::num_params(&m) as f64 * 4.0;
         let t0 = Instant::now();
         // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
         // for the whole cache at every step).
@@ -1181,7 +1216,7 @@ fn traced_generation() {
             shapes.steps
         );
         report(
-            &format!("smollm2-135m traced generation, build ({traces})"),
+            &format!("{name} traced generation, build ({traces})"),
             "ms",
             "host",
             Stats::of([ms(t0.elapsed())]),
@@ -1221,26 +1256,26 @@ fn traced_generation() {
                     gddr as f64 / (sections + unit_traces as u64).max(1) as f64,
                 );
                 report(
-                    &format!("smollm2-135m traced generation, {key} entry bytes ({traces})"),
+                    &format!("{name} traced generation, {key} entry bytes ({traces})"),
                     "bytes",
                     "count",
                     Stats::of([real as f64]),
                 );
                 report(
-                    &format!("smollm2-135m traced generation, {key} stream bytes ({traces})"),
+                    &format!("{name} traced generation, {key} stream bytes ({traces})"),
                     "bytes",
                     "count",
                     Stats::of([gddr as f64]),
                 );
             }
             report(
-                &format!("smollm2-135m traced generation, program cache held ({traces})"),
+                &format!("{name} traced generation, program cache held ({traces})"),
                 "bytes",
                 "count",
                 Stats::of([held as f64]),
             );
             report(
-                &format!("smollm2-135m traced generation, trace streams ({traces})"),
+                &format!("{name} traced generation, trace streams ({traces})"),
                 "bytes",
                 "count",
                 Stats::of([set.gddr_bytes() as f64]),
@@ -1263,7 +1298,7 @@ fn traced_generation() {
             let mut tokens = None;
             for i in 0..WARMUPS + SAMPLES {
                 let t0 = Instant::now();
-                let out = g.generate(&p, NEW).unwrap();
+                let out = g.generate(&p, new).unwrap();
                 let all = t0.elapsed();
                 match &tokens {
                     None => tokens = Some(out.tokens.clone()),
@@ -1275,8 +1310,27 @@ fn traced_generation() {
                     total.push(ms(all));
                 }
             }
-            let key =
-                format!("smollm2-135m generation, {len}-token prompt, {NEW} tokens ({traces})");
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
+            let step_ms = median(&step);
+            report(
+                &format!("{key}, prefill, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&first)]),
+            );
+            report(
+                &format!("{key}, decode, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / step_ms]),
+            );
+            // The F32 weights read a decode step, over its time: how near decode is to GDDR's bound.
+            report(
+                &format!("{key}, decode weight bandwidth, traced"),
+                "GB/s",
+                "host",
+                Stats::of([weight_bytes / step_ms / 1e6]),
+            );
             report(
                 &format!("{key}, first token, traced"),
                 "ms",

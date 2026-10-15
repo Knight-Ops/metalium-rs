@@ -26,6 +26,8 @@
 //!   (`TracedGenerator::with_private_prefill`) give a different generation. The prefill's logits
 //!   still agree; the decode steps do not.
 
+mod ladder_support;
+
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::gelu;
@@ -34,13 +36,13 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Int, Tensor};
 use burn_tt::{TtBackend, TtDevice};
+use ladder_support::{assert_same, bits, generate, prompt, traced, traced_equals_eager};
 use tt_models::generate::{
-    generate_fixed, FixedShapeCache, FixedShapeDecoder, GenerateError, Generation, Shapes,
-    TracedGenerator,
+    generate_fixed, FixedShapeCache, FixedShapeDecoder, GenerateError, Shapes, TracedGenerator,
 };
 use tt_models::kv_cache::FixedCache;
 use tt_models::llama::{Llama, LlamaConfig, Precision, SMOLLM2_135M};
-use tt_tests::burn_device::{assert_native_model, with_device, Config};
+use tt_tests::burn_device::{with_device, Config};
 
 const MAX_LEN: usize = 16;
 const BUCKETS: [usize; 2] = [4, 8];
@@ -54,59 +56,6 @@ fn shapes() -> Shapes {
 const LENGTHS: [usize; 7] = [1, 3, 4, 5, 8, 9, 12];
 /// Decode steps per prompt (the tokens chosen; one fewer are fed back).
 const STEPS: usize = 3;
-
-fn bits(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// A prompt of `len` ids below `vocab`, not all alike.
-fn prompt(len: usize, vocab: usize) -> Vec<i32> {
-    (0..len)
-        .map(|i| ((7 + 31 * i * i + 13 * i) % vocab) as i32)
-        .collect()
-}
-
-fn assert_same(got: &Generation, want: &Generation, what: &str) {
-    assert_eq!(got.tokens, want.tokens, "{what}: tokens");
-    assert_eq!(got.logits.len(), want.logits.len(), "{what}: predictions");
-    for (i, (g, w)) in got.logits.iter().zip(&want.logits).enumerate() {
-        assert_eq!(bits(g), bits(w), "{what}: logits {i}");
-    }
-}
-
-/// Build a generator, checking that its captures and warm-up ran natively: the trace inputs it
-/// makes resident are the only transfers outside an op (uploads, nothing read back or staged).
-fn traced<'m, M: FixedShapeDecoder<TtBackend>>(
-    model: &'m M,
-    shapes: &Shapes,
-    d: &TtDevice,
-) -> TracedGenerator<'m, M> {
-    let (g, report) = burn_tt::with_report(|| TracedGenerator::new(model, shapes, d));
-    let report = burn_tt::Report(
-        report
-            .0
-            .into_iter()
-            .filter(|s| !(s.op == "(outside an op)" && s.downloaded == 0 && s.staged == 0))
-            .collect(),
-    );
-    assert_native_model(&report);
-    g.unwrap()
-}
-
-/// A traced generation, checking that the host built no Burn op for it: what runs is replays,
-/// their inputs written and their logits read.
-fn generate(
-    g: &TracedGenerator<'_, impl FixedShapeDecoder<TtBackend>>,
-    p: &[i32],
-    steps: usize,
-) -> Generation {
-    let (out, report) = burn_tt::with_report(|| g.generate(p, steps));
-    for s in &report.0 {
-        assert_eq!(s.op, "(outside an op)", "a traced generation ran a Burn op");
-        assert_eq!(s.staged, 0, "a traced generation staged");
-    }
-    out.unwrap()
-}
 
 /// Shapes SmolLM2 does not have, each two layers.
 fn synthetic_configs() -> Vec<(&'static str, LlamaConfig)> {
@@ -157,24 +106,7 @@ fn synthetic_configs() -> Vec<(&'static str, LlamaConfig)> {
 /// A Llama `model`'s traced generation of every prompt length against the eager fixed-shape
 /// schedule and the growing cache.
 fn check_llama(model: &Llama<TtBackend>, what: &str, lengths: &[usize], d: &TtDevice) {
-    let vocab = model.config().vocab;
-    let g = traced(model, &shapes(), d);
-    for &len in lengths {
-        let p = prompt(len, vocab);
-        let got = generate(&g, &p, STEPS);
-        let fixed = generate_fixed(model, &p, STEPS, &shapes(), d).unwrap();
-        assert_same(
-            &got,
-            &fixed,
-            &format!("{what}, prompt {len}, eager fixed schedule"),
-        );
-        let growing = model.generate(&p, STEPS, Precision::F32, d);
-        assert_same(
-            &got,
-            &growing,
-            &format!("{what}, prompt {len}, growing cache"),
-        );
-    }
+    traced_equals_eager(model, &shapes(), lengths, STEPS, what, d);
 }
 
 #[test]

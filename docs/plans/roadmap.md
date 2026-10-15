@@ -11,9 +11,11 @@ linking to its evidence and to the detailed plan. Closed work lives in
   ([close-out record](../completed-plans/hardware-coverage-closeout.md)). The Burn operation
   traits have no unsupported float, int or bool methods
   ([burn-op-coverage.md](burn-op-coverage.md)).
-- **Models: three pretrained networks run on a card, slowly.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
+- **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
-  (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2.
+  (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 13.6 tokens/s traced against
+  burn-flex's 3.4, and prefills 29-35x faster.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -324,16 +326,36 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   nothing more for them. What the formats cost the model (host, 30 layers, one position): F16 0.017, BF16 0.26,
   BFP8 1.4, BFP4 19.8, BFP2 23.0 (top-1 holds through BFP8). Left: the full 30 layers per plan (the lookup makes each
   plan two minutes), the half formats against a per-matmul reference, and BFP in a trace or under autodiff.
-- [ ] **A real LLM of 1B parameters or more** (decided 2026-10-15). SmolLM2-135M is a test vehicle, not a model
-  worth running, so performance work should be measured on one that is. Candidates are Llama-3.2-1B and
-  Qwen2.5-0.5B/1.5B. What it takes:
-  - pin the checkpoint in `PINS.toml`;
-  - add what its architecture adds over `LlamaConfig`: RoPE scaling (Llama 3) and QKV biases (Qwen2);
-  - a host reference against `transformers`, as `llama_host.rs` does;
-  - the ladder's device-vs-Flex gate;
-  - `TracedGenerator` on it.
+- [x] **A real LLM of 1B parameters or more: SmolLM2-1.7B-Instruct** (2026-10-15). SmolLM2-135M is a test vehicle,
+  not a model worth running; performance work is now measured on this one. It is the same Llama architecture at 24
+  layers of width 2048, 32 heads (multi-head), vocabulary 49,152, tied head, F32 (6.8 GB of weights). What it took:
+  - **Pinned:** `smollm2-1.7b-instruct`, 3.4 GB BF16 (the fetch timeout now scales with size).
+  - **The preset** `SMOLLM2_1_7B_INSTRUCT` and `Llama::smollm2_1_7b_instruct`, with no model code changes.
+  - **A reproducible reference:** `crates/tt-models/reference/llama_reference.py`, a uv script pinning `transformers`
+    5.19.0 and torch 2.14.1 (CPU).
+  - **The host test `llama_1_7b_host`:** the preset equals `config.json`; all 218 tensors load; the top-10 on a raw
+    and a chat-templated prompt equal `transformers`, the logits within 3.3e-5; and the same greedy answer, "The
+    capital of France is Paris."
+  - **Gate `step188_smollm2_1_7b`** (card 0, run `1792080640`):
+    - device against Flex: the same 16 greedy tokens, the largest logit difference 0.116 on 42.4;
+    - traced against eager: bit for bit across chunks of 32 and 64 and step lengths 64 and 128.
 
-  Everything generation-side is already generic (`FixedShapeDecoder`, `step187`).
+    It is not in `--smoke` (3.4 minutes); run it with `--filter step188` and `--timeout-secs 1800`. The traced test is
+    silicon only: the simulator's one tile cannot hold a 2048-wide capture's programs (trace segmentation). Shared
+    helpers are in `crates/tt-tests/tests/ladder_support`.
+  - **Measured** (card 1, every tile, 512-position cache, run `1792082994`,
+    [log](../learnings/performance-log.md#smollm2-17b-instruct-on-the-card-2026-10-15-card-1)):
+    - **decode 13.6 / 13.1 / 12.6 tokens/s** against burn-flex's 3.4 / 3.2 / 3.0, at 32 / 128 / 256-token prompts
+      (4.0-4.2x);
+    - **prefill 267 / 657 / 771 tokens/s** against 7.6 / 23.0 / 24.7 (29-35x);
+    - a 256-token prompt plus 64 tokens in **5.3 s against 31.3 s**.
+
+    Decode reads its weights at only **86-93 GB/s, 17-18% of GDDR's 512**. The bandwidth floor is ~14 ms a token,
+    against 74-79 ms measured, so decode is far from bound by memory: the next performance target. The traces hold
+    155 KB of the 240 KB program cache and 1.5 GB of streams.
+
+  **Next:** Llama-3.2-1B or Qwen2.5-1.5B for the architecture features this one lacks (grouped-query attention, RoPE
+  scaling, QKV biases), and BF16 weights for this one (half the bytes a token).
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL

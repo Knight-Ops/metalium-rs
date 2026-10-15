@@ -74,7 +74,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
 `fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
-`cargo xtask conformance`), `fetch-weights` (needed by the `tt-models` tests and the model-ladder
+`cargo xtask conformance`), `fetch-weights` (3.8 GB, or `--model <name>`; needed by the `tt-models` tests and the model-ladder
 gates, which are ignored without `--features weights`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:

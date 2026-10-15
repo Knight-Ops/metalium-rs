@@ -146,7 +146,10 @@ sha256    = "ff7bcfd416de33731a308c3f266cc351222c34898ecbeaf847f06e48f7ec33f2"
 #
 # Only `model.safetensors` is pinned. The architectures are fixed in tt-models and
 # every tensor shape is checked on load, so a `config.json` would be a second
-# source of truth for the same fact.
+# source of truth for the same fact (a Llama preset is checked against its
+# checkpoint's `config.json` by `crates/tt-models/reference/llama_reference.py`
+# instead). `cargo xtask fetch-weights` without `--model` fetches all of them, about
+# 3.8 GB.
 base_url = "https://huggingface.co"
 
 [[weights.files]]
@@ -172,6 +175,16 @@ revision = "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
 file     = "model.safetensors"
 bytes    = 269060552
 sha256   = "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1"
+
+# The first rung past 1B parameters (Track 1): the same architecture as SmolLM2-135M at
+# 24 layers of width 2048 (`tt_models::llama::SMOLLM2_1_7B_INSTRUCT`), BF16 on disk.
+[[weights.files]]
+model    = "smollm2-1.7b-instruct"
+repo     = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+revision = "31b70e2e869a7173562077fd711b654946d38674"
+file     = "model.safetensors"
+bytes    = 3422777952
+sha256   = "f55217be716b6a997b97b9d8d7eb6fad02e00858f5010ec24f64603c3a98a0e8"
 
 # The ladder's test inputs: natural photographs, so a top-1 comparison between burn-tt and
 # burn-flex is between real classes and not between near-tied logits of noise. Fetched with the

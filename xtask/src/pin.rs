@@ -112,6 +112,14 @@ pub const WEIGHT_FILES: &[WeightFile] = &[
         bytes: 269_060_552,
         sha256: "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
     },
+    WeightFile {
+        model: "smollm2-1.7b-instruct",
+        repo: "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        revision: "31b70e2e869a7173562077fd711b654946d38674",
+        file: "model.safetensors",
+        bytes: 3_422_777_952,
+        sha256: "f55217be716b6a997b97b9d8d7eb6fad02e00858f5010ec24f64603c3a98a0e8",
+    },
 ];
 
 /// One pinned test image of the model ladder (`PINS.toml`, `[[weights.images]]`), fetched by

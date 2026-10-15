@@ -70,6 +70,24 @@ pub const SMOLLM2_135M: LlamaConfig = LlamaConfig {
     tied_head: true,
 };
 
+/// SmolLM2-1.7B-Instruct (`HuggingFaceTB/SmolLM2-1.7B-Instruct`): 24 layers of 32 query and 32
+/// key/value heads of 64 (multi-head attention), width 2048, an MLP of 8,192, SmolLM2's
+/// 49,152-token vocabulary, the head tied to the embedding. Checked against the checkpoint's
+/// `config.json` by `crates/tt-models/reference/llama_reference.py`
+/// (`tests/llama_1_7b_host.rs`).
+pub const SMOLLM2_1_7B_INSTRUCT: LlamaConfig = LlamaConfig {
+    hidden: 2048,
+    heads: 32,
+    kv_heads: 32,
+    head_dim: 64,
+    ff: 8192,
+    vocab: 49_152,
+    layers: 24,
+    rope_theta: 130_000.0,
+    eps: 1e-5,
+    tied_head: true,
+};
+
 impl LlamaConfig {
     /// The same architecture with its first `layers` layers.
     pub fn with_layers(self, layers: usize) -> Self {
@@ -463,6 +481,21 @@ impl<B: Backend> Llama<B> {
             Precision::F32 => model.map(&mut ToF32),
         };
         Ok((model, loaded))
+    }
+
+    /// SmolLM2-1.7B-Instruct ([`SMOLLM2_1_7B_INSTRUCT`], `cargo xtask fetch-weights --model
+    /// smollm2-1.7b-instruct`), its first `layers` layers of twenty-four.
+    pub fn smollm2_1_7b_instruct(
+        layers: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        Self::pretrained(
+            &SMOLLM2_1_7B_INSTRUCT.with_layers(layers),
+            "smollm2-1.7b-instruct",
+            precision,
+            device,
+        )
     }
 
     /// SmolLM2-135M ([`SMOLLM2_135M`], `cargo xtask fetch-weights --model smollm2-135m`), its

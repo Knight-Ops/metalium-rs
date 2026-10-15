@@ -33,7 +33,7 @@ cargo xtask fetch-ttsim   # pinned libttsim builds (1, 2 and 4 chip) into vendor
 cargo xtask fetch-spec    # pinned ISA specification tree into vendor/
 cargo xtask fetch-mnist   # MNIST into vendor/mnist/; tt-mnist's build.rs needs it
 cargo xtask fetch-kmd     # optional: tt-kmd's ioctl.h, for its ABI layout test
-cargo xtask fetch-weights # optional: pretrained weights and photos for tt-models (340 MB)
+cargo xtask fetch-weights # optional: pretrained weights and photos for tt-models (3.8 GB; --model <name> for one)
 cargo test                # builds the riscv32im firmware and runs the validation tier
 ```
 
