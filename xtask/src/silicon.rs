@@ -214,6 +214,10 @@ pub const SMOKE: &[&str] = &[
     "step181_region_assign::",
     // Slices and swaps as views, ragged views copied by tiles (`decode-host-cost.md` P2).
     "step182_region_views::",
+    // Attention's products one job each: a ragged `m`, heads stacked by rows gathered once
+    // (roadmap Track 2 item 9, `attention-jobs.md` P1-P2).
+    "step183_attention_jobs::",
+    "step184_ragged_batched_matmul::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

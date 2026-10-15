@@ -212,7 +212,9 @@ impl Strided {
     /// of `shape` is `[lead.., r, c]`, `lead` broadcast to `batch` from the
     /// right): its first element, and whether it is read transposed. `None`
     /// unless the last two dimensions are a block of the source (or its
-    /// transpose) and every block fits ([`Strided::block_fits`]).
+    /// transpose) and every block fits ([`Strided::block_fits`]) or every block
+    /// is whole rows of the source (heads stacked in a `[h s, d]` buffer, which
+    /// `Session::matmul_dram_batched` gathers into whole tile rows).
     pub(crate) fn matrix_blocks(&self, shape: &[usize], batch: &[usize]) -> Option<Vec<Block>> {
         let n = shape.len();
         if n < 2 || batch.len() < n - 2 {
@@ -231,6 +233,9 @@ impl Strided {
         let lead = n - 2;
         let pad = batch.len() - lead;
         let count: usize = batch.iter().product();
+        let [rows, cols] = self.src_dims();
+        let mut fits = true;
+        let mut whole_rows = true;
         let mut blocks = Vec::with_capacity(count);
         for flat in 0..count {
             let [mut r0, mut c0] = self.base;
@@ -243,7 +248,9 @@ impl Strided {
                     c0 += i * self.strides[k - pad][1];
                 }
             }
-            if !self.block_fits([r0, c0], extent) {
+            fits &= self.block_fits([r0, c0], extent);
+            whole_rows &= c0 == 0 && extent[1] == cols && r0 + extent[0] <= rows;
+            if !fits && !whole_rows {
                 return None;
             }
             blocks.push(Block {

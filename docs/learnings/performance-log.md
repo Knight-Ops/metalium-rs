@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Attention products in one job](#attention-products-in-one-job-2026-10-14-cards-0-and-1) | 2026-10-14 | a batched matmul takes a ragged `m` and heads stacked by rows (one row gather, not a repack a head): attention 64 -> 10 server jobs a decode call, 28 -> 10 a ViT call; ViT-Tiny 283.4 -> 173.5 ms on every tile (burn-flex 107.2), the SmolLM2 decode step 99.6 -> 86.5 |
 | [Slices and swaps as views](#slices-and-swaps-as-views-2026-10-14-card-0) | 2026-10-14 | a positive-step slice is a view, a swap of a view stays one, a ragged view is a tile copy: ViT-Tiny 401.4 -> 283.4 ms on every tile (burn-flex 106.7), the SmolLM2 decode step 108.5 -> 99.6 |
 | [Cache writes as a tile copy and written rows](#cache-writes-as-a-tile-copy-and-written-rows-2026-10-14-card-0) | 2026-10-14 | `slice_assign` of whole rows copies the destination by tile runs and writes only the value's rows: a SmolLM2 cache write 254 -> 25 us of server time, the decode step 117.3 -> 108.5 ms on every tile |
 | [Native `cat`](#native-cat-2026-10-14-card-0) | 2026-10-14 | `cat` and `repeat_dim` are one row gather or one element repack, not a zero-fill and a `slice_assign` a piece: the SmolLM2 decode step 232.6 -> 117.3 ms on every tile (burn-flex 26.3), 623.9 -> 458.1 on one; its 121 `cat`s 196.6 -> 4.6 ms of server time |
@@ -58,6 +59,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-14 | 1792019870 / 1792019882 / 1792019917 | Attention products in one job (ragged `m`, heads stacked by rows gathered once): ViT-Tiny 283.4 -> 173.5 ms and the SmolLM2 decode step 99.6 -> 86.5 ms on every tile at `work:64:4` (burn-flex 107.2 and 26.5), card 1; one tile ViT 481.9, decode 449.7; see "Attention products in one job". | ViT and decode rows updated in place. |
 | 2026-10-14 | 1792000003 | ResNet-18 forward traced, every tile: 17.6 ms a replay against 205.7 untraced and burn-flex 151.7, card 1, bit for bit the eager forward; one tile does not capture (program cache); see "Chunk-free convolution and max pooling" below. | New scoreboard row. |
 | 2026-10-14 | 1791996580 / 1791996716 / 1791996730 | Chunk-free convolution and max pooling (NHWC tap select, one product, views between layers): ResNet-18 forward 16,288 -> 782.3 ms on one tile, 131.1 ms on every tile at `work:64:4` (burn-flex 151-157 ms), card 1, top-1 validated; see "Chunk-free convolution and max pooling" below. | ResNet-18 rows updated in place. |
 | 2026-10-13 | 1791851940 / 1791852097 | Row select (`Session::select_rows`, B's `SELECT_ROWS`): the embedding lookup of SmolLM2's 49,152 x 576 table, 15.9 s -> 260 us a token, validated against the host's rows; a decode step from a token id 623 ms; see "Row select" below. | Scoreboard rows updated in place. |
@@ -297,6 +299,47 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Attention products in one job (2026-10-14, cards 0 and 1)
+
+P0-P2 of [attention-jobs.md](../plans/attention-jobs.md). Before this, a batched matmul whose `m` was not whole tile rows
+(decode m = 1, ViT m = 197, a prefill's m = t) ran one head at a time: two element repacks and a matmul a head, then a row
+gather, so 28 of a decode call's 64 attention jobs for each product. Now `Session::matmul_dram_batched`
+does three things, and the whole product is one server job:
+- writes each product from a tile row of its own;
+- stacks the products' rows with one row gather;
+- gathers an operand whose heads are stacked by rows (`repeat_kv`'s `[9 T, 64]`, the stacked scores) into whole tile rows with zero
+  tails.
+
+`module::attention` charges its stages to parts (`attention/qk`, `/softmax`, ...). Release, card 1 (both cards were free;
+the gates ran on card 0 at the same time), two warm-ups and nine timed passes, burn-flex timed in the same run:
+
+| Workload | Before (card 0) | After (card 1) | burn-flex (same run) |
+|---|--:|--:|--:|
+| ViT-Tiny forward, every tile at `work:64:4` | 283.4 ms (`1792013104`) | **173.5 ms** (`1792019882`) | 107.2 ms |
+| ViT-Tiny forward, one tile | 663.0 ms (`1792013112`) | 481.9 ms (`1792019870`) | 107.3 ms |
+| SmolLM2 decode step, every tile | 99.6 ms (`1792013124`) | **86.5 ms** (`1792019882`) | 26.5 ms |
+| SmolLM2 decode step, one tile | 450.4 ms (`1792013133`) | 449.7 ms (`1792019917`) | 25.1 ms |
+
+- **Decode on every tile.**
+  - Server jobs: 3,316 -> 1,696.
+  - Server time: attention's 73 ms is now 36: `qk` 30 jobs, 20.6 ms; `pv` 30, 13.2 ms; `softmax` 210, 2.1 ms;
+    `scale` 30, 0.3 ms.
+  - A product job is 0.4-0.7 ms of server time. It runs up to two zero rows, two operand gathers, the product and
+    the stacking gather.
+- **Decode on one tile is unchanged.** It still waits on its m = 1 matmuls (roadmap, "Per-workload tile choice").
+- **ViT on every tile.**
+  - Server jobs: 766 -> 550.
+  - Server time: `pv` 12 jobs, 47.2 ms; `qk` 12, 26.5 ms; `softmax` 84, 2.2 ms.
+  - `pv` is the most expensive because the stacked scores `[3 x 197, 197]` are gathered by rows into whole tile
+    rows before the product.
+  - **Next:** the stacking gather after `qk` and the gather before `pv` undo each other. Keeping the scores padded
+    through the softmax would remove both.
+- **Correctness.**
+  - Card 0 (`1792019871`): `step183_attention_jobs`, `step184_ragged_batched_matmul`, `step83_attention`, `step60`, `step182`,
+    `step166_vit_tiny`, and `step167_smollm2` (F32 23.1 s, was 33; BF16 229 s).
+  - Both cards (`1792020158`): the mesh attention, trace and module-reference tests.
+  - On ttsim: Burn's conformance has 0 unexpected results (`1792018795`), and the MNIST e2e golden is unchanged.
 
 ## Slices and swaps as views (2026-10-14, card 0)
 

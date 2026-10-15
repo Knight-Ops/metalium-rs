@@ -1590,6 +1590,43 @@ pub struct Block {
     pub transposed: bool,
 }
 
+/// Whether a block of `extent` elements at `at` in `t` is one
+/// [`matmul_dram_batched`] reads where it lies: inside `t`, starting on a
+/// tile and, where it does not end on one, ending at `t`'s own edge.
+pub fn block_fits(t: &DramTensor, [r0, c0]: [usize; 2], [r, c]: [usize; 2]) -> bool {
+    r0 + r <= t.rows
+        && c0 + c <= t.cols
+        && r0 % 32 == 0
+        && c0 % 32 == 0
+        && (r % 32 == 0 || r0 + r == t.rows)
+        && (c % 32 == 0 || c0 + c == t.cols)
+}
+
+/// [`block_ref`] for an operand laid out a block per whole tile rows, each
+/// block's tail rows its own zero padding: the block must start on a tile and
+/// its tile rows lie inside `t`, but may end inside it.
+fn padded_block_ref(
+    t: &DramTensor,
+    at: [usize; 2],
+    extent: [usize; 2],
+    what: &str,
+) -> Result<TensorRef> {
+    let ([r0, c0], [r, c]) = (at, extent);
+    let fits = r0 % 32 == 0
+        && r0 + r.div_ceil(32) * 32 <= t.grid()[0] * 32
+        && block_fits(t, [0, c0], [t.rows, c]);
+    if !fits {
+        return Err(TensorError::Shape(format!(
+            "{what}: a padded [{r}, {c}] block at [{r0}, {c0}] of a [{}, {}] tensor is not \
+             whole tile rows inside it",
+            t.rows, t.cols
+        )));
+    }
+    let mut x = t.tensor_ref();
+    x.first += ((r0 / 32) * t.grid()[1] + c0 / 32) as u32;
+    Ok(x)
+}
+
 /// A block of `extent` elements at `at` in `t`, as a record names it: the
 /// tensor's ref with its first tile moved to the block's, the row stride
 /// kept. Refused unless the block starts on a tile and, where it does not end
@@ -1597,12 +1634,7 @@ pub struct Block {
 /// would read its neighbour's elements as padding.
 fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> Result<TensorRef> {
     let ([r0, c0], [r, c]) = (at, extent);
-    let fits = r0 + r <= t.rows && c0 + c <= t.cols;
-    let aligned = r0 % 32 == 0
-        && c0 % 32 == 0
-        && (r % 32 == 0 || r0 + r == t.rows)
-        && (c % 32 == 0 || c0 + c == t.cols);
-    if !fits || !aligned {
+    if !block_fits(t, at, extent) {
         return Err(TensorError::Shape(format!(
             "{what}: a [{r}, {c}] block at [{r0}, {c0}] of a [{}, {}] tensor is not whole tiles \
              inside it",
@@ -1616,13 +1648,16 @@ fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> 
 
 /// `op(A_i) @ op(B_i)` for every `i` of `items` -- blocks of `a` and `b`,
 /// each `[m, k] @ [k, n]` after its transposes -- as one op: the products'
-/// jobs together, each product's output written to rows `i m .. (i + 1) m`
-/// of one `[items.len() m, n]` tensor. A batched matmul of resident
-/// operands, and of views into them (a head's columns of a projection),
-/// with no copy: each block is gathered where it lies. Every product is
-/// [`matmul_dram`]'s, bit for bit, including accumulator reloads across K
-/// blocks. With more than one item, refused unless `m` is whole tiles (each product's
-/// output must start on a tile row).
+/// jobs together, each product's output written from tile row `i mt` (`mt`
+/// the tile rows of `m`) of one `[items.len() mt 32, n]` tensor -- the stacked
+/// `[items.len() m, n]` when `m` is whole tiles; otherwise each product's last
+/// tile row ends in padding rows of its own ([`Session::matmul_dram_batched`]
+/// compacts them). A batched matmul of resident operands, and of views into
+/// them (a head's columns of a projection), with no copy: each block is
+/// gathered where it lies. Every product is [`matmul_dram`]'s, bit for bit,
+/// including accumulator reloads across K blocks.
+///
+/// [`Session::matmul_dram_batched`]: crate::session::Session::matmul_dram_batched
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_dram_batched(
     alloc: &mut DramAlloc,
@@ -1648,9 +1683,17 @@ pub fn matmul_dram_batched(
         allow_mop,
         pipeline,
         None,
+        [false; 2],
     )
 }
 
+/// [`matmul_dram_batched`] with a K block limit, and `padded` saying which
+/// operands are laid out a block per whole tile rows, each block's tail rows
+/// zero ([`Session::matmul_dram_batched`] makes them): such a block may end
+/// inside the tensor, since what follows it to the tile boundary is its own
+/// zero padding, not a neighbour's elements.
+///
+/// [`Session::matmul_dram_batched`]: crate::session::Session::matmul_dram_batched
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_batched_limited(
     alloc: &mut DramAlloc,
@@ -1664,6 +1707,7 @@ pub(crate) fn matmul_dram_batched_limited(
     allow_mop: bool,
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
+    padded: [bool; 2],
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1671,11 +1715,6 @@ pub(crate) fn matmul_dram_batched_limited(
     if batch == 0 || m == 0 || k == 0 || n == 0 {
         return Err(TensorError::Shape(format!(
             "{batch} x [{m}, {k}] @ [{k}, {n}]: nothing to compute"
-        )));
-    }
-    if batch > 1 && m % 32 != 0 {
-        return Err(TensorError::Shape(format!(
-            "{batch} x [{m}, {k}] @ [{k}, {n}]: a batch needs whole tile rows per product"
         )));
     }
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
@@ -1698,9 +1737,16 @@ pub(crate) fn matmul_dram_batched_limited(
     for (ba, bb) in items {
         let ea = if ba.transposed { [k, m] } else { [m, k] };
         let eb = if bb.transposed { [n, k] } else { [k, n] };
+        let operand = |t, padded, at, extent, what| {
+            if padded {
+                padded_block_ref(t, at, extent, what)
+            } else {
+                block_ref(t, at, extent, what)
+            }
+        };
         refs.push((
-            block_ref(a, ba.at, ea, "a batched matmul's left operand")?,
-            block_ref(b, bb.at, eb, "a batched matmul's right operand")?,
+            operand(a, padded[0], ba.at, ea, "a batched matmul's left operand")?,
+            operand(b, padded[1], bb.at, eb, "a batched matmul's right operand")?,
             [ba.transposed, bb.transposed],
         ));
     }
@@ -1714,7 +1760,8 @@ pub(crate) fn matmul_dram_batched_limited(
         fidelity,
         allow_mop,
     };
-    let c = DramTensor::alloc(alloc, batch * m, n)?;
+    let rows = if batch == 1 { m } else { batch * mt * 32 };
+    let c = DramTensor::alloc(alloc, rows, n)?;
     let mut jobs = Vec::new();
     for (i, (ra, rb, t)) in refs.into_iter().enumerate() {
         let mut rc = c.tensor_ref();

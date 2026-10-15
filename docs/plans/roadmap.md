@@ -418,7 +418,21 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   causal mask's upload. P0's counters give the jobs per op inside the call. Then fuse what the numbers favour: one
   batched product per matmul, a softmax over rows in one job or a few (the reduce/norm fuser below), and the mask as
   geometry. The arithmetic order stays Burn's: the existing attention gates must hold bit for bit or within their derived
-  bounds. FlashAttention ("Later") is the end state, not this item.
+  bounds. FlashAttention ("Later") is the end state, not this item. Plan: [attention-jobs.md](attention-jobs.md).
+  - **P0 (2026-10-14):** `module::attention` charges its stages to parts (`report::part`). Of a decode call's 64 jobs,
+    56 were the two products, each run a head at a time because `m` was not whole tile rows (two repacks and a matmul a
+    head). The softmax is 7 and the scale 1; a causal mask adds 3.
+  - **P1-P2 (2026-10-14, ttsim, cards 0 and 1):** a batched matmul takes a ragged `m` and heads stacked by rows,
+    gathered once into whole tile rows. Each product is one job, bit for bit `matmul_dram`'s
+    (`step184_ragged_batched_matmul`, `step183_attention_jobs`).
+    - **Jobs a call:** decode 64 -> 10, ViT 28 -> 10, prefill 67 -> 13.
+    - **Every tile:** ViT-Tiny **173.5 ms** (was 283.4; burn-flex 107.2) and the decode step **86.5 ms** (was 99.6; burn-flex
+      26.5), card 1, runs `1792019882` and `1792019870` ([log](../learnings/performance-log.md#attention-products-in-one-job-2026-10-14-cards-0-and-1)).
+    - **Left:**
+      - ViT's scores are stacked after `qk` and gathered back into tile rows before `pv` (74 of ViT's attention ms):
+        keep them padded through the softmax.
+      - The causal mask as cached geometry (P3).
+      - The softmax's 7 jobs (P4).
 - [ ] **5. BF16 lookup (open; the row select does not take it).** `step167` BF16 (six layers) takes 229 s on card 0 (run
   `1791852139`; its 441 s was `1791848957`) because the BF16 lookup still stages through `gather_indexed_bf16`. A packed
   BF16 row select needs about 400 bytes the B image does not have; the split design (B reads the pair, NC writes the
