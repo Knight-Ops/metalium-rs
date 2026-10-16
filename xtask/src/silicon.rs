@@ -241,6 +241,15 @@ pub const SMOKE: &[&str] = &[
     "step190_thin_matmul::",
     // `Llama::fused`: `q|k|v` and `gate|up` one product each, bit for bit the unfused model (P3).
     "step191_fused_projections::",
+    // Element-wise ops on block views read in place, and RoPE on a projection's heads by tile
+    // copies (decode-small-ops.md S1, S2a).
+    "step192_block_views::",
+    // A decode step traced on `Fusion<TtBackend>`, bit for bit `TtBackend`'s (decode-small-ops.md F0).
+    "step193_fusion_decode_trace::",
+    // Burn's default sigmoid, silu and silu(gate) * up fused on `Tt` (kernel-fusion.md Phase 2).
+    "step194_fused_sigmoid_silu::",
+    // RMSNorm up to its scale as one kernel on `Tt` (decode-small-ops.md S3).
+    "step195_fused_rms_norm::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

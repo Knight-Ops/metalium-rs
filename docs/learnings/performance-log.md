@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Decode fusers: sigmoid, SiLU and RMSNorm](#decode-fusers-sigmoid-silu-and-rmsnorm-2026-10-16-cards-0-and-1) | 2026-10-16 | decode runs on `Tt` (burn-fusion), with three chain fusers bit for bit `TtBackend`: Burn's sigmoid composition as the native sigmoid, `silu(gate) * up` as one SFPU pass, RMSNorm's statistic as one reduction kernel. A 1.7B decode step 45.23 / 47.71 / 50.78 -> **43.42 / 45.85 / 49.00 ms** (23.0-20.4 tokens/s), 135M 22.46-23.63 -> **20.20 / 20.66 / 21.34**. A norm that also divided in one kernel was 640 us a norm (71.5 ms a 1.7B step): one unit pushed `DIV`'s instructions for 64 tiles |
+| [Block views: RoPE and SiLU without repacks or copies](#block-views-rope-and-silu-without-repacks-or-copies-2026-10-16-cards-0-and-1) | 2026-10-16 | element-wise ops read a block of a buffer in place, RoPE runs in the projection's layout (its table laid over the heads once a step, its halves swapped by tile copies): a 1.7B decode step 47.90 / 50.37 / 53.53 -> **45.23 / 47.71 / 50.78 ms** (22.1-19.7 tokens/s), 135M 22.91-23.98 -> **22.46 / 22.95 / 23.63**; RoPE's four repacks a layer gone, the key write now repacks (S1d); F0: the step under burn-fusion is +1.5 / +2.2 ms (its sigmoid is Burn's 8-op composition) |
 | [Decode matmuls read only the activation rows they use](#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1) | 2026-10-16 | P3 (fused `q\|k\|v` and `gate\|up`, `Llama::fused`): 1.7B **47.90 / 50.37 / 53.53 ms**, 135M **22.91-23.98**; `gate\|up` at ~490 GB/s. P0-P2: an `m = 1` product's `GATHER` reads each `A` tile through row `r` of face 1 (one entry, ~27% of the bytes), not the whole tile, and a one-tile-row product's last round is spread over the units: a 1.7B decode step 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms** (20.1-18.0 tokens/s), its matmuls 33.8 -> 26.3 ms; two face-row reads a tile instead were *slower* on the 135M (the mover's cost is per entry); what is left is entry-bound on B |
 | [A cache write of one row a head](#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1) | 2026-10-16 | `scatter_nd` with `Assign` is one row scatter at resident indices (NC's `SCATTER_ROWS`), and `FixedCache` writes a step with it: a 1.7B decode step 73.65 / 76.08 / 79.30 -> **57.21 / 59.64 / 62.81 ms** (17.5-15.9 tokens/s), the 135M step 25.81-26.99 -> 24.40-25.53 (burn-flex 26.66-31.12); the cache write is 5.0 of 56.8 ms a 1.7B step, was ~20 |
 | [Where a SmolLM2-1.7B step goes: the profile mode](#where-a-smollm2-17b-step-goes-the-profile-mode-2026-10-15-cards-0-and-1) | 2026-10-15 | the first profile from the profile mode (`cargo xtask bench --profile`): a 1.7B decode step is 46% matmuls (~200 GB/s), **24% the cache write's `expand`** (32 key/value heads), ~30% small ops; stamping compiled in costs 0.46 ms a 135M step, so it is now a build feature |
@@ -70,6 +72,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-16 | 1792170667 / 1792171171 / 1792172763 / 1792174412 / 1792174499 / 1792172342 / 1792174906 | Block views (`decode-small-ops.md` S1, S2a; gate `step192`): element-wise ops on a block of a buffer read in place (`Session::eltwise_blocks`), RoPE in the projection's layout (`Strided::layout_moves`: the table laid over the heads once a step, the halves swapped by tile copies), a regrouped GQA `q` made plain once for attention. SmolLM2-1.7B decode 47.90 / 50.37 / 53.53 -> **45.23 / 47.71 / 50.78 ms**; 135M 22.91-23.98 -> **22.46 / 22.95 / 23.63** (burn-flex 29.5-31.0); card 1, every tile. F0: the same steps on `Fusion<TtBackend>` 47.49 / 49.90 / 53.08 and 24.00 / 24.52 / 25.15. | Decode rows updated. |
 | 2026-10-16 | 1792161551 / 1792161623 / 1792162031 / 1792162257 | Fused projections (`decode-matmul-bandwidth.md` P3, `Llama::fused`, gate `step191`): a layer's 7 products become 4, bit for bit. SmolLM2-1.7B decode 49.78 / 52.27 / 55.44 -> **47.90 / 50.37 / 53.53 ms**; 135M 24.14-25.25 -> **22.91 / 23.35 / 23.98** (burn-flex 26.43-30.65); card 1, every tile. | Decode rows updated. |
 | 2026-10-16 | 1792114379 / 1792114782 / 1792115180 / 1792115571 / 1792115848 / 1792118484 / 1792118871 / 1792119119 | Decode matmul bandwidth (`decode-matmul-bandwidth.md` P1, P2): thin `A` reads (`record::gather_rows`), first as two face-row reads a tile (1.7B 55.69-61.30 ms, 135M *slower*, 25.43-26.51), then as one prefix read (1.7B 51.15-56.71, 135M 24.07-25.21), then the last round of a one-tile-row product spread over the units (`tensor::thin_runs`). SmolLM2-1.7B decode 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms**; 135M 24.40-25.53 -> 24.14-25.25 (burn-flex 26.05-30.44); card 1, every tile. | 1.7B decode row updated. |
 | 2026-10-15 | 1792034179 / 1792034180 / 1792034647 / 1792035075 / 1792035466 / 1792035579 / 1792036613 / 1792036724 / 1792036850 / 1792036818 | A traced replay's fixed cost (`replay-fixed-cost.md`): P0 profile (2,418 ops, replay 36.0 ms; per op ~13 us; the barrier 0.6 us of it), then matmul padding off `K`, a kept zero row, a kept transpose for `B`, the model's mask expanded once a step and RoPE's sign in its table, thin downloads untilized by the card. SmolLM2 decode traced 37.2 -> **26.46 ms** (burn-flex 26.42), prefill 256 tokens 79.0 -> 73.1 ms, ViT-Tiny traced 12.6 -> 11.6, ResNet-18 traced 17.6 -> 17.2; card 1, every tile. | Rows updated. |
@@ -317,6 +320,106 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Decode fusers: sigmoid, SiLU and RMSNorm (2026-10-16, cards 0 and 1)
+
+[decode-small-ops.md](../plans/decode-small-ops.md) F0 (decode on `Tt`), S2b, S3;
+[kernel-fusion.md](../plans/kernel-fusion.md) Phases 2 and 4.
+
+**Gates:**
+- On card 0: `step194_fused_sigmoid_silu` 4 of 4 (BF16 included, `1792186176`), `step195_fused_rms_norm` 3 of 3
+  (`1792186165`), `step193_fusion_decode_trace` 4 of 4 (SmolLM2-135M on `Tt` included, `1792186169`).
+- On ttsim: `step12` (`e2e`, `add_relu` still fused) and the Llama gates (`step187`, `step191`, `step192`).
+- Burn conformance on ttsim, plain and `--fusion`: no unexpected result.
+
+**Bench:** `TT_TILES=all TT_GEN_MODEL=<model> TT_GEN_FLEX_SAMPLES=1 cargo xtask bench --device 1 --filter
+silicon_bench_models::traced_generation`, release, card 1, 2 warmups, 9 samples, burn-flex in the same run. The model
+now runs on `Tt` (`TT_GEN_FUSION=0` gives `TtBackend`).
+
+| decode step, ms, 32 / 128 / 256-token prompt | before (`TtBackend`) | `Tt`, three fusers | burn-flex, same run |
+|---|--:|--:|--:|
+| SmolLM2-1.7B-Instruct | 45.23 / 47.71 / 50.78 (`1792174499`) | **43.42 / 45.85 / 49.00** (`1792186180`) | 304.2 / 316.0 / 335.8 |
+| SmolLM2-135M | 22.46 / 22.95 / 23.63 (`1792174412`) | **20.20 / 20.66 / 21.34** (`1792186583`) | 26.9 / 30.7 / 31.6 |
+| 1.7B build (capture and warm-up), s | 70.2 | 69.3 | |
+
+**What changed.**
+- **Sigmoid.** burn-fusion 0.21 sends `sigmoid` as Burn's 8-op composition. The chain fuser runs `TtBackend`'s
+  sigmoid for it, which removes F0's +1.5 / +2.2 ms. A decode step on `Tt` gives `TtBackend`'s logits bit for bit.
+- **`silu(gate) * up`:** one SFPU pass (`SILU_MUL`), 49 us, where the sigmoid and two muls were three jobs.
+- **RMSNorm** up to its scale: the statistic `sqrt(mean(x x) + eps)` as one reduction kernel (`sfpu::norm`), then
+  the existing `DIV`. That is two jobs a norm where there were five.
+
+**The version that lost** (run `1792184225`, profile `1792184874`):
+- The norm was one kernel that also divided, the row unpacked a second time.
+- It took **640 us a norm** (95% kernel), 31.3 of a 70.8 ms 1.7B step (71.53 / 73.94 / 77.14 ms; 135M 28.90-30.07).
+- `DIV`'s body does not fit the 32-entry replay buffer, so each of its ~1,000 instructions a tile is pushed from the
+  role program, and one unit pushed them for all 64 tiles. The separate `DIV` spreads those tiles over the units.
+- The lesson: fuse a reduction's sequential part, and leave its element-wise map a parallel op.
+
+## Block views: RoPE and SiLU without repacks or copies (2026-10-16, cards 0 and 1)
+
+[decode-small-ops.md](../plans/decode-small-ops.md) S1 and S2a; gate `step192_block_views` (ttsim; card 0 runs
+`1792168902`, `1792174393`); `step188` on card 0 (`1792170465`); `--smoke` 1,096 of 1,096 (`1792175641`); Burn
+conformance on ttsim with no unexpected result; the MNIST training regression (`step12`, `e2e`) matches its golden. Bench: `TT_TILES=all TT_GEN_MODEL=<model> TT_GEN_FLEX_SAMPLES=1 cargo xtask bench
+--device 1 --filter silicon_bench_models::traced_generation`, release, card 1, 2 warmups, 9 samples, burn-flex in the
+same run.
+
+**What changed.**
+
+- **Element-wise ops on a block view.** A view that is a block of its buffer (`Strided::as_block`: its elements fill
+  a tile-aligned block one to one) runs the op on that block where it lies (`Session::eltwise_blocks`; each operand's
+  `READ_RUN` counts over the output's grid at its parent's row stride). Examples: SiLU's `gate` and `up` columns of
+  the fused product, and `q`'s heads along a projection's row. No firmware change.
+- **RoPE in the projection's layout.** In decode, `q` is `[1, h, 1, d]` with every head in row 0 of the projection.
+  Laying it out as `[h, d]` moves data from one row to many, which no tile move does, so both `cat` and `x cos` were
+  element repacks (~38 us each on 2 units).
+  - Now the table is laid over the heads by tile copies (`Strided::layout_moves`), kept beside it
+    (`TtTensor::derived`), once a step.
+  - The halves' `cat` is a permutation of the projection's tile columns (`region::cat_in_layout`).
+  - `head_dim` 32 (halves of 16 columns) keeps the repack.
+- **A regrouped GQA `q` is made plain once** (`operand_blocks`). Without this, SmolLM2-135M's step went 23 -> **40 ms**
+  (profile `1792172763`): `q` in the projection's layout, regrouped `[kv, groups, d]`, is not a block, so attention
+  fell to Burn's composition and repacked the keys a group, 214 us.
+
+**Result.**
+
+| Step (ms), 32 / 128 / 256-token prompt | before (`1792161623`, `1792162031`) | after (`1792174499`, `1792174412`) |
+|---|--:|--:|
+| SmolLM2-1.7B | 47.90 / 50.37 / 53.53 | **45.23 / 47.71 / 50.78** (22.1 / 21.0 / 19.7 tokens/s) |
+| SmolLM2-135M | 22.91 / 23.35 / 23.98 | **22.46 / 22.95 / 23.63** (burn-flex 29.5 / 31.0 at 128 / 256) |
+
+**Where the 1.7B step changed** (`Step(64)`, profile `1792171171` against `1792162257`):
+
+| Part, ms a step | before | after |
+|---|--:|--:|
+| `float_cat` (RoPE's halves) | 1.83 | 0.30 |
+| `float_mul` (RoPE, SiLU, the norm's `gamma`) | 3.75 | 1.91 |
+| `sigmoid` | 1.28 | 1.08 |
+| `attention/qk` (q's row gather became a fill-pad) | 1.75 | 1.55 |
+| `float_scatter_nd` (the key write now repacks, as the value's did) | 3.89 | 4.80 |
+
+- **The key write's new repack, 0.9 ms.** The key reaches the cache write in the projection's layout and repacks
+  there (38 us a layer), as the value already did. Both repacks are S1d, a `SCATTER_ROWS` that reads its rows from a
+  strided view.
+- **The 135M step gained only 0.4 ms.** Its regrouped `q` is now made plain once (6 us), and its key write repacks
+  too.
+
+**F0: the same step on `Fusion<TtBackend>`** (`TT_GEN_FUSION=1`; gate `step193_fusion_decode_trace`, card 0
+`1792174399`):
+
+| ms | `TtBackend` | `Fusion<TtBackend>` |
+|---|--:|--:|
+| 1.7B decode step, 32 / 128 / 256 | 45.23 / 47.71 / 50.78 | 47.49 / 49.90 / 53.08 (`1792172342`) |
+| 135M decode step | 22.46 / 22.95 / 23.63 | 24.00 / 24.52 / 25.15 (`1792174906`) |
+| 1.7B build (capture and warm-up) | 70,158 | 74,080 |
+| 135M build | 16,397 | 17,962 |
+
+- **Capture works, and replays run no Burn op.** But burn-fusion 0.21 does not forward activations, so its
+  `sigmoid` is Burn's default composition: eight ops (cast, `x -1`, `exp`, `+1`, `log`, `x -1`, `exp`, cast) where
+  burn-tt has one.
+- **The tax:** +1.5 / +2.2 ms a step, and logits not always bit for bit `TtBackend`'s (one case of four differed by
+  7.9e-6).
+- **What burn-fusion fuses today in a decode step: nothing.** The only fuser starts on `Add` or relu.
 
 ## Decode matmuls read only the activation rows they use (2026-10-16, cards 0 and 1)
 

@@ -33,6 +33,7 @@ pub mod integer;
 pub mod interp;
 pub mod kernel;
 pub mod macro_sched;
+pub mod norm;
 pub mod ops;
 pub mod reduce;
 pub mod round;

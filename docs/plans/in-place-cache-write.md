@@ -185,7 +185,9 @@ Phases, each on ttsim then card 0, each gate watched failing:
     - two writes to one buffer in a step chain;
     - the negative controls still diverge (`step185` `stateful = false`, `step187` private prefill).
 - [ ] **D4. Measure** as above. Rows go into the performance log and scoreboard.
-- [ ] **D5 (separate, optional): the value's layout** (0.92 + 0.56 ms).
+- [ ] **D5 (separate, optional): the value's layout** (0.92 + 0.56 ms). **Now the key's too** (2026-10-16): since
+  RoPE runs in the projection's layout ([decode-small-ops.md](decode-small-ops.md) S1), the key reaches the write
+  as a view and repacks there as well (+0.9 ms a 1.7B step, profile `1792171171`). This is decode-small-ops S1d.
   - **Why it repacks:** `v` is a view of parts of rows (a column block of the fused `qkv` product, then
     `reshape`/`swap_dims` into heads, `Layer::forward`), so the write's `new.reshape([kv, d])` and `scatter_nd`'s
     restack (`ops/index.rs` `restack`) fall to an element repack (`mapped_native`).

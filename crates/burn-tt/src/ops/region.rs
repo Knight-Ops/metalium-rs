@@ -222,6 +222,11 @@ pub(crate) fn cat_native(tensors: &[TtTensor], dim: usize) -> Option<TtTensor> {
             })
         })
         .collect();
+    if !is_half(dtype) {
+        if let Some(t) = cat_in_layout(&pieces, dim, &out, device, dtype) {
+            return Some(t);
+        }
+    }
     let rows = (!is_half(dtype)).then(|| cat_rows(&pieces, dim)).flatten();
     let (id, dims) = match rows {
         Some(rows) => {
@@ -242,6 +247,71 @@ pub(crate) fn cat_native(tensors: &[TtTensor], dim: usize) -> Option<TtTensor> {
         dims,
         Shape::from(out),
         dtype,
+    ))
+}
+
+/// The strides a `cat` of `pieces` along `dim` keeps their layout with: the pieces' own, where
+/// every piece lays each dimension of the result alike (`dim` taken from the pieces longer than one
+/// there). `None` if they differ, or no piece says where `dim` goes.
+fn common_strides(pieces: &[Piece<'_>], dim: usize, out: &[usize]) -> Option<Vec<[usize; 2]>> {
+    let mut strides = vec![None; out.len()];
+    for (v, s) in pieces {
+        for k in 0..out.len() {
+            if out[k] == 1 || s[k] == 1 {
+                continue;
+            }
+            match strides[k] {
+                None => strides[k] = Some(v.strides[k]),
+                Some(t) if t == v.strides[k] => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    (0..out.len())
+        .map(|k| {
+            if out[k] == 1 {
+                Some([0, 0])
+            } else {
+                strides[k]
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|_| dim < out.len())
+}
+
+/// A `cat` of views of one buffer laid out alike, kept in their layout: a view of a new buffer
+/// with the pieces' strides, built by whole-tile copies (`Strided::layout_moves`). RoPE's halves of
+/// heads laid along a projection's columns, swapped, are a permutation of the projection's tile
+/// columns, where the result in row-major order would move each element alone. `None` unless every
+/// output tile is one source tile.
+fn cat_in_layout(
+    pieces: &[Piece<'_>],
+    dim: usize,
+    out: &[usize],
+    device: crate::TtDevice,
+    dtype: burn_backend::DType,
+) -> Option<TtTensor> {
+    let (first, _) = *pieces.first()?;
+    if pieces
+        .iter()
+        .any(|(v, _)| v.src.buffer.id != first.src.buffer.id)
+    {
+        return None;
+    }
+    let strides = common_strides(pieces, dim, out)?;
+    let (dims, moves) = Strided::layout_moves(pieces, dim, out, &strides)?;
+    let (id, dims) = crate::server::copy_blocks(device, first.src.buffer.id, moves, dims);
+    let buffer = super::device_result_shaped(device, id, dims, Shape::new(dims), dtype);
+    let src = buffer.to_dram().clone();
+    Some(TtTensor::view(
+        Strided {
+            src,
+            base: [0, 0],
+            strides,
+        },
+        Shape::from(out.to_vec()),
+        dtype,
+        device,
     ))
 }
 

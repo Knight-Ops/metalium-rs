@@ -72,8 +72,16 @@ impl Strided {
     /// Reshapes and swaps can change the stored matrix (a loss's `[n, 1]`
     /// column viewed as `[n]`) without changing a full reduction's inputs.
     pub(crate) fn covers_source(&self, shape: &[usize]) -> bool {
-        if self.base != [0, 0] || shape.len() != self.strides.len() || shape.contains(&0) {
-            return false;
+        self.base == [0, 0] && self.covered(shape) == Some(self.src_dims())
+    }
+
+    /// The `[rows, cols]` this view's elements fill from `base`, if they fill
+    /// it one to one: each dimension longer than one along a single axis of
+    /// the buffer, and along each axis the strides, smallest first, each the
+    /// extent of the ones before it (the first 1).
+    fn covered(&self, shape: &[usize]) -> Option<[usize; 2]> {
+        if shape.len() != self.strides.len() || shape.contains(&0) {
+            return None;
         }
         let mut dimensions = [Vec::new(), Vec::new()];
         for (&n, &stride) in shape.iter().zip(&self.strides) {
@@ -83,7 +91,7 @@ impl Strided {
             match stride {
                 [r, 0] if r > 0 => dimensions[0].push((r, n)),
                 [0, c] if c > 0 => dimensions[1].push((c, n)),
-                _ => return false,
+                _ => return None,
             }
         }
         let mut covered = [1, 1];
@@ -91,15 +99,26 @@ impl Strided {
             dims.sort_unstable();
             for &(stride, n) in dims.iter() {
                 if stride != covered[axis] {
-                    return false;
+                    return None;
                 }
-                let Some(extent) = covered[axis].checked_mul(n) else {
-                    return false;
-                };
-                covered[axis] = extent;
+                covered[axis] = covered[axis].checked_mul(n)?;
             }
         }
-        covered == self.src_dims()
+        Some(covered)
+    }
+
+    /// The block of its buffer this view is, if it is one the card reads
+    /// where it lies: its elements fill the `dims` block at `base` one to one
+    /// ([`Strided::covered`]), which starts on a tile and is ragged only at
+    /// the buffer's own edge ([`Strided::block_fits`]). An element-wise op
+    /// on the view is then the op on that block, in whatever order the view
+    /// names it: a gate's columns of a fused projection (`[1, 1, ff]` at
+    /// column `at`), the heads of `q` laid along a projection's row
+    /// (`[1, h, 1, d]`, `h` at a stride of `d` columns). The whole buffer at
+    /// the origin is the block [`Strided::covers_source`] asks for.
+    pub(crate) fn as_block(&self, shape: &[usize]) -> Option<[usize; 2]> {
+        let dims = self.covered(shape)?;
+        self.block_fits(self.base, dims).then_some(dims)
     }
 
     /// The element at row-major position `flat` of a tensor of `shape`.
@@ -259,6 +278,120 @@ impl Strided {
             });
         }
         Some(blocks)
+    }
+
+    /// The index of the element a layout of `strides` (a tensor of `shape`
+    /// filling a block from its origin one to one, [`Strided::covered`])
+    /// puts at `pos` of the block: along each axis, the dimensions laid
+    /// there, largest stride first.
+    fn index_at(strides: &[[usize; 2]], shape: &[usize], pos: [usize; 2]) -> Vec<usize> {
+        let mut idx = vec![0; shape.len()];
+        for (axis, &p) in pos.iter().enumerate() {
+            let mut along: Vec<(usize, usize)> = (0..shape.len())
+                .filter(|&k| shape[k] > 1 && strides[k][axis] > 0)
+                .map(|k| (strides[k][axis], k))
+                .collect();
+            along.sort_unstable_by(|a, b| b.cmp(a));
+            let mut p = p;
+            for (stride, k) in along {
+                idx[k] = p / stride;
+                p %= stride;
+            }
+        }
+        idx
+    }
+
+    /// Whole-tile moves that lay a tensor of `out` out by `strides` -- the
+    /// layout of a view, filling a new `[rows, cols]` buffer one to one
+    /// (returned with the moves) -- from `pieces`, views of one buffer
+    /// concatenated along `dim` (one piece: the tensor itself, whose strides
+    /// may be zero along dimensions it broadcasts over). Each output tile
+    /// must be one tile of the source: each of its rows a run of the
+    /// layout's innermost column dimension, read along a row of the source,
+    /// the rows the source's next ones, the block starting on a tile and
+    /// ragged only at the source's edge ([`Strided::block_fits`]). This is
+    /// how an element-wise op meets an operand in a view's own layout: RoPE's
+    /// `cos` table repeated over the heads of a projection's row, and its
+    /// halves swapped (`cat` of two views of the projection). `None` where a
+    /// tile is not one source tile (a head of 32 columns: halves of 16).
+    pub(crate) fn layout_moves(
+        pieces: &[(&Strided, &[usize])],
+        dim: usize,
+        out: &[usize],
+        strides: &[[usize; 2]],
+    ) -> Option<([usize; 2], Vec<BlockMove>)> {
+        let first = pieces.first()?.0;
+        let layout = Strided {
+            src: first.src.clone(),
+            base: [0, 0],
+            strides: strides.to_vec(),
+        };
+        let [rows, cols] = layout.covered(out)?;
+        if pieces.iter().any(|(v, s)| {
+            v.src.buffer.id != first.src.buffer.id || v.src.transposed || s.len() != out.len()
+        }) {
+            return None;
+        }
+        // The extent of the innermost dimension along the columns: a tile row
+        // must not carry out of it, so that it is one run of the pieces.
+        let run = (0..out.len())
+            .find(|&k| out[k] > 1 && strides[k] == [0, 1])
+            .map_or(1, |k| out[k]);
+        // The piece holding `idx` and the element there, in its buffer.
+        let source = |mut idx: Vec<usize>| -> Option<(usize, [usize; 2])> {
+            for (p, (v, s)) in pieces.iter().enumerate() {
+                if idx[dim] < s[dim] {
+                    let flat = idx.iter().zip(*s).fold(0, |n, (&i, &d)| n * d + i);
+                    return Some((p, v.at(s, flat)));
+                }
+                idx[dim] -= s[dim];
+            }
+            None
+        };
+        let mut moves: Vec<BlockMove> = Vec::new();
+        for ti in 0..rows.div_ceil(32) {
+            let rr = (rows - ti * 32).min(32);
+            for tj in 0..cols.div_ceil(32) {
+                let cc = (cols - tj * 32).min(32);
+                if (tj * 32) % run + cc > run {
+                    return None;
+                }
+                let at = |a: usize, c: usize| {
+                    source(Self::index_at(strides, out, [ti * 32 + a, tj * 32 + c]))
+                };
+                let (piece, s0) = at(0, 0)?;
+                for a in 0..rr {
+                    let want = [s0[0] + a, s0[1]];
+                    if at(a, 0)? != (piece, want)
+                        || at(a, cc - 1)? != (piece, [want[0], want[1] + cc - 1])
+                    {
+                        return None;
+                    }
+                }
+                if !first.block_fits(s0, [rr, cc]) {
+                    return None;
+                }
+                // A tile next to the last one in the source too extends its move.
+                match moves.last_mut() {
+                    Some(m)
+                        if m.to[0] == ti * 32
+                            && m.extent[0] == rr
+                            && m.to[1] + m.extent[1] == tj * 32
+                            && m.from[0] == s0[0]
+                            && m.from[1] + m.extent[1] == s0[1] =>
+                    {
+                        m.extent[1] += cc;
+                    }
+                    _ => moves.push(BlockMove {
+                        from: s0,
+                        to: [ti * 32, tj * 32],
+                        extent: [rr, cc],
+                        transposed: false,
+                    }),
+                }
+            }
+        }
+        Some(([rows, cols], moves))
     }
 
     /// Whole-tile moves that build the plain matrix of a tensor of `to`

@@ -62,9 +62,9 @@ pub use report::{
     strictly, with_report, OpStat, Report, ServerStat,
 };
 pub use server::{
-    attach, device_traffic, mesh_execution, AttachGuard, BufferId, DramBuffers, Elem, Engine,
-    GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload, PowArg, Serve,
-    SortedBuffers, TraceRun,
+    attach, device_traffic, mesh_execution, AttachGuard, BlockArg, BufferId, DramBuffers, Elem,
+    Engine, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload,
+    PowArg, Serve, SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;
@@ -78,8 +78,12 @@ pub use trace::{
 #[cfg(feature = "fusion")]
 pub type Tt = burn_fusion::Fusion<TtBackend>;
 #[cfg(feature = "fusion")]
+#[doc(hidden)]
+pub use fusion::resolve_int_tensor;
+#[cfg(feature = "fusion")]
 pub use fusion::{
-    fused_add_relu_count, fused_relu_count, reset_fusion_counters, resolve_float_tensor,
+    fused_add_relu_count, fused_count, fused_relu_count, reset_fusion_counters,
+    resolve_float_tensor,
 };
 #[cfg(not(feature = "fusion"))]
 pub type Tt = TtBackend;

@@ -64,6 +64,11 @@ enum FuserState {
 
 impl OperationFuser<TtOptimization> for ElementWiseFuser {
     fn fuse(&mut self, operation: &OperationIr) {
+        // burn-fusion keeps offering a block's operations while any other fuser is open; a
+        // match (or a miss) is final, so a later operation must not undo it.
+        if matches!(self.status(), FuserStatus::Closed) {
+            return;
+        }
         match operation {
             OperationIr::NumericFloat(
                 _dtype,
@@ -285,4 +290,69 @@ fn with_ids(ids: &[u64], scalar: &ScalarIr) -> Vec<u64> {
     let mut ids = ids.to_vec();
     ids.extend(zero_scalar_ids(scalar).unwrap_or_default());
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_backend::{DType, Shape};
+    use burn_ir::{FloatOperationIr, TensorId, TensorStatus, UnaryOpIr};
+
+    fn t(id: u64, status: TensorStatus) -> TensorIr {
+        TensorIr {
+            id: TensorId::new(id),
+            shape: Shape::from(vec![4]),
+            status,
+            dtype: DType::F32,
+        }
+    }
+
+    /// burn-fusion offers a block's later operations to a fuser that has closed while another
+    /// fuser is still open; a matched relu must stay matched.
+    #[test]
+    fn a_match_survives_the_operations_after_it() {
+        use TensorStatus::{NotInit, ReadOnly, ReadWrite};
+        let mut f = ElementWiseFuser::default();
+        let ops = [
+            OperationIr::NumericFloat(
+                DType::F32,
+                NumericOperationIr::Add(BinaryOpIr {
+                    lhs: t(1, ReadWrite),
+                    rhs: t(2, ReadWrite),
+                    out: t(3, NotInit),
+                }),
+            ),
+            OperationIr::NumericFloat(
+                DType::F32,
+                NumericOperationIr::LowerEqualElem(ScalarOpIr {
+                    lhs: t(3, ReadOnly),
+                    rhs: ScalarIr::UInt(0),
+                    out: t(4, NotInit),
+                }),
+            ),
+            OperationIr::BaseFloat(BaseOperationIr::MaskFill(MaskFillOpIr {
+                tensor: t(3, ReadWrite),
+                mask: t(4, ReadWrite),
+                value: ScalarIr::UInt(1),
+                out: t(5, NotInit),
+            })),
+        ];
+        for op in &ops {
+            f.fuse(op);
+        }
+        assert!(f.properties().ready);
+        f.fuse(&OperationIr::Float(
+            DType::F32,
+            FloatOperationIr::Exp(UnaryOpIr {
+                input: t(5, ReadWrite),
+                out: t(6, NotInit),
+            }),
+        ));
+        assert!(f.properties().ready);
+        assert_eq!(f.len(), 3);
+        assert!(matches!(
+            f.finish(),
+            TtOptimization::AddRelu { num_ops: 3, .. }
+        ));
+    }
 }

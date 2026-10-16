@@ -360,6 +360,11 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// Each row's `sqrt(mean(a a) + eps)`, `[rows, 1]`, left on the device
+    /// (`tt_kernels::session::Session::rms`).
+    fn rms(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
     /// keeps `a` alive while the view is.
     fn slice_rows(
@@ -395,6 +400,18 @@ pub trait Engine {
             return Err(unsupported());
         }
         self.eltwise(op.kind, op.scalar, a, b)
+    }
+    /// [`Engine::eltwise_op`] over blocks of resident F32 buffers
+    /// (`Session::eltwise_blocks`): each operand read where it lies, the
+    /// result a new buffer of `a`'s block's dims.
+    fn eltwise_blocks(
+        &mut self,
+        _op: tt_kernels::tensor::Eltwise,
+        _a: BlockArg,
+        _b: Option<BlockArg>,
+        _c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
     }
     /// `x^y` as `powf` (`tt_kernels::session::Session::pow`), result on the
     /// device.
@@ -1514,6 +1531,30 @@ impl DramBuffers {
         Ok((self.next, dims))
     }
 
+    pub fn eltwise_blocks<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let block = |x: BlockArg| -> Result<tt_kernels::tensor::BlockOperand<'_>, TtError> {
+            Ok(tt_kernels::tensor::BlockOperand {
+                tensor: self.get(x.id)?,
+                at: x.at,
+                dims: x.dims,
+            })
+        };
+        let (ta, tb, tc) = (
+            block(a)?,
+            b.map(block).transpose()?,
+            c.map(block).transpose()?,
+        );
+        let out = s.eltwise_blocks(op, ta, tb, tc).map_err(TtError::from)?;
+        Ok(self.insert(out))
+    }
+
     pub fn sum_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1533,6 +1574,17 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
         let c = s.reduce(&ta, op, axis).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn rms<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let c = s.rms(&ta, eps).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -2735,6 +2787,43 @@ pub(crate) fn eltwise_op(
     )
 }
 
+/// A block of a resident buffer, as [`Engine::eltwise_blocks`] reads it: the
+/// `dims` elements whose top-left is `at` (a tile boundary; ragged only at
+/// the buffer's own edge).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockArg {
+    pub id: BufferId,
+    pub at: [usize; 2],
+    pub dims: [usize; 2],
+}
+
+/// [`eltwise_op`] over blocks of resident buffers, without waiting: the
+/// result is `a`'s block's dims.
+pub(crate) fn eltwise_blocks(
+    device: TtDevice,
+    op: tt_kernels::tensor::Eltwise,
+    a: BlockArg,
+    b: Option<BlockArg>,
+    c: Option<BlockArg>,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "eltwise",
+        device,
+        a.dims,
+        move || format!("element-wise {:#x} on blocks", op.kind),
+        move |engine, ids| {
+            let get = |x: BlockArg| -> Result<BlockArg, TtError> {
+                Ok(BlockArg {
+                    id: ids.get(x.id)?,
+                    ..x
+                })
+            };
+            let (b, c) = (b.map(get).transpose()?, c.map(get).transpose()?);
+            engine.eltwise_blocks(op, get(a)?, b, c)
+        },
+    )
+}
+
 /// `x^y` on the device, without waiting: `x`'s shape.
 pub(crate) fn pow(device: TtDevice, x: BufferId, y: PowArg) -> (BufferId, [usize; 2]) {
     submit(
@@ -2773,6 +2862,19 @@ pub(crate) fn reduce(
         dims,
         move || format!("{op:?} over {axis:?}"),
         move |engine, ids| engine.reduce(ids.get(a)?, op, axis),
+    )
+}
+
+/// RMSNorm's statistic on the device, without waiting: each row's `sqrt(mean(a a) + eps)`,
+/// `[rows, 1]`. The caller has checked the row fits one job (`tt_kernels::sfpu::norm::fits`).
+pub(crate) fn rms(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
+    let [r, _] = dims_of(a);
+    submit(
+        "rms",
+        device,
+        [r, 1],
+        move || format!("eps {eps:e}"),
+        move |engine, ids| engine.rms(ids.get(a)?, eps),
     )
 }
 
@@ -3309,6 +3411,16 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_op(&mut self.session, op, a, b, c)
     }
+    fn eltwise_blocks(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_blocks(&mut self.session, op, a, b, c)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.pow(&mut self.session, x, y)
@@ -3325,6 +3437,10 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.reduce(&mut self.session, a, op, axis)
+    }
+    fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rms(&mut self.session, a, eps)
     }
     fn scan(
         &mut self,
@@ -4120,6 +4236,16 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let bufs = &mut self.buffers;
         bufs.eltwise_op(self.fabric.chips[0].session(), op, a, b, c)
     }
+    fn eltwise_blocks(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.eltwise_blocks(self.fabric.chips[0].session(), op, a, b, c)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.pow(self.fabric.chips[0].session(), x, y)
@@ -4136,6 +4262,10 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.reduce(self.fabric.chips[0].session(), a, op, axis)
+    }
+    fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rms(self.fabric.chips[0].session(), a, eps)
     }
     fn scan(
         &mut self,

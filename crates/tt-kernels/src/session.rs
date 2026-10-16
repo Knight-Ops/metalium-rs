@@ -4433,6 +4433,38 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// [`Session::eltwise3`] over blocks of resident tensors
+    /// ([`tensor::sfpu_eltwise_blocks`]): each operand read where it lies, at
+    /// its parent's row stride, the result a new tensor of `a`'s block's dims.
+    pub fn eltwise_blocks(
+        &mut self,
+        op: tensor::Eltwise,
+        a: tensor::BlockOperand<'_>,
+        b: Option<tensor::BlockOperand<'_>>,
+        c: Option<tensor::BlockOperand<'_>>,
+    ) -> Result<DramTensor, TensorError> {
+        use tensor::OpPadding;
+        let op = op.in_mode(self.math);
+        let tiles = |x: &tensor::BlockOperand<'_>| x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
+        let units = self.spread_for(tiles(&a).max(b.as_ref().map_or(0, tiles)));
+        let overlap = self.overlap();
+        let alloc = &mut self.dram_state()?.alloc;
+        let Some(work) = tensor::sfpu_eltwise_blocks(alloc, op, a, b, c, units, overlap)? else {
+            return Err(TensorError::Shape(format!(
+                "element-wise {:#x} on blocks: no SFPU program computes it",
+                op.kind
+            )));
+        };
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
+        let shapes: Vec<DramTensor> = [Some(a), b, c]
+            .into_iter()
+            .flatten()
+            .map(|x| x.shape_only())
+            .collect();
+        out.set_pad(op.produces(&shapes.iter().collect::<Vec<_>>()));
+        Ok(out)
+    }
+
     /// `x^y` as `powf` (S4, 10.2d): `e^(y ln|x|)` and the special values, one
     /// SFPU op (`POW`, `POW_S`, `POW_I`); within `sfpu::ops::pow_bound`. `y`
     /// the same shape as `x`, a scalar, or an `I32` tensor (`as f32` in the
@@ -5069,6 +5101,16 @@ impl<T: Transport> Session<T> {
         let units = self.spread_for(tiles_of(a));
         let overlap = self.overlap();
         let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, overlap)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`: RMSNorm's statistic,
+    /// one job a tile row (`tensor::sfpu_rms`), bit for bit the ops it replaces.
+    pub fn rms(&mut self, a: &DramTensor, eps: f32) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(a.grid()[0]);
+        let work = tensor::sfpu_rms(&mut self.dram_state()?.alloc, a, eps)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)

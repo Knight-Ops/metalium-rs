@@ -4,6 +4,15 @@ This plan defines the concrete specification, architecture, and verification che
 
 It tracks milestones **B12** and **B13a–B13c** from [`burn-backend-parity.md`](burn-backend-parity.md).
 
+**Decision (2026-10-16): fusion lives in burn-fusion fusers.** The alternative was model-level fused ops in tt-models.
+Fusers are the end state, reliable and benefiting any model that runs on TT through Burn. Individual ops are still
+optimised as far as they go, since every fuser falls back to them. Evidence:
+[decode-small-ops.md](decode-small-ops.md) F0.
+- A decode step on `Fusion<TtBackend>` captures and replays (gate `step193`), and fuses nothing yet.
+- It costs +1.5 / +2.2 ms a step (135M / 1.7B), because burn-fusion 0.21 expands `sigmoid` into Burn's 8-op
+  composition.
+- RMSNorm's and SiLU's ops are contiguous in the stream, with scalars bound at execution.
+
 Current BFP contract (2026-10-06): `StorageBackend` also supports
 `Fusion<TtBackend>`. Explicit casts resolve pending work and register a new
 handle, preserving compression boundaries. Compressed add/ReLU executes its
@@ -205,6 +214,21 @@ flowchart TD
 - [x] Add backend execution path in `crates/burn-tt/src/ops.rs` (`float_add_relu`).
 - [x] Support Traced Execution + Kernel Fusion simultaneously in `burn_tt::Trace` and `crates/tt-mnist`.
 - [x] Validate on silicon hardware across both Blackhole devices (`compare_all_four_execution_modes_latency_and_traffic`).
+- [x] **Burn's default `sigmoid` composition** (cast, `x -1`, `exp`, `+1`, `log`, `x -1`, `exp`, cast) runs the
+  native `SIGMOID` (2026-10-16, `fusion/chain.rs`). Decode on `Tt` is `TtBackend`'s bit for bit.
+  - **How:** `ChainFuser` matches a declarative pattern (`Pattern`: steps and the step counts where it may end).
+    - Every intermediate must die inside the match (read `ReadWrite`, or dropped).
+    - Exact scalars (`-1`, `1`) are checked at execution; a miss runs the operations.
+    - The casts are required, so a hand-written chain stays as written.
+    - A chain may begin one op into its block when that op is one `ElementWiseFuser` stays open on (an `Add`); the
+      op runs first as itself. Passing over any other op broke `add_relu`: it kept a matmul's block open over the
+      bias `Add` that must begin one.
+  - **Gate:** `step194` (bit for bit `TtBackend::sigmoid` over special values; near misses: `+2`, a kept `exp(-x)`,
+    no casts) and `step193` (a decode step's logits equal `TtBackend`'s).
+  - **Fixed on the way:** `ElementWiseFuser` lost its match to any later op while another fuser kept the block open.
+- [x] **SiLU** (`x sigmoid(x) y`, decode-small-ops S2b) as one SFPU body (`SILU_MUL`, `SILU`), bit for bit the
+  three ops (unit gate `sfpu::ops::silu`; `step194`, a fused projection's halves read in place). BF16 and the
+  matrix element-wise mode run the separate ops.
 - [ ] Define `SfpuMicroOp` instruction enum and parameterized execution kernel in `tt_kernels::sfpu`.
 - [ ] Implement greedy virtual register allocator (`L0..L7`) with 8-register budget splitting.
 - [ ] Generalize `ElementWiseFuser` to emit arbitrary micro-op bytecode chains.
@@ -217,7 +241,17 @@ flowchart TD
 - [ ] Measure throughput and memory bandwidth savings in benchmark suite.
 
 ### Phase 4: Reduce-Map Normalization Fuser (B13d)
-- [ ] Implement `ReduceMapFuser` in `crates/burn-tt/src/fusion/reduce.rs`.
-- [ ] Add L1 circular-buffer streaming path for multi-tile row reductions.
-- [ ] Verify fused RMSNorm and LayerNorm against unfused baseline in `step70_native_norms`.
+- [x] RMSNorm up to its scale as two ops (2026-10-16): the chain fuser's `RMS_NORM` pattern (`Mul(x, x)`,
+  `MeanDim` of the last dimension, `AddScalar(eps)`, `Sqrt`, `Div`).
+  - **The statistic** runs as one reduction kernel (`tt_kernels::sfpu::norm`, `Session::rms`, one job a tile row):
+    the sum of squares in `sum_dim`'s order, then `MUL_SCALAR`, `ADD_SCALAR` and `SQRT`'s bodies before the pack.
+  - **The division** is the existing multi-unit `DIV`.
+  - Bit for bit the five ops (unit gate `sfpu::norm`, with a reversed-order control; `step195`; `step193`).
+  - **Measured:** a single-kernel version that also divided cost 640 us a norm on silicon. `DIV`'s instructions are
+    pushed one by one, all on one unit. A reduce-map whose map is long must spread its map over the units.
+  - **The scale is not in it:** its `Reshape` is a block of its own in burn-fusion, and the product joins neither
+    (observed).
+  - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
+- [ ] LayerNorm and softmax as reduce-maps.
+- [ ] Add L1 circular-buffer streaming path for rows too long for one job.
 - [ ] Benchmark fused transformer encoder layer in `step59_burn_transformer`.

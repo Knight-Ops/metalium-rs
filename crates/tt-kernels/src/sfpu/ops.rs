@@ -230,6 +230,11 @@ pub mod kind_sfpu {
     pub const INT_LE_S: u32 = 0x18d;
     /// `relu(a + b)`: compound fused addition and ReLU in one SFPU pass.
     pub const ADD_RELU: u32 = 0x1f0;
+    /// `x * sigmoid(x)`: Burn's `silu`, as `SIGMOID` then `MUL(x, s)` compute it, in one pass
+    /// (the same instructions, the sigmoid kept in a register: bit for bit the two ops).
+    pub const SILU: u32 = 0x1f1;
+    /// `silu(x) * y`: `SILU` then `MUL(t, y)`, in one pass, bit for bit the three ops.
+    pub const SILU_MUL: u32 = 0x1f2;
     /// End of the original contiguous activation range. Additional kinds
     /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
@@ -347,6 +352,8 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::SQRT..=kind_sfpu::POW_I
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
+        | kind_sfpu::SILU
+        | kind_sfpu::SILU_MUL
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
@@ -2365,6 +2372,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::SIGMOID_BACKWARD
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::LOG_SIGMOID_BACKWARD
+        | kind_sfpu::SILU_MUL
         | kind_sfpu::ATAN2 => Operands::Binary,
         kind_sfpu::MASK_WHERE | kind_sfpu::INT_MASK_WHERE | kind_sfpu::BOOL_MASK_WHERE => {
             Operands::Ternary
@@ -2390,6 +2398,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::INT_ABS
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
+        | kind_sfpu::SILU
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
@@ -3190,6 +3199,30 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             });
             Operands::Unary
         }
+        // `SIGMOID`'s program, then `MUL`'s `x * s` (`SFPMAD(x, s, -0)`, the
+        // operands in `MUL`'s order), and for `SILU_MUL` `MUL`'s `t * y`. The
+        // sigmoid and the product stay in registers where the separate ops
+        // store and reload them as FP32: neither is ever a denormal (every
+        // `SFPMAD` result is flushed, and sigmoid's other results are 0.5 or a
+        // NaN), so the store would change no bit.
+        kind_sfpu::SILU | kind_sfpu::SILU_MUL => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                sigmoid_program(p, super::kernel::SPILL_ROW + o);
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.mul(LReg::L0, LReg::L7, LReg::L2);
+                if kind == kind_sfpu::SILU_MUL {
+                    p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                    p.mul(LReg::L2, LReg::L1, LReg::L2);
+                }
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            if kind == kind_sfpu::SILU {
+                Operands::Unary
+            } else {
+                Operands::Binary
+            }
+        }
         // Flex's `g * s * (1 - s)`, left to right: three roundings, as here.
         kind_sfpu::SIGMOID_BACKWARD => {
             p.for_each_row_group(64, |p, o| {
@@ -3624,6 +3657,8 @@ mod fit {
         for k in [
             kind::ADD,
             kind_sfpu::ADD_RELU,
+            kind_sfpu::SILU,
+            kind_sfpu::SILU_MUL,
             kind::SUB,
             kind::MUL,
             kind::MUL_SCALAR,
@@ -5307,6 +5342,84 @@ mod intbool {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod silu {
+    use super::*;
+
+    /// A tile of every special value (signed zeros, subnormals, infinities, NaN payloads,
+    /// `±f32::MAX`, sigmoid's saturation edges) among ordinary values in `[-24, 24)`.
+    fn tile(seed: u32) -> Vec<f32> {
+        const SPECIAL: [u32; 16] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x0080_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7fc1_2345,
+            0xffc0_0001,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+            0x42b0_0000,
+            0xc2b0_0000,
+            0x42c8_0000,
+            0xc2c8_0000,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 7 == 0 {
+                    f32::from_bits(SPECIAL[(s >> 8) as usize % SPECIAL.len()])
+                } else {
+                    (s >> 8) as f32 / (1u32 << 24) as f32 * 48.0 - 24.0
+                }
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// `SILU` and `SILU_MUL` are `SIGMOID`, `MUL(x, s)` and `MUL(t, y)` run one by one, bit for
+    /// bit, as the programs run on the specification's functional model.
+    #[test]
+    fn the_fused_programs_are_the_separate_ops_bit_for_bit() {
+        let one = |kind: u32, a: &[f32], b: Option<&[f32]>| reference(kind, 0.0, a, b, 32, 32);
+        for seed in [1, 2, 3] {
+            let (x, y) = (tile(seed), tile(seed + 100));
+            let s = one(kind_sfpu::SIGMOID, &x, None);
+            let t = one(kind::MUL, &x, Some(&s));
+            let want = one(kind::MUL, &t, Some(&y));
+            assert_eq!(
+                bits(&one(kind_sfpu::SILU, &x, None)),
+                bits(&t),
+                "silu, seed {seed}"
+            );
+            assert_eq!(
+                bits(&one(kind_sfpu::SILU_MUL, &x, Some(&y))),
+                bits(&want),
+                "silu_mul, seed {seed}"
+            );
+            // Control: the comparison sees a product's rounding. `(x y) s`, the same three
+            // factors associated otherwise, differs somewhere.
+            let other = one(kind::MUL, &one(kind::MUL, &x, Some(&y)), Some(&s));
+            let differ = bits(&other)
+                .iter()
+                .zip(bits(&want))
+                .filter(|(a, b)| **a != *b)
+                .count();
+            assert!(
+                differ > 0,
+                "control, seed {seed}: (x y) s is s x y everywhere"
+            );
         }
     }
 }

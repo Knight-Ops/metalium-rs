@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Int, Tensor, TensorData, TensorPrimitive};
 use burn_tt::{
-    InputPayload, OutputPayload, SharedStateTraces, TtBackend, TtDevice, TtError, TtTensor,
+    InputPayload, OutputPayload, SharedStateTraces, Tt, TtBackend, TtDevice, TtError, TtTensor,
 };
 
 /// The logits a run of next-token predictions produced.
@@ -360,11 +360,46 @@ enum Key {
     Chunk(usize),
 }
 
-fn float<const D: usize>(t: Tensor<TtBackend, D>) -> TtTensor {
+/// A backend whose steps a [`TracedGenerator`] captures: `TtBackend`, and `burn_tt::Tt` (burn-fusion
+/// over it), whose tensors resolve to the device's own. Resolving inside a capture runs what the
+/// fusion stream holds, so the trace records it.
+pub trait TracedBackend: Backend<Device = TtDevice> {
+    /// The device tensor of a float primitive.
+    fn float_native(t: Self::FloatTensorPrimitive) -> TtTensor;
+    /// The device tensor of an int primitive.
+    fn int_native(t: Self::IntTensorPrimitive) -> TtTensor;
+}
+
+impl TracedBackend for TtBackend {
+    fn float_native(t: TtTensor) -> TtTensor {
+        t
+    }
+    fn int_native(t: TtTensor) -> TtTensor {
+        t
+    }
+}
+
+impl TracedBackend for Tt {
+    fn float_native(t: Self::FloatTensorPrimitive) -> TtTensor {
+        burn_tt::resolve_float_tensor(&t)
+    }
+    fn int_native(t: Self::IntTensorPrimitive) -> TtTensor {
+        burn_tt::resolve_int_tensor(&t)
+    }
+}
+
+fn float<B: TracedBackend, const D: usize>(t: Tensor<B, D>) -> TtTensor {
     match t.into_primitive() {
-        TensorPrimitive::Float(t) => t,
+        TensorPrimitive::Float(t) => B::float_native(t),
         TensorPrimitive::QFloat(_) => unreachable!("a quantised tensor is not a step's output"),
     }
+}
+
+/// A trace input made on `B`, resident, as the device tensor the trace reads.
+fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
+    let t = B::int_native(t.clone().into_primitive());
+    t.ensure_resident();
+    t
 }
 
 fn logits(out: Vec<OutputPayload>) -> Result<Vec<f32>, GenerateError> {
@@ -383,7 +418,11 @@ fn logits(out: Vec<OutputPayload>) -> Result<Vec<f32>, GenerateError> {
 /// cache (`burn_tt::SharedStateTraces`), so the sizes a model can keep together are bounded by it
 /// (`footprint`). A capture runs its step once and writes the cache, which a generation never
 /// relies on: every position it reads was written by its own prompt or steps first.
-pub struct TracedGenerator<'m, M: FixedShapeDecoder<TtBackend>> {
+///
+/// `B` is the backend the model runs on while it is captured: `burn_tt::Tt` (the default, whose
+/// fusion stream each capture runs to its end before the capture closes, and whose fusers make the
+/// step `TtBackend`'s bit for bit or faster), or `TtBackend`.
+pub struct TracedGenerator<'m, M: FixedShapeDecoder<B>, B: TracedBackend = Tt> {
     model: &'m M,
     shapes: Shapes,
     /// The caches the traces read and write: one, or two for
@@ -394,7 +433,7 @@ pub struct TracedGenerator<'m, M: FixedShapeDecoder<TtBackend>> {
     prefill: usize,
 }
 
-impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
+impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
     /// Capture `model`'s step at each length and a chunk of each size `shapes` names, over one
     /// cache on `device`. The cache's state must be F32: a packed one would be unpacked by each
     /// replay's write-back.
@@ -460,14 +499,9 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
 
         let cache = &caches[0];
         for &len in &shapes.steps {
-            let token = ids::<TtBackend>(&[0], device);
-            let position = index::<TtBackend>(0, device);
-            let (tp, pp) = (
-                token.clone().into_primitive(),
-                position.clone().into_primitive(),
-            );
-            tp.ensure_resident();
-            pp.ensure_resident();
+            let token = ids::<B>(&[0], device);
+            let position = index::<B>(0, device);
+            let (tp, pp) = (input(&token), input(&position));
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
                 let (y, state) = model.step(token, position, len, cache);
                 (vec![float(y)], state.into_iter().map(float).collect())
@@ -477,17 +511,10 @@ impl<'m, M: FixedShapeDecoder<TtBackend>> TracedGenerator<'m, M> {
         let prefill = caches.len() - 1;
         let cache = &caches[prefill];
         for &c in &shapes.chunks {
-            let tokens = ids::<TtBackend>(&vec![0; c], device);
-            let start = index::<TtBackend>(0, device);
-            let last = index::<TtBackend>(0, device);
-            let (tp, sp, lp) = (
-                tokens.clone().into_primitive(),
-                start.clone().into_primitive(),
-                last.clone().into_primitive(),
-            );
-            for p in [&tp, &sp, &lp] {
-                p.ensure_resident();
-            }
+            let tokens = ids::<B>(&vec![0; c], device);
+            let start = index::<B>(0, device);
+            let last = index::<B>(0, device);
+            let (tp, sp, lp) = (input(&tokens), input(&start), input(&last));
             sets[prefill].capture(Key::Chunk(c), &[&tp, &sp, &lp], || {
                 let (y, state) = model.chunk(tokens, start, last, cache);
                 (vec![float(y)], state.into_iter().map(float).collect())

@@ -1416,113 +1416,221 @@ fn device_op_ungated(
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
 }
 
-/// `t`'s view if it is one that covers its buffer one to one (`base` at the
-/// origin, each element a different buffer element, every one of them
-/// named): an element-wise op on it is the op on the buffer, whatever order
-/// the view reads it in. A convolution's NHWC output viewed as NCHW is one.
-fn covering_view(t: &TtTensor) -> Option<crate::views::Strided> {
+/// `t`'s view and the block of its buffer it is, if it is one the card reads
+/// where it lies (`Strided::as_block`: each element a different element of
+/// a block on tile boundaries, every one of them named): an element-wise op
+/// on it is the op on that block, whatever order the view reads it in. A
+/// convolution's NHWC output viewed as NCHW is one (the whole buffer), and so
+/// is a gate's columns of a fused projection, or the heads of `q` along its
+/// row.
+fn block_view(t: &TtTensor) -> Option<(crate::views::Strided, [usize; 2])> {
     if !t.is_view() {
         return None;
     }
     let v = t.as_strided()?;
-    (!v.src.transposed
-        && v.src.buffer.storage == crate::storage::StorageFormat::F32
-        && v.covers_source(&t.shape().to_vec()))
-    .then_some(v)
+    if v.src.transposed || v.src.buffer.storage != crate::storage::StorageFormat::F32 {
+        return None;
+    }
+    let dims = v.as_block(&t.shape().to_vec())?;
+    Some((v, dims))
 }
 
-/// An element-wise op on a covering view ([`covering_view`]) run on its
-/// buffer, the result a view of the output buffer with the same strides: no
-/// datum moves to put the view in row-major order first. Every other operand
-/// is a view of the same layout (the same strides on each dimension longer
-/// than one, a buffer of the same dimensions), or broadcasts as one row or
-/// one column of the buffer: its dimensions longer than one are exactly
-/// those the view lays along the buffer's columns (or rows), in the order the
-/// view lays them -- a BatchNorm's `[1, C, 1, 1]` against an NHWC activation
-/// is a row of `C`. `None` for anything else (the caller materialises the
-/// view).
+/// `x` broadcast to `shape` and laid out as `strides` lay a tensor of
+/// `shape` out (a view's layout, filling a block one to one): a view of a new
+/// buffer, built by whole-tile copies of `x` (`Strided::layout_moves`), and
+/// kept beside `x` ([`TtTensor::derived`]) for every op that meets it in the
+/// same layout. RoPE's `[1, 1, t, d]` table against heads laid along a
+/// projection's columns is `h` copies of each of its tiles. `None` where the
+/// tiles do not line up (a dimension of 16 columns) or `x` is not F32.
+fn relaid(x: &TtTensor, shape: &[usize], strides: &[[usize; 2]]) -> Option<TtTensor> {
+    let sx = x.shape().to_vec();
+    if sx.len() > shape.len() || x.dtype() != DType::F32 {
+        return None;
+    }
+    let src = match x.as_strided() {
+        Some(v) => v,
+        None => crate::views::Strided::of(&plain_dram(x), &sx),
+    };
+    if src.src.transposed || src.src.buffer.storage != crate::storage::StorageFormat::F32 {
+        return None;
+    }
+    let lead = shape.len() - sx.len();
+    let expanded = crate::views::Strided {
+        strides: (0..shape.len())
+            .map(|k| {
+                if k < lead || sx[k - lead] == 1 {
+                    [0, 0]
+                } else {
+                    src.strides[k - lead]
+                }
+            })
+            .collect(),
+        ..src.clone()
+    };
+    let (dims, moves) =
+        crate::views::Strided::layout_moves(&[(&expanded, shape)], 0, shape, strides)?;
+    let key = format!("laid out as {shape:?} {strides:?}");
+    let (device, shape, strides) = (
+        x.device,
+        burn_backend::Shape::from(shape.to_vec()),
+        strides.to_vec(),
+    );
+    Some(x.derived(key, move |_| {
+        let (id, dims) = crate::server::copy_blocks(device, src.src.buffer.id, moves, dims);
+        let out = device_view(device, id, dims, None, DType::F32)
+            .to_dram()
+            .clone();
+        TtTensor::view(
+            crate::views::Strided {
+                src: out,
+                base: [0, 0],
+                strides,
+            },
+            shape,
+            DType::F32,
+            device,
+        )
+    }))
+}
+
+/// An element-wise op on a block view ([`block_view`]) run on that block of
+/// its buffer, the result a view of the output buffer with the same strides:
+/// no datum moves to put the view in row-major order first. Every other
+/// operand of the same shape is laid out alike -- a block view, or a plain
+/// tensor, of the same block dimensions and the same strides on each
+/// dimension longer than one (a gate's columns times the plain
+/// `sigmoid` of them) -- or broadcasts as one row or one column of the block:
+/// its dimensions longer than one are exactly those the view lays along the
+/// block's columns (or rows), in the order the view lays them -- a
+/// BatchNorm's `[1, C, 1, 1]` against an NHWC activation is a row of `C`.
+/// Operands that are whole buffers run as any element-wise op does; a block
+/// inside a buffer is read where it lies (`server::eltwise_blocks`), except
+/// in the matrix element-wise mode, which reads whole buffers. `None` for
+/// anything else (the caller materialises the view).
 fn view_op(
     op: tt_kernels::tensor::Eltwise,
     a: &TtTensor,
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
+    use crate::server::BlockArg;
     use tt_kernels::kind as k;
     let kind = op.kind;
-    let (a, b) = match (covering_view(a), b) {
-        (Some(_), _) => (a, b),
-        // A commuting op with the view on the right.
-        (None, Some(rhs)) if c.is_none() && matches!(kind, k::ADD | k::MUL) => {
-            covering_view(rhs)?;
-            (rhs, Some(a))
+    let (a, b, (v, [rows, cols])) = if let Some(l) = block_view(a) {
+        (a, b, l)
+    } else {
+        let rhs = b?;
+        let l = block_view(rhs)?;
+        if rhs.shape() == a.shape() {
+            (a, b, l)
+        } else if c.is_none() && matches!(kind, k::ADD | k::MUL) {
+            // A commuting op with the view on the right.
+            (rhs, Some(a), l)
+        } else {
+            return None;
         }
-        _ => return None,
     };
-    let v = covering_view(a)?;
     let sa = a.shape().to_vec();
-    let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
     let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
-    let operand = |x: &TtTensor, broadcast: bool| -> Option<crate::tensor::DramRef> {
-        if x.device != a.device {
-            return None;
-        }
-        let sx = x.shape().to_vec();
-        if sx == sa {
-            let w = covering_view(x)?;
-            let same = [w.src.buffer.rows, w.src.buffer.cols] == [rows, cols]
-                && sa
-                    .iter()
-                    .zip(v.strides.iter().zip(&w.strides))
-                    .all(|(&n, (s, t))| n == 1 || s == t);
-            return same.then_some(w.src);
-        }
-        if !broadcast || sx.len() > sa.len() {
-            return None;
-        }
-        // `x`'s dimensions right-aligned to `a`'s: the ones longer than one
-        // must be `a`'s, and all of `a`'s along one axis of the buffer.
-        let lead = sa.len() - sx.len();
-        let long: Vec<usize> = (0..sa.len())
-            .filter(|&d| d >= lead && sx[d - lead] != 1)
-            .collect();
-        if long.iter().any(|&d| sx[d - lead] != sa[d]) {
-            return None;
-        }
-        for axis in 0..2 {
-            let along = |d: usize| v.strides[d][axis] > 0 && v.strides[d][1 - axis] == 0;
-            let spans: Vec<usize> = (0..sa.len()).filter(|&d| sa[d] > 1 && along(d)).collect();
-            if spans.is_empty() || spans != long {
-                continue;
-            }
-            // In `x`'s row-major order: the last dimension stride 1.
-            let mut stride = 1;
-            for &d in long.iter().rev() {
-                if v.strides[d][axis] != stride {
-                    return None;
-                }
-                stride *= sa[d];
-            }
-            if stride != [rows, cols][axis] {
+    // Each operand's block, whether it is its whole buffer, and the buffer,
+    // kept alive until the op is queued (a broadcast row made here has no
+    // other owner).
+    let whole = |d: crate::tensor::DramRef| {
+        let arg = BlockArg {
+            id: d.buffer.id,
+            at: [0, 0],
+            dims: [d.buffer.rows, d.buffer.cols],
+        };
+        (arg, true, d)
+    };
+    let operand =
+        |x: &TtTensor, broadcast: bool| -> Option<(BlockArg, bool, crate::tensor::DramRef)> {
+            if x.device != a.device {
                 return None;
             }
-            let dims = if axis == 1 { [1, cols] } else { [rows, 1] };
-            // Already that row (or column) of a buffer, read in order: a
-            // parameter `[C]` viewed as `[1, C, 1, 1]`.
-            if let Some(w) = x.as_strided() {
-                let n = dims[0] * dims[1];
-                if w.base == [0, 0]
-                    && !w.src.transposed
-                    && [w.src.buffer.rows, w.src.buffer.cols] == dims
-                    && (0..n).all(|f| w.at(&sx, f) == if axis == 1 { [0, f] } else { [f, 0] })
-                {
-                    return Some(w.src);
-                }
+            let sx = x.shape().to_vec();
+            if sx == sa {
+                let (w, dims) = if x.is_view() {
+                    block_view(x)?
+                } else {
+                    let d = plain_dram(x);
+                    if d.buffer.storage != crate::storage::StorageFormat::F32 {
+                        return None;
+                    }
+                    let dims = [d.buffer.rows, d.buffer.cols];
+                    (crate::views::Strided::of(&d, &sx), dims)
+                };
+                let same = dims == [rows, cols]
+                    && sa
+                        .iter()
+                        .zip(v.strides.iter().zip(&w.strides))
+                        .all(|(&n, (s, t))| n == 1 || s == t);
+                let entire = w.base == [0, 0] && dims == [w.src.buffer.rows, w.src.buffer.cols];
+                let arg = BlockArg {
+                    id: w.src.buffer.id,
+                    at: w.base,
+                    dims,
+                };
+                return same.then_some((arg, entire, w.src));
             }
-            let flat = reshaped(x.clone(), burn_backend::Shape::new(dims));
-            return Some(plain_dram(&flat));
-        }
-        None
-    };
+            if !broadcast || sx.len() > sa.len() {
+                return None;
+            }
+            // `x`'s dimensions right-aligned to `a`'s: the ones longer than one
+            // must be `a`'s, and all of `a`'s along one axis of the block.
+            let lead = sa.len() - sx.len();
+            let long: Vec<usize> = (0..sa.len())
+                .filter(|&d| d >= lead && sx[d - lead] != 1)
+                .collect();
+            if long.iter().any(|&d| sx[d - lead] != sa[d]) {
+                return None;
+            }
+            for axis in 0..2 {
+                let along = |d: usize| v.strides[d][axis] > 0 && v.strides[d][1 - axis] == 0;
+                let spans: Vec<usize> = (0..sa.len()).filter(|&d| sa[d] > 1 && along(d)).collect();
+                if spans.is_empty() || spans != long {
+                    continue;
+                }
+                // In `x`'s row-major order: the last dimension stride 1.
+                let mut stride = 1;
+                for &d in long.iter().rev() {
+                    if v.strides[d][axis] != stride {
+                        stride = 0;
+                        break;
+                    }
+                    stride *= sa[d];
+                }
+                if stride != [rows, cols][axis] {
+                    continue;
+                }
+                let dims = if axis == 1 { [1, cols] } else { [rows, 1] };
+                // Already that row (or column) of a buffer, read in order: a
+                // parameter `[C]` viewed as `[1, C, 1, 1]`.
+                if let Some(w) = x.as_strided() {
+                    let n = dims[0] * dims[1];
+                    if w.base == [0, 0]
+                        && !w.src.transposed
+                        && [w.src.buffer.rows, w.src.buffer.cols] == dims
+                        && (0..n).all(|f| w.at(&sx, f) == if axis == 1 { [0, f] } else { [f, 0] })
+                    {
+                        return Some(whole(w.src));
+                    }
+                }
+                let flat = reshaped(x.clone(), burn_backend::Shape::new(dims));
+                return Some(whole(plain_dram(&flat)));
+            }
+            // Neither: `x` laid out in the view's own layout by tile copies,
+            // kept beside it (RoPE's `cos` over a projection's heads, made
+            // once a step and read by every layer).
+            // (A plain tensor where the layout is a plain one.)
+            let laid = relaid(x, &sa, &v.strides)?;
+            let d = match block_view(&laid) {
+                Some((w, _)) => w.src,
+                None => plain_dram(&laid),
+            };
+            ([d.buffer.rows, d.buffer.cols] == [rows, cols]).then(|| whole(d))
+        };
+    let da = operand(a, false)?;
     let db = match b {
         Some(b) => Some(operand(b, broadcasts)?),
         None => None,
@@ -1532,13 +1640,22 @@ fn view_op(
         None => None,
     };
     let device = a.device;
-    let (id, dims) = crate::server::eltwise_op(
-        device,
-        op,
-        v.src.buffer.id,
-        db.as_ref().map(|d| d.buffer.id),
-        dc.as_ref().map(|d| d.buffer.id),
-    );
+    let all_whole = [Some(&da), db.as_ref(), dc.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|(_, w, _)| *w);
+    let _held = (&da.2, db.as_ref().map(|d| &d.2), dc.as_ref().map(|d| &d.2));
+    let (da, db, dc) = (da.0, db.as_ref().map(|d| d.0), dc.as_ref().map(|d| d.0));
+    let (id, dims) = if all_whole {
+        crate::server::eltwise_op(device, op, da.id, db.map(|d| d.id), dc.map(|d| d.id))
+    } else if matches!(
+        crate::server::elementwise_mode(device),
+        crate::ElementwiseMode::Matrix { .. }
+    ) {
+        return None;
+    } else {
+        crate::server::eltwise_blocks(device, op, da, db, dc)
+    };
     let sig = tt_kernels::sfpu::ops::elems(kind);
     let dtype = if sig.out == sig.inputs[0] {
         a.dtype()
@@ -1949,6 +2066,69 @@ pub mod float {
         super::activation::relu(float_add(lhs, rhs))
     }
 
+    /// `silu(x) * y` (`SILU_MUL`), or `x * sigmoid(x)` (`SILU`) without `y`, in one SFPU pass:
+    /// bit for bit `sigmoid(x)`, `float_mul(x, s)` and `float_mul(t, y)` on this backend, for
+    /// F32 operands of one shape where those run as SFPU ops (not the matrix element-wise
+    /// mode). `None` where they would not: the caller runs the separate ops, whose own paths
+    /// (widening, block-float storage, broadcasts) then apply.
+    pub fn float_silu_mul(x: &TtTensor, y: Option<&TtTensor>) -> Option<TtTensor> {
+        use tt_kernels::sfpu::ops::kind_sfpu;
+        let plain = |t: &TtTensor| {
+            t.dtype() == DType::F32 && t.storage_format() == crate::storage::StorageFormat::F32
+        };
+        if !plain(x)
+            || y.is_some_and(|y| !plain(y) || y.shape() != x.shape())
+            || matches!(
+                crate::server::elementwise_mode(x.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let kind = if y.is_some() {
+            kind_sfpu::SILU_MUL
+        } else {
+            kind_sfpu::SILU
+        };
+        device_eltwise(kind, 0.0, x, y)
+    }
+
+    /// Burn's `RmsNorm` without its scale, `x / sqrt(mean(x x) + eps)` over the last dimension,
+    /// as two ops: the statistic in one kernel (`tt_kernels::sfpu::norm`), then `float_div` by
+    /// it. Bit for bit `float_mul(x, x)`, `float_mean_dim`, `float_add_scalar(eps)`, `float_sqrt`
+    /// and `float_div` on this backend, where those run as SFPU ops on F32 (not the matrix
+    /// element-wise mode) and a row fits one job. `None` where they would not: the caller runs
+    /// the separate ops.
+    pub fn float_rms_norm(x: &TtTensor, eps: f32) -> Option<TtTensor> {
+        let shape = x.shape().to_vec();
+        let cols = *shape.last()?;
+        if x.dtype() != DType::F32
+            || x.storage_format() != crate::storage::StorageFormat::F32
+            || shape.contains(&0)
+            || !x.is_storable()
+            || !crate::server::supports_dram(x.device)
+            || matches!(
+                crate::server::elementwise_mode(x.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+            || !tt_kernels::sfpu::norm::fits(cols)
+        {
+            return None;
+        }
+        let d = plain_dram(x);
+        let (id, dims) = crate::server::rms(x.device, d.buffer.id, eps);
+        let mut shape = shape;
+        *shape.last_mut()? = 1;
+        let rms = device_result_shaped(
+            x.device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        );
+        Some(float_div(x.clone(), rms))
+    }
+
     /// `atan2(lhs, rhs)` on the device where the data is, within
     /// `ops::ATAN2_BOUND`, a denormal operand read as a zero of its sign; else
     /// Flex's. Operands of one shape only: a broadcast is refused, not sent to
@@ -2271,16 +2451,28 @@ pub mod float {
     }
 
     /// The buffer a batched matmul reads `t` from, and `t`'s block for each
-    /// index of `batch` (`Strided::matrix_blocks`).
+    /// index of `batch` (`Strided::matrix_blocks`). A view whose matrices are
+    /// not blocks of its buffer is made plain first, once: grouped-query
+    /// attention's `q`, heads laid along a projection's row and regrouped
+    /// `[kv, groups, d]`, whose groups' rows lie along the buffer's columns.
     pub(crate) fn operand_blocks(
         t: &TtTensor,
         batch: &[usize],
     ) -> Option<(crate::BufferId, Vec<crate::Block>)> {
+        let shape = t.shape().to_vec();
         let v = t.as_strided().or_else(|| {
             t.to_dram();
             t.as_strided()
         })?;
-        let blocks = v.matrix_blocks(&t.shape().to_vec(), batch)?;
+        if let Some(blocks) = v.matrix_blocks(&shape, batch) {
+            return Some((v.src.buffer.id, blocks));
+        }
+        if !t.is_view() {
+            return None;
+        }
+        t.to_dram();
+        let v = t.as_strided()?;
+        let blocks = v.matrix_blocks(&shape, batch)?;
         Some((v.src.buffer.id, blocks))
     }
 

@@ -861,11 +861,14 @@ fn smollm2_decode_with_the_embedding_lookup() {
 /// - a 32-token prompt's first 4 tokens, bit for bit against the eager fixed-shape schedule on
 ///   the card (`generate_fixed`);
 /// - every timed run produces the same tokens.
+///
+/// The model runs on `burn_tt::Tt` (burn-fusion over `TtBackend`, with its fusers) for the
+/// warm-up, the captures and the validation; `TT_GEN_FUSION=0` runs it on `TtBackend` itself,
+/// its rows named "on TtBackend" (`docs/plans/decode-small-ops.md` F0; gates
+/// `step193_fusion_decode_trace`, `step194_fused_sigmoid_silu`).
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
 fn traced_generation() {
-    use tt_models::generate::{generate_fixed, Generation, Shapes, TracedGenerator};
-    const PROMPTS: [usize; 3] = [32, 128, 256];
     let max_len: usize = std::env::var("TT_GEN_MAX_LEN")
         .map(|v| v.parse().unwrap())
         .unwrap_or(512);
@@ -886,30 +889,12 @@ fn traced_generation() {
     };
     let flex_samples = env("TT_GEN_FLEX_SAMPLES", SAMPLES);
     let new = env("TT_GEN_NEW", 64);
-    let vocab = config.vocab;
-    // Tokens a second, from a median time.
-    let median = |v: &[f64]| {
-        let mut v = v.to_vec();
-        v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
-    };
-    let prompt = |len: usize| -> Vec<i32> {
-        (0..len)
-            .map(|i| ((7 + 7919 * i + 104_729 * i * i) % vocab) as i32)
-            .collect()
-    };
-    let decode_ms = |g: &Generation| -> f64 {
-        let mut d: Vec<f64> = g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
-        d.sort_by(f64::total_cmp);
-        d[d.len() / 2]
-    };
-    let ms = |t: std::time::Duration| t.as_secs_f64() * 1e3;
     // burn-flex, eager, growing cache.
     {
         let (m, _) =
             Llama::<Flex>::pretrained(&config, &name, Precision::F32, &FlexDevice).unwrap();
-        for len in PROMPTS {
-            let p = prompt(len);
+        for len in GEN_PROMPTS {
+            let p = gen_prompt(len, config.vocab);
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
             for i in 0..WARMUPS.min(flex_samples) + flex_samples {
                 let t0 = Instant::now();
@@ -957,9 +942,81 @@ fn traced_generation() {
     let buckets: Vec<usize> = std::env::var("TT_GEN_BUCKETS")
         .map(|v| v.split(',').map(|b| b.trim().parse().unwrap()).collect())
         .unwrap_or_else(|_| vec![64, 128, 256]);
+    let run = GenRun {
+        name,
+        config,
+        max_len,
+        buckets,
+        new,
+    };
     with_device(Config::default(), |d| {
         conditions(card());
-        let (m, _) = Llama::<TtBackend>::pretrained(&config, &name, Precision::F32, &d).unwrap();
+        if std::env::var("TT_GEN_FUSION").is_ok_and(|v| v == "0") {
+            traced_generation_on::<TtBackend>(&d, &run, " on TtBackend");
+        } else {
+            traced_generation_on::<burn_tt::Tt>(&d, &run, "");
+        }
+    });
+}
+
+/// The prompt lengths [`traced_generation`] times.
+const GEN_PROMPTS: [usize; 3] = [32, 128, 256];
+
+/// What [`traced_generation`] runs: the model, the cache, the chunk sizes and the tokens a
+/// generation.
+struct GenRun {
+    name: String,
+    config: tt_models::llama::LlamaConfig,
+    max_len: usize,
+    buckets: Vec<usize>,
+    new: usize,
+}
+
+/// A prompt of `len` token ids below `vocab`.
+fn gen_prompt(len: usize, vocab: usize) -> Vec<i32> {
+    (0..len)
+        .map(|i| ((7 + 7919 * i + 104_729 * i * i) % vocab) as i32)
+        .collect()
+}
+
+/// The median of `v`.
+fn median(v: &[f64]) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// The median decode step of `g`, in ms.
+fn decode_ms(g: &tt_models::generate::Generation) -> f64 {
+    let mut d: Vec<f64> = g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
+    d.sort_by(f64::total_cmp);
+    d[d.len() / 2]
+}
+
+fn ms(t: std::time::Duration) -> f64 {
+    t.as_secs_f64() * 1e3
+}
+
+/// [`traced_generation`]'s device half, with the model on `B` while it is warmed up, captured
+/// and validated; `suffix` names `B` in the rows (empty for `TtBackend`).
+fn traced_generation_on<B: tt_models::generate::TracedBackend>(
+    d: &burn_tt::TtDevice,
+    run: &GenRun,
+    suffix: &str,
+) {
+    use tt_models::generate::{generate_fixed, Shapes, TracedGenerator};
+    let GenRun {
+        name,
+        config,
+        max_len,
+        buckets,
+        new,
+    } = run;
+    let (name, max_len, new) = (name.as_str(), *max_len, *new);
+    let prompt = |len: usize| gen_prompt(len, config.vocab);
+    {
+        let d = *d;
+        let (m, _) = Llama::<B>::pretrained(config, name, Precision::F32, &d).unwrap();
         // What a decode step reads at least: every F32 parameter once (counted before fusing, whose
         // views would count the fused matrices twice).
         let weight_bytes = burn::module::Module::num_params(&m) as f64 * 4.0;
@@ -971,7 +1028,7 @@ fn traced_generation() {
         let t0 = Instant::now();
         // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
         // for the whole cache at every step).
-        let mut shapes = Shapes::new(max_len, &buckets);
+        let mut shapes = Shapes::new(max_len, buckets);
         if let Ok(v) = std::env::var("TT_GEN_STEPS") {
             let steps: Vec<usize> = v
                 .split(',')
@@ -980,7 +1037,7 @@ fn traced_generation() {
                 .collect();
             shapes = shapes.with_steps(&steps);
         }
-        let g = match TracedGenerator::new(&m, &shapes, &d) {
+        let g = match TracedGenerator::<_, B>::new(&m, &shapes, &d) {
             Ok(g) => g,
             Err(e) => {
                 // A capture that does not fit fails the attachment for good: rerun with fewer.
@@ -989,7 +1046,7 @@ fn traced_generation() {
             }
         };
         let traces = format!(
-            "chunks {buckets:?}, steps {:?}, {max_len}-position cache",
+            "chunks {buckets:?}, steps {:?}, {max_len}-position cache{suffix}",
             shapes.steps
         );
         report(
@@ -1059,7 +1116,7 @@ fn traced_generation() {
             );
         }
         // Validation: the eager schedule on the card, bit for bit.
-        let p = prompt(PROMPTS[0]);
+        let p = prompt(GEN_PROMPTS[0]);
         let want = generate_fixed(&m, &p, 4, &shapes, &d).unwrap();
         let got = g.generate(&p, 4).unwrap();
         assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
@@ -1069,7 +1126,7 @@ fn traced_generation() {
                 "logits {i} against the eager schedule"
             );
         }
-        for len in PROMPTS {
+        for len in GEN_PROMPTS {
             let p = prompt(len);
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
             let mut tokens = None;
@@ -1127,5 +1184,5 @@ fn traced_generation() {
                 Stats::of(total),
             );
         }
-    });
+    }
 }

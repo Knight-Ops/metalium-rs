@@ -137,7 +137,7 @@ pub fn traced<'m, M: FixedShapeDecoder<TtBackend>>(
     model: &'m M,
     shapes: &Shapes,
     d: &TtDevice,
-) -> TracedGenerator<'m, M> {
+) -> TracedGenerator<'m, M, TtBackend> {
     let (g, report) = burn_tt::with_report(|| TracedGenerator::new(model, shapes, d));
     let report = burn_tt::Report(
         report
@@ -153,7 +153,7 @@ pub fn traced<'m, M: FixedShapeDecoder<TtBackend>>(
 /// A traced generation, checking that the host built no Burn op for it: what runs is replays,
 /// their inputs written and their logits read.
 pub fn generate(
-    g: &TracedGenerator<'_, impl FixedShapeDecoder<TtBackend>>,
+    g: &TracedGenerator<'_, impl FixedShapeDecoder<TtBackend>, TtBackend>,
     p: &[i32],
     steps: usize,
 ) -> Generation {

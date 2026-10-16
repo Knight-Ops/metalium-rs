@@ -1,7 +1,7 @@
 # Decode small ops
 
-Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **planned, not
-started.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
+Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
+done (2026-10-16; a 1.7B step 43.42 / 45.85 / 49.00 ms on `Tt`, run `1792186180`); S1d, S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
 [in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies).
 
 ## Why this item
@@ -78,45 +78,137 @@ A and B with numbers, then the fusions.
 
 ## Phases
 
-### S1. RoPE without element repacks (C; ~3.7 ms a 1.7B step)
+### S1. RoPE without element repacks: done (2026-10-16)
 
-- [ ] **Find what repacks.** `apply` slices `x` into halves, `cat`s them swapped, and computes `x cos + swapped sin`
-  (the sign is in `sin`'s table), with `cos` and `sin` `[1, 1, t, d]` broadcast over heads. `x` is a view (`reshape` +
-  `swap_dims` of a projection's column block). Read the labels to see which input each repack materialises.
-- [ ] **The half swap is tile-aligned for `head_dim` 64 and 128** (halves of 32 and 64 columns are whole tile columns):
-  a `cat` of whole-tile column blocks of a view should be a block copy, not an element repack. Fix it in
-  `ops/region.rs` / `cat` for any tile-aligned pieces, as a general rule.
-- [ ] **The broadcast multiply:** either a row-broadcast over heads that reads the table in place (no repack), or the
-  model building `[1, heads, t, d]` tables once a step and sharing them across layers. Prefer the backend fix; it
-  helps every model.
-- [ ] **Gates:** bit for bit (only data movement changes): `step185`, `step187`, `step191`, plus a `cat`/broadcast gate
-  on views with ragged and tile-aligned halves (`step180`'s style).
+**The premise above was wrong for decode.** In a decode step `x` is `[1, h, 1, d]` with every head in row 0 of the
+`[1, W]` projection. Laying it out as `[h, d]` moves data from one row to many rows, which no tile move does
+(`tile_moves` fails at the first tile). A tile-aligned `cat` in row-major order could therefore never be a block copy
+there.
+
+**What was built instead: RoPE runs in the projection's own layout.** Element-wise results do not depend on layout, so
+the bits are unchanged.
+- [x] **Element-wise ops on block views** (shared with S2a, below): `x cos` reads `x`'s heads where they lie.
+- [x] **The table laid over the heads.** A broadcast operand that is neither a row nor a column of the view's block is
+  relaid into the view's layout by tile copies (`ops.rs` `relaid`, `Strided::layout_moves`). It is kept beside the
+  table (`TtTensor::derived`), so it is made once a step and read by every layer.
+- [x] **The halves' `cat` as a tile permutation.** A `cat` of views of one buffer laid out alike keeps their layout and
+  is one block copy (`region::cat_in_layout`).
+- [x] **`head_dim` 32 keeps the repack** (halves of 16 columns).
+- [x] **A regrouped GQA `q` is made plain once** (`operand_blocks`). In the projection's layout, `[kv, groups, d]`'s
+  groups lie along columns and are not blocks. Without this, attention fell to Burn's composition: the 135M step went
+  23 -> 40 ms (profile `1792172763`).
+- [x] **Gates:**
+  - `step192_block_views`: RoPE against burn-flex bit for bit at `head_dim` 64 / 128 / 32, decode and prefill shapes,
+    MHA and GQA; no repack at 64 and 128; the table kept for the next layer; the GQA attention gate, watched failing
+    without the fix (6 repacks for 1).
+  - `step185`, `step187`, `step191`, `step180`, `step182`, `step183`, `step184`, `step188` (card 0 `1792170465`).
+  - Two mutations watched failing: a block read without its column offset, and a `cat` reading every piece from the
+    first.
+
+### S1d. The cache write reads its rows in place (open; ~1.8 ms a 1.7B step)
+
+The key now reaches `FixedWrite::write` in the projection's layout and repacks there (38 us a layer, 0.9 ms a step),
+as the value already did (0.9 ms). This is [in-place-cache-write.md](in-place-cache-write.md) D5's fix, for both: a
+`SCATTER_ROWS` whose value rows are read from a strided view (each head's row is a tile-aligned column block of the
+projection), or `FixedWrite` taking the rows before the head split.
 
 ### S2. SiLU and `x up` (~1.9 ms)
 
-- [ ] **S2a (C): the two block copies.** `sigmoid | block copy list` and `float_mul | block copy list`, 24 each,
-  likely materialise the fused `gate|up` product's column views (P3's split) before an element-wise op. Element-wise
-  ops run on some views in place (`ops::view_op`); make a tile-aligned column block one of them.
-- [ ] **S2b (fusion): `silu(gate) up` as one SFPU body** (`x sigmoid(x) y`, the same instructions as the three ops
-  in registers), bit for bit the composition. Through A or B per F0.
+- [x] **S2a (C): the two block copies: done (2026-10-16).** They did materialise the fused product's `gate` and `up`
+  column views. An element-wise op on a block view now reads the block where it lies (`Strided::as_block`,
+  `Session::eltwise_blocks`, `tensor::sfpu_eltwise_blocks`): each operand's tiles are read at its parent's row
+  stride, through `READ_RUN`'s grid width.
+  - Gate: `step192` `element_wise_ops_read_column_blocks_in_place` (raw bits, every special value, against the same
+    ops on plain copies; ragged at the buffer's edge; a block inside a tile still copied).
+  - `sigmoid` 1.28 -> 1.08 ms a step.
+- [x] **S2b (fusion): `silu(gate) up` as one SFPU body** (2026-10-16): `kind_sfpu::SILU_MUL` runs `SIGMOID`'s
+  program, then `MUL(x, s)` and `MUL(t, up)` in registers. Bit for bit the three ops: the sigmoid and the product
+  are never denormal, so their FP32 store and reload change nothing.
+  - **Where:** the chain fuser (`burn-tt` `fusion/chain.rs`) runs it on `Tt`. Its halves of a fused projection are
+    read in place, one job where there were three.
+  - **Gates:** unit `sfpu::ops::silu` (two mutations watched: the sigmoid of `y` fails; not reloading `x` passes,
+    since `sigmoid_program` keeps `x` in L0); `step194`.
 
-### F0. Measure before choosing A or B
+### F0. Measure before choosing A or B: measured (2026-10-16)
 
-- [ ] Run the decode step under `Tt` (`Fusion<TtBackend>`): `TracedGenerator` over a `FixedShapeDecoder<Tt>`.
-  - Does it capture?
-  - What does burn-fusion add to a replay? (Nothing should remain: a trace replays lowered lists.)
-  - What does it add to the capture and the warm-up?
-- [ ] Record the answer here and pick A or B for S2b, S3 and S4.
+- [x] **The decode step runs and traces on `Tt`.** `TracedGenerator<'m, M, B = TtBackend>` is generic over
+  `TracedBackend`, and the bench switch is `TT_GEN_FUSION=1`. Gate `step193_fusion_decode_trace` (ttsim; card 0
+  `1792174399`): on `Tt`, traced equals eager bit for bit (synthetic Llamas, MHA and GQA, fused and unfused; the 135M
+  checkpoint), and a nudged RMSNorm `gamma` diverges.
+- [x] **Replay, capture and warm-up**, card 1, every tile:
+
+  | | `TtBackend` | `Fusion<TtBackend>` |
+  |---|--:|--:|
+  | 1.7B decode step, ms | 45.23 / 47.71 / 50.78 (`1792174499`) | 47.49 / 49.90 / 53.08 (`1792172342`) |
+  | 135M decode step, ms | 22.46 / 22.95 / 23.63 (`1792174412`) | 24.00 / 24.52 / 25.15 (`1792174906`) |
+  | 1.7B build, s | 70.2 | 74.1 |
+  | 135M build, s | 16.4 | 18.0 |
+
+  - **Why `Tt` is slower:** burn-fusion 0.21 does not forward activations (`burn-fusion-0.21.0/src/ops/activation.rs`),
+    so `sigmoid` becomes Burn's default composition: eight ops (cast, `x -1`, `exp`, `+1`, `log`, `x -1`, `exp`,
+    cast) in place of one SFPU op.
+  - **Bits:** the logits are not always `TtBackend`'s (one case of four differed by 7.9e-6).
+  - **Fusion today:** none in a decode step; the one fuser (`ADD_RELU`) starts only on `Add` or relu.
+- [x] **What the stream shows:**
+  - **RMSNorm is contiguous:** `Mul(x, x)` (not `powi_scalar`), `MeanDim`, `AddScalar(eps)`, `Sqrt`, `Div`, the
+    `gamma` `Reshape`, `Mul`. The `1/n` is inside burn-tt's `mean_dim`, and `Drop`s can fall between the ops.
+  - **SiLU is contiguous:** the 8-op sigmoid, `Mul(gate, sig)`, `Mul(., up)`.
+  - **Scalars are ids at optimisation time** (`ScalarIr`), bound at execution as `ADD_RELU` binds its zero.
+- [x] **The decision (2026-10-16): A, burn-fusion fusers, as the end state.**
+  - **Why:** fusers serve any model that runs on TT through Burn, which is Burn's real strength. A model-level fused
+    API serves only tt-models.
+  - **Meanwhile:** the individual ops are made as fast as they go (S1d, S4, S5). They are what every fuser falls back
+    to, and what a model not yet fused runs on.
+  - **What a fuser must be, to be reliable:**
+    - bit for bit the composition it replaces, or a bound derived beside its gate;
+    - gated with a negative control;
+    - covered by `cargo xtask conformance --fusion`.
+  - **Order** (each a [kernel-fusion.md](kernel-fusion.md) item):
+    1. Recognise Burn's generic sigmoid and run the native one. This brings decode on `Tt` to `TtBackend`'s time and
+       bits.
+    2. SiLU, `silu(gate) up` as one SFPU body (S2b, B13b).
+    3. RMSNorm as one reduce-map (S3, B13d).
+  - **Decode moves to `Tt`** in the bench and tt-models once (1) puts it at parity, so that each later fuser
+    shows in the step. **Done (2026-10-16):**
+    - (1) holds: step193 asserts a decode step's logits on `Tt` equal `TtBackend`'s.
+    - `TracedGenerator` defaults to `Tt`; the bench runs `Tt`, and `TT_GEN_FUSION=0` gives `TtBackend` ("on
+      TtBackend" rows).
 
 ### S3. RMSNorm as one reduce-map (~5.2 ms -> target under 1)
 
-- [ ] **One op a norm:** read the row of 64 tiles once, square and sum in `sum_dim`'s order (bit for bit), then
-  `x / sqrt(mean + eps) gamma`, writing one row: Burn's composition (`x.cast(F32).square().mean_dim(..) + eps`,
-  `.sqrt()`, `x / rms`, `* gamma`), in the same order. kernel-fusion.md B13d's design (stats in Dst rows or an L1
-  circular buffer), F32 first.
-- [ ] **Gate:** bit for bit against the composed norm on ragged widths, signed zeros, subnormals, `eps` 1e-5 and 1e-6
-  (both SmolLM2 presets), and NaN/inf in one element of a row; the Llama gates (`step185`, `step187`, `step191`) bit
-  for bit; negative control: a reduction in another order differs.
+- [x] **Two ops a norm, up to its scale** (2026-10-16, `tt_kernels::sfpu::norm`, `Session::rms`, the chain
+  fuser's `RMS_NORM`): the statistic in one kernel, then the existing `DIV`.
+  - **R0, observed on `Tt` (`BURN_FUSION_LOG=full`):** F32 has no casts (`Tensor::cast` skips a same-dtype cast),
+    and `square` is `Mul(x, x)`. `gamma`'s `Reshape` is a block of its own, and the product by it joins neither
+    block, so `* gamma` stays one SFPU op (~0.44 ms a 1.7B step).
+  - **The kernel:** a reduction's kernel (`reduce::roles`), one job a tile row.
+    - It squares each tile as it accumulates it, in `sum_dim`'s order, then `reduce::finish` folds.
+    - The statistic: `MUL_SCALAR`, `ADD_SCALAR` and `SQRT`'s bodies, lanewise, before the pack.
+    - The output is the `[rows, 1]` tensor those ops leave. `DIV` reads its column 0 through the mover's broadcast,
+      as before.
+  - **A first version also divided, and lost** (silicon, run `1792184225`):
+    - It unpacked the row a second time and ran `DIV`'s program per tile: 640 us a 2048-wide norm, against 106 us
+      for the five ops.
+    - The 1.7B step went 45.2 -> 71.5 ms. `DIV`'s body does not fit the replay buffer, so each instruction is
+      pushed from the role program, and one unit pushed all 64 tiles'.
+    - It also needed column 0's value copied to every lane by bits, since the fold leaves each lane its own rounding.
+    - The lesson: fuse the sequential part (the sum) and leave a parallel op parallel.
+  - **Found on the way:** a residual `Add` keeps `ElementWiseFuser` open, so the norm's `Mul(x, x)` joined its
+    block, and only 6 of 30 norms fused. A chain may now begin one op into a block, if that op is an `Add` (or
+    relu's compare) that `ElementWiseFuser` stays open on. A first version passed over any op, and `add_relu` stopped
+    fusing in MNIST (step12): the matmul's block grew over the bias `Add` that must begin one.
+- [x] **Gate:**
+  - Unit `sfpu::norm`: the statistic equals the composed ops' on the specification model, at widths 37-4096,
+    `eps` 1e-5 and 1e-6, and special values. The control is the sum reversed. The longest row's programs fit a slot.
+  - `step195`: bit for bit `TtBackend` for decode `[1, 1, 2048]` and `[1, 1, 576]`, ragged, several tile rows and
+    Burn's `RmsNorm` module; no `mean_dim`, `sqrt` or `float_div` call (the division is the fused op's own). Near misses run as themselves: another `eps` (bound), a mean over another
+    dimension, a kept `x * x`.
+  - `step193`: every norm of a decode step fused; the logits are `TtBackend`'s.
+- [x] **Measured** (card 1, with S2b and the sigmoid fuser):
+  - 1.7B step **45.23 / 47.71 / 50.78 -> 43.42 / 45.85 / 49.00 ms** (`1792186180`).
+  - 135M **22.46-23.63 -> 20.20-21.34** (`1792186583`; burn-flex 26.9-31.6).
+  - Next if it pays: the statistic kernel touching only the row groups a decode row occupies (1 of 8). Bit
+    identity keeps the sum sequential, on one unit a row.
 
 ### S4. Attention's non-product ops (~4.5 ms)
 

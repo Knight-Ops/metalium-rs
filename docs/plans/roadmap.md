@@ -3,7 +3,7 @@
 **Start here.** This is the single list of open work. It holds only open items, each
 linking to its evidence and to the detailed plan. Closed work lives in
 [`completed-plans/`](../completed-plans/) and the archived phase docs below; permanent facts live in
-[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-15.
+[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-16.
 
 ## Where the project stands
 
@@ -14,8 +14,8 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 20.9 tokens/s traced against
-  burn-flex's 3.4 (13.6 on 2026-10-15; the cache's row write, thin matmul reads and fused projections since), and prefills 29-35x faster.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 22.1 tokens/s traced against
+  burn-flex's 3.3 (13.6 on 2026-10-15; the cache's row write, thin matmul reads, fused projections and block views since), and prefills 29-35x faster.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -378,13 +378,35 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     - `gate|up` now reads at GDDR's ceiling. `o` and `down`, on 64 units, move ~300 GB/s, and **not** because of the
       in-flight cap (16/32/128 measured, unchanged).
     - **Open: P5**, a probe of one channel a column, then perhaps a skewed weight placement.
-  - [ ] **The small ops: 23.4 of the 47.5 ms step** ([decode-small-ops.md](decode-small-ops.md), planned
-    2026-10-16): RMSNorm ~5.2 ms, RoPE ~4.9 (3.7 of it two element repacks), attention outside the products ~4.5,
-    SiLU ~1.9.
-    - A trace records lowered lists (no capture-time fusion), and decode does not run on burn-fusion today.
-    - First: the bit-identical repack and copy fixes (S1, S2a).
-    - Then decide where fusion lives (F0: the decode step under `Fusion<TtBackend>`), then RMSNorm as one
-      reduce-map (S3).
+  - [ ] **The small ops** ([decode-small-ops.md](decode-small-ops.md)): 23.4 of a 47.5 ms step, now ~20.7 of 44.7.
+    - **S1 and S2a are done** (2026-10-16, gate `step192`).
+      - Element-wise ops read a block of a buffer in place.
+      - RoPE runs in the projection's layout: its table is laid over the heads once a step, and its halves are swapped
+        by tile copies.
+      - A 1.7B decode step **47.90 / 50.37 / 53.53 -> 45.23 / 47.71 / 50.78 ms** (22.1-19.7 tokens/s, run
+        `1792174499`); the 135M step 22.46-23.63 (`1792174412`).
+    - **Open: S1d.** The key write now repacks, as the value's did; reading both in place saves ~1.8 ms.
+    - **F0 measured** (gate `step193`). On `Fusion<TtBackend>` the step captures and replays, but costs
+      +2.2 / +1.5 ms (1.7B / 135M): burn-fusion turns `sigmoid` into Burn's 8-op composition, and fuses nothing in
+      the step.
+    - **Decided: burn-fusion fusers are the end state** (2026-10-16). They are reliable, and serve any model on TT;
+      individual ops are still made as fast as they go.
+    - **The three fusers are done** (2026-10-16, `burn-tt` `fusion/chain.rs`; gates `step194`, `step195`, `step193`
+      on ttsim and card 0).
+      - A 1.7B decode step on `Tt` is **45.23 / 47.71 / 50.78 -> 43.42 / 45.85 / 49.00 ms** (23.0-20.4 tokens/s, run
+        `1792186180`); the 135M step 22.46-23.63 -> **20.20-21.34** (`1792186583`)
+        ([log](../learnings/performance-log.md#decode-fusers-sigmoid-silu-and-rmsnorm-2026-10-16-cards-0-and-1)).
+      - Burn's sigmoid composition runs as `TtBackend`'s sigmoid. A decode step on `Tt` is `TtBackend`'s bit for bit
+        (step193 asserts the logits), and decode moves to `Tt` (`TracedGenerator`'s default; the bench's
+        `TT_GEN_FUSION=0` opts out).
+      - `silu(gate) * up` is one SFPU pass (`SILU_MUL`), bit for bit the three ops, reading a fused projection's
+        halves in place (S2b).
+      - RMSNorm up to its scale is two ops (S3): its statistic in one kernel (`sfpu::norm`: the sum of squares in
+        `sum_dim`'s order, then `* 1/n`, `+ eps`, `sqrt`), then the existing `DIV`. Bit for bit the five ops. A
+        version that also divided ran 640 us a norm on one unit (silicon, the 1.7B step 71.5 ms). The scale stays its own op:
+        burn-fusion puts its `Reshape` in another block.
+      - Found: a chain must be able to begin one op into a block (a residual `Add` holds the norm's first op), and
+        `ElementWiseFuser` lost its match to any later op while another fuser was open.
   - [ ] **The cache write's two whole-cache copies, 2.25 ms** ([in-place-cache-write.md](in-place-cache-write.md),
     scheduled 2026-10-16, phases D1-D5): donation declared before capture, buffer generations, then
     `scatter_rows_into`.
@@ -674,11 +696,12 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   - **Measure first:** the entries `UnitFootprint::stream` counts, times 32 bytes, against `gddr_bytes`.
   - **The fix if so:** one contiguous arena per unit per trace, its sections packed at entry alignment.
   - **When:** before the 1B-parameter model (Track 1), whose F32 weights alone take 4-5 GB of a card's 32.
-- [ ] **B13b** general SFPU micro-op chain fuser (today one fuser, `ADD_RELU`).
-  [kernel-fusion.md](kernel-fusion.md) lines 195–197.
+- [ ] **B13b** general SFPU micro-op chain fuser. The decode chains are done (2026-10-16): Burn's sigmoid
+  composition, `silu`, `silu(gate) * up` (`fusion/chain.rs`, a declarative chain matcher). Open: the general
+  micro-op bytecode ([kernel-fusion.md](kernel-fusion.md) Phase 2).
 - [ ] **B13c** matmul + bias + activation epilogue (kernel-fusion.md lines 200–204).
-- [ ] **Reduce/norm fuser**, L1 circular-buffer streaming for multi-tile row reductions
-  (kernel-fusion.md lines 207–210).
+- [ ] **Reduce/norm fuser.** RMSNorm's statistic is done (2026-10-16, `sfpu::norm`, one reduction job a tile
+  row; the division stays a multi-unit op). Open: LayerNorm, softmax, rows past 128 tiles (kernel-fusion.md Phase 4).
 - [x] **Barriers on the units an op ran on (2026-10-14).** A multi-tile op's barrier was on every unit, and a unit
   it gave no job to enqueued a barrier list of its own: one PCIe enqueue a tile an op, 355,000 a step for the
   all-tiles transformer. Now only the units an op runs on arrive, and the others catch up with a wait-only

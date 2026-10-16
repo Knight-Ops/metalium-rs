@@ -179,6 +179,24 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return accumulate_in_order(first, valid.unwrap_or(32));
     }
+    accumulate_with(op, axis, first, valid, false)
+}
+
+/// [`accumulate`] of each datum's square (`x * x` as `MUL`'s program forms it, `SFPMAD(x, x,
+/// -0)`) for a sum over columns: what accumulating `MUL(x, x)`'s output tile does, bit for bit,
+/// since a product is never a denormal and so its FP32 store and reload change nothing. The sum
+/// of squares of `sfpu::norm`.
+pub fn accumulate_squares(first: bool, valid: Option<u32>) -> Vec<Instruction> {
+    accumulate_with(ReduceOp::Sum, Axis::Cols, first, valid, true)
+}
+
+fn accumulate_with(
+    op: ReduceOp,
+    axis: Axis,
+    first: bool,
+    valid: Option<u32>,
+    square: bool,
+) -> Vec<Instruction> {
     let fmt = op.format();
     let masked = valid.is_some_and(|v| v < 32);
     let mut p = Program::with_policy(if masked {
@@ -211,6 +229,9 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
             mask_setup(p);
         }
         p.load(LReg::L0, fmt, A_ROW + o);
+        if square {
+            p.mul(LReg::L0, LReg::L0, LReg::L0);
+        }
         if masked {
             let g = o / 4;
             // What the lane index in `L6` must stay below for the lane to

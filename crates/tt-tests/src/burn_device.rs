@@ -416,6 +416,15 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.eltwise_op(&mut self.session, op, a, b, c)
         }
+        fn eltwise_blocks(
+            &mut self,
+            op: tt_kernels::tensor::Eltwise,
+            a: burn_tt::BlockArg,
+            b: Option<burn_tt::BlockArg>,
+            c: Option<burn_tt::BlockArg>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.eltwise_blocks(&mut self.session, op, a, b, c)
+        }
         fn pow(
             &mut self,
             x: burn_tt::BufferId,
@@ -436,6 +445,13 @@ fn sim_factory(
             axis: tt_kernels::sfpu::reduce::Axis,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.reduce(&mut self.session, a, op, axis)
+        }
+        fn rms(
+            &mut self,
+            a: burn_tt::BufferId,
+            eps: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.rms(&mut self.session, a, eps)
         }
         fn scan(
             &mut self,

@@ -2046,12 +2046,101 @@ pub fn sfpu_eltwise(
     units: usize,
     overlap: Overlap,
 ) -> Result<Option<Work>> {
+    let (kind, bcast) = broadcast_of(op, a, b)?;
+    if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
+        return sfpu_divide(alloc, Eltwise { kind, ..op }, a, b, bcast).map(Some);
+    }
+    sfpu_eltwise_blocks(
+        alloc,
+        op,
+        BlockOperand::whole(a),
+        b.map(BlockOperand::whole),
+        c.map(BlockOperand::whole),
+        units,
+        overlap,
+    )
+}
+
+/// One operand of [`sfpu_eltwise_blocks`]: the `dims` block of `tensor` whose
+/// top-left element is `at`, read where it lies ([`block_fits`]: on tile
+/// boundaries, ragged only at the tensor's own edge) -- a gate's columns of a
+/// fused projection, a head's columns of `q`.
+#[derive(Copy, Clone, Debug)]
+pub struct BlockOperand<'a> {
+    pub tensor: &'a DramTensor,
+    pub at: [usize; 2],
+    pub dims: [usize; 2],
+}
+
+impl<'a> BlockOperand<'a> {
+    /// All of `t`.
+    pub fn whole(t: &'a DramTensor) -> Self {
+        BlockOperand {
+            tensor: t,
+            at: [0, 0],
+            dims: [t.rows, t.cols],
+        }
+    }
+
+    /// The block as a tensor of its own for what reads only its shape, type
+    /// and padding (`broadcast_of`, `OpPadding::produces`): never for its
+    /// slots, whose row stride is the parent's. Its padding is the parent's
+    /// where the block is ragged (only ever at the parent's edge), and none
+    /// where it is whole tiles.
+    pub fn shape_only(&self) -> DramTensor {
+        let t = DramTensor {
+            rows: self.dims[0],
+            cols: self.dims[1],
+            elem: self.tensor.elem,
+            placement: Placement {
+                owned: false,
+                ..self.tensor.placement.clone()
+            },
+            pad: std::cell::Cell::new(self.tensor.pad()),
+        };
+        t.set_pad(self.tensor.pad());
+        t
+    }
+
+    fn tensor_ref(&self, what: &str) -> Result<TensorRef> {
+        block_ref(self.tensor, self.at, self.dims, what)
+    }
+}
+
+/// [`sfpu_eltwise`] over blocks of resident tensors ([`BlockOperand`]), the
+/// result a new tensor of `a`'s block's dims: each operand's tiles read where
+/// they lie at its parent's row stride (`record::READ_RUN` counts over the
+/// output's grid), so a view that is a block of its buffer needs no copy
+/// first. Integer division is refused here (it reads whole tensors).
+pub fn sfpu_eltwise_blocks(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: BlockOperand<'_>,
+    b: Option<BlockOperand<'_>>,
+    c: Option<BlockOperand<'_>>,
+    units: usize,
+    overlap: Overlap,
+) -> Result<Option<Work>> {
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
+    let what = "an element-wise op's block";
+    let (ra, rb, rc) = (
+        a.tensor_ref(what)?,
+        b.map(|b| b.tensor_ref(what)).transpose()?,
+        c.map(|c| c.tensor_ref(what)).transpose()?,
+    );
+    let (a, b, c) = (
+        a.shape_only(),
+        b.map(|b| b.shape_only()),
+        c.map(|c| c.shape_only()),
+    );
+    let (a, b, c) = (&a, b.as_ref(), c.as_ref());
     let (kind, bcast) = broadcast_of(op, a, b)?;
     let op = Eltwise { kind, ..op };
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
-        return sfpu_divide(alloc, op, a, b, bcast).map(Some);
+        return Err(TensorError::Shape(
+            "integer division reads whole tensors, not blocks".into(),
+        ));
     }
     let Some((operands, _)) = crate::sfpu::ops::program_for(kind, [op.scalar, op.scalar2], bcast)
     else {
@@ -2069,7 +2158,7 @@ pub fn sfpu_eltwise(
             if let Some(&want) = crate::sfpu::ops::elems(kind).inputs.get(2) {
                 c.expect(&format!("element-wise op {kind:#x}"), want)?;
             }
-            Some(c.tensor_ref())
+            rc
         }
         (Operands::Ternary, None) => {
             return Err(TensorError::Shape(
@@ -2085,8 +2174,7 @@ pub fn sfpu_eltwise(
     };
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
     let [rt, ct] = a.grid();
-    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
-    let rb = b.map(DramTensor::tensor_ref);
+    let ro = out.tensor_ref();
     // Pipelined (checklist 9.15): runs in alternating halves of the arena,
     // so a unit's mover moves one run while the roles compute another.
     let piped = pipelined_runs(
@@ -2700,6 +2788,83 @@ pub fn sfpu_reduce(
     Ok(Work { out, jobs })
 }
 
+/// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`, on the SFPU
+/// (`crate::sfpu::norm`): bit for bit `MUL(a, a)`, the sum over columns, `MUL_SCALAR(1/cols)`,
+/// `ADD_SCALAR(eps)` and `SQRT`, with no tensor between them. A reduction's kernel, one job a
+/// tile row: the mover reads the row, the kernel sums its squares and takes the statistic, the
+/// mover writes the column. A row longer than one job takes (`sfpu::norm::fits`) is refused.
+pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work> {
+    use crate::sfpu::{norm, reduce};
+    a.expect("an RMS statistic", Elem::F32)?;
+    if !norm::fits(a.cols) {
+        return Err(TensorError::Shape(format!(
+            "a row of {} columns does not fit one RMS statistic job",
+            a.cols
+        )));
+    }
+    let [rt, per] = a.grid();
+    let valid = match a.cols % 32 {
+        0 => 32,
+        v => v as u32,
+    };
+    let layout = reduce::plan_layout(1, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (squares, fin) = norm::math(per, valid, eps);
+    let roles = Arc::new(reduce::roles(&layout, &squares, &fin));
+    let out = DramTensor::alloc_elem(alloc, a.rows, 1, Elem::F32)?;
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let jobs = (0..rt)
+        .map(|k| {
+            // As a reduction over columns gathers and scatters a run of one output.
+            let gather = [
+                [
+                    record::READ_RUN,
+                    (k * per) as u32,
+                    per as u32,
+                    layout.in_at as u32,
+                    0,
+                    per as u32,
+                    0,
+                    0,
+                ],
+                ra.encode()[0],
+                ra.encode()[1],
+            ];
+            let scatter = [
+                [
+                    record::WRITE_RUN,
+                    k as u32,
+                    1,
+                    layout.out_at as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                ro.encode()[0],
+                ro.encode()[1],
+            ];
+            vec![
+                Step::List {
+                    what: "rms gather",
+                    entries: gather.to_vec(),
+                },
+                Step::Kernel {
+                    roles: roles.clone(),
+                    init: layout.init.clone(),
+                    mop: Box::new([None; 3]),
+                    loops: Default::default(),
+                    half: None,
+                },
+                Step::List {
+                    what: "rms scatter",
+                    entries: scatter.to_vec(),
+                },
+            ]
+        })
+        .collect();
+    Ok(Work { out, jobs })
+}
+
 /// Inclusive scan down matrix rows. Each column tile is a job, so its
 /// continuations stay on one unit. A WAIT protects every prior-output reload.
 pub fn sfpu_scan(
@@ -3233,6 +3398,9 @@ impl Eltwise {
             POW_S => s > 0.0,
             // `g (1/2)` and `g 0 1`: zero with the gradient's padding.
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
+            // `0 * 0.5`, then times `y`.
+            SILU => true,
+            SILU_MUL => b_zero,
             // `atan2(+0, +0) = +0`.
             ATAN2 => b_zero,
             // `((0 % s) + s) % s` is a zero (the sign of `s`) for a
