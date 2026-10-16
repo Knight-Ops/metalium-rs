@@ -982,6 +982,17 @@ What the numbers taught (each from a build, not from reading code):
   CI lint. It strips both now, so the firmware is the same bytes whoever builds it; firmware is linted on its own
   (`cargo clippy --manifest-path crates/tt-firmware/Cargo.toml ...`).
 - RISCV NC's image (`dm_nc`, 14,240 bytes of its 24,576-byte slot, `dm::nc::IMAGE_MAX`) has about 10 KB free.
+- **NC's first index-reading record, `SCATTER_ROWS` (2026-10-15, `size -A`, same path, release):** `dm_nc` 13,908 ->
+  15,088 bytes (9.5 KB of its slot free). `dm_b` grew too, 24,608 -> 25,724, although B never runs the record (its
+  arm is compiled out of B): giving the new op a length in `record::len` alone moved LLVM's inlining in B's
+  `run_record` (23 `record_entry` call sites against 10). Neither the opcode's place (0x12, inside the record range,
+  or 0x1A after it) nor where `len` lists it changed that. B has ~17 KB of its 42 KiB slot left. The record is the
+  writing half the split BF16 select below needs: NC reads its index slot after `publish()`, one index slot a staging
+  half.
+- **Writes to one GDDR address through different ports are not ordered**: `write_rows` and `SCATTER_ROWS` rotate
+  ports, and each port is its own endpoint (`port_for`). A repeated index is therefore resolved in the record (only
+  the last index naming a row is written), and across batches by the writer's credit pop, which waits for its
+  writes (`Action::Pop`).
 
 **Open: a packed-BF16 row select** (roadmap, Track 2, "Gather without staging"). A BF16 face-row is 32 bytes at
 `TILE_DATA + face x 512 + row x 32`: congruent to `TILE_DATA` mod 64 (the GDDR read rule) only on an even row,

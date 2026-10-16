@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A cache write of one row a head](#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1) | 2026-10-16 | `scatter_nd` with `Assign` is one row scatter at resident indices (NC's `SCATTER_ROWS`), and `FixedCache` writes a step with it: a 1.7B decode step 73.65 / 76.08 / 79.30 -> **57.21 / 59.64 / 62.81 ms** (17.5-15.9 tokens/s), the 135M step 25.81-26.99 -> 24.40-25.53 (burn-flex 26.66-31.12); the cache write is 5.0 of 56.8 ms a 1.7B step, was ~20 |
 | [Where a SmolLM2-1.7B step goes: the profile mode](#where-a-smollm2-17b-step-goes-the-profile-mode-2026-10-15-cards-0-and-1) | 2026-10-15 | the first profile from the profile mode (`cargo xtask bench --profile`): a 1.7B decode step is 46% matmuls (~200 GB/s), **24% the cache write's `expand`** (32 key/value heads), ~30% small ops; stamping compiled in costs 0.46 ms a 135M step, so it is now a build feature |
 | [SmolLM2-1.7B-Instruct on the card](#smollm2-17b-instruct-on-the-card-2026-10-15-card-1) | 2026-10-15 | the first model past 1B parameters, traced, F32, every tile: decode 13.6-12.6 tokens/s (burn-flex 3.4-3.0), prefill 267-771 tokens/s (burn-flex 7.6-24.7); decode reads its weights at 86-93 GB/s, 17-18% of GDDR's 512 |
 | [Decode length and trace size](#decode-length-and-trace-size-2026-10-15-cards-0-and-1) | 2026-10-15 | one GDDR region a unit a trace (traces 3,754 -> 563 MB, build 44.9 -> 18.8 s); grouped-query attention without `repeat_kv` and steps attending to 64/128/256/512 positions: decode over a 512-position cache 32.29 -> 26.13-27.31 ms, a generation 0.60x-0.90x burn-flex's time |
@@ -313,6 +314,53 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A cache write of one row a head (2026-10-16, cards 0 and 1)
+
+Roadmap Track 2 item 6, step 6 (`decode-length-cost.md` B3), from the 1.7B profile below: a fixed cache's write
+expanded the new key and value to the cache's whole shape and `mask_where`d them in, 24% of a decode step.
+
+**The change:**
+- **`SCATTER_ROWS`**, NC's first record that reads indices (`tt_isa::dm::record`): B stages an index tile and the
+  values' tile row; NC writes each staged row's two 64-byte face-rows a tile column at the row the index names, a
+  repeated index's last row only, `DOMAIN` before any write.
+- **`Session::scatter_rows`**: a tile copy, then the scatter, one job per group of tile columns (every index of those
+  columns, in order, so a spread never splits a row's writers).
+- **burn-tt**: `scatter_nd` with `Assign` is that op; with one coordinate the indices are read where they are, with
+  no flat-row ops.
+- **`FixedCache`**: a step writes `rows = h max_len + position` (`[kv_heads, 1]`, built once a step) with
+  `scatter_nd`. Prefill chunks keep `mask_where` (their padded tail may run past the cache).
+
+Gates: `step189_scatter_rows` (ttsim; card 0 run `1792109189`, with `step185`, `step187`, `step188` and the mover gates,
+30 of 30), Burn's `scatter`/`gather_scatter_nd`/`select` conformance plain and under `Fusion` (186 of 186, ttsim).
+
+**Measured** (card 1, release, every tile, default spread, burn-flex in the same run):
+
+| | Decode step, 32 / 128 / 256-token prompt | Prompt + 64 tokens | burn-flex step |
+|---|---|---|---|
+| SmolLM2-1.7B before (`1792082994`) | 73.65 / 76.08 / 79.30 ms | 4,789 / 4,992 / 5,332 ms | |
+| SmolLM2-1.7B now (`1792109477`) | **57.21 / 59.64 / 62.81** (17.5 / 16.8 / 15.9 tokens/s) | **3,757 / 3,957 / 4,292** | 298.3 / 307.5 / 333.9 |
+| SmolLM2-135M before (`1792089070`) | 25.81 / 26.28 / 26.99 | | |
+| SmolLM2-135M now (`1792110130`) | **24.40 / 24.84 / 25.53** | 1,580 / 1,615 / 1,682 | 26.66 / 28.97 / 31.12 |
+
+- Prefill is unchanged (1.7B: 267 / 658 / 774 tokens/s).
+- Decode reads the 1.7B weights at 109-120 GB/s, was 86-93.
+- The 1.7B traces hold 1.10 GB of streams, was 1.54; the driver's build is 67.2 s, was 76.2.
+
+**Where the cache write's time is now** (the profile mode, `Step(64)`, run `1792110380`; 56.8 ms a replay, every op
+covered). 48 writes a step (24 layers, keys and values), 5.03 ms in all:
+
+| Part | ops | ms | us each |
+|---|--:|--:|--:|
+| the row scatter (`SCATTER_ROWS`) | 48 | 1.30 | 27.0 |
+| the scatter's tile copy of the cache | 48 | 1.13 | 23.5 |
+| the trace's write-back (`copy_into`) | 48 | 1.13 | 23.5 |
+| a repack of the value (once a layer) | 24 | 0.91 | 38.1 |
+| a block copy of the value | 48 | 0.56 | 11.7 |
+
+The two whole-cache copies (2.26 ms) are what writing in place would remove (the plan's Phase 2, capture-level
+donation); the value's repack and block copy (1.47 ms) are its layout after RoPE and the head split, not the cache.
+`float_matmul` is now 59.5% of the step (33.8 ms).
 
 ## Where a SmolLM2-1.7B step goes: the profile mode (2026-10-15, cards 0 and 1)
 

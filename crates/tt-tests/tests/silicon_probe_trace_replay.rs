@@ -237,6 +237,8 @@ fn class(word: u32) -> Part {
         | record::WRITE_RUN
         | record::FILL_PAD
         | record::PAD_WRITE
+        | record::SELECT_ROWS
+        | record::SCATTER_ROWS
         | op::READ
         | op::WRITE => Part::Data,
         _ => Part::Other,

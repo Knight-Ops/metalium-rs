@@ -326,6 +326,18 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// A copy of `table` with `values`' row `i` at its row `indices[i]`, the
+    /// indices a resident I32 buffer, `[1, n]` or (`column`) `[n, 1]`
+    /// (`Session::scatter_rows`): a `scatter_nd` with `Assign` over whole rows.
+    fn scatter_rows(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+        _values: BufferId,
+        _column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
     fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
@@ -1255,6 +1267,33 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
         let c = s.assign_rows(&tt, &tv, rows).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    /// [`Session::scatter_rows`]: a 32-bit table only, a packed one refused.
+    pub fn scatter_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        for b in [table, values] {
+            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+                return Err(TtError::Device(
+                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                ));
+            }
+        }
+        let (tt, ti, tv) = (
+            self.get(table)?.clone(),
+            self.get(indices)?.clone(),
+            self.get(values)?.clone(),
+        );
+        let c = s
+            .scatter_rows(&tt, &ti, &tv, column)
+            .map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -2899,6 +2938,28 @@ pub(crate) fn assign_rows(
     )
 }
 
+/// A copy of `table` with `values`' row `i` at its row `indices[i]`
+/// (`Engine::scatter_rows`), the indices a resident I32 buffer, `[1, n]` or
+/// (`column`) `[n, 1]`, without waiting: `dims` is `table`'s.
+pub(crate) fn scatter_rows(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    values: BufferId,
+    column: bool,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "scatter_rows",
+        device,
+        dims,
+        || "checked resident row scatter".into(),
+        move |engine, ids| {
+            engine.scatter_rows(ids.get(table)?, ids.get(indices)?, ids.get(values)?, column)
+        },
+    )
+}
+
 /// A block copy on the device, without waiting.
 pub(crate) fn copy_blocks(
     device: TtDevice,
@@ -3426,6 +3487,16 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.assign_rows(&mut self.session, t, value, rows)
+    }
+    fn scatter_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.scatter_rows(&mut self.session, table, indices, values, column)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
@@ -4250,6 +4321,22 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.assign_rows(self.fabric.chips[0].session(), t, value, rows)
+    }
+    fn scatter_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.scatter_rows(
+            self.fabric.chips[0].session(),
+            table,
+            indices,
+            values,
+            column,
+        )
     }
     fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
         Some(self.fabric.execution().clone())

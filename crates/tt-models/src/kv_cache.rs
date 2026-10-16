@@ -2,9 +2,10 @@
 //! once and replayed: any decoder that keeps per-layer keys and values `[1, kv_heads, max_len,
 //! head_dim]` can use it.
 //!
-//! A step's position (or a chunk's start) is a tensor. Its keys and values land through
-//! `mask_where` where a mask built from that tensor is set, and attention reads all `max_len`
-//! positions with those later than each query masked. A masked position adds an exact zero to a
+//! A step's position (or a chunk's start) is a tensor. A step's keys and values are written at
+//! the rows that tensor names (`scatter_nd` with `Assign`: one row a head, not the whole cache); a
+//! chunk's land through `mask_where` where a mask built from its start is set. Attention reads
+//! the positions a step attends to with those later than each query masked. A masked position adds an exact zero to a
 //! softmax's sum and to `P V`, so the step's arithmetic on the positions it attends to is a
 //! growing cache's (`step185_fixed_decode`).
 //!
@@ -18,7 +19,7 @@
 //! of their own.
 
 use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, DType, Int, Tensor};
+use burn::tensor::{Bool, DType, IndexingUpdateOp, Int, Tensor};
 
 /// Every layer's keys and values, and the positions `0..max_len` a step's position is compared
 /// with.
@@ -33,11 +34,12 @@ pub struct FixedCache<B: Backend> {
 /// How a step's keys and values reach a layer's cache, and which positions each query attends to.
 #[derive(Clone, Debug)]
 pub enum FixedWrite<B: Backend> {
-    /// One token at the position set in `here` (the cache's shape: made once a step, not once a
-    /// layer); the query attends to the first `len` positions but those set in `later`
-    /// (`[1, 1, 1, len]`).
+    /// One token at a position: head `h`'s key or value goes to row `rows[h]` (`[kv_heads, 1]`,
+    /// `h max_len + position`: made once a step, not once a layer) of the cache's `[kv_heads
+    /// max_len, head_dim]` rows; the query attends to the first `len` positions but those set in
+    /// `later` (`[1, 1, 1, len]`).
     Masked {
-        here: Tensor<B, 4, Bool>,
+        rows: Tensor<B, 2, Int>,
         later: Tensor<B, 4, Bool>,
         len: usize,
     },
@@ -131,14 +133,16 @@ impl<B: Backend> FixedCache<B> {
             (1..=max_len).contains(&len),
             "attending to {len} of {max_len} positions"
         );
-        let at = position.clone().expand([max_len]);
-        // Expanded to the cache's shape here, once, rather than in each layer.
-        let here = self
+        let [_, kv_heads, _, _] = self.shape();
+        // Each head's row of the cache's rows, built here once rather than in each layer.
+        let rows = (self
             .positions
             .clone()
-            .equal(at.clone())
-            .reshape([1, 1, max_len, 1])
-            .expand(self.shape());
+            .narrow(0, 0, kv_heads)
+            .mul_scalar(max_len as i64)
+            + position.clone().expand([kv_heads]))
+        .reshape([kv_heads, 1]);
+        let at = position.clone().expand([max_len]);
         let later = if len == max_len {
             self.positions.clone().greater(at)
         } else {
@@ -148,7 +152,7 @@ impl<B: Backend> FixedCache<B> {
                 .greater(position.expand([len]))
         }
         .reshape([1, 1, 1, len]);
-        FixedWrite::Masked { here, later, len }
+        FixedWrite::Masked { rows, later, len }
     }
 
     /// The write of `c` tokens from `start` (`[1]`) on, and each token's own position (`[c]`,
@@ -194,7 +198,16 @@ impl<B: Backend> FixedWrite<B> {
     pub fn write(&self, cache: Tensor<B, 4>, new: Tensor<B, 4>) -> Tensor<B, 4> {
         let shape = cache.dims();
         match self {
-            FixedWrite::Masked { here, .. } => cache.mask_where(here.clone(), new.expand(shape)),
+            FixedWrite::Masked { rows, .. } => {
+                // The new row of each head written over the cache's: nothing else is read or
+                // moved.
+                let [_, kv, max_len, d] = shape;
+                assert_eq!(new.dims(), [1, kv, 1, d], "a step writes one token");
+                cache
+                    .reshape([kv * max_len, d])
+                    .scatter_nd(rows.clone(), new.reshape([kv, d]), IndexingUpdateOp::Assign)
+                    .reshape(shape)
+            }
             FixedWrite::Chunk { here, index, .. } => {
                 // The chunk's rows laid over the whole cache by a row gather, kept where `here` is
                 // set.

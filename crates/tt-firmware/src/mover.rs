@@ -1132,7 +1132,12 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
     // Each mover expands its own direction's records, so the other's code is
     // not in its image.
     if IS_NC {
-        record::expand_writes(&rec[..n], |e| record_entry(me, usable, e))
+        if rec[0][0] == record::SCATTER_ROWS {
+            // Its indices were read into L1 by B before the credit this list
+            // waited on: make them visible to this core (as `CHECK_FLAGS`).
+            publish();
+        }
+        record::expand_writes(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e))
     } else {
         if rec[0][0] == record::SELECT_ROWS {
             // Its indices were read into L1 by entries before it: they have

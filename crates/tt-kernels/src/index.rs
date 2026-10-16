@@ -303,6 +303,150 @@ pub(crate) fn select_taps_jobs(
     Ok(jobs)
 }
 
+/// Tile columns a [`scatter_rows_jobs`] batch stages, as [`SELECT_TILES`].
+const SCATTER_TILES: usize = 24;
+
+/// `values`' rows written over rows of `dst` in place, `dst` row `indices[i]`
+/// becoming `values` row `i` -- Burn's `scatter_nd` with `Assign` over whole
+/// rows, a cache write at a position the card holds -- with no host address:
+/// each batch reads one tile of 32 indices and the values' tile row, and NC's
+/// [`record::SCATTER_ROWS`] turns them into the destination's face-row
+/// writes. `indices` is a resident I32 tensor, `[1, n]` or (`column`) `[n,
+/// 1]`, and `values` is `[n, dst.cols]` of `dst`'s element.
+///
+/// The job list depends on the shapes alone (the indices are read where they
+/// run), so a trace replays it with the indices it finds. An index outside
+/// `0..dst.rows` stops the mover with `DOMAIN` before that batch writes a
+/// datum. When indices repeat, the last one's row is written, at any spread:
+/// each job owns a group of tile columns for every index (no two units write
+/// one address), its batches in index order, a batch's writes acknowledged
+/// before the next batch's are issued (the writer's credit pop), and within a
+/// batch the record writes a repeated row once, from its last index.
+pub(crate) fn scatter_rows_jobs(
+    dst: &DramTensor,
+    indices: &DramTensor,
+    values: &DramTensor,
+    column: bool,
+    units: usize,
+) -> Result<Vec<Job>> {
+    indices.expect("resident row scatter indices", Elem::I32)?;
+    let n = if column { indices.rows } else { indices.cols };
+    let one = if column { indices.cols } else { indices.rows };
+    if !dst.placement.owned() {
+        return Err(TensorError::Shape(
+            "a view's slots are another tensor's: write that one".into(),
+        ));
+    }
+    if n == 0
+        || one != 1
+        || dst.rows == 0
+        || dst.cols == 0
+        || dst.rows > i32::MAX as usize
+        || [values.rows, values.cols] != [n, dst.cols]
+        || values.elem != dst.elem
+    {
+        return Err(TensorError::Shape(format!(
+            "a resident row scatter needs [1, n] or [n, 1] indices and [n, {}] values of {:?}: \
+             got {:?} indices of [{}, {}] and [{}, {}] {:?} values",
+            dst.cols,
+            dst.elem,
+            [indices.rows, indices.cols],
+            indices.rows,
+            indices.cols,
+            values.rows,
+            values.cols,
+            values.elem,
+        )));
+    }
+    let mut req = crate::l1::Requirements::new(1);
+    let idx = req.scratch("row scatter index tiles", 2 * TILE_SLOT, 64, 0..1);
+    let slots = req.scratch(
+        "row scatter staged tiles",
+        2 * SCATTER_TILES as u64 * TILE_SLOT,
+        64,
+        0..1,
+    );
+    let layout = req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (idx, stage) = (layout.addr(idx), layout.addr(slots));
+    // The mover does not check that `SCATTER_ROWS`'s slots are in the data
+    // arena (`record::SCATTER_ROWS`); they come from this plan, and this is
+    // the check that says so.
+    if !tt_isa::l1::DATA.contains(idx, 2 * TILE_SLOT)
+        || !tt_isa::l1::DATA.contains(stage, 2 * SCATTER_TILES as u64 * TILE_SLOT)
+    {
+        return Err(TensorError::Shape(
+            "the row scatter's slots are outside the data arena".into(),
+        ));
+    }
+    let ct = dst.grid()[1];
+    // Column groups, as many as there are units to share them (each a job):
+    // a job holds every index batch of its columns, in order.
+    let width = ct.div_ceil(units.max(1)).clamp(1, SCATTER_TILES);
+    let groups = ct.div_ceil(width);
+    let dst_ref = dst.tensor_ref().encode();
+    let flags = if column {
+        record::SCATTER_ROWS_COLUMN
+    } else {
+        0
+    };
+    let read = |range: tt_isa::dram::DramRange, at: u64, port: usize| {
+        [
+            op::READ,
+            range.channel().index() as u32,
+            (port % tt_isa::dram::PORTS as usize) as u32,
+            range.offset() as u32,
+            at as u32,
+            range.len() as u32,
+            0,
+            0,
+        ]
+    };
+    let jobs = (0..groups)
+        .map(|g| {
+            let (j0, j1) = (g * width, ((g + 1) * width).min(ct));
+            let batches = (0..n.div_ceil(32))
+                .map(|b| {
+                    let at = idx + (b % 2) as u64 * TILE_SLOT;
+                    let first = stage + (b % 2 * SCATTER_TILES) as u64 * TILE_SLOT;
+                    let index_tile = if column {
+                        indices.tile(b, 0)
+                    } else {
+                        indices.tile(0, b)
+                    };
+                    let mut read_side = vec![read(index_tile, at, 0)];
+                    for j in j0..j1 {
+                        let slot = first + (j - j0) as u64 * TILE_SLOT;
+                        read_side.push(read(values.tile(b, j), slot, j - j0 + 1));
+                    }
+                    let mut write = vec![[
+                        record::SCATTER_ROWS,
+                        at as u32,
+                        32.min(n - b * 32) as u32,
+                        dst.rows as u32,
+                        j0 as u32,
+                        (j1 - j0) as u32,
+                        first as u32,
+                        flags,
+                    ]];
+                    write.extend(dst_ref);
+                    TransferBatch {
+                        read: read_side,
+                        write,
+                    }
+                })
+                .collect();
+            vec![Step::Transfer {
+                what: "resident row scatter",
+                depth: 2,
+                batches,
+            }]
+        })
+        .collect();
+    Ok(jobs)
+}
+
 /// Tile row `tile_row` of `out` all zeros, padding too: one staged tile made
 /// zero on the card (a `FILL` leaves datum `(0, 0)` and zeroes the rest; a
 /// `COPY_WORDS` spreads datum `(0, 1)` over all of them) and written to each

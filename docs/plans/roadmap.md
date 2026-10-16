@@ -362,8 +362,14 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   - ~30% in ~1,200 small ops.
 
   **Next, by that profile:**
-  - a row write at a device-held position for the cache (decode-length-cost B3, now ~18 ms a 1.7B token);
-  - the matmuls' bandwidth;
+  - [x] a row write at a device-held position for the cache (2026-10-16; decode-length-cost B3): `scatter_nd` with
+    `Assign` is one row scatter at resident indices (NC's `SCATTER_ROWS`, `Session::scatter_rows`, gate `step189`),
+    and `FixedCache` writes a step's `kv` rows with it. A 1.7B decode step **73.65 / 76.08 / 79.30 -> 57.21 / 59.64 /
+    62.81 ms** (17.5-15.9 tokens/s, run `1792109477`); the 135M step 24.40-25.53 ms, below burn-flex's 26.66-31.12
+    ([log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The write is now
+    5.0 of 56.8 ms a 1.7B step; its two whole-cache copies (2.3 ms) are left (Track 2 item 6, step 6);
+  - [ ] the matmuls' bandwidth (59.5% of a 1.7B step, 33.8 ms; every `m = 1` job re-reads the padded activation:
+    [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md));
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
@@ -587,16 +593,19 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
        lengths, and a step attending to too few positions diverging), ttsim and card 0. **Left:**
        - chunks of 512 (the per-token prefill cost had not flattened at 256: 0.29 ms, `1792036724`) and chunks that also
          attend only to what they use;
-       - the cache write's `expand` and `mask_where`, still whole-cache (about 1 ms a step at 512 positions; step 6's
-         native row write).
+       - ~~the cache write's `expand` and `mask_where`~~ (2026-10-16: a step writes one row a head, step 6).
     5. **One tile and `work:64:4`:** prefill chunks and ResNet-18/ViT capture there only once traces are segmented
        ("Trace segmentation" below).
     6. [ ] **What is left of a replay's fixed cost** (each measured in [replay-fixed-cost.md](replay-fixed-cost.md),
        P0 and P2; decode is at burn-flex, not below it). In order of share:
-       - **The cache write's operands** (~70 us a layer, ~2 ms a step): `k` and `v` expanded to the cache's shape by
-         device copies (`expanded`), then two whole-cache `mask_where`s. A native row assign at a resident index
-         (Burn's `select_assign` with `IndexingUpdateOp::Assign`; `burn-tt` has only `select_add` natively) would write
-         the one row instead: a new op, so its definition of done applies.
+       - [x] **The cache write's operands** (2026-10-16). Burn 0.21's `select_assign` panics for `Assign` before a
+         backend sees it, so the reachable op is `scatter_nd` with `Assign`: now one row scatter at resident indices
+         (`Session::scatter_rows`, NC's `SCATTER_ROWS`, gate `step189`; ttsim and card 0), which `FixedCache` uses for a
+         step. Left of the write (`Step(64)` profile, 1.7B, `1792110380`, 5.03 ms a step): the scatter's tile copy and
+         the trace's write-back, two whole-cache copies (2.26 ms; writing in place inside a capture would remove both:
+         how to make that safe is [in-place-cache-write.md](../proposals/in-place-cache-write.md)),
+         and the value's repack and block copy after RoPE (1.47 ms). Prefill chunks still `mask_where` (a padded chunk
+         may run past the cache, and a scatter cannot drop rows).
        - **The RMSNorm's broadcast `div`** (27 us, twice a layer): the mover broadcasts the `[1, 1]` column in software
          (`READ_BROADCAST_COL`), and the SFPU divides.
        - **The replay's start** (~170 us): every unit's catch-up and its `CALL` are two enqueues, since the mover takes

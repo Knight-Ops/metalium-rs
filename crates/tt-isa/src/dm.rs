@@ -399,7 +399,7 @@ const _: () = {
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
-        assert!(ops[i] < record::GATHER || ops[i] > record::SELECT_ROWS);
+        assert!(ops[i] < record::GATHER || ops[i] > record::SCATTER_ROWS);
         i += 1;
     }
 };

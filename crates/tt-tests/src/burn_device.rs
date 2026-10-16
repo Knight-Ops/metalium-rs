@@ -593,6 +593,16 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.assign_rows(&mut self.session, t, value, rows)
         }
+        fn scatter_rows(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            values: burn_tt::BufferId,
+            column: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .scatter_rows(&mut self.session, table, indices, values, column)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }

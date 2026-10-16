@@ -119,7 +119,7 @@ and 512 positions. The fold is most of the gain (5 ms a step); the step lengths 
 generation is now faster than burn-flex at every prompt length: 0.90x, 0.74x and 0.60x of its time. The first token
 also improved (35.1 / 46.0 / 69.3 ms, was 38.8 / 49.6 / 73.0), since the chunks fold too.
 
-### B3. Deferred: a row write at a resident index
+### B3. A row write at a resident index (done 2026-10-16)
 
 Per B0, the cache write's `expand` (+27 us a layer at 512) and `mask_where` (+8) are what still grow after B2: a step
 over 512 positions is 1.2 ms slower than one over 64 (26.13 against 27.31 ms). A native row write at a device-held
@@ -132,4 +132,6 @@ left for when longer contexts or a larger model make it a larger share.
 - A0, A1 (trace size 3,754 -> 563 MB, and 517 MB with four step lengths);
 - B0, B1, B2 (decode at or below burn-flex at every length measured).
 
-B3 is deferred. This plan moves to `completed-plans/` when the roadmap entries cite it.
+B3 was done on 2026-10-16, once SmolLM2-1.7B made it a quarter of a step: `scatter_nd` with `Assign` as one row scatter
+(NC's `SCATTER_ROWS`), which `FixedCache` writes a step with. A 1.7B decode step 73.65 -> 57.21 ms at a 32-token
+prompt ([log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)).

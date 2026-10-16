@@ -4923,6 +4923,47 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `values`' row `i` written over `dst`'s row `indices[i]`, in place, the
+    /// indices a resident I32 tensor, `[1, n]` or (`column`) `[n, 1]`
+    /// ([`crate::index::scatter_rows_jobs`]): no host address, so a trace
+    /// replays it with the indices it finds. A repeated index's last row is
+    /// written; one outside `0..dst.rows` is `DOMAIN` from the mover, queued as
+    /// any list's error.
+    pub fn scatter_rows_into(
+        &mut self,
+        dst: &DramTensor,
+        indices: &DramTensor,
+        values: &DramTensor,
+        column: bool,
+    ) -> Result<(), TensorError> {
+        let units = self.spread_for(tiles_of(values));
+        let jobs = crate::index::scatter_rows_jobs(dst, indices, values, column, units)?;
+        self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
+        if values.pad() != tensor::Pad::Zero {
+            dst.set_pad(tensor::Pad::Undefined);
+        }
+        Ok(())
+    }
+
+    /// A copy of `table` with `values`' row `i` at its row `indices[i]`
+    /// ([`Session::scatter_rows_into`] over a tile copy, [`Session::copy`]):
+    /// Burn's `scatter_nd` with `Assign` over whole rows, a cache write at a
+    /// position the card holds. `table` is not written.
+    pub fn scatter_rows(
+        &mut self,
+        table: &DramTensor,
+        indices: &DramTensor,
+        values: &DramTensor,
+        column: bool,
+    ) -> Result<DramTensor, TensorError> {
+        let out = self.copy(table)?;
+        if let Err(e) = self.scatter_rows_into(&out, indices, values, column) {
+            self.free(out)?;
+            return Err(e);
+        }
+        Ok(out)
+    }
+
     /// `t` with `value`'s row `i` added to its row `indices[i]`, for every `i`
     /// in order -- Burn's `select_add` along rows, an embedding's gradient --
     /// on the card, in a new tensor. Only the rows the indices touch are

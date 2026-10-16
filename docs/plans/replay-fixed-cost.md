@@ -82,8 +82,8 @@ stays bit for bit the eager step (`step185_fixed_decode`).
 - [x] **A tensor mostly of padding downloads untilized by the card** (`Session::dma_download`): rows filling at most a
   quarter of their tile rows come back as rows, on a unit per 96 tiles. Gate `step58_tile_layout` (now with `[2, 3100]`;
   card 0, run `1792036250`). The logits read: 0.95 -> 0.47 ms.
-- [ ] Left, by share (tracked as [roadmap](roadmap.md) Track 2 item 6, next step 6): the cache write's `k` and `v` expands and two `mask_where`s (~70 us a layer; a native row assign at
-  a resident index would replace them), the RMSNorm's broadcast `div` (27 us, twice a layer), the replay's start (~170 us:
+- [ ] Left, by share (tracked as [roadmap](roadmap.md) Track 2 item 6, next step 6): ~~the cache write's `k` and `v` expands and two `mask_where`s~~ (done 2026-10-16: one row
+  scatter a write, `scatter_nd` with `Assign`; its two whole-cache copies remain), the RMSNorm's broadcast `div` (27 us, twice a layer), the replay's start (~170 us:
   the mover takes a `CALL` only as a list of its own, so each unit's catch-up is a second enqueue), and each op's ~3.5 us
   of control.
 

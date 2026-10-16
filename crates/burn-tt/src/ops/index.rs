@@ -27,8 +27,12 @@
 //!   fold in index order, `((data + v_0) + v_1) + ...`, as Flex's sequential
 //!   `+=` does.
 //! * `scatter_nd(Assign)`: **the last writer in index order wins** (Flex's
-//!   sequential overwrite). Each index tuple, in order, replaces its row through
-//!   a mask select, so a later tuple replaces an earlier one by construction.
+//!   sequential overwrite). One row scatter on the card (`Session::scatter_rows`,
+//!   the mover's `SCATTER_ROWS`): a tile copy of the data, then each tuple's row
+//!   written at the row the card holds, a repeated row from its last tuple. With
+//!   `K = 1` the indices are read where they are and the mover's own `DOMAIN`
+//!   check is the coordinate's, so a cache write at a resident position is one
+//!   op. Packed storage keeps the mask loop of `Mul` below.
 //! * `scatter_nd(Mul | Min | Max)` run the same per-tuple loop as Assign, so
 //!   duplicates fold in index order as Flex's sequential update does (Burn leaves
 //!   the order undefined; ours is Flex's). `Mul` replaces the row by
@@ -270,14 +274,69 @@ fn scatter_nd(
             ),
         );
     }
-    let flat = nd_flat_rows(&data, &indices, &nd);
     let table = restack(&data, vec![nd.rows, nd.rest]);
     let rows = restack(&values, vec![nd.n, nd.rest]);
+    if reduction == IndexingUpdateOp::Assign {
+        if let Some(updated) = scatter_rows_native(&data, &indices, &table, &rows, &nd) {
+            return restack(&updated, data.shape().to_vec());
+        }
+    }
+    let flat = nd_flat_rows(&data, &indices, &nd);
     let updated = match reduction {
         IndexingUpdateOp::Add => select_add_native(table, 0, flat, rows),
         _ => scatter_rows(table, flat, rows, reduction),
     };
     restack(&updated, data.shape().to_vec())
+}
+
+/// `scatter_nd(Assign)` as one row scatter on the card (`Session::scatter_rows`):
+/// a copy of `table` (`[P, R]`) with `rows[j]` written at row `flat[j]`, the
+/// last writer winning, no mask pass over the table. With one coordinate
+/// (`K = 1`) the indices are the flat rows themselves, an `[N, 1]` column the
+/// mover reads where it is, and its own `DOMAIN` check (`0..P`, read as
+/// unsigned) is the coordinate's; with more, the checked flat rows of
+/// [`nd_flat_rows`]. `None` for what the primitive does not take (packed
+/// storage), which the mask loop then runs.
+fn scatter_rows_native(
+    data: &TtTensor,
+    indices: &TtTensor,
+    table: &TtTensor,
+    rows: &TtTensor,
+    nd: &Nd,
+) -> Option<TtTensor> {
+    let device = data.device;
+    let (index, column) = if nd.k == 1 {
+        (restack(indices, vec![nd.n, 1]), true)
+    } else {
+        (nd_flat_rows(data, indices, nd), false)
+    };
+    let (t, i, v) = (plain_dram(table), plain_dram(&index), plain_dram(rows));
+    let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    let index_dims = if column { [nd.n, 1] } else { [1, nd.n] };
+    if !words(&t)
+        || !words(&i)
+        || !words(&v)
+        || [t.buffer.rows, t.buffer.cols] != [nd.rows, nd.rest]
+        || [i.buffer.rows, i.buffer.cols] != index_dims
+        || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest]
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::scatter_rows(
+        device,
+        t.buffer.id,
+        i.buffer.id,
+        v.buffer.id,
+        column,
+        [nd.rows, nd.rest],
+    );
+    Some(device_result_shaped(
+        device,
+        id,
+        dims,
+        vec![nd.rows, nd.rest].into(),
+        data.dtype(),
+    ))
 }
 
 /// `table` (`[P, R]`) updated by `rows[j]` into row `flat[j]` for `j = 0..N` in

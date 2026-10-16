@@ -115,6 +115,35 @@ pub const SELECT_ROWS: u32 = 0x18;
 pub const POKE_RUN: u32 = 0x19;
 /// Words one [`POKE_RUN`] carries: five in its header, eight in the entry after it.
 pub const POKE_RUN_MAX: usize = 13;
+/// Whole rows written over a tensor's rows chosen by indices already in L1,
+/// L1 -> GDDR: [`SELECT_ROWS`] the other way, on the writer. `[SCATTER_ROWS,
+/// idx_at, count, bound, j0, cols, stage_at, flags]` + `X`. For each of the
+/// first `count` (1..=32) indices `v` (index `r` at `(0, r)` of the slot at
+/// `idx_at`, or at `(r, 0)` with [`SCATTER_ROWS_COLUMN`]: an `[n, 1]` index
+/// tensor's tile), row `r` of the slots `j - j0` from `stage_at` goes to row
+/// `v` of `X` (a tensor of `bound` rows), for tile columns `j0..j0 + cols` --
+/// two 64-byte face-row writes a tile column, as `tensor::write_rows` makes
+/// them, except that the destination is found here, from the index the card
+/// holds. Every other datum of `X` is left as it was.
+///
+/// An index at or past `bound`, or a negative one (read as `u32`), is
+/// [`super::error::DOMAIN`] before any write is issued. When two of the
+/// record's indices name one row, **the later one's row is written** and the
+/// earlier one's is not: writes to one address through different ports are not
+/// ordered, so the record, not the NoC, decides. Between records the writer's
+/// credit pop waits for its writes (`Action::Pop`), so a later batch's row
+/// lands after an earlier batch's.
+///
+/// `flags`: [`SCATTER_ROWS_COLUMN`]; bit 0 (16-bit datums) is reserved and,
+/// as any other bit, [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
+/// slots are not checked against the data arena here
+/// (`tt_kernels::index::scatter_rows_jobs` places them from its plan); each
+/// write's L1 range is checked as any write's is. The host's [`expand`] reads
+/// every index as `0`, so it checks the geometry only.
+pub const SCATTER_ROWS: u32 = 0x1A;
+/// [`SCATTER_ROWS`]'s indices are a column, `(r, 0)` of the slot: an `[n, 1]`
+/// index tensor, read where it is with no repack.
+pub const SCATTER_ROWS_COLUMN: u32 = 1 << 1;
 
 /// A [`POKE_RUN`] of `values` into the words from `address`, which the caller
 /// has checked is a role mailbox's (`Entry::decode` refuses what is not, of
@@ -154,7 +183,7 @@ pub const fn poke_run_word(rec: &[[u32; 8]], k: usize) -> u32 {
 pub const fn direction(op: u32) -> Option<Direction> {
     match op {
         GATHER | READ_RUN | FILL_PAD | SELECT_ROWS => Some(Direction::Read),
-        SCATTER | WRITE_RUN | PAD_WRITE => Some(Direction::Write),
+        SCATTER | WRITE_RUN | PAD_WRITE | SCATTER_ROWS => Some(Direction::Write),
         _ => None,
     }
 }
@@ -176,7 +205,7 @@ pub const MAX_EXTENT: u32 = 1 << 16;
 pub const fn len(op: u32) -> usize {
     match op {
         GATHER => 5,
-        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN | SELECT_ROWS => 3,
+        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN | SELECT_ROWS | SCATTER_ROWS => 3,
         POKE_RUN => 2,
         _ => 1,
     }
@@ -315,7 +344,7 @@ fn extent(v: u32) -> Result<u32, u32> {
 /// inside a job: exactly the list the session used to send.
 ///
 /// The host's expansion, for validation: it has no L1, so a [`SELECT_ROWS`]
-/// index reads as `0` (see there).
+/// or [`SCATTER_ROWS`] index reads as `0` (see there).
 pub fn expand(rec: &[[u32; 8]], emit: impl FnMut([u32; 8]) -> Result<(), u32>) -> Result<(), u32> {
     expand_for::<true, true>(rec, &mut |_| 0, emit)
 }
@@ -334,11 +363,14 @@ pub fn expand_reads(
 }
 
 /// [`expand`] of the writing records only: what RISCV NC's firmware calls.
+/// `index` reads the L1 word at an address, for [`SCATTER_ROWS`]; the caller
+/// has made the indices visible before it calls.
 pub fn expand_writes(
     rec: &[[u32; 8]],
+    mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<false, true>(rec, &mut |_| 0, emit)
+    expand_for::<false, true>(rec, &mut index, emit)
 }
 
 #[inline(always)]
@@ -618,6 +650,54 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 }
             }
         }
+        SCATTER_ROWS if WRITES => {
+            let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
+            if flags & !SCATTER_ROWS_COLUMN != 0 {
+                // 16-bit datums (bit 0) are not implemented.
+                return Err(super::error::RANGE);
+            }
+            let (x, cols) = indexed_rows(rec, count, bound, j0, cols)?;
+            // As `SELECT_ROWS`: every index checked before any write, each
+            // read again where it is used, 32-bit arithmetic throughout.
+            const DATA: u32 = TILE_DATA as u32;
+            let word = |r: u32| {
+                idx_at
+                    + DATA
+                    + if flags & SCATTER_ROWS_COLUMN != 0 {
+                        (r / 16 * 512 + r % 16 * 16) * 4
+                    } else {
+                        (r / 16 * 256 + r % 16) * 4
+                    }
+            };
+            for r in 0..count {
+                if index(word(r)) >= bound {
+                    return Err(super::error::DOMAIN);
+                }
+            }
+            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
+            let mut port = 0;
+            for r in 0..count {
+                let v = index(word(r));
+                // A later index naming the same row is the one written.
+                let mut later = r + 1;
+                while later < count && index(word(later)) != v {
+                    later += 1;
+                }
+                if later < count {
+                    continue;
+                }
+                let mut row = x.cursor(v / 32, j0)?;
+                for j in 0..cols {
+                    let (ch, off) = row.next()?;
+                    for half in 0..core::hint::black_box(2) {
+                        let to = off + face_row(v % 32, half);
+                        let from = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
+                        emit([op::WRITE, ch, port, to, from, 64, 0, 0])?;
+                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                    }
+                }
+            }
+        }
         POKE_RUN => {
             // RISCV B's, as `Mover::permits` has it: it is not a write, so NC does not
             // reach the mailbox words through a record either.
@@ -646,6 +726,34 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         _ => return Err(super::error::OP),
     }
     Ok(())
+}
+
+/// [`SELECT_ROWS`]'s and [`SCATTER_ROWS`]'s shared header checks: `count`
+/// indices of a tensor of `bound` rows, tile columns `j0..j0 + cols` of the
+/// record's tensor, which this returns with the checked `cols`.
+#[inline(always)]
+fn indexed_rows(
+    rec: &[[u32; 8]],
+    count: u32,
+    bound: u32,
+    j0: u32,
+    cols: u32,
+) -> Result<(TensorRef, u32), u32> {
+    if count == 0 || count > 32 || bound == 0 || bound > i32::MAX as u32 {
+        return Err(super::error::LENGTH);
+    }
+    let cols = extent(cols)?;
+    let x = tensor(rec, 1)?;
+    // Every tile number a checked index can name fits a `u32` (the cursor
+    // adds without checking: an index comes from L1).
+    let tiles = bound
+        .div_ceil(32)
+        .checked_mul(x.ct)
+        .and_then(|t| t.checked_add(x.first));
+    if x.ct == 0 || tiles.is_none() || j0.checked_add(cols).is_none_or(|end| end > x.ct) {
+        return Err(super::error::RANGE);
+    }
+    Ok((x, cols))
 }
 
 /// [`FILL_PAD`]'s edge tiles (`WRITE` false: each read into its slot and
@@ -788,7 +896,7 @@ mod tests {
         assert!(super::super::Mover::B.permits(POKE_RUN));
         assert!(!super::super::Mover::NC.permits(POKE_RUN));
         assert_eq!(
-            expand_writes(&rec, |_| Ok(())),
+            expand_writes(&rec, |_| 0, |_| Ok(())),
             Err(super::super::error::DIRECTION)
         );
         assert!(expand_reads(&rec, &mut |_| 0, |_| Ok(())).is_ok());
@@ -868,7 +976,7 @@ mod tests {
         assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
         a0[5] = 32; // Descriptor dimensions must agree with its grid.
         assert!(expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
-        assert!(expand_writes(&[head, a0, a1, b0, b1], |_| Ok(())).is_err());
+        assert!(expand_writes(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
     }
 
     /// Every tile a record names is the one `TensorRef::tile` gives: the
@@ -1082,7 +1190,7 @@ mod tests {
         let run = |rec: &[[u32; 8]]| expand_reads(rec, |_| 0, |_| Ok(()));
         assert_eq!(run(&ok), Ok(()));
         // The writer's code does not hold it.
-        assert_eq!(expand_writes(&ok, |_| Ok(())), Err(DIRECTION));
+        assert_eq!(expand_writes(&ok, |_| 0, |_| Ok(())), Err(DIRECTION));
         assert_eq!(direction(SELECT_ROWS), Some(Direction::Read));
         assert_eq!(len(SELECT_ROWS), 3);
         for (word, value, want) in [
@@ -1110,6 +1218,210 @@ mod tests {
         huge[0][3] = 1 << 10; // 32 tile rows of 65,536 tiles do fit
         assert_eq!(run(&huge), Ok(()));
         // No table: its channel count is zero.
+        let mut none = ok;
+        none[1][0] = 0;
+        assert_eq!(run(&none), Err(RANGE));
+    }
+
+    /// An L1 holding `values` as an index tile at `IDX` in column 0 (an
+    /// `[n, 1]` index tensor's tile), refusing any other address.
+    fn l1_column_of(values: &[u32]) -> impl FnMut(u32) -> u32 {
+        let mut words = std::collections::HashMap::new();
+        for (r, &v) in values.iter().enumerate() {
+            words.insert(IDX + 16 + crate::dm::face_index(r, 0) as u32 * 4, v);
+        }
+        move |at| *words.get(&at).unwrap_or_else(|| panic!("read of {at:#x}"))
+    }
+
+    /// A `SCATTER_ROWS` of `count` indices into `bound` rows, tile columns
+    /// `j0..j0 + cols` of `x`.
+    fn scatter(
+        x: TensorRef,
+        bound: u32,
+        count: u32,
+        j0: u32,
+        cols: u32,
+        flags: u32,
+    ) -> [[u32; 8]; 3] {
+        let [m0, m1] = x.encode();
+        [
+            [SCATTER_ROWS, IDX, count, bound, j0, cols, STAGE, flags],
+            m0,
+            m1,
+        ]
+    }
+
+    /// The writes a `SCATTER_ROWS` of distinct `values` must make, from the
+    /// face layout (`face_index`) and `TensorRef::tile`, independently of
+    /// `expand`'s arithmetic: staged row `r`'s two face-rows of each tile
+    /// column to row `values[r]`'s, the ports rotating.
+    fn scattered(x: &TensorRef, values: &[u32], j0: u32, cols: u32) -> Vec<[u32; 8]> {
+        let mut want = Vec::new();
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = x.tile(v / 32, j0 + j).unwrap();
+                for h in 0..2usize {
+                    let to = off as u64
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index((v % 32) as usize, 16 * h) as u64;
+                    let from = STAGE as u64
+                        + j as u64 * TILE_SLOT
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index(r, 16 * h) as u64;
+                    let n = want.len() as u32;
+                    want.push([op::WRITE, ch, n % PORTS, to as u32, from as u32, 64, 0, 0]);
+                }
+            }
+        }
+        want
+    }
+
+    /// Each index's staged row goes to its two face-rows of every tile column
+    /// of the destination -- across a channel wrap mid-row, a view that starts
+    /// mid-grid, the first and last rows, and a row either side of a tile --
+    /// with the indices in a row of their tile or in a column of it.
+    #[test]
+    fn scatter_rows_writes_the_face_rows_of_each_index() {
+        let mut x = t(3, 5);
+        x.first = 2;
+        let bound = 100;
+        let values = [
+            0u32, 99, 31, 32, 33, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13,
+            14, 15, 18, 19, 20, 21, 22, 23, 24,
+        ];
+        let (j0, cols) = (1u32, 3u32);
+        let want = scattered(&x, &values, j0, cols);
+        for (flags, l1) in [
+            (
+                0,
+                std::boxed::Box::new(l1_of(&values)) as std::boxed::Box<dyn FnMut(u32) -> u32>,
+            ),
+            (
+                SCATTER_ROWS_COLUMN,
+                std::boxed::Box::new(l1_column_of(&values)),
+            ),
+        ] {
+            let rec = scatter(x, bound, values.len() as u32, j0, cols, flags);
+            let mut got = Vec::new();
+            expand_writes(&rec, l1, |e| {
+                got.push(e);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(got, want, "flags {flags}");
+            // What a GDDR write needs: congruent mod 16 (and these mod 64).
+            for e in &got {
+                assert_eq!(e[3] % 64, e[4] % 64);
+            }
+        }
+    }
+
+    /// When indices repeat, only the last of them is written -- its staged
+    /// row, not an earlier one's -- whichever positions they are in.
+    #[test]
+    fn scatter_rows_writes_a_repeated_row_once_from_its_last_index() {
+        let x = t(2, 2);
+        let values = [5u32, 7, 5, 9, 7, 7, 40];
+        let rec = scatter(x, 64, values.len() as u32, 0, 2, 0);
+        let mut got = Vec::new();
+        expand_writes(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        // The staged rows written: 2 (row 5), 3 (row 9), 5 (row 7), 6 (row 40).
+        let mut want = Vec::new();
+        for (r, v) in [(2usize, 5u32), (3, 9), (5, 7), (6, 40)] {
+            for j in 0..2 {
+                let (ch, off) = x.tile(v / 32, j).unwrap();
+                for h in 0..2usize {
+                    let to = off as u64
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index((v % 32) as usize, 16 * h) as u64;
+                    let from = STAGE as u64
+                        + j as u64 * TILE_SLOT
+                        + TILE_DATA
+                        + 4 * crate::dm::face_index(r, 16 * h) as u64;
+                    want.push((ch, to as u32, from as u32));
+                }
+            }
+        }
+        let got: Vec<_> = got.iter().map(|e| (e[1], e[3], e[4])).collect();
+        assert_eq!(got, want);
+    }
+
+    /// An index at or past `bound`, or a negative one, is `DOMAIN` before a
+    /// single write is issued, wherever it is; the host's `expand` reads
+    /// every index as 0 (one row, written once) and checks the geometry.
+    #[test]
+    fn scatter_rows_refuses_an_index_out_of_range_before_any_write() {
+        let x = t(4, 3);
+        for (values, ok) in [
+            ([0u32, 99, 5], true),
+            ([0, 100, 5], false),
+            ([0, 1, 100], false),
+            ([u32::MAX, 1, 2], false),
+            ([1, 2, 0x8000_0000], false),
+        ] {
+            let rec = scatter(x, 100, values.len() as u32, 0, 3, 0);
+            let mut issued = 0;
+            let got = expand_writes(&rec, l1_of(&values), |_| {
+                issued += 1;
+                Ok(())
+            });
+            if ok {
+                assert_eq!((got, issued), (Ok(()), 3 * 3 * 2), "{values:?}");
+            } else {
+                assert_eq!(
+                    (got, issued),
+                    (Err(crate::dm::error::DOMAIN), 0),
+                    "{values:?}"
+                );
+            }
+        }
+        let rec = scatter(x, 100, 4, 0, 3, SCATTER_ROWS_COLUMN);
+        let mut issued = 0;
+        expand(&rec, |_| {
+            issued += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(issued, 3 * 2);
+    }
+
+    #[test]
+    fn scatter_rows_refuses_what_it_should() {
+        use crate::dm::error::{DIRECTION, LENGTH, RANGE};
+        let x = t(3, 4);
+        let ok = scatter(x, 64, 3, 1, 3, 0);
+        let run = |rec: &[[u32; 8]]| expand_writes(rec, |_| 0, |_| Ok(()));
+        assert_eq!(run(&ok), Ok(()));
+        // The reader's code does not hold it, nor does its mover run it.
+        assert_eq!(expand_reads(&ok, |_| 0, |_| Ok(())), Err(DIRECTION));
+        assert_eq!(direction(SCATTER_ROWS), Some(Direction::Write));
+        assert_eq!(len(SCATTER_ROWS), 3);
+        assert!(crate::dm::Mover::NC.permits(SCATTER_ROWS));
+        assert!(!crate::dm::Mover::B.permits(SCATTER_ROWS));
+        for (word, value, want) in [
+            (2, 0, LENGTH),       // no indices
+            (2, 33, LENGTH),      // more than a tile of them
+            (3, 0, LENGTH),       // no rows
+            (3, 1 << 31, LENGTH), // more than an I32 names
+            (5, 0, LENGTH),       // no tile columns
+            (4, 2, RANGE),        // columns 2..5 of 4
+            (5, 4, RANGE),        // columns 1..5 of 4
+            (7, 1, RANGE),        // 16-bit datums are not implemented
+            (7, 4, RANGE),        // an unknown flag
+        ] {
+            let mut bad = ok;
+            bad[0][word] = value;
+            assert_eq!(run(&bad), Err(want), "word {word} = {value:#x}");
+        }
+        let wide = TensorRef {
+            ct: 1 << 16,
+            ..t(3, 1)
+        };
+        assert_eq!(run(&scatter(wide, i32::MAX as u32, 3, 0, 3, 0)), Err(RANGE));
         let mut none = ok;
         none[1][0] = 0;
         assert_eq!(run(&none), Err(RANGE));
