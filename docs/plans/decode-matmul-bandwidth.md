@@ -202,9 +202,15 @@ the rest is entries. Next:
 
 **What is left of the products** (24.0 ms; ~9.5 GB a step, ~395 GB/s on average; the weights alone ~14.3 ms at
 480 GB/s):
-- `o` and `down` run on 64 units at ~300 GB/s: 64 units x 8 requests in flight (`dm::TILE_IN_FLIGHT_CAP`) is too
-  little to cover GDDR's latency (Little's law). The cap was chosen for every tile reading at once. Next, measure
-  caps above 8 for products on fewer units (the fast-mode sweep only went 2-8).
+- `o` and `down` run on 64 units at ~300 GB/s. **Not the in-flight cap:** a mover started at 16, 32 or 128 requests
+  in flight (`dm::TILE_IN_FLIGHT_CAP` is 8) leaves the 1.7B step at 47.94 / 47.96 / 48.20 ms against 47.90 (runs
+  `1792163344`, `1792163754`, `1792164166`; an experiment, not kept).
+  - **What the numbers fit:** a `q` job is 128 entries in 76 us with whole tiles and 54 us thin, which fits ~0.13 us
+    a request plus ~9 GB/s a unit.
+  - **A likely reason, not yet measured:** each unit streams a weight column's tiles from one channel (`j % 8`),
+    eight units to a channel.
+  - **Next:** the probe P0 planned (a unit's `B` stream alone, `READ_RUN`, on 64 and 120 units, and with the
+    columns spread over channels), then a placement that spreads a job's `B` tiles if channels are the bound.
 - `qkv`'s uneven last round (2 and 1 columns).
 - `A` read again by every job (~70 KB a job, thin).
 
