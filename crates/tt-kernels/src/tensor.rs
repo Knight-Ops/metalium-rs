@@ -1230,9 +1230,24 @@ pub fn matmul_dram(
         allow_mop,
         pipeline,
         None,
+        true,
     )
 }
 
+/// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
+/// it uses ([`record::gather_rows`]): `m % 32` when that is 1..=16 and `A` is
+/// not transposed, otherwise 0 (whole tiles). An `m = 1` decode product reads
+/// one row of each `A` tile instead of 32.
+pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
+    match m % 32 {
+        r @ 1..=16 if !a_transposed => r as u32,
+        _ => 0,
+    }
+}
+
+/// [`matmul_dram`] with `K` blocked to at most `max_k_tiles`, and `thin`: whether
+/// `A`'s last tile row is read as only its [`thin_rows`] (off, whole tiles: the
+/// output's padding rows are then what `A`'s held).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_limited(
     alloc: &mut DramAlloc,
@@ -1246,6 +1261,7 @@ pub(crate) fn matmul_dram_limited(
     allow_mop: bool,
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
+    thin: bool,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1284,6 +1300,7 @@ pub(crate) fn matmul_dram_limited(
     } else {
         kc
     };
+    let col_runs = thin_runs([mt, kt, nt], [kc, nc], staging, units);
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
     let c = DramTensor::alloc(alloc, m, n)?;
@@ -1298,6 +1315,8 @@ pub(crate) fn matmul_dram_limited(
         route,
         fidelity,
         allow_mop,
+        thin: if thin { thin_rows(m, a_transposed) } else { 0 },
+        col_runs,
     };
     if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
         alloc.free(&c.placement);
@@ -1317,6 +1336,40 @@ struct BlockPlan {
     route: SrcRoute,
     fidelity: Fidelity,
     allow_mop: bool,
+    /// [`thin_rows`] of `op(A)`, set on the gathers of its last tile row.
+    thin: u32,
+    /// The output's columns, one run a job in dealing order, when [`thin_runs`]
+    /// deals them (instead of `block`'s width).
+    col_runs: Option<Vec<std::ops::Range<usize>>>,
+}
+
+/// A one-tile-row product's output columns, one run a job, in the order a
+/// session deals them (job `j` to unit `j % units`): whole rounds of the plan's
+/// width `nc`, then what is left as even runs over as many units as it covers.
+/// [`blocks`] cuts every job `nc` wide, so the last round's few jobs leave most
+/// units idle while some do a whole block more (`[1, 2048] @ [2048, 8192]`, `nc`
+/// 2 on 120 units: 8 units run two jobs of 2, 4 columns; spread, 16 run 2 + 1,
+/// and no unit more than the 3 that 256 columns over 120 units need). For
+/// `K` whole and unpipelined only (`None` otherwise, and with no columns past
+/// one per unit to deal). Each output tile's accumulation is unchanged: only
+/// which job holds it moves.
+pub fn thin_runs(
+    [mt, kt, nt]: [usize; 3],
+    [kc, nc]: [usize; 2],
+    staging: Staging,
+    units: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if mt != 1 || kc < kt || staging != Staging::Slots || nt <= units || nc == 0 {
+        return None;
+    }
+    let full = nt / (units * nc) * units * nc;
+    let mut out: Vec<_> = (0..full).step_by(nc).map(|j| j..j + nc).collect();
+    out.extend(
+        runs(nt - full, units, nc)
+            .into_iter()
+            .map(|r| full + r.start..full + r.end),
+    );
+    Some(out)
 }
 
 impl BlockPlan {
@@ -1337,10 +1390,16 @@ impl BlockPlan {
         let [mc, nc] = self.block;
         let (units, staging) = (self.units, self.staging);
         let (in_fmt, out_fmt) = self.route.formats();
+        let col_blocks: Vec<(usize, usize)> = match &self.col_runs {
+            Some(runs) => runs.iter().map(|r| (r.start, r.len())).collect(),
+            None => (0..nt)
+                .step_by(nc)
+                .map(|j0| (j0, nc.min(nt - j0)))
+                .collect(),
+        };
         for i0 in (0..mt).step_by(mc) {
             let rows = mc.min(mt - i0);
-            for j0 in (0..nt).step_by(nc) {
-                let cols = nc.min(nt - j0);
+            for &(j0, cols) in &col_blocks {
                 let tiles = [rows, kt, cols];
                 // A session deals job `j` to unit `j % units`, so a unit's blocks
                 // are every `units`-th: they alternate halves by `j / units`.
@@ -1358,8 +1417,11 @@ impl BlockPlan {
                     sems,
                     init,
                 } = layout;
-                let flags =
-                    u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
+                let thin = if i0 + rows == mt { self.thin } else { 0 };
+                let flags = u32::from(a_transposed)
+                    | u32::from(b_transposed) << 1
+                    | record::gather_rows(thin)
+                    | (kt as u32) << 8;
                 let gather = [
                     [
                         record::GATHER,
@@ -1485,8 +1547,10 @@ impl BlockPlan {
                     } else {
                         (k0 * br.ct as usize) as u32
                     };
+                    let thin = if i + 1 == mt { self.thin } else { 0 };
                     let flags = u32::from(transposed[0])
                         | u32::from(transposed[1]) << 1
+                        | record::gather_rows(thin)
                         | (count as u32) << 8;
                     let mut gather = vec![
                         [
@@ -1759,6 +1823,10 @@ pub(crate) fn matmul_dram_batched_limited(
         route,
         fidelity,
         allow_mop,
+        // Whole tiles: attention's products are not the decode weights' reads
+        // (decode-matmul-bandwidth P1), and their padding claims stay as they were.
+        thin: 0,
+        col_runs: None,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -4304,6 +4372,144 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A thin product's columns are dealt so that the busiest unit holds the
+    /// fewest a balanced deal can give it, `ceil(nt / units)`, in jobs no wider
+    /// than the plan's block, covering every column once and in order -- and
+    /// never more than [`blocks`]' deal gave it. Not for `K` blocked, a
+    /// pipelined staging, more than one tile row, or no more columns than units.
+    #[test]
+    fn thin_runs_give_no_unit_more_than_its_share() {
+        use super::thin_runs;
+        use crate::matmul::Staging;
+        let load = |cols: &mut dyn Iterator<Item = usize>, units: usize| {
+            let mut load = vec![0; units];
+            for (j, c) in cols.enumerate() {
+                load[j % units] += c;
+            }
+            load.into_iter().max().unwrap()
+        };
+        for units in [1, 7, 64, 120] {
+            for nc in [1, 2, 3] {
+                for nt in [
+                    units + 1,
+                    units * nc,
+                    units * nc + 1,
+                    2 * units * nc + units / 2 + 1,
+                    1536,
+                ] {
+                    let runs = thin_runs([1, 4, nt], [4, nc], Staging::Slots, units);
+                    if nt <= units {
+                        assert_eq!(runs, None);
+                        continue;
+                    }
+                    let runs = runs.unwrap();
+                    let mut next = 0;
+                    for r in &runs {
+                        assert_eq!(r.start, next);
+                        assert!(!r.is_empty() && r.len() <= nc, "{r:?} wider than {nc}");
+                        next = r.end;
+                    }
+                    assert_eq!(next, nt);
+                    let thin = load(&mut runs.iter().map(|r| r.len()), units);
+                    assert_eq!(thin, nt.div_ceil(units), "nt {nt} units {units} nc {nc}");
+                    let [_, bn] = blocks([1, nt], [1, nc], units);
+                    let whole = load(&mut (0..nt).step_by(bn).map(|j| bn.min(nt - j)), units);
+                    assert!(whole >= thin);
+                }
+            }
+        }
+        assert_eq!(thin_runs([1, 64, 256], [2, 2], Staging::Slots, 120), None);
+        assert_eq!(
+            thin_runs([1, 64, 256], [64, 2], Staging::SlotsHalf, 120),
+            None
+        );
+        assert_eq!(thin_runs([2, 64, 256], [64, 2], Staging::Slots, 120), None);
+        assert_eq!(thin_runs([1, 64, 120], [64, 2], Staging::Slots, 120), None);
+    }
+
+    /// What a decode step's `m = 1` products ask of GDDR, from the jobs
+    /// `matmul_dram` builds (decode-matmul-bandwidth P0): jobs, the rounds the
+    /// busiest unit runs, and the bytes its gathers read of `A` and of `B`.
+    /// `cargo test -p tt-kernels decode_products -- --nocapture` prints the table.
+    #[test]
+    fn decode_products_jobs_rounds_and_bytes() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::TILE_SLOT;
+        let units = 120;
+        // name, [k, n], B transposed (the tied head reads the table transposed)
+        let shapes = [
+            ("q/k/v/o", [2048, 2048], false),
+            ("gate/up", [2048, 8192], false),
+            ("down", [8192, 2048], false),
+            ("head", [2048, 49152], true),
+        ];
+        let mut rows = Vec::new();
+        for (name, [k, n], bt) in shapes {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = match bt {
+                true => DramTensor::alloc(&mut alloc, n, k),
+                false => DramTensor::alloc(&mut alloc, k, n),
+            }
+            .unwrap();
+            let work = super::matmul_dram(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                bt,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                true,
+            )
+            .unwrap();
+            let (mut a_bytes, mut b_bytes, mut gathers) = (0u64, 0u64, 0usize);
+            let mut per_unit = vec![0usize; units];
+            for (j, job) in work.jobs.iter().enumerate() {
+                per_unit[j % units] += 1;
+                for step in job {
+                    let Step::List { entries, .. } = step else {
+                        continue;
+                    };
+                    for e in entries.iter().filter(|e| e[0] == record::GATHER) {
+                        let kt = u64::from(e[1] >> 8);
+                        let [rows, cols] = [u64::from(e[5]), u64::from(e[7])];
+                        // A thin last tile row reads through row `r` of face 1.
+                        let r = u64::from(e[1] >> record::GATHER_ROWS_SHIFT & 0x1f);
+                        let last = if r == 0 { TILE_SLOT } else { 1024 + 64 * r };
+                        a_bytes += ((rows - 1) * TILE_SLOT + last) * kt;
+                        b_bytes += kt * cols * TILE_SLOT;
+                        gathers += 1;
+                    }
+                }
+            }
+            let plan = crate::matmul::plan_in(
+                [1, k, n],
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                crate::matmul::Staging::Slots,
+            )
+            .unwrap()
+            .tiles;
+            let busy = per_unit.iter().filter(|&&n| n > 0).count();
+            let rounds = *per_unit.iter().max().unwrap();
+            let two = per_unit.iter().filter(|&&n| n > 1).count();
+            rows.push(format!(
+                "{name:8} plan {plan:?} jobs {:4} gathers {gathers:4} busy {busy:3} rounds {rounds} \
+                 (units with >1 job: {two:3}) A {:6.1} MB  B {:6.1} MB  A share {:4.1}%",
+                work.jobs.len(),
+                a_bytes as f64 / 1e6,
+                b_bytes as f64 / 1e6,
+                100.0 * a_bytes as f64 / (a_bytes + b_bytes) as f64,
+            ));
+            // `B`'s whole tiles are read once: blocks never share a column.
+            assert_eq!(b_bytes, (k as u64 / 32) * (n as u64 / 32) * TILE_SLOT);
+        }
+        println!("{}", rows.join("\n"));
     }
 }
 

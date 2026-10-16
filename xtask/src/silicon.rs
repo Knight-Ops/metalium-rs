@@ -237,6 +237,8 @@ pub const SMOKE: &[&str] = &[
     // `scatter_nd` with `Assign` as one row scatter at resident indices (NC's `SCATTER_ROWS`): a
     // fixed cache's write of one row a head, not the whole cache (roadmap Track 2 item 6, step 6).
     "step189_scatter_rows::",
+    // A matmul reads only the rows of `A`'s last tile row it uses (decode-matmul-bandwidth P1).
+    "step190_thin_matmul::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

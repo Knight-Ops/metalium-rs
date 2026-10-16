@@ -26,9 +26,26 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160.
-/// Only local ragged lanes are zeroed, without changing the source tensor.
+/// Only local ragged lanes are zeroed, without changing the source tensor; a
+/// tile with at most 16 valid rows is read only through its last valid row of
+/// face 1 (faces 2 and 3 not at all), since the zeroing overwrites the rest.
+/// Bits 3-7 ([`gather_rows`], F32, `A` untransposed): `r`, 1..=16, the rows of
+/// `A`'s last tile row of the block that the product uses, which is then read
+/// as its datums up to row `r` of face 1 (one `1024 + 64 r`-byte read a tile:
+/// face 0 whole, face 1's first `r` rows) instead of whole tiles. Its other
+/// rows in L1 keep whatever they held, and face 0's rows past `r` hold `A`'s
+/// padding; either reaches only the same rows of the output -- its padding,
+/// then undefined. 0: whole tiles.
 pub const GATHER: u32 = 0x10;
 pub const GATHER_BF16: u32 = 1 << 2;
+/// Where [`GATHER`]'s `r` sits in its flags.
+pub const GATHER_ROWS_SHIFT: u32 = 3;
+
+/// [`GATHER`]'s flag bits for `A`'s last tile row read as its first `r` rows
+/// (`0`: whole tiles).
+pub const fn gather_rows(r: u32) -> u32 {
+    r << GATHER_ROWS_SHIFT
+}
 /// One matmul block's outputs, L1 -> GDDR: `[SCATTER, out_at, out_stride, i0,
 /// rows, j0, cols, 0]` + `C`. Output `(i, j)`'s datums are at `out_at + (i *
 /// cols + j) * out_stride`.
@@ -419,21 +436,32 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     }
                     for i in 0..nr {
                         let mut row = x.cursor(r0 + i, c0)?;
+                        let valid_rows = (height - (r0 + i) * 32).min(32);
                         for j in 0..nc {
                             let (ch, off) = row.next_with_slot(super::BF16_TILE_SLOT)?;
                             let to = (at as u64) + (i as u64 * nc as u64 + j as u64) * TILE_SLOT;
                             let to = u32::try_from(to).map_err(|_| super::error::RANGE)?;
-                            emit([
-                                op::READ,
-                                ch,
-                                (i + j) % PORTS,
-                                off,
-                                to,
-                                super::BF16_TILE_SLOT as u32,
-                                0,
-                                0,
-                            ])?;
-                            let valid_rows = (height - (r0 + i) * 32).min(32);
+                            if valid_rows <= 16 {
+                                // The datums through row `valid_rows - 1` of face 1
+                                // (512 bytes a face, 32 a face row), one read as
+                                // a whole tile is: the fill below zeroes every
+                                // other datum, so nothing else need land.
+                                const DATA: u32 = TILE_DATA as u32;
+                                let len = 512 + 32 * valid_rows;
+                                let port = (i + j) % PORTS;
+                                emit([op::READ, ch, port, off + DATA, to + DATA, len, 0, 0])?;
+                            } else {
+                                emit([
+                                    op::READ,
+                                    ch,
+                                    (i + j) % PORTS,
+                                    off,
+                                    to,
+                                    super::BF16_TILE_SLOT as u32,
+                                    0,
+                                    0,
+                                ])?;
+                            }
                             let valid_cols = (width - (c0 + j) * 32).min(32);
                             if valid_rows != 32 || valid_cols != 32 {
                                 emit([
@@ -476,18 +504,44 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     0,
                 ]
             };
+            let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
+            if thin > 16 || (thin != 0 && a_t) {
+                return Err(super::error::RANGE);
+            }
             for i in 0..rows {
                 let mut row = if a_t {
                     None
                 } else {
                     Some(a.cursor(i0 + i, 0)?)
                 };
+                let r = if i + 1 == rows { thin } else { 0 };
                 for kk in 0..kt {
                     let to = a_at + (i * kt + kk) * TILE_SLOT as u32;
-                    emit(match row.as_mut() {
-                        Some(r) => read(r.next()?, i0 + i, kk, to),
-                        None => fetch(&a, a_t, i0 + i, kk, to)?,
-                    })?;
+                    match row.as_mut() {
+                        // One read of the datums through row `r - 1` of face 1:
+                        // face 0 whole (its rows past `r` reach only the
+                        // output's padding), then face 1's first `r` rows. One
+                        // entry a tile, as a whole tile is: the mover's cost is
+                        // per entry as much as per byte (two face-row reads a
+                        // tile measured slower on small products).
+                        Some(c) if r != 0 => {
+                            let (ch, off) = c.next()?;
+                            const DATA: u32 = TILE_DATA as u32;
+                            let port = (i0 + i + kk) % PORTS;
+                            emit([
+                                op::READ,
+                                ch,
+                                port,
+                                off + DATA,
+                                to + DATA,
+                                1024 + 64 * r,
+                                0,
+                                0,
+                            ])?;
+                        }
+                        Some(c) => emit(read(c.next()?, i0 + i, kk, to))?,
+                        None => emit(fetch(&a, a_t, i0 + i, kk, to)?)?,
+                    }
                 }
             }
             for kk in 0..kt {
@@ -934,22 +988,43 @@ mod tests {
                     let channel = (tile % 3) as usize;
                     let off = x.base[channel] + tile / 3 * 2112;
                     let to = at + (i * nc + j) * 4160;
-                    assert_eq!(
-                        got[next],
-                        [
-                            op::READ,
-                            x.channels[channel] as u32,
-                            (i + j) % PORTS,
-                            off,
-                            to,
-                            2112,
-                            0,
-                            0
-                        ]
-                    );
-                    next += 1;
                     let rows = (height - i * 32).min(32);
                     let cols = (width - j * 32).min(32);
+                    if rows <= 16 {
+                        // The datums through row `rows - 1` of face 1 alone, whose
+                        // 16 datums start where the face layout says.
+                        let row = crate::dm::face_index(rows as usize - 1, 16) as u32;
+                        let len = 2 * (row + 16);
+                        assert_eq!(
+                            got[next],
+                            [
+                                op::READ,
+                                x.channels[channel] as u32,
+                                (i + j) % PORTS,
+                                off + 16,
+                                to + 16,
+                                len,
+                                0,
+                                0
+                            ]
+                        );
+                        next += 1;
+                    } else {
+                        assert_eq!(
+                            got[next],
+                            [
+                                op::READ,
+                                x.channels[channel] as u32,
+                                (i + j) % PORTS,
+                                off,
+                                to,
+                                2112,
+                                0,
+                                0
+                            ]
+                        );
+                        next += 1;
+                    }
                     if rows != 32 || cols != 32 {
                         assert_eq!(
                             got[next],
@@ -969,10 +1044,15 @@ mod tests {
                 }
             }
         }
+        // A's last tile row (5 rows) and B's (1 row) are read thin, an entry a
+        // tile as before.
         assert_eq!(next, 20);
         assert_eq!(next, got.len());
         let mut bad = head;
         bad[1] |= 1; // A BF16 transpose cannot enter the F32 mover transform.
+        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
+        let mut bad = head;
+        bad[1] |= gather_rows(1); // BF16 finds its rows in the metadata.
         assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
         a0[5] = 32; // Descriptor dimensions must agree with its grid.
         assert!(expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
@@ -1072,6 +1152,72 @@ mod tests {
                 expand(&[head, a0, a1], |_| Ok(())).is_err(),
                 "flags {flags}"
             );
+        }
+    }
+
+    /// A gather told `A`'s last tile row has `r` rows reads that row's tiles
+    /// from their first datum through row `r - 1` of face 1 -- where the face
+    /// layout puts it, at the same offset in GDDR and L1, one read a tile as a
+    /// whole tile is -- and everything else as whole tiles,
+    /// as before; `r` past 16, or with `A` transposed, is refused.
+    #[test]
+    fn a_thin_gather_reads_the_first_rows_of_a_last_tile_row() {
+        let mut a = t(3, 5);
+        a.first = 2;
+        let mut b = t(3, 7);
+        b.first = 4;
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        let (i0, rows, j0, cols, kt) = (1u32, 2u32, 2u32, 3u32, 4u32);
+        let (a_at, b_at) = (0x2_0000u32, 0x6_0000u32);
+        let gather = |flags: u32| {
+            let head = [GATHER, flags | kt << 8, a_at, b_at, i0, rows, j0, cols];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1, b0, b1], |e| {
+                got.push(e);
+                Ok(())
+            })
+            .map(|_| got)
+        };
+        let whole = gather(0).unwrap();
+        for r in [1u32, 2, 15, 16] {
+            for b_t in [0, 2] {
+                let got = gather(gather_rows(r) | b_t).unwrap();
+                let whole = gather(b_t).unwrap();
+                // Row 0's `A` tiles as before, then row 1's thin, then `B` as before.
+                let k = kt as usize;
+                assert_eq!(got[..k], whole[..k], "r {r}");
+                for kk in 0..k {
+                    let w = whole[k + kk];
+                    let e = got[k + kk];
+                    // From the first datum through row `r - 1` of face 1, whose
+                    // 16 datums start where the face layout says.
+                    let data = 16;
+                    let row = crate::dm::face_index(r as usize - 1, 16) as u32;
+                    let end = 16 + 4 * (row + 16);
+                    assert_eq!(
+                        [e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]],
+                        [
+                            op::READ,
+                            w[1],
+                            w[2],
+                            w[3] + data,
+                            w[4] + data,
+                            end - data,
+                            0,
+                            0
+                        ],
+                        "r {r}, kk {kk}"
+                    );
+                    // Congruent mod 64 at both ends, as a read must be.
+                    assert_eq!(e[3] % 64, e[4] % 64);
+                }
+                assert_eq!(got[2 * k..], whole[2 * k..], "r {r}: B unchanged");
+            }
+        }
+        assert_eq!(gather(0).unwrap(), whole, "0 is whole tiles");
+        for bad in [gather_rows(17), gather_rows(31), gather_rows(1) | 1] {
+            assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
     }
 

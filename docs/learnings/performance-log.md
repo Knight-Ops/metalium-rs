@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Decode matmuls read only the activation rows they use](#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1) | 2026-10-16 | an `m = 1` product's `GATHER` reads each `A` tile through row `r` of face 1 (one entry, ~27% of the bytes), not the whole tile, and a one-tile-row product's last round is spread over the units: a 1.7B decode step 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms** (20.1-18.0 tokens/s), its matmuls 33.8 -> 26.3 ms; two face-row reads a tile instead were *slower* on the 135M (the mover's cost is per entry); what is left is entry-bound on B |
 | [A cache write of one row a head](#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1) | 2026-10-16 | `scatter_nd` with `Assign` is one row scatter at resident indices (NC's `SCATTER_ROWS`), and `FixedCache` writes a step with it: a 1.7B decode step 73.65 / 76.08 / 79.30 -> **57.21 / 59.64 / 62.81 ms** (17.5-15.9 tokens/s), the 135M step 25.81-26.99 -> 24.40-25.53 (burn-flex 26.66-31.12); the cache write is 5.0 of 56.8 ms a 1.7B step, was ~20 |
 | [Where a SmolLM2-1.7B step goes: the profile mode](#where-a-smollm2-17b-step-goes-the-profile-mode-2026-10-15-cards-0-and-1) | 2026-10-15 | the first profile from the profile mode (`cargo xtask bench --profile`): a 1.7B decode step is 46% matmuls (~200 GB/s), **24% the cache write's `expand`** (32 key/value heads), ~30% small ops; stamping compiled in costs 0.46 ms a 135M step, so it is now a build feature |
 | [SmolLM2-1.7B-Instruct on the card](#smollm2-17b-instruct-on-the-card-2026-10-15-card-1) | 2026-10-15 | the first model past 1B parameters, traced, F32, every tile: decode 13.6-12.6 tokens/s (burn-flex 3.4-3.0), prefill 267-771 tokens/s (burn-flex 7.6-24.7); decode reads its weights at 86-93 GB/s, 17-18% of GDDR's 512 |
@@ -69,6 +70,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-16 | 1792114379 / 1792114782 / 1792115180 / 1792115571 / 1792115848 / 1792118484 / 1792118871 / 1792119119 | Decode matmul bandwidth (`decode-matmul-bandwidth.md` P1, P2): thin `A` reads (`record::gather_rows`), first as two face-row reads a tile (1.7B 55.69-61.30 ms, 135M *slower*, 25.43-26.51), then as one prefix read (1.7B 51.15-56.71, 135M 24.07-25.21), then the last round of a one-tile-row product spread over the units (`tensor::thin_runs`). SmolLM2-1.7B decode 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms**; 135M 24.40-25.53 -> 24.14-25.25 (burn-flex 26.05-30.44); card 1, every tile. | 1.7B decode row updated. |
 | 2026-10-15 | 1792034179 / 1792034180 / 1792034647 / 1792035075 / 1792035466 / 1792035579 / 1792036613 / 1792036724 / 1792036850 / 1792036818 | A traced replay's fixed cost (`replay-fixed-cost.md`): P0 profile (2,418 ops, replay 36.0 ms; per op ~13 us; the barrier 0.6 us of it), then matmul padding off `K`, a kept zero row, a kept transpose for `B`, the model's mask expanded once a step and RoPE's sign in its table, thin downloads untilized by the card. SmolLM2 decode traced 37.2 -> **26.46 ms** (burn-flex 26.42), prefill 256 tokens 79.0 -> 73.1 ms, ViT-Tiny traced 12.6 -> 11.6, ResNet-18 traced 17.6 -> 17.2; card 1, every tile. | Rows updated. |
 | 2026-10-15 | 1792031467 / 1792032275 / 1792032323 | SmolLM2 prefill chunk sweep (`smollm2_prefill_chunk_sweep`, traced `Llama::step_chunk`, 512-position cache): every tile 1 / 32 / 64 / 128 / 256 tokens a replay in 43.8 / 40.2 / 44.3 / 55.2 / 79.0 ms (burn-flex prefill of 32 / 128 / 256 tokens 175 / 514 / 1,040 ms), card 1; one tile does not capture 32 and up; `work:64:4` 228-418 ms. | New scoreboard row. |
 | 2026-10-15 | 1792029144 / 1792029158 / 1792029169 | SmolLM2 decode step traced (`smollm2_decode_traced`, fixed shapes, cache as written-back state): 37.1 ms a replay on every tile with the default spread, 83.5 at `work:64:4`, 478.3 on one tile (burn-flex 25.5-26.6), card 1, bit for bit the eager fixed step. | New scoreboard row. |
@@ -314,6 +316,70 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Decode matmuls read only the activation rows they use (2026-10-16, cards 0 and 1)
+
+Roadmap Track 1, SmolLM2-1.7B "Next, by that profile": the matmuls' bandwidth
+([decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md), P0-P2). They were 59.5% of a 1.7B decode step,
+33.8 of 56.8 ms (`1792110380`).
+
+**What the jobs read** (P0, host only, `tt-kernels` test `decode_products_jobs_rounds_and_bytes`, 120 units). Every
+`m = 1` product read whole `A` tiles (4,160 bytes) for one row of 32: a step's products moved 12.06 GB, 5.11 GB of
+it `A`'s padding, ~357 GB/s at the profile's 33.8 ms. `gate`/`up` (256 output columns, two a job, 128 jobs on 120
+units) left 8 units running two jobs while 112 ran one. The L1 plan caps every K-whole `m = 1` block at two columns
+of `K` = 2048 (64 `A` + 128 `B` slots of the arena's ~215), so a unit cannot take a third in one job.
+
+**What changed:**
+- **P1, thin `A` reads.** `GATHER`'s free flag bits 3-7 carry `r` (1..=16, `record::gather_rows`), set by
+  `BlockPlan` on the gathers of `op(A)`'s last tile row when `m % 32` is 1..=16 and `A` is not transposed
+  (`tensor::thin_rows`; `Session::set_thin_matmul_reads`, on by default). Each such tile is one read of its datums
+  through row `r - 1` of face 1, `1024 + 64 r` bytes (1,088 for `m = 1`, was 4,160). The rest of the L1 slot keeps
+  what it held; with face 0's rows past `r` (read from `A`'s padding) it reaches only the output's padding rows,
+  whose claim is then `Pad::Undefined`. No zeroing is needed: consumers that need zero padding already refill it
+  (`Session::meet`). Packed BF16 reads a tile with at most 16 valid rows the same way, from its metadata, with no
+  flag (its fill already zeroes the rest).
+- **P2, the last round spread.** For a one-tile-row product with `K` whole and unpipelined, `tensor::thin_runs`
+  deals whole rounds of the plan's width, then the remainder as even runs over the units: `gate`/`up` 8 units with
+  2 + 2 columns -> 16 with 2 + 1 (the busiest unit 4 -> 3 columns, `ceil(256 / 120)`); the tied head 14 -> 13.
+
+**Read shape, measured (P1's decision).** Two 64-byte face-row reads a tile (2x the entries, 1/32 the bytes) first:
+the 1.7B step 57.21 / 59.64 / 62.81 -> 55.69 / 58.13 / 61.30 ms (`1792114379`), and the 135M step **slower**, 24.40 /
+24.84 / 25.53 -> 25.43 / 25.81 / 26.51 (`1792114782`). One prefix read a tile instead (the same entry count as a whole
+tile, ~27% of the bytes): 51.15 / 53.55 / 56.71 and 24.07 / 24.51 / 25.21 (`1792115180`, `1792115571`). The B
+mover's cost is per record-expanded entry as much as per byte, so a read shape must not add entries.
+
+**Measured** (card 1, release, every tile, default spread, burn-flex in the same run):
+
+| Decode step, 32 / 128 / 256-token prompt | Before (`1792109477`, `1792110130`) | P1 (`1792115180`, `1792115571`) | P1 + P2 (`1792118484`, `1792118871`) | burn-flex (same run as P1 + P2) |
+|---|---|---|---|---|
+| SmolLM2-1.7B | 57.21 / 59.64 / 62.81 ms | 51.15 / 53.55 / 56.71 | **49.78 / 52.27 / 55.44** (20.1 / 19.1 / 18.0 tokens/s) | 294.4 / 307.8 / 334.7 |
+| SmolLM2-135M | 24.40 / 24.84 / 25.53 | 24.07 / 24.51 / 25.21 | **24.14 / 24.57 / 25.25** | 26.05 / 28.24 / 30.44 |
+
+- A 256-token prompt plus 64 tokens: 1.7B 4,292 -> **3,830 ms** (burn-flex 31,206); prefill unchanged (267 / 656 /
+  771 tokens/s).
+- Decode reads the 1.7B weights at 123-138 GB/s, was 109-120.
+- The 1.7B traces hold 155.6 KB of the 240 KB program cache (155.5 before: P2's one-column jobs add one program).
+
+**Where the matmul time went** (the profile mode, `Step(64)`, unit 0, 1.7B; `1792110380` before, `1792115848` P1,
+`1792119119` P1 + P2):
+
+| Products | Before | P1 | P1 + P2 |
+|---|--:|--:|--:|
+| `q`/`k`/`v`/`o` (64 units), us each | 94.9 | 73.8 | 73.8 |
+| `down` (K-blocked, 64 units) | 343.3 | 267.9 | 267.8 |
+| `gate`/`up` and the head (120 units) | 335.6 | 286.4 | 261.3 (`gate`/`up` 241) |
+| all 169 products, ms a step | 33.79 | 27.55 | **26.32** |
+| the step, ms | 56.81 | 50.61 | 49.38 |
+
+**What bounds them now: entries, not bytes.** A `q` job now reads 64 `B` tiles and 64 thin `A` tiles (337 KB) in
+~60 us of data on each of 64 units, ~290 GB/s card-wide, below the ~358 GB/s whole tiles reached. Its 128
+record-expanded entries at ~0.45 us each are most of that time. Fewer entries a tile, or more units on the narrow
+products (P3's fused `q|k|v` on 120 units; split-K, P4), are what is left; not fewer bytes.
+
+Gates: `step190_thin_matmul` (ttsim; card 0 runs `1792113956`, `1792115747`, fast-reads `1792116118`), with
+`step77`'s BF16 matmuls (ragged rows, NaN-poisoned padding) for the packed path; `step185`/`step187`/`step188` bit for
+bit (`1792115747`, `1792118267`); `--smoke` 1,083 of 1,083 (`1792116807`); Burn conformance on ttsim with no unexpected
+result (`1792113791`; after P2 `1792117214`).
 
 ## A cache write of one row a head (2026-10-16, cards 0 and 1)
 

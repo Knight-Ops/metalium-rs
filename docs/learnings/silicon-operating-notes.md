@@ -1008,6 +1008,30 @@ fails the same congruence for one of the two source parities. The candidates:
    is `Undefined`.
 3. Make room in B: no longer needed -- B's slot grew by 18 KiB (above), so the B-side branch (1) fits.
 
+## Partial-tile GDDR reads in records: one entry beats fewer bytes (2026-10-16, ttsim and cards 0 and 1)
+
+From [decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md) P1 (log:
+[decode matmuls](performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
+
+- **A read shorter than a slot is legal and lands as asked.** `Descriptor::decode` checks only a nonzero length, the
+  range inside its channel and `gddr % 64 == l1 % 64`. A read that starts at the same offset inside a GDDR slot and
+  an L1 slot is congruent for any length, since both slots are 64-byte aligned (`TILE_SLOT` and `BF16_TILE_SLOT` are
+  multiples of 64). Records expand on the card through `Descriptor::decode` (never `READ_ENCODED`), so the
+  fast-reads encoder plays no part. Gates `step190` (both read modes) and `step77` on card 0.
+- **The B mover pays per entry as much as per byte.** For an `m = 1` product's `A` tiles (one used row in 32):
+  - **Two 64-byte face-row reads a tile** (1/32 of the bytes, twice the entries): a 1.7B decode step 1.5 ms faster,
+    but the 135M step ~1 ms *slower* (its products are 18 `A` tiles a job).
+  - **One read through row `r` of face 1** (`1024 + 64 r` bytes, 27% for `r = 1`, the same entry count): the 1.7B
+    step 6.1 ms faster and the 135M step 0.3 ms.
+
+  After it, a `q` job's 128 entries take ~60 us on each of 64 units (~0.45 us an entry, ~290 GB/s card-wide), so
+  these products are bound by B's record-expanded entries, not GDDR. Choose a read shape by entry count first.
+- **L1 left unread is the next op's data.** Silicon keeps L1 between programs, so a slot's unread rows hold a
+  previous op's values (NaN in `step190`'s priming). They are safe only where they reach nothing but padding, with
+  the output's padding claim `Undefined`; `step190`'s negative control shows a false `Pad::Zero` there makes
+  `C^T @ C` non-finite.
+- **B's image:** 25,724 -> 26,528 bytes of 43,008 (default build); NC unchanged at 15,088.
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

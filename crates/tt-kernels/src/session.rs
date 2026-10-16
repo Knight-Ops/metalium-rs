@@ -430,6 +430,8 @@ pub struct Session<T: Transport> {
     /// How many units an op runs on ([`Session::set_spread`]).
     spread: Spread,
     matmul_k_block_limit: Option<std::num::NonZeroUsize>,
+    /// [`Session::set_thin_matmul_reads`].
+    thin_matmul_reads: bool,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -1813,6 +1815,7 @@ impl<T: Transport> Session<T> {
             pipeline: true,
             spread: Spread::All,
             matmul_k_block_limit: None,
+            thin_matmul_reads: true,
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -5205,6 +5208,8 @@ impl<T: Transport> Session<T> {
         let allow_mop = false;
         let pipeline = self.pipeline;
         let max_k_tiles = self.matmul_k_block_limit;
+        let m = if a_transposed { a.cols } else { a.rows };
+        let thin = self.thin_matmul_reads && tensor::thin_rows(m, a_transposed) != 0;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -5220,6 +5225,7 @@ impl<T: Transport> Session<T> {
                     allow_mop,
                     pipeline,
                     max_k_tiles,
+                    thin,
                 )
             })
             .and_then(|work| self.execute_on(work, units, budget));
@@ -5228,9 +5234,11 @@ impl<T: Transport> Session<T> {
         }
         let out = out?;
         // An operand used with its padding off `K` as it was leaves that padding's
-        // image in the output's.
+        // image in the output's; a thin read of `A` leaves whatever its L1 slots
+        // held past the rows it read.
         let dirty = (off_k[0] && a.pad() != tensor::Pad::Zero)
-            || (off_k[1] && b.pad() != tensor::Pad::Zero);
+            || (off_k[1] && b.pad() != tensor::Pad::Zero)
+            || thin;
         out.set_pad(match dirty {
             true => tensor::Pad::Undefined,
             false => need.produces(&[a, b]),
@@ -5654,6 +5662,13 @@ impl<T: Transport> Session<T> {
     /// `None` lets the resident planner choose the block length.
     pub fn set_matmul_k_block_limit(&mut self, limit: Option<std::num::NonZeroUsize>) {
         self.matmul_k_block_limit = limit;
+    }
+
+    /// Whether a GDDR matmul reads only the rows of `op(A)`'s last tile row it
+    /// uses, when that is 16 or fewer ([`tensor::thin_rows`]; on by default).
+    /// Off, it reads whole tiles, as before: the gates compare the two.
+    pub fn set_thin_matmul_reads(&mut self, on: bool) {
+        self.thin_matmul_reads = on;
     }
 
     /// How the transcendentals run from the next element-wise op on
