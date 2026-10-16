@@ -14,8 +14,8 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 20.1 tokens/s traced against
-  burn-flex's 3.4 (13.6 on 2026-10-15; the cache's row write and thin matmul reads since), and prefills 29-35x faster.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 20.9 tokens/s traced against
+  burn-flex's 3.4 (13.6 on 2026-10-15; the cache's row write, thin matmul reads and fused projections since), and prefills 29-35x faster.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -368,13 +368,15 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     62.81 ms** (17.5-15.9 tokens/s, run `1792109477`); the 135M step 24.40-25.53 ms, below burn-flex's 26.66-31.12
     ([log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The write is now
     5.0 of 56.8 ms a 1.7B step; its two whole-cache copies (2.3 ms) are left (Track 2 item 6, step 6);
-  - [ ] the matmuls' bandwidth ([decode-matmul-bandwidth.md](decode-matmul-bandwidth.md); P0-P2 done 2026-10-16, P3
-    next). An `m = 1` product reads each activation tile through its used rows (one entry, ~27% of the bytes, gate
+  - [ ] the matmuls' bandwidth ([decode-matmul-bandwidth.md](decode-matmul-bandwidth.md); P0-P3 done 2026-10-16:
+    fused `q|k|v` and `gate|up`, `Llama::fused`, gate `step191`, bring the 1.7B step to **47.90 / 50.37 / 53.53 ms**
+    and the 135M to 22.91-23.98, `1792161623`/`1792162031`). An `m = 1` product reads each activation tile through its used rows (one entry, ~27% of the bytes, gate
     `step190`), and its last round is spread over the units. A 1.7B decode step **57.21 / 59.64 / 62.81 -> 49.78 /
     52.27 / 55.44 ms** (20.1-18.0 tokens/s, run `1792118484`), its products 33.8 -> 26.3 ms; the 135M step 24.14-25.25
     ([log](../learnings/performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
-    What is left is bound by the B mover's entries (~0.45 us each), not GDDR's bytes: next, fused `q|k|v` and
-    `gate|up` (P3, bit for bit), then fewer entries a tile;
+    Now `gate|up` reads at GDDR's ceiling. The products on 64 units (`o`, `down`) are held to ~300 GB/s by the
+    in-flight cap (next: caps above 8 for few-unit products). The step's other 23 ms are small ops: the RMSNorm
+    ~5, the cache write ~5, RoPE ~3.6;
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still

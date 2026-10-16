@@ -960,8 +960,14 @@ fn traced_generation() {
     with_device(Config::default(), |d| {
         conditions(card());
         let (m, _) = Llama::<TtBackend>::pretrained(&config, &name, Precision::F32, &d).unwrap();
-        // What a decode step reads at least: every F32 parameter once.
+        // What a decode step reads at least: every F32 parameter once (counted before fusing, whose
+        // views would count the fused matrices twice).
         let weight_bytes = burn::module::Module::num_params(&m) as f64 * 4.0;
+        // `q|k|v` and `gate|up` one product each (`Llama::fused`, bit for bit the unfused model;
+        // `TT_GEN_FUSED=0` keeps them apart).
+        let fused = std::env::var("TT_GEN_FUSED").map_or(true, |v| v != "0");
+        println!("BENCH {{\"kind\":\"conditions\",\"fused_projections\":{fused}}}");
+        let m = if fused { m.fused() } else { m };
         let t0 = Instant::now();
         // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
         // for the whole cache at every step).

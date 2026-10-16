@@ -239,6 +239,8 @@ pub const SMOKE: &[&str] = &[
     "step189_scatter_rows::",
     // A matmul reads only the rows of `A`'s last tile row it uses (decode-matmul-bandwidth P1).
     "step190_thin_matmul::",
+    // `Llama::fused`: `q|k|v` and `gate|up` one product each, bit for bit the unfused model (P3).
+    "step191_fused_projections::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

@@ -2,8 +2,9 @@
 
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile": **the matmuls' bandwidth**. Written 2026-10-16 against
 `5ef99ca` plus the row-scatter work (`step189`). Status (2026-10-16): **P0-P2 done** (a 1.7B decode step
-57.21 / 59.64 / 62.81 -> 49.78 / 52.27 / 55.44 ms; matmuls 33.8 -> 26.3 ms a step); **P3 next**. What is left is
-bound by the B mover's entries, not GDDR's bytes (P1, "Measured").
+57.21 / 59.64 / 62.81 -> 49.78 / 52.27 / 55.44 ms; matmuls 33.8 -> 26.3 ms a step); **P3 done** (47.90 / 50.37 /
+53.53 ms; matmuls 24.0 ms). The fused `gate|up` reads at ~490 GB/s, GDDR's ceiling; the narrow products on 64 units
+(`o`, `down`) at ~300 GB/s, bound by what the in-flight cap lets a unit hold (next, "What is left").
 
 ## Why this item
 
@@ -167,14 +168,54 @@ the rest is entries. Next:
 - **Fewer B entries a tile** (a tighter record-expansion loop, or larger reads where tiles are contiguous) is a
   firmware item beyond this plan.
 
-### P3. Fused projections (model level, bit-identical)
+### P3. Fused projections (model level, bit-identical; done 2026-10-16)
 
-- [ ] In `tt-models`, generic over `LlamaConfig`: `q|k|v` as one `[h, q + 2 kv]` weight and `gate|up` as one
+- [x] **`Llama::fused`** (`tt-models/src/llama.rs`):
+  - each layer's `q|k|v` becomes one `[h, q + 2 kv]` matrix and `gate|up` one `[h, 2 ff]`, concatenated once after
+    strict loading;
+  - the outputs are split by column views (`project_split`);
+  - the separate weights become views of the fused one, so storage is shared and parameter paths stay as loaded;
+  - a group whose matrices differ in dtype stays unfused;
+  - not for a model a `quant` plan rewrites (its BFP storage is invisible to generic code, and its rules name the
+    separate matrices).
+
+  A layer goes from 7 products to 4. The bench fuses by default (`TT_GEN_FUSED=0` keeps them apart), counting its
+  weight bytes before fusing.
+- [x] **Gate `step191_fused_projections`** (ttsim; card 0 run `1792161551`, with `step185` and `step187`):
+  - fused against unfused, bit for bit, eager (the growing cache) and traced, on step187's Llama shapes and on the
+    135M checkpoint (all 30 layers on silicon);
+  - `4 layers + 1` products a forward, against `7 layers + 1`;
+  - **negative control:** scaling `v_proj` after fusing changes the unfused model's generation and not the fused
+    one's.
+
+  Found on the way: a Burn module's lazily initialised parameters are initialised again, to other values, by a
+  clone taken before their first use, so the gate materialises them first.
+- [x] **Measured** (card 1, every tile, burn-flex in the same run):
+  - **1.7B:** 49.78 / 52.27 / 55.44 -> **47.90 / 50.37 / 53.53 ms** (20.9-18.7 tokens/s, `1792161623`).
+  - **135M:** 24.14-25.25 -> **22.91 / 23.35 / 23.98** (`1792162031`, burn-flex 26.43 / 28.21 / 30.65).
+  - **Profile `1792162257`:**
+    - `qkv` 180 us, against three products of 74 (37 us of it unit 0 waiting at the barrier: 192 columns go 2 to
+      72 units and 1 to 48);
+    - `gate|up` 426 us, against two of 241: ~490 GB/s card-wide, the ceiling;
+    - all products 26.32 -> 24.01 ms a step.
+  - **Program cache:** 157.2 KB of 240 KB.
+
+**What is left of the products** (24.0 ms; ~9.5 GB a step, ~395 GB/s on average; the weights alone ~14.3 ms at
+480 GB/s):
+- `o` and `down` run on 64 units at ~300 GB/s: 64 units x 8 requests in flight (`dm::TILE_IN_FLIGHT_CAP`) is too
+  little to cover GDDR's latency (Little's law). The cap was chosen for every tile reading at once. Next, measure
+  caps above 8 for products on fewer units (the fast-mode sweep only went 2-8).
+- `qkv`'s uneven last round (2 and 1 columns).
+- `A` read again by every job (~70 KB a job, thin).
+
+The original P3 items, done as above (`step188` not rerun: `step191` covers the 135M checkpoint fused):
+
+- In `tt-models`, generic over `LlamaConfig`: `q|k|v` as one `[h, q + 2 kv]` weight and `gate|up` as one
   `[h, 2 ff]`, concatenated once after strict loading (checkpoint names unchanged), outputs split by views. A
   layer goes from 7 products to 4, `qkv` runs on 120 units instead of three ops on 64, and every output tile keeps
   its `K` chain, so logits are **bit for bit** the unfused model's.
-- [ ] Fuse only matrices that share a format (`quant.rs` names one per matrix); a mixed plan keeps them apart.
-- [ ] Gate: fused against unfused, bit for bit, on the 135M preset and on `step187`'s shapes (GQA 4:1, head widths
+- Fuse only matrices that share a format (`quant.rs` names one per matrix); a mixed plan keeps them apart.
+- Gate: fused against unfused, bit for bit, on the 135M preset and on `step187`'s shapes (GQA 4:1, head widths
   32 and 128, untied head); the GPT-2-style decoder is already fused. Then `step185`, `step187`, `step188`.
 
 ### P4. Only if P0-P3 leave narrow products short of the floor

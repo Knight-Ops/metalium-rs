@@ -152,6 +152,9 @@ pub struct SelfAttn<B: Backend> {
     k_proj: Linear<B>,
     v_proj: Linear<B>,
     o_proj: Linear<B>,
+    /// `q|k|v` as one `[hidden, q + 2 kv]` matrix ([`Llama::fused`]), whose column blocks the three
+    /// projections above are then views of. `None` as loaded.
+    qkv: Option<Linear<B>>,
 }
 
 #[derive(Module, Debug)]
@@ -159,6 +162,50 @@ pub struct Mlp<B: Backend> {
     gate_proj: Linear<B>,
     up_proj: Linear<B>,
     down_proj: Linear<B>,
+    /// `gate|up` as one `[hidden, 2 ff]` matrix ([`Llama::fused`]), as `qkv` is.
+    gate_up: Option<Linear<B>>,
+}
+
+/// The projections `parts` as one matrix, their weights concatenated along the outputs, and each
+/// part's weight replaced by its column block of it (a view where the backend makes slices views,
+/// so the parts and the whole share storage). `None`, and `parts` untouched, unless every part is
+/// the same dtype and without a bias.
+fn fuse<B: Backend>(parts: &mut [&mut Linear<B>]) -> Option<Linear<B>> {
+    let dtype = parts[0].weight.val().dtype();
+    if parts
+        .iter()
+        .any(|p| p.bias.is_some() || p.weight.val().dtype() != dtype)
+    {
+        return None;
+    }
+    let whole = Tensor::cat(parts.iter().map(|p| p.weight.val()).collect(), 1);
+    let [rows, _] = whole.dims();
+    let mut at = 0;
+    for p in parts.iter_mut() {
+        let [_, cols] = p.weight.val().dims();
+        p.weight = Param::from_tensor(whole.clone().slice([0..rows, at..at + cols]));
+        at += cols;
+    }
+    Some(Linear {
+        weight: Param::from_tensor(whole),
+        bias: None,
+    })
+}
+
+/// `x @ W` for the fused `whole`, split back into the parts' outputs, `widths` columns each.
+fn project_split<B: Backend, const N: usize>(
+    x: Tensor<B, 3>,
+    whole: &Linear<B>,
+    widths: [usize; N],
+) -> [Tensor<B, 3>; N] {
+    let y = project(x, whole);
+    let [n, t, _] = y.dims();
+    let mut at = 0;
+    widths.map(|w| {
+        let part = y.clone().slice([0..n, 0..t, at..at + w]);
+        at += w;
+        part
+    })
 }
 
 #[derive(Module, Debug)]
@@ -211,13 +258,27 @@ impl<B: Backend> Layer<B> {
                 k_proj: linear(h, kv, device),
                 v_proj: linear(h, kv, device),
                 o_proj: linear(q, h, device),
+                qkv: None,
             },
             post_attention_layernorm: rms_norm(cfg, device),
             mlp: Mlp {
                 gate_proj: linear(h, cfg.ff, device),
                 up_proj: linear(h, cfg.ff, device),
                 down_proj: linear(cfg.ff, h, device),
+                gate_up: None,
             },
+        }
+    }
+
+    /// [`Llama::fused`] for one layer.
+    fn fuse(&mut self) {
+        let a = &mut self.self_attn;
+        if a.qkv.is_none() {
+            a.qkv = fuse(&mut [&mut a.q_proj, &mut a.k_proj, &mut a.v_proj]);
+        }
+        let m = &mut self.mlp;
+        if m.gate_up.is_none() {
+            m.gate_up = fuse(&mut [&mut m.gate_proj, &mut m.up_proj]);
         }
     }
 
@@ -245,9 +306,18 @@ impl<B: Backend> Layer<B> {
         let a = &self.self_attn;
         let heads =
             |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, head_dim]).swap_dims(1, 2);
-        let q = rope.apply(heads(project(h.clone(), &a.q_proj), cfg.heads));
-        let k = rope.apply(heads(project(h.clone(), &a.k_proj), kv_heads));
-        let v = heads(project(h, &a.v_proj), kv_heads);
+        let (qw, kvw) = (cfg.heads * head_dim, kv_heads * head_dim);
+        let [q, k, v] = match &a.qkv {
+            Some(qkv) => project_split(h, qkv, [qw, kvw, kvw]),
+            None => [
+                project(h.clone(), &a.q_proj),
+                project(h.clone(), &a.k_proj),
+                project(h, &a.v_proj),
+            ],
+        };
+        let q = rope.apply(heads(q, cfg.heads));
+        let k = rope.apply(heads(k, kv_heads));
+        let v = heads(v, kv_heads);
 
         let (q, new_k, new_v, keys, values, mask, is_causal) = match write {
             Write::At(start) => {
@@ -309,10 +379,11 @@ impl<B: Backend> Layer<B> {
 
         let h = self.post_attention_layernorm.forward(x.clone());
         let m = &self.mlp;
-        let hidden = hook(
-            "mlp_hidden",
-            silu(project(h.clone(), &m.gate_proj)) * project(h, &m.up_proj),
-        );
+        let [gate, up] = match &m.gate_up {
+            Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff]),
+            None => [project(h.clone(), &m.gate_proj), project(h, &m.up_proj)],
+        };
+        let hidden = hook("mlp_hidden", silu(gate) * up);
         (x + project(hidden, &m.down_proj), new_k, new_v)
     }
 }
@@ -440,6 +511,22 @@ impl<B: Backend> Llama<B> {
 
     pub fn config(&self) -> &LlamaConfig {
         &self.config
+    }
+
+    /// The same model with each layer's `q|k|v` and `gate|up` projections one matrix each, their
+    /// outputs split back by column views: three products and two become one each, so a decode
+    /// step's narrow `m = 1` products spread over more of the card. Every output column keeps its
+    /// own accumulation over the hidden dimension, so the logits are the unfused model's **bit for
+    /// bit** (`step191_fused_projections`). The separate weights become views of the fused one,
+    /// which keeps parameter paths (and a later save) as loaded. A group whose matrices differ in
+    /// dtype stays unfused. Not for a model a [`crate::quant`] plan rewrites, before or after: its
+    /// block-float storage is invisible here (the dtype is F32), and its rules name the separate
+    /// matrices.
+    pub fn fused(mut self) -> Self {
+        for layer in &mut self.layers {
+            layer.fuse();
+        }
+        self
     }
 
     /// A pretrained Llama-architecture checkpoint (`cargo xtask fetch-weights --model <weights>`)
