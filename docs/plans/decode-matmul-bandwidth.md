@@ -224,6 +224,49 @@ The original P3 items, done as above (`step188` not rerun: `step191` covers the 
 - Gate: fused against unfused, bit for bit, on the 135M preset and on `step187`'s shapes (GQA 4:1, head widths
   32 and 128, untied head); the GPT-2-style decoder is already fused. Then `step185`, `step187`, `step188`.
 
+### P5. Why a narrow product's unit reads ~9 GB/s (open; next session)
+
+After P3 the products are 24.0 of a 47.5 ms 1.7B step (`1792162257`): `gate|up` reads at ~490 GB/s, but `o` (74 us)
+and `down` (268 us), on 64 units, move ~300 GB/s, and `qkv` (120 units) ~330. GDDR's ceiling for the step's ~9.5
+GB of products is ~19.8 ms, the weights' alone ~14.3. The in-flight cap is ruled out (P3, "What is left").
+
+**The leading hypothesis: one channel a column.** Tile `t` of a tensor is on channel `t % 8` (`Placement::slot`)
+and tile `(kk, j)` is `t = kk ct + j`, so with `ct % 8 == 0` (every decode weight: 64, 256, 1536 tile columns) a
+column's 64 `K` tiles are all on channel `j % 8`, at slot stride `ct / 8`. A job of one or two columns streams from
+one or two channels, eight units to a channel at 64 units. `A`'s tiles walk the channels in `kk` order on every
+unit at once (a convoy; small since P1).
+
+- [ ] **P5.0 Probe, host only, no firmware change** (`silicon_bench_tensix_ops` or a new
+  `silicon_probe_matmul_channels`; release, card 0, warmups and medians, every output validated bit for bit
+  against `matmul_dram`):
+  - **The control:** `[1, 2048] @ [2048, 2048]` and `[1, 8192] @ [8192, 2048]` with `B` as is (`ct = 64`), on 64
+    and 120 units (`Session::set_spread`).
+  - **The skew, through the batched path's blocks:** `B` a block of a `[2048, 2080]` parent (`ct = 65`), so tile
+    `(kk, j)` sits on channel `(kk + j) % 8` and a column cycles all eight channels. `matmul_dram_batched` takes a
+    `Block` of a resident tensor and reads it at the parent's stride (`block_ref`).
+  - Compare batched against batched (it keeps whole `A` tiles and `blocks`' deal), and whole against thin is
+    already known.
+  - **The ceiling:** each unit's `B` tiles alone as `READ_RUN` records (as `silicon_probe_read_loop`
+    `records_against_entries`), at both strides.
+  - **Attribution** with the profile mode (`--profile`), not new instrumentation.
+- [ ] **Answer:** does the skew take the 64-unit products from ~300 toward ~450 GB/s? If not, which of the
+  per-request cost (~0.13 us), the per-unit rate (~9 GB/s), or NoC routing bounds them (the operating notes' "What
+  holds card reads" and the read-loop probe have the single-tile numbers).
+- [ ] **P5.1 If channels are the bound: a skewed placement for weights.** The options, cheapest first:
+  - (a) Allocate a matrix whose tile row is a multiple of 8 one tile column wider (`ct + 1`, 1.6% more GDDR at
+    `ct = 64`) and use it as a view: `DramTensor` then needs a row stride apart from its width (today `ct` is
+    `grid()[1]`). That touches every record's `TensorRef` (`ct` is already a field) and every host builder that
+    assumes `ct == cols / 32`. Audit with `find_references(DramTensor::tensor_ref)`.
+  - (b) A placement whose channel of tile `t` is `(t + t / ct) % n` (a per-row rotation): a `TensorRef` flag the
+    cursor and `tile()` honour, in `tt-isa` (firmware) and `Placement::slot` (host). No padding, but a record
+    format change: the mover gates (`step172`, `step173`) in both read modes, and `encoded::validate`.
+  - Either way, every output keeps its `K` chain, so the gates hold bit for bit; add a gate for the placement
+    itself (tiles land where `slot` says, views and ragged edges).
+- [ ] **P5.2 `qkv`'s uneven last round** (192 columns: 72 units of 2, 48 of 1; unit 0 waits 37 us at the barrier).
+  Measure whether a deal of 192 as 120 runs that end on the longest unit costs less, or whether `q|k|v` should
+  deal its K-blocked form.
+- [ ] **Measure** as P1: `traced_generation` 1.7B and 135M on card 1, burn-flex in the same run, then `--profile`.
+
 ### P4. Only if P0-P3 leave narrow products short of the floor
 
 - [ ] Split-K for products with fewer output tiles than units (`o`, `down`): partial sums on two units, then one
@@ -235,7 +278,7 @@ The original P3 items, done as above (`step188` not rerun: `step191` covers the 
 - **BF16 and BFP weights** (the next roadmap item): halve or quarter the bytes. P1 covers `GATHER_BF16`, so they
   compose.
 - **Multicast of `A` (G7):** the structural fix for large `m` (prefill), where `A` is real data, not padding.
-- **The cache write's two whole-cache copies** ([in-place-cache-write.md](../proposals/in-place-cache-write.md)).
+- **The cache write's two whole-cache copies** ([in-place-cache-write.md](in-place-cache-write.md)).
 
 ## Documentation on completion
 

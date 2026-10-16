@@ -368,15 +368,26 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     62.81 ms** (17.5-15.9 tokens/s, run `1792109477`); the 135M step 24.40-25.53 ms, below burn-flex's 26.66-31.12
     ([log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The write is now
     5.0 of 56.8 ms a 1.7B step; its two whole-cache copies (2.3 ms) are left (Track 2 item 6, step 6);
-  - [ ] the matmuls' bandwidth ([decode-matmul-bandwidth.md](decode-matmul-bandwidth.md); P0-P3 done 2026-10-16:
-    fused `q|k|v` and `gate|up`, `Llama::fused`, gate `step191`, bring the 1.7B step to **47.90 / 50.37 / 53.53 ms**
-    and the 135M to 22.91-23.98, `1792161623`/`1792162031`). An `m = 1` product reads each activation tile through its used rows (one entry, ~27% of the bytes, gate
-    `step190`), and its last round is spread over the units. A 1.7B decode step **57.21 / 59.64 / 62.81 -> 49.78 /
-    52.27 / 55.44 ms** (20.1-18.0 tokens/s, run `1792118484`), its products 33.8 -> 26.3 ms; the 135M step 24.14-25.25
-    ([log](../learnings/performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
-    Now `gate|up` reads at GDDR's ceiling. The products on 64 units (`o`, `down`) are held to ~300 GB/s by the
-    in-flight cap (next: caps above 8 for few-unit products). The step's other 23 ms are small ops: the RMSNorm
-    ~5, the cache write ~5, RoPE ~3.6;
+  - [ ] the matmuls' bandwidth ([decode-matmul-bandwidth.md](decode-matmul-bandwidth.md); P0-P3 done 2026-10-16,
+    [log](../learnings/performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
+    - An `m = 1` product reads each activation tile through its used rows (gate `step190`), and its last round is
+      spread over the units.
+    - `Llama::fused` makes `q|k|v` and `gate|up` one product each, bit for bit (gate `step191`).
+    - **Result:** a 1.7B decode step **57.21 / 59.64 / 62.81 -> 47.90 / 50.37 / 53.53 ms** (20.9 tokens/s, run
+      `1792161623`), its products 33.8 -> 24.0 ms; the 135M step 22.91-23.98 (burn-flex 26.4-30.6).
+    - `gate|up` now reads at GDDR's ceiling. `o` and `down`, on 64 units, move ~300 GB/s, and **not** because of the
+      in-flight cap (16/32/128 measured, unchanged).
+    - **Open: P5**, a probe of one channel a column, then perhaps a skewed weight placement.
+  - [ ] **The small ops: 23.4 of the 47.5 ms step** ([decode-small-ops.md](decode-small-ops.md), planned
+    2026-10-16): RMSNorm ~5.2 ms, RoPE ~4.9 (3.7 of it two element repacks), attention outside the products ~4.5,
+    SiLU ~1.9.
+    - A trace records lowered lists (no capture-time fusion), and decode does not run on burn-fusion today.
+    - First: the bit-identical repack and copy fixes (S1, S2a).
+    - Then decide where fusion lives (F0: the decode step under `Fusion<TtBackend>`), then RMSNorm as one
+      reduce-map (S3).
+  - [ ] **The cache write's two whole-cache copies, 2.25 ms** ([in-place-cache-write.md](in-place-cache-write.md),
+    scheduled 2026-10-16, phases D1-D5): donation declared before capture, buffer generations, then
+    `scatter_rows_into`.
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
@@ -610,7 +621,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
          (`Session::scatter_rows`, NC's `SCATTER_ROWS`, gate `step189`; ttsim and card 0), which `FixedCache` uses for a
          step. Left of the write (`Step(64)` profile, 1.7B, `1792110380`, 5.03 ms a step): the scatter's tile copy and
          the trace's write-back, two whole-cache copies (2.26 ms; writing in place inside a capture would remove both:
-         how to make that safe is [in-place-cache-write.md](../proposals/in-place-cache-write.md)),
+         how to make that safe is [in-place-cache-write.md](in-place-cache-write.md)),
          and the value's repack and block copy after RoPE (1.47 ms). Prefill chunks still `mask_where` (a padded chunk
          may run past the cache, and a scatter cannot drop rows).
        - **The RMSNorm's broadcast `div`** (27 us, twice a layer): the mover broadcasts the `[1, 1]` column in software

@@ -9,7 +9,6 @@ flowchart TD
     subgraph Tier3["Tier 3: docs/proposals/ (RFCs & Design Notes)"]
         P1["x280-on-card-dispatch.md<br/><i>(Proposed, unscheduled)</i>"]
         P2["future-fusion-features.md<br/><i>(FlashAttention, Sharded L1, NoC stream)</i>"]
-        P3["in-place-cache-write.md<br/><i>(Traced cache written in place)</i>"]
     end
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs)"]
@@ -22,6 +21,7 @@ flowchart TD
         PL8["kernel-fusion.md (B12 & B13a-c Burn Fusion)"]
         PL9["mixed-bfp-storage.md (BFP8/4/2 Contract & PRNG Diagnostics)"]
         PL10["ttinsn-push-experiment.md (done: result go)"]
+        PL11["decode-matmul-bandwidth.md, decode-small-ops.md, in-place-cache-write.md (LLM decode performance)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -84,6 +84,9 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
+  - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
+  - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.
+  - [`in-place-cache-write.md`](plans/in-place-cache-write.md): writing a traced key/value cache in place (no whole-cache copy a write), and the donation and buffer-generation rules that make a read of the overwritten cache an error by name (was a proposal).
 
 ### 3. `docs/proposals/` — Feature Proposals & RFCs
 Unscheduled design proposals and exploratory RFCs evaluating trade-offs before implementation.
@@ -91,7 +94,6 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
 - **Contents**:
   - [`x280-on-card-dispatch.md`](proposals/x280-on-card-dispatch.md): RFC proposing use of on-card SiFive X280 RISC-V cores for on-card host orchestration.
   - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
-  - [`in-place-cache-write.md`](proposals/in-place-cache-write.md): writing a traced key/value cache in place (no whole-cache copy a write), and the donation and buffer-generation rules that make a read of the overwritten cache an error by name.
 
 ### Completed plans: `docs/completed-plans/`
 Plans whose checklists are closed move here as a record, with their evidence. They are not updated; current behaviour lives in `docs/learnings/` and the active plans, and any item still open is carried in [`roadmap.md`](plans/roadmap.md).

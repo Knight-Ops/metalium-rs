@@ -1,8 +1,22 @@
 # Writing a traced cache in place
 
-Status: **proposal, not scheduled** (2026-10-16). It follows the cache write of one row a head (roadmap Track 2
-item 6, step 6; [performance log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)).
-Written against the working tree after that change; read the current code before treating a name here as current.
+Status: **planned, not started** (scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows
+the cache write of one row a head (roadmap Track 2 item 6, step 6;
+[performance log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The
+phases and checklist are at the end ("Plan"); the design above them is the proposal's, unchanged. Read the current
+code before treating a name here as current.
+
+**Baseline now** (after the decode matmul work, `dbe71bb`/`6fcb943`): SmolLM2-1.7B decode **47.90 / 50.37 / 53.53
+ms** (run `1792161623`, fused projections). The cache write is **5.02 ms a step** in profile `1792162257`
+(`Step(64)`, 47.46 ms), unchanged by that work:
+
+| Part of the 48 writes a step | ms |
+|---|--:|
+| the row scatter (`resident row scatter`) | 1.29 |
+| the scatter's tile copy of the cache (`copy list`) | 1.12 |
+| the trace's write-back (`copy_into list`) | 1.13 |
+| the value's repack (`native repack`, once a layer) | 0.92 |
+| a block copy (`block copy list`) | 0.56 |
 
 ## What it would remove
 
@@ -125,7 +139,60 @@ On ttsim, then card 0; each watched failing.
 
 ## Cost to measure
 
-`TT_GEN_MODEL=smollm2-1.7b-instruct` `traced_generation` on card 1, with and without `--profile`, against the
-2026-10-16 numbers (decode 57.21 / 59.64 / 62.81 ms, run `1792109477`; profile `1792110380`); the 135M bench for
-no regression. The expected gain is the two copies' 2.26 ms a 1.7B step; anything well short of it means a copy
+`TT_GEN_MODEL=smollm2-1.7b-instruct` `traced_generation` on card 1, with and without `--profile`. The baseline is
+decode 47.90 / 50.37 / 53.53 ms (run `1792161623`) and profile `1792162257`; the proposal was written against 57.21 /
+59.64 / 62.81 (`1792109477`, profile `1792110380`). The 135M bench checks for no regression (22.91 / 23.35 / 23.98,
+`1792162031`). The expected gain is the two copies' ~2.25 ms a 1.7B step; anything well short of it means a copy
 survived.
+
+## Plan
+
+Code facts to start from (checked 2026-10-16):
+- **The copy:** `Session::scatter_rows` (`crates/tt-kernels/src/session.rs`, ~4955) is `self.copy(table)` then
+  `scatter_rows_into(&out, ..)`. `scatter_rows_into` is the in-place primitive, already gated by `step189`'s in-place
+  test, which also refuses a view.
+- **The routing:** `burn-tt/src/ops/index.rs` `scatter_nd` -> `scatter_rows_native` -> `server::scatter_rows` ->
+  `DramBuffers::scatter_rows` (`server.rs`, ~1274).
+- **The write-back:** `TracedInference::capture_with_state` (`crates/burn-tt/src/trace.rs`, ~221-332) runs `f` under
+  the `Capturing` guard. Only after `f` returns does it check each `(new, state)` pair and record
+  `server::copy_into(device, new, state)` (`server.rs`, ~3632; it also marks `dst` `written_in_place`).
+- **Shared state:** `SharedStateTraces::capture` (~501-546) pairs the returned new state with its own state, so it
+  learns the state only after `f`. That is why donation must move up front.
+- **The callers:** `FixedCache`'s step write (`crates/tt-models/src/kv_cache.rs`, `FixedWrite::write`, `Masked`)
+  does `reshape -> scatter_nd(Assign) -> reshape`. Chunks keep `mask_where`.
+
+Phases, each on ttsim then card 0, each gate watched failing:
+
+- [ ] **D1. Donation up front.** `capture_with_state` and `SharedStateTraces::capture` take the state before `f`. They
+  check it (owned, untransposed, not a row view), mark it donated under a guard that ends with the capture (also on
+  error), and call `written_in_place` for each donated buffer at donation.
+  - **Gates:** errors end donation; no stale kept transpose (the proposal's gate list).
+  - **No behaviour change yet:** the write still copies.
+- [ ] **D2. Buffer generations.** `tensor::Buffer` gets a generation, each `TtTensor` records its own, and `dram()` /
+  `to_dram()` refuse a stale one by name. Views made after a write take the new generation, and capture end brings
+  each state handle current.
+  - **Gate:** a read of the old cache, and of a view taken before the write, fails by name. Watched failing (a wrong
+    token) with the check removed.
+  - Costs one compare a read; measure that the 135M step does not move.
+- [ ] **D3. The write in place.** `scatter_rows_native` calls `Session::scatter_rows_into` when the table is donated,
+  at its current generation, owned and untransposed; every other call copies, as now. When `new` and `state` are one
+  buffer, `capture_with_state` records no `copy_into`.
+  - **Gates:**
+    - equal results (`step185`, `step187`, `step188` bit for bit);
+    - the copies are gone (no `copy list` before a donated scatter and no state `copy_into`, from
+      `TracedInference::ops` labels);
+    - eager unchanged (`step189`);
+    - two writes to one buffer in a step chain;
+    - the negative controls still diverge (`step185` `stateful = false`, `step187` private prefill).
+- [ ] **D4. Measure** as above. Rows go into the performance log and scoreboard.
+- [ ] **D5 (separate, optional): the value's layout** (0.92 + 0.56 ms).
+  - **Why it repacks:** `v` is a view of parts of rows (a column block of the fused `qkv` product, then
+    `reshape`/`swap_dims` into heads, `Layer::forward`), so the write's `new.reshape([kv, d])` and `scatter_nd`'s
+    restack (`ops/index.rs` `restack`) fall to an element repack (`mapped_native`).
+  - **The block copy:** which op makes the 48 block copies is not pinned down: `plain_dram`'s `copy_blocks`
+    (`ops.rs`) or a region view's materialisation. Read the `TracedInference::ops` labels first.
+  - **The fix to try:** a `SCATTER_ROWS` that reads its value rows from a strided view (the record already names a
+    tensor), or `FixedWrite` taking the value before the head split.
+
+Documentation on completion: the roadmap (Track 2 item 6, step 6), the performance log and scoreboard,
+`docs/README.md`, and this file moved to `completed-plans/`.
