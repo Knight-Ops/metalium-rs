@@ -81,6 +81,17 @@ stays bit for bit the eager step (`step185_fixed_decode`).
   - **Within noise, below P0's ~1.5 ms:** an idle unit's arrival costs the others almost nothing.
   - **What it buys is the condition for a prefetch** (decode-step-bandwidth B2.0): a unit can now stream between ops
     without holding their barriers.
+- [x] **Fixed after the first commit (`307bc70`): a capture that syncs between its ops lost its waits.**
+  - **The bug:** the stream's waits were taken from the session's catch-up state, and `sync()` marks every unit
+    caught up on the card. The profile mode syncs after every op, so under `--profile` a 1.7B and a 135M traced
+    generation replayed without waits and raced, giving garbage tokens. Every plain run passed.
+  - **The fix:** the capture counts its own barriers (`Capture::barrier_ops`, each unit's `barriers_accounted`). A
+    unit whose count is behind gets a wait in its stream whatever the card's catch-up did, and at `end_trace` too.
+  - **The window:** each wait carries the barriers it stands for (`dm::BARRIER_STANDS_FOR`, word 5). The firmware's
+    profile window (`TRACE_BARRIERS`) counts that as it counts arrivals, so every unit's count is the op's index.
+  - **Gate:** `step176::a_capture_that_syncs_between_its_ops_keeps_its_waits`, watched failing with the waits taken
+    from the catch-up state. `step176`'s stream counts now include what the waits stand for.
+  - **Silicon, under `--profile` (card 1):** `step187` with the 135M checkpoint and `step188` pass.
 
 ### P2. What the P0 table showed, largest first
 

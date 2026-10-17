@@ -376,6 +376,7 @@ pub(crate) fn matmul(
                         fidelity,
                         layout.sems,
                         false,
+                        false,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -383,6 +384,7 @@ pub(crate) fn matmul(
                                     (k0 > 0).then_some(reload),
                                     route,
                                     fidelity,
+                                    false,
                                 ),
                                 [None; 3],
                             )

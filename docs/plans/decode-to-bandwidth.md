@@ -1,12 +1,13 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-17): **a 1.7B step 41.83 / 44.25 / 47.40 -> 37.69 / 40.20 / 43.41 ms (`1792268720`), 135M
-20.03 / 20.55 / 21.19 -> 17.51 / 17.97 / 18.76 (`1792269106`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-17): **a 1.7B step 41.83 / 44.25 / 47.40 -> 37.24 / 38.66 / 40.50 ms (`1792272596`), 135M
+20.03 / 20.55 / 21.19 -> 17.10 / 17.52 / 18.25 (`1792273005`).**
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** the copies are done; the k/v repack moved to Phase 2.
 - **Phase 3:** the capture barriers and the row-limited element-wise ops are done.
-- **Next:** Phase 3's fusers, then Phase 2. This is the umbrella plan.
+- **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b).
+- **Next:** Phase 2's A1-A2 (the batched path's padding, no regathering), then Phase 3's fusers. This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);
 - [decode-small-ops.md](decode-small-ops.md) (S1d, S4, S5);
@@ -109,7 +110,8 @@ Burn model gains.
 ### Phase 3. Each op's fixed cost and the op count, ~7 -> ≲2.5 ms exposed
 
 - [x] **Captured barriers on the units an op ran on** (2026-10-17; replay-fixed-cost P1 = decode-step-bandwidth B2.0;
-  gate in `step176`). **Measured: no change** (1.7B 38.93 / 41.38 / 44.58 ms, `1792266392`). An idle unit's arrival
+  gate in `step176`). **Measured: no change** (1.7B 38.93 / 41.38 / 44.58 ms, `1792266392`). A capture that syncs
+  mid-run (the profile mode) lost its waits in the first version: fixed, see replay-fixed-cost P1. An idle unit's arrival
   cost nothing measurable. It is kept because Phase 5 needs it: a streaming unit no longer holds other ops'
   barriers. The plan below, kept:
   - **The changes** (from `Session::enqueue_work_inner`):

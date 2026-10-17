@@ -260,6 +260,8 @@ pub const SMOKE: &[&str] = &[
     "step199_in_place_cache_write::",
     // Element-wise ops on a decode row's row groups only (decode-to-bandwidth.md Phase 3).
     "step200_row_limited_eltwise::",
+    // A matmul's transposed `B` transposed by the unpacker, bit for bit the mover's (decode-attention.md).
+    "step201_unpacker_transposed_b::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

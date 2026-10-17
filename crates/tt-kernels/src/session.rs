@@ -446,6 +446,8 @@ pub struct Session<T: Transport> {
     thin_matmul_reads: bool,
     /// [`Session::set_resident_matmul_a`].
     resident_matmul_a: bool,
+    /// [`Session::set_unpack_transposed_b`].
+    unpack_transposed_b: bool,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -1336,15 +1338,21 @@ fn admitted(words: usize, cache: u64) -> bool {
 /// reader section (NC's writes wait on credits only the reader and the roles release, so
 /// they follow it too), or first in a plain list. `false`, and `seg` unchanged, if the
 /// list is already as long as a list may be.
-/// A captured stream's top-level `BARRIER` entries: `[arrivals, wait-only]` (`dm::op::BARRIER`
-/// word 4).
-fn barrier_entries(stream: &[[u32; 8]]) -> [u32; 2] {
-    let mut out = [0u32; 2];
+/// A captured stream's top-level `BARRIER` entries: `[arrivals, wait-only, the barriers both
+/// stand for]` (`dm::op::BARRIER` words 4 and 5).
+fn barrier_entries(stream: &[[u32; 8]]) -> [u32; 3] {
+    let mut out = [0u32; 3];
     let mut i = 0;
     while i < stream.len() {
         let e = stream[i];
         if e[0] == tt_isa::dm::op::BARRIER {
-            out[(e[4] == 1) as usize] += 1;
+            let wait = e[4] == 1;
+            out[wait as usize] += 1;
+            out[2] += if wait {
+                e[tt_isa::dm::BARRIER_STANDS_FOR]
+            } else {
+                1
+            };
         }
         i += tt_isa::dm::record::len(e[0]).max(1);
     }
@@ -1876,6 +1884,7 @@ impl<T: Transport> Session<T> {
             matmul_k_block_limit: None,
             thin_matmul_reads: true,
             resident_matmul_a: true,
+            unpack_transposed_b: true,
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -3509,6 +3518,21 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+        // In a capture, what the trace's stream of each unit the op runs on must wait for: the
+        // latest captured barrier, if the unit sat out ops since it last accounted for one. This
+        // is the trace's own count, not `behind`: the capture's run may have synced since (the
+        // profile mode syncs after every op), which catches every unit up on the card but puts
+        // no wait in a replay's stream.
+        let trace_behind: Vec<Option<u32>> = match &self.capture {
+            Some(c) if n > 1 => (0..spread)
+                .map(|u| {
+                    (!queues[u].is_empty() && c.units[u].barriers_accounted != c.barrier_ops)
+                        .then(|| self.barriers.wrapping_sub(c.barriers_base))
+                })
+                .collect(),
+            _ => vec![None; spread],
+        };
+        let mut trace_behind = trace_behind;
         // In rounds: every unit's first list, then every unit's second, and
         // so on. A unit whose share is more than its ring holds makes the
         // host wait for room; enqueued unit by unit, that wait came before
@@ -3557,14 +3581,22 @@ impl<T: Transport> Session<T> {
                     if what.is_empty() {
                         *what = seg.what;
                     }
+                    if let Some(rel) = trace_behind[u].take() {
+                        // The trace's stream waits for the barrier, relative to the capture's
+                        // first as every captured target is, standing for the barriers the unit
+                        // sat out (which the profile mode's window counts as it counts
+                        // arrivals).
+                        let mut wait = self.barrier_wait(rel);
+                        let c = self.capture.as_mut().unwrap();
+                        wait[tt_isa::dm::BARRIER_STANDS_FOR] =
+                            c.barrier_ops - c.units[u].barriers_accounted;
+                        c.units[u].barriers_accounted = c.barrier_ops;
+                        c.units[u].stream.push(wait);
+                    }
                     if let Some(target) = behind[u].take() {
                         if capturing {
-                            // The trace's stream waits for the barrier, relative to the
-                            // capture's first as every captured target is; the capture's own
-                            // run waits now, in a list of its own the trace does not hold.
-                            let c = self.capture.as_ref().unwrap();
-                            let wait = self.barrier_wait(target.wrapping_sub(c.barriers_base));
-                            self.capture.as_mut().unwrap().units[u].stream.push(wait);
+                            // The capture's own run waits now, in a list of its own the trace
+                            // does not hold.
                             let start = self.mark();
                             self.catch_up_to(u, target)?;
                             self.stage(HostStage::Barrier, start);
@@ -3599,7 +3631,9 @@ impl<T: Transport> Session<T> {
                 // next op (above) and at the trace's end (`end_trace`).
                 let rel = entry[1].wrapping_sub(c.barriers_base);
                 c.barriers += arrivals;
+                c.barrier_ops += 1;
                 for &u in &arriving {
+                    c.units[u].barriers_accounted = c.barrier_ops;
                     c.units[u]
                         .stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
@@ -4050,6 +4084,7 @@ impl<T: Transport> Session<T> {
             epoch: self.epoch,
             barriers_base: self.barriers,
             barriers: 0,
+            barrier_ops: 0,
             units,
             freed: Vec::new(),
             ops: Vec::new(),
@@ -4068,9 +4103,13 @@ impl<T: Transport> Session<T> {
         // A unit that sat out the trace's last ops waits for its last barrier at the end of
         // its stream, so a replay leaves every unit it ran on past all of its barriers.
         let last = self.barriers.wrapping_sub(capture.barriers_base);
-        for (u, uc) in capture.units.iter_mut().enumerate() {
-            if !uc.stream.is_empty() && self.units[u].barrier_seen != self.barriers {
-                uc.stream.push(self.barrier_wait(last));
+        let ops = capture.barrier_ops;
+        for uc in capture.units.iter_mut() {
+            if !uc.stream.is_empty() && uc.barriers_accounted != ops {
+                let mut wait = self.barrier_wait(last);
+                wait[tt_isa::dm::BARRIER_STANDS_FOR] = ops - uc.barriers_accounted;
+                uc.barriers_accounted = ops;
+                uc.stream.push(wait);
             }
         }
         let held: Vec<Vec<(u64, u64)>> = capture
@@ -4435,10 +4474,10 @@ impl<T: Transport> Session<T> {
             .ok_or_else(|| TraceError::Unknown(id.0).into())
     }
 
-    /// For each unit, the `BARRIER` entries in trace `id`'s stream: `[arrivals, waits]`
-    /// (`None` for a unit the trace does not run on).
+    /// For each unit, the `BARRIER` entries in trace `id`'s stream: `[arrivals, waits, the
+    /// barriers both stand for]` (`None` for a unit the trace does not run on).
     #[doc(hidden)]
-    pub fn trace_barrier_entries(&self, id: TraceId) -> Result<Vec<Option<[u32; 2]>>, TensorError> {
+    pub fn trace_barrier_entries(&self, id: TraceId) -> Result<Vec<Option<[u32; 3]>>, TensorError> {
         let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
         Ok(t.units
             .iter()
@@ -5510,6 +5549,7 @@ impl<T: Transport> Session<T> {
         let m = if a_transposed { a.cols } else { a.rows };
         let thin = self.thin_matmul_reads && tensor::thin_rows(m, a_transposed) != 0;
         let resident_a = self.resident_matmul_a;
+        let unpack_b = self.unpack_transposed_b;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -5525,7 +5565,11 @@ impl<T: Transport> Session<T> {
                     allow_mop,
                     pipeline,
                     max_k_tiles,
-                    tensor::Reads { thin, resident_a },
+                    tensor::Reads {
+                        thin,
+                        resident_a,
+                        unpack_b,
+                    },
                 )
             })
             .and_then(|work| self.execute_on(work, units, budget));
@@ -5675,6 +5719,7 @@ impl<T: Transport> Session<T> {
                 self.spread_for(items.len() * m.div_ceil(32) * n.div_ceil(32) * k.div_ceil(32));
             let pipeline = self.pipeline;
             let max_k_tiles = self.matmul_k_block_limit;
+            let unpack_b = self.unpack_transposed_b;
             let out = self
                 .dram_state()
                 .and_then(|d| {
@@ -5691,6 +5736,7 @@ impl<T: Transport> Session<T> {
                         pipeline,
                         max_k_tiles,
                         padded,
+                        unpack_b,
                     )
                 })
                 .and_then(|work| self.execute_on(work, units, budget))?;
@@ -5976,6 +6022,13 @@ impl<T: Transport> Session<T> {
     /// Off, every block reads its `A`: the gates compare the two.
     pub fn set_resident_matmul_a(&mut self, on: bool) {
         self.resident_matmul_a = on;
+    }
+
+    /// Whether a matmul's transposed `B` (on the TF32 route) is transposed by the kernel's
+    /// unpacker (`record::GATHER_B_UNPACK_TRANSPOSE`): on by default. Off, the mover transposes
+    /// each tile as it reads it (`READ_TRANSPOSED`, ~10 us a tile on silicon), the same bits.
+    pub fn set_unpack_transposed_b(&mut self, on: bool) {
+        self.unpack_transposed_b = on;
     }
 
     /// How the transcendentals run from the next element-wise op on

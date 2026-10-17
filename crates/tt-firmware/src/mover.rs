@@ -1078,8 +1078,15 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             }
             trace(entry_traced, ev::ENTRY_END, head[0]);
             if traced && head[0] == op::BARRIER {
+                // An arrival is one of the trace's barriers; a wait stands for those the unit
+                // sat out (`dm::BARRIER_STANDS_FOR`), so the window counts ops on every unit.
+                let n = if head[4] == 1 {
+                    head[dm::BARRIER_STANDS_FOR]
+                } else {
+                    1
+                };
                 unsafe {
-                    TRACE_BARRIERS += 1;
+                    TRACE_BARRIERS += n;
                 }
             }
             i += n;

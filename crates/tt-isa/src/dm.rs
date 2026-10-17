@@ -134,6 +134,9 @@ pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
 pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
 /// Where the atomic increment's old value lands.
 pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
+/// The word of a wait-only `op::BARRIER` that says how many barriers it stands for: the
+/// profile mode's window counts it as that many arrivals.
+pub const BARRIER_STANDS_FOR: usize = 5;
 const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
 
 /// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
@@ -334,6 +337,11 @@ pub mod op {
     /// target before its next list, which orders it after those ops' writes
     /// without making it arrive at barriers it had no part in
     /// (`tt_kernels::session`). Only 0 or 1. Only in a list entry.
+    ///
+    /// Word 5 ([`super::BARRIER_STANDS_FOR`]): for a wait, the barriers it stands for -- in a
+    /// trace, the captured ops' barriers the unit sat out -- which the profile mode's window
+    /// (`TRACE_WINDOW`) counts as an arrival counts one, so every unit's count is the op's index.
+    /// Zero for an arrival, at most `0xffff`.
     pub const BARRIER: u32 = 9;
     /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
     /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
@@ -926,7 +934,14 @@ impl Entry {
             return Ok(Entry::Wait);
         }
         if w[0] == op::BARRIER {
-            if w[2] > 0x3f || w[3] > 0x3f || w[4] > 1 || w[5..].iter().any(|&v| v != 0) {
+            // Word 5, a wait's barriers ([`BARRIER_STANDS_FOR`]): zero on an arrival.
+            if w[2] > 0x3f
+                || w[3] > 0x3f
+                || w[4] > 1
+                || (w[4] == 0 && w[5] != 0)
+                || w[5] > 0xffff
+                || w[6..].iter().any(|&v| v != 0)
+            {
                 return Err(error::OP);
             }
             return Ok(Entry::Barrier {
@@ -1163,7 +1178,10 @@ mod tests {
             })
         );
         assert_eq!(decode(2, 0), Err(error::OP));
-        assert_eq!(decode(1, 1), Err(error::OP));
+        // A wait may say how many barriers it stands for; an arrival may not.
+        assert!(decode(1, 3).is_ok());
+        assert_eq!(decode(1, 0x1_0000), Err(error::OP));
+        assert_eq!(decode(0, 1), Err(error::OP));
     }
 
     #[test]

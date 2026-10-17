@@ -205,11 +205,13 @@ fn a_captured_op_s_barrier_counts_the_units_it_ran_on() {
         );
         assert!((arrivals as usize) < ops.len() * UNITS);
         // Unit 0 arrives at all four barriers; units 1-3 at two, and wait before each op after one
-        // they sat out (`out`, `wide`): the waits a replay needs, in the streams.
+        // they sat out (`out`, `wide`): the waits a replay needs, in the streams. Each wait stands
+        // for the one barrier its unit sat out, so every stream accounts for all four (the
+        // profile mode's window counts ops by them).
         let entries = s.trace_barrier_entries(trace).unwrap();
-        assert_eq!(entries[0], Some([4, 0]), "unit 0's stream");
+        assert_eq!(entries[0], Some([4, 0, 4]), "unit 0's stream");
         for (u, e) in entries.iter().enumerate().skip(1) {
-            assert_eq!(*e, Some([2, 2]), "unit {u}'s stream");
+            assert_eq!(*e, Some([2, 2, 4]), "unit {u}'s stream");
         }
         for round in 0..3 {
             let (a1, b1, a2) = (
@@ -241,6 +243,53 @@ fn a_captured_op_s_barrier_counts_the_units_it_ran_on() {
                 "round {round}: an eager op after the replay"
             );
             s.free(after).unwrap();
+        }
+        s.release_trace(trace).unwrap();
+        for t in [x, w, z, q, slow, out, again, wide] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// A capture whose run syncs between its ops (as the profile mode's does after every op) has the
+/// same waits in its streams: a sync catches every unit up on the card, not in a replay. Watched
+/// failing with the waits taken from the session's catch-up state (no wait at all, a garbage
+/// generation under `--profile`).
+#[test]
+fn a_capture_that_syncs_between_its_ops_keeps_its_waits() {
+    const UNITS: usize = 4;
+    with_tiles(UNITS, |s| {
+        let (m1, k1, n1) = (32, 256, 32);
+        let (m2, k2) = (128, 32);
+        let x = s.upload(&bits(m1 * k1, 1), m1, k1).unwrap();
+        let w = s.upload(&bits(k1 * n1, 2), k1, n1).unwrap();
+        let z = s.upload(&bits(m2 * k2, 3), m2, k2).unwrap();
+        let q = s.upload(&bits(m1 * m2, 4), m1, m2).unwrap();
+        s.begin_trace().unwrap();
+        let slow = mm(s, &x, &w);
+        s.sync().unwrap();
+        let out = mm(s, &z, &slow);
+        s.sync().unwrap();
+        let again = mm(s, &q, &out);
+        s.sync().unwrap();
+        let wide = mm(s, &z, &again);
+        let trace = s.end_trace().unwrap();
+        let entries = s.trace_barrier_entries(trace).unwrap();
+        assert_eq!(entries[0], Some([4, 0, 4]), "unit 0's stream");
+        for (u, e) in entries.iter().enumerate().skip(1) {
+            assert_eq!(*e, Some([2, 2, 4]), "unit {u}'s stream");
+        }
+        let want_slow = host_matmul(&bits(m1 * k1, 1), &bits(k1 * n1, 2), m1, k1, n1);
+        let want_out = host_matmul(&bits(m2 * k2, 3), &want_slow, m2, k2, n1);
+        let want_again = host_matmul(&bits(m1 * m2, 4), &want_out, m1, m2, n1);
+        let want_wide = host_matmul(&bits(m2 * k2, 3), &want_again, m2, k2, n1);
+        for _ in 0..2 {
+            s.replay(trace).unwrap();
+            let got = s.download(&wide).unwrap();
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want_wide.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
         }
         s.release_trace(trace).unwrap();
         for t in [x, w, z, q, slow, out, again, wide] {

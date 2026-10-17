@@ -56,9 +56,39 @@ Every phase is bit for bit with today's attention, and each head's positions kee
     - `pv` with `V_h` as an untransposed block `B`.
 
   Decide it with A0's numbers: it changes `FixedCache`, the prefill chunks' write and attention's operand forms.
-- [ ] **A0. Profile by sub-op** at `Step(64)`, `Step(256)` and `Step(512)` (the profile mode; no new instruments).
-  - Why `qk` reads K at ~30 GB/s: `block_fits` at attended lengths on and off multiples of 32, and the 64-unit deal
-    over 32 heads.
+- [x] **A0. Profile by sub-op** (profile `1792264052`). **Why `qk` reads K at ~30 GB/s:**
+  - **Not the deal or `block_fits`:** at `Step(512)` the product is ~11 read entries a unit on 120 units, and
+    still 138 us of data.
+  - **The cause:** `q @ K^T` reads the cache as a transposed `B`, and the mover transposed each tile one datum at a
+    time (`READ_TRANSPOSED`, ~10 us a tile).
+- [x] **A0b. The unpacker transposes `B`** (2026-10-17).
+  - **The flag:** `record::GATHER_B_UNPACK_TRANSPOSE` has the mover read each of a transposed `B`'s tiles as it
+    lies.
+  - **The kernel:** `matmul_items_reloading(.., b_transposed)` sets unpacker 0's `Haloize_mode`, which transposes
+    within each face, and unpacks `B`'s face `(k, fj)` from the slot's face `(fj, k)`.
+  - **When:** the TF32 route, every product path (whole, thin, K-blocked, batched). On by default;
+    `Session::set_unpack_transposed_b(false)` keeps the mover's transpose.
+  - **Bits:** the unpack converts each datum as it does untransposed, so `SrcA` holds the same values. Measured bit
+    for bit on silicon, special values included.
+  - **Gate `step201_unpacker_transposed_b`** (ttsim; card 0 `1792271895`, `1792272312`; in `--smoke`). Bit for bit
+    against the mover's transpose and against `B^T` uploaded plain:
+    - whole, ragged, thin, K-blocked and `A`-transposed products;
+    - a batched `q k^T`.
+  - **Watched failing:** the faces in the untransposed order; `Haloize_mode` off.
+  - **Also checked:** `step121`'s wait planner over the transposed programs; record unit test
+    `an_unpacker_transposed_b_is_read_as_it_lies`.
+  - **Regression:**
+    - ttsim: `step172`/`step173` in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images; `step18`,
+      `step183`, `step184`, `step186`, `step187`, `step190`, `step193`, `step198`; `step12_mnist`;
+    - firmware clippy in four configurations;
+    - Burn conformance: 2,973 passed, 52 as expected;
+    - card 0: 45 gates (`1792272312`), the mover gates and `step201` in `fast-reads` (`1792272565`), and
+      `--smoke` 1,115 of 1,115 (`1792276969`).
+  - **Measured** (card 1):
+    - 1.7B 37.69 / 40.20 / 43.41 -> **37.24 / 38.66 / 40.50 ms** (`1792272596`). The context slope from 32 to 256
+      tokens fell from 5.7 to 3.3 ms;
+    - 135M 17.51 / 17.97 / 18.76 -> **17.10 / 17.52 / 18.25** (`1792273005`);
+    - 1.7B prefill's first token 101.7 / 172.5 / 297.3 -> 98.7 / 169.7 / 293.4 ms.
 - [ ] **A1. The batched path's padding:** `matmul_dram_batched` gets `matmul_padding_off_k`.
   - `q` and `P` have padding past `M` only.
   - **Worth:** −0.38 ms.

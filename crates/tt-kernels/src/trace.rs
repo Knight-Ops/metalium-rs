@@ -196,6 +196,9 @@ pub struct UnitFootprint {
 /// One unit's share of a capture in progress.
 #[derive(Default)]
 pub(crate) struct UnitCapture {
+    /// The captured barriers this unit's stream accounts for so far: those it arrived at, and
+    /// those a wait in it stands for (`tt_isa::dm::BARRIER_STANDS_FOR`).
+    pub(crate) barriers_accounted: u32,
     /// What the sections so far are made of.
     pub(crate) sections_composition: Composition,
     /// Each packet's reader and writer sections, laid out for streaming
@@ -282,6 +285,8 @@ pub(crate) struct Capture {
     pub(crate) barriers_base: u32,
     /// Arrivals at the barriers captured: each barrier's units, the ones its op ran on.
     pub(crate) barriers: u32,
+    /// The barriers captured, one an op that ended in one.
+    pub(crate) barrier_ops: u32,
     pub(crate) units: Vec<UnitCapture>,
     /// Frees during the capture, deferred to the trace's release.
     pub(crate) freed: Vec<Placement>,
@@ -308,8 +313,8 @@ pub(crate) struct UnitTrace {
     pub(crate) composition: Composition,
     pub(crate) top_level_entries: u32,
     pub(crate) gddr_bytes: u64,
-    /// Its stream's `BARRIER` entries: `[arrivals, wait-only]`.
-    pub(crate) barriers: [u32; 2],
+    /// Its stream's `BARRIER` entries: `[arrivals, wait-only, the barriers both stand for]`.
+    pub(crate) barriers: [u32; 3],
 }
 
 /// A finished trace: see the module documentation.

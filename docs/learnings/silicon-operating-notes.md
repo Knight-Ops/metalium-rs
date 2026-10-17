@@ -1066,6 +1066,19 @@ The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
   - **the compute after the last read:** ~15 us an op, not overlapped;
   - **a deal's last round:** uneven on 120 units.
 
+## A matmul's transposed `B` through unpacker 0 (2026-10-17, card 0)
+
+From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpacker_transposed_b`.
+- **The mechanism:** a transposed `B` (its tiles in their slots as they lie in GDDR) is unpacked into `SrcA` with
+  `Haloize_mode` set, which transposes within each face. `B`'s face `(k, fj)` is unpacked from the slot's face
+  `(fj, k)`. The products are **bit for bit** those of the mover's datum-by-datum transpose (`READ_TRANSPOSED`) and
+  of `B^T` uploaded plain: TF32, HiFi4, every special value, whole, ragged, thin, K-blocked and batched.
+- **What that shows:** the unpack's per-datum conversion into `SrcA` (normalising -0, subnormals and low mantissa
+  bits) commutes with the transpose, as the earlier unpacker-mode probes implied.
+- **State:** `Haloize_mode` is persistent. Every later unpack configuration writes the whole `SEC0_REG2` word with it
+  clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
+  none unpacks to `Dst` with it set (undefined behaviour).
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

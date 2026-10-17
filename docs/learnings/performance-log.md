@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A transposed `B` transposed by the unpacker](#a-transposed-b-transposed-by-the-unpacker-2026-10-17-cards-0-and-1) | 2026-10-17 | a matmul's transposed `B` read as it lies and transposed by unpacker 0 (`Haloize_mode`, faces swapped), not by the mover at ~10 us a tile: bit for bit; a 1.7B decode step -> **37.24 / 38.66 / 40.50 ms**, 135M -> **17.10 / 17.52 / 18.25** |
 | [Element-wise ops on a decode row's row groups](#element-wise-ops-on-a-decode-rows-row-groups-2026-10-17-cards-0-and-1) | 2026-10-17 | lanewise SFPU kinds on a `[1, W]` row run 1 of 8 row groups: a 1.7B decode step 38.93 / 41.38 / 44.58 -> **37.69 / 40.20 / 43.41 ms**, 135M -> **17.51 / 17.97 / 18.76** |
 | [Captured barriers on the units an op ran on](#captured-barriers-on-the-units-an-op-ran-on-2026-10-17-cards-0-and-1) | 2026-10-17 | a captured op's barrier counts the units it ran on (waits for a unit that sat ops out, in its stream): no step time change (1.7B 38.93 / 41.38 / 44.58 ms); the condition for a cross-op prefetch |
 | [A traced cache written in place](#a-traced-cache-written-in-place-2026-10-17-cards-0-and-1) | 2026-10-17 | a traced step's cache donated and written in place (no tile copy, no write-back; a stale read refused by name), the write's indices read as a row: a 1.7B decode step 41.83 / 44.25 / 47.40 -> **38.97 / 41.41 / 44.58 ms**, 135M 20.03-21.19 -> **18.59 / 19.07 / 19.79** |
@@ -329,6 +330,23 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## A transposed `B` transposed by the unpacker (2026-10-17, cards 0 and 1)
+
+[decode-attention.md](../plans/decode-attention.md) A0-A0b.
+- **What A0 found:** at `Step(512)` a 1.7B step's `q @ K^T` took 144 us a layer for ~11 read entries a unit. The
+  mover transposed each key tile it read, one datum at a time (`READ_TRANSPOSED`, ~10 us a tile).
+- **The change:** the mover reads the tiles as they lie (`record::GATHER_B_UNPACK_TRANSPOSE`). Unpacker 0
+  transposes within each face (`Haloize_mode`), and the kernel unpacks `B`'s faces in transposed order.
+- **Bits:** bit for bit with the mover's transpose, special values included (`step201`, ttsim and card 0).
+
+| Step, ms (32 / 128 / 256-token prompt) | Before (`1792268720`, `1792269106`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct decode | 37.69 / 40.20 / 43.41 | **37.24 / 38.66 / 40.50** (`1792272596`) | 310.1 / 308.4 / 325.7 |
+| SmolLM2-1.7B-Instruct first token (prefill) | 101.7 / 172.5 / 297.3 | **98.7 / 169.7 / 293.4** | 7,131 / 7,621 / 12,359 |
+| SmolLM2-135M decode | 17.51 / 17.97 / 18.76 | **17.10 / 17.52 / 18.25** (`1792273005`) | 26.8 / 28.9 / 31.3 |
+
+**The context-length slope:** a 1.7B step's cost from 32 to 256 tokens fell from 5.7 to 3.3 ms.
+
 ## Element-wise ops on a decode row's row groups (2026-10-17, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. A lanewise SFPU kind on a single tile row of
@@ -364,6 +382,11 @@ fewer than 32 rows runs its programs over only the row groups its rows occupy: o
 - **On silicon, a trace with the waits dropped still gave the right bits** (unit 0 on a 1,024-tile `K` chain, units
   1-3 reading its output next). The replay's start closes that window, so the gate checks the streams' barrier
   entries instead.
+- **Under `--profile` the race was real.** The profile mode syncs after every captured op, and the first version
+  took the stream's waits from the card's catch-up state, so its streams had none. The 1.7B and 135M traced
+  generations then gave garbage tokens.
+  - **Fixed:** the capture counts its own barriers, and each wait says how many it stands for, for the profile
+    window ([replay-fixed-cost.md](../plans/replay-fixed-cost.md) P1).
 
 ## A traced cache written in place (2026-10-17, cards 0 and 1)
 

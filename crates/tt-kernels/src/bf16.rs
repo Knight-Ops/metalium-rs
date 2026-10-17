@@ -578,6 +578,7 @@ pub(crate) fn matmul(
                 fidelity,
                 layout.sems,
                 false,
+                false,
                 || {
                     matmul::matmul_kernel(
                         &layout.outputs,
@@ -585,6 +586,7 @@ pub(crate) fn matmul(
                         L1Format::Bf16,
                         5,
                         fidelity,
+                        false,
                         false,
                     )
                 },
@@ -675,6 +677,7 @@ fn matmul_continuing(
                         fidelity,
                         layout.sems,
                         false,
+                        false,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -682,6 +685,7 @@ fn matmul_continuing(
                                     (k0 > 0).then_some(reload),
                                     route,
                                     fidelity,
+                                    false,
                                 ),
                                 [None; 3],
                             )

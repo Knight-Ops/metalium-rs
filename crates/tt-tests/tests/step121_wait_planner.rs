@@ -127,16 +127,17 @@ fn corpus() -> Vec<Checked> {
                     }],
                 ),
             ] {
-                for allow_mop in [false, true] {
+                for (allow_mop, b_t) in [(false, false), (true, false), (false, true)] {
                     let (sems, _) = MatmulSemaphores::alone();
-                    let (words, mop) =
-                        matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop);
+                    let (words, mop) = matmul::matmul_kernel(
+                        &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, b_t,
+                    );
                     for t in 0..3 {
                         let stream = frontend_stream(&words[t], mop[t].as_ref())
                             .expect("frontend model accepts the matmul");
                         out.push(check(
                             format!(
-                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} {}",
+                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} b_t={b_t} {}",
                                 role[t]
                             ),
                             &stream,

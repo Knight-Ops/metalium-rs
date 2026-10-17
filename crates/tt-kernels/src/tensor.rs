@@ -1233,6 +1233,7 @@ pub fn matmul_dram(
         Reads {
             thin: true,
             resident_a: false,
+            unpack_b: false,
         },
     )
 }
@@ -1247,6 +1248,8 @@ pub(crate) struct Reads {
     /// ([`record::GATHER_A_RESIDENT`]): with `K` whole under [`Staging::Slots`], `A` is at the
     /// same slots for every block.
     pub resident_a: bool,
+    /// A transposed `B` is transposed by the kernel's unpacker (`BlockPlan::unpack_b`).
+    pub unpack_b: bool,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1335,6 +1338,7 @@ pub(crate) fn matmul_dram_limited(
         },
         resident_a: reads.resident_a && staging == Staging::Slots,
         col_runs,
+        unpack_b: reads.unpack_b && route == SrcRoute::Tf32FromFp32,
     };
     if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
         alloc.free(&c.placement);
@@ -1363,6 +1367,11 @@ struct BlockPlan {
     /// The output's columns, one run a job in dealing order, when [`thin_runs`]
     /// deals them (instead of `block`'s width).
     col_runs: Option<Vec<std::ops::Range<usize>>>,
+    /// A transposed `B`'s tiles are read as they lie and transposed by the kernel's unpacker
+    /// ([`record::GATHER_B_UNPACK_TRANSPOSE`]), not one datum at a time by the mover
+    /// (`READ_TRANSPOSED`, ~10 us a tile). Only on the TF32 route, where `B`'s unpack to `SrcA`
+    /// converts it anyway.
+    unpack_b: bool,
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -1409,6 +1418,7 @@ impl BlockPlan {
         if self.k_block < kt {
             return self.push_k_jobs(jobs, [ra, rb, rc], [a_transposed, b_transposed]);
         }
+        let unpack_b = self.unpack_b && b_transposed;
         let [mc, nc] = self.block;
         let (units, staging) = (self.units, self.staging);
         let (in_fmt, out_fmt) = self.route.formats();
@@ -1455,6 +1465,11 @@ impl BlockPlan {
                         record::GATHER_A_RESIDENT
                     } else {
                         0
+                    }
+                    | if unpack_b {
+                        record::GATHER_B_UNPACK_TRANSPOSE
+                    } else {
+                        0
                     };
                 let gather = [
                     [
@@ -1483,7 +1498,12 @@ impl BlockPlan {
                     fidelity,
                     sems,
                     allow_mop,
-                    || matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop),
+                    unpack_b,
+                    || {
+                        matmul::matmul_kernel(
+                            &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, unpack_b,
+                        )
+                    },
                 );
                 // Only the datums go back: the packer writes nothing else, and the
                 // unpacker skips the header whatever it holds (`step18_dram_matmul`).
@@ -1535,7 +1555,7 @@ pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -
     loop {
         if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
-                matmul::k_block_kernel(&layout, r, route, fidelity)
+                matmul::k_block_kernel(&layout, r, route, fidelity, false)
                     .iter()
                     .all(|p| {
                         p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
@@ -1561,6 +1581,7 @@ impl BlockPlan {
         transposed: [bool; 2],
     ) -> Result<()> {
         let [mt, kt, nt] = self.tiles;
+        let unpack_b = self.unpack_b && transposed[1];
         // One output tile per job keeps its prior accumulator and every K
         // continuation on the same unit; outputs remain independent.
         for i in 0..mt {
@@ -1585,7 +1606,12 @@ impl BlockPlan {
                     let flags = u32::from(transposed[0])
                         | u32::from(transposed[1]) << 1
                         | record::gather_rows(thin)
-                        | (count as u32) << 8;
+                        | (count as u32) << 8
+                        | if unpack_b {
+                            record::GATHER_B_UNPACK_TRANSPOSE
+                        } else {
+                            0
+                        };
                     let mut gather = vec![
                         [
                             record::GATHER,
@@ -1630,6 +1656,7 @@ impl BlockPlan {
                         self.fidelity,
                         layout.sems,
                         false,
+                        unpack_b,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -1637,6 +1664,7 @@ impl BlockPlan {
                                     (k0 > 0).then_some(reload),
                                     self.route,
                                     self.fidelity,
+                                    unpack_b,
                                 ),
                                 [None; 3],
                             )
@@ -1782,6 +1810,7 @@ pub fn matmul_dram_batched(
         pipeline,
         None,
         [false; 2],
+        false,
     )
 }
 
@@ -1806,6 +1835,7 @@ pub(crate) fn matmul_dram_batched_limited(
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
     padded: [bool; 2],
+    unpack_b: bool,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1862,6 +1892,7 @@ pub(crate) fn matmul_dram_batched_limited(
         thin: 0,
         resident_a: false,
         col_runs: None,
+        unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -4677,6 +4708,7 @@ mod tests {
             let reads = super::Reads {
                 thin: true,
                 resident_a,
+                unpack_b: false,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,

@@ -542,8 +542,10 @@ pub fn matmul_kernel(
     out_fmt: u32,
     fidelity: Fidelity,
     allow_mop: bool,
+    b_transposed: bool,
 ) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
-    let [unpack, math, pack] = matmul_items(outputs, sems, in_fmt, out_fmt, fidelity);
+    let [unpack, math, pack] =
+        matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None, b_transposed);
     // With `allow_mop`, a `MOP` on the math role only: on silicon (row AE) one
     // on the unpack or pack role made MNIST inference slower (0.487 -> 0.500,
     // 0.528 ms a batch), and the math role's is no faster end to end on the
@@ -619,6 +621,7 @@ pub(crate) fn k_block_kernel(
     reload: Option<Reload>,
     route: SrcRoute,
     fidelity: Fidelity,
+    b_transposed: bool,
 ) -> [Vec<Instruction>; 3] {
     let (in_fmt, out_fmt) = route.formats();
     let items = matmul_items_reloading(
@@ -628,6 +631,7 @@ pub(crate) fn k_block_kernel(
         out_fmt,
         fidelity,
         reload,
+        b_transposed,
     );
     items.map(|items| crate::loops::lower_with(&items, false).words)
 }
@@ -656,16 +660,23 @@ pub fn matmul_items(
     out_fmt: u32,
     fidelity: Fidelity,
 ) -> [Vec<Item>; 3] {
-    matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None)
+    matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None, false)
 }
 
-fn matmul_items_reloading(
+/// [`matmul_items`], continuing a K block's accumulator from `reload`'s prior tile when given,
+/// and with each `B` tile the transpose of the tile in its slot when `b_transposed`: unpacker 0
+/// transposes within each face (`Haloize_mode`, [`tt_isa::unpacker::stage_transpose`]) and `B`'s
+/// face `(k, fj)` is unpacked from the slot's face `(fj, k)`, so the mover reads the stored tile
+/// as it lies (`record::GATHER_B_UNPACK_TRANSPOSE`). The unpack converts each datum as it does
+/// untransposed, so `SrcA` holds the same values the mover's own transpose would give it.
+pub(crate) fn matmul_items_reloading(
     outputs: &[OutputTile],
     sems: MatmulSemaphores,
     in_fmt: L1Format,
     out_fmt: u32,
     fidelity: Fidelity,
     reload: Option<Reload>,
+    b_transposed: bool,
 ) -> [Vec<Item>; 3] {
     assert!(
         outputs.iter().all(|o| !o.pairs.is_empty()),
@@ -676,6 +687,9 @@ fn matmul_items_reloading(
     let mut words = ConfigWords::new();
     let descriptor = tile_descriptor(in_fmt);
     unpack_src_config(&mut words, Unpacker::SrcA, descriptor, b0, out_fmt);
+    if b_transposed {
+        tt_isa::unpacker::stage_transpose(&mut words, false).expect("a Src unpack");
+    }
     unpack_src_config(&mut words, Unpacker::SrcB, descriptor, a0, out_fmt);
     words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
     words
@@ -729,6 +743,8 @@ fn matmul_items_reloading(
     // `fi` unit -- its two `k` halves, the second ending by moving the `Dst`
     // base on two faces: the same words for every pair and, on the math role,
     // for both `fi` (the banks start and end empty), so built once.
+    // `B`'s face `(k, fj)`: the slot's own, or its `(fj, k)` transposed by the unpacker.
+    let b_face = |k: u32, fj: u32| if b_transposed { 2 * fj + k } else { 2 * k + fj };
     let mut ub = Vec::new();
     let mut unit: Option<Vec<Instruction>> = None;
     let mut banks = Banks::after_reset();
@@ -740,13 +756,13 @@ fn matmul_items_reloading(
             let (u, with_b) = banks.unpack_b(base).unwrap();
             ub.push(u);
             // `B` is in1 and goes to `SrcA`: its faces `(k, fj)`.
-            ub.push(zw(Unpacker::SrcA, 2 * k));
+            ub.push(zw(Unpacker::SrcA, b_face(k, 0)));
             let (u, both) = with_b.unpack_a(base).unwrap();
             ub.push(u);
             let loaded = group(&mut mb, 0, both);
             let (m, only_b) = loaded.mvmul_release_a(mv(8, MATH_AM_GROUP)).unwrap();
             mb.push(m);
-            ub.push(zw(Unpacker::SrcA, 2 * k + 1));
+            ub.push(zw(Unpacker::SrcA, b_face(k, 1)));
             let (u, both) = only_b.unpack_a(base).unwrap();
             ub.push(u);
             let loaded = group(&mut mb, 16, both);
@@ -1637,6 +1653,7 @@ pub(crate) fn programs(
 
 /// [`programs`] for [`matmul_kernel`]: the programs and their MOP
 /// configurations, built once per process.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn kernel_programs(
     tiles: [usize; 3],
     half: u8,
@@ -1644,6 +1661,7 @@ pub(crate) fn kernel_programs(
     fidelity: Fidelity,
     sems: MatmulSemaphores,
     allow_mop: bool,
+    b_transposed: bool,
     build: impl FnOnce() -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]),
 ) -> (
     std::sync::Arc<[Vec<Instruction>; 3]>,
@@ -1653,11 +1671,19 @@ pub(crate) fn kernel_programs(
     use std::sync::{Arc, Mutex, OnceLock};
     // `half`: the half of a double-buffered pair (`Staging::SlotsHalf`), whose
     // programs name addresses `HALF` apart under the same semaphores.
-    type Key = ([usize; 3], u8, SrcRoute, Fidelity, MatmulSemaphores, bool);
+    type Key = (
+        [usize; 3],
+        u8,
+        SrcRoute,
+        Fidelity,
+        MatmulSemaphores,
+        bool,
+        bool,
+    );
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, half, route, fidelity, sems, allow_mop);
+    let key = (tiles, half, route, fidelity, sems, allow_mop, b_transposed);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -2002,8 +2028,15 @@ mod loop_tests {
                     }
                 }
                 // What a GDDR kernel carries: the words with their MOP configurations.
-                let (words, mop) =
-                    matmul_kernel(&layout.outputs, layout.sems, L1Format::Fp32, 0, f, true);
+                let (words, mop) = matmul_kernel(
+                    &layout.outputs,
+                    layout.sems,
+                    L1Format::Fp32,
+                    0,
+                    f,
+                    true,
+                    false,
+                );
                 for r in 0..3 {
                     let got = crate::loops::frontend_stream(&words[r], mop[r].as_ref()).unwrap();
                     assert!(

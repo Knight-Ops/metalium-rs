@@ -44,10 +44,15 @@ pub const GATHER_BF16: u32 = 1 << 2;
 /// and nothing since wrote there (a product's later rounds on a unit, under one
 /// staging). Only `B` is read; `A`'s slots keep what they hold.
 pub const GATHER_A_RESIDENT: u32 = 1 << 25;
+/// [`GATHER`]'s flag for a transposed `B` (bit 1) whose tiles the kernel's unpacker transposes:
+/// tile `(kk, j)` of `op(B)` is `B`'s tile `(j, kk)` read as it lies (`op::READ`, not
+/// `op::READ_TRANSPOSED`), so the mover moves whole tiles and transposes nothing. Refused
+/// without bit 1, and with packed BF16.
+pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
 /// [`GATHER`]'s flag bits that are not `kt`.
-const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT | 0xff;
+const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | 0xff;
 
-/// [`GATHER`]'s `kt`, from its flags (bits 26-31 set make it too large for
+/// [`GATHER`]'s `kt`, from its flags (bits 27-31 set make it too large for
 /// [`MAX_EXTENT`], so a record with them is refused).
 pub const fn gather_kt(flags: u32) -> u32 {
     (flags & !GATHER_FLAG_BITS) >> 8
@@ -424,6 +429,10 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             let [_, flags, a_at, b_at, i0, rows, j0, cols] = h;
             let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
             let resident = flags & GATHER_A_RESIDENT != 0;
+            let b_unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
+            if b_unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+                return Err(super::error::RANGE);
+            }
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let (a, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
             if flags & GATHER_BF16 != 0 {
@@ -568,6 +577,8 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     let to = b_at + (kk * cols + j) * TILE_SLOT as u32;
                     emit(match row.as_mut() {
                         Some(r) => read(r.next()?, kk, j0 + j, to),
+                        // The kernel transposes it: the tile as it lies.
+                        None if b_unpacked => read(b.tile(j0 + j, kk)?, kk, j0 + j, to),
                         None => fetch(&b, b_t, kk, j0 + j, to)?,
                     })?;
                 }
@@ -1285,12 +1296,65 @@ mod tests {
         let first_b = whole.iter().position(|e| e[4] >= 0x6_0000).unwrap();
         assert_eq!(resident, whole[first_b..]);
         assert_eq!(gather_kt(GATHER_A_RESIDENT | 7 << 8 | 0xff), 7);
-        for bad in [1 << 26, 1 << 31] {
+        for bad in [1 << 27, 1 << 31] {
             assert_eq!(
                 gather(bad, a0, b0),
                 Err(super::super::error::LENGTH),
                 "{bad:#x}"
             );
+        }
+    }
+
+    /// A `B` the unpacker transposes is read as it lies: the same tiles, to the same slots, as
+    /// the transposed gather, each a plain `READ` where that one is `READ_TRANSPOSED`. Refused
+    /// without the transpose flag, and with packed BF16.
+    #[test]
+    fn an_unpacker_transposed_b_is_read_as_it_lies() {
+        let a = t(3, 5);
+        let b = t(7, 4);
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        let (i0, rows, j0, cols, kt) = (1u32, 2u32, 2u32, 3u32, 4u32);
+        let gather = |flags: u32| {
+            let head = [
+                GATHER,
+                flags | kt << 8,
+                0x2_0000,
+                0x6_0000,
+                i0,
+                rows,
+                j0,
+                cols,
+            ];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1, b0, b1], |e| {
+                got.push(e);
+                Ok(())
+            })
+            .map(|_| got)
+        };
+        for a_flag in [0, 1] {
+            let software = gather(a_flag | 2).unwrap();
+            let unpacked = gather(a_flag | 2 | GATHER_B_UNPACK_TRANSPOSE).unwrap();
+            assert_eq!(software.len(), unpacked.len());
+            let mut b_reads = 0;
+            for (s, u) in software.iter().zip(&unpacked) {
+                if s[4] >= 0x6_0000 {
+                    assert_eq!(s[0], op::READ_TRANSPOSED);
+                    assert_eq!(u[0], op::READ);
+                    assert_eq!(s[1..], u[1..], "the same tile to the same slot");
+                    b_reads += 1;
+                } else {
+                    assert_eq!(s, u);
+                }
+            }
+            assert_eq!(b_reads, kt * cols);
+        }
+        for bad in [
+            GATHER_B_UNPACK_TRANSPOSE,
+            GATHER_B_UNPACK_TRANSPOSE | GATHER_BF16 | 2,
+        ] {
+            assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
     }
 
