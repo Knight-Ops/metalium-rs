@@ -252,6 +252,8 @@ flowchart TD
   - **The scale is not in it:** its `Reshape` is a block of its own in burn-fusion, and the product joins neither
     (observed).
   - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
+  - **Row-limited** (2026-10-16): a tile row of fewer than 32 rows runs only the row groups they occupy
+    (`sfpu::reduce::row_offsets`); a decode row's kernel 14.95 -> 5.58 us (`step196`, decode-small-ops.md S3).
 - [ ] LayerNorm and softmax as reduce-maps.
 - [ ] Add L1 circular-buffer streaming path for rows too long for one job.
 - [ ] Benchmark fused transformer encoder layer in `step59_burn_transformer`.

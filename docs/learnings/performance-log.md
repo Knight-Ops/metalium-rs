@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [RMSNorm's statistic over a decode row's row groups](#rmsnorms-statistic-over-a-decode-rows-row-groups-2026-10-16-cards-0-and-1) | 2026-10-16 | the statistic kernel runs only the row groups a tile row's rows occupy (1 of 8 for a decode row): its kernel 14.95 -> 5.58 us a norm; a 1.7B decode step 43.42 / 45.85 / 49.00 -> **42.97 / 45.41 / 48.59 ms**, 135M 20.20-21.34 -> **19.94 / 20.42 / 21.11**. Reading only the rows used (a thin `READ_RUN`, ~74% fewer bytes) made the read slower, 19.15 -> 21.01 us, and was reverted |
 | [Decode fusers: sigmoid, SiLU and RMSNorm](#decode-fusers-sigmoid-silu-and-rmsnorm-2026-10-16-cards-0-and-1) | 2026-10-16 | decode runs on `Tt` (burn-fusion), with three chain fusers bit for bit `TtBackend`: Burn's sigmoid composition as the native sigmoid, `silu(gate) * up` as one SFPU pass, RMSNorm's statistic as one reduction kernel. A 1.7B decode step 45.23 / 47.71 / 50.78 -> **43.42 / 45.85 / 49.00 ms** (23.0-20.4 tokens/s), 135M 22.46-23.63 -> **20.20 / 20.66 / 21.34**. A norm that also divided in one kernel was 640 us a norm (71.5 ms a 1.7B step): one unit pushed `DIV`'s instructions for 64 tiles |
 | [Block views: RoPE and SiLU without repacks or copies](#block-views-rope-and-silu-without-repacks-or-copies-2026-10-16-cards-0-and-1) | 2026-10-16 | element-wise ops read a block of a buffer in place, RoPE runs in the projection's layout (its table laid over the heads once a step, its halves swapped by tile copies): a 1.7B decode step 47.90 / 50.37 / 53.53 -> **45.23 / 47.71 / 50.78 ms** (22.1-19.7 tokens/s), 135M 22.91-23.98 -> **22.46 / 22.95 / 23.63**; RoPE's four repacks a layer gone, the key write now repacks (S1d); F0: the step under burn-fusion is +1.5 / +2.2 ms (its sigmoid is Burn's 8-op composition) |
 | [Decode matmuls read only the activation rows they use](#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1) | 2026-10-16 | P3 (fused `q\|k\|v` and `gate\|up`, `Llama::fused`): 1.7B **47.90 / 50.37 / 53.53 ms**, 135M **22.91-23.98**; `gate\|up` at ~490 GB/s. P0-P2: an `m = 1` product's `GATHER` reads each `A` tile through row `r` of face 1 (one entry, ~27% of the bytes), not the whole tile, and a one-tile-row product's last round is spread over the units: a 1.7B decode step 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms** (20.1-18.0 tokens/s), its matmuls 33.8 -> 26.3 ms; two face-row reads a tile instead were *slower* on the 135M (the mover's cost is per entry); what is left is entry-bound on B |
@@ -320,6 +321,40 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## RMSNorm's statistic over a decode row's row groups (2026-10-16, cards 0 and 1)
+
+[decode-small-ops.md](../plans/decode-small-ops.md) S3, "next if it pays". Bench: `TT_TILES=all TT_GEN_MODEL=<model>
+TT_GEN_FLEX_SAMPLES=1 cargo xtask bench --device 1 --filter silicon_bench_models::traced_generation`, release, card 1,
+2 warmups, 9 samples, burn-flex in the same run; profiles the same with `--profile` (1.7B, `Step(64)`, unit 0).
+
+**What changed.** A decode row is tensor row 0 of each tile: 4 of the SFPU's 32 `Dst` loads a tile. The statistic's
+programs (sum of squares, fold, `sqrt(sum / n + eps)`) run only the row groups that hold a tile row's rows
+(`sfpu::reduce::row_offsets`); a ragged last tile row has programs of its own. Bit for bit as before (no value moves
+between rows); the output's other rows were already claimed `Pad::Undefined`.
+
+| A norm's statistic, `Step(64)`, 1.7B (us, 49 a step) | span | kernels | data |
+|---|--:|--:|--:|
+| before (`1792188326`) | 35.90 | 14.95 | 19.16 |
+| row-limited (`1792190118`) | **26.52** | **5.58** | 19.15 |
+| row-limited, rows read thin too (`1792192008`, reverted) | 28.32 | 5.58 | 21.01 |
+
+The `DIV` after it is unchanged: 30.9 us on 64 units (kernels 8.90, data 15.7).
+
+| decode step, ms, 32 / 128 / 256-token prompt | before (`1792186180`) | row-limited | burn-flex, same run |
+|---|--:|--:|--:|
+| SmolLM2-1.7B-Instruct | 43.42 / 45.85 / 49.00 | **42.97 / 45.41 / 48.59** (`1792189445`) | 303.4 / 311.2 / 329.3 |
+| SmolLM2-135M | 20.20 / 20.66 / 21.34 | **19.94 / 20.42 / 21.11** (`1792189939`) | 28.0 / 29.9 / 32.6 |
+
+**The thin read that lost.** `READ_RUN` with a row count read each tile through its used rows (`1024 + 64 r` bytes, as
+a thin matmul `GATHER` reads `A`): ~74% fewer bytes, the same 64 entries. The read got slower (19.15 -> 21.01 us) and
+the step did not move (1.7B 42.99 / 45.40 / 48.57, `1792191435`; 135M 20.06 / 20.54 / 21.24, `1792191823`). A row
+read by one unit costs per read, not per byte, as decode-matmul-bandwidth P1 found for two face-row reads a tile. It
+passed the mover gates in both read modes and `--smoke` (1,104 of 1,104, `1792192846`) and was reverted.
+
+**Gates:** unit `sfpu::norm` (rows 1-49, NaN padding, control `a_row_group_too_few_differs`); `step196_row_limited_rms`
+(ttsim; card 0 `1792194490`); `step195` and `step193` on ttsim and card 0 (`1792189325`, `1792194490`); `step187` on
+ttsim; Burn conformance (`norm`, `rms`) plain and `--fusion`, no unexpected result.
 
 ## Decode fusers: sigmoid, SiLU and RMSNorm (2026-10-16, cards 0 and 1)
 

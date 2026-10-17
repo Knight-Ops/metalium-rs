@@ -179,15 +179,30 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return accumulate_in_order(first, valid.unwrap_or(32));
     }
-    accumulate_with(op, axis, first, valid, false)
+    accumulate_with(op, axis, first, valid, false, 32)
 }
 
 /// [`accumulate`] of each datum's square (`x * x` as `MUL`'s program forms it, `SFPMAD(x, x,
 /// -0)`) for a sum over columns: what accumulating `MUL(x, x)`'s output tile does, bit for bit,
 /// since a product is never a denormal and so its FP32 store and reload change nothing. The sum
-/// of squares of `sfpu::norm`.
-pub fn accumulate_squares(first: bool, valid: Option<u32>) -> Vec<Instruction> {
-    accumulate_with(ReduceOp::Sum, Axis::Cols, first, valid, true)
+/// of squares of `sfpu::norm`, over the tile's first `rows` rows only ([`row_offsets`]).
+pub fn accumulate_squares(first: bool, valid: Option<u32>, rows: u32) -> Vec<Instruction> {
+    accumulate_with(ReduceOp::Sum, Axis::Cols, first, valid, true, rows)
+}
+
+/// The `Dst` offsets, from a tile's first row and as `for_each_row_group(64, ..)` hands them,
+/// of the row groups that hold the tile's first `rows` (1..=32) tensor rows. Tensor rows 0..16
+/// are faces 0 (offsets 0..16) and 1 (16..32), rows 16..32 faces 2 and 3; each face is four
+/// groups of four rows, a group's even columns at `4g` and its odd at `4g | 2`. A load holds
+/// four rows of eight columns, and a reduction over columns never moves a value between rows
+/// (its fold rotates within a lane row), so the groups past `rows` -- padding -- need not run:
+/// a decode row (`rows == 1`) is 4 of the 32.
+pub fn row_offsets(rows: u32) -> Vec<u32> {
+    assert!((1..=32).contains(&rows), "{rows} rows of a tile");
+    (0..64)
+        .step_by(2)
+        .filter(|o| o / 32 * 16 + o % 16 / 4 * 4 < rows)
+        .collect()
 }
 
 fn accumulate_with(
@@ -196,10 +211,15 @@ fn accumulate_with(
     first: bool,
     valid: Option<u32>,
     square: bool,
+    rows: u32,
 ) -> Vec<Instruction> {
+    assert!(
+        rows == 32 || axis == Axis::Cols,
+        "rows limit a sum over columns"
+    );
     let fmt = op.format();
     let masked = valid.is_some_and(|v| v < 32);
-    let mut p = Program::with_policy(if masked {
+    let mut p = Program::with_policy(if masked || rows < 32 {
         LoopPolicy::Unrolled
     } else {
         LoopPolicy::Replay
@@ -224,7 +244,7 @@ fn accumulate_with(
         mask_setup(&mut p);
     }
     let v = valid.unwrap_or(32) as i32;
-    p.for_each_row_group(64, |p, o| {
+    let body = |p: &mut Program, o: u32| {
         if masked && matches!(op, ReduceOp::ProdI32 | ReduceOp::MinI32 | ReduceOp::MaxI32) {
             mask_setup(p);
         }
@@ -258,7 +278,14 @@ fn accumulate_with(
             combine(p, op, LReg::L0, LReg::L1);
             p.store(LReg::L1, fmt, OUT_ROW + o);
         }
-    });
+    };
+    if rows == 32 {
+        p.for_each_row_group(64, body);
+    } else {
+        for o in row_offsets(rows) {
+            body(&mut p, o);
+        }
+    }
     p.finish()
 }
 
@@ -319,6 +346,16 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
 /// The finishing program: the accumulator folded within the tile (see the
 /// module documentation). Nothing for a sum over rows, already in row 0.
 pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
+    finish_rows(op, axis, 32)
+}
+
+/// [`finish`] of a sum over columns folding only the row groups of the tile's first `rows`
+/// rows ([`row_offsets`]); the others are left as they were, padding.
+pub fn finish_rows(op: ReduceOp, axis: Axis, rows: u32) -> Vec<Instruction> {
+    assert!(
+        rows == 32 || axis == Axis::Cols,
+        "rows limit a sum over columns"
+    );
     let fmt = op.format();
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
@@ -331,6 +368,9 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
             // faces 2 and 3; a group of four rows in each.
             for lower in [0, 32] {
                 for g in 0..4 {
+                    if lower / 2 + 4 * g >= rows {
+                        continue;
+                    }
                     let (left, right) = (lower + 4 * g, lower + 16 + 4 * g);
                     let at = [left, left | 2, right, right | 2];
                     p.load(LReg::L0, fmt, acc(at[0]));

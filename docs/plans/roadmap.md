@@ -405,6 +405,9 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         `sum_dim`'s order, then `* 1/n`, `+ eps`, `sqrt`), then the existing `DIV`. Bit for bit the five ops. A
         version that also divided ran 640 us a norm on one unit (silicon, the 1.7B step 71.5 ms). The scale stays its own op:
         burn-fusion puts its `Reshape` in another block.
+      - The statistic runs only the row groups a tile row's rows occupy (2026-10-16, gate `step196`): a decode row's
+        kernel 14.95 -> 5.58 us. 1.7B step **42.97 / 45.41 / 48.59 ms** (`1792189445`), 135M **19.94-21.11**
+        (`1792189939`). Reading only those rows too was slower (19.2 -> 21.0 us) and was reverted.
       - Found: a chain must be able to begin one op into a block (a residual `Add` holds the norm's first op), and
         `ElementWiseFuser` lost its match to any later op while another fuser was open.
   - [ ] **The cache write's two whole-cache copies, 2.25 ms** ([in-place-cache-write.md](in-place-cache-write.md),
@@ -701,7 +704,7 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
   micro-op bytecode ([kernel-fusion.md](kernel-fusion.md) Phase 2).
 - [ ] **B13c** matmul + bias + activation epilogue (kernel-fusion.md lines 200–204).
 - [ ] **Reduce/norm fuser.** RMSNorm's statistic is done (2026-10-16, `sfpu::norm`, one reduction job a tile
-  row; the division stays a multi-unit op). Open: LayerNorm, softmax, rows past 128 tiles (kernel-fusion.md Phase 4).
+  row, over only the row groups its rows occupy; the division stays a multi-unit op). Open: LayerNorm, softmax, rows past 128 tiles (kernel-fusion.md Phase 4).
 - [x] **Barriers on the units an op ran on (2026-10-14).** A multi-tile op's barrier was on every unit, and a unit
   it gave no job to enqueued a barrier list of its own: one PCIe enqueue a tile an op, 355,000 a step for the
   all-tiles transformer. Now only the units an op runs on arrive, and the others catch up with a wait-only

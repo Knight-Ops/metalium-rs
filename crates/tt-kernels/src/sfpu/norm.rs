@@ -14,6 +14,11 @@
 //!    rounding of the row's sum; the separate ops compute every lane too, and `DIV`'s column
 //!    broadcast reads column 0's, so lane for lane the same instructions give the same tensor.
 //!
+//! A tile row with fewer than 32 rows (a decode step's `[1, n]`) runs all three over only the
+//! row groups its rows occupy ([`super::reduce::row_offsets`]: one of eight for one row). No
+//! value moves between rows, so the rows computed are the same bits; the output's other rows
+//! are whatever `Dst` held, padding, as the output claims (`Pad::Undefined`).
+//!
 //! **Why not the division too.** A first version divided in the same kernel, the row's tiles
 //! unpacked a second time: 640 us a 2048-wide norm on silicon, against 106 us for the five ops.
 //! `DIV`'s body is too long for the replay buffer, so each of its instructions is pushed from
@@ -23,7 +28,7 @@ use tt_isa::isa::Instruction;
 
 use super::kernel::OUT_ROW;
 use super::ops::sqrt_program;
-use super::reduce::{accumulate_squares, finish, Axis, ReduceOp};
+use super::reduce::{accumulate_squares, finish_rows, Axis, ReduceOp};
 use super::{Format, LReg, LoopPolicy, Program};
 
 /// Most tiles a row may have: its slots fit the data arena and its role programs a program
@@ -36,8 +41,8 @@ pub fn fits(cols: usize) -> bool {
 }
 
 /// The statistic of `n` columns, in place on the folded sums at `OUT_ROW`:
-/// `sqrt(sum (1/n) + eps)`, every lane.
-pub fn statistic(n: usize, eps: f32) -> Vec<Instruction> {
+/// `sqrt(sum (1/n) + eps)`, every lane of the row groups of the tile's first `rows` rows.
+pub fn statistic(n: usize, eps: f32, rows: u32) -> Vec<Instruction> {
     let (l0, l2, l3, l7) = (LReg::L0, LReg::L2, LReg::L3, LReg::L7);
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     // The scalars as `float_mean_dim` and `float_add_scalar` give them.
@@ -47,6 +52,9 @@ pub fn statistic(n: usize, eps: f32) -> Vec<Instruction> {
     // lanes at all four).
     for lower in [0, 32] {
         for g in 0..4 {
+            if lower / 2 + 4 * g >= rows {
+                continue;
+            }
             let (left, right) = (lower + 4 * g, lower + 16 + 4 * g);
             p.load(l0, Format::Fp32, OUT_ROW + left);
             // `MUL_SCALAR`, `ADD_SCALAR`, `SQRT`: each op's body, its result where the next
@@ -66,23 +74,40 @@ pub fn statistic(n: usize, eps: f32) -> Vec<Instruction> {
     p.finish()
 }
 
-/// The math programs of a row of `per` tiles whose last has `valid` columns: each tile's
-/// sum-of-squares program in order, then the fold and the statistic as one finishing program
-/// (`sfpu::reduce::roles` runs them).
-pub fn math(per: usize, valid: u32, eps: f32) -> (Vec<Vec<Instruction>>, Vec<Instruction>) {
+/// The math programs of a tile row of `rows` rows and `per` tiles, whose last has `valid`
+/// columns: each tile's sum-of-squares program in order, then the fold and the statistic as one
+/// finishing program (`sfpu::reduce::roles` runs them).
+pub fn math(
+    per: usize,
+    valid: u32,
+    eps: f32,
+    rows: u32,
+) -> (Vec<Vec<Instruction>>, Vec<Instruction>) {
     let cols = (per - 1) * 32 + valid as usize;
     let masked = valid < 32;
     let squares = (0..per)
-        .map(|n| accumulate_squares(n == 0, (n + 1 == per && masked).then_some(valid)))
+        .map(|n| accumulate_squares(n == 0, (n + 1 == per && masked).then_some(valid), rows))
         .collect();
-    let mut fin = finish(ReduceOp::Sum, Axis::Cols);
-    fin.extend(statistic(cols, eps));
+    let mut fin = finish_rows(ReduceOp::Sum, Axis::Cols, rows);
+    fin.extend(statistic(cols, eps, rows));
     (squares, fin)
 }
 
 /// What the device computes for `x` (`[rows, cols]`, row-major): `[rows]`, each row's
 /// statistic as column 0 holds it, the same programs run by the interpreter over each tile row.
+/// Padding is a NaN, which no row's statistic may see.
 pub fn reference(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+    reference_with(x, rows, cols, eps, |r| r)
+}
+
+/// [`reference`], each tile row's programs made for `programmed(r)` rows where it has `r`.
+fn reference_with(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    programmed: impl Fn(u32) -> u32,
+) -> Vec<f32> {
     use super::interp::Vector;
     use tt_isa::dm::face_index;
     let (rt, per) = (rows.div_ceil(32), cols.div_ceil(32));
@@ -90,9 +115,8 @@ pub fn reference(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
         0 => 32,
         v => v as u32,
     };
-    let (squares, fin) = math(per, valid, eps);
     let tile = |i: usize, j: usize| -> Vec<u32> {
-        let mut t = vec![0u32; 1024];
+        let mut t = vec![0x7fc0_dead_u32; 1024];
         for r in 0..32 {
             for c in 0..32 {
                 let (gr, gc) = (32 * i + r, 32 * j + c);
@@ -105,6 +129,7 @@ pub fn reference(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
     };
     let mut out = Vec::with_capacity(rows);
     for i in 0..rt {
+        let (squares, fin) = math(per, valid, eps, programmed((rows - 32 * i).min(32) as u32));
         let mut v = Vector::new();
         for (j, program) in squares.iter().enumerate() {
             v.put_tile(super::kernel::A_ROW as usize, &tile(i, j));
@@ -177,7 +202,20 @@ mod tests {
 
     #[test]
     fn the_statistic_is_the_composed_ops_bit_for_bit() {
-        for (rows, cols) in [(1, 64), (5, 37), (33, 96), (2, 576), (1, 2048), (3, 4096)] {
+        for (rows, cols) in [
+            (1, 64),
+            (5, 37),
+            (33, 96),
+            (2, 576),
+            (1, 2048),
+            (3, 4096),
+            (4, 64),
+            (16, 40),
+            (17, 64),
+            (31, 33),
+            (32, 64),
+            (49, 70),
+        ] {
             for eps in [1e-5f32, 1e-6] {
                 let x = values(rows, cols, (rows * 1000 + cols) as u32);
                 let want = composed(&x, rows, cols, eps);
@@ -204,11 +242,40 @@ mod tests {
         );
     }
 
+    /// Control: the gate sees the row groups. The last tile row's programs made for one group
+    /// of rows fewer than it has leave its last rows' statistic undone, at a group boundary, at a
+    /// face boundary, and past a whole tile row.
+    #[test]
+    fn a_row_group_too_few_differs() {
+        for (rows, programmed) in [(5, 4), (17, 16), (37, 4)] {
+            let (cols, last) = (96, (rows - 1) % 32 + 1);
+            let x = values(rows, cols, 7);
+            let want = bits(&reference(&x, rows, cols, 1e-5));
+            let got = bits(&reference_with(&x, rows, cols, 1e-5, |r| {
+                if r == last as u32 {
+                    programmed
+                } else {
+                    r
+                }
+            }));
+            let kept = rows - last + programmed as usize;
+            assert_ne!(
+                got, want,
+                "{rows} rows, the last {last} programmed as {programmed}"
+            );
+            assert_eq!(
+                got[..kept],
+                want[..kept],
+                "{rows} rows: the rows programmed still run"
+            );
+        }
+    }
+
     /// The longest row's role programs fit a program slot, and its slots the arena.
     #[test]
     fn the_longest_row_fits() {
         use crate::sfpu::reduce::{plan_layout, roles};
-        let (squares, fin) = math(MAX_TILES, 32, 1e-5);
+        let (squares, fin) = math(MAX_TILES, 32, 1e-5, 32);
         let layout = plan_layout(1, MAX_TILES).unwrap();
         for (role, p) in roles(&layout, &squares, &fin).iter().enumerate() {
             assert!(

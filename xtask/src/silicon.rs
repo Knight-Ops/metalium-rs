@@ -250,6 +250,8 @@ pub const SMOKE: &[&str] = &[
     "step194_fused_sigmoid_silu::",
     // RMSNorm up to its scale as one kernel on `Tt` (decode-small-ops.md S3).
     "step195_fused_rms_norm::",
+    // RMSNorm's statistic over only the row groups a tile row's rows occupy (decode-small-ops.md S3).
+    "step196_row_limited_rms::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

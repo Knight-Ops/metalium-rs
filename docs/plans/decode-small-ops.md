@@ -1,7 +1,8 @@
 # Decode small ops
 
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
-done (2026-10-16; a 1.7B step 43.42 / 45.85 / 49.00 ms on `Tt`, run `1792186180`); S1d, S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
+done (2026-10-16; a 1.7B step 42.97 / 45.41 / 48.59 ms on `Tt` with S3's row-limited statistic, run `1792189445`);
+S1d, S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
 [in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies).
 
 ## Why this item
@@ -207,8 +208,30 @@ projection), or `FixedWrite` taking the rows before the head split.
 - [x] **Measured** (card 1, with S2b and the sigmoid fuser):
   - 1.7B step **45.23 / 47.71 / 50.78 -> 43.42 / 45.85 / 49.00 ms** (`1792186180`).
   - 135M **22.46-23.63 -> 20.20-21.34** (`1792186583`; burn-flex 26.9-31.6).
-  - Next if it pays: the statistic kernel touching only the row groups a decode row occupies (1 of 8). Bit
-    identity keeps the sum sequential, on one unit a row.
+- [x] **The statistic over only the row groups a tile row's rows occupy** (2026-10-16). A decode row is tensor row 0
+  of each tile, 4 of the 32 `Dst` loads a tile (`sfpu::reduce::row_offsets`). `accumulate_squares`, `finish_rows` and
+  `norm::statistic` take the tile row's row count, and `sfpu_rms` gives a ragged last tile row programs of its own.
+  No value moves between rows, so the computed rows keep their bits; the output's other rows were already
+  `Pad::Undefined`.
+  - **P0, the profile first** (`1792188326`, `Step(64)`, 1.7B, a norm's two ops): the statistic 35.9 us, **kernels
+    14.95**, data 19.16; the `DIV` 30.9 us on 64 units (kernels 8.90, data 15.67).
+  - **Measured** (card 1, burn-flex in the same run): kernels 14.95 -> **5.58 us**, the statistic 35.9 -> 26.5 us
+    (profile `1792190118`). 1.7B step **43.42 / 45.85 / 49.00 -> 42.97 / 45.41 / 48.59 ms** (`1792189445`, burn-flex
+    303.4 / 311.2 / 329.3); 135M **20.20 / 20.66 / 21.34 -> 19.94 / 20.42 / 21.11** (`1792189939`, burn-flex 28.0 /
+    29.9 / 32.6).
+  - **Tried and reverted: reading only the rows used.** `READ_RUN` with a row count (one `1024 + 64 r`-byte read a
+    tile, as a thin matmul `GATHER` reads `A`) made the data phase **slower, 19.15 -> 21.01 us**, with ~74% fewer
+    bytes, and the step no faster (1.7B 42.99 / 45.40 / 48.57, `1792191435`; 135M 20.06-21.24, `1792191823`;
+    profile `1792192008`). A row's 64 reads from one unit cost per read, not per byte. It passed every gate (mover
+    gates in both read modes, `--smoke` 1,104 of 1,104, `1792192846`) and was not kept.
+  - **Gates:** unit `sfpu::norm` (rows 1-49 across group and face boundaries, NaN padding; control
+    `a_row_group_too_few_differs`); `step196_row_limited_rms` (ttsim, card 0 `1792194490`; L1 and `Dst` primed with
+    NaN; watched failing with the last tile row programmed 4 rows short); `step195`, `step193`, `step187` (ttsim)
+    and `step195`, `step193` on card 0; Burn conformance (`norm`, `rms`) plain and `--fusion`.
+  - **What is left of a norm:** the statistic's read (19 us, one unit, 64 entries) and the `DIV` (31 us). The same
+    row limit applies to every SFPU element-wise op on a `[1, W]` decode activation (`DIV` here, 8.9 us of kernel on
+    each of 64 units, `SILU_MUL`, `sigmoid`, the residual adds), whose decode row is one of the eight row groups their
+    kernels run (what that saves there is unmeasured).
 
 ### S4. Attention's non-product ops (~4.5 ms)
 

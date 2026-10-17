@@ -2808,13 +2808,24 @@ pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work>
         v => v as u32,
     };
     let layout = reduce::plan_layout(1, per).map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (squares, fin) = norm::math(per, valid, eps);
-    let roles = Arc::new(reduce::roles(&layout, &squares, &fin));
+    // A tile row's programs run over the row groups its rows occupy: a ragged last tile row (a
+    // decode step's one row) has its own.
+    let roles_for = |rows: usize| {
+        let (squares, fin) = norm::math(per, valid, eps, rows as u32);
+        Arc::new(reduce::roles(&layout, &squares, &fin))
+    };
+    let whole = (a.rows >= 32).then(|| roles_for(32));
+    let last = match a.rows % 32 {
+        0 => whole.clone().expect("a whole tile row"),
+        r => roles_for(r),
+    };
     let out = DramTensor::alloc_elem(alloc, a.rows, 1, Elem::F32)?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let jobs = (0..rt)
         .map(|k| {
-            // As a reduction over columns gathers and scatters a run of one output.
+            // As a reduction over columns gathers and scatters a run of one output. Whole
+            // tiles even for a decode row: reading only its rows (`1024 + 64 r` bytes a tile)
+            // measured slower, 21.0 us a 2048-wide row against 19.2 (decode-small-ops.md S3).
             let gather = [
                 [
                     record::READ_RUN,
@@ -2849,7 +2860,10 @@ pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work>
                     entries: gather.to_vec(),
                 },
                 Step::Kernel {
-                    roles: roles.clone(),
+                    roles: match &whole {
+                        Some(w) if k + 1 < rt => w.clone(),
+                        _ => last.clone(),
+                    },
                     init: layout.init.clone(),
                     mop: Box::new([None; 3]),
                     loops: Default::default(),
